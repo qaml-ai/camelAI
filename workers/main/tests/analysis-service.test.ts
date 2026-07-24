@@ -426,13 +426,23 @@ describe("runAnalysisCode env scoping", () => {
 
 describe("AnalysisService workspace uploads mount", () => {
   function analysisServiceSandbox() {
-    const mounts: Array<{ bucketBinding: string; prefix: string; mountPath?: string }> = [];
+    const mounts: Array<{
+      bucketBinding: string;
+      prefix: string;
+      mountPath?: string;
+      options?: { readOnly?: boolean };
+    }> = [];
     const connections: Array<unknown> = [];
     const sandbox: AnalysisSandboxStub & { mounts: typeof mounts; connections: typeof connections } = {
       mounts,
       connections,
-      async ensureMounted(bucketBinding: string, prefix: string, mountPath?: string) {
-        mounts.push({ bucketBinding, prefix, mountPath });
+      async ensureMounted(
+        bucketBinding: string,
+        prefix: string,
+        mountPath?: string,
+        options?: { readOnly?: boolean },
+      ) {
+        mounts.push({ bucketBinding, prefix, mountPath, options });
       },
       async ensureConnectionsRpc(params: unknown) {
         connections.push(params);
@@ -474,11 +484,20 @@ describe("AnalysisService workspace uploads mount", () => {
     return { service, sandbox, listCalls };
   }
 
+  const OUTPUTS_MOUNT = {
+    bucketBinding: "R2_BUCKET",
+    prefix: "org-1/ws-1/user-outputs",
+    mountPath: "/outputs",
+    options: { readOnly: false },
+  };
+
   it("skips the /uploads mount when the workspace upload prefix is empty", async () => {
     const { service, sandbox, listCalls } = serviceWithUploads([]);
     await expect(service.runCode({ code: "print('ok')" })).resolves.toMatchObject({ ok: true });
     expect(listCalls).toEqual([{ prefix: "org-1/ws-1/user-uploads/", limit: 1 }]);
-    expect(sandbox.mounts).toEqual([]);
+    // No uploads to read, but outputs is still mounted: it is the run's only
+    // way to hand a generated file back, and it starts empty by definition.
+    expect(sandbox.mounts).toEqual([OUTPUTS_MOUNT]);
     expect(sandbox.connections).toHaveLength(1);
   });
 
@@ -490,8 +509,35 @@ describe("AnalysisService workspace uploads mount", () => {
         bucketBinding: "R2_BUCKET",
         prefix: "org-1/ws-1/user-uploads",
         mountPath: "/uploads",
+        options: undefined,
       },
+      OUTPUTS_MOUNT,
     ]);
+  });
+
+  it("mounts /outputs writable so a run can deliver a generated file", async () => {
+    // Regression: with no writable outputs mount a generated .xlsx was trapped
+    // in the sandbox, and agents resorted to base64-through-a-text-tool or
+    // deploying a Worker just to serve one file.
+    const { service, sandbox } = serviceWithUploads([]);
+    await expect(service.runCode({ code: "print('ok')" })).resolves.toMatchObject({ ok: true });
+
+    const outputs = sandbox.mounts.find((mount) => mount.mountPath === "/outputs");
+    expect(outputs).toBeDefined();
+    expect(outputs?.options?.readOnly).toBe(false);
+    expect(outputs?.prefix).toBe("org-1/ws-1/user-outputs");
+  });
+
+  it("still runs when the outputs mount fails", async () => {
+    // Losing the delivery path is bad; taking down notebook and code execution
+    // for every workspace would be far worse.
+    const { service, sandbox } = serviceWithUploads([]);
+    const failing = sandbox as unknown as { ensureMounted: (...args: unknown[]) => Promise<void> };
+    failing.ensureMounted = async (_binding: unknown, _prefix: unknown, mountPath?: unknown) => {
+      if (mountPath === "/outputs") throw new Error("s3fs mount refused");
+    };
+
+    await expect(service.runCode({ code: "print('ok')" })).resolves.toMatchObject({ ok: true });
   });
 });
 

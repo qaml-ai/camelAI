@@ -133,7 +133,10 @@ export class AnalysisSandbox extends Sandbox<Env> {
   private readonly mountGates = new Map<string, (run: () => Promise<void>) => Promise<void>>();
 
   /**
-   * Mount an R2 prefix read-only so container code can read the staged objects.
+   * Mount an R2 prefix so container code can read the staged objects. Mounts are
+   * read-only by default; pass `{ readOnly: false }` for the outputs mount,
+   * which is how a run hands a generated file back to the user.
+   *
    * By default the mount lands at `/<prefix>` (preserving the warehouse's
    * `'/' + r2_key` contract for exports); pass `mountPath` to mount at a stable
    * alias instead (uploads mount at `/uploads`, since the org/workspace-prefixed
@@ -146,7 +149,12 @@ export class AnalysisSandbox extends Sandbox<Env> {
    * calls on a warm container are a no-op. An already-mounted error from a
    * previous container life is treated as success (see isMountAlreadyPresent).
    */
-  async ensureMounted(bucketBinding: string, prefix: string, mountPath?: string): Promise<void> {
+  async ensureMounted(
+    bucketBinding: string,
+    prefix: string,
+    mountPath?: string,
+    options: { readOnly?: boolean } = {},
+  ): Promise<void> {
     const resolvedMountPath = mountPath ?? `/${prefix}`;
     if (this.mountedPaths.has(resolvedMountPath)) return;
     let gate = this.mountGates.get(resolvedMountPath);
@@ -154,11 +162,12 @@ export class AnalysisSandbox extends Sandbox<Env> {
       gate = createSingleFlight();
       this.mountGates.set(resolvedMountPath, gate);
     }
+    const readOnly = options.readOnly ?? true;
     await gate(async () => {
       try {
         await this.mountBucket(bucketBinding, resolvedMountPath, {
           prefix: `/${prefix}`,
-          readOnly: true,
+          readOnly,
           // Shrink the s3fs stat cache (default 60s + negative caching) so a
           // just-staged export/upload isn't read through a stale/partial view —
           // which otherwise surfaces as a read failure. The stage → read gap

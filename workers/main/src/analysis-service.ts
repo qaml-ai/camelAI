@@ -44,6 +44,19 @@ export const ANALYSIS_UPLOADS_BUCKET_BINDING = "R2_BUCKET";
  * prefix is never shown to the agent and can't be derived inside the container.
  */
 export const ANALYSIS_UPLOADS_MOUNT_PATH = "/uploads";
+/**
+ * Where workspace outputs mount inside the container, writable. This is how a
+ * run hands a generated file back to the user: anything written to
+ * `/outputs/<name>` is the `outputs/<name>` R2 reference the file tools read
+ * and the chat links as `/api/workspaces/<id>/outputs/<name>`.
+ *
+ * Without it a generated binary was effectively trapped. Production agents hit
+ * this repeatedly on "export this to Excel": the file existed in the sandbox
+ * and every route out was a dead end — `shutil` to a project path (not mounted),
+ * base64 through the text-only `write` tool (corrupts), and finally deploying a
+ * whole Worker just to serve one spreadsheet.
+ */
+export const ANALYSIS_OUTPUTS_MOUNT_PATH = "/outputs";
 /** Files larger than this are NOT auto-persisted back to the project FS. */
 export const ANALYSIS_MAX_PERSIST_BYTES = 25 * 1024 * 1024;
 /**
@@ -80,7 +93,12 @@ export interface AnalysisSandboxLike {
 
 /** The full DO-RPC stub surface the service drives (custom AnalysisSandbox methods). */
 export type AnalysisSandboxStub = AnalysisSandboxLike & {
-  ensureMounted(bucketBinding: string, prefix: string, mountPath?: string): Promise<void>;
+  ensureMounted(
+    bucketBinding: string,
+    prefix: string,
+    mountPath?: string,
+    options?: { readOnly?: boolean },
+  ): Promise<void>;
   ensureConnectionsRpc(params: AnalysisConnectionsParams): Promise<void>;
   sealAppEgress(): Promise<void>;
 };
@@ -977,6 +995,25 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
       const uploadsPrefix = `${getWorkspaceR2Prefix(this.ctx.props.orgId, this.ctx.props.workspaceId)}/user-uploads`;
       if (await r2PrefixHasObjects(this.env.R2_BUCKET, uploadsPrefix)) {
         await sandbox.ensureMounted(ANALYSIS_UPLOADS_BUCKET_BINDING, uploadsPrefix, ANALYSIS_UPLOADS_MOUNT_PATH);
+      }
+      // Writable, and deliberately NOT gated on the prefix already having
+      // objects the way uploads is: outputs starts empty by definition, and the
+      // whole point is to let a run create the first file in it.
+      //
+      // A failure here is logged rather than thrown. Losing the outputs mount
+      // costs the run its delivery path, but throwing would take down notebook
+      // and code execution entirely — a much larger regression than the one
+      // this mount exists to fix.
+      const outputsPrefix = `${getWorkspaceR2Prefix(this.ctx.props.orgId, this.ctx.props.workspaceId)}/user-outputs`;
+      try {
+        await sandbox.ensureMounted(
+          ANALYSIS_UPLOADS_BUCKET_BINDING,
+          outputsPrefix,
+          ANALYSIS_OUTPUTS_MOUNT_PATH,
+          { readOnly: false },
+        );
+      } catch (error) {
+        console.error("[AnalysisService] outputs mount failed", error);
       }
     }
     if (this.ctx.props.orgId && this.ctx.props.workspaceId) {

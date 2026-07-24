@@ -193,6 +193,11 @@
       "tier": "hard"
     },
     {
+      "id": "output-file-delivery-live",
+      "description": "Generate a spreadsheet from an uploaded CSV and deliver it as a downloadable file in workspace outputs",
+      "kind": "skill"
+    },
+    {
       "id": "analysis-tools-reachable-live",
       "description": "Reach the analysis sandbox by name without a not-found dead end, and report ground-truth totals",
       "kind": "unit"

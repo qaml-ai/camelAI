@@ -192,6 +192,48 @@ export const CODE_MODE_DEFAULT_MAX_OUTPUT_CHARACTERS = 60_000;
 export const CODE_MODE_MAX_OUTPUT_CHARACTERS = 200_000;
 const CODE_MODE_R2_READ_NOTICE_RESERVED_BYTES = 1024;
 const CODE_MODE_R2_MAX_WRITE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * File extensions whose contents are binary. Writing text to one of these
+ * produces a file that downloads but will not open.
+ */
+const CODE_MODE_BINARY_EXTENSIONS = new Set([
+  "xlsx", "xls", "xlsm", "docx", "doc", "pptx", "ppt", "pdf",
+  "zip", "gz", "tar", "7z", "rar",
+  "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff",
+  "mp3", "mp4", "wav", "mov", "avi", "webm",
+  "parquet", "db", "sqlite", "wasm", "woff", "woff2", "ttf", "otf",
+]);
+
+/** Long, unbroken, base64-alphabet text — what an encoded binary looks like. */
+function looksLikeBase64Payload(content: string): boolean {
+  const trimmed = content.trim();
+  if (trimmed.length < 512) return false;
+  return /^[A-Za-z0-9+/\r\n=]+$/.test(trimmed);
+}
+
+/**
+ * Reject base64 text written to a binary filename.
+ *
+ * `write` is text-only — there is no encoding parameter — so an agent trying to
+ * deliver a generated spreadsheet would base64 it and write that string to
+ * `outputs/report.xlsx`. R2 accepted it, the tool reported success, and the user
+ * got a download that would not open. This happened in production: the agent
+ * wrote 9,556 characters of base64 to a .xlsx twice, saw no error either time,
+ * and eventually deployed a Worker to serve the file instead.
+ *
+ * Fail loudly and point at the mount that actually carries bytes.
+ */
+export function assertNotBase64IntoBinaryFile(path: string, content: string): void {
+  const extension = path.split(".").pop()?.toLowerCase() ?? "";
+  if (!CODE_MODE_BINARY_EXTENSIONS.has(extension)) return;
+  if (!looksLikeBase64Payload(content)) return;
+  throw new Error(
+    `Refusing to write base64 text to ${path}: the write tool stores content verbatim, so this would produce a corrupt .${extension} that will not open. ` +
+    `Generate the file in the analysis sandbox and save it straight to the writable /outputs mount instead — e.g. run_code with wb.save('/outputs/${path.split("/").pop()}') — ` +
+    `which writes real bytes to the same outputs/ object the user downloads.`,
+  );
+}
 const CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES = 10 * 1024 * 1024;
 const JS_EXEC_EXCLUDED_TOOL_NAMES = new Set([
   // This tool waits for human input and can outlive js_exec's short sandbox
@@ -880,7 +922,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   ),
   codeModePassthroughTool(
     "run_notebook",
-    "Execute a Jupyter notebook (.ipynb) in a DO-backed project, persist the executed notebook + any changed files, and open a clean successful run in preview automatically. This is the PRIMARY data-analysis path — one call runs `jupyter nbconvert --execute --inplace`, validates the result, and previews it, so you don't drive nbconvert/validate or call set_preview by hand. The default Python data stack (pandas, numpy, polars, duckdb, pyarrow, altair, plotly, matplotlib, seaborn, scipy, scikit-learn, statsmodels, openpyxl, pdfplumber, jupyter) is PREINSTALLED — no setup needed; use add_python_dependency for anything else. Read big inputs from the read-only mounts — uploaded files at /uploads/<name> (the R2 uploads/<name> reference with a leading slash) and connection exports at '/' + r2_key — keep large intermediates in the per-run $SCRATCH directory (created for you, cleaned up after the run), and put notebooks + small results in the project. deploy_project publishes the executed notebook as a static report app, returns the live URL, and opens that app in preview automatically when the user wants a shareable link. Returns { ok, executed, validation: { clean, issues }, preview?, message?, stdout, stderr, exitCode, changedFiles, removedFiles, skippedOversize, durationMs }. If ok is false, the current preview is unchanged; fix the failing cells and re-run — never suppress errors: error carries the Python traceback, and when stdout/stderr are truncated inline, fullOutput.path is an R2 log with the complete output (read({ location: 'r2', path: fullOutput.path })). Arguments: { project, path, timeoutMs? }.",
+    "Execute a Jupyter notebook (.ipynb) in a DO-backed project, persist the executed notebook + any changed files, and open a clean successful run in preview automatically. This is the PRIMARY data-analysis path — one call runs `jupyter nbconvert --execute --inplace`, validates the result, and previews it, so you don't drive nbconvert/validate or call set_preview by hand. The default Python data stack (pandas, numpy, polars, duckdb, pyarrow, altair, plotly, matplotlib, seaborn, scipy, scikit-learn, statsmodels, openpyxl, pdfplumber, jupyter) is PREINSTALLED — no setup needed; use add_python_dependency for anything else. Read big inputs from the read-only mounts — uploaded files at /uploads/<name> (the R2 uploads/<name> reference with a leading slash) and connection exports at '/' + r2_key — keep large intermediates in the per-run $SCRATCH directory (created for you, cleaned up after the run), and put notebooks + small results in the project. To hand the user a generated FILE (.xlsx, .csv, .pdf, .zip, an image), write it to the writable /outputs mount: `wb.save('/outputs/costs.xlsx')` makes it the R2 outputs/costs.xlsx reference, downloadable at /api/workspaces/<workspaceId>/outputs/costs.xlsx and previewable with set_preview({ location: 'r2', path: 'outputs/costs.xlsx' }). Never base64 a binary through the text-only write tool, and never deploy an app just to serve a file. deploy_project publishes the executed notebook as a static report app, returns the live URL, and opens that app in preview automatically when the user wants a shareable link. Returns { ok, executed, validation: { clean, issues }, preview?, message?, stdout, stderr, exitCode, changedFiles, removedFiles, skippedOversize, durationMs }. If ok is false, the current preview is unchanged; fix the failing cells and re-run — never suppress errors: error carries the Python traceback, and when stdout/stderr are truncated inline, fullOutput.path is an R2 log with the complete output (read({ location: 'r2', path: fullOutput.path })). Arguments: { project, path, timeoutMs? }.",
     Type.Object({
       project: Type.String(),
       path: Type.String(),
@@ -893,7 +935,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   ),
   codeModePassthroughTool(
     "run_code",
-    "Run a Python string in this workspace's analysis sandbox for heavy cross-source data work too big for a Durable Object. STRONGLY PREFER DuckDB (pre-installed): `import duckdb`. Bring big data in by exporting a connection: call a connection's `export` method (via env.CONNECTIONS, e.g. `connections[alias].export({ query })`), which streams the full result to R2 server-side (credentials stay server-side) and returns { r2_key }. Each export is mounted read-only at the path '/' + r2_key. Read it with the reader that matches the export FORMAT: SQL databases + ClickHouse export Parquet → `duckdb.read_parquet('/' + r2_key)`; **BigQuery exports NDJSON** → `duckdb.read_json_auto('/' + r2_key)`. The r2_key extension (.parquet vs .ndjson) tells you which; analysis_list_connections reports each connection's `exportFormat`. Pass values via `params` (a JSON dict) instead of interpolating into the code string — they arrive as a Python `params` dict, e.g. `duckdb.read_parquet('/' + params['r2_key'])`. Each call runs isolated. Returns { ok, stdout, stderr, error } — read printed output from `stdout` (e.g. `print` CSV/JSON, then write it with tools.write). Arguments: { code, params? }.",
+    "Run a Python string in this workspace's analysis sandbox for heavy cross-source data work too big for a Durable Object. STRONGLY PREFER DuckDB (pre-installed): `import duckdb`. Bring big data in by exporting a connection: call a connection's `export` method (via env.CONNECTIONS, e.g. `connections[alias].export({ query })`), which streams the full result to R2 server-side (credentials stay server-side) and returns { r2_key }. Each export is mounted read-only at the path '/' + r2_key. Read it with the reader that matches the export FORMAT: SQL databases + ClickHouse export Parquet → `duckdb.read_parquet('/' + r2_key)`; **BigQuery exports NDJSON** → `duckdb.read_json_auto('/' + r2_key)`. The r2_key extension (.parquet vs .ndjson) tells you which; analysis_list_connections reports each connection's `exportFormat`. Pass values via `params` (a JSON dict) instead of interpolating into the code string — they arrive as a Python `params` dict, e.g. `duckdb.read_parquet('/' + params['r2_key'])`. Each call runs isolated. Returns { ok, stdout, stderr, error } — read printed output from `stdout` (e.g. `print` CSV/JSON, then write it with tools.write). To hand the user a generated FILE instead of printed text, write it to the writable /outputs mount (e.g. `df.to_excel('/outputs/costs.xlsx')`); it becomes the R2 outputs/costs.xlsx reference, downloadable at /api/workspaces/<workspaceId>/outputs/costs.xlsx. Never base64 a binary through the text-only write tool. Arguments: { code, params? }.",
     Type.Object({
       code: Type.String(),
       params: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
@@ -904,7 +946,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   ),
   codeModePassthroughTool(
     "analysis_exec",
-    "Run a shell command in the workspace analysis sandbox. Pass a `project` to run inside that DO-backed project's working tree; changed files persist back to project storage. Use purpose-built project tools first (`add_dependency`, `add_shadcn_component`, `deploy_project`); use analysis_exec only for project-local CLIs those tools do not cover. It is also the escape hatch for data work run_notebook doesn't cover (usql/sqlite3 schema poking, file-format conversions, quick `python -c` probes over a mounted upload). Omit `project` for scratch work over the read-only mounts. Returns { ok, stdout, stderr, exitCode, changedFiles, removedFiles, skippedOversize, durationMs }. Arguments: { command, project?, cwd?, env?, timeoutMs? }.",
+    "Run a shell command in the workspace analysis sandbox. Pass a `project` to run inside that DO-backed project's working tree; changed files persist back to project storage. Use purpose-built project tools first (`add_dependency`, `add_shadcn_component`, `deploy_project`); use analysis_exec only for project-local CLIs those tools do not cover. It is also the escape hatch for data work run_notebook doesn't cover (usql/sqlite3 schema poking, file-format conversions, quick `python -c` probes over a mounted upload). Omit `project` for scratch work over the mounts. Files written to /outputs/<name> are delivered to the user as the R2 outputs/<name> reference. Returns { ok, stdout, stderr, exitCode, changedFiles, removedFiles, skippedOversize, durationMs }. Arguments: { command, project?, cwd?, env?, timeoutMs? }.",
     Type.Object({
       command: Type.String(),
       project: Type.Optional(Type.String()),
@@ -2192,6 +2234,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (contentBytes > CODE_MODE_R2_MAX_WRITE_BYTES) {
       throw new Error(`R2 write content exceeds ${CODE_MODE_R2_MAX_WRITE_BYTES} bytes`);
     }
+    assertNotBase64IntoBinaryFile(target.path, content);
     const contentType = typeof args.content_type === "string" && args.content_type.trim()
       ? args.content_type.trim()
       : "text/plain; charset=utf-8";

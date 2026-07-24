@@ -28,6 +28,7 @@ import type {
   PiSqlStorageSerialization,
 } from "../pi-message-storage";
 import { piTextBytes, piCoreMessageKey } from "./pi-message-helpers";
+import { normalizePiUiMetadata } from "../../../../src/lib/runtime-artifacts";
 import { createPiSummaryMessage } from "./pi-compaction";
 import { buildWorkspaceScopedR2Key } from "../../../../src/lib/workspace-r2-paths";
 import type { ChatContextState } from "./types";
@@ -58,6 +59,12 @@ export interface PiCoreMessageStoreDeps {
   chatContext(): ChatContextState | null;
   /** Privacy-safe allocation counters used by focused tests and diagnostics. */
   recordReadOperation?(operation: "payload_row_parsed" | "r2_image_hydrated"): void;
+  /**
+   * Wall-clock duration measured for a settled tool call, consumed once as its
+   * toolResult row is committed. Optional so tests and non-agent callers can
+   * construct the store without a timing source.
+   */
+  takeToolDurationMs?(toolCallId: string): number | undefined;
 }
 
 export class PiCoreMessageStore {
@@ -497,6 +504,32 @@ export class PiCoreMessageStore {
     ];
   }
 
+  /**
+   * Stamp a toolResult row with the wall-clock duration measured live between
+   * its tool_execution_start/end pair. Pi persists no start timestamp, and an
+   * assistant row's `timestamp` marks when the model request opened, so a
+   * duration derived after the fact from adjacent message timestamps would
+   * silently include model latency. Recording it at commit time is the only
+   * point where the real value is still known. UI-only metadata:
+   * sanitizePiModelMessage strips it before anything reaches the provider.
+   */
+  private stampPiToolDuration(message: AgentMessage): AgentMessage {
+    const take = this.deps.takeToolDurationMs;
+    if (!take) return message;
+    const record = message as unknown as Record<string, unknown>;
+    if (record.role !== "toolResult") return message;
+    const toolCallId =
+      typeof record.toolCallId === "string" ? record.toolCallId.trim() : "";
+    if (!toolCallId) return message;
+    const durationMs = take.call(this.deps, toolCallId);
+    if (typeof durationMs !== "number") return message;
+    const existing = normalizePiUiMetadata(record.uiMetadata);
+    return {
+      ...record,
+      uiMetadata: { ...existing, toolDurationMs: durationMs },
+    } as unknown as AgentMessage;
+  }
+
   async appendPiCoreMessages(messages: AgentMessage[]): Promise<void> {
     if (messages.length === 0) return;
     this.ensurePiCoreTables();
@@ -509,7 +542,7 @@ export class PiCoreMessageStore {
     const startIndex = Math.max(0, Math.floor(Number(rows[0]?.next_idx) || 0));
     const now = Date.now();
     for (let offset = 0; offset < messages.length; offset += 1) {
-      const message = messages[offset];
+      const message = this.stampPiToolDuration(messages[offset]);
       const serialized = await this.serializePiMessageForSqlStorageDetailed(message);
       this.deps.sql().exec(
         "INSERT INTO pi_core_messages (idx, payload, created_at) VALUES (?, ?, ?)",

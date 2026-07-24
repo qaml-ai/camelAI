@@ -10,6 +10,11 @@
 // exists to keep the DO file smaller.
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type {
+  LakeStream,
+  PiMessageLakeRecord,
+  ToolCallLakeRecord,
+} from "../lake-streams";
 import type { OrgDO, UserDO } from "../auth";
 import type { WorkspaceDO } from "../workspace";
 import type { WorkspaceCronDO } from "../workspace-cron";
@@ -140,6 +145,10 @@ export interface ChatEnv extends WorkspaceFilesystemEnv {
   CODE_MODE_LOADER?: WorkerLoader;
   OBSERVABILITY_EVENTS?: AnalyticsEngineDataset;
   ERROR_ANALYTICS?: AnalyticsEngineDataset;
+  // Transcript data lake streams (Cloudflare Pipelines -> R2 Data Catalog).
+  // Optional everywhere: absent bindings disable export, they never fail a turn.
+  TRANSCRIPT_LAKE?: LakeStream<PiMessageLakeRecord>;
+  TOOL_CALLS_LAKE?: LakeStream<ToolCallLakeRecord>;
   CF_ZONE_ID?: string;
   CF_API_TOKEN?: string;
   CF_CUSTOM_HOSTNAME_FALLBACK?: string;

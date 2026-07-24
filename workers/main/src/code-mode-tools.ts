@@ -24,6 +24,11 @@ import { PiContainerTools, PI_CONTAINER_TOOL_DEFINITIONS } from "./pi-container-
 import { parseFilePreviewPath } from "./preview-paths";
 import type { ConnectionSetupResponse } from "./chat-thread-browser-prompts";
 import { CodeModeWebSearch } from "./code-mode-web-search";
+import {
+  boundLakeErrorMessage,
+  sendToolCallRecords,
+  toolBlocksOnHuman,
+} from "./lake-streams";
 import type { HostedCapability } from "../../../src/lib/capability-allowances";
 import { buildWorkspaceScopedR2Key } from "../../../src/lib/workspace-r2-paths";
 import { retryR2Read } from "../../../src/lib/r2-read-retry";
@@ -78,6 +83,21 @@ export interface AIVirtualBindingProps {
   orgId: string;
   workspaceId: string;
   userId?: string;
+}
+
+/**
+ * Size of a tool result for telemetry only. Never throws and never retains the
+ * serialized copy: an unserializable or oversized result reports 0 rather than
+ * failing the tool call it is measuring.
+ */
+function measureResultChars(value: unknown): number {
+  if (value === undefined || value === null) return 0;
+  if (typeof value === "string") return value.length;
+  try {
+    return JSON.stringify(value)?.length ?? 0;
+  } catch {
+    return 0;
+  }
 }
 
 function simplifyAgentWebToolResult(name: string, value: unknown): unknown {
@@ -2706,11 +2726,19 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     | { ok: true; data: unknown }
     | { ok: false; error: { tool: string; message: string; origin: "tool" } }
   > {
+    // Inner code-mode calls never produce a pi_core row: to the transcript the
+    // whole script is one opaque `js_exec`, which in production is ~35% of all
+    // tool calls and hides every build, deploy, notebook and DB timing inside
+    // it. Timing them here is the only place those durations are observable.
+    const startedAtMs = Date.now();
     try {
       const result = await this.callTool(name, rawArgs);
-      return { ok: true, data: simplifyAgentWebToolResult(name, result) };
+      const data = simplifyAgentWebToolResult(name, result);
+      this.recordCodeModeToolCall(name, startedAtMs, true, "", data);
+      return { ok: true, data };
     } catch (error) {
       const message = error instanceof Error && error.message ? error.message : String(error);
+      this.recordCodeModeToolCall(name, startedAtMs, false, message, undefined);
       const props = this.ctx?.props;
       if (name === "build_project" || name === "deploy_project") {
         console.error("[code-mode] project tool call failed", {
@@ -2734,6 +2762,37 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       }
       return { ok: false, error: { tool: name, message, origin: "tool" } };
     }
+  }
+
+  /** Emit one `tool_calls` lake row for a call made from inside js_exec. */
+  private recordCodeModeToolCall(
+    toolName: string,
+    startedAtMs: number,
+    ok: boolean,
+    errorMessage: string,
+    result: unknown,
+  ): void {
+    const props = this.ctx?.props;
+    sendToolCallRecords(this.env, [{
+      ingested_at_ms: Date.now(),
+      ts_ms: startedAtMs,
+      thread_id: props?.threadId ?? "",
+      org_id: props?.orgId ?? "",
+      workspace_id: props?.workspaceId ?? "",
+      user_id: props?.userId ?? "",
+      turn_id: "",
+      tool_call_id: crypto.randomUUID(),
+      parent_tool_call_id: props?.parentToolUseId ?? "",
+      tool_name: toolName,
+      surface: "code_mode",
+      model: "",
+      provider: "",
+      duration_ms: Math.max(0, Date.now() - startedAtMs),
+      ok,
+      error_message: ok ? "" : boundLakeErrorMessage(errorMessage),
+      blocks_on_human: toolBlocksOnHuman(toolName),
+      result_chars: measureResultChars(result),
+    }]);
   }
 
   async callTool(name: string, rawArgs: unknown = {}): Promise<unknown> {

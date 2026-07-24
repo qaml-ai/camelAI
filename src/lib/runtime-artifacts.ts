@@ -37,6 +37,15 @@ export interface PiUiMetadata {
    * UI-only — stripPiUiMetadata removes it from model-facing loads.
    */
   renderMessageId?: string;
+  /**
+   * Wall-clock milliseconds the tool took to execute, stamped on toolResult rows
+   * at commit time from the live tool_execution_start/end pair. Pi records no
+   * start timestamp of its own, so without this the duration is unrecoverable
+   * after the fact: an assistant row's `timestamp` is stamped when the model
+   * request opens, making result-minus-previous include model latency.
+   * UI-only — stripPiUiMetadata removes it from model-facing loads.
+   */
+  toolDurationMs?: number;
 }
 
 export function isRuntimeCallArtifact(value: unknown): value is RuntimeCallArtifact {
@@ -69,10 +78,19 @@ export function normalizePiUiMetadata(value: unknown): PiUiMetadata | undefined 
     typeof record.renderMessageId === "string" && record.renderMessageId.trim()
       ? record.renderMessageId.trim()
       : undefined;
-  if (codeModeArtifacts.length === 0 && !renderMessageId) return undefined;
+  const toolDurationMs =
+    typeof record.toolDurationMs === "number" &&
+    Number.isFinite(record.toolDurationMs) &&
+    record.toolDurationMs >= 0
+      ? Math.round(record.toolDurationMs)
+      : undefined;
+  if (codeModeArtifacts.length === 0 && !renderMessageId && toolDurationMs === undefined) {
+    return undefined;
+  }
   return {
     ...(codeModeArtifacts.length > 0 ? { codeModeArtifacts } : {}),
     ...(renderMessageId ? { renderMessageId } : {}),
+    ...(toolDurationMs === undefined ? {} : { toolDurationMs }),
   };
 }
 

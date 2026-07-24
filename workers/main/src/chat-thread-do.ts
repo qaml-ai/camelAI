@@ -94,6 +94,12 @@ import { planPiTurnResume } from "./pi-turn-journal";
 
 import { recordErrorEvent, recordObservabilityEvent } from "./observability";
 import {
+  boundLakeErrorMessage,
+  sendToolCallRecords,
+  toolBlocksOnHuman,
+} from "./lake-streams";
+import { TranscriptLakeMirror } from "./chat-thread/transcript-lake";
+import {
   BrowserPromptCoordinator,
   type ConnectionSetupResponse,
 } from "./chat-thread-browser-prompts";
@@ -614,6 +620,25 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   private previewStateInstance?: ChatThreadPreviewState;
   private streamingActivityInstance?: ChatThreadStreamingActivity;
   private threadMetadataInstance?: ChatThreadMetadata;
+  private transcriptLakeInstance?: TranscriptLakeMirror;
+  // Live tool timing. Pi emits tool_execution_start/end but records no start
+  // timestamp on the resulting toolResult message, so duration exists only
+  // between these two events: `piToolStartedAtMs` holds it in flight, and
+  // `piToolDurationMs` carries the settled value forward to the commit that
+  // stamps it onto the persisted row (uiMetadata.toolDurationMs).
+  //
+  // Lazily materialized through prototype getters rather than constructor field
+  // initializers, so the prototype-fake seam these handlers are unit-tested
+  // through (Object.create(ChatThreadDO.prototype)) does not have to enumerate
+  // them to exercise an unrelated event.
+  private piToolStartedAtMsMap?: Map<string, number>;
+  private piToolDurationMsMap?: Map<string, number>;
+  private get piToolStartedAtMs(): Map<string, number> {
+    return (this.piToolStartedAtMsMap ??= new Map<string, number>());
+  }
+  private get piToolDurationMs(): Map<string, number> {
+    return (this.piToolDurationMsMap ??= new Map<string, number>());
+  }
   private lastChatMemoryStoreSnapshotAt = 0;
   private lastChatMemoryPhaseAt = new Map<string, number>();
   private aiChatMemoryBoundariesInstrumented = false;
@@ -1369,6 +1394,10 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       await this.topUpUiMessagesFromPiCore();
       await this.healLegacyUiMessageTimes();
       await this.healLegacyUiMessageAuthors();
+      // Repair path for the lake export: catches rows whose post-commit sync was
+      // lost to an eviction or a stream failure, and backfills threads whose
+      // history predates the export entirely.
+      this.scheduleTranscriptLakeSync();
 
       if (!this.isThreadStreaming() && this.currentTodos.length > 0) {
         // This syncs a completed-todo override; do not overwrite it afterward.
@@ -2596,6 +2625,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       sql: () => this.ctx.storage.sql,
       r2: () => this.env.R2_BUCKET,
       chatContext: () => this.chatContext,
+      takeToolDurationMs: (toolCallId) => this.takePiToolDurationMs(toolCallId),
     }));
   }
 
@@ -3005,13 +3035,46 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     return this.uiMirror.rebuildUiMessagesFromPiCore();
   }
 
-  /** Compatibility seam used by direct pi_core persistence tests. */
-  appendPiCoreMessages(messages: AgentMessage[]): Promise<void> {
-    return this.piCoreStore.appendPiCoreMessages(messages);
+  // Transcript data lake export (pi_core -> Pipelines -> R2 Data Catalog).
+  // Watermark-based and idempotent, so it is safe to fire from every commit.
+  private get transcriptLake(): TranscriptLakeMirror {
+    return (this.transcriptLakeInstance ??= new TranscriptLakeMirror({
+      sql: () => this.ctx.storage.sql,
+      kv: () => this.ctx.storage.kv,
+      chatContext: () => this.chatContext,
+      env: () => this.env,
+      withMemoryPhase: (operation, fn) => this.withChatMemoryPhase(operation, fn),
+      recordChatThreadObservabilityEvent: (event, details) =>
+        this.recordChatThreadObservabilityEvent(event, details),
+    }));
   }
 
-  private appendPiCoreMessagesIfMissing(messages: AgentMessage[]): Promise<void> {
-    return this.piCoreStore.appendPiCoreMessagesIfMissing(messages);
+  /**
+   * Export newly committed pi_core rows. Deliberately fired through waitUntil:
+   * the lake is derived data, so a slow or failing stream must never extend a
+   * turn — the high-water mark simply re-sends the range on the next call.
+   */
+  private scheduleTranscriptLakeSync(): void {
+    // Defensive on both bindings: export is opt-in per environment, and this
+    // runs from connect/commit paths that must never fail because telemetry
+    // plumbing is absent.
+    if (!this.env?.TRANSCRIPT_LAKE || !this.ctx?.waitUntil) return;
+    this.ctx.waitUntil(
+      this.transcriptLake.syncTranscriptLake().catch((error) => {
+        console.error("[ChatThreadDO] transcript lake sync failed", error);
+      }),
+    );
+  }
+
+  /** Compatibility seam used by direct pi_core persistence tests. */
+  async appendPiCoreMessages(messages: AgentMessage[]): Promise<void> {
+    await this.piCoreStore.appendPiCoreMessages(messages);
+    this.scheduleTranscriptLakeSync();
+  }
+
+  private async appendPiCoreMessagesIfMissing(messages: AgentMessage[]): Promise<void> {
+    await this.piCoreStore.appendPiCoreMessagesIfMissing(messages);
+    this.scheduleTranscriptLakeSync();
   }
 
   // --- Durable resume of an interrupted Pi turn (Flue-style journal + reconcile) ---
@@ -5838,6 +5901,56 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     return merged;
   }
 
+  /**
+   * Close out a tool's timing at tool_execution_end: emit the `tool_calls` lake
+   * row and retain the duration so the commit path can stamp it onto the
+   * persisted toolResult row. Returns null when no matching start was seen (a
+   * resumed turn whose start event predates this DO instance), so callers can
+   * omit the field rather than publish a fabricated zero.
+   */
+  private settlePiToolDuration(
+    toolCallId: string,
+    toolName: string,
+    isError: boolean,
+    result: unknown,
+  ): number | null {
+    const startedAtMs = this.piToolStartedAtMs.get(toolCallId);
+    this.piToolStartedAtMs.delete(toolCallId);
+    if (typeof startedAtMs !== "number") return null;
+    const durationMs = Math.max(0, Date.now() - startedAtMs);
+    this.piToolDurationMs.set(toolCallId, durationMs);
+    const context = this.chatContext;
+    sendToolCallRecords(this.env, [{
+      ingested_at_ms: Date.now(),
+      ts_ms: startedAtMs,
+      thread_id: context?.threadId ?? "",
+      org_id: context?.orgId ?? "",
+      workspace_id: context?.workspaceId ?? "",
+      user_id: context?.userId ?? "",
+      turn_id: this.activePiStreamTurnId ?? "",
+      tool_call_id: toolCallId,
+      parent_tool_call_id: "",
+      tool_name: toolName,
+      surface: "agent",
+      model: this.piSession?.state.model?.id ?? "",
+      provider: this.piCurrentUsageProvider ?? "",
+      duration_ms: durationMs,
+      ok: !isError,
+      error_message: isError ? boundLakeErrorMessage(piToolResultText(result)) : "",
+      blocks_on_human: toolBlocksOnHuman(toolName),
+      result_chars: piToolResultText(result).length,
+    }]);
+    return durationMs;
+  }
+
+  /** Duration measured for a settled tool call, consumed at commit time. */
+  private takePiToolDurationMs(toolCallId: string): number | undefined {
+    const durationMs = this.piToolDurationMs.get(toolCallId);
+    if (durationMs === undefined) return undefined;
+    this.piToolDurationMs.delete(toolCallId);
+    return durationMs;
+  }
+
   private async handlePiSessionEvent(event: AgentEvent): Promise<void> {
     this.touchPiTurnProgress();
     if (event.type === "agent_start") {
@@ -5846,6 +5959,11 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       this.piActiveItemId = null;
       this.piReasoningItemId = null;
       this.piToolArgs = new Map();
+      // In-flight timings must not outlive the run that opened them: a tool
+      // whose end event never arrived would otherwise attach its stale start to
+      // a later call that reuses the id.
+      this.piToolStartedAtMs.clear();
+      this.piToolDurationMs.clear();
       this.piToolFailures = new Map();
       this.piToolFailureRecordedCallIds = new Set();
       this.piAgentStartedAtMs = Date.now();
@@ -6057,6 +6175,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     if (event.type === "tool_execution_start") {
       const toolCallId = event.toolCallId || `pi_tool_${crypto.randomUUID()}`;
       const toolName = event.toolName || "tool";
+      this.piToolStartedAtMs.set(toolCallId, Date.now());
       const args = this.rememberPiToolArgs(toolCallId, piEventArgs(event.args));
       this.publishPiToolActivity(toolCallId, toolName, args, "running");
       this.pushPiRuntimeEvent("item/started", {
@@ -6091,6 +6210,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         result: event.result,
         isError,
       });
+      const durationMs = this.settlePiToolDuration(toolCallId, toolName, isError, event.result);
       const status = isError ? "failed" : "completed";
       const item: Record<string, unknown> = {
         id: toolCallId,
@@ -6100,6 +6220,10 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         status,
         isError,
         result: event.result,
+        // The UIMessage encoder already forwards this onto the tool part
+        // (pi-chunk-encoder's tool-output-available), so tool cards get a real
+        // duration as soon as it is measured here.
+        ...(durationMs === null ? {} : { durationMs }),
       };
       const contentItems = piRuntimeContentItems(event.result);
       if (contentItems.length > 0) {

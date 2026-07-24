@@ -203,6 +203,7 @@ Important DOs and runtime classes live primarily in `workers/main/src/`:
 - `mcp-handler.ts` - Internal MCP agent/tools.
 - `*-mcp.ts` / `connections-runtime.ts` - Per-provider connection MCP wrappers and shared connection runtime (candidate for an `integrations/` folder).
 - `observability.ts` - Shared Cloudflare Analytics Engine event/error writer. New structured instrumentation should go through this helper instead of calling `writeDataPoint` directly.
+- `lake-streams.ts` + `chat-thread/transcript-lake.ts` - Transcript / tool-call export to Iceberg tables in R2 Data Catalog via Cloudflare Pipelines. Both bindings are optional and every helper no-ops without them, so dev/tests/self-host never export. Tool durations are measured live (Pi records no tool start timestamp) and stamped as `uiMetadata.toolDurationMs`. Design, setup commands, and the privacy posture: `docs/transcript-lake.md`. Verify with `bun run test:workers -- transcript-lake`.
 
 Durable Objects use SQLite-backed storage. Prefer:
 
@@ -228,7 +229,7 @@ waitUntil(
 
 - Cloudflare Workers Observability and source-map uploads are enabled in deployed Wrangler configs.
 - Structured operational events go to `OBSERVABILITY_EVENTS`; structured errors are mirrored through `ERROR_ANALYTICS`. Use `recordObservabilityEvent` / `recordErrorEvent` from `workers/main/src/observability.ts` for new instrumentation.
-- Keep observability payloads diagnostic but not transcript-like: include ids, counts, status, durations, routes, and error metadata; do not store chat message contents, secrets, request bodies, or auth headers.
+- Keep observability payloads diagnostic but not transcript-like: include ids, counts, status, durations, routes, and error metadata; do not store chat message contents, secrets, request bodies, or auth headers. The one deliberate exception is the transcript data lake (`docs/transcript-lake.md`), which exports transcript text on purpose and is governed by its own access/retention rules — it is not a licence to widen Analytics Engine payloads.
 - The main app workers attach Tail Consumers to `workers/user-logs-tail/`, which forwards raw Worker trace/log/exception events into `WorkerLogsDO`.
 - Production datasets are `chiridion_observability_prod` and `chiridion_errors_prod`; staging uses the corresponding `_staging` datasets. Verify bindings in the environment-specific `wrangler*.jsonc` files before changing collection paths.
 - Query Analytics Engine through Cloudflare's SQL API with an account token that has Account Analytics Read. The account id is `CF_ACCOUNT_ID` in Wrangler vars. Example:

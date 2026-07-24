@@ -1,0 +1,22 @@
+{
+  "fields": [
+    { "name": "ingested_at_ms", "type": "int64", "required": true },
+    { "name": "ts_ms", "type": "int64", "required": true },
+    { "name": "thread_id", "type": "string", "required": true },
+    { "name": "org_id", "type": "string", "required": true },
+    { "name": "workspace_id", "type": "string", "required": true },
+    { "name": "user_id", "type": "string", "required": false },
+    { "name": "turn_id", "type": "string", "required": false },
+    { "name": "tool_call_id", "type": "string", "required": true },
+    { "name": "parent_tool_call_id", "type": "string", "required": false },
+    { "name": "tool_name", "type": "string", "required": true },
+    { "name": "surface", "type": "string", "required": true },
+    { "name": "model", "type": "string", "required": false },
+    { "name": "provider", "type": "string", "required": false },
+    { "name": "duration_ms", "type": "int64", "required": true },
+    { "name": "ok", "type": "bool", "required": true },
+    { "name": "error_message", "type": "string", "required": false },
+    { "name": "blocks_on_human", "type": "bool", "required": false },
+    { "name": "result_chars", "type": "int64", "required": false }
+  ]
+}

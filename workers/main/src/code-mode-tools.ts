@@ -139,6 +139,10 @@ type CodeModeToolCategory =
   | "domains"
   | "web"
   | "agents"
+  // Notebook/python/shell execution in the analysis sandbox. Split out of
+  // "connections" so the primary data-analysis path is not filed under, and
+  // hidden with, the connection-management long tail.
+  | "analysis"
   | "connections";
 
 interface CodeModeToolOptions {
@@ -883,7 +887,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
       timeoutMs: Type.Optional(Type.Number()),
     }),
     {
-      category: "connections",
+      category: "analysis",
       sideEffect: true,
     },
   ),
@@ -895,7 +899,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
       params: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
     }),
     {
-      category: "connections",
+      category: "analysis",
     },
   ),
   codeModePassthroughTool(
@@ -909,7 +913,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
       timeoutMs: Type.Optional(Type.Number()),
     }),
     {
-      category: "connections",
+      category: "analysis",
       sideEffect: true,
     },
   ),
@@ -922,7 +926,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
       dev: Type.Optional(Type.Boolean()),
     }),
     {
-      category: "connections",
+      category: "analysis",
       sideEffect: true,
     },
   ),

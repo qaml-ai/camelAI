@@ -193,6 +193,11 @@
       "tier": "hard"
     },
     {
+      "id": "analysis-tools-reachable-live",
+      "description": "Reach the analysis sandbox by name without a not-found dead end, and report ground-truth totals",
+      "kind": "unit"
+    },
+    {
       "id": "metrics-ground-truth-notebook-live",
       "description": "Analyze a seeded CSV with explicit provenance, avoid deployment, and report findings checked against computed ground truth",
       "kind": "skill",

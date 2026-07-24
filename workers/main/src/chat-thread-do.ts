@@ -209,7 +209,8 @@ import {
   piModelContextWindow,
   piCompactionReserveTokens,
   capPiMainRequestOutput,
-  estimatePiCompactionTokens,
+  effectivePiContextTokens,
+  isPiLengthStopContextExhaustion,
   shouldCompactPiAfterAssistantUsage,
   loadPiCompleteSimple,
   findPiCompactionCutIndex,
@@ -217,6 +218,7 @@ import {
   createFallbackPiCompactionSummary,
   createPiSummaryMessage,
 } from "./chat-thread/pi-compaction";
+import { measurePiContextTokens } from "./chat-thread/pi-token-count";
 
 // Agent-eval helpers (timeout, result extraction, deployed-app collection).
 import {
@@ -5314,7 +5316,14 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     const contextWindow = piModelContextWindow(model);
     const reserveTokens = piCompactionReserveTokens(model);
     const keepRecentTokens = 20_000;
-    const tokens = estimatePiCompactionTokens(messages);
+    // Three sources, most trustworthy first: what the provider actually charged
+    // for everything up to the last turn (exact and free), plus a real BPE
+    // count of only the messages added since (accurate, and cheap because that
+    // tail is small). The character heuristic alone used to decide this, and it
+    // read 137,964 tokens for a request the provider billed at 216,184 — far
+    // enough under the threshold that compaction never ran while the thread was
+    // already too full to answer.
+    const tokens = await measurePiContextTokens(messages, contextWindow);
     if (!force && tokens < contextWindow - reserveTokens) {
       return messages;
     }
@@ -5328,7 +5337,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       }
     } else if (existing && existing.firstKeptIndex > 0 && existing.firstKeptIndex < messages.length) {
       const tail = messages.slice(existing.firstKeptIndex);
-      if (estimatePiCompactionTokens([
+      if (effectivePiContextTokens([
         createPiSummaryMessage(existing.summary),
         ...tail,
       ]) < contextWindow - reserveTokens) {
@@ -5369,6 +5378,48 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     }
   }
 
+  /**
+   * A turn whose input filled the context window stops with `length` before it
+   * can say anything. Left alone this reads to the user as the agent silently
+   * ignoring them — the case that wedged a production thread for five hours
+   * across eleven unanswered messages, with nothing in the error telemetry
+   * because a `length` stop is not a provider error. Record it and return text
+   * to surface, so the turn explains itself instead of rendering blank.
+   * Post-turn compaction (scheduled from the same `agent_end`) shrinks the
+   * history, so the user's next message has room to run.
+   */
+  private piContextExhaustionNotice(messages: AgentMessage[]): string {
+    const model = this.piSession?.state.model;
+    const contextWindow = piModelContextWindow(model);
+    const latest = latestPiAssistantMessage(messages);
+    if (!latest || !isPiLengthStopContextExhaustion(latest, contextWindow)) {
+      return "";
+    }
+
+    const usage = (latest as unknown as { usage?: { input?: unknown; cacheRead?: unknown } }).usage;
+    const inputTokens =
+      Math.max(0, Math.floor(Number(usage?.input ?? 0))) +
+      Math.max(0, Math.floor(Number(usage?.cacheRead ?? 0)));
+    this.recordChatThreadObservabilityEvent("chat_context_exhausted", {
+      operation: "pi_turn",
+      status: "context_exhausted",
+      severity: "error",
+      count: inputTokens,
+      size: contextWindow,
+      model: typeof model?.id === "string" ? model.id : null,
+      provider: this.piCurrentUsageProvider || null,
+      error: new Error(
+        `Pi turn stopped at length with no usable output: ${inputTokens} input tokens against a ${contextWindow} context window`,
+      ),
+    });
+
+    return (
+      "This conversation has grown past what the model can read in one go, so that turn had no room left to answer. " +
+      "I've just compacted the earlier history — send your message again and I'll pick it up. " +
+      "If it keeps happening, starting a fresh chat for this task will give me the most room to work."
+    );
+  }
+
   private maybeSchedulePiPostTurnCompaction(messages: AgentMessage[]): void {
     const latestAssistant = latestPiAssistantMessage(messages);
     if (!latestAssistant || !shouldCompactPiAfterAssistantUsage(latestAssistant, this.piSession?.state.model)) {
@@ -5385,9 +5436,21 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   private async compactPiContextAfterTurn(triggerMessage: AgentMessage): Promise<void> {
     const resolver = this.piModelResolver;
     const session = this.piSession;
+    if (!resolver || !session) return;
+
+    // `agent_end` fires from inside the Pi run, and `isStreaming` is only
+    // cleared afterwards in the agent's `finally` (`finishRun`). Guarding on it
+    // here without waiting meant this method returned on its very first check
+    // every single time, so post-turn compaction never ran in production: a
+    // thread that outgrew its window stayed oversized forever and every later
+    // turn died with nothing to show the user. Wait for the run to settle
+    // first. Safe to await because the caller schedules this via `waitUntil`
+    // and does not block `agent_end` on it — awaiting inside the listener
+    // itself would deadlock, since `waitForIdle` only resolves after listeners
+    // settle.
+    await session.waitForIdle();
+
     if (
-      !resolver ||
-      !session ||
       session.state.isStreaming ||
       !shouldCompactPiAfterAssistantUsage(triggerMessage, session.state.model)
     ) {
@@ -6074,7 +6137,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
           ? this.ensurePiUserStopMessage(event.messages, stoppedByUserAtMs)
           : this.ensurePiAssistantTextMessage(
               event.messages,
-              this.piAssistantText,
+              this.piAssistantText || this.piContextExhaustionNotice(event.messages),
             ),
       );
       this.maybeSchedulePiPostTurnCompaction(newMessages);

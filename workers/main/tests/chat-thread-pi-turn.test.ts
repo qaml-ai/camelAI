@@ -12,9 +12,21 @@ import {
   piCompactionReserveTokens,
   piModelContextWindow,
   capPiMainRequestOutput,
+  effectivePiContextTokens,
+  observedPiContextTokens,
+  estimatePiCompactionTokens,
+  isPiLengthStopContextExhaustion,
+  isPiContextOverflowMessage,
+  shouldCompactPiAfterAssistantUsage,
   PI_MAIN_REQUEST_DEFAULT_OUTPUT_TOKENS,
   PI_MAIN_REQUEST_MAX_OUTPUT_TOKENS,
 } from '../src/chat-thread/pi-compaction';
+import {
+  countPiContextTokensPrecise,
+  findLastPricedContextSplit,
+  measurePiContextTokens,
+  shouldMeasurePiContextPrecisely,
+} from '../src/chat-thread/pi-token-count';
 import { extractToolContent } from '../src/chat-thread/pi-message-helpers';
 import { PiCoreMessageStore } from '../src/chat-thread/pi-core-store';
 import {
@@ -38,6 +50,44 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
+
+/**
+ * Deterministic varied prose, for fixtures that need to weigh what real
+ * conversation history weighs. `'y'.repeat(n)` does not: a run of one character
+ * collapses to roughly n/8 tokens, so padding with it understates a context by
+ * several times once token counts are measured rather than estimated.
+ */
+function syntheticProse(length: number): string {
+  const words = [
+    'restoration', 'excavator', 'schedule', 'peat', 'dam', 'contractor',
+    'estimate', 'linear', 'hectare', 'reprofiling', 'bund', 'plant',
+    'labour', 'materials', 'tender', 'rate', 'output', 'ground',
+  ];
+  let seed = 987_654;
+  let out = '';
+  while (out.length < length) {
+    seed = (seed * 1_103_515_245 + 12_345) & 0x7fff_ffff;
+    out += `${words[seed % words.length]} `;
+  }
+  return out.slice(0, length);
+}
+
+/**
+ * Deterministic high-entropy base64, for fixtures that need to weigh what a real
+ * inline image payload weighs. Built from a random block that is then tiled:
+ * BPE merges locally, so tiling keeps the per-block token cost instead of
+ * collapsing the way a single repeated character does.
+ */
+function syntheticBase64(length: number): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let seed = 12_345;
+  let block = '';
+  for (let i = 0; i < 4_096; i++) {
+    seed = (seed * 1_103_515_245 + 12_345) & 0x7fff_ffff;
+    block += alphabet[seed % 64];
+  }
+  return block.repeat(Math.ceil(length / block.length)).slice(0, length);
+}
 
 describe('child agent progress labels', () => {
   it('keeps concrete child tool names and adds useful arguments', () => {
@@ -3423,7 +3473,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     const fake = Object.create(ChatThreadDO.prototype) as any;
     const messages = [
       { role: 'user', content: 'old context', timestamp: 1 },
-      { role: 'assistant', content: [{ type: 'text', text: `recent context ${'y'.repeat(80_000)}` }], timestamp: 2 },
+      { role: 'assistant', content: [{ type: 'text', text: `recent context ${syntheticProse(120_000)}` }], timestamp: 2 },
     ];
     fake.loadPiCoreCompaction = vi.fn(() => null);
     fake.persistPiCoreCompaction = vi.fn();
@@ -3449,7 +3499,10 @@ describe('ChatThreadDO Pi turn handling', () => {
 
   it('preflights compaction for inline base64 tool output before it exhausts the provider context', async () => {
     const fake = Object.create(ChatThreadDO.prototype) as any;
-    const screenshot = `data:image/jpeg;base64,${'A'.repeat(250_000)}`;
+    // Genuine base64 entropy, not a repeated character. `'A'.repeat(n)` merges
+    // into a handful of BPE tokens, so it understates a real screenshot payload
+    // by roughly 6x and only looked large to the character heuristic.
+    const screenshot = `data:image/jpeg;base64,${syntheticBase64(1_100_000)}`;
     const messages = [
       { role: 'toolResult', toolCallId: 'shot', toolName: 'take_screenshot', content: [{ type: 'text', text: screenshot }], timestamp: 1 },
       { role: 'assistant', content: [{ type: 'text', text: 'I will fix the game.' }], timestamp: 2 },
@@ -3487,7 +3540,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     const messages = [
       createPiSummaryMessage(existing.summary, 100),
       { role: 'user', content: 'raw row 2', timestamp: 200 },
-      { role: 'assistant', content: [{ type: 'text', text: `raw row 3 ${'y'.repeat(80_000)}` }], timestamp: 300 },
+      { role: 'assistant', content: [{ type: 'text', text: `raw row 3 ${syntheticProse(120_000)}` }], timestamp: 300 },
       { role: 'user', content: 'raw row 4', timestamp: 400 },
     ];
     fake.loadPiCoreCompaction = vi.fn(() => existing);
@@ -3519,7 +3572,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     const fake = Object.create(ChatThreadDO.prototype) as any;
     const messages = [
       { role: 'user', content: 'old context', timestamp: 1 },
-      { role: 'assistant', content: [{ type: 'text', text: `recent context ${'y'.repeat(80_000)}` }], timestamp: 2 },
+      { role: 'assistant', content: [{ type: 'text', text: `recent context ${syntheticProse(120_000)}` }], timestamp: 2 },
     ];
     fake.loadPiCoreCompaction = vi.fn(() => null);
     fake.persistPiCoreCompaction = vi.fn();
@@ -3604,6 +3657,7 @@ describe('ChatThreadDO Pi turn handling', () => {
         model: { contextWindow: 1_000_000 },
         messages: beforeMessages,
       },
+      waitForIdle: vi.fn(async () => {}),
     };
     fake.loadPiCompleteSimple = vi.fn(async () => vi.fn());
     fake.compactPiContext = vi.fn(async () => compactedMessages);
@@ -3624,6 +3678,283 @@ describe('ChatThreadDO Pi turn handling', () => {
     });
     expect(fake.clearPiCoreCompaction).toHaveBeenCalled();
     expect(fake.piMainBaselineIndex).toBe(compactedMessages.length);
+  });
+
+  // Regression cluster for the context-exhaustion wedge. A production camelCode
+  // thread stopped answering for five hours across eleven unanswered user
+  // messages: every turn came back `stopReason: "length"` with `input: 216149`
+  // of a 220000 window and a single reasoning token of output. Nothing was
+  // logged (a length stop is not a provider error) and nothing compacted, so
+  // the thread could never recover. These numbers are taken from that thread.
+  describe('context exhaustion wedge', () => {
+    const WEDGED_CONTEXT_WINDOW = 220_000;
+    const wedgedAssistantMessage = () => ({
+      role: 'assistant',
+      content: [{ type: 'thinking', thinking: 'The' }],
+      api: 'openai-completions',
+      provider: 'cloudflare-ai-gateway',
+      model: 'dynamic/deepseek-v4-auto',
+      usage: {
+        input: 216_149,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 216_150,
+      },
+      stopReason: 'length',
+      timestamp: 1_784_926_541_156,
+    }) as any;
+
+    it('treats a length stop with no usable output as context exhaustion', () => {
+      const message = wedgedAssistantMessage();
+
+      // Pi's own isContextOverflow misses this by a hair on both axes: it wants
+      // output === 0 (this emitted one reasoning token) and input >= 99% of the
+      // window (216149 is 98.25%, short by 1651 tokens).
+      expect(isPiLengthStopContextExhaustion(message, WEDGED_CONTEXT_WINDOW)).toBe(true);
+      expect(isPiContextOverflowMessage(message, WEDGED_CONTEXT_WINDOW)).toBe(true);
+      expect(
+        shouldCompactPiAfterAssistantUsage(message, {
+          contextWindow: WEDGED_CONTEXT_WINDOW,
+          maxTokens: 262_144,
+        } as any),
+      ).toBe(true);
+    });
+
+    it('does not mistake an ordinary length stop for exhaustion', () => {
+      // A real max-output truncation: plenty of room on the input side.
+      expect(
+        isPiLengthStopContextExhaustion(
+          {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'a long answer' }],
+            usage: { input: 5_000, output: 900, cacheRead: 0 },
+            stopReason: 'length',
+          } as any,
+          WEDGED_CONTEXT_WINDOW,
+        ),
+      ).toBe(false);
+
+      // Same token counts, but the turn actually completed.
+      expect(
+        isPiLengthStopContextExhaustion(
+          { ...wedgedAssistantMessage(), stopReason: 'stop' },
+          WEDGED_CONTEXT_WINDOW,
+        ),
+      ).toBe(false);
+    });
+
+    it('counts raw base64 blobs densely, not as prose', () => {
+      // Agents moving a generated file around embed bare base64 in tool args
+      // and results, with no data: URL header to key off.
+      const blob = 'UEsDBBQAAAAIAAig+FxGx01IlQAAAM0AAAAQAAAAZG9jUHJvcHMv'.repeat(20);
+      // Ordinary prose of the same length still uses the 4-chars/token rule;
+      // only unbroken high-entropy runs are treated as dense.
+      const prose = 'the quick brown fox jumps over the lazy dog '.repeat(
+        Math.ceil(blob.length / 44),
+      ).slice(0, blob.length);
+
+      expect(estimatePiTextTokens(prose)).toBeCloseTo(blob.length / 4, -1);
+      expect(estimatePiTextTokens(blob)).toBeGreaterThan(estimatePiTextTokens(prose) * 2);
+    });
+
+    it('floors the character estimate with the provider-reported input count', () => {
+      // The estimate cannot see the system prompt or tool schemas, so on its own
+      // it undercounts the real request. The last assistant turn reports what the
+      // provider actually charged; that is the floor.
+      const messages = [
+        { role: 'user', content: 'earlier work', timestamp: 0 },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'ok' }],
+          usage: { input: 200_000, output: 10, cacheRead: 0 },
+          stopReason: 'stop',
+          timestamp: 1,
+        },
+        { role: 'user', content: 'follow up', timestamp: 2 },
+      ] as any;
+
+      expect(estimatePiCompactionTokens(messages)).toBeLessThan(200_000);
+      expect(observedPiContextTokens(messages)).toBeGreaterThanOrEqual(200_000);
+      expect(effectivePiContextTokens(messages)).toBeGreaterThanOrEqual(200_000);
+    });
+
+    it('counts context with a real tokenizer inside the Worker runtime', async () => {
+      // Also proves the o200k BPE ranks load under workerd, not just in the
+      // bundler: the import is dynamic, so a runtime failure would otherwise
+      // only show up in production as a silent fall back to the heuristic.
+      const messages = [
+        { role: 'user', content: 'the quick brown fox jumps over the lazy dog', timestamp: 0 },
+      ] as any;
+
+      const precise = await countPiContextTokensPrecise(messages);
+
+      expect(precise).not.toBeNull();
+      // Nine short English words tokenize to roughly one token each.
+      expect(precise).toBeGreaterThan(5);
+      expect(precise).toBeLessThan(20);
+    });
+
+    it('identifies the prefix the provider has already priced', () => {
+      const messages = [
+        { role: 'user', content: 'first', timestamp: 0 },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'older' }],
+          usage: { input: 100, output: 5, cacheRead: 0 },
+          timestamp: 1,
+        },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'newer' }],
+          usage: { input: 900, output: 5, cacheRead: 100 },
+          timestamp: 2,
+        },
+        { role: 'user', content: 'latest', timestamp: 3 },
+      ] as any;
+
+      // Most recent priced turn wins, and cacheRead counts as input.
+      expect(findLastPricedContextSplit(messages)).toEqual({ index: 2, reported: 1_000 });
+      expect(findLastPricedContextSplit([{ role: 'user', content: 'hi' }] as any)).toBeNull();
+    });
+
+    it('measures only the unpriced tail rather than re-tokenizing the history', async () => {
+      // The CPU guard. transformContext runs once per provider request — 25+
+      // times in one agent-loop turn — and a full 560KB context takes ~117ms to
+      // tokenize. Only the messages after the last priced turn are measured, so
+      // the cost tracks new content instead of total history size.
+      const hugePricedPrefix = {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'x'.repeat(400_000) }],
+        usage: { input: 150_000, output: 10, cacheRead: 0 },
+        stopReason: 'stop',
+        timestamp: 1,
+      };
+      const messages = [
+        { role: 'user', content: 'y'.repeat(400_000), timestamp: 0 },
+        hugePricedPrefix,
+        { role: 'user', content: 'one short follow-up', timestamp: 2 },
+      ] as any;
+
+      const measured = await measurePiContextTokens(messages, 220_000);
+
+      // 150k reported + the assistant's own output + a short user message.
+      // A full recount of ~800KB of history would land far above this.
+      expect(measured).toBeGreaterThan(150_000);
+      expect(measured).toBeLessThan(275_000);
+    });
+
+    it('only pays for tokenization when the cheap estimate is near the limit', () => {
+      expect(shouldMeasurePiContextPrecisely(10_000, 220_000)).toBe(false);
+      expect(shouldMeasurePiContextPrecisely(150_000, 220_000)).toBe(true);
+      expect(shouldMeasurePiContextPrecisely(10_000, 0)).toBe(false);
+    });
+
+    it('never returns less than the provider-reported floor', async () => {
+      const messages = [
+        { role: 'user', content: 'short', timestamp: 0 },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'ok' }],
+          usage: { input: 200_000, output: 2, cacheRead: 0 },
+          stopReason: 'stop',
+          timestamp: 1,
+        },
+      ] as any;
+
+      await expect(
+        measurePiContextTokens(messages, 220_000),
+      ).resolves.toBeGreaterThanOrEqual(200_000);
+    });
+
+    it('falls back to the character estimate before any turn reports usage', () => {
+      const messages = [{ role: 'user', content: 'first message', timestamp: 0 }] as any;
+
+      expect(observedPiContextTokens(messages)).toBe(0);
+      expect(effectivePiContextTokens(messages)).toBe(
+        estimatePiCompactionTokens(messages),
+      );
+    });
+
+    it('compacts after a turn even though agent_end fires while isStreaming is still set', async () => {
+      // The wedge itself. `agent_end` is emitted from inside the Pi run and
+      // `isStreaming` is only cleared afterwards, in the agent's `finally`. The
+      // guard used to run before any await, so this method returned on its first
+      // check every time and post-turn compaction never executed in production.
+      const trigger = wedgedAssistantMessage();
+      const beforeMessages = [{ role: 'user', content: 'old', timestamp: 0 }, trigger] as any;
+      const compactedMessages = [{ role: 'user', content: '[summary] old', timestamp: 2 }] as any;
+
+      const fake = Object.create(ChatThreadDO.prototype) as any;
+      const state = {
+        isStreaming: true, // still streaming, exactly as at agent_end
+        model: { contextWindow: WEDGED_CONTEXT_WINDOW, maxTokens: 262_144 },
+        messages: beforeMessages,
+      };
+      fake.piSession = {
+        state,
+        // Resolves once the run settles, which is when finishRun clears the flag.
+        waitForIdle: vi.fn(async () => {
+          state.isStreaming = false;
+        }),
+      };
+      fake.piModelResolver = vi.fn(async () => ({
+        model: { contextWindow: WEDGED_CONTEXT_WINDOW, maxTokens: 262_144, id: 'deepseek-v4-auto' },
+        apiKey: 'token',
+      }));
+      fake.loadPiCompleteSimple = vi.fn(async () => vi.fn());
+      fake.compactPiContext = vi.fn(async () => compactedMessages);
+      fake.replacePiCoreMessages = vi.fn();
+      fake.clearPiCoreCompaction = vi.fn();
+      fake.recordChatThreadObservabilityEvent = vi.fn();
+      fake.piMainBaselineIndex = beforeMessages.length;
+
+      await ChatThreadDO.prototype['compactPiContextAfterTurn'].call(fake, trigger);
+
+      expect(fake.piSession.waitForIdle).toHaveBeenCalled();
+      expect(fake.compactPiContext).toHaveBeenCalled();
+      expect(fake.piSession.state.messages).toBe(compactedMessages);
+    });
+
+    it('surfaces context exhaustion to the user and to error telemetry', () => {
+      const fake = Object.create(ChatThreadDO.prototype) as any;
+      fake.piSession = {
+        state: { model: { contextWindow: WEDGED_CONTEXT_WINDOW, id: 'deepseek-v4-auto' } },
+      };
+      fake.piCurrentUsageProvider = 'compat';
+      fake.recordChatThreadObservabilityEvent = vi.fn();
+
+      const notice = ChatThreadDO.prototype['piContextExhaustionNotice'].call(fake, [
+        { role: 'user', content: 'is it ready yet?', timestamp: 0 },
+        wedgedAssistantMessage(),
+      ]);
+
+      // The turn must say something rather than render blank.
+      expect(notice).not.toBe('');
+      expect(fake.recordChatThreadObservabilityEvent).toHaveBeenCalledWith(
+        'chat_context_exhausted',
+        expect.objectContaining({ status: 'context_exhausted', error: expect.any(Error) }),
+      );
+    });
+
+    it('stays silent when the turn ended normally', () => {
+      const fake = Object.create(ChatThreadDO.prototype) as any;
+      fake.piSession = { state: { model: { contextWindow: WEDGED_CONTEXT_WINDOW } } };
+      fake.recordChatThreadObservabilityEvent = vi.fn();
+
+      const notice = ChatThreadDO.prototype['piContextExhaustionNotice'].call(fake, [
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'here is your spreadsheet' }],
+          usage: { input: 1_000, output: 50, cacheRead: 0 },
+          stopReason: 'stop',
+          timestamp: 1,
+        },
+      ]);
+
+      expect(notice).toBe('');
+      expect(fake.recordChatThreadObservabilityEvent).not.toHaveBeenCalled();
+    });
   });
 
   it('caps the main Pi request output without mutating catalog metadata', () => {
@@ -3836,6 +4167,7 @@ describe('ChatThreadDO Pi turn handling', () => {
         model,
         messages: before,
       },
+      waitForIdle: vi.fn(async () => {}),
     };
     fake.piModelResolver = vi.fn(async () => ({
       model,
@@ -3887,6 +4219,7 @@ describe('ChatThreadDO Pi turn handling', () => {
         model,
         messages: before,
       },
+      waitForIdle: vi.fn(async () => {}),
     };
     fake.piModelResolver = vi.fn(async () => ({
       model,

@@ -90,6 +90,42 @@ export function shouldCompactPiAfterAssistantUsage(
   return contextTokens >= contextWindow - piCompactionReserveTokens(model);
 }
 
+/**
+ * A `length` stop that produced no usable answer means the input filled the
+ * window and left no room to generate. Pi's own `isContextOverflow` covers this
+ * (its "Xiaomi MiMo" case) but only for `output === 0` at `>= 99%` of the
+ * window. Real exhaustion routinely misses both bars: a reasoning model emits a
+ * token or two of thinking before the budget runs out, and providers that
+ * reserve their own headroom stop short of 99%. A camelCode thread wedged
+ * permanently at `input: 216149 / 220000` (98.25%) with `output: 1` — one
+ * reasoning token — and every later turn repeated it, because neither bar was
+ * met so nothing forced compaction. Keep Pi's check and widen it: no usable
+ * output plus a near-full window is exhaustion regardless of the exact counts.
+ */
+const PI_LENGTH_STOP_MAX_USABLE_OUTPUT_TOKENS = 16;
+const PI_LENGTH_STOP_CONTEXT_FRACTION = 0.9;
+
+export function isPiLengthStopContextExhaustion(
+  message: AgentMessage,
+  contextWindow: number,
+): boolean {
+  const record = message as unknown as {
+    role?: unknown;
+    stopReason?: unknown;
+    usage?: { input?: unknown; cacheRead?: unknown; output?: unknown };
+  };
+  if (record.role !== "assistant") return false;
+  if (record.stopReason !== "length") return false;
+  if (!contextWindow || contextWindow <= 0) return false;
+  const usage = record.usage;
+  if (!usage || typeof usage !== "object") return false;
+  const output = Math.max(0, Math.floor(Number(usage.output ?? 0)));
+  if (output > PI_LENGTH_STOP_MAX_USABLE_OUTPUT_TOKENS) return false;
+  const input = Math.max(0, Math.floor(Number(usage.input ?? 0)));
+  const cacheRead = Math.max(0, Math.floor(Number(usage.cacheRead ?? 0)));
+  return input + cacheRead >= contextWindow * PI_LENGTH_STOP_CONTEXT_FRACTION;
+}
+
 export function isPiContextOverflowMessage(message: AgentMessage, contextWindow: number): boolean {
   const record = message as unknown as {
     role?: unknown;
@@ -100,6 +136,7 @@ export function isPiContextOverflowMessage(message: AgentMessage, contextWindow:
     timestamp?: unknown;
   };
   if (record.role !== "assistant") return false;
+  if (isPiLengthStopContextExhaustion(message, contextWindow)) return true;
   return isContextOverflow(record as Parameters<typeof isContextOverflow>[0], contextWindow);
 }
 
@@ -116,6 +153,50 @@ export function estimatePiContextTokens(messages: AgentMessage[]): number {
 }
 
 /**
+ * The character heuristic only sees `messages`. The real request also carries
+ * the system prompt and every tool schema, and no char-count models a
+ * provider's tokenizer exactly — measured against a wedged production thread
+ * the estimate came in at 154,520 tokens for a request the provider billed at
+ * 216,184, a 1.40x undercount that kept the pre-turn check below its threshold
+ * while the real context was already too full to answer.
+ *
+ * Each assistant turn reports what the provider actually counted, so use that
+ * as a floor: the last assistant `input + cacheRead` covers everything up to
+ * that message (system prompt and tools included), and only the messages after
+ * it need estimating. Returns 0 when no turn has reported usage yet.
+ */
+export function observedPiContextTokens(messages: AgentMessage[]): number {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const record = messages[index] as unknown as {
+      role?: unknown;
+      usage?: { input?: unknown; cacheRead?: unknown };
+    };
+    if (record.role !== "assistant") continue;
+    const usage = record.usage;
+    if (!usage || typeof usage !== "object") continue;
+    const input = Math.max(0, Math.floor(Number(usage.input ?? 0)));
+    const cacheRead = Math.max(0, Math.floor(Number(usage.cacheRead ?? 0)));
+    const reported = input + cacheRead;
+    if (reported <= 0) continue;
+    // Everything from this assistant message onward is new input for the next
+    // request: the assistant's own output plus any later user/tool messages.
+    return reported + estimatePiContextTokens(messages.slice(index));
+  }
+  return 0;
+}
+
+/**
+ * Best available size for the next request: the char estimate, floored by what
+ * the provider last reported. Ground truth wins whenever we have it.
+ */
+export function effectivePiContextTokens(messages: AgentMessage[]): number {
+  return Math.max(
+    estimatePiCompactionTokens(messages),
+    observedPiContextTokens(messages),
+  );
+}
+
+/**
  * Base64 is much less token-dense than ordinary prose for the models we use.
  * In particular, `take_screenshot({ include_image_data_url: true })` places a
  * data URL inside a text tool result. Counting all characters at 4 chars/token
@@ -124,38 +205,74 @@ export function estimatePiContextTokens(messages: AgentMessage[]): number {
  * conservatively while retaining the ordinary heuristic for the surrounding
  * JSON/text.
  */
+/**
+ * Long unbroken high-entropy runs (base64, hex) are charged separately from
+ * prose. Two things to know about this rule:
+ *
+ * 1. It matches any such run, not just `data:` URLs. The common case is an
+ *    agent moving a generated file around, which puts raw base64 into tool
+ *    arguments and results with no `data:` prefix at all.
+ * 2. The per-character rate is deliberately pessimistic, NOT an estimate of
+ *    true density. Measured with o200k, real base64 runs about 5.4 chars/token
+ *    — slightly *cheaper* than prose, not "near one token per character" as
+ *    this rule originally assumed. The rate is kept high on purpose: this
+ *    heuristic's only remaining job is to decide whether a precise count is
+ *    worth taking (see ./pi-token-count), and over-counting merely buys an
+ *    accurate measurement, while under-counting silently skips compaction.
+ *
+ * Anything that actually depends on the number, rather than on "are we close",
+ * should use the tokenizer or the provider-reported count instead.
+ */
+const PI_DENSE_BLOB_MIN_LENGTH = 256;
+const PI_DENSE_BLOB_TOKENS_PER_CHAR = 0.75;
+const PI_DENSE_BLOB_PATTERN = new RegExp(
+  `[A-Za-z0-9+/_=-]{${PI_DENSE_BLOB_MIN_LENGTH},}`,
+  "g",
+);
+
 export function estimatePiTextTokens(text: string): number {
-  const dataUrl = /data:[^,\s"']+;base64,([A-Za-z0-9+/_=-]+)/g;
   let tokens = 0;
   let offset = 0;
-  for (const match of text.matchAll(dataUrl)) {
+  for (const match of text.matchAll(PI_DENSE_BLOB_PATTERN)) {
     const start = match.index ?? offset;
+    // Overlapping matches cannot happen with a global regex, but a blob that
+    // begins before the current offset (already counted) must not double-count.
+    if (start < offset) continue;
     tokens += Math.ceil((start - offset) / 4);
-    // Base64's high-entropy alphabet tokenizes much closer to one token per
-    // character than natural language. 0.75 is deliberately conservative.
-    tokens += Math.ceil((match[1]?.length ?? 0) * 0.75);
+    tokens += Math.ceil(match[0].length * PI_DENSE_BLOB_TOKENS_PER_CHAR);
     offset = start + match[0].length;
   }
   tokens += Math.ceil((text.length - offset) / 4);
   return tokens;
 }
 
+/**
+ * The text a message contributes to the context, as both the character
+ * heuristic and the real tokenizer in ./pi-token-count see it. Shared so the
+ * two measurements always agree on *what* is being counted and differ only in
+ * how.
+ */
+export function stringifyPiMessageForTokenCount(message: AgentMessage): string {
+  const record = message as unknown as { role?: unknown; content?: unknown };
+  if (record.role === "user") {
+    return stringifyPiUserContentForCompaction(record.content);
+  }
+  if (record.role === "assistant") {
+    return stringifyPiAssistantContentForCompaction(record.content);
+  }
+  if (record.role === "toolResult") {
+    return stringifyPiToolResultContentForCompaction(record.content);
+  }
+  try {
+    return JSON.stringify(message);
+  } catch {
+    return String(message);
+  }
+}
+
 export function estimatePiMessageTokens(message: AgentMessage): number {
   const record = message as unknown as { role?: unknown; content?: unknown };
-  let text = "";
-  if (record.role === "user") {
-    text = stringifyPiUserContentForCompaction(record.content);
-  } else if (record.role === "assistant") {
-    text = stringifyPiAssistantContentForCompaction(record.content);
-  } else if (record.role === "toolResult") {
-    text = stringifyPiToolResultContentForCompaction(record.content);
-  } else {
-    try {
-      text = JSON.stringify(message);
-    } catch {
-      text = String(message);
-    }
-  }
+  const text = stringifyPiMessageForTokenCount(message);
   return estimatePiTextTokens(text) + estimatePiImageMemoryTokens(record.content);
 }
 

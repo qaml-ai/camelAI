@@ -111,6 +111,7 @@
 		"emoji-regex": "^10.6.0",
 		"emojibase-data": "^17.0.0",
 		"flubber": "^0.4.2",
+		"gpt-tokenizer": "^3.4.0",
 		"hono": "^4.12.3",
 		"hono-zod-openapi": "^1.1.1",
 		"isbot": "^5.1.17",

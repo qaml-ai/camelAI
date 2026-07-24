@@ -193,9 +193,16 @@ function extractCapabilitySources(text: string): Array<{ url: string }> {
 // and discoverable through `tools.search()` / `tools.help()`; we simply stop spending
 // per-turn context on their schemas (the executor-style "search → describe → call"
 // approach). These are long-tail, rarely-needed tools the agent reliably rediscovers
-// by category; the app/project lifecycle and agent categories intentionally STAY
-// top-level, because dropping them led the agent to
+// by category; the app/project lifecycle, analysis, and agent categories
+// intentionally STAY top-level, because dropping them led the agent to
 // guess tool names on complex build+deploy tasks instead of searching.
+//
+// "analysis" (run_notebook / run_code / analysis_exec / add_python_dependency)
+// is top-level for exactly that reason. Those tools used to be filed under
+// "connections" and were therefore hidden, so a data-analysis request burned
+// turns on `Tool run_notebook not found` / `Tool analysis_exec not found`
+// before the agent rediscovered them through js_exec — run_notebook is the
+// primary data-analysis path and has to be visible where the agent looks.
 const TOP_LEVEL_EXCLUDED_CATEGORIES = new Set<string>([
   "workflows",
   "schedules",

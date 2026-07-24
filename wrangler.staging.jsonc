@@ -104,6 +104,12 @@
     { "binding": "ERROR_ANALYTICS", "dataset": "chiridion_errors_staging" },
     { "binding": "OBSERVABILITY_EVENTS", "dataset": "chiridion_observability_staging" },
   ],
+  // Transcript data lake (docs/transcript-lake.md). Streams land in the
+  // chiridion-transcript-lake-staging R2 Data Catalog as Iceberg tables.
+  "pipelines": [
+    { "binding": "TRANSCRIPT_LAKE", "stream": "02a2d092797b4903bd1f259752d563d2" },
+    { "binding": "TOOL_CALLS_LAKE", "stream": "51df244b1d8f4098adf032cd1c35256f" },
+  ],
   "kv_namespaces": [
     { "binding": "EMAIL_TO_USER", "id": "ab267c4f44b847dda8bdca400a4e1884" },
     { "binding": "APP_KV", "id": "e894eb2caf1641ad8870da994b992fce" },

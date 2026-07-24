@@ -42,7 +42,7 @@ They are deliberately separate. Transcripts are customer content subject to
 deletion requests; operational timings you want to keep for years. One table
 would weld those two policies together.
 
-Schemas live in [`config/pipelines/`](../config/pipelines/). Columns are **flat
+Schemas live in the JSON files alongside this README. Columns are **flat
 scalars**, which is load-bearing rather than stylistic: Parquet is columnar and
 R2 SQL bills on bytes scanned, so a duration query prunes the fat `text` column
 and reads almost nothing. A single JSON payload column would force every query

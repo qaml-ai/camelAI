@@ -1,7 +1,7 @@
 // Cloudflare Pipelines stream bindings for the transcript data lake.
 //
 // Two narrow, FLAT record shapes are sent here and land as Apache Iceberg
-// tables in R2 Data Catalog (see docs/transcript-lake.md):
+// tables in R2 Data Catalog (see config/pipelines/README.md):
 //
 //   pi_messages  - one row per persisted pi_core row (the transcript itself)
 //   tool_calls   - one row per tool execution, including the inner code-mode

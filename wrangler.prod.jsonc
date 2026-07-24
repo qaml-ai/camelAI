@@ -112,7 +112,7 @@
     { "binding": "ERROR_ANALYTICS", "dataset": "chiridion_errors_prod" },
     { "binding": "OBSERVABILITY_EVENTS", "dataset": "chiridion_observability_prod" },
   ],
-  // Transcript data lake (docs/transcript-lake.md). Streams land in the
+  // Transcript data lake (config/pipelines/README.md). Streams land in the
   // chiridion-transcript-lake-prod R2 Data Catalog as Iceberg tables.
   "pipelines": [
     { "binding": "TRANSCRIPT_LAKE", "stream": "c3b4395560954073baf658cc22850e03" },

@@ -130,7 +130,7 @@ export default defineConfig({
   plugins: [
     cloudflareTest({
       remoteBindings: false,
-      wrangler: { configPath: './wrangler.test.jsonc' },
+      wrangler: { configPath: './wrangler.test.slim.jsonc' },
       miniflare: {
         bindings: {
           ...loadBedrockDevVars(),
@@ -169,14 +169,8 @@ export default defineConfig({
     ],
   },
   test: {
-    // Tests that need the real worker entry. Everything else runs against
-    // the slim entry via vitest.workers.slim.config.ts.
-    include: FULL_ENTRY_TESTS,
-    // Agent evals are opt-in (RUN_AGENT_EVALS=1, scripts/run-agent-eval.mjs).
-    // Skipped test files still cost ~14s each to load the entry graph, so
-    // keep them out of ordinary worker test runs entirely.
-    exclude:
-      process.env.RUN_AGENT_EVALS === '1' ? [] : ['workers/main/tests/evals/**'],
+    include: ['workers/**/tests/**/*.test.ts'],
+    exclude: [...FULL_ENTRY_TESTS, 'workers/main/tests/evals/**'],
     testTimeout: 20_000,
     // Agent-eval runs only: don't let vitest's exit code flip to 1 on unhandled
     // errors. The vitest-pool-workers handler-context shim re-reports tool throws

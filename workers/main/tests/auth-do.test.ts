@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { env } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { createNewSession, type SessionData } from '../src/session-kv';
 import { getAppIndexDatabase } from '../src/app-index-db';
 import {
@@ -963,15 +963,31 @@ describe('Auth flow (full-stack with DOs)', () => {
       const { org, defaultWorkspaceId } = await createOrg(testEnv, 'Large BYOK Org', userId);
       const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
 
-      for (let index = 0; index < 101; index += 1) {
-        await orgStub.createThread(
-          defaultWorkspaceId,
-          `codex thread ${index}`,
-          userId,
-          undefined,
-          'gpt-5.4'
-        );
-      }
+      // Create all 101 threads inside one DO context. Calling createThread over
+      // RPC 101 times pays a round trip and a storage commit per thread (~65ms
+      // each); the real createThread logic still runs for every thread.
+      await runInDurableObject(
+        orgStub,
+        async (instance: {
+          createThread(
+            workspaceId: string,
+            title: string,
+            userId: string,
+            parentId: undefined,
+            model: string,
+          ): Promise<unknown>;
+        }) => {
+          for (let index = 0; index < 101; index += 1) {
+            await instance.createThread(
+              defaultWorkspaceId,
+              `codex thread ${index}`,
+              userId,
+              undefined,
+              'gpt-5.4',
+            );
+          }
+        },
+      );
 
       expect(await orgStub.getActiveThreadIdsForByokChange()).toHaveLength(101);
     });

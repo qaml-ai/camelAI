@@ -62,6 +62,8 @@ type SourceInspection = {
   sourceHasDurableObject: boolean;
   sourceHasUpdatedMarker: boolean;
   sourceHasInitialMarker: boolean;
+  sourcePreservesReportForm: boolean;
+  sourcePreservesHistoryPanel: boolean;
   error?: string;
 };
 
@@ -71,6 +73,8 @@ type AppSmoke = {
     bodyLength?: number;
     hasUpdatedMarker: boolean;
     hasInitialMarker: boolean;
+    preservesReportForm: boolean;
+    preservesHistoryPanel: boolean;
     attempts: number;
     durationMs: number;
   };
@@ -111,6 +115,8 @@ type SeedSmoke = {
 const PROJECT_NAME = "stateful-checkins";
 const INITIAL_MARKER = "INITIAL_STATEFUL_CHECKINS_MARKER";
 const UPDATED_MARKER = "UPDATED_STATEFUL_CHECKINS_MARKER";
+const EXISTING_REPORT_FORM_MARKER = "EXISTING_REPORT_FORM_MARKER";
+const EXISTING_HISTORY_PANEL_MARKER = "EXISTING_HISTORY_PANEL_MARKER";
 const SEEDED_NAME = "eval-seed-before-redeploy";
 const testEnv = env as unknown as ProjectUpdateRedeployStateEvalEnv;
 const maybeIt = isRealEvalDeployEnabled(testEnv) ? it : it.skip;
@@ -206,6 +212,8 @@ async function inspectProjectSource(
       text.includes("DurableObjectState"),
     sourceHasUpdatedMarker: text.includes(UPDATED_MARKER),
     sourceHasInitialMarker: text.includes(INITIAL_MARKER),
+    sourcePreservesReportForm: text.includes(EXISTING_REPORT_FORM_MARKER),
+    sourcePreservesHistoryPanel: text.includes(EXISTING_HISTORY_PANEL_MARKER),
     error: packageRead.error ?? wranglerRead.error ?? workerRead.error ?? homeRouteRead.error,
   };
 }
@@ -235,13 +243,17 @@ async function smokeCheckDeployedApp(
         bodyLength: body.length,
         hasUpdatedMarker: body.includes(UPDATED_MARKER),
         hasInitialMarker: body.includes(INITIAL_MARKER),
+        preservesReportForm: body.includes(EXISTING_REPORT_FORM_MARKER),
+        preservesHistoryPanel: body.includes(EXISTING_HISTORY_PANEL_MARKER),
         attempts: rootAttempts,
         durationMs: Date.now() - rootStartedAt,
       };
       if (
         smoke.root.status === 200 &&
         smoke.root.hasUpdatedMarker &&
-        !smoke.root.hasInitialMarker
+        !smoke.root.hasInitialMarker &&
+        smoke.root.preservesReportForm &&
+        smoke.root.preservesHistoryPanel
       ) {
         break;
       }
@@ -250,11 +262,19 @@ async function smokeCheckDeployedApp(
     if (smoke.root.status !== 200) failures.push(`root returned HTTP ${smoke.root.status}`);
     if (!smoke.root.hasUpdatedMarker) failures.push("root did not include updated marker");
     if (smoke.root.hasInitialMarker) failures.push("root still included initial marker");
+    if (!smoke.root.preservesReportForm) {
+      failures.push(`root lost ${EXISTING_REPORT_FORM_MARKER}`);
+    }
+    if (!smoke.root.preservesHistoryPanel) {
+      failures.push(`root lost ${EXISTING_HISTORY_PANEL_MARKER}`);
+    }
   } catch (error) {
     smoke.root = {
       ...smoke.root,
       hasUpdatedMarker: smoke.root?.hasUpdatedMarker ?? false,
       hasInitialMarker: smoke.root?.hasInitialMarker ?? false,
+      preservesReportForm: smoke.root?.preservesReportForm ?? false,
+      preservesHistoryPanel: smoke.root?.preservesHistoryPanel ?? false,
       attempts: rootAttempts,
       durationMs: Date.now() - rootStartedAt,
     };
@@ -444,6 +464,7 @@ describe("project update redeploy state agent eval", () => {
           "Use the default deployable React Router scaffold; do not use the data-analysis template.",
           "Implement a Durable Object-backed check-in counter with binding name CHECKINS. GET /api/checkins must return JSON with numeric count and names: string[] of submitted check-in names. POST /api/checkins must accept JSON { name: string }, persist that name in the Durable Object, increment the count, and return JSON with numeric count and names: string[].",
           `Make the root page contain the exact text "${INITIAL_MARKER}".`,
+          `The root page must also contain the exact existing-feature markers "${EXISTING_REPORT_FORM_MARKER}" and "${EXISTING_HISTORY_PANEL_MARKER}". Treat them as an already-working report form and history panel that later changes must preserve.`,
           `Deploy it using js_exec with await tools.deploy_project({ project: "${PROJECT_NAME}", script_name: "${PROJECT_NAME}" }); deploy_project is not a top-level tool.`,
           "Do not use legacy VM work, create-worker, wrangler deploy, or bun run deploy for this DO-backed project.",
           "Leave live-app verification to the eval harness, which will verify the public app and seed one live check-in before asking for the update.",
@@ -475,6 +496,7 @@ describe("project update redeploy state agent eval", () => {
         message: [
           `The eval harness has now called the live deployed app's POST /api/checkins once. The Durable Object count should be at least 1.`,
           `Update only the user-visible root page marker to exact text "${UPDATED_MARKER}" and remove "${INITIAL_MARKER}" from the page.`,
+          `Keep the existing report form and history panel intact, including exact text "${EXISTING_REPORT_FORM_MARKER}" and "${EXISTING_HISTORY_PANEL_MARKER}".`,
           "Preserve the same Durable Object binding name CHECKINS, Durable Object class, API behavior, and migrations so existing live state is preserved.",
           `Redeploy the same project using js_exec with await tools.deploy_project({ project: "${PROJECT_NAME}", script_name: "${PROJECT_NAME}" }) again, using the same script_name.`,
           "Do not use legacy VM work, create-worker, wrangler deploy, bun run deploy, rollback_deploy, or a new project.",
@@ -576,17 +598,21 @@ describe("project update redeploy state agent eval", () => {
               sourceInspection.wranglerHasDurableObjectBinding &&
               sourceInspection.wranglerHasMigration &&
               sourceInspection.sourceHasUpdatedMarker &&
-              !sourceInspection.sourceHasInitialMarker,
+              !sourceInspection.sourceHasInitialMarker &&
+              sourceInspection.sourcePreservesReportForm &&
+              sourceInspection.sourcePreservesHistoryPanel,
             reason:
               sourceInspection.readSuccess &&
               sourceInspection.packageHasReactRouter &&
               sourceInspection.wranglerHasDurableObjectBinding &&
               sourceInspection.wranglerHasMigration &&
               sourceInspection.sourceHasUpdatedMarker &&
-              !sourceInspection.sourceHasInitialMarker
+              !sourceInspection.sourceHasInitialMarker &&
+              sourceInspection.sourcePreservesReportForm &&
+              sourceInspection.sourcePreservesHistoryPanel
                 ? undefined
                 : sourceInspection.error ??
-                  `reactRouter=${sourceInspection.packageHasReactRouter}, binding=${sourceInspection.wranglerHasDurableObjectBinding}, migration=${sourceInspection.wranglerHasMigration}, do=${sourceInspection.sourceHasDurableObject}, updated=${sourceInspection.sourceHasUpdatedMarker}, initial=${sourceInspection.sourceHasInitialMarker}`,
+                  `reactRouter=${sourceInspection.packageHasReactRouter}, binding=${sourceInspection.wranglerHasDurableObjectBinding}, migration=${sourceInspection.wranglerHasMigration}, do=${sourceInspection.sourceHasDurableObject}, updated=${sourceInspection.sourceHasUpdatedMarker}, initial=${sourceInspection.sourceHasInitialMarker}, reportForm=${sourceInspection.sourcePreservesReportForm}, history=${sourceInspection.sourcePreservesHistoryPanel}`,
             details: sourceInspection,
           }),
           passFailCriterion({

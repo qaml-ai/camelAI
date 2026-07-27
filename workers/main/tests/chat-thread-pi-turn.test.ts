@@ -6260,6 +6260,16 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(prompt).toContain('creating an analysis, notebook, report, or file does not imply publishing');
     expect(prompt).toContain('Never invent missing rows, prompts, campaigns, categories, URLs, fields, or provenance');
     expect(prompt).toContain('User corrections override earlier assumptions');
+    expect(prompt).toContain(
+      'The top-level file tools are `read`, `write`, `edit`, `ls`, and `delete`',
+    );
+    expect(prompt).toContain(
+      'Content search and glob/file search are available only inside `js_exec`',
+    );
+    expect(prompt).toContain('never call `grep` or `find` as a top-level tool');
+    expect(prompt).not.toContain(
+      'top-level file tools (`read`, `write`, `edit`, `ls`, `delete`, `grep`, `find`)',
+    );
     expect(prompt).toContain('set_preview({ location: "workspace", path: "/notes.md" })');
     expect(prompt).toContain('set_preview({ location: "r2", path: "outputs/report.html" })');
     expect(prompt).toContain('A clean successful `run_notebook` opens the executed notebook automatically');

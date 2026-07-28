@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { env } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { createNewSession, type SessionData } from '../src/session-kv';
 import type { Workspace } from '../src/workspace';
 import {
@@ -135,9 +135,24 @@ describe('Workspace DO (full-stack with DOs)', () => {
       ): Promise<Array<{ action: string; target_id: string | null }>>;
     }>;
 
-    for (let i = 0; i < 125; i++) {
-      await orgStub.updateName(`Busy Audit Org ${i}`, userId);
-    }
+    // Seed >100 audit rows that do NOT belong to this workspace, so a
+    // implementation that limits before filtering would push workspace_created
+    // out of the page. Written in a single DO call: going through updateName()
+    // one at a time costs a storage commit per row (~130ms each, ~16s total).
+    const seededAt = Date.now();
+    await runInDurableObject(orgStub, async (instance: { ctx: DurableObjectState }) => {
+      for (let i = 0; i < 125; i++) {
+        instance.ctx.storage.sql.exec(
+          'INSERT INTO audit_log (id, action, actor_id, target_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+          `seed-audit-${i}`,
+          'org_renamed',
+          userId,
+          org.id,
+          JSON.stringify({ name: `Busy Audit Org ${i}` }),
+          seededAt + i + 1,
+        );
+      }
+    });
 
     const audit = await orgStub.getWorkspaceAuditLog(workspace.id, 10, 0);
     expect(audit).toContainEqual(

@@ -1,0 +1,82 @@
+{
+	// Slim test entry: same bindings as wrangler.test.jsonc, except the worker
+	// entry is workers/main/tests/slim-entry.ts, which does NOT export
+	// ChatThreadDO. workerd re-evaluates the entry module graph in every test
+	// isolate, and ChatThreadDO's deps (agents, @cloudflare/ai-chat,
+	// pi-agent-core, pi-ai, agents/chat) cost ~9s each time. Tests that need
+	// chat, SELF routing, or a container sandbox run against wrangler.test.jsonc
+	// instead — see vitest.workers.full-entry-tests.ts.
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "chiridion-app-test-slim",
+	"main": "workers/main/tests/slim-entry.ts",
+	"compatibility_date": "2026-03-24",
+	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+	"rules": [{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }],
+	"assets": { "binding": "ASSETS", "directory": "./public" },
+	"send_email": [{ "name": "EMAIL" }],
+	"services": [],
+	"vars": {
+		"AI_VIRTUAL_MODEL": "dynamic/auto",
+		"CF_ACCOUNT_ID": "85bbd288051330fb51ee1c86031a299b",
+		"CF_GATEWAY_NAME": "chiridion",
+		"TOKEN_SIGNING_SECRET": "test-signing-secret-for-unit-tests-only",
+		"INTEGRATION_SECRET_KEY": "test-secret-key-for-integration-tests",
+		"CF_DISPATCH_NAMESPACE": "chiridion-platform-evals",
+		"CF_WORKER_NAME": "chiridion-app-staging",
+		"WORKER_BASE_URL": "https://evals.camelai.dev",
+		"LOCAL_APP_VANITY_DOMAIN": "evals.camelai.app",
+		"LOCAL_APP_IFRAME_DOMAIN": "apps.evals.camelai.dev"
+	},
+	"kv_namespaces": [
+		{ "binding": "EMAIL_TO_USER", "id": "test-email-to-user" },
+		{ "binding": "APP_KV", "id": "test-api-tokens" },
+		{ "binding": "SESSIONS", "id": "test-sessions" }
+	],
+	"r2_buckets": [
+		{ "binding": "R2_BUCKET", "bucket_name": "chiridion-sandbox-test" },
+		{ "binding": "R2_OUTPUTS_BUCKET", "bucket_name": "chiridion-sandbox-test" }
+	],
+	"d1_databases": [
+		{
+			"binding": "APP_DB",
+			"database_name": "chiridion-app-test-db",
+			"database_id": "test-app-db",
+			"migrations_dir": "migrations"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{ "name": "USER", "class_name": "UserDO" },
+			{ "name": "SIGNUP", "class_name": "SignupDO" },
+			{ "name": "ORG", "class_name": "OrgDO" },
+			{ "name": "ORG_SLUG", "class_name": "OrgSlugDO" },
+			{ "name": "EMAIL_HANDLE", "class_name": "EmailHandleDO" },
+			{ "name": "TELEGRAM_REGISTRY", "class_name": "TelegramRegistryDO" },
+			{ "name": "SLACK_TEAM_REGISTRY", "class_name": "SlackTeamRegistryDO" },
+			{ "name": "WORKSPACE", "class_name": "WorkspaceDO" },
+			{ "name": "WORKSPACE_CRON", "class_name": "WorkspaceCronDO" },
+			{ "name": "WORKSPACE_FS", "class_name": "WorkspaceFilesystemDO" },
+			{ "name": "WORKER_LOGS", "class_name": "WorkerLogsDO" }
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"UserDO",
+				"OrgDO",
+				"OrgSlugDO",
+				"WorkspaceDO",
+				"EmailHandleDO"
+			]
+		},
+		{ "tag": "v4", "new_sqlite_classes": ["WorkspaceCronDO"] },
+		{
+			"tag": "v7",
+			"new_sqlite_classes": ["TelegramRegistryDO", "SlackTeamRegistryDO"]
+		},
+		{ "tag": "v8", "new_sqlite_classes": ["WorkspaceFilesystemDO"] },
+		{ "tag": "v14", "new_sqlite_classes": ["SignupDO"] },
+		{ "tag": "v15", "new_sqlite_classes": ["WorkerLogsDO"] }
+	]
+}

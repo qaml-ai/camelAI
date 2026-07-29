@@ -3,6 +3,10 @@ import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import {
+  tlsTerminatesOnVm,
+  usesCaddy,
+} from "./selfhost-tls-mode.mjs";
 
 export const repoRoot = path.resolve(import.meta.dirname, "..");
 export const composeFile = path.join(repoRoot, "docker-compose.selfhost.yml");
@@ -18,6 +22,14 @@ export const pomeriumLoopbackComposeFile = path.join(
   repoRoot,
   "docker-compose.selfhost.pomerium-loopback.yml",
 );
+export const caddyComposeFile = path.join(
+  repoRoot,
+  "docker-compose.selfhost.caddy.yml",
+);
+export const caddySourceComposeFile = path.join(
+  repoRoot,
+  "docker-compose.selfhost.caddy-source.yml",
+);
 export const envFile = path.resolve(
   repoRoot,
   process.env.SELFHOST_ENV_FILE || ".env.selfhost",
@@ -26,10 +38,12 @@ export const defaultProjectName = "camelai-selfhost";
 export const volumeNames = ["app-state", "local-artifacts-repos"];
 
 export function volumeNamesForEnv(env = {}) {
-  return (env.SELFHOST_AUTH_MODE || process.env.SELFHOST_AUTH_MODE) ===
+  const names =
+    (env.SELFHOST_AUTH_MODE || process.env.SELFHOST_AUTH_MODE) ===
     "bundled-pomerium"
     ? [...volumeNames, "pomerium-data"]
     : volumeNames;
+  return usesCaddy(env) ? [...names, "caddy-data", "caddy-config"] : names;
 }
 
 export async function readSelfhostEnv(required = false) {
@@ -81,10 +95,8 @@ export function composeArgs(env, args) {
     (env.SELFHOST_AUTH_MODE || process.env.SELFHOST_AUTH_MODE) ===
     "bundled-pomerium";
   const pomeriumLoopbackHttps =
-    bundledPomerium &&
-    (env.SELFHOST_POMERIUM_LOOPBACK_HTTPS ||
-      process.env.SELFHOST_POMERIUM_LOOPBACK_HTTPS ||
-      "1") !== "0";
+    bundledPomerium && tlsTerminatesOnVm(env);
+  const caddy = usesCaddy(env);
   return [
     "compose",
     "--env-file",
@@ -93,6 +105,8 @@ export function composeArgs(env, args) {
     composeFile,
     ...(sourceMode ? ["-f", sourceComposeFile] : []),
     ...(bundledPomerium ? ["-f", pomeriumComposeFile] : []),
+    ...(caddy ? ["-f", caddyComposeFile] : []),
+    ...(sourceMode && caddy ? ["-f", caddySourceComposeFile] : []),
     ...(pomeriumLoopbackHttps ? ["-f", pomeriumLoopbackComposeFile] : []),
     ...args,
   ];
@@ -128,6 +142,10 @@ export function scriptEnv(env = {}, extra = {}) {
           env.SELFHOST_CONTAINER_EGRESS_IMAGE ||
           process.env.SELFHOST_CONTAINER_EGRESS_IMAGE ||
           "camelai-selfhost-container-egress:0.12.0",
+        SELFHOST_CADDY_IMAGE:
+          env.SELFHOST_CADDY_IMAGE ||
+          process.env.SELFHOST_CADDY_IMAGE ||
+          "camelai-selfhost-caddy:source",
       }
     : {};
   return {

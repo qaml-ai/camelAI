@@ -5,7 +5,7 @@ name       = "camelai-selfhost"
 repository_url = "https://github.com/qaml-ai/camelAI.git"
 repository_ref = "REPLACE_WITH_TESTED_TAG_OR_COMMIT"
 
-# Use the six references from the same self-host release. Digest-pinned
+# Use the seven references from the same self-host release. Digest-pinned
 # references are preferred; release or commit tags are accepted.
 app_image             = "ghcr.io/qaml-ai/camelai-selfhost-app:selfhost-v0.1.0"
 local_artifacts_image = "ghcr.io/qaml-ai/camelai-selfhost-local-artifacts:selfhost-v0.1.0"
@@ -13,21 +13,23 @@ project_build_image   = "ghcr.io/qaml-ai/camelai-selfhost-project-build:selfhost
 analysis_image        = "ghcr.io/qaml-ai/camelai-selfhost-analysis:selfhost-v0.1.0"
 db_query_image        = "ghcr.io/qaml-ai/camelai-selfhost-db-query:selfhost-v0.1.0"
 container_egress_image = "ghcr.io/qaml-ai/camelai-selfhost-container-egress:selfhost-v0.1.0"
+caddy_image            = "ghcr.io/qaml-ai/camelai-selfhost-caddy:selfhost-v0.1.0"
 
-# A certificate in tls_certificate_secret_arn must cover all three names below:
-# camel.example.com, authenticate.example.com, and *.apps.example.com.
+# Automatic TLS uses the instance role to complete Route53 DNS-01 challenges
+# and renew the certificate without operator-provided PEM files.
 main_hostname     = "camel.example.com"
 app_vanity_domain = "apps.example.com"
-tls_mode          = "provided"
+tls_mode          = "automatic"
 
-# SecretString values are the raw PEM certificate chain and private key.
-tls_certificate_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:camelai/tls-cert-AbCdEf"
-tls_private_key_secret_arn  = "arn:aws:secretsmanager:us-east-1:123456789012:secret:camelai/tls-key-AbCdEf"
-
-# Set this to true when the domain is in Route53. Otherwise create equivalent
-# main + wildcard records with your DNS provider using the public_ip output.
+# Automatic mode requires a Route53 public hosted zone. Set this to true to
+# create the main, authenticate, and wildcard A records too.
 create_route53_records = true
 route53_zone_id        = "Z0123456789EXAMPLE"
+
+# Private-PKI or air-gapped fallback:
+# tls_mode = "provided"
+# tls_certificate_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:camelai/tls-cert-AbCdEf"
+# tls_private_key_secret_arn  = "arn:aws:secretsmanager:us-east-1:123456789012:secret:camelai/tls-key-AbCdEf"
 
 # Prefer SSM Session Manager. Add a narrowly scoped CIDR and key only for
 # break-glass SSH.

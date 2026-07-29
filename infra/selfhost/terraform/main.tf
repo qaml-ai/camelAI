@@ -63,8 +63,15 @@ check "tls_secrets" {
 
 check "route53_zone" {
   assert {
-    condition     = !var.create_route53_records || var.route53_zone_id != ""
-    error_message = "route53_zone_id is required when create_route53_records=true."
+    condition     = (!var.create_route53_records && var.tls_mode != "automatic") || var.route53_zone_id != ""
+    error_message = "route53_zone_id is required for automatic TLS or when create_route53_records=true."
+  }
+}
+
+check "tls_auth_compatibility" {
+  assert {
+    condition     = var.tls_mode == "external" || var.auth_provider == "bundled-pomerium"
+    error_message = "automatic and provided TLS require auth_provider=bundled-pomerium; external identity proxies must terminate TLS upstream."
   }
 }
 
@@ -110,7 +117,7 @@ resource "aws_security_group" "selfhost" {
   dynamic "ingress" {
     for_each = var.web_ingress_cidrs
     content {
-      description = var.tls_mode == "provided" ? "HTTP redirect" : "HTTP origin for external TLS proxy"
+      description = contains(["automatic", "provided"], var.tls_mode) ? "HTTP redirect and ACME fallback" : "HTTP origin for external TLS proxy"
       protocol    = "tcp"
       from_port   = 80
       to_port     = 80
@@ -119,7 +126,7 @@ resource "aws_security_group" "selfhost" {
   }
 
   dynamic "ingress" {
-    for_each = var.tls_mode == "provided" ? var.web_ingress_cidrs : []
+    for_each = contains(["automatic", "provided"], var.tls_mode) ? var.web_ingress_cidrs : []
     content {
       description = "HTTPS"
       protocol    = "tcp"
@@ -181,6 +188,45 @@ resource "aws_iam_role_policy" "secrets" {
   })
 }
 
+resource "aws_iam_role_policy" "tls_dns01" {
+  count = var.tls_mode == "automatic" ? 1 : 0
+  name  = "ManageCamelAITlsDnsChallenge"
+  role  = aws_iam_role.selfhost.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["route53:ListHostedZones", "route53:ListHostedZonesByName"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["route53:ListResourceRecordSets"]
+        Resource = "arn:aws:route53:::hostedzone/${var.route53_zone_id}"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["route53:GetChange"]
+        Resource = "arn:aws:route53:::change/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["route53:ChangeResourceRecordSets"]
+        Resource = "arn:aws:route53:::hostedzone/${var.route53_zone_id}"
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "route53:ChangeResourceRecordSetsRecordTypes" = "TXT"
+          }
+          "ForAllValues:StringLike" = {
+            "route53:ChangeResourceRecordSetsNormalizedRecordNames" = "_acme-challenge.*"
+          }
+        }
+      },
+    ]
+  })
+}
+
 resource "aws_iam_instance_profile" "selfhost" {
   name_prefix = "${var.name}-"
   role        = aws_iam_role.selfhost.name
@@ -198,6 +244,7 @@ resource "aws_ebs_volume" "data" {
 
 locals {
   cloud_init = templatefile("${path.module}/cloud-init.sh.tpl", {
+    aws_region_b64                     = base64encode(var.aws_region)
     data_volume_id_b64                 = base64encode(aws_ebs_volume.data.id)
     repository_url_b64                 = base64encode(var.repository_url)
     repository_ref_b64                 = base64encode(var.repository_ref)
@@ -207,12 +254,14 @@ locals {
     analysis_image_b64                 = base64encode(var.analysis_image)
     db_query_image_b64                 = base64encode(var.db_query_image)
     container_egress_image_b64         = base64encode(var.container_egress_image)
+    caddy_image_b64                    = base64encode(var.caddy_image)
     main_hostname_b64                  = base64encode(lower(var.main_hostname))
     app_vanity_domain_b64              = base64encode(lower(var.app_vanity_domain))
     app_iframe_domain_b64              = base64encode(lower(local.app_iframe_domain))
     tls_mode_b64                       = base64encode(var.tls_mode)
     tls_certificate_secret_arn_b64     = base64encode(var.tls_certificate_secret_arn)
     tls_private_key_secret_arn_b64     = base64encode(var.tls_private_key_secret_arn)
+    route53_zone_id_b64                = base64encode(var.route53_zone_id)
     auth_provider_b64                  = base64encode(var.auth_provider)
     auth_default_org_name_b64          = base64encode(var.auth_default_org_name)
     cloudflare_access_team_domain_b64  = base64encode(var.cloudflare_access_team_domain)
@@ -270,6 +319,7 @@ resource "aws_instance" "selfhost" {
   depends_on = [
     aws_iam_role_policy_attachment.ssm,
     aws_iam_role_policy.secrets,
+    aws_iam_role_policy.tls_dns01,
   ]
 }
 

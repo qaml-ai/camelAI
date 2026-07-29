@@ -15,6 +15,15 @@ import {
   volumeName,
   volumeNamesForEnv,
 } from "./selfhost-common.mjs";
+import {
+  selfhostTlsMode,
+  usesCaddy,
+} from "./selfhost-tls-mode.mjs";
+import {
+  caddyDirectory,
+  caddySecretsDirectory,
+  writeCaddyConfig,
+} from "./selfhost-caddy-config.mjs";
 import { writePomeriumConfig } from "./selfhost-pomerium-config.mjs";
 
 const checks = [];
@@ -75,6 +84,7 @@ const imageKeys = [
   "SELFHOST_ANALYSIS_IMAGE",
   "SELFHOST_DB_QUERY_IMAGE",
   "SELFHOST_CONTAINER_EGRESS_IMAGE",
+  ...(usesCaddy(env) ? ["SELFHOST_CADDY_IMAGE"] : []),
 ];
 
 await check("container images", async () => {
@@ -245,13 +255,6 @@ await check("authentication", async () => {
     if (!/@sha256:[0-9a-f]{64}$/i.test(env.SELFHOST_POMERIUM_IMAGE || "")) {
       fail("SELFHOST_POMERIUM_IMAGE must be pinned by sha256 digest");
     }
-    if (
-      !new Set(["0", "1"]).has(
-        (env.SELFHOST_POMERIUM_LOOPBACK_HTTPS || "1").trim(),
-      )
-    ) {
-      fail("SELFHOST_POMERIUM_LOOPBACK_HTTPS must be 0 or 1");
-    }
     for (const key of [
       "POMERIUM_ISSUER",
       "POMERIUM_AUDIENCE",
@@ -261,7 +264,6 @@ await check("authentication", async () => {
     }
     await writePomeriumConfig(env);
     note("bundled Pomerium configuration rendered");
-    note(`TLS mode: ${env.SELFHOST_POMERIUM_TLS_MODE || "direct"}`);
     return;
   }
   if (mode === "external-pomerium") {
@@ -297,6 +299,80 @@ await check("authentication", async () => {
     fail("SELFHOST_AUTH_MODE=local requires LOCAL_AUTH_BYPASS=1");
   }
   warn("local authentication bypass is for smoke tests only");
+});
+
+await check("TLS front door", async () => {
+  const mode = selfhostTlsMode(env);
+  if (!new Set(["automatic", "external", "provided"]).has(mode)) {
+    fail(
+      `SELFHOST_TLS_MODE must be automatic, external, or provided; got ${mode}`,
+    );
+  }
+  if (!/@sha256:[0-9a-f]{64}$/i.test(env.SELFHOST_CADDY_IMAGE || "") &&
+      deploymentMode === "release") {
+    fail("SELFHOST_CADDY_IMAGE must be pinned by sha256 digest in release mode");
+  }
+  await writeCaddyConfig(env);
+  note(`SELFHOST_TLS_MODE: ${mode}`);
+  if (mode === "automatic") {
+    note(`DNS provider: ${env.SELFHOST_TLS_DNS_PROVIDER}`);
+    if ((env.SELFHOST_TLS_DNS_PROVIDER || "").trim() === "route53") {
+      note(
+        (env.SELFHOST_TLS_AWS_ACCESS_KEY_ID || "").trim()
+          ? "Route 53 credentials: protected generated credentials file"
+          : "Route 53 credentials: AWS instance role or ambient SDK credentials",
+      );
+    }
+  } else if (mode === "external") {
+    const bindAddress = (
+      env.SELFHOST_TLS_EXTERNAL_BIND_ADDRESS || "127.0.0.1"
+    ).trim();
+    if (bindAddress === "0.0.0.0" || bindAddress === "::") {
+      warn(
+        "external TLS origin listens on all interfaces; restrict ingress to the trusted TLS proxy",
+      );
+    }
+    note(
+      `HTTP origin: ${bindAddress}:${env.SELFHOST_TLS_EXTERNAL_PORT || "8080"}`,
+    );
+  } else {
+    note("operator-provided certificate copied into the protected Caddy mount");
+  }
+  note("Caddy configuration rendered");
+
+  const caddyImage = effectiveEnv.SELFHOST_CADDY_IMAGE;
+  const inspect = await capture("docker", ["image", "inspect", caddyImage], {
+    env: effectiveEnv,
+  });
+  if (inspect.code === 0) {
+    const validation = await capture(
+      "docker",
+      [
+        "run",
+        "--rm",
+        "--volume",
+        `${caddyDirectory}:/etc/caddy:ro`,
+        "--volume",
+        `${caddySecretsDirectory}:/run/camelai-secrets:ro`,
+        "--env",
+        `AWS_REGION=${env.SELFHOST_TLS_AWS_REGION || "us-east-1"}`,
+        caddyImage,
+        "caddy",
+        "validate",
+        "--config",
+        "/etc/caddy/Caddyfile",
+      ],
+      { env: effectiveEnv },
+    );
+    if (validation.code !== 0) {
+      fail(validation.stderr.trim() || "Caddy configuration validation failed");
+    }
+    note("Caddy configuration validated with the configured image");
+  } else {
+    note(
+      "Caddy image is not local yet; image-level validation deferred until pull/build",
+    );
+  }
 });
 
 await check("compose config", async () => {

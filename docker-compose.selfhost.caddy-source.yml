@@ -1,0 +1,6 @@
+services:
+  caddy:
+    image: camelai-selfhost-caddy:source
+    build:
+      context: .
+      dockerfile: infra/selfhost/caddy.Dockerfile

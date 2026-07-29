@@ -7,6 +7,7 @@ import {
   readSelfhostEnv,
   repoRoot,
 } from "./selfhost-common.mjs";
+import { usesCaddy } from "./selfhost-tls-mode.mjs";
 
 export const pomeriumConfigFile = path.join(
   repoRoot,
@@ -55,7 +56,9 @@ export async function writePomeriumConfig(env, { strict = true } = {}) {
   }
 
   const appPort = validPort(env.SELFHOST_APP_PORT || "3001");
-  const tlsMode = (env.SELFHOST_POMERIUM_TLS_MODE || "direct").trim();
+  const tlsMode = usesCaddy(env)
+    ? "upstream"
+    : (env.SELFHOST_POMERIUM_TLS_MODE || "upstream").trim();
   if (!new Set(["direct", "upstream"]).has(tlsMode)) {
     throw new Error(
       'SELFHOST_POMERIUM_TLS_MODE must be "direct" or "upstream"',
@@ -71,16 +74,6 @@ export async function writePomeriumConfig(env, { strict = true } = {}) {
       requiredHttpsUrl(
         env.POMERIUM_IDP_PROVIDER_URL,
         "POMERIUM_IDP_PROVIDER_URL",
-      );
-    }
-    if (tlsMode === "direct") {
-      await requireFile(
-        path.join(repoRoot, ".selfhost", "pomerium", "tls.crt"),
-        ".selfhost/pomerium/tls.crt",
-      );
-      await requireFile(
-        path.join(repoRoot, ".selfhost", "pomerium", "tls.key"),
-        ".selfhost/pomerium/tls.key",
       );
     }
   }
@@ -225,13 +218,6 @@ function validPort(value) {
 
 function requireValue(value, name) {
   if (!String(value || "").trim()) throw new Error(`Missing ${name}`);
-}
-
-async function requireFile(filePath, displayPath) {
-  const stat = await fs.stat(filePath).catch(() => null);
-  if (!stat?.isFile() || stat.size === 0) {
-    throw new Error(`Missing ${displayPath}`);
-  }
 }
 
 if (path.resolve(process.argv[1] || "") === path.resolve(import.meta.filename)) {

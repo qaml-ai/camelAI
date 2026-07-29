@@ -111,6 +111,15 @@ variable "container_egress_image" {
   }
 }
 
+variable "caddy_image" {
+  description = "Immutable ghcr.io/qaml-ai/camelai-selfhost-caddy image with Cloudflare and Route53 DNS modules."
+  type        = string
+  validation {
+    condition     = var.caddy_image != "" && !endswith(lower(var.caddy_image), ":latest")
+    error_message = "caddy_image must be a non-latest release tag or digest."
+  }
+}
+
 variable "main_hostname" {
   description = "Public camelAI hostname without scheme, for example camel.example.com."
   type        = string
@@ -136,12 +145,12 @@ variable "app_iframe_domain" {
 }
 
 variable "tls_mode" {
-  description = "provided installs a certificate/key from Secrets Manager on Caddy; external expects an upstream TLS proxy and exposes HTTP origin port 80."
+  description = "automatic obtains and renews a wildcard certificate through Route53 DNS; provided reads PEM secrets; external exposes an HTTP origin to a trusted TLS proxy."
   type        = string
-  default     = "provided"
+  default     = "automatic"
   validation {
-    condition     = contains(["provided", "external"], var.tls_mode)
-    error_message = "tls_mode must be provided or external."
+    condition     = contains(["automatic", "provided", "external"], var.tls_mode)
+    error_message = "tls_mode must be automatic, provided, or external."
   }
 }
 
@@ -158,7 +167,7 @@ variable "tls_private_key_secret_arn" {
 }
 
 variable "web_ingress_cidrs" {
-  description = "CIDRs allowed to reach Caddy. Restrict these to an upstream proxy when tls_mode=external."
+  description = "CIDRs allowed to reach Caddy. Restrict these to the trusted upstream proxy when tls_mode=external."
   type        = list(string)
   default     = ["0.0.0.0/0"]
 }
@@ -182,7 +191,7 @@ variable "create_route53_records" {
 }
 
 variable "route53_zone_id" {
-  description = "Route53 public hosted zone id used when create_route53_records is true."
+  description = "Route53 public hosted zone id used for automatic DNS-01 TLS and optional DNS records."
   type        = string
   default     = ""
 }

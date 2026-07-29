@@ -12,6 +12,7 @@ import {
   scriptEnv,
   writeEnvValue,
 } from "./selfhost-common.mjs";
+import { writeCaddyConfig } from "./selfhost-caddy-config.mjs";
 import { writePomeriumConfig } from "./selfhost-pomerium-config.mjs";
 
 const IMAGE_ENV_BY_MANIFEST_KEY = {
@@ -21,6 +22,7 @@ const IMAGE_ENV_BY_MANIFEST_KEY = {
   analysis: "SELFHOST_ANALYSIS_IMAGE",
   "db-query": "SELFHOST_DB_QUERY_IMAGE",
   "container-egress": "SELFHOST_CONTAINER_EGRESS_IMAGE",
+  caddy: "SELFHOST_CADDY_IMAGE",
   pomerium: "SELFHOST_POMERIUM_IMAGE",
 };
 
@@ -191,6 +193,7 @@ async function applyCurrentConfig(env, { onRuntimeStart } = {}) {
     "source";
   const effectiveEnv = scriptEnv(env);
   await writePomeriumConfig(env);
+  await writeCaddyConfig(env);
 
   await run(
     "docker",
@@ -302,29 +305,14 @@ async function restoreReleaseState(snapshotDir) {
   await run("bun", ["install", "--frozen-lockfile"]);
 
   const restoredEnv = await readSelfhostEnv(true);
-  await writePomeriumConfig(restoredEnv);
-  const pull = await capture("docker", composeArgs(restoredEnv, ["pull"]), {
+  // The restored checkout owns its Compose topology and config schema. This
+  // matters when rolling back across a release that adds or removes overlays.
+  await run("bun", ["run", "selfhost:configure"], {
     env: scriptEnv(restoredEnv),
   });
-  if (pull.code !== 0) {
-    console.warn(
-      `[selfhost:upgrade] Could not refresh rollback images; trying the images already present locally: ${
-        pull.stderr.trim() || `docker compose pull exited ${pull.code}`
-      }`,
-    );
-  }
-  await run(
-    "docker",
-    composeArgs(restoredEnv, [
-      "up",
-      "-d",
-      "--remove-orphans",
-      "--wait",
-      "--wait-timeout",
-      "900",
-    ]),
-    { env: scriptEnv(restoredEnv) },
-  );
+  await run("bun", ["run", "selfhost:up"], {
+    env: scriptEnv(restoredEnv),
+  });
   await run(process.execPath, ["scripts/selfhost-doctor.mjs"], {
     env: scriptEnv(restoredEnv),
   });

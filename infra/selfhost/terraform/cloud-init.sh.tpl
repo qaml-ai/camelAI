@@ -13,6 +13,7 @@ decode() {
   printf '%s' "$1" | base64 --decode
 }
 
+AWS_REGION="$(decode "${aws_region_b64}")"
 DATA_VOLUME_ID="$(decode "${data_volume_id_b64}")"
 REPOSITORY_URL="$(decode "${repository_url_b64}")"
 REPOSITORY_REF="$(decode "${repository_ref_b64}")"
@@ -22,12 +23,14 @@ PROJECT_BUILD_IMAGE="$(decode "${project_build_image_b64}")"
 ANALYSIS_IMAGE="$(decode "${analysis_image_b64}")"
 DB_QUERY_IMAGE="$(decode "${db_query_image_b64}")"
 CONTAINER_EGRESS_IMAGE="$(decode "${container_egress_image_b64}")"
+CADDY_IMAGE="$(decode "${caddy_image_b64}")"
 MAIN_HOSTNAME="$(decode "${main_hostname_b64}")"
 APP_VANITY_DOMAIN="$(decode "${app_vanity_domain_b64}")"
 APP_IFRAME_DOMAIN="$(decode "${app_iframe_domain_b64}")"
 TLS_MODE="$(decode "${tls_mode_b64}")"
 TLS_CERTIFICATE_SECRET_ARN="$(decode "${tls_certificate_secret_arn_b64}")"
 TLS_PRIVATE_KEY_SECRET_ARN="$(decode "${tls_private_key_secret_arn_b64}")"
+ROUTE53_ZONE_ID="$(decode "${route53_zone_id_b64}")"
 AUTH_PROVIDER="$(decode "${auth_provider_b64}")"
 AUTH_DEFAULT_ORG_NAME="$(decode "${auth_default_org_name_b64}")"
 CLOUDFLARE_ACCESS_TEAM_DOMAIN="$(decode "${cloudflare_access_team_domain_b64}")"
@@ -61,12 +64,8 @@ chmod a+r /etc/apt/keyrings/docker.asc
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
 
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key -o /etc/apt/keyrings/caddy.asc
-chmod a+r /etc/apt/keyrings/caddy.asc
-echo "deb [signed-by=/etc/apt/keyrings/caddy.asc] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" > /etc/apt/sources.list.d/caddy.list
-
 apt-get update
-apt-get install -y caddy docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin nodejs
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin nodejs
 npm install --global bun@1.3.14
 
 if ! command -v aws >/dev/null 2>&1; then
@@ -174,6 +173,7 @@ export CFG_SELFHOST_PROJECT_BUILD_IMAGE="$${PROJECT_BUILD_IMAGE}"
 export CFG_SELFHOST_ANALYSIS_IMAGE="$${ANALYSIS_IMAGE}"
 export CFG_SELFHOST_DB_QUERY_IMAGE="$${DB_QUERY_IMAGE}"
 export CFG_SELFHOST_CONTAINER_EGRESS_IMAGE="$${CONTAINER_EGRESS_IMAGE}"
+export CFG_SELFHOST_CADDY_IMAGE="$${CADDY_IMAGE}"
 export CFG_SELFHOST_DEPLOYMENT_MODE="release"
 export CFG_SELFHOST_PUBLIC_BASE_URL="https://$${MAIN_HOSTNAME}"
 export CFG_SELFHOST_MAIN_HOSTNAME="$${MAIN_HOSTNAME}"
@@ -181,10 +181,18 @@ export CFG_SELFHOST_AUTH_MODE="$${AUTH_PROVIDER}"
 if [ "$${AUTH_PROVIDER}" = "pomerium" ]; then
   export CFG_SELFHOST_AUTH_MODE="external-pomerium"
 fi
-export CFG_SELFHOST_POMERIUM_TLS_MODE="upstream"
-export CFG_SELFHOST_POMERIUM_LOOPBACK_HTTPS="0"
-if [ "$${TLS_MODE}" = "provided" ]; then
-  export CFG_SELFHOST_POMERIUM_LOOPBACK_HTTPS="1"
+export CFG_SELFHOST_TLS_MODE="$${TLS_MODE}"
+export CFG_SELFHOST_TLS_DNS_PROVIDER=""
+export CFG_SELFHOST_TLS_ROUTE53_HOSTED_ZONE_ID=""
+export CFG_SELFHOST_TLS_AWS_REGION="$${AWS_REGION}"
+export CFG_SELFHOST_TLS_EXTERNAL_BIND_ADDRESS="127.0.0.1"
+export CFG_SELFHOST_TLS_EXTERNAL_PORT="8080"
+if [ "$${TLS_MODE}" = "automatic" ]; then
+  export CFG_SELFHOST_TLS_DNS_PROVIDER="route53"
+  export CFG_SELFHOST_TLS_ROUTE53_HOSTED_ZONE_ID="$${ROUTE53_ZONE_ID}"
+elif [ "$${TLS_MODE}" = "external" ]; then
+  export CFG_SELFHOST_TLS_EXTERNAL_BIND_ADDRESS="0.0.0.0"
+  export CFG_SELFHOST_TLS_EXTERNAL_PORT="80"
 fi
 export CFG_SELFHOST_POMERIUM_IMAGE="$${POMERIUM_IMAGE}"
 export CFG_LOCAL_APP_VANITY_DOMAIN="$${APP_VANITY_DOMAIN}"
@@ -270,96 +278,29 @@ fs.writeFileSync(envPath, `$${output.join("\n").replace(/\n+$/, "")}\n`, {
 NODE
 unset SELFHOST_AI_API_KEY CFG_SELFHOST_AI_API_KEY POMERIUM_IDP_CLIENT_SECRET CFG_POMERIUM_IDP_CLIENT_SECRET
 chmod 600 .env.selfhost
-bun run selfhost:configure
-
-install -d -m 0700 /etc/camelai
-APP_HTTP_SITE_ADDRESSES="http://*.$${APP_VANITY_DOMAIN}"
-if [ "$${APP_IFRAME_DOMAIN}" != "$${APP_VANITY_DOMAIN}" ]; then
-  APP_HTTP_SITE_ADDRESSES="$${APP_HTTP_SITE_ADDRESSES}, http://*.$${APP_IFRAME_DOMAIN}"
-fi
 if [ "$${TLS_MODE}" = "provided" ]; then
+  install -d -m 0700 .selfhost/tls
   aws secretsmanager get-secret-value \
     --secret-id "$${TLS_CERTIFICATE_SECRET_ARN}" \
     --query SecretString \
-    --output text > /etc/camelai/tls.crt
+    --output text > .selfhost/tls/tls.crt
   aws secretsmanager get-secret-value \
     --secret-id "$${TLS_PRIVATE_KEY_SECRET_ARN}" \
     --query SecretString \
-    --output text > /etc/camelai/tls.key
-  chmod 600 /etc/camelai/tls.crt /etc/camelai/tls.key
-  chown root:caddy /etc/camelai/tls.crt /etc/camelai/tls.key
-  chmod 640 /etc/camelai/tls.crt /etc/camelai/tls.key
-
-  APP_SITE_ADDRESSES="https://*.$${APP_VANITY_DOMAIN}"
-  if [ "$${APP_IFRAME_DOMAIN}" != "$${APP_VANITY_DOMAIN}" ]; then
-    APP_SITE_ADDRESSES="$${APP_SITE_ADDRESSES}, https://*.$${APP_IFRAME_DOMAIN}"
-  fi
-  AUTH_SITE_ADDRESS=""
-  MAIN_UPSTREAM="127.0.0.1:3001"
-  if [ "$${AUTH_PROVIDER}" = "bundled-pomerium" ]; then
-    AUTH_SITE_ADDRESS=", http://$${POMERIUM_AUTHENTICATE_HOSTNAME}"
-    MAIN_UPSTREAM="127.0.0.1:5444"
-  fi
-  cat > /etc/caddy/Caddyfile <<EOF
-http://$${MAIN_HOSTNAME}, $${APP_HTTP_SITE_ADDRESSES}$${AUTH_SITE_ADDRESS} {
-  redir https://{host}{uri} permanent
-}
-
-https://$${MAIN_HOSTNAME} {
-  tls /etc/camelai/tls.crt /etc/camelai/tls.key
-  reverse_proxy $${MAIN_UPSTREAM}
-}
-
-$${APP_SITE_ADDRESSES} {
-  tls /etc/camelai/tls.crt /etc/camelai/tls.key
-  reverse_proxy 127.0.0.1:3001
-}
-EOF
-  if [ "$${AUTH_PROVIDER}" = "bundled-pomerium" ]; then
-    cat >> /etc/caddy/Caddyfile <<EOF
-
-https://$${POMERIUM_AUTHENTICATE_HOSTNAME} {
-  tls /etc/camelai/tls.crt /etc/camelai/tls.key
-  reverse_proxy 127.0.0.1:5444
-}
-EOF
-  fi
-else
-  if [ "$${AUTH_PROVIDER}" = "bundled-pomerium" ]; then
-    cat > /etc/caddy/Caddyfile <<EOF
-http://$${MAIN_HOSTNAME}, http://$${POMERIUM_AUTHENTICATE_HOSTNAME} {
-  reverse_proxy 127.0.0.1:5444 {
-    header_up X-Forwarded-Proto https
-  }
-}
-
-$${APP_HTTP_SITE_ADDRESSES} {
-  reverse_proxy 127.0.0.1:3001 {
-    header_up X-Forwarded-Proto https
-  }
-}
-EOF
-  else
-    cat > /etc/caddy/Caddyfile <<'EOF'
-:80 {
-  reverse_proxy 127.0.0.1:3001 {
-    header_up X-Forwarded-Proto https
-  }
-}
-EOF
-  fi
+    --output text > .selfhost/tls/tls.key
+  chmod 600 .selfhost/tls/tls.crt .selfhost/tls/tls.key
 fi
-caddy validate --config /etc/caddy/Caddyfile
-systemctl enable --now caddy
+bun run selfhost:configure
 
 cat > /usr/local/sbin/camelai-selfhost-compose <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 cd /srv/camelai/repo
 args=(--env-file .env.selfhost -f docker-compose.selfhost.yml)
+args+=(-f docker-compose.selfhost.caddy.yml)
 if grep -q '^SELFHOST_AUTH_MODE=bundled-pomerium$' .env.selfhost; then
   args+=(-f docker-compose.selfhost.pomerium.yml)
-  if grep -q '^SELFHOST_POMERIUM_LOOPBACK_HTTPS=1$' .env.selfhost; then
+  if grep -Eq '^SELFHOST_TLS_MODE=(automatic|provided)$' .env.selfhost; then
     args+=(-f docker-compose.selfhost.pomerium-loopback.yml)
   fi
 fi

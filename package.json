@@ -13,7 +13,7 @@
 		"check:pi-bedrock-build": "node scripts/check-pi-bedrock-build.mjs",
 		"start": "node scripts/wrangler-dev.mjs",
 		"selfhost:init": "node scripts/selfhost-init.mjs",
-		"selfhost:configure": "node scripts/selfhost-pomerium-config.mjs",
+		"selfhost:configure": "node scripts/selfhost-configure.mjs",
 		"selfhost:doctor": "node scripts/selfhost-doctor.mjs",
 		"selfhost:up": "node scripts/selfhost-up.mjs",
 		"selfhost:workerd:build": "bun run build:cf && node scripts/selfhost-workerd-config.mjs",

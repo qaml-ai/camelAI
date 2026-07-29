@@ -10,6 +10,7 @@ import {
   repoRoot,
   writeEnvValue,
 } from "./selfhost-common.mjs";
+import { writeCaddyConfig } from "./selfhost-caddy-config.mjs";
 import { writePomeriumConfig } from "./selfhost-pomerium-config.mjs";
 
 const force = process.argv.includes("--force");
@@ -33,14 +34,27 @@ const values = {
   SELFHOST_DB_QUERY_IMAGE: "camelai-selfhost-db-query:0.12.0",
   SELFHOST_CONTAINER_EGRESS_IMAGE:
     "camelai-selfhost-container-egress:0.12.0",
+  SELFHOST_CADDY_IMAGE: "camelai-selfhost-caddy:source",
   SELFHOST_BIND_ADDRESS: "127.0.0.1",
   SELFHOST_APP_PORT: "3001",
   SELFHOST_PUBLIC_BASE_URL: "https://camel.example.com",
   SELFHOST_INTERNAL_APP_URL: "http://127.0.0.1:3001",
   SELFHOST_AUTH_MODE: "bundled-pomerium",
   SELFHOST_MAIN_HOSTNAME: "camel.example.com",
-  SELFHOST_POMERIUM_TLS_MODE: "direct",
-  SELFHOST_POMERIUM_LOOPBACK_HTTPS: "1",
+  SELFHOST_TLS_MODE: "automatic",
+  SELFHOST_TLS_DNS_PROVIDER: "cloudflare",
+  SELFHOST_TLS_ACME_EMAIL: "",
+  SELFHOST_TLS_CLOUDFLARE_API_TOKEN: "",
+  SELFHOST_TLS_ROUTE53_HOSTED_ZONE_ID: "",
+  SELFHOST_TLS_AWS_REGION: "us-east-1",
+  SELFHOST_TLS_AWS_PROFILE: "default",
+  SELFHOST_TLS_AWS_ACCESS_KEY_ID: "",
+  SELFHOST_TLS_AWS_SECRET_ACCESS_KEY: "",
+  SELFHOST_TLS_AWS_SESSION_TOKEN: "",
+  SELFHOST_TLS_CERTIFICATE_FILE: "",
+  SELFHOST_TLS_PRIVATE_KEY_FILE: "",
+  SELFHOST_TLS_EXTERNAL_BIND_ADDRESS: "127.0.0.1",
+  SELFHOST_TLS_EXTERNAL_PORT: "8080",
   SELFHOST_POMERIUM_IMAGE:
     "pomerium/pomerium@sha256:aae6010af6ba4c864bbd3f748cf37843a140b1ddef74d7d2ac1aa87660f8da1f",
   LOCAL_APP_VANITY_DOMAIN: "apps.example.com",
@@ -101,9 +115,10 @@ ${Object.entries(values)
 
 await fs.writeFile(envFile, content, { mode: 0o600 });
 await writePomeriumConfig(values, { strict: false });
+await writeCaddyConfig(values, { strict: false });
 console.log(`Wrote ${path.relative(repoRoot, envFile)}.`);
 console.log("Next steps:");
-console.log("  Configure identity, DNS, TLS, and AI settings in .env.selfhost");
+console.log("  Configure identity, automatic TLS, DNS, and AI settings in .env.selfhost");
 console.log("  bun run selfhost:configure");
 console.log("  bun run selfhost:doctor");
 console.log("  bun run selfhost:up");

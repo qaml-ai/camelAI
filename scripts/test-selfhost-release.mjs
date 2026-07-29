@@ -2,12 +2,15 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
+  caddyComposeFile,
+  caddySourceComposeFile,
   composeArgs,
   pomeriumComposeFile,
   pomeriumLoopbackComposeFile,
   sourceComposeFile,
   volumeNamesForEnv,
 } from "./selfhost-common.mjs";
+import { selfhostTlsMode } from "./selfhost-tls-mode.mjs";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 
@@ -29,6 +32,11 @@ const [
   pomeriumOverride,
   pomeriumLoopbackOverride,
   pomeriumConfig,
+  caddyOverride,
+  caddySourceOverride,
+  caddyConfig,
+  caddyDockerfile,
+  tlsModeScript,
   commonScript,
   bundledDockerfile,
   imageWorkflow,
@@ -46,6 +54,11 @@ const [
   read("docker-compose.selfhost.pomerium.yml"),
   read("docker-compose.selfhost.pomerium-loopback.yml"),
   read("scripts/selfhost-pomerium-config.mjs"),
+  read("docker-compose.selfhost.caddy.yml"),
+  read("docker-compose.selfhost.caddy-source.yml"),
+  read("scripts/selfhost-caddy-config.mjs"),
+  read("infra/selfhost/caddy.Dockerfile"),
+  read("scripts/selfhost-tls-mode.mjs"),
   read("scripts/selfhost-common.mjs"),
   read("infra/selfhost/app-bundled.Dockerfile"),
   read(".github/workflows/selfhost-images.yml"),
@@ -130,6 +143,10 @@ assert(
   !pomeriumOverride.includes("IDP_CLIENT_SECRET:"),
   "bundled Pomerium secrets must not be exposed through container environment values",
 );
+assert(
+  !pomeriumOverride.includes("NET_BIND_SERVICE"),
+  "bundled Pomerium must not retain the capability to bind public TLS ports",
+);
 includesAll(
   pomeriumConfig,
   [
@@ -150,40 +167,126 @@ assert(
   ".env.selfhost must be the single source of truth for generated Pomerium configuration",
 );
 includesAll(
+  caddyOverride,
+  [
+    "SELFHOST_CADDY_IMAGE",
+    "network_mode: host",
+    "./.selfhost/caddy:/etc/caddy:ro",
+    "./.selfhost/caddy/secrets:/run/camelai-secrets:ro",
+    "caddy-data",
+    "caddy-config",
+    "NET_BIND_SERVICE",
+    "no-new-privileges:true",
+  ],
+  "Caddy TLS front-door Compose override",
+);
+includesAll(
+  caddySourceOverride,
+  ["infra/selfhost/caddy.Dockerfile", "camelai-selfhost-caddy:source"],
+  "source-build Caddy override",
+);
+includesAll(
+  caddyDockerfile,
+  [
+    "ARG CADDY_VERSION=2.11.4",
+    "caddy:${CADDY_VERSION}-builder-alpine",
+    "caddy-dns/cloudflare@v0.2.4",
+    "caddy-dns/route53@v1.6.2",
+    "caddy:${CADDY_VERSION}-alpine",
+  ],
+  "Caddy release image",
+);
+includesAll(
+  caddyConfig,
+  [
+    "SELFHOST_TLS_MODE",
+    "SELFHOST_TLS_DNS_PROVIDER",
+    "dns cloudflare",
+    "dns route53",
+    "hosted_zone_id",
+    "/run/camelai-secrets/tls.crt",
+    "SELFHOST_TLS_EXTERNAL_BIND_ADDRESS",
+    "http://127.0.0.1:5444",
+  ],
+  "Caddy configuration generator",
+);
+includesAll(
+  tlsModeScript,
+  [
+    '"automatic"',
+    '"external"',
+    '"provided"',
+    "SELFHOST_POMERIUM_TLS_MODE",
+  ],
+  "legacy TLS-mode migration",
+);
+assert(
+  selfhostTlsMode({
+    SELFHOST_AUTH_MODE: "bundled-pomerium",
+    SELFHOST_POMERIUM_TLS_MODE: "direct",
+  }) === "provided",
+  "legacy direct-Pomerium installs must migrate to provided Caddy TLS",
+);
+assert(
+  selfhostTlsMode({
+    SELFHOST_AUTH_MODE: "bundled-pomerium",
+    SELFHOST_POMERIUM_TLS_MODE: "upstream",
+  }) === "external",
+  "legacy upstream-Pomerium installs must preserve external TLS termination",
+);
+includesAll(
   commonScript,
   [
     "docker-compose.selfhost.pomerium.yml",
     "docker-compose.selfhost.pomerium-loopback.yml",
-    "SELFHOST_POMERIUM_LOOPBACK_HTTPS",
+    "docker-compose.selfhost.caddy.yml",
+    "docker-compose.selfhost.caddy-source.yml",
+    "tlsTerminatesOnVm",
     '"bundled-pomerium"',
     '"pomerium-data"',
+    '"caddy-data"',
+    '"caddy-config"',
   ],
   "self-host Compose selection",
 );
 for (const [name, env, expectedFiles] of [
-  ["release/external", { SELFHOST_DEPLOYMENT_MODE: "release" }, []],
   [
-    "release/bundled",
+    "release/external-proxy",
+    {
+      SELFHOST_DEPLOYMENT_MODE: "release",
+      SELFHOST_TLS_MODE: "external",
+    },
+    [caddyComposeFile],
+  ],
+  [
+    "release/bundled/automatic",
     {
       SELFHOST_DEPLOYMENT_MODE: "release",
       SELFHOST_AUTH_MODE: "bundled-pomerium",
+      SELFHOST_TLS_MODE: "automatic",
     },
-    [pomeriumComposeFile, pomeriumLoopbackComposeFile],
+    [pomeriumComposeFile, caddyComposeFile, pomeriumLoopbackComposeFile],
   ],
   [
-    "source/external",
-    { SELFHOST_DEPLOYMENT_MODE: "source" },
-    [sourceComposeFile],
+    "source/external-proxy",
+    {
+      SELFHOST_DEPLOYMENT_MODE: "source",
+      SELFHOST_TLS_MODE: "external",
+    },
+    [sourceComposeFile, caddyComposeFile, caddySourceComposeFile],
   ],
   [
-    "source/bundled",
+    "source/bundled/provided",
     {
       SELFHOST_DEPLOYMENT_MODE: "source",
       SELFHOST_AUTH_MODE: "bundled-pomerium",
+      SELFHOST_TLS_MODE: "provided",
     },
     [
       sourceComposeFile,
       pomeriumComposeFile,
+      caddyComposeFile,
+      caddySourceComposeFile,
       pomeriumLoopbackComposeFile,
     ],
   ],
@@ -192,9 +295,18 @@ for (const [name, env, expectedFiles] of [
     {
       SELFHOST_DEPLOYMENT_MODE: "release",
       SELFHOST_AUTH_MODE: "bundled-pomerium",
-      SELFHOST_POMERIUM_LOOPBACK_HTTPS: "0",
+      SELFHOST_TLS_MODE: "external",
     },
-    [pomeriumComposeFile],
+    [pomeriumComposeFile, caddyComposeFile],
+  ],
+  [
+    "release/legacy-direct-pomerium-migration",
+    {
+      SELFHOST_DEPLOYMENT_MODE: "release",
+      SELFHOST_AUTH_MODE: "bundled-pomerium",
+      SELFHOST_POMERIUM_TLS_MODE: "direct",
+    },
+    [pomeriumComposeFile, caddyComposeFile, pomeriumLoopbackComposeFile],
   ],
 ]) {
   const args = composeArgs(env, ["config"]);
@@ -202,6 +314,8 @@ for (const [name, env, expectedFiles] of [
     sourceComposeFile,
     pomeriumComposeFile,
     pomeriumLoopbackComposeFile,
+    caddyComposeFile,
+    caddySourceComposeFile,
   ]) {
     assert(
       args.includes(file) === expectedFiles.includes(file),
@@ -210,10 +324,13 @@ for (const [name, env, expectedFiles] of [
   }
 }
 assert(
-  volumeNamesForEnv({ SELFHOST_AUTH_MODE: "bundled-pomerium" }).includes(
-    "pomerium-data",
+  ["pomerium-data", "caddy-data", "caddy-config"].every((name) =>
+    volumeNamesForEnv({
+      SELFHOST_AUTH_MODE: "bundled-pomerium",
+      SELFHOST_TLS_MODE: "automatic",
+    }).includes(name),
   ),
-  "bundled Pomerium backups must include pomerium-data",
+  "bundled automatic-TLS backups must include Pomerium and Caddy state",
 );
 
 assert(
@@ -245,6 +362,7 @@ includesAll(
     "image: analysis",
     "image: db-query",
     "image: container-egress",
+    "image: caddy",
     "platforms: linux/amd64",
     "provenance: mode=max",
     "sbom: true",
@@ -259,6 +377,9 @@ includesAll(
     "Smoke analysis notebook runtime",
     "Smoke DB query drivers",
     "Smoke release app nested-Docker topology",
+    "Validate Caddy DNS providers",
+    "dns.providers.cloudflare",
+    "dns.providers.route53",
     "--network host",
     "- validate-contract",
     "- validate-bundled-images",
@@ -279,6 +400,7 @@ includesAll(
     "SELFHOST_ANALYSIS_IMAGE",
     "SELFHOST_DB_QUERY_IMAGE",
     "SELFHOST_CONTAINER_EGRESS_IMAGE",
+    "SELFHOST_CADDY_IMAGE",
     "SELFHOST_POMERIUM_IMAGE",
     "@sha256:",
     "snapshotReleaseState",
@@ -330,8 +452,14 @@ includesAll(
   [
     'await check("network binding"',
     "SELFHOST_BIND_ADDRESS must remain loopback",
+    'await check("TLS front door"',
+    "SELFHOST_CADDY_IMAGE",
+    "SELFHOST_TLS_DNS_PROVIDER",
+    '"caddy",',
+    '"validate",',
+    "Caddy configuration validated with the configured image",
   ],
-  "self-host loopback binding validation",
+  "self-host network and TLS validation",
 );
 
 for (const [name, template] of [
@@ -351,7 +479,12 @@ includesAll(
     "bundled-pomerium",
     "PomeriumIdpClientSecretArn",
     "PomeriumAuthenticateDnsRecord",
-    "127.0.0.1:5444",
+    "Default: automatic",
+    "route53:ChangeResourceRecordSets",
+    "SELFHOST_CADDY_IMAGE",
+    "SELFHOST_TLS_MODE",
+    "SELFHOST_TLS_DNS_PROVIDER",
+    "docker-compose.selfhost.caddy.yml",
     "docker-compose.selfhost.pomerium.yml",
     "docker-compose.selfhost.pomerium-loopback.yml",
   ],
@@ -363,6 +496,10 @@ includesAll(
     'var.auth_provider == "bundled-pomerium"',
     "pomerium_idp_client_secret_arn",
     "aws_route53_record\" \"pomerium_authenticate",
+    'var.tls_mode == "automatic"',
+    "ManageCamelAITlsDnsChallenge",
+    "caddy_image_b64",
+    "route53_zone_id_b64",
     "user_data_base64",
     "base64gzip(local.cloud_init)",
   ],
@@ -373,7 +510,9 @@ includesAll(
   [
     "POMERIUM_IDP_CLIENT_SECRET_ARN",
     'CFG_SELFHOST_AUTH_MODE="external-pomerium"',
-    "127.0.0.1:5444",
+    'CFG_SELFHOST_TLS_DNS_PROVIDER="route53"',
+    "CFG_SELFHOST_CADDY_IMAGE",
+    "docker-compose.selfhost.caddy.yml",
     "docker-compose.selfhost.pomerium.yml",
     "docker-compose.selfhost.pomerium-loopback.yml",
   ],

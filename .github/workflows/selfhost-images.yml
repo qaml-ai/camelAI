@@ -82,6 +82,9 @@ jobs:
           - image: local-artifacts
             context: .
             dockerfile: infra/selfhost/local-artifacts.Dockerfile
+          - image: caddy
+            context: .
+            dockerfile: infra/selfhost/caddy.Dockerfile
     steps:
       - uses: actions/checkout@v4
 
@@ -96,6 +99,13 @@ jobs:
           tags: camelai-selfhost-${{ matrix.image }}:release-validation
           cache-from: type=gha,scope=selfhost-${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=selfhost-${{ matrix.image }}
+
+      - name: Validate Caddy DNS providers
+        if: matrix.image == 'caddy'
+        run: |
+          modules="$(docker run --rm camelai-selfhost-caddy:release-validation caddy list-modules)"
+          grep -qx 'dns.providers.cloudflare' <<<"$modules"
+          grep -qx 'dns.providers.route53' <<<"$modules"
 
   validate-runtimes:
     name: Validate attached container runtimes
@@ -215,6 +225,9 @@ jobs:
           - image: container-egress
             context: workers/main/eval-egress-fix
             dockerfile: workers/main/eval-egress-fix/Dockerfile
+          - image: caddy
+            context: .
+            dockerfile: infra/selfhost/caddy.Dockerfile
     steps:
       - uses: actions/checkout@v4
 
@@ -300,7 +313,7 @@ jobs:
             '{schema: 1, release: $release, revision: $revision, images: {}}' \
             > selfhost-release.json
 
-          for image in app local-artifacts project-build analysis db-query container-egress; do
+          for image in app local-artifacts project-build analysis db-query container-egress caddy; do
             ref="ghcr.io/${owner}/${repo}-selfhost-${image}:${tag}"
             digest="$(
               docker buildx imagetools inspect "$ref" |

@@ -293,6 +293,7 @@ if any of them drift apart.
 
 - Session/auth helpers are split between app-side loaders/actions in `src/lib/` and Worker-side helpers in `workers/main/src/helpers/`.
 - Reverse-proxy identity providers (auto-login behind Cloudflare Access or Pomerium) share one engine in `workers/main/src/helpers/proxy-auth-core.ts` (JWT verify, JWKS, org mapping, revalidation); per-provider adapters are `access-session.ts` (RS256, get-identity endpoint) and `pomerium-session.ts` (ES256, inline-group claims). The registry/dispatcher is `proxy-auth-providers.ts`; app-side silent login/provisioning is `src/lib/proxy-auth.server.ts`. To add a provider, implement `ProxyAuthProvider` and register it. Tests: `tests/{pomerium,cloudflare-access}-*.test.ts`. Docs: `docs/pomerium-auth.md`, `docs/cloudflare-access-auth.md`.
+- Self-host Compose uses containerized Caddy as its ingress/TLS service. Bundled Pomerium is plaintext on loopback `127.0.0.1:5444`; do not restore direct Pomerium TLS or a host-installed Caddy service. TLS modes are `automatic` (Cloudflare/Route 53 DNS validation), `external`, and `provided`.
 - Password auth, OAuth account creation, email verification, onboarding, bans, and blocked signup policies all have tests in `workers/main/tests/`; update or add focused tests when touching these flows.
 - First-touch marketing attribution and the durable first-accepted-message definition of `new_camel_activation` are documented in `MARKETING_ATTRIBUTION.md`.
 - Superuser UI routes live under `/qaml-backdoor`.

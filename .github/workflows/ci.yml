@@ -38,7 +38,7 @@ jobs:
           }
           trap cleanup EXIT
           {
-            echo "SELFHOST_POMERIUM_TLS_MODE=upstream"
+            echo "SELFHOST_TLS_MODE=external"
             echo "POMERIUM_IDP_PROVIDER_URL=https://accounts.example.com"
             echo "POMERIUM_IDP_CLIENT_ID=ci-client"
             echo "POMERIUM_IDP_CLIENT_SECRET=ci-secret"

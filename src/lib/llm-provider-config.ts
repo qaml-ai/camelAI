@@ -303,6 +303,22 @@ export function getVisibleLlmModelOptions(
     return visibleOptions;
   }
 
+  // Retained thread models may bypass the provider catalog so an existing
+  // hosted thread can remain usable after an admin changes picker settings.
+  // Runtime exclusions are different: self-host must never re-add camelCode
+  // merely because a legacy thread still has it stored.
+  if (
+    !isLlmModelAllowedForOrgProvider(includeModel, options?.orgProvider, {
+      customApi: options?.customApi,
+      customModelId: options?.customModelId,
+      awsRegion: options?.awsRegion,
+      allowOpenAiSubscription: options?.allowOpenAiSubscription,
+      allowCamelCode: options?.allowCamelCode,
+    })
+  ) {
+    return visibleOptions;
+  }
+
   const fallbackOption = [
     ...OPENAI_COMPATIBLE_LLM_MODEL_OPTIONS,
     ...ANTHROPIC_LLM_MODEL_OPTIONS,

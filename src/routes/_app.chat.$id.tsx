@@ -31,12 +31,14 @@ import {
   getDevChatInitialError,
 } from "@/lib/chat-credit-status";
 import {
+  CAMEL_CODE_LLM_MODEL,
   getDefaultLlmModel,
   getStoredCustomLlmProviderApi,
   getStoredCustomLlmProviderModelId,
   getStoredBedrockAwsRegion,
   getVisibleLlmModelOptions,
   isLlmModel,
+  normalizeLlmModel,
 } from "@/lib/llm-provider-config";
 import { getEffectiveLlmProviderConfig } from "@/lib/selfhost-ai-provider";
 import { isSelfhostRuntime } from "@/lib/selfhost-runtime";
@@ -809,12 +811,25 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
   const customApi = getStoredCustomLlmProviderApi(effectiveLlmProviderConfig);
   const customModelId = getStoredCustomLlmProviderModelId(effectiveLlmProviderConfig);
   const awsRegion = getStoredBedrockAwsRegion(effectiveLlmProviderConfig);
-  const fallbackThreadModel =
-    thread?.model ??
-    getDefaultLlmModel(effectiveLlmProviderConfig?.provider, {
+  const providerDefaultModel = getDefaultLlmModel(
+    effectiveLlmProviderConfig?.provider,
+    {
       customApi,
       customModelId,
-    });
+    },
+  );
+  const fallbackThreadModel = selfhostRuntime
+    ? normalizeLlmModel(
+        thread.model,
+        effectiveLlmProviderConfig?.provider,
+        {
+          customApi,
+          customModelId,
+          awsRegion,
+          allowCamelCode: false,
+        },
+      )
+    : thread.model ?? providerDefaultModel;
   const fallbackAllowedThreadModels = getVisibleLlmModelOptions(
     fallbackThreadModel,
     {
@@ -902,7 +917,7 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
     : Promise.resolve([null, []] as const);
   const [activeChatGroup, moveChatGroups] = await activeChatGroupPromise;
   const resolvedThreadModel =
-    thread?.model ??
+    (selfhostRuntime ? fallbackThreadModel : thread?.model) ??
     pausedPickerState?.defaultModel ??
     fallbackThreadModel;
   recordChatThreadRouteLoaderStage(
@@ -1022,6 +1037,14 @@ export default function ChatPage() {
   const markViewedEnabled = chatDebugFlags.markViewed;
   const markThreadIdleRef = useRef(markThreadIdle);
   const resolvedActiveGroupId = activeGroupId ?? activeChatGroup?.id ?? null;
+  const selfhostDisplayFallbackModel =
+    threadModel ??
+    allowedThreadModels?.[0] ??
+    getDefaultLlmModel(llmProvider);
+  const modelForDisplay = (model: LlmModel): LlmModel =>
+    billingAccessMode === "selfhost" && model === CAMEL_CODE_LLM_MODEL
+      ? selfhostDisplayFallbackModel
+      : model;
   const liveActiveChatGroup =
     resolvedActiveGroupId && !readOnly
       ? liveChatGroups.find((group) => group.id === resolvedActiveGroupId) ??
@@ -1073,7 +1096,9 @@ export default function ChatPage() {
   const isDisplayingLoaderThread = displayThreadId === threadId;
   const displayThreadModel = isDisplayingLoaderThread
     ? threadModel
-    : (activeThreadSummary?.model ?? threadModel);
+    : activeThreadSummary
+      ? modelForDisplay(activeThreadSummary.model)
+      : threadModel;
   const displayAllowedThreadModels = allowedThreadModels;
   const cachedSnapshot = displayThreadId ? getSnapshot(displayThreadId) : null;
   const shouldUseCachedSnapshot = Boolean(
@@ -1118,7 +1143,7 @@ export default function ChatPage() {
     liveActiveChatGroup?.open_threads.map((thread) => ({
       threadId: thread.id,
       title: thread.title,
-      model: thread.model,
+      model: modelForDisplay(thread.model),
       status: thread.status,
     })) ?? [];
 
@@ -1126,7 +1151,7 @@ export default function ChatPage() {
     liveActiveChatGroup?.closed_threads.map((thread) => ({
       threadId: thread.id,
       title: thread.title,
-      model: thread.model,
+      model: modelForDisplay(thread.model),
       status: thread.status,
     })) ?? [];
   const liveChatGroupById = new Map(

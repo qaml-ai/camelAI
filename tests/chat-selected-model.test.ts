@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  isModelVisibleForChatRuntime,
   resolveAgentFallbackOptimisticModel,
   resolveSelectedThreadModel,
   shouldIgnoreOlderThreadModelUpdate,
@@ -13,6 +14,16 @@ const visibleCatalog = [
 ] as ModelCatalogEntry[];
 
 describe("new-chat selected model", () => {
+  it("never exposes camelCode in the self-host chat runtime", () => {
+    expect(
+      isModelVisibleForChatRuntime("deepseek-v4-auto", "selfhost"),
+    ).toBe(false);
+    expect(isModelVisibleForChatRuntime("sonnet", "selfhost")).toBe(true);
+    expect(
+      isModelVisibleForChatRuntime("deepseek-v4-auto", "camel_free"),
+    ).toBe(true);
+  });
+
   it("holds a recent Agent-state fallback over a stale loader model", () => {
     const now = Date.parse("2026-07-16T12:00:00.000Z");
     expect(

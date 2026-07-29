@@ -35,6 +35,7 @@ import {
   normalizeLlmModel,
 } from "./llm-provider-config";
 import { getEffectiveLlmProviderConfig } from "./selfhost-ai-provider";
+import { isSelfhostRuntime } from "./selfhost-runtime";
 import {
   MODEL_CATALOG,
   resolveModelPickerCatalog,
@@ -115,10 +116,26 @@ export function normalizeStoredThreadModel(
   return { model: normalizeLlmModel(rawModel) };
 }
 
+function normalizeRuntimeThreadModel(
+  env: CloudflareEnv,
+  rawModel: unknown,
+): LlmModel {
+  if (!isSelfhostRuntime(env)) {
+    return normalizeStoredThreadModel(rawModel).model;
+  }
+  const providerConfig = getEffectiveLlmProviderConfig(env, null);
+  return normalizeLlmModel(rawModel, providerConfig?.provider, {
+    customApi: getStoredCustomLlmProviderApi(providerConfig),
+    customModelId: getStoredCustomLlmProviderModelId(providerConfig),
+    awsRegion: getStoredBedrockAwsRegion(providerConfig),
+    allowCamelCode: false,
+  });
+}
+
 // Full thread records are used by single-thread loaders and new-thread
 // transcript hydration, so canonical message metadata must remain unbounded.
-function toThread(orgThread: OrgThread): Thread {
-  const { model } = normalizeStoredThreadModel(orgThread.model);
+function toThread(env: CloudflareEnv, orgThread: OrgThread): Thread {
+  const model = normalizeRuntimeThreadModel(env, orgThread.model);
   return {
     id: orgThread.id,
     workspace_id: orgThread.workspace_id,
@@ -146,8 +163,11 @@ function toThread(orgThread: OrgThread): Thread {
 
 // List and history surfaces should not serialize full prompt text. Keep this
 // mapper separate from toThread so transcript hydration keeps full metadata.
-function toThreadListPreview(orgThread: OrgThread): Thread {
-  const thread = toThread(orgThread);
+function toThreadListPreview(
+  env: CloudflareEnv,
+  orgThread: OrgThread,
+): Thread {
+  const thread = toThread(env, orgThread);
   return {
     ...thread,
     first_user_message: truncateThreadPreviewText(thread.first_user_message, 500),
@@ -490,7 +510,7 @@ export async function getThreads(
   if (!wsInfo) return [];
   const orgStub = env.ORG.get(env.ORG.idFromName(wsInfo.org_id));
   const threads = await orgStub.getThreadsByWorkspace(workspaceId);
-  return threads.map((t) => toThreadListPreview(t));
+  return threads.map((t) => toThreadListPreview(env, t));
 }
 
 export async function getThreadsPaginated(
@@ -521,7 +541,7 @@ export async function getThreadsPaginated(
   const searchTerms = parseThreadSearchTerms(params.searchQuery);
   return {
     items: result.items.map((thread) => {
-      const preview = toThreadListPreview(thread);
+      const preview = toThreadListPreview(env, thread);
       return searchTerms.length > 0
         ? {
             ...preview,
@@ -566,7 +586,7 @@ export async function getThreadsPaginatedAllWorkspaces(
   const searchTerms = parseThreadSearchTerms(params.searchQuery);
   return {
     items: result.items.map((thread) => {
-      const preview = toThreadListPreview(thread);
+      const preview = toThreadListPreview(env, thread);
       return searchTerms.length > 0
         ? {
             ...preview,
@@ -641,7 +661,7 @@ export async function createThread(
     firstUserMessage,
     selectedModel,
   );
-  return toThread(thread);
+  return toThread(env, thread);
 }
 
 export async function createThreadWithValidatedAccess(
@@ -668,7 +688,7 @@ export async function createThreadWithValidatedAccess(
     firstUserMessage,
     selectedModel,
   );
-  return toThread(thread);
+  return toThread(env, thread);
 }
 
 export async function getRecentThreads(
@@ -692,7 +712,7 @@ export async function getRecentThreads(
     workspaceId,
     createdBy,
   );
-  return result.items.map((t) => toThreadListPreview(t));
+  return result.items.map((t) => toThreadListPreview(env, t));
 }
 
 export async function getThread(
@@ -715,7 +735,7 @@ export async function getThread(
   if (!thread) return null;
   // Verify the thread belongs to this workspace
   if (thread.workspace_id !== workspaceId) return null;
-  return toThread(thread);
+  return toThread(env, thread);
 }
 
 export async function getThreadsByIds(
@@ -735,7 +755,7 @@ export async function getThreadsByIds(
     "OrgDO.getThreadsByIds",
     () => orgStub.getThreadsByIds(workspaceId, uniqueThreadIds),
   );
-  return threads.map((thread) => toThreadListPreview(thread));
+  return threads.map((thread) => toThreadListPreview(env, thread));
 }
 
 export async function updateThread(
@@ -758,7 +778,7 @@ export async function updateThread(
   if (!existing || existing.workspace_id !== workspaceId) return null;
   const thread = await orgStub.updateThread(id, title);
   if (!thread) return null;
-  return toThread(thread);
+  return toThread(env, thread);
 }
 
 export async function updateThreadModel(
@@ -800,7 +820,7 @@ export async function updateThreadModel(
     throw new Error("Invalid thread model");
   }
   const updated = await orgStub.updateThreadModel(id, model);
-  return updated ? toThread(updated) : null;
+  return updated ? toThread(env, updated) : null;
 }
 
 export async function setThreadFirstUserMessage(
@@ -818,7 +838,7 @@ export async function setThreadFirstUserMessage(
   if (!existing || existing.workspace_id !== workspaceId) return null;
   const thread = await orgStub.setThreadFirstUserMessage(id, firstUserMessage);
   if (!thread) return null;
-  return toThread(thread);
+  return toThread(env, thread);
 }
 
 export async function deleteThread(

@@ -230,6 +230,88 @@ describe('getWorkspaceModelPickerState rollout compatibility', () => {
     );
   });
 
+  it('never exposes or accepts camelCode in self-host mode', async () => {
+    const workspaceStub = {
+      getInfo: vi.fn().mockResolvedValue({ org_id: 'org_123' }),
+      getModelPickerConfig: vi.fn().mockResolvedValue({
+        use_org_defaults: true,
+        models: [],
+        default_model: null,
+      }),
+    };
+    const orgStub = {
+      getInfo: vi.fn().mockResolvedValue({
+        billing_status: 'inactive',
+        billing_credit_purchase_total_cents: 0,
+        billing_credit_grant_total_cents: 0,
+      }),
+      getLlmProviderConfig: vi.fn().mockResolvedValue(null),
+      getModelPickerConfig: vi.fn().mockResolvedValue({
+        use_platform_defaults: true,
+        models: [],
+        default_model: null,
+      }),
+      createThread: vi.fn().mockResolvedValue({
+        id: 'thread_selfhost',
+        workspace_id: 'ws_123',
+        title: 'New Chat',
+        created_by: 'user_123',
+        model: 'sonnet',
+        created_at: 1,
+        updated_at: 1,
+        user_message_count: 0,
+        first_user_message: null,
+      }),
+    };
+
+    getEnvMock.mockReturnValue({
+      CF_ACCOUNT_ID: 'selfhost',
+      SELFHOST_AI_PROVIDER: 'bedrock',
+      SELFHOST_AI_API_KEY: 'bedrock-api-key-test',
+      SELFHOST_AI_AWS_REGION: 'us-east-1',
+      WORKSPACE: {
+        idFromName: (id: string) => id,
+        get: () => workspaceStub,
+      },
+      ORG: {
+        idFromName: (id: string) => id,
+        get: () => orgStub,
+      },
+    });
+
+    const state = await getWorkspaceModelPickerState({}, 'ws_123');
+
+    expect(state).toMatchObject({
+      billingAccessMode: 'selfhost',
+      llmProvider: 'bedrock',
+      defaultModel: 'sonnet',
+    });
+    expect(state?.modelOptions.map((option) => option.id)).not.toContain(
+      CAMEL_CODE_LLM_MODEL,
+    );
+    expect(state?.allowedThreadModels).not.toContain(CAMEL_CODE_LLM_MODEL);
+
+    await expect(
+      createThread(
+        {},
+        'ws_123',
+        'New Chat',
+        'user_123',
+        undefined,
+        CAMEL_CODE_LLM_MODEL,
+      ),
+    ).rejects.toThrow('Invalid thread model');
+
+    await createThread({}, 'ws_123', 'New Chat', 'user_123');
+    expect(orgStub.createThread).toHaveBeenCalledWith(
+      'ws_123',
+      'New Chat',
+      'user_123',
+      undefined,
+      'sonnet',
+    );
+  });
+
   it('keeps the hosted premium default for a subscribed organization', async () => {
     const workspaceStub = {
       getInfo: vi.fn().mockResolvedValue({ org_id: 'org_123' }),
@@ -1111,6 +1193,44 @@ describe('getWorkspaceModelPickerState rollout compatibility', () => {
     const thread = await getThread({}, 'thread_123', 'ws_123');
 
     expect(thread?.model).toBe('gemini-3.5-flash');
+  });
+
+  it('replaces retained camelCode before returning self-host threads to React', async () => {
+    const workspaceStub = {
+      getInfo: vi.fn().mockResolvedValue({ org_id: 'org_123' }),
+    };
+    const orgStub = {
+      getThread: vi.fn().mockResolvedValue({
+        id: 'thread_123',
+        workspace_id: 'ws_123',
+        title: 'Migrated self-host thread',
+        created_by: 'user_123',
+        model: CAMEL_CODE_LLM_MODEL,
+        created_at: 1,
+        updated_at: 2,
+        user_message_count: 0,
+        first_user_message: null,
+      }),
+    };
+
+    getEnvMock.mockReturnValue({
+      CF_ACCOUNT_ID: 'selfhost',
+      SELFHOST_AI_PROVIDER: 'bedrock',
+      SELFHOST_AI_API_KEY: 'bedrock-api-key-test',
+      SELFHOST_AI_AWS_REGION: 'us-east-1',
+      WORKSPACE: {
+        idFromName: (id: string) => id,
+        get: () => workspaceStub,
+      },
+      ORG: {
+        idFromName: (id: string) => id,
+        get: () => orgStub,
+      },
+    });
+
+    const thread = await getThread({}, 'thread_123', 'ws_123');
+
+    expect(thread?.model).toBe('sonnet');
   });
 
   it('keeps full prompts for single thread reads but bounds recent-thread previews', async () => {

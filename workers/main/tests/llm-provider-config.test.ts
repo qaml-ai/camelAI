@@ -248,6 +248,14 @@ describe("llm provider config helpers", () => {
         allowCamelCode: false,
       }).map((option) => option.value),
     ).toEqual([...ANTHROPIC_MODELS, ...BEDROCK_OPENAI_MODELS]);
+
+    expect(
+      getVisibleLlmModelOptions(CAMEL_CODE_MODEL, {
+        orgProvider: "bedrock",
+        awsRegion: "us-east-1",
+        allowCamelCode: false,
+      }).map((option) => option.value),
+    ).toEqual([...ANTHROPIC_MODELS, ...BEDROCK_OPENAI_MODELS]);
   });
 
   it("shows only policy-allowed model families for new chats", () => {

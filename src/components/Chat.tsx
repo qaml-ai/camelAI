@@ -268,6 +268,16 @@ type ChatBillingAccessMode =
   | "selfhost"
   | "camel_free";
 
+export function isModelVisibleForChatRuntime(
+  model: LlmModel,
+  billingAccessMode: ChatBillingAccessMode | null,
+): boolean {
+  return (
+    billingAccessMode !== "selfhost" ||
+    model !== CAMEL_CODE_LLM_MODEL
+  );
+}
+
 function sameJson(left: unknown, right: unknown): boolean {
   return left === right || JSON.stringify(left) === JSON.stringify(right);
 }
@@ -687,10 +697,10 @@ export default function Chat({
   initialUiMessages,
   olderUiMessagesCursor = null,
   initialTodos = [],
-  threadModel,
+  threadModel: providedThreadModel,
   llmProvider,
-  allowedThreadModels,
-  modelOptions,
+  allowedThreadModels: providedAllowedThreadModels,
+  modelOptions: providedModelOptions,
   effectivePickerDefaultModel = null,
   hasEffectivePickerDefault = false,
   billingAccessMode = null,
@@ -717,6 +727,25 @@ export default function Chat({
   bridgedStreamingMessageId,
   welcomeData,
 }: ChatProps) {
+  const threadModel =
+    providedThreadModel &&
+    !isModelVisibleForChatRuntime(providedThreadModel, billingAccessMode)
+      ? getDefaultLlmModel(llmProvider)
+      : providedThreadModel;
+  const allowedThreadModels = useMemo(
+    () =>
+      providedAllowedThreadModels?.filter((model) =>
+        isModelVisibleForChatRuntime(model, billingAccessMode),
+      ),
+    [billingAccessMode, providedAllowedThreadModels],
+  );
+  const modelOptions = useMemo(
+    () =>
+      providedModelOptions?.filter((entry) =>
+        isModelVisibleForChatRuntime(entry.id, billingAccessMode),
+      ),
+    [billingAccessMode, providedModelOptions],
+  );
   const navigate = useNavigate();
   const location = useLocation();
   const locationPathname = location.pathname;
@@ -1373,12 +1402,14 @@ export default function Chat({
       {
         orgProvider: llmProvider,
         allowOpenAiSubscription,
+        allowCamelCode: billingAccessMode !== "selfhost",
       },
     );
     return modelCatalogEntriesForIds(options.map((option) => option.value));
   }, [
     allowedThreadModels,
     allowOpenAiSubscription,
+    billingAccessMode,
     llmProvider,
     modelOptions,
     threadModel,
@@ -3123,7 +3154,12 @@ export default function Chat({
       const optimisticFallbackModel = resolveAgentFallbackOptimisticModel({
         threadId,
         model: state.model,
-        notice: fallbackNotice,
+        notice:
+          fallbackNotice &&
+          isLlmModel(state.model) &&
+          isModelVisibleForChatRuntime(state.model, billingAccessMode)
+            ? fallbackNotice
+            : null,
       });
       if (optimisticFallbackModel) {
         // Agent state is newer than the route's loader snapshot. Hold this as
@@ -3141,7 +3177,9 @@ export default function Chat({
       }
       if ("modelFallbackNotice" in state) {
         setModelFallbackNotice((current) =>
-          current?.id === fallbackNotice?.id
+          billingAccessMode === "selfhost"
+            ? null
+            : current?.id === fallbackNotice?.id
             ? current
             : (fallbackNotice ?? null),
         );
@@ -3190,7 +3228,10 @@ export default function Chat({
               : Date.now(),
         });
       }
-      if (isLlmModel(state.model)) {
+      if (
+        isLlmModel(state.model) &&
+        isModelVisibleForChatRuntime(state.model, billingAccessMode)
+      ) {
         const updatedAt =
           typeof state.modelUpdatedAt === "number" &&
           Number.isFinite(state.modelUpdatedAt)
@@ -3228,6 +3269,7 @@ export default function Chat({
     },
     [
       applyAgentPreviewState,
+      billingAccessMode,
       setConnectionSetupPrompt,
       handleTerminalError,
       threadId,
@@ -3794,6 +3836,9 @@ export default function Chat({
     }
     if (updateThreadModelFetcher.data.thread?.model) {
       const nextModel = updateThreadModelFetcher.data.thread.model;
+      if (!isModelVisibleForChatRuntime(nextModel, billingAccessMode)) {
+        return;
+      }
       const updatedAt = updateThreadModelFetcher.data.thread.updated_at;
       if (
         shouldIgnoreStaleThreadModelResult({
@@ -3836,6 +3881,7 @@ export default function Chat({
     }
   }, [
     llmProvider,
+    billingAccessMode,
     threadId,
     ready,
     threadModel,
@@ -3884,7 +3930,12 @@ export default function Chat({
       selectedThreadModel,
       refreshedThreadModel,
     );
-    if (!canonicalModel) return;
+    if (
+      !canonicalModel ||
+      !isModelVisibleForChatRuntime(canonicalModel, billingAccessMode)
+    ) {
+      return;
+    }
     optimisticThreadModelRef.current = {
       threadId,
       model: canonicalModel,
@@ -3900,7 +3951,13 @@ export default function Chat({
       model: canonicalModel,
       updatedAt: refreshedThreadModel?.updatedAt ?? Date.now(),
     });
-  }, [readOnly, refreshedThreadModel, selectedThreadModel, threadId]);
+  }, [
+    billingAccessMode,
+    readOnly,
+    refreshedThreadModel,
+    selectedThreadModel,
+    threadId,
+  ]);
 
   // The Durable Object persists hosted-credit fallback and normally broadcasts
   // the new model through Agent state. Reconcile from the independent

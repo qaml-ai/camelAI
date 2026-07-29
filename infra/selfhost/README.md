@@ -341,8 +341,7 @@ release. The instance role is for SSM and bootstrap secret reads only. Bedrock
 model access and regional availability still apply.
 
 The standalone default is the supported Bedrock model configured by the model
-catalog. camelCode is a camelAI-hosted route and is not offered by this
-standalone provider path.
+catalog.
 
 Anthropic, OpenAI, and OpenRouter use the same key fields:
 

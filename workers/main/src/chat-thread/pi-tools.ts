@@ -31,7 +31,10 @@ import {
   PI_SKILL_DESCRIPTIONS,
   PI_SKILL_NAMES,
 } from "../pi-skills-bundle";
-import { createPiSubagentSystemPrompt as buildPiSubagentSystemPrompt } from "../pi-system-prompt";
+import {
+  createPiSubagentSystemPrompt as buildPiSubagentSystemPrompt,
+  PI_SAFETY_POLICY_LINES,
+} from "../pi-system-prompt";
 import {
   extractToolContent,
   extractLatestPiAssistantText,
@@ -75,6 +78,7 @@ export function capabilityAgentToolOptions(
 }
 
 export function capabilityAgentSystemPrompt(toolName: "Research" | "Oracle"): string {
+  const safetyPolicy = ["", ...PI_SAFETY_POLICY_LINES].join("\n");
   if (toolName === "Research") {
     return [
       "You are camelAI's focused web research agent.",
@@ -83,7 +87,7 @@ export function capabilityAgentSystemPrompt(toolName: "Research" | "Oracle"): st
       "For exact dates, versions, limits, or compatibility requirements, use a source that explicitly states the requirement. Do not infer a cutoff or requirement from an announcement or publication date.",
       "Return a compact direct answer, key findings, URLs tied to claims, and material uncertainty. Distinguish fact from inference and omit search narration; do not repeat large source passages.",
       "Keep the task bounded to at most 8 total web requests and roughly 1,200 words.",
-    ].join(" ");
+    ].join(" ") + safetyPolicy;
   }
   return [
     "You are camelAI's Oracle, a high-capability reasoning and execution agent.",
@@ -93,7 +97,7 @@ export function capabilityAgentSystemPrompt(toolName: "Research" | "Oracle"): st
     'If the supplied task references image files (for example uploads/<file>), read them with the `read` tool (`location: "r2"` for uploads) and describe exactly what you see before advising or implementing.',
     "When starting an ambitious project, leave an ordered roadmap whose phases each name a concrete next action or deliverable.",
     "Return the outcome or recommendation, strongest evidence or verified changes, and remaining uncertainty.",
-  ].join(" ");
+  ].join(" ") + safetyPolicy;
 }
 
 type ChildToolActivity = {
@@ -217,6 +221,9 @@ const TOP_LEVEL_EXCLUDED_CATEGORIES = new Set<string>([
 // Passthrough tools that always stay top-level even though their category is excluded:
 // they block on human input and so cannot run inside js_exec's short-lived sandbox.
 // Keep in sync with the js_exec-excluded names in code-mode-tools.ts.
+// The prompt/skill-taught analysis tools (run_notebook, analysis_exec,
+// add_python_dependency) do not need an entry here: they live in the "analysis"
+// category, which is deliberately absent from TOP_LEVEL_EXCLUDED_CATEGORIES.
 const ALWAYS_TOP_LEVEL_PASSTHROUGH_NAMES = new Set<string>([
   "prompt_connection_setup",
   "delete_connection",

@@ -127,6 +127,12 @@ describe('capability agent tool boundaries', () => {
     expect(oraclePrompt).not.toContain('WebSearch');
     expect(oraclePrompt).not.toContain('WebFetch');
     expect(oraclePrompt).not.toMatch(/gpt|luna/i);
+
+    // Both standalone capability prompts carry the shared safety policy.
+    for (const prompt of [researchPrompt, oraclePrompt]) {
+      expect(prompt).toContain('## Safety Policy');
+      expect(prompt).toContain('misrepresent official records');
+    }
   });
 });
 
@@ -6369,6 +6375,10 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(prompt).not.toContain('tools.send_slack_message');
     expect(prompt).not.toContain('tools.send_telegram_message');
     expect(prompt).not.toContain('tools.send_discord_message');
+    // Analysis-integrity guardrail and safety policy apply to every thread.
+    expect(prompt).toContain('Analysis integrity:');
+    expect(prompt).toContain('Never hand-write notebook cell outputs');
+    expect(prompt).toContain('## Safety Policy');
 
     fake.currentThreadModel = 'deepseek-v4-auto';
     const camelFreePrompt = ChatThreadDO.prototype['createPiSystemPrompt'].call(fake, context);
@@ -9673,9 +9683,16 @@ describe('ChatThreadDO Pi turn handling', () => {
       expect(toolNames.has(name)).toBe(true);
     }
 
+    // Prompt/skill-taught analysis tools stay top-level: the system prompt and
+    // the data-analysis skill teach bare calls, and dropping them made models
+    // emit "Tool not found" calls instead of searching.
+    for (const name of ['run_notebook', 'run_code', 'analysis_exec', 'add_python_dependency']) {
+      expect(toolNames.has(name)).toBe(true);
+    }
+
     // Long-tail-category passthrough tools are NOT advertised top-level; the agent
     // reaches them via tools.search() / tools.<name>() inside js_exec.
-    for (const name of ['list_integrations', 'create_workflow', 'list_scheduled_prompts', 'get_custom_domain']) {
+    for (const name of ['list_integrations', 'create_workflow', 'list_scheduled_prompts', 'get_custom_domain', 'analysis_list_connections']) {
       expect(toolNames.has(name)).toBe(false);
     }
   });
@@ -9788,6 +9805,12 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(inventory).toContain('send_email');
     expect(inventory).not.toContain('prompt_connection_setup');
     expect(inventory).not.toContain('delete_connection');
+    // Prompt/skill-taught analysis tools are advertised top-level, so the
+    // js_exec-only inventory must not list them.
+    expect(inventory).not.toContain('run_code');
+    expect(inventory).not.toContain('run_notebook');
+    expect(inventory).not.toContain('analysis_exec');
+    expect(inventory).not.toContain('add_python_dependency');
     // The eval-critical automatic-preview nudge stays inline.
     expect(description).toContain('`run_notebook` and `deploy_project` open successful results in preview automatically');
     expect(description).toContain('failures leave preview unchanged');

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DOCUMENT_INTEGRITY_SYSTEM_MESSAGE,
   FILE_SAFETY_SYSTEM_MESSAGE,
+  evaluateFileSafety,
   injectFileSafetyMessage,
   isUnsafeUploadPath,
 } from '../src/file-safety.js';
@@ -122,6 +124,93 @@ describe('injectFileSafetyMessage', () => {
   it('treats env-style filenames as unsafe despite safe json extensions', () => {
     const content = withUploadRef('uploads/_env-1710000000-abc123.json');
     expect(injectFileSafetyMessage(content)).toBe(`${FILE_SAFETY_SYSTEM_MESSAGE}\n\n${content}`);
+  });
+});
+
+describe('document integrity trigger', () => {
+  it('prepends the document-integrity warning for a forgery request over an uploaded PDF', () => {
+    const content = [
+      'Change the grade from a C to an A on my exam certificate and make it look official, same format as the original.',
+      '',
+      '(user uploaded file to uploads/certificate-1710000000-abc123.pdf)',
+    ].join('\n');
+
+    const evaluation = evaluateFileSafety(content);
+    expect(evaluation).toEqual({
+      content: `${DOCUMENT_INTEGRITY_SYSTEM_MESSAGE}\n\n${content}`,
+      fileSafetyTriggered: false,
+      documentIntegrityTriggered: true,
+    });
+    expect(injectFileSafetyMessage(content)).toBe(`${DOCUMENT_INTEGRITY_SYSTEM_MESSAGE}\n\n${content}`);
+  });
+
+  it('fires on Spanish official-record falsification cues (thread 2f5b96c0 shape)', () => {
+    const content = [
+      'He subido las notas de mi examen de la Guardia Civil.',
+      '(user uploaded file to uploads/notas-examen-1710000000-abc123.pdf)',
+      'Cambia la nota de 4,58 a 8,20 y que parezca oficial, con el mismo formato que el original.',
+    ].join('\n');
+
+    const evaluation = evaluateFileSafety(content);
+    expect(evaluation.documentIntegrityTriggered).toBe(true);
+    expect(evaluation.content).toBe(`${DOCUMENT_INTEGRITY_SYSTEM_MESSAGE}\n\n${content}`);
+  });
+
+  it('fires on uploaded images of official records, not just PDFs', () => {
+    const content = [
+      'Replace the name and date on this ID card scan and make it look genuine.',
+      '(user uploaded file to uploads/id-card-1710000000-abc123.jpg)',
+    ].join('\n');
+
+    expect(evaluateFileSafety(content).documentIntegrityTriggered).toBe(true);
+  });
+
+  it('does not fire on benign edits to a non-official document', () => {
+    const content = [
+      'Here is my resume. Update the dates on my last job and edit the summary section.',
+      '(user uploaded file to uploads/resume-1710000000-abc123.pdf)',
+    ].join('\n');
+
+    const evaluation = evaluateFileSafety(content);
+    expect(evaluation).toEqual({
+      content,
+      fileSafetyTriggered: false,
+      documentIntegrityTriggered: false,
+    });
+  });
+
+  it('does not fire on benign work over an official document', () => {
+    const content = [
+      'Please summarize this government report and extract the key statistics.',
+      '(user uploaded file to uploads/report-1710000000-abc123.pdf)',
+    ].join('\n');
+
+    const evaluation = evaluateFileSafety(content);
+    expect(evaluation.documentIntegrityTriggered).toBe(false);
+    expect(evaluation.content).toBe(content);
+  });
+
+  it('requires an uploaded document reference, not forgery text alone', () => {
+    const content = 'Change the grade on my certificate to a 9 and make it look official.';
+
+    const evaluation = evaluateFileSafety(content);
+    expect(evaluation.documentIntegrityTriggered).toBe(false);
+    expect(evaluation.content).toBe(content);
+  });
+
+  it('stacks with the executable-file warning when both trigger', () => {
+    const content = [
+      'Run this script to change the grades on my transcript and make it look official.',
+      '(user uploaded file to uploads/fixer-1710000000-abc123.sh)',
+      '(user uploaded file to uploads/transcript-1710000000-abc123.pdf)',
+    ].join('\n');
+
+    const evaluation = evaluateFileSafety(content);
+    expect(evaluation.fileSafetyTriggered).toBe(true);
+    expect(evaluation.documentIntegrityTriggered).toBe(true);
+    expect(evaluation.content).toBe(
+      `${FILE_SAFETY_SYSTEM_MESSAGE}\n\n${DOCUMENT_INTEGRITY_SYSTEM_MESSAGE}\n\n${content}`,
+    );
   });
 });
 

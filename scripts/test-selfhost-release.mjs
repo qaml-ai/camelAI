@@ -337,6 +337,18 @@ assert(
   bundledDockerfile.includes("RUN bun run build:cf"),
   "bundled app image must build the application at image-build time",
 );
+assert(
+  bundledDockerfile.includes(
+    "COPY package.json bun.lock ./\nCOPY patches ./patches\nRUN bun install --frozen-lockfile",
+  ),
+  "bundled app build must copy patched dependencies before installing",
+);
+assert(
+  bundledDockerfile.includes(
+    "COPY package.json bun.lock ./\nCOPY patches ./patches\nRUN bun install --frozen-lockfile --production",
+  ),
+  "bundled app runtime must copy patched dependencies before installing",
+);
 const bundledCommand =
   bundledDockerfile.match(/^CMD\s+(.+)$/m)?.[1] ?? "";
 assert(

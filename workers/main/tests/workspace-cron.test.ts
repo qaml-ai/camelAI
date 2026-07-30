@@ -1059,4 +1059,251 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
     expect(afterDue?.next_run_at).toBeNull();
     expect(afterDue?.last_run_error).toBe('workspace_unavailable');
   });
+
+  describe('billing-failure auto-pause', () => {
+    const BILLING_ERROR =
+      'Hosted model credits are used up. Buy more credits or add an API key to continue.';
+    const PAUSE_PREFIX = 'Schedule paused after repeated billing failures:';
+
+    async function setupPrompt(ownerName: string) {
+      const { userId } = await createUser(testEnv, testEmail(), 'password123', ownerName);
+      const { org } = await createOrg(testEnv, `${ownerName} Org`, userId);
+      const workspaces = await listUserWorkspaces(testEnv, userId, org.id);
+      const workspaceId = workspaces[0]?.id;
+      expect(workspaceId).toBeTypeOf('string');
+      const cronStub = testEnv.WORKSPACE_CRON.get(
+        testEnv.WORKSPACE_CRON.idFromName(workspaceId!)
+      ) as DurableObjectStub<WorkspaceCronDO>;
+      const created = await cronStub.createScheduledPrompt({
+        workspaceId: workspaceId!,
+        name: 'Hourly digest',
+        prompt: 'Summarize workspace status.',
+        cronExpression: '0 * * * *',
+        createdBy: userId,
+      });
+      return { cronStub, workspaceId: workspaceId!, promptId: created.id };
+    }
+
+    async function latestRunId(
+      cronStub: DurableObjectStub<WorkspaceCronDO>,
+      workspaceId: string,
+      promptId: string,
+    ): Promise<string> {
+      const page = await cronStub.listAutomationRunsPage(workspaceId, {
+        kind: 'scheduled_prompt',
+        automationId: promptId,
+        limit: 1,
+      });
+      const runId = page.runs[0]?.id;
+      expect(runId).toBeTypeOf('string');
+      return runId!;
+    }
+
+    async function runAndRecord(
+      cronStub: DurableObjectStub<WorkspaceCronDO>,
+      workspaceId: string,
+      promptId: string,
+      status: 'success' | 'error' | 'question' | 'busy',
+      message?: string,
+    ): Promise<string> {
+      await cronStub.runScheduledPromptNow(workspaceId, promptId);
+      const runId = await latestRunId(cronStub, workspaceId, promptId);
+      const recorded = await cronStub.recordScheduledPromptRunResult({
+        workspaceId,
+        promptId,
+        runId,
+        status,
+        message,
+        completedAt: status === 'question' ? null : Date.now(),
+      });
+      expect(recorded).toBe(true);
+      return runId;
+    }
+
+    async function getPrompt(
+      cronStub: DurableObjectStub<WorkspaceCronDO>,
+      workspaceId: string,
+      promptId: string,
+    ) {
+      const prompt = (await cronStub.listScheduledPrompts(workspaceId)).find(
+        (candidate) => candidate.id === promptId,
+      );
+      expect(prompt).toBeDefined();
+      return prompt!;
+    }
+
+    it('auto-pauses after three consecutive billing failures and preserves the pause against a late success', async () => {
+      const base = Date.parse('2031-01-01T00:00:30.000Z');
+      useFixedTime(new Date(base).toISOString());
+      const { cronStub, workspaceId, promptId } = await setupPrompt('Pause Streak Owner');
+
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        vi.setSystemTime(new Date(base + attempt * 60_000));
+        await runAndRecord(cronStub, workspaceId, promptId, 'error', BILLING_ERROR);
+        const after = await getPrompt(cronStub, workspaceId, promptId);
+        expect(after.consecutive_billing_failures).toBe(attempt);
+        expect(after.enabled).toBe(true);
+        expect(after.auto_paused).toBe(false);
+        expect(after.next_run_at).toBeTypeOf('number');
+      }
+
+      vi.setSystemTime(new Date(base + 3 * 60_000));
+      const runId3 = await runAndRecord(cronStub, workspaceId, promptId, 'error', BILLING_ERROR);
+      const paused = await getPrompt(cronStub, workspaceId, promptId);
+      expect(paused.enabled).toBe(false);
+      expect(paused.next_run_at).toBeNull();
+      expect(paused.auto_paused).toBe(true);
+      expect(paused.consecutive_billing_failures).toBe(3);
+      expect(paused.last_run_status).toBe('error');
+      expect(paused.last_run_error).toContain(PAUSE_PREFIX);
+      expect(paused.last_run_error).toContain('credits are used up');
+
+      // The paused schedule must not re-arm: a later alarm wake runs nothing.
+      const runCountBefore = paused.run_count;
+      vi.setSystemTime(new Date(base + 3 * 60 * 60_000));
+      await cronStub.runDueAutomationsForTest(workspaceId);
+      const afterAlarm = await getPrompt(cronStub, workspaceId, promptId);
+      expect(afterAlarm.enabled).toBe(false);
+      expect(afterAlarm.next_run_at).toBeNull();
+      expect(afterAlarm.run_count).toBe(runCountBefore);
+
+      // A late duplicate success completion for the final run must not clear
+      // the pause summary or the streak.
+      const lateSuccess = await cronStub.recordScheduledPromptRunResult({
+        workspaceId,
+        promptId,
+        runId: runId3,
+        status: 'success',
+        completedAt: Date.now(),
+      });
+      expect(lateSuccess).toBe(true);
+      const afterLateSuccess = await getPrompt(cronStub, workspaceId, promptId);
+      expect(afterLateSuccess.enabled).toBe(false);
+      expect(afterLateSuccess.auto_paused).toBe(true);
+      expect(afterLateSuccess.consecutive_billing_failures).toBe(3);
+      expect(afterLateSuccess.last_run_status).toBe('error');
+      expect(afterLateSuccess.last_run_error).toContain(PAUSE_PREFIX);
+    });
+
+    it('does not count busy or non-billing errors toward the billing pause', async () => {
+      const base = Date.parse('2031-01-02T00:00:30.000Z');
+      useFixedTime(new Date(base).toISOString());
+      const { cronStub, workspaceId, promptId } = await setupPrompt('Transient Owner');
+
+      const outcomes: Array<{ status: 'error' | 'busy'; message: string }> = [
+        { status: 'error', message: 'TypeError: fetch failed' },
+        { status: 'busy', message: 'Thread is busy with another run' },
+        { status: 'error', message: 'Internal error: DO restarted' },
+        { status: 'busy', message: 'Thread is busy with another run' },
+      ];
+      for (const [index, outcome] of outcomes.entries()) {
+        vi.setSystemTime(new Date(base + (index + 1) * 60_000));
+        await runAndRecord(cronStub, workspaceId, promptId, outcome.status, outcome.message);
+        const after = await getPrompt(cronStub, workspaceId, promptId);
+        expect(after.consecutive_billing_failures).toBe(0);
+        expect(after.enabled).toBe(true);
+        expect(after.auto_paused).toBe(false);
+      }
+    });
+
+    it('success and question outcomes reset the billing-failure streak', async () => {
+      const base = Date.parse('2031-01-03T00:00:30.000Z');
+      useFixedTime(new Date(base).toISOString());
+      const { cronStub, workspaceId, promptId } = await setupPrompt('Reset Owner');
+
+      vi.setSystemTime(new Date(base + 60_000));
+      await runAndRecord(cronStub, workspaceId, promptId, 'error', BILLING_ERROR);
+      vi.setSystemTime(new Date(base + 2 * 60_000));
+      await runAndRecord(cronStub, workspaceId, promptId, 'error', BILLING_ERROR);
+      expect(
+        (await getPrompt(cronStub, workspaceId, promptId)).consecutive_billing_failures,
+      ).toBe(2);
+
+      vi.setSystemTime(new Date(base + 3 * 60_000));
+      await runAndRecord(cronStub, workspaceId, promptId, 'success');
+      expect(
+        (await getPrompt(cronStub, workspaceId, promptId)).consecutive_billing_failures,
+      ).toBe(0);
+
+      // A fresh streak after the reset stays below the pause threshold.
+      vi.setSystemTime(new Date(base + 4 * 60_000));
+      await runAndRecord(cronStub, workspaceId, promptId, 'error', BILLING_ERROR);
+      vi.setSystemTime(new Date(base + 5 * 60_000));
+      await runAndRecord(cronStub, workspaceId, promptId, 'error', BILLING_ERROR);
+      const afterSecondStreak = await getPrompt(cronStub, workspaceId, promptId);
+      expect(afterSecondStreak.consecutive_billing_failures).toBe(2);
+      expect(afterSecondStreak.enabled).toBe(true);
+
+      vi.setSystemTime(new Date(base + 6 * 60_000));
+      await runAndRecord(cronStub, workspaceId, promptId, 'question', 'Should I continue?');
+      const afterQuestion = await getPrompt(cronStub, workspaceId, promptId);
+      expect(afterQuestion.consecutive_billing_failures).toBe(0);
+      expect(afterQuestion.enabled).toBe(true);
+    });
+
+    it('stale run completions do not touch the billing-failure streak', async () => {
+      const base = Date.parse('2031-01-04T00:00:30.000Z');
+      useFixedTime(new Date(base).toISOString());
+      const { cronStub, workspaceId, promptId } = await setupPrompt('Stale Streak Owner');
+
+      vi.setSystemTime(new Date(base + 60_000));
+      await cronStub.runScheduledPromptNow(workspaceId, promptId);
+      const firstRunId = await latestRunId(cronStub, workspaceId, promptId);
+      vi.setSystemTime(new Date(base + 2 * 60_000));
+      await cronStub.runScheduledPromptNow(workspaceId, promptId);
+      const secondRunId = await latestRunId(cronStub, workspaceId, promptId);
+      expect(secondRunId).not.toBe(firstRunId);
+
+      // The prompt's current run is the second one; a late billing-error
+      // completion for the first run must not move the streak.
+      const staleRecorded = await cronStub.recordScheduledPromptRunResult({
+        workspaceId,
+        promptId,
+        runId: firstRunId,
+        status: 'error',
+        message: BILLING_ERROR,
+      });
+      expect(staleRecorded).toBe(true);
+      const afterStale = await getPrompt(cronStub, workspaceId, promptId);
+      expect(afterStale.consecutive_billing_failures).toBe(0);
+      expect(afterStale.enabled).toBe(true);
+
+      // The current run still counts normally.
+      const currentRecorded = await cronStub.recordScheduledPromptRunResult({
+        workspaceId,
+        promptId,
+        runId: secondRunId,
+        status: 'error',
+        message: BILLING_ERROR,
+      });
+      expect(currentRecorded).toBe(true);
+      const afterCurrent = await getPrompt(cronStub, workspaceId, promptId);
+      expect(afterCurrent.consecutive_billing_failures).toBe(1);
+    });
+
+    it('re-enabling a paused schedule clears the billing-failure streak and re-arms it', async () => {
+      const base = Date.parse('2031-01-05T00:00:30.000Z');
+      useFixedTime(new Date(base).toISOString());
+      const { cronStub, workspaceId, promptId } = await setupPrompt('Resume Owner');
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        vi.setSystemTime(new Date(base + attempt * 60_000));
+        await runAndRecord(cronStub, workspaceId, promptId, 'error', BILLING_ERROR);
+      }
+      const paused = await getPrompt(cronStub, workspaceId, promptId);
+      expect(paused.enabled).toBe(false);
+      expect(paused.auto_paused).toBe(true);
+      expect(paused.consecutive_billing_failures).toBe(3);
+
+      const resumed = await cronStub.updateScheduledPrompt({
+        workspaceId,
+        id: promptId,
+        enabled: true,
+      });
+      expect(resumed?.enabled).toBe(true);
+      expect(resumed?.next_run_at).toBeTypeOf('number');
+      expect(resumed?.consecutive_billing_failures).toBe(0);
+      expect(resumed?.auto_paused).toBe(false);
+    });
+  });
 });

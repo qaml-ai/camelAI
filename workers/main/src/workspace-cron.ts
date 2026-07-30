@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { wrapWorkflowBinding } from "@cloudflare/dynamic-workflows";
-import type { OrgDO, OrgThread } from "./auth";
+import type { OrgDO, OrgThread, UserDO } from "./auth";
 import type {
   ChatThreadDO,
   InitialUserMessageRequest,
@@ -31,17 +31,34 @@ import {
   getBillingPlanLimits,
   type BillingPlanLimits,
 } from "../../../src/lib/billing-plans";
+import { isChatBillingOrCreditError } from "../../../src/lib/chat-api-errors";
+import { sendScheduledPromptPausedEmail } from "../../../src/lib/email.server";
+import type { CloudflareEmailSender } from "../../../src/lib/cloudflare-email.server";
 import type { LlmModel } from "../../../src/types";
 import {
   readOrgModelPickerConfig,
   readWorkspaceModelPickerConfig,
 } from "./model-picker-config-reader";
+import { recordObservabilityEvent } from "./observability";
 
 const MAX_DUE_JOBS_PER_ALARM = 20;
 const WORKSPACE_ID_KEY = "workspaceId";
 const AUTOMATION_WORKFLOW_BINDING = "DETERMINISTIC_AUTOMATION_WORKFLOWS";
 const SCHEDULE_DISABLED_BY_BILLING_PREFIX =
   "Schedule disabled by billing plan:";
+/**
+ * Prefix stamped on `last_run_error` when a scheduled prompt is auto-paused
+ * after repeated billing failures. Exported so UI/tests can detect the state.
+ */
+export const SCHEDULE_PAUSED_BILLING_FAILURES_PREFIX =
+  "Schedule paused after repeated billing failures:";
+/**
+ * Auto-pause a scheduled prompt once this many consecutive runs fail with a
+ * billing-classified error. Successful (or clarifying-question) runs reset the
+ * streak; busy and non-billing errors leave it unchanged.
+ */
+const SCHEDULED_PROMPT_BILLING_FAILURE_PAUSE_THRESHOLD = 3;
+const OBSERVABILITY_COMPONENT = "workspace_cron";
 
 function formatInterval(ms: number): string {
   if (ms % (24 * 60 * 60 * 1000) === 0) {
@@ -94,6 +111,7 @@ interface ScheduledPromptRow {
   last_run_status: string | null;
   last_run_error: string | null;
   run_count: number;
+  consecutive_billing_failures: number;
 }
 
 interface DeterministicAutomationRow {
@@ -222,6 +240,13 @@ export interface WorkspaceScheduledPrompt {
   last_run_status: RunStatus | null;
   last_run_error: string | null;
   run_count: number;
+  consecutive_billing_failures: number;
+  /**
+   * True when the schedule was automatically paused after repeated billing
+   * failures (derived from `enabled` + the pause-prefixed `last_run_error`).
+   * Re-enabling the schedule clears the failure streak.
+   */
+  auto_paused: boolean;
 }
 
 export interface WorkspaceDeterministicAutomation {
@@ -318,6 +343,7 @@ export interface ValidateDeterministicAutomationResult {
 
 export interface WorkspaceCronEnv {
   ORG: DurableObjectNamespace<OrgDO>;
+  USER: DurableObjectNamespace<UserDO>;
   WORKSPACE: DurableObjectNamespace<WorkspaceDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   R2_BUCKET: R2Bucket;
@@ -336,6 +362,10 @@ export interface WorkspaceCronEnv {
   SELFHOST_AI_API?: string;
   SELFHOST_AI_AWS_REGION?: string;
   WORKER_BASE_URL?: string;
+  EMAIL?: CloudflareEmailSender;
+  EMAIL_FROM_ADDRESS?: string;
+  OBSERVABILITY_EVENTS?: AnalyticsEngineDataset;
+  ERROR_ANALYTICS?: AnalyticsEngineDataset;
 }
 
 export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
@@ -471,6 +501,13 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       );
       this.ctx.storage.kv.put("schemaVersion", 6);
     }
+
+    if (version < 7) {
+      this.sql.exec(
+        "ALTER TABLE scheduled_prompts ADD COLUMN consecutive_billing_failures INTEGER NOT NULL DEFAULT 0",
+      );
+      this.ctx.storage.kv.put("schemaVersion", 7);
+    }
   }
 
   private normalizeWorkspaceId(workspaceId: string): string {
@@ -517,6 +554,10 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       last_run_status: (row.last_run_status as RunStatus | null) ?? null,
       last_run_error: row.last_run_error,
       run_count: row.run_count,
+      consecutive_billing_failures: row.consecutive_billing_failures ?? 0,
+      auto_paused:
+        row.enabled === 0 &&
+        this.isSchedulePausedByBillingFailuresMessage(row.last_run_error),
     };
   }
 
@@ -951,6 +992,33 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     message: string | null | undefined,
   ): boolean {
     return Boolean(message?.startsWith(SCHEDULE_DISABLED_BY_BILLING_PREFIX));
+  }
+
+  private formatSchedulePausedByBillingFailuresMessage(
+    message: string,
+  ): string {
+    return `${SCHEDULE_PAUSED_BILLING_FAILURES_PREFIX} ${message}`;
+  }
+
+  private isSchedulePausedByBillingFailuresMessage(
+    message: string | null | undefined,
+  ): boolean {
+    return Boolean(
+      message?.startsWith(SCHEDULE_PAUSED_BILLING_FAILURES_PREFIX),
+    );
+  }
+
+  /**
+   * Whether a `last_run_error` summary records a billing-driven disable/pause
+   * that a late-arriving success completion must not overwrite.
+   */
+  private isBillingProtectedSummaryMessage(
+    message: string | null | undefined,
+  ): boolean {
+    return (
+      this.isScheduleDisabledByBillingMessage(message) ||
+      this.isSchedulePausedByBillingFailuresMessage(message)
+    );
   }
 
   private async resolveDefaultThreadModel(
@@ -1675,9 +1743,12 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       }
     }
 
+    // Re-enabling grants a fresh run of billing-failure attempts (e.g. after
+    // topping up credits), so the auto-pause streak resets with it.
+    const reenabling = enabled && !existingPrompt.enabled;
     this.sql.exec(
       `UPDATE scheduled_prompts
-       SET name = ?, prompt = ?, cron_expression = ?, enabled = ?, updated_at = ?, next_run_at = ?
+       SET name = ?, prompt = ?, cron_expression = ?, enabled = ?, updated_at = ?, next_run_at = ?, consecutive_billing_failures = ?
        WHERE id = ?`,
       name,
       prompt,
@@ -1685,8 +1756,23 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       enabled ? 1 : 0,
       now,
       nextRunAt,
+      reenabling ? 0 : (existing.consecutive_billing_failures ?? 0),
       existingPrompt.id,
     );
+    if (
+      reenabling &&
+      this.isSchedulePausedByBillingFailuresMessage(existing.last_run_error)
+    ) {
+      recordObservabilityEvent(this.env, {
+        event: "scheduled_prompt_resumed",
+        component: OBSERVABILITY_COMPONENT,
+        operation: "update",
+        status: "resumed",
+        threadId: existing.thread_id,
+        workspaceId: workspace.id,
+        orgId: workspace.org_id,
+      });
+    }
 
     await this.scheduleNextAlarm();
     const updated = this.getPromptRow(existingPrompt.id);
@@ -1939,6 +2025,18 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       existing.id,
     );
 
+    if (!dispatch.accepted) {
+      // The run failed to start, so this is its final outcome; accepted runs
+      // report theirs later through recordScheduledPromptRunResult.
+      await this.applyScheduledRunOutcome(existing.id, {
+        status: dispatch.status,
+        message: dispatch.error ?? null,
+        trigger: "manual",
+        workspaceId,
+        orgId: workspace.org_id,
+      });
+    }
+
     await this.scheduleNextAlarm();
     const updated = this.getPromptRow(existing.id);
     if (!updated) return null;
@@ -2090,6 +2188,179 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     };
   }
 
+  /**
+   * Update the consecutive-billing-failure streak for a scheduled prompt after
+   * a run outcome is known, auto-pausing the schedule once the streak reaches
+   * {@link SCHEDULED_PROMPT_BILLING_FAILURE_PAUSE_THRESHOLD}.
+   *
+   * Semantics:
+   * - "success" / "question" reset the streak to 0.
+   * - "error" with a billing-classified message increments the streak.
+   * - "busy" and non-billing errors leave the streak unchanged (transient).
+   *
+   * Callers must only invoke this for the prompt's current run (never for a
+   * stale late completion), so the streak reflects consecutive outcomes.
+   */
+  private async applyScheduledRunOutcome(
+    promptId: string,
+    outcome: {
+      status: RunStatus;
+      message: string | null;
+      trigger: AutomationRunTrigger;
+      workspaceId: string;
+      orgId?: string | null;
+    },
+  ): Promise<void> {
+    const prompt = this.getPromptRow(promptId);
+    if (!prompt) return;
+
+    if (outcome.status === "success" || outcome.status === "question") {
+      if ((prompt.consecutive_billing_failures ?? 0) !== 0) {
+        this.sql.exec(
+          "UPDATE scheduled_prompts SET consecutive_billing_failures = 0 WHERE id = ?",
+          promptId,
+        );
+      }
+      return;
+    }
+
+    if (outcome.status !== "error") return;
+    const message = outcome.message?.trim();
+    if (!message || !isChatBillingOrCreditError(message)) return;
+
+    const streak = (prompt.consecutive_billing_failures ?? 0) + 1;
+    this.sql.exec(
+      "UPDATE scheduled_prompts SET consecutive_billing_failures = ? WHERE id = ?",
+      streak,
+      promptId,
+    );
+    recordObservabilityEvent(this.env, {
+      event: "scheduled_prompt_billing_failure",
+      severity: "warn",
+      component: OBSERVABILITY_COMPONENT,
+      operation: outcome.trigger,
+      status: "billing_failure",
+      threadId: prompt.thread_id,
+      workspaceId: outcome.workspaceId,
+      orgId: outcome.orgId ?? null,
+      errorMessage: message,
+      count: streak,
+    });
+
+    if (
+      streak < SCHEDULED_PROMPT_BILLING_FAILURE_PAUSE_THRESHOLD ||
+      prompt.enabled !== 1
+    ) {
+      return;
+    }
+
+    const pausedMessage =
+      this.formatSchedulePausedByBillingFailuresMessage(message);
+    this.sql.exec(
+      `UPDATE scheduled_prompts
+       SET enabled = 0, next_run_at = NULL, updated_at = ?, last_run_status = 'error', last_run_error = ?
+       WHERE id = ? AND enabled = 1`,
+      Date.now(),
+      pausedMessage,
+      promptId,
+    );
+    await this.scheduleNextAlarm();
+
+    let orgId = outcome.orgId ?? null;
+    if (!orgId) {
+      try {
+        orgId = (await this.getWorkspaceInfo(outcome.workspaceId)).org_id;
+      } catch {
+        // The pause itself must not depend on the org lookup succeeding.
+      }
+    }
+    recordObservabilityEvent(this.env, {
+      event: "scheduled_prompt_auto_paused",
+      severity: "warn",
+      component: OBSERVABILITY_COMPONENT,
+      operation: outcome.trigger,
+      status: "paused",
+      threadId: prompt.thread_id,
+      workspaceId: outcome.workspaceId,
+      orgId,
+      errorMessage: message,
+      count: streak,
+    });
+
+    this.ctx.waitUntil(
+      this.notifyScheduledPromptPaused(prompt, outcome.workspaceId, message).catch(
+        (error) => {
+          console.warn(
+            "[WorkspaceCronDO] scheduled prompt pause notification failed",
+            {
+              promptId,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
+        },
+      ),
+    );
+  }
+
+  /**
+   * Best-effort email to the schedule creator when a scheduled prompt is
+   * auto-paused after repeated billing failures. Degrades to a no-op when the
+   * creator has no resolvable profile/email or email bindings are unset.
+   */
+  private async notifyScheduledPromptPaused(
+    prompt: ScheduledPromptRow,
+    workspaceId: string,
+    billingErrorMessage: string,
+  ): Promise<void> {
+    const createdBy = prompt.created_by?.trim();
+    if (!createdBy || createdBy === "system") return;
+
+    const userStub = this.env.USER.get(
+      this.env.USER.idFromName(createdBy),
+    ) as DurableObjectStub<UserDO>;
+    const profile = await userStub.getProfile();
+    const email = profile?.email?.trim();
+    if (!email) return;
+
+    let workspaceName: string | null = null;
+    try {
+      const workspaceStub = this.env.WORKSPACE.get(
+        this.env.WORKSPACE.idFromName(workspaceId),
+      ) as DurableObjectStub<WorkspaceDO>;
+      workspaceName = (await workspaceStub.getInfo())?.name ?? null;
+    } catch {
+      // Name is cosmetic; send the notification without it.
+    }
+
+    let automationsUrl: string | null = null;
+    const baseUrl = this.env.WORKER_BASE_URL?.trim();
+    if (baseUrl) {
+      try {
+        automationsUrl = new URL("/automations", baseUrl).toString();
+      } catch {
+        automationsUrl = null;
+      }
+    }
+
+    const result = await sendScheduledPromptPausedEmail({
+      env: {
+        EMAIL: this.env.EMAIL,
+        EMAIL_FROM_ADDRESS: this.env.EMAIL_FROM_ADDRESS,
+      },
+      to: email,
+      scheduleName: prompt.name,
+      workspaceName,
+      billingError: billingErrorMessage,
+      automationsUrl,
+    });
+    if (result.status === "failed") {
+      console.warn("[WorkspaceCronDO] scheduled prompt pause email failed", {
+        promptId: prompt.id,
+        reason: result.reason,
+      });
+    }
+  }
+
   async recordScheduledPromptRunResult(
     input: RecordScheduledPromptRunResultInput,
   ): Promise<boolean> {
@@ -2129,11 +2400,18 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
 
     const now = Date.now();
     const currentPrompt = this.getPromptRow(promptId);
+    // Any completion that lands after the schedule was disabled or auto-paused
+    // for billing must leave that summary alone: it is the reason the schedule
+    // stopped, it is what `auto_paused` derives from, and it is what the user
+    // has to act on. A run can report more than once (a late duplicate, or a
+    // turn that fails asynchronously after the pause was written), and letting
+    // an unrelated later error overwrite the summary strands the schedule
+    // disabled with no explanation. The run row itself still records the real
+    // status/message above, so no detail is lost.
     const preserveBillingDisabledSummary =
-      input.status === "success" &&
       currentPrompt?.enabled === 0 &&
       currentPrompt.last_run_status === "error" &&
-      this.isScheduleDisabledByBillingMessage(currentPrompt.last_run_error);
+      this.isBillingProtectedSummaryMessage(currentPrompt.last_run_error);
     if (preserveBillingDisabledSummary) {
       this.sql.exec(
         `UPDATE scheduled_prompts
@@ -2151,7 +2429,7 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       return true;
     }
 
-    this.sql.exec(
+    const summaryUpdate = this.sql.exec(
       `UPDATE scheduled_prompts
        SET updated_at = ?, last_run_status = ?, last_run_error = ?
        WHERE id = ?
@@ -2166,6 +2444,16 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       runId,
       runRow.started_at,
     );
+    // Only the prompt's current run may move the billing-failure streak; a
+    // stale late completion (guarded UPDATE wrote no row) must not touch it.
+    if (summaryUpdate.rowsWritten > 0) {
+      await this.applyScheduledRunOutcome(promptId, {
+        status: input.status,
+        message,
+        trigger: runRow.trigger,
+        workspaceId: input.workspaceId,
+      });
+    }
     return true;
   }
 
@@ -2378,6 +2666,17 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
         dispatch.error ?? (!enabledAfterRun ? "No future run found" : null),
         prompt.id,
       );
+      if (!dispatch.accepted) {
+        // The run failed to start, so this is its final outcome; accepted runs
+        // report theirs later through recordScheduledPromptRunResult.
+        await this.applyScheduledRunOutcome(prompt.id, {
+          status: dispatch.status,
+          message: dispatch.error ?? null,
+          trigger: "schedule",
+          workspaceId,
+          orgId: workspace.org_id,
+        });
+      }
     }
 
     const dueAutomationRows = this.sql

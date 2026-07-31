@@ -52,7 +52,7 @@
 		{
 			"class_name": "ProjectBuildSandbox",
 			"image": "./workers/main/project-build-sandbox.Dockerfile",
-			"instance_type": "standard-4",
+			"instance_type": "standard-2",
 			"max_instances": 10
 		},
 		{

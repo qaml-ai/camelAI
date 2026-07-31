@@ -1,6 +1,7 @@
 import { Sandbox } from "@cloudflare/sandbox";
 
 import { createSingleFlight, isMountAlreadyPresent } from "./analysis-sandbox.js";
+import { DB_QUERY_SLEEP_AFTER } from "./container-sizing.js";
 import type { Env } from "./types.js";
 
 /** R2 binding name the export mount resolves against (credential-less mount). */
@@ -46,6 +47,8 @@ export class DbQuerySandbox extends Sandbox<Env> {
   // HTTPS interception governs the relay's cloudflared WSS and the R2 export
   // mount — kept on regardless of the internet switch.
   interceptHttps = true;
+  // Queries/exports are short-lived; sleep promptly to cut provisioned memory/disk.
+  sleepAfter = DB_QUERY_SLEEP_AFTER;
 
   // Mount paths already established in this container + a per-path single-flight
   // gate (same pattern as AnalysisSandbox.ensureMounted). Instance state on a

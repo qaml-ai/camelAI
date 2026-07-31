@@ -66,22 +66,25 @@
   "worker_loaders": [{ "binding": "CODE_MODE_LOADER" }],
   "containers": [
     {
+      // Per-org Vite/bun builds with a prewarmed bun cache. standard-2 (1 vCPU /
+      // 6 GiB / 12 GB) is enough — memory/disk are provisioned-billed while awake
+      // (see workers/main/src/container-sizing.ts).
       "class_name": "ProjectBuildSandbox",
       "image": "./workers/main/project-build-sandbox.Dockerfile",
-      "instance_type": "standard-4",
+      "instance_type": "standard-2",
       "max_instances": 100,
     },
     {
       // Unified analysis container (notebooks + shell + DuckDB) — successor to
-      // the warehouse tier. Largest instance type (4 vCPU / 12 GiB / 20 GB disk)
-      // for data-intensive DuckDB. The account-wide vCPU quota is shared across
-      // all environments and application creation/scale-up is rejected if the
-      // requested max_instances would exceed it; the 2026-07-10 orphan-app
-      // cleanup freed ~600 vCPU, so 100 × 4 = 400 vCPU fits with headroom.
-      // Ceiling is demand-driven, not reserved; scale-to-zero when idle.
+      // the warehouse tier. standard-3 (2 vCPU / 8 GiB / 16 GB) covers typical
+      // DuckDB/notebook work without standard-4's provisioned memory/disk cost.
+      // The account-wide vCPU quota is shared across all environments and
+      // application creation/scale-up is rejected if the requested max_instances
+      // would exceed it; 100 × 2 = 200 vCPU fits with headroom. Ceiling is
+      // demand-driven, not reserved; scale-to-zero when idle.
       "class_name": "AnalysisSandbox",
       "image": "./workers/main/analysis-sandbox.Dockerfile",
-      "instance_type": "standard-4",
+      "instance_type": "standard-3",
       "max_instances": 100,
     },
     {
@@ -90,7 +93,7 @@
       // THE SQL query/export path (connection MCP, DATA_PROXY user-app binding,
       // sandbox routes) — one warm container per active workspace, scale-to-zero
       // when idle, so the cap bounds concurrently-querying workspaces
-      // (25 × standard-1 = 25 vCPU, well under the account container budget).
+      // (25 × standard-1 = 12.5 vCPU, well under the account container budget).
       "class_name": "DbQuerySandbox",
       "image": "./workers/main/db-query-sandbox.Dockerfile",
       "instance_type": "standard-1",

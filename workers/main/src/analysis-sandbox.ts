@@ -1,5 +1,6 @@
 import { InvalidMountConfigError, S3FSMountError, Sandbox } from "@cloudflare/sandbox";
 
+import { ANALYSIS_SLEEP_AFTER } from "./container-sizing.js";
 import { handleAuthenticatedConnectionsRpc } from "./routes/connections-rpc.js";
 import type { Env } from "./types.js";
 
@@ -123,6 +124,9 @@ export class AnalysisSandbox extends Sandbox<Env> {
   // so the baked container-server trusts the interception CA for spawned
   // processes. connections.internal is plain HTTP and unaffected.
   interceptHttps = true;
+  // Memory/disk bill while awake; 5m is enough for interactive notebooks
+  // without the SDK's 10m default idle burn (see container-sizing.ts).
+  sleepAfter = ANALYSIS_SLEEP_AFTER;
 
   // Mount paths already established in this container, and a per-path single-flight
   // gate coalescing concurrent mount attempts of the SAME path. Both are tied to

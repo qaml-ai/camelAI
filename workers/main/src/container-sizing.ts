@@ -17,8 +17,11 @@
  * (tests/container-sizing.test.ts).
  */
 
-/** Per-org `bun install && bun run build` with a prewarmed bun cache. */
-export const PROJECT_BUILD_INSTANCE_TYPE = "standard-2";
+/**
+ * Per-org `bun install && bun run build` with a prewarmed bun cache.
+ * standard-3 (2 vCPU) keeps Vite/esbuild parallelism without standard-4 memory.
+ */
+export const PROJECT_BUILD_INSTANCE_TYPE = "standard-3";
 
 /**
  * Notebooks + DuckDB over mounted Parquet. Needs headroom above a Vite build,

@@ -66,12 +66,12 @@
   "worker_loaders": [{ "binding": "CODE_MODE_LOADER" }],
   "containers": [
     {
-      // Per-org Vite/bun builds with a prewarmed bun cache. standard-2 (1 vCPU /
-      // 6 GiB / 12 GB) is enough — memory/disk are provisioned-billed while awake
-      // (see workers/main/src/container-sizing.ts).
+      // Per-org Vite/bun builds with a prewarmed bun cache. standard-3 (2 vCPU /
+      // 8 GiB / 16 GB) keeps compile parallelism without standard-4 memory/disk
+      // (provisioned-billed while awake; see workers/main/src/container-sizing.ts).
       "class_name": "ProjectBuildSandbox",
       "image": "./workers/main/project-build-sandbox.Dockerfile",
-      "instance_type": "standard-2",
+      "instance_type": "standard-3",
       "max_instances": 100,
     },
     {

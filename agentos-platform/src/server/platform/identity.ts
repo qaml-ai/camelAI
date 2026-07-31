@@ -57,6 +57,10 @@ function userKey(id: string): string {
   return `user:${id}`;
 }
 
+function userPasswordKey(id: string): string {
+  return `user-password:${id}`;
+}
+
 function threadKey(id: string): string {
   return `thread:${id}`;
 }
@@ -155,6 +159,10 @@ export class IdentityService {
     if (!this.store.get(orgKey(input.orgId))) {
       throw new Error(`createUser: org not found: ${input.orgId}`);
     }
+    const existingUser = this.findUserByEmail(email);
+    if (existingUser) {
+      throw new Error(`createUser: email already exists: ${email}`);
+    }
     const id = input.id ?? `user_${randomUUID()}`;
     if (this.store.get(userKey(id))) {
       throw new Error(`createUser: user already exists: ${id}`);
@@ -172,6 +180,34 @@ export class IdentityService {
 
   getUser(id: string): User | undefined {
     return this.store.get<User>(userKey(id));
+  }
+
+  findUserByEmail(email: string): User | undefined {
+    const normalizedEmail = email?.trim().toLowerCase();
+    if (!normalizedEmail) {
+      return undefined;
+    }
+    return this.store
+      .listByPrefix<User>("user:")
+      .map((entry) => entry.value)
+      .find((user) => user.email.toLowerCase() === normalizedEmail);
+  }
+
+  setPasswordHash(userId: string, passwordHash: string): void {
+    if (!this.getUser(userId)) {
+      throw new Error(`setPasswordHash: user not found: ${userId}`);
+    }
+    if (!passwordHash?.trim()) {
+      throw new Error("setPasswordHash: passwordHash is required");
+    }
+    this.store.set(userPasswordKey(userId), passwordHash);
+  }
+
+  getPasswordHash(userId: string): string | undefined {
+    if (!userId) {
+      return undefined;
+    }
+    return this.store.get<string>(userPasswordKey(userId));
   }
 
   createThread(input: {

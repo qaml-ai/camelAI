@@ -1,7 +1,10 @@
-import { createPlatform } from "./platform/index.ts";
+import { startPlatformHttpServer } from "./http/metrics.ts";
+import { createPlatform, setPlatform } from "./platform/index.ts";
 import { registry } from "./registry.ts";
 
 export const platform = createPlatform({ ensureDemoTenant: true });
+setPlatform(platform);
+export const httpServer = startPlatformHttpServer();
 
 const demo = platform.identity.ensureDemoTenant();
 const port = Number(process.env.PORT ?? "6420");
@@ -22,5 +25,5 @@ console.log("camelAI agentOS demo tenant", {
 registry.start();
 
 console.log(
-  `camelAI agentOS server ready (Rivetkit client endpoint http://127.0.0.1:6420, PORT hint ${port})`,
+  `camelAI agentOS server ready (Rivetkit http://127.0.0.1:6420, HTTP API http://127.0.0.1:${httpServer.port}, PORT hint ${port})`,
 );

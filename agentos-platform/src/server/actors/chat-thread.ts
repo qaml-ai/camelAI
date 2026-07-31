@@ -13,7 +13,14 @@ import {
   createAgentRuntime,
   type AgentRuntime,
 } from "../chat/runtime.ts";
+import {
+  assertCanStartHostedTurn,
+  chargeTurn,
+  CreditDeniedError,
+} from "../chat/credits-gate.ts";
 import { runChatTurn, type SendResult } from "../chat/turn.ts";
+import { recordError, recordEvent } from "../observability.ts";
+import { getPlatform, type Platform } from "../platform/index.ts";
 
 export type ChatThreadCreateInput = {
   threadId: string;
@@ -44,6 +51,7 @@ export type ChatThreadState = {
 type ChatThreadVars = {
   activeRuntime: AgentRuntime | null;
   abortController: AbortController | null;
+  platform: Platform;
 };
 
 function requireCreateInput(input: ChatThreadCreateInput): ChatThreadCreateInput {
@@ -126,6 +134,7 @@ export function createChatThreadActor() {
     createVars: (): ChatThreadVars => ({
       activeRuntime: null,
       abortController: null,
+      platform: getPlatform(),
     }),
     createConnState: (_c, _params: ChatThreadConnParams): undefined =>
       undefined,
@@ -235,6 +244,62 @@ export function createChatThreadActor() {
           return { status: "error", messageId: assistantMessageId, error };
         }
 
+        const platform = c.vars.platform;
+        const bypassCredits =
+          process.env.AGENT_BYOK === "1" || c.state.model.startsWith("byok:");
+        try {
+          assertCanStartHostedTurn({
+            billing: platform.billing,
+            orgId: c.state.orgId,
+            bypass: bypassCredits,
+          });
+        } catch (error) {
+          if (!(error instanceof CreditDeniedError)) {
+            throw error;
+          }
+          const messageId = `assistant:${clientMessageId}`;
+          const lastError = {
+            id: `error:${clientMessageId}`,
+            error: error.message,
+            title: "Credits required",
+            status: error.status,
+            errorType: error.code,
+          };
+          c.state.threadState.lastError = lastError;
+          c.state.turnStatus = "error";
+          await c.broadcast("chatEvent", {
+            type: "state",
+            state: { lastError },
+          } satisfies ChatEvent);
+          await c.broadcast("chatEvent", {
+            type: "turnStatus",
+            status: "error",
+            errorMessage: error.message,
+          } satisfies ChatEvent);
+          recordEvent({
+            event: "turns_denied_credits",
+            severity: "warn",
+            component: "chat-thread",
+            operation: "sendMessage",
+            status: "denied",
+            threadId: c.state.threadId,
+            workspaceId: c.state.workspaceId,
+            orgId: c.state.orgId,
+          });
+          return { status: "error", messageId, error: error.message };
+        }
+
+        const startedAt = Date.now();
+        recordEvent({
+          event: "turns_started",
+          component: "chat-thread",
+          operation: "sendMessage",
+          status: "started",
+          threadId: c.state.threadId,
+          workspaceId: c.state.workspaceId,
+          orgId: c.state.orgId,
+          meta: { model: c.state.model, creditChargeable: !bypassCredits },
+        });
         const runtime = runtimeForEnvironment();
         const abortController = new AbortController();
         c.vars.activeRuntime = runtime;
@@ -257,7 +322,57 @@ export function createChatThreadActor() {
         });
 
         try {
-          return await c.keepAwake(turnPromise);
+          const result = await c.keepAwake(turnPromise);
+          const durationMs = Date.now() - startedAt;
+          if (result.status === "completed") {
+            try {
+              chargeTurn(
+                platform.billing,
+                platform.usage,
+                {
+                  orgId: c.state.orgId,
+                  workspaceId: c.state.workspaceId,
+                  threadId: c.state.threadId,
+                  bypass: bypassCredits,
+                },
+                { cents: 1, durationMs, model: c.state.model },
+              );
+            } catch (error) {
+              recordError({
+                event: "turn_charge_failed",
+                component: "chat-thread",
+                operation: "chargeTurn",
+                threadId: c.state.threadId,
+                workspaceId: c.state.workspaceId,
+                orgId: c.state.orgId,
+                durationMs,
+                error,
+              });
+              throw error;
+            }
+            recordEvent({
+              event: "turns_completed",
+              component: "chat-thread",
+              operation: "sendMessage",
+              status: "completed",
+              threadId: c.state.threadId,
+              workspaceId: c.state.workspaceId,
+              orgId: c.state.orgId,
+              durationMs,
+            });
+          } else if (result.status === "error") {
+            recordError({
+              event: "turn_failed",
+              component: "chat-thread",
+              operation: "sendMessage",
+              threadId: c.state.threadId,
+              workspaceId: c.state.workspaceId,
+              orgId: c.state.orgId,
+              durationMs,
+              error: result.error,
+            });
+          }
+          return result;
         } finally {
           if (c.vars.activeRuntime === runtime) {
             c.vars.activeRuntime = null;

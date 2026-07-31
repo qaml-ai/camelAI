@@ -2,6 +2,7 @@ import { BillingService } from "./billing.ts";
 import { ProjectFilesystem } from "./filesystem.ts";
 import { IdentityService } from "./identity.ts";
 import { Store, resolveDataDir, type StoreOptions } from "./store.ts";
+import { UsageService } from "./usage.ts";
 
 export { BillingService, type BillingAccount } from "./billing.ts";
 export {
@@ -18,6 +19,11 @@ export {
   type Workspace,
 } from "./identity.ts";
 export { Store, resolveDataDir, type StoreOptions } from "./store.ts";
+export {
+  UsageService,
+  type ListUsageOptions,
+  type UsageEvent,
+} from "./usage.ts";
 
 export type PlatformOptions = StoreOptions & {
   /** Seed the demo org/workspace/user on create. Default false. */
@@ -31,6 +37,7 @@ export type Platform = {
   store: Store;
   identity: IdentityService;
   billing: BillingService;
+  usage: UsageService;
   /** Open a project filesystem under DATA_DIR/projects/{workspaceId}/{projectId}. */
   projectFilesystem: (
     workspaceId: string,
@@ -46,6 +53,7 @@ export function createPlatform(options: PlatformOptions = {}): Platform {
   });
   const identity = new IdentityService(store);
   const billing = new BillingService(store);
+  const usage = new UsageService(store);
 
   if (options.ensureDemoTenant) {
     const demo = identity.ensureDemoTenant();
@@ -60,6 +68,7 @@ export function createPlatform(options: PlatformOptions = {}): Platform {
     store,
     identity,
     billing,
+    usage,
     projectFilesystem: (workspaceId, projectId) =>
       new ProjectFilesystem({
         dataDir: store.dataDir,
@@ -67,4 +76,21 @@ export function createPlatform(options: PlatformOptions = {}): Platform {
         projectId,
       }),
   };
+}
+
+let activePlatform: Platform | undefined;
+
+/** Configure the process-wide platform used by actor definitions. */
+export function setPlatform(platform: Platform): void {
+  activePlatform = platform;
+}
+
+/** Return the process-wide platform configured by the server or test harness. */
+export function getPlatform(): Platform {
+  if (!activePlatform) {
+    throw new Error(
+      "Platform is not configured; call setPlatform(createPlatform(...)) first",
+    );
+  }
+  return activePlatform;
 }

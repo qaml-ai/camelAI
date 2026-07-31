@@ -1,13 +1,46 @@
-import { expect, test, type TestContext } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  afterAll,
+  beforeAll,
+  expect,
+  test,
+  type TestContext,
+} from "vitest";
 import { setupTest } from "rivetkit/test";
+import {
+  createPlatform,
+  setPlatform,
+  type Platform,
+} from "../src/server/platform/index.ts";
 import { registry } from "../src/server/registry.ts";
 
-async function setupChat(c: TestContext) {
+let platform: Platform;
+let dataDir: string;
+
+beforeAll(() => {
+  dataDir = mkdtempSync(join(tmpdir(), "agentos-chat-"));
+  platform = createPlatform({ dataDir });
+  setPlatform(platform);
+});
+
+afterAll(() => {
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+async function setupChat(
+  c: TestContext,
+  options: { grantCredits?: boolean } = {},
+) {
   const { client } = await setupTest(c, registry);
   const suffix = crypto.randomUUID();
   const threadId = `thread-${suffix}`;
   const workspaceId = `workspace-${suffix}`;
   const orgId = `org-${suffix}`;
+  if (options.grantCredits !== false) {
+    platform.billing.grantCredits(orgId, 10_000);
+  }
   const chat = client.chatThread.getOrCreate(threadId, {
     createWithInput: {
       threadId,
@@ -30,7 +63,7 @@ async function waitUntil(check: () => Promise<boolean>): Promise<void> {
 }
 
 test("chatThread persists a happy-path user and assistant exchange", async (c) => {
-  const { chat } = await setupChat(c);
+  const { chat, orgId } = await setupChat(c);
 
   await expect(chat.sendMessage("hello", "client-1")).resolves.toEqual({
     status: "completed",
@@ -49,6 +82,32 @@ test("chatThread persists a happy-path user and assistant exchange", async (c) =
       parts: [{ type: "text", text: "Mock reply: hello", state: "done" }],
     },
   ]);
+  expect(platform.billing.getCreditBalance(orgId)).toBe(9_999);
+  expect(platform.usage.listUsage(orgId)).toMatchObject([
+    { kind: "turn", cents: 1, creditChargeable: true },
+  ]);
+});
+
+test("chatThread denies hosted turns when the org has no credits", async (c) => {
+  const { chat, orgId } = await setupChat(c, { grantCredits: false });
+
+  await expect(chat.sendMessage("hello", "client-denied")).resolves.toEqual({
+    status: "error",
+    messageId: "assistant:client-denied",
+    error: expect.stringMatching(/insufficient credits/i),
+  });
+  expect(platform.billing.getCreditBalance(orgId)).toBe(0);
+  expect(platform.usage.listUsage(orgId)).toEqual([]);
+  await expect(chat.getMessages()).resolves.toEqual([]);
+  await expect(chat.getThreadState()).resolves.toMatchObject({
+    turnStatus: "error",
+    threadState: {
+      lastError: {
+        status: 402,
+        errorType: "credits_denied",
+      },
+    },
+  });
 });
 
 test("chatThread deduplicates client message ids", async (c) => {
@@ -205,7 +264,7 @@ test("workspace actor registers and lists unique threads", async (c) => {
 });
 
 test("chatThread handles allowlisted slash commands without the runtime", async (c) => {
-  const { chat } = await setupChat(c);
+  const { chat, orgId } = await setupChat(c, { grantCredits: false });
 
   await expect(chat.sendMessage("/compact", "client-compact")).resolves.toEqual({
     status: "completed",
@@ -222,6 +281,8 @@ test("chatThread handles allowlisted slash commands without the runtime", async 
       },
     ],
   });
+  expect(platform.billing.getCreditBalance(orgId)).toBe(0);
+  expect(platform.usage.listUsage(orgId)).toEqual([]);
 });
 
 test("chatThread rejects unknown slash commands with an assistant error", async (c) => {

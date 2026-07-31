@@ -109,6 +109,43 @@ function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+const PI_ENV_KEYS = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_OAUTH_TOKEN",
+  "OPENAI_API_KEY",
+  "AZURE_OPENAI_API_KEY",
+  "AZURE_OPENAI_BASE_URL",
+  "AZURE_OPENAI_RESOURCE_NAME",
+  "AZURE_OPENAI_API_VERSION",
+  "AZURE_OPENAI_DEPLOYMENT_NAME_MAP",
+  "GEMINI_API_KEY",
+  "GROQ_API_KEY",
+  "CEREBRAS_API_KEY",
+  "XAI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "AI_GATEWAY_API_KEY",
+  "ZAI_API_KEY",
+  "MISTRAL_API_KEY",
+  "MINIMAX_API_KEY",
+  "OPENCODE_API_KEY",
+  "KIMI_API_KEY",
+  "AWS_PROFILE",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AWS_BEARER_TOKEN_BEDROCK",
+  "AWS_REGION",
+] as const;
+
+function piSessionEnvironment(): Record<string, string> {
+  return Object.fromEntries(
+    PI_ENV_KEYS.flatMap((key) => {
+      const value = process.env[key];
+      return value ? [[key, value]] : [];
+    }),
+  );
+}
+
 function appendMappedParts(message: UiMessage, incoming: UiPart[]): void {
   for (const part of incoming) {
     if (part.type === "reasoning") {
@@ -360,6 +397,7 @@ export function createChatThreadAgentOsActor(
               agent: "pi",
               cwd: "/workspace",
               permissionPolicy: "ask",
+              env: piSessionEnvironment(),
             });
             c.state.sessionId = "main";
           }
@@ -370,12 +408,13 @@ export function createChatThreadAgentOsActor(
             content: [{ type: "text", text: content }],
           });
           const result = await c.keepAwake(promptPromise);
+          const promptResult = result as {
+            message?: { content?: unknown };
+            stopReason?: unknown;
+          };
 
           if (assistantMessage.parts.length === 0) {
-            const response = result as {
-              message?: { content?: unknown };
-            };
-            const responseContent = response.message?.content;
+            const responseContent = promptResult.message?.content;
             if (Array.isArray(responseContent)) {
               const text = responseContent
                 .flatMap((block) =>
@@ -408,7 +447,9 @@ export function createChatThreadAgentOsActor(
             message: cloneJson(assistantMessage),
           });
           c.broadcast("chatEvent", { type: "turnStatus", status: "idle" });
-          return { status: "completed", messageId: assistantMessage.id };
+          return promptResult.stopReason === "cancelled"
+            ? { status: "stopped", messageId: assistantMessage.id }
+            : { status: "completed", messageId: assistantMessage.id };
         } catch (error) {
           const message =
             error instanceof Error ? error.message : String(error);
@@ -475,7 +516,6 @@ export function createChatThreadAgentOsActor(
           sessionId: c.state.sessionId,
         });
         c.state.turnStatus = "idle";
-        c.state.activeAssistantMessageId = null;
         c.broadcast("chatEvent", { type: "turnStatus", status: "idle" });
         return { status: "stopped" };
       },

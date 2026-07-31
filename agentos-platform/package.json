@@ -1,0 +1,24 @@
+{
+  "name": "@camelai/agentos-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "bun run --watch src/server/index.ts",
+    "dev:web": "vite --config web/vite.config.ts",
+    "build": "tsc -p tsconfig.json --noEmit && vite build --config web/vite.config.ts",
+    "start": "bun run src/server/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "docker:up": "docker compose up --build -d",
+    "docker:down": "docker compose down"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "bun-types": "^1.2.15",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.9"
+  }
+}

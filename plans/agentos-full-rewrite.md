@@ -78,11 +78,11 @@ Rivetkit **embedded mode** — engine in-process, no separate `rivet-engine` ser
 
 ### Phase 3 — Platform hardening
 
-- [x] HMAC turn tickets (foundation); full session auth still TODO
-- [ ] Session auth (password + OAuth); optional proxy-auth providers
-- [ ] Stripe billing parity with `src/lib/billing-plans.ts`
-- [ ] Usage metering and credit enforcement on inference path
-- [ ] Structured logging / metrics (replace Analytics Engine)
+- [x] HMAC turn tickets (foundation)
+- [x] Session auth (password + OAuth start/callback + proxy-auth CF Access/Pomerium)
+- [x] Stripe billing parity (`billing-plans`, Checkout, webhook HMAC, idempotent grants)
+- [x] Usage metering + credit enforcement on `chatThread` turns (BYOK bypass)
+- [x] Structured JSON observability + `/health` + `/api/metrics` ring buffer
 
 ### Phase 4 — Production adjacency
 

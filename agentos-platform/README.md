@@ -152,27 +152,29 @@ Back up the `agentos-data` volume (or host path bound to `/data`):
 
 ## Ported vs TODO
 
-### Ported (initial scaffold)
+### Ported (through Phase 3)
 
 - Shared chat contracts: messages, events, thread state, slash commands (`src/shared/`)
-- Platform services: JSON `Store`, `IdentityService`, `BillingService` (credits stub), `ProjectFilesystem`
-- Real `chatThreadAgentOs` actor with Pi sessions, camel bindings, and ACP event mapping
-- Vitest coverage for platform layer
+- Platform services: JSON `Store`, `IdentityService`, ledger `BillingService`, `ProjectFilesystem`, `UsageService`
+- `chatThread` (mock) + `chatThreadAgentOs` (Pi) actors, camel bindings, ACP mapper
+- React SPA + `useRivetChat` (replaces Cloudflare Agents SDK)
+- Session auth: password, GitHub/Google OAuth, CF Access / Pomerium proxy headers (`AUTH_HTTP_PORT`, default `:6422`)
+- Stripe Checkout (subscription + credits) + signed webhooks + plan limits parity
+- Credit gate on hosted turns + usage metering (`AGENT_BYOK=1` or `byok:` model bypass)
+- Structured JSON logs, counters, `/health`, `/api/metrics`
 - Docker / Compose VPS layout with healthchecks and canary profile
 
-### Still TODO
+### Still TODO (Phase 4+)
 
 | Area | Notes |
 | --- | --- |
-| `chatThread` Rivet actor | Replace `ChatThreadDO` turn loop, Pi session, recovery |
-| Web SPA | `web/` Vite client, Rivet React hooks |
-| Auth / SSO | Session cookies, OAuth, Cloudflare Access / Pomerium parity |
-| Stripe billing | Hosted credits, subscriptions, webhooks |
 | Dispatcher / user apps | Workers for Platforms deploy path not in this stack |
 | Builds / notebooks / SQL | CF sandbox containers → agentOS or separate runners |
 | R2 / uploads | Local disk or S3-compatible object store |
 | Admin / MCP | Superuser APIs and moderation |
 | Migrations | Import from production OrgDO / thread / project data |
+| Live Pi e2e | API-key smoke on a real VPS (`AGENT_RUNTIME=agentos`) |
+| Turn resume across migrate | Durable ACP history + client reconnect polish |
 
 ## Migration map: `ChatThreadDO` → `chatThread` actor
 

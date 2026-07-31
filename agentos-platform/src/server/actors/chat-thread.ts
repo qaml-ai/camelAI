@@ -3,6 +3,8 @@ import {
   EMPTY_THREAD_STATE,
   type AnswerQuestionInput,
   type ChatEvent,
+  isSlashCommand,
+  type SlashCommand,
   type ThreadState,
   type TurnStatus,
   type UiMessage,
@@ -81,14 +83,37 @@ function initialState(rawInput: ChatThreadCreateInput): ChatThreadState {
 }
 
 function runtimeForEnvironment(): AgentRuntime {
-  // "echo" is retained as a convenient alias for the deterministic mock.
-  return process.env.AGENT_RUNTIME === "agentos"
-    ? createAgentRuntime({ mode: "agentos" })
-    : createAgentRuntime({ mode: "mock" });
+  // This actor intentionally remains deterministic. Live AgentOS sessions are
+  // exposed by the separate chatThreadAgentOs actor.
+  return createAgentRuntime({ mode: "mock" });
 }
 
 function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function slashCommandReply(
+  command: SlashCommand,
+  state: ChatThreadState,
+  messageCount: number,
+): string {
+  switch (command) {
+    case "/compact":
+      return "Context compacted (stub).";
+    case "/context":
+      return `Context contains ${messageCount} messages.`;
+    case "/debug":
+      return JSON.stringify({
+        orgId: state.orgId,
+        workspaceId: state.workspaceId,
+        threadId: state.threadId,
+        projectId: state.projectId,
+      });
+    case "/insights":
+      return "Insights generated (stub).";
+    case "/security-review":
+      return "Security review requested (stub).";
+  }
 }
 
 export function createChatThreadActor() {
@@ -132,6 +157,84 @@ export function createChatThreadActor() {
         }
 
         c.state.clientMessageIds.push(clientMessageId);
+        const normalizedContent = content.trim();
+        if (normalizedContent.startsWith("/")) {
+          const now = Date.now();
+          const assistantMessageId = `assistant:${clientMessageId}`;
+          const userMessage: UiMessage = {
+            id: clientMessageId,
+            role: "user",
+            parts: [{ type: "text", text: content, state: "done" }],
+            createdAt: now,
+          };
+
+          if (isSlashCommand(normalizedContent)) {
+            const assistantMessage: UiMessage = {
+              id: assistantMessageId,
+              role: "assistant",
+              parts: [
+                {
+                  type: "text",
+                  text: slashCommandReply(
+                    normalizedContent,
+                    c.state,
+                    c.state.messages.length,
+                  ),
+                  state: "done",
+                },
+              ],
+              createdAt: now,
+            };
+            c.state.messages.push(userMessage, assistantMessage);
+            await c.broadcast("chatEvent", {
+              type: "messageUpsert",
+              message: cloneJson(userMessage),
+            } satisfies ChatEvent);
+            await c.broadcast("chatEvent", {
+              type: "messageUpsert",
+              message: cloneJson(assistantMessage),
+            } satisfies ChatEvent);
+            return { status: "completed", messageId: assistantMessageId };
+          }
+
+          const error = `Unknown slash command: ${normalizedContent}`;
+          const errorId = `error:${clientMessageId}`;
+          const assistantMessage: UiMessage = {
+            id: assistantMessageId,
+            role: "assistant",
+            parts: [
+              {
+                type: "data-error",
+                id: errorId,
+                data: { error },
+              },
+            ],
+            createdAt: now,
+          };
+          const lastError = { id: errorId, error };
+          c.state.messages.push(userMessage, assistantMessage);
+          c.state.threadState.lastError = lastError;
+          c.state.turnStatus = "error";
+          await c.broadcast("chatEvent", {
+            type: "messageUpsert",
+            message: cloneJson(userMessage),
+          } satisfies ChatEvent);
+          await c.broadcast("chatEvent", {
+            type: "messageUpsert",
+            message: cloneJson(assistantMessage),
+          } satisfies ChatEvent);
+          await c.broadcast("chatEvent", {
+            type: "state",
+            state: { lastError },
+          } satisfies ChatEvent);
+          await c.broadcast("chatEvent", {
+            type: "turnStatus",
+            status: "error",
+            errorMessage: error,
+          } satisfies ChatEvent);
+          return { status: "error", messageId: assistantMessageId, error };
+        }
+
         const runtime = runtimeForEnvironment();
         const abortController = new AbortController();
         c.vars.activeRuntime = runtime;

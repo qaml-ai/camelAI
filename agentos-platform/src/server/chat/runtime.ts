@@ -37,11 +37,57 @@ function throwIfCancelled(cancelled: boolean, signal?: AbortSignal): void {
   }
 }
 
+export type MockAgentRuntimeOptions = {
+  delayMs?: number;
+};
+
+function normalizeDelayMs(delayMs: number | undefined): number {
+  if (delayMs === undefined) {
+    return 0;
+  }
+  if (!Number.isFinite(delayMs) || delayMs < 0) {
+    throw new Error("MockAgentRuntime delayMs must be a non-negative number");
+  }
+  return delayMs;
+}
+
 /**
  * Small deterministic runtime used by unit tests and local development.
  */
 export class MockAgentRuntime implements AgentRuntime {
   private cancelled = false;
+  private cancelDelay: (() => void) | null = null;
+
+  constructor(private readonly options: MockAgentRuntimeOptions = {}) {
+    normalizeDelayMs(options.delayMs);
+  }
+
+  private async waitForDelay(signal?: AbortSignal): Promise<void> {
+    const delayMs = normalizeDelayMs(this.options.delayMs);
+    if (delayMs === 0) {
+      return;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        this.cancelDelay = null;
+        reject(new DOMException("Agent turn was cancelled", "AbortError"));
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", abort);
+        this.cancelDelay = null;
+        resolve();
+      }, delayMs);
+
+      this.cancelDelay = abort;
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) {
+        abort();
+      }
+    });
+  }
 
   async prompt({
     content,
@@ -49,6 +95,8 @@ export class MockAgentRuntime implements AgentRuntime {
     onEvent,
   }: Parameters<AgentRuntime["prompt"]>[0]): Promise<void> {
     this.cancelled = false;
+    throwIfCancelled(this.cancelled, signal);
+    await this.waitForDelay(signal);
     throwIfCancelled(this.cancelled, signal);
 
     if (content.toLowerCase().includes("tool")) {
@@ -97,6 +145,7 @@ export class MockAgentRuntime implements AgentRuntime {
 
   async cancel(): Promise<void> {
     this.cancelled = true;
+    this.cancelDelay?.();
   }
 }
 
@@ -126,14 +175,20 @@ export class AgentOsRuntime implements AgentRuntime {
 }
 
 export type CreateAgentRuntimeOptions =
-  | { mode: "mock" }
+  | ({ mode: "mock" } & MockAgentRuntimeOptions)
   | ({ mode: "agentos" } & AgentOsRuntimeOptions);
 
 export function createAgentRuntime(
   options: CreateAgentRuntimeOptions,
 ): AgentRuntime {
   if (options.mode === "mock") {
-    return new MockAgentRuntime();
+    const envDelay = process.env.MOCK_AGENT_DELAY_MS;
+    const delayMs =
+      options.delayMs ??
+      (envDelay === undefined || envDelay.trim() === ""
+        ? undefined
+        : Number(envDelay));
+    return new MockAgentRuntime({ delayMs });
   }
   return new AgentOsRuntime(options);
 }

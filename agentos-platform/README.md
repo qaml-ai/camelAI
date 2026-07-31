@@ -72,6 +72,26 @@ Smoke script (CI-friendly, no server boot):
 ./scripts/smoke.sh
 ```
 
+### Agent runtime selection
+
+`AGENT_RUNTIME` defaults to `mock`. The deterministic `chatThread` actor stays
+available in every mode so unit tests and local UI work do not require model
+credentials.
+
+Set `AGENT_RUNTIME=agentos` before starting the server to enable the AgentOS
+registry setup (including the actor SQLite runtime socket), then connect to the
+separate `chatThreadAgentOs` actor. It opens a durable Pi session on the first
+`sendMessage`, streams ACP events through the same `ChatEvent` contract, and
+exposes the camel workspace bindings:
+
+```bash
+AGENT_RUNTIME=agentos bun run dev
+```
+
+Configure the model provider credentials required by Pi in the server
+environment. Merely importing the registry or running the default test suite
+does not boot the AgentOS sidecar or require API keys.
+
 ## VPS deploy
 
 ### 1. Prepare the host
@@ -133,6 +153,7 @@ Back up the `agentos-data` volume (or host path bound to `/data`):
 
 - Shared chat contracts: messages, events, thread state, slash commands (`src/shared/`)
 - Platform services: JSON `Store`, `IdentityService`, `BillingService` (credits stub), `ProjectFilesystem`
+- Real `chatThreadAgentOs` actor with Pi sessions, camel bindings, and ACP event mapping
 - Vitest coverage for platform layer
 - Docker / Compose VPS layout with healthchecks and canary profile
 
@@ -141,7 +162,6 @@ Back up the `agentos-data` volume (or host path bound to `/data`):
 | Area | Notes |
 | --- | --- |
 | `chatThread` Rivet actor | Replace `ChatThreadDO` turn loop, Pi session, recovery |
-| Real Pi via agentOS | `AGENT_RUNTIME=agentos`, `@rivet-dev/agentos` Pi software package |
 | Web SPA | `web/` Vite client, Rivet React hooks |
 | Auth / SSO | Session cookies, OAuth, Cloudflare Access / Pomerium parity |
 | Stripe billing | Hosted credits, subscriptions, webhooks |

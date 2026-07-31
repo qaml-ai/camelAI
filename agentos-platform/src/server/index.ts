@@ -1,7 +1,9 @@
 import { createPlatform } from "./platform/index.ts";
 import { registry } from "./registry.ts";
+import { setChatThreadAgentOsPlatform } from "./actors/chat-thread-agentos.ts";
 
 export const platform = createPlatform({ ensureDemoTenant: true });
+setChatThreadAgentOsPlatform(platform);
 
 const demo = platform.identity.ensureDemoTenant();
 const port = Number(process.env.PORT ?? "6420");

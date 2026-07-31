@@ -27,6 +27,7 @@
     "vitest": "^3.0.9"
   },
   "dependencies": {
+    "@agentos-software/pi": "0.2.7",
     "@rivet-dev/agentos": "0.2.15",
     "@rivet-dev/agentos-core": "^0.2.15",
     "@rivetkit/react": "2.3.10",

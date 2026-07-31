@@ -1,10 +1,17 @@
+import { createApiHandler } from "./http/api.ts";
 import { startPlatformHttpServer } from "./http/metrics.ts";
 import { createPlatform, setPlatform } from "./platform/index.ts";
 import { registry } from "./registry.ts";
 
 export const platform = createPlatform({ ensureDemoTenant: true });
 setPlatform(platform);
-export const httpServer = startPlatformHttpServer();
+export const httpServer = startPlatformHttpServer(
+  Number(process.env.AUTH_HTTP_PORT ?? process.env.PORT_HTTP ?? "6422"),
+  createApiHandler({
+    platform,
+    billingService: platform.billing,
+  }),
+);
 
 const demo = platform.identity.ensureDemoTenant();
 const port = Number(process.env.PORT ?? "6420");

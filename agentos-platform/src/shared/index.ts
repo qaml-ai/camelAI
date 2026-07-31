@@ -2,6 +2,18 @@
  * Shared agentOS types — safe for both server and web (no React / Cloudflare).
  */
 
+export {
+  BILLING_PLANS,
+  BILLING_PLAN_LIMITS,
+  includedCreditsForPlan,
+  planAllowsHostedModels,
+} from "./billing-plans";
+
+export type {
+  BillingPlan,
+  BillingPlanLimits,
+} from "./billing-plans";
+
 export type {
   TextBlock,
   ToolUseBlock,

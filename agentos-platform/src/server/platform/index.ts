@@ -4,7 +4,11 @@ import { IdentityService } from "./identity.ts";
 import { Store, resolveDataDir, type StoreOptions } from "./store.ts";
 import { UsageService } from "./usage.ts";
 
-export { BillingService, type BillingAccount } from "./billing.ts";
+export {
+  BillingService,
+  type BillingAccount,
+  type BillingStatus,
+} from "./billing.ts";
 export {
   ProjectFilesystem,
   type FsEntry,

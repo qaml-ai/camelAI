@@ -403,16 +403,17 @@ describe("enterprise SSO first-login linking", () => {
     expect(emailDelete).not.toHaveBeenCalled();
   });
 
-  it("rejects reserved superuser emails before claiming a tenant identity", async () => {
+  it("rejects configured bootstrap superuser emails before claiming a tenant identity", async () => {
     const claimSsoJitIdentity = vi.fn();
     const superuserIdentity = {
       ...googleIdentity,
-      email: "admin-one@example.com",
+      email: "ops@camelai.test",
     };
     try {
       await resolveOrgSsoUser({
         authEnv: {
           ...authEnv(user()),
+          SUPERUSER_EMAILS: "ops@camelai.test",
           EMAIL_TO_USER: {
             get: vi.fn().mockResolvedValue(null),
           },

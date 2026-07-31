@@ -507,7 +507,7 @@ export async function resolveOrgSsoUser(input: {
       input.connectionId &&
       input.issuer &&
       input.orgStub.claimSsoInvitedIdentity &&
-      !isSuperuserEmail(identity.email)
+      !isSuperuserEmail(identity.email, authEnv.SUPERUSER_EMAILS)
     ) {
       invitedIdentity = await input.orgStub.claimSsoInvitedIdentity(
         input.connectionId,
@@ -540,7 +540,7 @@ export async function resolveOrgSsoUser(input: {
         ) {
           return null;
         }
-        if (isSuperuserEmail(identity.email)) {
+        if (isSuperuserEmail(identity.email, authEnv.SUPERUSER_EMAILS)) {
           throw new Response("Superuser identities cannot use enterprise SSO", {
             status: 403,
           });
@@ -579,7 +579,7 @@ export async function resolveOrgSsoUser(input: {
     account = null;
   }
 
-  if (isSuperuserEmail(identity.email)) {
+  if (isSuperuserEmail(identity.email, authEnv.SUPERUSER_EMAILS)) {
     throw new Response("Superuser identities cannot use enterprise SSO", {
       status: 403,
     });

@@ -137,9 +137,15 @@ describe("organization OIDC SSO", () => {
   });
 
   it("never grants global superuser privileges to an enterprise SSO session", () => {
-    const user = { is_superuser: true } as never;
+    const user = { is_superuser: true, email_verified_at: Date.now() } as never;
     expect(canUseSuperuserAccess({ user, session: { auth_source: "enterprise_oidc" } as never })).toBe(false);
     expect(canUseSuperuserAccess({ user, session: { auth_source: null } as never })).toBe(true);
+    expect(
+      canUseSuperuserAccess({
+        user: { is_superuser: true, email_verified_at: null } as never,
+        session: { auth_source: null } as never,
+      }),
+    ).toBe(false);
   });
 
   it("rejects an enterprise SSO session targeting another org", async () => {

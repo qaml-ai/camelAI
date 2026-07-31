@@ -174,6 +174,9 @@ export interface Env
   SLACK_TEAM_REGISTRY?: DurableObjectNamespace<SlackTeamRegistryDO>;
   // Admin CLI API key (set via wrangler secret)
   ADMIN_API_KEY?: string;
+  // Optional comma/whitespace-separated bootstrap superuser emails.
+  // Prefer `wrangler secret put SUPERUSER_EMAILS`.
+  SUPERUSER_EMAILS?: string;
   // Derived global admin/index read model. Tenant-owned state remains authoritative in DOs.
   APP_DB?: D1Database;
   // Optional static OAuth client id for the remote admin MCP server.

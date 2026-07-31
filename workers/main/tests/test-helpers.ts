@@ -111,7 +111,12 @@ export async function updateUserProfile(
   updates: { name?: string | null; avatar?: { color?: string; content?: string }; is_superuser?: boolean }
 ): Promise<User | null> {
   const userStub = env.USER.get(env.USER.idFromName(userId));
-  return userStub.updateProfile(updates);
+  const profile = await userStub.updateProfile(updates);
+  if (updates.is_superuser === true) {
+    await userStub.markEmailVerified();
+    return userStub.getProfile();
+  }
+  return profile;
 }
 
 /**

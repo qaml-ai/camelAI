@@ -64,8 +64,11 @@ describe("OrgDO enterprise SSO state", () => {
   });
 
   it("refuses to create a superuser identity through enterprise SSO", () => {
-    expect(canCreateEnterpriseSsoUser("admin-one@example.com")).toBe(false);
+    expect(
+      canCreateEnterpriseSsoUser("ops@camelai.test", "ops@camelai.test"),
+    ).toBe(false);
     expect(canCreateEnterpriseSsoUser("member@example.com")).toBe(true);
+    expect(canCreateEnterpriseSsoUser("admin-one@example.com")).toBe(true);
   });
 
   it("atomically consumes a login transaction once", async () => {

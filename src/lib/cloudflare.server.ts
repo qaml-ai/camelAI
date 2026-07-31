@@ -120,6 +120,8 @@ export interface CloudflareEnv {
   LOCAL_AUTH_BYPASS_HOSTS?: string;
   LOCAL_AUTH_USER_EMAIL?: string;
   LOCAL_AUTH_USER_NAME?: string;
+  /** Comma/whitespace-separated bootstrap superuser emails (prefer wrangler secret). */
+  SUPERUSER_EMAILS?: string;
 }
 
 /**

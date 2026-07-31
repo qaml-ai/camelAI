@@ -9,6 +9,10 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import {
+  isSuperuserEmail,
+  parseSuperuserEmails,
+} from '../workers/main/src/identity/superuser';
 
 // Types matching the actual implementation
 interface SessionData {
@@ -194,42 +198,30 @@ describe('requireSuperuser', () => {
 });
 
 describe('Superuser email allowlist', () => {
-  // Tests the email allowlist logic from worker/auth.ts
-  const SUPERUSER_EMAILS = new Set([
-    'admin-one@example.com',
-    'admin-two@example.com',
-  ]);
-
-  function isSuperuserEmail(email: string | null): boolean {
-    if (!email) return false;
-    return SUPERUSER_EMAILS.has(email.toLowerCase());
-  }
-
-  it('should return true for allowlisted emails', () => {
-    expect(isSuperuserEmail('admin-one@example.com')).toBe(true);
-    expect(isSuperuserEmail('admin-two@example.com')).toBe(true);
-  });
-
-  it('should be case-insensitive', () => {
-    expect(isSuperuserEmail('ADMIN-ONE@EXAMPLE.COM')).toBe(true);
-    expect(isSuperuserEmail('Admin-Two@Example.com')).toBe(true);
-  });
-
-  it('should return false for non-allowlisted emails', () => {
-    expect(isSuperuserEmail('other@example.com')).toBe(false);
+  it('should return false for every email when no allowlist is configured', () => {
+    expect(isSuperuserEmail('admin-one@example.com')).toBe(false);
+    expect(isSuperuserEmail('admin-two@example.com')).toBe(false);
     expect(isSuperuserEmail('admin@example.com')).toBe(false);
-    expect(isSuperuserEmail('illiana@otherdomain.com')).toBe(false);
+  });
+
+  it('should honor an explicit allowlist and be case-insensitive', () => {
+    const allowlist = parseSuperuserEmails('ops@camelai.test,other@camelai.test');
+    expect(isSuperuserEmail('ops@camelai.test', allowlist)).toBe(true);
+    expect(isSuperuserEmail('OPS@CamelAI.test', 'ops@camelai.test')).toBe(true);
+    expect(isSuperuserEmail('other@example.com', allowlist)).toBe(false);
   });
 
   it('should return false for null or empty email', () => {
-    expect(isSuperuserEmail(null)).toBe(false);
-    expect(isSuperuserEmail('')).toBe(false);
+    expect(isSuperuserEmail(null, 'ops@camelai.test')).toBe(false);
+    expect(isSuperuserEmail('', 'ops@camelai.test')).toBe(false);
   });
 
   it('should handle edge cases', () => {
-    // Email with extra spaces should fail (not trimmed)
-    expect(isSuperuserEmail(' admin@example.com ')).toBe(false);
-    // Partial match should fail
-    expect(isSuperuserEmail('admin@example.com.evil.com')).toBe(false);
+    expect(isSuperuserEmail(' ops@camelai.test ', 'ops@camelai.test')).toBe(
+      false,
+    );
+    expect(
+      isSuperuserEmail('ops@camelai.test.evil.com', 'ops@camelai.test'),
+    ).toBe(false);
   });
 });

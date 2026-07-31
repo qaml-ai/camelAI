@@ -181,7 +181,7 @@ async function verifyAdminMcpAuth(
   }
 
   const user = await env.USER.get(env.USER.idFromName(grant.user_id)).getProfile();
-  if (!user?.is_superuser) {
+  if (!user?.is_superuser || user.email_verified_at == null) {
     return Response.json(
       { error: "Forbidden", details: "Admin access required" },
       { status: 403, headers: JSON_HEADERS },

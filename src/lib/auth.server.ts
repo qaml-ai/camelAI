@@ -885,7 +885,8 @@ export function canUseSuperuserAccess(
 ): boolean {
   return Boolean(
     context.user.is_superuser &&
-    context.session.auth_source !== ENTERPRISE_OIDC_AUTH_SOURCE,
+      context.user.email_verified_at != null &&
+      context.session.auth_source !== ENTERPRISE_OIDC_AUTH_SOURCE,
   );
 }
 

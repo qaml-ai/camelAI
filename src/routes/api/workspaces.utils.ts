@@ -109,7 +109,9 @@ export async function requireWorkspaceAccess(
     const userProfile = await authEnv.USER
       .get(authEnv.USER.idFromName(sessionContext.session.user_id))
       .getProfile();
-    superuser = Boolean(userProfile?.is_superuser);
+    superuser = Boolean(
+      userProfile?.is_superuser && userProfile.email_verified_at != null,
+    );
     return superuser;
   };
 

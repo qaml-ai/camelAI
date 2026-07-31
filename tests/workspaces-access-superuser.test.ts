@@ -75,6 +75,7 @@ describe('requireWorkspaceAccess superuser override', () => {
     getProfileMock.mockResolvedValue({
       id: 'user_123',
       is_superuser: true,
+      email_verified_at: Date.now(),
     });
 
     const result = await requireWorkspaceAccess(
@@ -100,6 +101,7 @@ describe('requireWorkspaceAccess superuser override', () => {
     getProfileMock.mockResolvedValue({
       id: 'user_123',
       is_superuser: true,
+      email_verified_at: Date.now(),
     });
 
     await expect(
@@ -145,6 +147,7 @@ describe('requireWorkspaceAccess superuser override', () => {
     getProfileMock.mockResolvedValue({
       id: 'user_123',
       is_superuser: true,
+      email_verified_at: Date.now(),
     });
 
     const result = await requireWorkspaceAccess(
@@ -170,6 +173,7 @@ describe('requireWorkspaceAccess superuser override', () => {
     getProfileMock.mockResolvedValue({
       id: 'user_123',
       is_superuser: true,
+      email_verified_at: Date.now(),
     });
 
     await expect(

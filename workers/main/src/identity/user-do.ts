@@ -30,7 +30,7 @@ import type {
 } from "../../../../src/types";
 import { dispatchAdminEvent } from "./admin-events";
 import { getDefaultOnboardingPreferences, sanitizeOnboardingPreferences, toOnboardingPreferences } from "./onboarding";
-import { isSuperuserEmail } from "./superuser";
+import { isSuperuserEmail, parseSuperuserEmails } from "./superuser";
 import { recordObservabilityEvent } from "../observability";
 
 // Re-export for consumers that import from this module
@@ -91,8 +91,13 @@ export interface UserOAuthProvider {
   linked_at: number;
 }
 
-export function canCreateEnterpriseSsoUser(email: string): boolean {
-  return !isSuperuserEmail(email);
+export function canCreateEnterpriseSsoUser(
+  email: string,
+  allowlist?: Set<string> | string | null,
+): boolean {
+  // With an empty/missing allowlist, enterprise SSO may create the user as a
+  // normal member. Only configured bootstrap superuser emails are refused.
+  return !isSuperuserEmail(email, allowlist);
 }
 
 export interface OrgMember {
@@ -457,7 +462,10 @@ export class UserDO extends DurableObject<DOEnv> {
         const profile = JSON.parse(
           (rows[0] as { value: string }).value,
         ) as User;
-        const shouldBeSuperuser = isSuperuserEmail(profile.email);
+        const shouldBeSuperuser = isSuperuserEmail(
+          profile.email,
+          this.superuserAllowlist(),
+        );
         if (profile.is_superuser !== shouldBeSuperuser) {
           profile.is_superuser = shouldBeSuperuser;
           this.sql.exec(
@@ -742,6 +750,12 @@ export class UserDO extends DurableObject<DOEnv> {
     }
   }
 
+  private superuserAllowlist(): Set<string> {
+    return parseSuperuserEmails(
+      (this.env as { SUPERUSER_EMAILS?: string }).SUPERUSER_EMAILS,
+    );
+  }
+
   // Profile methods
   async getProfile(): Promise<User | null> {
     const rows = this.sql
@@ -752,7 +766,10 @@ export class UserDO extends DurableObject<DOEnv> {
     let changed = false;
 
     if (typeof profile.is_superuser !== "boolean") {
-      profile.is_superuser = isSuperuserEmail(profile.email);
+      profile.is_superuser = isSuperuserEmail(
+        profile.email,
+        this.superuserAllowlist(),
+      );
       changed = true;
     }
     if (!profile.avatar) {
@@ -922,13 +939,14 @@ export class UserDO extends DurableObject<DOEnv> {
 
     const now = Date.now();
     const avatar = generateDefaultAvatar(name || email);
+    const allowlist = this.superuserAllowlist();
     const profile: User = {
       id,
       email,
       email_verified_at: null,
       name,
       created_at: now,
-      is_superuser: isSuperuserEmail(email),
+      is_superuser: isSuperuserEmail(email, allowlist),
       avatar,
       is_orphaned: false,
       orphaned_at: null,
@@ -2101,7 +2119,7 @@ export class UserDO extends DurableObject<DOEnv> {
     email: string,
     name: string | null,
   ): Promise<User> {
-    if (!canCreateEnterpriseSsoUser(email)) {
+    if (!canCreateEnterpriseSsoUser(email, this.superuserAllowlist())) {
       throw new Error("enterprise_sso_superuser_forbidden");
     }
     const existing = await this.getProfile();
@@ -2147,13 +2165,14 @@ export class UserDO extends DurableObject<DOEnv> {
   ): Promise<User> {
     const now = Date.now();
     const avatar = generateDefaultAvatar(name || email);
+    const allowlist = this.superuserAllowlist();
     const profile: User = {
       id,
       email,
       email_verified_at: now,
       name,
       created_at: now,
-      is_superuser: isSuperuserEmail(email),
+      is_superuser: isSuperuserEmail(email, allowlist),
       avatar,
       is_orphaned: false,
       orphaned_at: null,

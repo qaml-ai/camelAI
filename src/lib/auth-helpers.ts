@@ -30,6 +30,8 @@ export interface AuthEnv {
   TOKEN_SIGNING_SECRET: string;
   CF_ACCOUNT_ID?: string;
   CF_DISPATCH_NAMESPACE?: string;
+  /** Comma/whitespace-separated bootstrap superuser emails (optional secret). */
+  SUPERUSER_EMAILS?: string;
 }
 
 /**
@@ -48,6 +50,7 @@ export function getAuthEnv(env: CloudflareEnv): AuthEnv {
     TOKEN_SIGNING_SECRET: env.TOKEN_SIGNING_SECRET,
     CF_ACCOUNT_ID: env.CF_ACCOUNT_ID,
     CF_DISPATCH_NAMESPACE: env.CF_DISPATCH_NAMESPACE,
+    SUPERUSER_EMAILS: env.SUPERUSER_EMAILS,
   };
 }
 

@@ -11,7 +11,9 @@
     "start": "bun run src/server/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:live-smoke": "bun run scripts/live-smoke.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "smoke": "bash scripts/smoke.sh",
     "docker:up": "docker compose up --build -d",
     "docker:down": "docker compose down"
   },

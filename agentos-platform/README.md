@@ -43,7 +43,10 @@ Shared volume: DATA_DIR  (.data/ locally, /data in Docker)
   projects/{ws}/{id}/ — project source trees
 ```
 
-## Development
+## Dev
+
+The server boots Rivetkit with `registry.start()` (embedded engine on `:6420`).
+elopment
 
 Prerequisites: [Bun](https://bun.sh) 1.2+, Node 22-compatible host.
 

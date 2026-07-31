@@ -71,7 +71,7 @@ type LooseRivetHandle = {
 type LooseRivetClient = {
   chatThread: {
     getOrCreate(
-      key: string[],
+      key: string | string[],
       options: {
         createWithInput: Omit<ChatThreadInput, "initialTitle"> & {
           title?: string;
@@ -97,7 +97,9 @@ export function createRivetChatTransport(
   return {
     async connect(input, observer) {
       observer.onStatus("connecting");
-      const handle = client.chatThread.getOrCreate([input.threadId], {
+      // Rivet actor keys are strings (or string arrays for compound keys).
+      // Prefer the bare threadId string to match server tests / live smoke.
+      const handle = client.chatThread.getOrCreate(input.threadId, {
         createWithInput: {
           threadId: input.threadId,
           workspaceId: input.workspaceId,

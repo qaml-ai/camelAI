@@ -47,33 +47,38 @@ Rivetkit **embedded mode** — engine in-process, no separate `rivet-engine` ser
 
 ## Phases
 
-### Phase 0 — Scaffold (current)
+### Phase 0 — Scaffold
 
 - [x] `agentos-platform/` package with shared chat types
 - [x] Platform services: `Store`, `IdentityService`, `BillingService`, `ProjectFilesystem`
 - [x] Vitest + typecheck
 - [x] Docker / Compose VPS layout, `.env.example`, smoke script
-- [ ] `src/server/index.ts` — Bun HTTP + Rivetkit registry bootstrap
-- [ ] `web/` — minimal chat UI
+- [x] `src/server/index.ts` — Bun + Rivetkit registry bootstrap
+- [x] `web/` — dense chat SPA (`useRivetChat`, memory transport for offline UI)
 
 ### Phase 1 — Chat actor MVP
 
-- [ ] `chatThread` Rivet actor: websocket, `sendMessage`, turn status
-- [ ] `AGENT_RUNTIME=mock` — deterministic fake turns for UI dev
-- [ ] `ChatEvent` encoder mirroring `src/lib/pi-chunk-encoder.ts` semantics
-- [ ] Thread state patches (`StateEvent`) aligned with `src/shared/thread-state.ts`
-- [ ] Demo tenant bootstrap (`ensureDemoTenant`)
+- [x] `chatThread` Rivet actor: `sendMessage`, turn status, `chatEvent` broadcast
+- [x] `AGENT_RUNTIME=mock` — deterministic fake turns for UI/tests
+- [x] `ChatEvent` bus (`messageUpsert` / `messageDelta` / tool stream / state)
+- [x] Thread state patches aligned with `src/shared/thread-state.ts`
+- [x] Demo tenant bootstrap (`ensureDemoTenant`)
+- [x] org / workspace actors, HMAC tickets, slash commands
+- [x] React client replaces Agents SDK (`useRivetChat`)
 
 ### Phase 2 — Real agentOS / Pi
 
-- [ ] `AGENT_RUNTIME=agentos` — wire `@rivet-dev/agentos` Pi software
-- [ ] File tools backed by `ProjectFilesystem`
-- [ ] Tool permission gates + `AskUserQuestion`
-- [ ] `c.keepAwake` around full turn lifecycle
-- [ ] Context compaction + slash commands
+- [x] `chatThreadAgentOs` actor via `@rivet-dev/agentos` + Pi software package
+- [x] Camel host bindings → `ProjectFilesystem` / deploy stub / ask_user / credits
+- [x] ACP → `ChatEvent` mapper (+ unit tests)
+- [x] `c.keepAwake` around mock turn lifecycle
+- [x] Slash command stubs (`/compact`, `/context`, …)
+- [ ] Live Pi session e2e with API keys on a VPS (manual / smoke flag)
+- [ ] Full permission UI parity + turn resume across actor migrate
 
 ### Phase 3 — Platform hardening
 
+- [x] HMAC turn tickets (foundation); full session auth still TODO
 - [ ] Session auth (password + OAuth); optional proxy-auth providers
 - [ ] Stripe billing parity with `src/lib/billing-plans.ts`
 - [ ] Usage metering and credit enforcement on inference path

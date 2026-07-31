@@ -96,7 +96,10 @@
 		"test:e2e:ui": "playwright test --ui",
 		"test:e2e:staging-billing": "node scripts/run-staging-billing-e2e.mjs",
 		"publish:e2e:staging-billing": "E2E_REPORT_DIR=playwright-report-staging-billing node scripts/publish-e2e-report.mjs",
-		"build:renderer": "node scripts/build-notebook-renderer.mjs"
+		"build:renderer": "node scripts/build-notebook-renderer.mjs",
+		"dev:agentos": "bun --cwd agentos-platform run dev",
+		"test:agentos": "bun --cwd agentos-platform run test",
+		"typecheck:agentos": "bun --cwd agentos-platform run typecheck"
 	},
 	"dependencies": {
 		"@ai-sdk/react": "^3.0.204",

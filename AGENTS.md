@@ -52,6 +52,7 @@ worker-side). There is no in-repo Go sandbox-host or data-proxy tree.
 - `scripts/` - Deploy, eval, self-host, and maintenance scripts.
 - `docs/` - Supporting documentation; see `docs/README.md` for the canonical index (many `*-plan.md` / feedback files are historical).
 - `plans/` - Active cross-cutting architecture plans (e.g. OrgDO split, no-VM build/deploy).
+- `agentos-platform/` - Rivet Actors + agentOS VPS rewrite (experimental/next chat plane). See `agentos-platform/README.md` and `plans/agentos-full-rewrite.md`.
 - `infra/` - Terraform for the static-IP database egress relay VM (`infra/db-egress-relay/`); `infra/selfhost/` for self-host cloud templates. See `infra/README.md`.
 - `tests/` - Vitest UI / `src/lib` unit tests (`vitest.config.ts`).
 - `workers/main/tests/` - Worker / Durable Object / Miniflare tests + `evals/` (`vitest.workers.config.ts`).

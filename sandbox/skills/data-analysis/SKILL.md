@@ -246,6 +246,10 @@ happens the result's `fullOutput.path` points at an R2 log with the complete
 output — `read({ location: "r2", path: fullOutput.path })`. Never suppress errors — do not reach for `--allow-errors`,
 which silently embeds tracebacks the user sees in the rendered report.
 
+Never hand-write cell `outputs` into the notebook JSON — outputs must come from
+a real `run_notebook` execution. If `run_notebook` fails or is unavailable,
+report the error to the user; do not present uncomputed or fabricated results.
+
 Setup calls whose return value is not meaningful report content, such as
 `alt.data_transformers.disable_max_rows()` or `plt.plot(...)`, should be silenced
 with a trailing `;` or assigned to `_` so object reprs do not leak into outputs.

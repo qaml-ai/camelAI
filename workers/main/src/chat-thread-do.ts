@@ -41,7 +41,7 @@ import type { WorkspaceDO } from "./workspace";
 import { WorkspaceFilesystemClient } from "./workspace-filesystem-do";
 import { formatAttributedUserMessage } from './chat-author-attribution';
 import { resolveMessageAuthorDisplayName } from '../../../src/lib/message-author';
-import { injectFileSafetyMessage } from './file-safety';
+import { evaluateFileSafety, type FileSafetyEvaluation } from './file-safety';
 import { applyMentionContext } from './mention-context';
 import { extractThreadCompletionSummarySource } from '../../../src/lib/thread-completion-summary-generation.server';
 // Types only — the `ai` package's runtime surface is heavy and chat-thread-do.ts
@@ -4021,7 +4021,9 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     }
 
     let attributedContent: string;
-    const safeContent = injectFileSafetyMessage(rawContent);
+    const fileSafety = evaluateFileSafety(rawContent);
+    this.recordFileSafetyInjection(fileSafety);
+    const safeContent = fileSafety.content;
     const mentionAugmented = await this.applyMentionsForTurn(safeContent);
     attributedContent = formatAttributedUserMessage(mentionAugmented, {
       userName: context.userName,
@@ -4526,6 +4528,17 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     });
   }
 
+  // Structured signal only (which trigger fired) — never message content.
+  private recordFileSafetyInjection(evaluation: FileSafetyEvaluation): void {
+    if (evaluation.documentIntegrityTriggered) {
+      this.recordChatThreadObservabilityEvent("chat_document_integrity_notice", {
+        operation: "inject_file_safety",
+        status: "injected",
+        severity: "warn",
+      });
+    }
+  }
+
   private normalizeRunningActivityText(text: string | null | undefined): string | null {
     return this.streamingActivity.normalizeRunningActivityText(text);
   }
@@ -5018,7 +5031,9 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         });
       }
 
-      const safeContent = injectFileSafetyMessage(rawContent);
+      const fileSafety = evaluateFileSafety(rawContent);
+      this.recordFileSafetyInjection(fileSafety);
+      const safeContent = fileSafety.content;
       const mentionAugmented =
         await this.applyMentionsForTurn(safeContent);
       const attributedContent = formatAttributedUserMessage(mentionAugmented, {

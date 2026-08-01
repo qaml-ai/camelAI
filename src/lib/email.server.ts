@@ -41,6 +41,15 @@ interface EmailVerificationEmailArgs {
   expiresAt: number;
 }
 
+interface ScheduledPromptPausedEmailArgs {
+  env: EmailEnvBindings;
+  to: string;
+  scheduleName: string;
+  workspaceName: string | null;
+  billingError: string;
+  automationsUrl: string | null;
+}
+
 interface HelpConfirmationEmailArgs {
   env: EmailEnvBindings;
   to: string;
@@ -329,6 +338,42 @@ export async function sendEmailVerificationEmail({
     createElement(EmailVerificationEmailTemplate, {
       verificationUrl,
       expirationLabel: expiration,
+    })
+  );
+
+  return deliverEmail({
+    env,
+    to: normalizedTo,
+    subject,
+    htmlBody,
+    textBody,
+  });
+}
+
+export async function sendScheduledPromptPausedEmail({
+  env,
+  to,
+  scheduleName,
+  workspaceName,
+  billingError,
+  automationsUrl,
+}: ScheduledPromptPausedEmailArgs): Promise<EmailDeliveryResult> {
+  const normalizedTo = to.trim().toLowerCase();
+  const subject = sanitizeHeaderValue(
+    `Your scheduled prompt "${scheduleName}" was paused after billing failures`
+  );
+  const normalizedBillingError = truncateWithEllipsis(billingError.trim(), 500);
+
+  const [{ createElement }, { ScheduledPromptPausedEmailTemplate }] = await Promise.all([
+    import('react'),
+    import('./email/templates/scheduled-prompt-paused-email'),
+  ]);
+  const { htmlBody, textBody } = await renderEmailElement(
+    createElement(ScheduledPromptPausedEmailTemplate, {
+      scheduleName,
+      workspaceName,
+      billingError: normalizedBillingError,
+      automationsUrl,
     })
   );
 

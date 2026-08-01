@@ -41,6 +41,11 @@
       "kind": "unit"
     },
     {
+      "id": "project-search-live",
+      "description": "Locate content in a DO-backed project without calling code-mode-only search tools at top level",
+      "kind": "unit"
+    },
+    {
       "id": "template-select-crud-live",
       "description": "Choose the CRUD project starter from a stateful internal-tool request",
       "kind": "unit"

@@ -752,6 +752,7 @@ async function main() {
   // Do not leak host-only path knobs into the Worker env.
   delete vars.SELFHOST_AGENT_DIR;
   delete vars.SELFHOST_AGENT_SKILLS_DIR;
+  delete vars.SELFHOST_AGENT_HOST_DIR;
 
   for (const [name, value] of Object.entries(vars)) {
     bindings.push(bindingText(name, value));

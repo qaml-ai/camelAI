@@ -215,10 +215,16 @@ description: Follow ACME runbooks. Use when shipping internal tools.
     config.includes('acme-runbooks/SKILL.md'),
     'config should embed custom skill markdown in skills JSON',
   );
-  assert(
-    !config.includes('SELFHOST_AGENT_DIR'),
-    'host-only SELFHOST_AGENT_DIR must not leak into Worker bindings',
-  );
+  for (const hostOnly of [
+    'SELFHOST_AGENT_DIR',
+    'SELFHOST_AGENT_SKILLS_DIR',
+    'SELFHOST_AGENT_HOST_DIR',
+  ]) {
+    assert(
+      !config.includes(`name = "${hostOnly}"`),
+      `host-only ${hostOnly} must not leak into Worker bindings`,
+    );
+  }
   for (const [containerClass, image] of [
     ['ProjectBuildSandbox', 'camelai-selfhost-project-build:0.12.0'],
     ['AnalysisSandbox', 'camelai-selfhost-analysis:0.12.0'],

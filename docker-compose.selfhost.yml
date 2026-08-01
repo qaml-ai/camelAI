@@ -24,6 +24,11 @@ services:
       SELFHOST_AI_AUTH_TYPE: ${SELFHOST_AI_AUTH_TYPE:-bearer}
       SELFHOST_AI_API: ${SELFHOST_AI_API:-openai-completions}
       SELFHOST_AI_AWS_REGION: ${SELFHOST_AI_AWS_REGION:-us-east-1}
+      SELFHOST_AGENT_DIR: ${SELFHOST_AGENT_DIR:-.selfhost/agent}
+      SELFHOST_AGENT_SKILLS_DIR: ${SELFHOST_AGENT_SKILLS_DIR:-}
+      SELFHOST_AGENT_PROMPT_APPEND: ${SELFHOST_AGENT_PROMPT_APPEND:-}
+      SELFHOST_AGENT_PROMPT_PREPEND: ${SELFHOST_AGENT_PROMPT_PREPEND:-}
+      SELFHOST_AGENT_SKILLS_JSON: ${SELFHOST_AGENT_SKILLS_JSON:-}
       LOCAL_AUTH_BYPASS: ${LOCAL_AUTH_BYPASS:-}
       LOCAL_AUTH_BYPASS_HOSTS: ${LOCAL_AUTH_BYPASS_HOSTS:-}
       LOCAL_AUTH_USER_EMAIL: ${LOCAL_AUTH_USER_EMAIL:-}
@@ -62,6 +67,9 @@ services:
       POMERIUM_REQUIRED_EMAIL_DOMAIN: ${POMERIUM_REQUIRED_EMAIL_DOMAIN:-}
     volumes:
       - app-state:/workspace/.selfhost/workerd/state
+      # Operator agent customization pack (skills + prompt append/prepend).
+      # Read at workerd-config generation on container start.
+      - ${SELFHOST_AGENT_HOST_DIR:-./.selfhost/agent}:/workspace/.selfhost/agent:ro
       # Attached workerd containers require read-write Docker API access.
       # Treat control of this container as root-equivalent access to the VM.
       - ${SELFHOST_DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock:rw

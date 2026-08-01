@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
+import { loadSelfhostAgentPack } from './selfhost-agent-pack.mjs';
 import { readSelfhostEnv } from './selfhost-common.mjs';
 
 const repoRoot = process.cwd();
@@ -50,6 +51,11 @@ const SELFHOST_DEFAULT_VARS = {
   SELFHOST_AI_AUTH_TYPE: 'bearer',
   SELFHOST_AI_API: 'openai-completions',
   SELFHOST_AI_AWS_REGION: 'us-east-1',
+  SELFHOST_AGENT_DIR: '',
+  SELFHOST_AGENT_SKILLS_DIR: '',
+  SELFHOST_AGENT_PROMPT_APPEND: '',
+  SELFHOST_AGENT_PROMPT_PREPEND: '',
+  SELFHOST_AGENT_SKILLS_JSON: '',
   ARTIFACTS_NAMESPACE: 'selfhost',
   CF_DISPATCH_NAMESPACE: 'selfhost',
   CF_WORKER_NAME: 'chiridion-selfhost',
@@ -733,6 +739,17 @@ async function main() {
   for (const key of Object.keys(vars)) {
     if (process.env[key] !== undefined) vars[key] = process.env[key];
   }
+
+  // Resolve `.selfhost/agent` (or env overrides) into Worker text bindings.
+  // loadSelfhostAgentPack already prefers non-empty env values over files.
+  const agentPack = await loadSelfhostAgentPack(repoRoot, vars);
+  vars.SELFHOST_AGENT_PROMPT_APPEND = agentPack.promptAppend;
+  vars.SELFHOST_AGENT_PROMPT_PREPEND = agentPack.promptPrepend;
+  vars.SELFHOST_AGENT_SKILLS_JSON = JSON.stringify(agentPack.skills);
+  // Do not leak host-only path knobs into the Worker env.
+  delete vars.SELFHOST_AGENT_DIR;
+  delete vars.SELFHOST_AGENT_SKILLS_DIR;
+
   for (const [name, value] of Object.entries(vars)) {
     bindings.push(bindingText(name, value));
   }

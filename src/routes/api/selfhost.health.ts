@@ -32,6 +32,7 @@ export async function loader({ context }: LoaderFunctionArgs) {
   checks.push(requiredVar("LOCAL_APP_VANITY_DOMAIN", env.LOCAL_APP_VANITY_DOMAIN));
   checks.push(requiredVar("LOCAL_APP_IFRAME_DOMAIN", env.LOCAL_APP_IFRAME_DOMAIN));
   checks.push(checkAiProviderConfig(env));
+  checks.push(checkAgentPack(env));
 
   if (env.APP_DB) {
     checks.push(await checkD1(env.APP_DB));
@@ -121,6 +122,56 @@ function checkAiProviderConfig(env: ReturnType<typeof getEnv>): HealthCheck {
         message:
           "No self-host AI provider is configured. Chat requires SELFHOST_AI_PROVIDER and SELFHOST_AI_API_KEY, or a hosted Cloudflare AI Gateway configuration.",
       };
+}
+
+function checkAgentPack(env: ReturnType<typeof getEnv>): HealthCheck {
+  const promptAppend =
+    typeof env.SELFHOST_AGENT_PROMPT_APPEND === "string"
+      ? env.SELFHOST_AGENT_PROMPT_APPEND.trim()
+      : "";
+  const promptPrepend =
+    typeof env.SELFHOST_AGENT_PROMPT_PREPEND === "string"
+      ? env.SELFHOST_AGENT_PROMPT_PREPEND.trim()
+      : "";
+  const skillsJson =
+    typeof env.SELFHOST_AGENT_SKILLS_JSON === "string"
+      ? env.SELFHOST_AGENT_SKILLS_JSON.trim()
+      : "";
+
+  const parts: string[] = [];
+  if (promptPrepend) parts.push("prompt prepend");
+  if (promptAppend) parts.push("prompt append");
+
+  if (skillsJson) {
+    try {
+      const parsed = JSON.parse(skillsJson) as { files?: Record<string, unknown> };
+      const names = Object.keys(parsed.files ?? {})
+        .filter((filePath) => filePath.endsWith("/SKILL.md"))
+        .map((filePath) => filePath.slice(0, -"/SKILL.md".length))
+        .sort();
+      if (names.length > 0) {
+        parts.push(
+          `${names.length} custom skill${names.length === 1 ? "" : "s"} (${names.join(", ")})`,
+        );
+      }
+    } catch (error) {
+      return {
+        name: "agent-pack",
+        status: "fail",
+        message: `SELFHOST_AGENT_SKILLS_JSON is invalid: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      };
+    }
+  }
+
+  return {
+    name: "agent-pack",
+    status: "ok",
+    message: parts.length > 0
+      ? `Loaded ${parts.join("; ")}`
+      : "No custom agent pack configured (using bundled skills and stock prompt)",
+  };
 }
 
 async function checkD1(db: D1Database): Promise<HealthCheck> {

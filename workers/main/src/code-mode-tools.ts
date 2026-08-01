@@ -18,8 +18,11 @@ import { getPreferredAppUrl } from "../../../src/lib/app-url";
 import { findConnectionMethodEntry, getConnection, invokeConnectionMethod, listConnectionMethods, listConnections, listConnectionTools, testConnectionMethodEntry, verifyConnection } from "./connections-runtime";
 import { confirmDestructiveAction, DESTRUCTIVE_CONFIRM_LABEL } from "./confirmed-destructive-action";
 import { collectProjectDeletionTargets } from "./project-deletion";
-import { listPiBundledSkillFiles, readPiBundledSkillFile } from "./pi-skill-bundle-helpers";
-import { PI_SKILL_NAMES } from "./pi-skills-bundle";
+import {
+  listAgentSkillFiles,
+  readAgentSkillFile,
+  resolveAgentSkillCatalog,
+} from "./selfhost-agent-pack";
 import { PiContainerTools, PI_CONTAINER_TOOL_DEFINITIONS } from "./pi-container-tools";
 import { parseFilePreviewPath } from "./preview-paths";
 import type { ConnectionSetupResponse } from "./chat-thread-browser-prompts";
@@ -1354,7 +1357,7 @@ function hasR2Target(args: Record<string, unknown>): boolean {
   return args.location === "r2";
 }
 
-function bundledSkillReadResponse(skill: NonNullable<ReturnType<typeof readPiBundledSkillFile>>) {
+function skillReadResponse(skill: NonNullable<ReturnType<typeof readAgentSkillFile>>) {
   return {
     text: skill.text,
     content: [{ type: "text", text: skill.text }],
@@ -1368,10 +1371,13 @@ function bundledSkillReadResponse(skill: NonNullable<ReturnType<typeof readPiBun
   };
 }
 
-function bundledSkillTargetFromArgs(args: Record<string, unknown>): { skill: string; file: string } {
+function skillTargetFromArgs(
+  args: Record<string, unknown>,
+  availableSkillNames: readonly string[],
+): { skill: string; file: string } {
   const skill = typeof args.skill === "string" ? args.skill.trim() : "";
   if (!skill || !/^[a-z0-9][a-z0-9._-]*$/i.test(skill)) {
-    throw new Error(`read_skill requires one of these bundled skill names: ${PI_SKILL_NAMES.join(", ")}`);
+    throw new Error(`read_skill requires one of these skill names: ${availableSkillNames.join(", ")}`);
   }
 
   if (args.file != null && typeof args.file !== "string") {
@@ -2813,21 +2819,22 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       switch (name) {
         case "read_skill":
         {
-          const target = bundledSkillTargetFromArgs(args);
-          const skill = readPiBundledSkillFile(target.skill, target.file);
+          const catalog = resolveAgentSkillCatalog(this.env);
+          const target = skillTargetFromArgs(args, catalog.skillNames);
+          const skill = readAgentSkillFile(this.env, target.skill, target.file);
           if (!skill) {
-            const availableFiles = listPiBundledSkillFiles(target.skill);
+            const availableFiles = listAgentSkillFiles(this.env, target.skill);
             if (availableFiles.length === 0) {
               throw new Error(
-                `Bundled skill not found: ${target.skill}. Available skills: ${PI_SKILL_NAMES.join(", ")}`,
+                `Skill not found: ${target.skill}. Available skills: ${catalog.skillNames.join(", ")}`,
               );
             }
             throw new Error(
-              `Bundled skill file not found: ${target.skill}/${target.file}. ` +
+              `Skill file not found: ${target.skill}/${target.file}. ` +
               `Available files: ${availableFiles.join(", ")}.`,
             );
           }
-          return bundledSkillReadResponse(skill);
+          return skillReadResponse(skill);
         }
 
         case "read":

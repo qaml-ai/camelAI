@@ -223,6 +223,22 @@ await check("AI provider", async () => {
   note(`SELFHOST_AI_PROVIDER: ${provider}`);
 });
 
+await check("agent pack", async () => {
+  const { loadSelfhostAgentPack, ensureSelfhostAgentPackSkeleton } = await import(
+    "./selfhost-agent-pack.mjs"
+  );
+  await ensureSelfhostAgentPackSkeleton(repoRoot, env);
+  const pack = await loadSelfhostAgentPack(repoRoot, env);
+  note(`agent dir: ${path.relative(repoRoot, pack.agentDir)}`);
+  if (pack.skillNames.length > 0) {
+    note(`custom skills: ${pack.skillNames.join(", ")}`);
+  } else {
+    note("custom skills: none (bundled skills only)");
+  }
+  if (pack.promptPrepend) note("prompt.prepend loaded");
+  if (pack.promptAppend) note("prompt.append loaded");
+});
+
 await check("network binding", async () => {
   const bindAddress = (env.SELFHOST_BIND_ADDRESS || "127.0.0.1").trim();
   if (bindAddress !== "127.0.0.1" && bindAddress !== "::1") {

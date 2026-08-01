@@ -28,6 +28,7 @@ manifest.
 | --- | --- |
 | Web application and reverse-proxy SSO | Supported |
 | Bedrock, Anthropic, OpenAI, OpenRouter, or custom key-backed chat | Supported |
+| Custom agent skills + prompt append via `.selfhost/agent/` | Supported (additive; see `SELF_HOSTING.md`) |
 | Durable Objects, KV, R2, D1, queues, and workflows | Supported by local `workerd` services |
 | Workspace/project source and local git history | Supported |
 | Project package installation, builds, and `deploy_project` | Supported by the project-build container |

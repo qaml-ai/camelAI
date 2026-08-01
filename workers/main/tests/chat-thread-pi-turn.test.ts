@@ -6328,7 +6328,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(prompt).toContain('a common and costly mistake');
     expect(prompt).toContain('before the first `create_project` call in a task');
     expect(prompt).toContain('read_skill({ skill: "developing-software" })');
-    expect(prompt).toContain('Never use the generic file `read` tool for bundled skills');
+    expect(prompt).toContain('Never use the generic file `read` tool for bundled or deployment skills');
     expect(prompt).toContain('Do not create a scaffold first and read the skill afterward');
     expect(prompt).toContain('`vanilla` for dependency-light client-only HTML/CSS/JavaScript experiences');
     expect(prompt).toContain('answer in chat only');

@@ -305,6 +305,60 @@ invitation, support, and agent-originated messages. The health contract should
 only mark `smtp` and `outbound_email` available after a live transport check
 succeeds.
 
+## Agent customization (skills and prompt)
+
+Enterprise self-host installs can add skills and append deployment instructions
+without rebuilding the application image. On container start,
+`selfhost-workerd-config` loads `.selfhost/agent/` (mounted read-only into the
+app container) and injects it into the Worker.
+
+```text
+.selfhost/agent/
+  README.md                 # created by selfhost:init / configure
+  prompt.append.md          # added after the stock camelAI system prompt
+  prompt.prepend.md         # optional policy text before the stock prompt
+  skills/
+    acme-runbooks/
+      SKILL.md              # same YAML frontmatter format as sandbox/skills/
+      references/foo.md     # optional extras; read via read_skill({ skill, file })
+```
+
+Example skill:
+
+```markdown
+---
+name: acme-runbooks
+description: Follow ACME internal deploy checklists. Use when shipping internal tools.
+---
+
+# ACME runbooks
+
+1. Call `read_skill({ skill: "developing-software" })` before creating projects.
+2. Prefer the `crud` template for internal tools.
+3. Never invent production URLs; use `deploy_project` results.
+```
+
+Example prompt append:
+
+```markdown
+Always prefer internal package mirrors. Do not suggest third-party SaaS unless
+the user asks. When creating apps for Finance, include an audit log table.
+```
+
+Rules:
+
+- Customization is **additive**. Full system-prompt replacement is not
+  supported; stock safety, tool, and evidence rules always remain.
+- Custom skills appear in `## Available Skills` and are served by `read_skill`.
+- A custom skill with the same name as a bundled skill **overrides** it.
+- After editing the pack, restart the app (`bun run selfhost:up` or recreate the
+  `app` container) so workerd-config regenerates bindings.
+- Escape hatches: `SELFHOST_AGENT_PROMPT_APPEND`, `SELFHOST_AGENT_PROMPT_PREPEND`,
+  `SELFHOST_AGENT_SKILLS_JSON`, `SELFHOST_AGENT_SKILLS_DIR`, and
+  `SELFHOST_AGENT_HOST_DIR` (Compose host mount path).
+
+`GET /api/selfhost/health` reports an `agent-pack` check summarizing what loaded.
+
 ## Operational validation
 
 After startup, verify:

@@ -27,6 +27,19 @@ async function main() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'camelai-workerd-config-test-'));
   const outPath = path.join(tempDir, 'camelai.capnp');
   const stateDir = path.join(tempDir, 'state');
+  const agentDir = path.join(tempDir, 'agent');
+  await fs.mkdir(path.join(agentDir, 'skills/acme-runbooks'), { recursive: true });
+  await fs.writeFile(path.join(agentDir, 'prompt.append.md'), 'Prefer internal mirrors.');
+  await fs.writeFile(
+    path.join(agentDir, 'skills/acme-runbooks/SKILL.md'),
+    `---
+name: acme-runbooks
+description: Follow ACME runbooks. Use when shipping internal tools.
+---
+
+# ACME
+`,
+  );
   const result = spawnSync(process.execPath, [
     'scripts/selfhost-workerd-config.mjs',
     '--out',
@@ -40,6 +53,7 @@ async function main() {
     env: {
       ...process.env,
       SELFHOST_ENV_FILE: path.join(tempDir, 'intentionally-missing.env'),
+      SELFHOST_AGENT_DIR: agentDir,
       SELFHOST_AI_PROVIDER: 'bedrock',
       SELFHOST_AI_API_KEY: 'test-bedrock-key',
       SELFHOST_AI_AWS_REGION: 'us-east-1',
@@ -184,6 +198,26 @@ async function main() {
   assert(
     config.includes('socketPath = "unix:///var/run/docker.sock"'),
     'config should point workerd at the mounted Docker socket',
+  );
+  assert(
+    config.includes('name = "SELFHOST_AGENT_PROMPT_APPEND"'),
+    'config should contain agent prompt append binding',
+  );
+  assert(
+    config.includes('Prefer internal mirrors.'),
+    'config should embed prompt.append.md content',
+  );
+  assert(
+    config.includes('name = "SELFHOST_AGENT_SKILLS_JSON"'),
+    'config should contain agent skills JSON binding',
+  );
+  assert(
+    config.includes('acme-runbooks/SKILL.md'),
+    'config should embed custom skill markdown in skills JSON',
+  );
+  assert(
+    !config.includes('SELFHOST_AGENT_DIR'),
+    'host-only SELFHOST_AGENT_DIR must not leak into Worker bindings',
   );
   for (const [containerClass, image] of [
     ['ProjectBuildSandbox', 'camelai-selfhost-project-build:0.12.0'],

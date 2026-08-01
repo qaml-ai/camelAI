@@ -88,12 +88,9 @@ import { isOrgBanned } from "./ban-list";
 import type { WorkspaceThreadStreamingOptions } from "./thread-status";
 
 import {
-  PI_SKILL_DESCRIPTIONS,
-  PI_SKILL_NAMES,
-} from "./pi-skills-bundle";
-import {
   createPiSystemPrompt,
 } from "./pi-system-prompt";
+import { resolveAgentSkillCatalog } from "./selfhost-agent-pack";
 
 import { repairPiMessageHistoryForReplay } from "./pi-message-history";
 import { planPiTurnResume } from "./pi-turn-journal";
@@ -5491,11 +5488,14 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
 
   private createPiSystemPrompt(
     context: ChatContextState,
-    envVars?: Record<string, string>,
+    _envVars?: Record<string, string>,
   ): string {
+    const catalog = resolveAgentSkillCatalog(this.env);
     const base = createPiSystemPrompt(context, {
-      skillNames: PI_SKILL_NAMES,
-      skillDescriptions: PI_SKILL_DESCRIPTIONS,
+      skillNames: catalog.skillNames,
+      skillDescriptions: catalog.skillDescriptions,
+      promptPrepend: catalog.promptPrepend,
+      promptAppend: catalog.promptAppend,
     });
     const verifiedWorkState = formatVerifiedWorkStatePrompt(
       this.ctx?.storage?.kv?.get<unknown>(CHAT_VERIFIED_WORK_STATE_KEY),
@@ -5999,7 +5999,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     context: ChatContextState,
     isExplore: boolean,
   ): Promise<string> {
-    return createPiSubagentSystemPrompt(context, isExplore);
+    return createPiSubagentSystemPrompt(context, isExplore, this.env);
   }
 
   private pushPiRuntimeEvent(method: string, params: Record<string, unknown>): void {

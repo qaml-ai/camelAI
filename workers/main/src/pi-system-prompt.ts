@@ -8,6 +8,10 @@ export type PiSystemPromptOptions = {
   skillNames: readonly string[];
   skillDescriptions?: Readonly<Record<string, string | undefined>>;
   researchAvailable?: boolean;
+  /** Optional deployment-level text placed before the stock camelAI prompt. */
+  promptPrepend?: string;
+  /** Optional deployment-level text appended after skills, before thread IDs. */
+  promptAppend?: string;
 };
 
 export type PiSubagentMode = "agent" | "explore";
@@ -37,8 +41,18 @@ export function createPiSystemPrompt(
     const instruction = `call \`read_skill({ skill: "${name}" })\``;
     return hint ? `- ${name}: ${instruction} — ${hint}` : `- ${name}: ${instruction}`;
   });
+  const promptPrepend = options.promptPrepend?.trim();
+  const promptAppend = options.promptAppend?.trim();
 
   return [
+    ...(promptPrepend
+      ? [
+          "## Deployment Policy",
+          "The following instructions are deployment-specific operator policy for this self-host install. Follow them together with the stock camelAI rules below; do not discard platform safety, tool, or evidence requirements.",
+          promptPrepend,
+          "",
+        ]
+      : []),
     "You are camelAI, an AI coding agent that helps users build, ship, analyze, and operate apps in their workspace. Act on clear requests; ask briefly only when an assumption could waste significant work or cause an irreversible or external side effect.",
     "Use the provided tools for durable project/workspace files, JavaScript code mode, mediated project build/deploy actions, and connections.",
     "Treat structured tool outcomes as the source of truth for operational claims. Say deployed, sent, scheduled, validated, live, or complete only when the corresponding current tool result succeeded; a successful deploy proves publication, not feature correctness or live-data quality. If a tool failed or verification was not run, state that plainly. User corrections override earlier assumptions: restate the corrected constraint, update downstream work, and do not repeat the superseded claim.",
@@ -56,8 +70,16 @@ export function createPiSystemPrompt(
     "Before relying on repository-specific conventions, read /workspace/AGENTS.md or /AGENTS.md if present.",
     "",
     "## Available Skills",
-    "Pay close attention to these skills — they are curated, battle-tested playbooks and are the preferred way to do a task, not optional reference. Before starting any non-trivial task, scan this list and check whether one applies. Skipping a skill that matches and improvising instead is a common and costly mistake; do not do it. When a task matches a skill, even loosely, call `read_skill` FIRST and follow the result before writing any other code or output; if several could apply, read the most specific one. For a referenced file, call `read_skill` again with the same `skill` and its relative `file` name. Never use the generic file `read` tool for bundled skills.",
+    "Pay close attention to these skills — they are curated, battle-tested playbooks and are the preferred way to do a task, not optional reference. Before starting any non-trivial task, scan this list and check whether one applies. Skipping a skill that matches and improvising instead is a common and costly mistake; do not do it. When a task matches a skill, even loosely, call `read_skill` FIRST and follow the result before writing any other code or output; if several could apply, read the most specific one. For a referenced file, call `read_skill` again with the same `skill` and its relative `file` name. Never use the generic file `read` tool for bundled or deployment skills.",
     ...skillLines,
+    ...(promptAppend
+      ? [
+          "",
+          "## Deployment Instructions",
+          "The following instructions are deployment-specific for this self-host install. Follow them together with the stock camelAI rules above; do not discard platform safety, tool, or evidence requirements.",
+          promptAppend,
+        ]
+      : []),
     "",
     `Thread ID: ${context.threadId}`,
     `Workspace ID: ${context.workspaceId}`,

@@ -99,6 +99,13 @@ const values = {
   SELFHOST_AI_AUTH_TYPE: "bearer",
   SELFHOST_AI_API: "openai-completions",
   SELFHOST_AI_AWS_REGION: "us-east-1",
+  // Optional agent customization (also loadable from .selfhost/agent/).
+  SELFHOST_AGENT_HOST_DIR: "./.selfhost/agent",
+  SELFHOST_AGENT_DIR: ".selfhost/agent",
+  SELFHOST_AGENT_SKILLS_DIR: "",
+  SELFHOST_AGENT_PROMPT_APPEND: "",
+  SELFHOST_AGENT_PROMPT_PREPEND: "",
+  SELFHOST_AGENT_SKILLS_JSON: "",
   TOKEN_SIGNING_SECRET: secret(),
   INTEGRATION_SECRET_KEY: secret(),
   LOCAL_ARTIFACTS_SECRET: secret(),
@@ -116,9 +123,13 @@ ${Object.entries(values)
 await fs.writeFile(envFile, content, { mode: 0o600 });
 await writePomeriumConfig(values, { strict: false });
 await writeCaddyConfig(values, { strict: false });
+const { ensureSelfhostAgentPackSkeleton } = await import("./selfhost-agent-pack.mjs");
+const agentSkeleton = await ensureSelfhostAgentPackSkeleton(repoRoot, values);
 console.log(`Wrote ${path.relative(repoRoot, envFile)}.`);
+console.log(`Wrote ${path.relative(repoRoot, agentSkeleton.agentDir)}/ (agent customization pack).`);
 console.log("Next steps:");
 console.log("  Configure identity, automatic TLS, DNS, and AI settings in .env.selfhost");
+console.log("  Optionally add skills/prompt under .selfhost/agent/");
 console.log("  bun run selfhost:configure");
 console.log("  bun run selfhost:doctor");
 console.log("  bun run selfhost:up");

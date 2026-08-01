@@ -27,11 +27,12 @@ import {
   type CodeModeToolsBinding,
 } from "../code-mode-tools";
 import { PI_CONTAINER_TOOL_DEFINITIONS } from "../pi-container-tools";
-import {
-  PI_SKILL_DESCRIPTIONS,
-  PI_SKILL_NAMES,
-} from "../pi-skills-bundle";
+import { connectionsBindingEnabled } from "../../../../src/lib/connections-binding";
 import { createPiSubagentSystemPrompt as buildPiSubagentSystemPrompt } from "../pi-system-prompt";
+import {
+  resolveAgentSkillCatalog,
+  type SelfhostAgentPackEnv,
+} from "../selfhost-agent-pack";
 import {
   extractToolContent,
   extractLatestPiAssistantText,
@@ -947,18 +948,18 @@ export async function runPiCapabilityAgentTool(
 export async function createPiSubagentSystemPrompt(
   context: ChatContextState,
   isExplore: boolean,
-  options: {
-    deployedConnectionsBindingEnabled?: boolean;
-  } = {},
+  env?: SelfhostAgentPackEnv & { CONNECTIONS_BINDING_ENABLED?: string },
 ): Promise<string> {
+  const catalog = resolveAgentSkillCatalog(env);
   return buildPiSubagentSystemPrompt(
     context,
     isExplore ? "explore" : "agent",
     {
-      skillNames: PI_SKILL_NAMES,
-      skillDescriptions: PI_SKILL_DESCRIPTIONS,
-      deployedConnectionsBindingEnabled:
-        options.deployedConnectionsBindingEnabled,
+      skillNames: catalog.skillNames,
+      skillDescriptions: catalog.skillDescriptions,
+      promptPrepend: catalog.promptPrepend,
+      promptAppend: catalog.promptAppend,
+      deployedConnectionsBindingEnabled: connectionsBindingEnabled(env),
     },
   );
 }

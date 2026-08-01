@@ -134,6 +134,9 @@ export interface ChatEnv extends WorkspaceFilesystemEnv {
   SELFHOST_AI_AUTH_TYPE?: string;
   SELFHOST_AI_API?: string;
   SELFHOST_AI_AWS_REGION?: string;
+  SELFHOST_AGENT_PROMPT_APPEND?: string;
+  SELFHOST_AGENT_PROMPT_PREPEND?: string;
+  SELFHOST_AGENT_SKILLS_JSON?: string;
   LOCAL_APP_VANITY_DOMAIN?: string;
   LOCAL_APP_IFRAME_DOMAIN?: string;
   WORKER_BASE_URL?: string;

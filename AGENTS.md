@@ -365,3 +365,17 @@ Tailscale host IPs are staging `100.115.221.105` and prod `100.112.135.2`. Publi
 - When adding a major subsystem, add a short map entry and the canonical test command.
 - When removing or renaming a subsystem, update this file in the same change.
 - If a detail is likely to drift quickly, document where to verify it instead of freezing it here.
+
+## Cursor Cloud specific instructions
+
+Durable, non-obvious notes for running this repo inside a Cursor Cloud VM (no Cloudflare account/credentials available). Standard commands live in the `README.md` / `package.json` tables above — this section only captures the gotchas.
+
+- **Run fully offline with `E2E_LOCAL=1`.** The default `bun run dev` marks several bindings `remote: true` (`AI`, `R2_BUCKET`, `R2_OUTPUTS_BUCKET`, `ARTIFACTS`, `BROWSER`, `send_email`) and expects a Cloudflare login. Setting `E2E_LOCAL=1` forces every binding into local Miniflare and disables sandbox containers (see `vite.config.ts`), so no Cloudflare creds and no Docker are needed for the web app. Use `E2E_LOCAL=1 bun run dev:local-auth` (auto-seeds a `Local Dev` user/org/workspace and auto-logs-in; localhost-only) → app on `http://localhost:3001`.
+- **`.dev.vars` is required to boot** and must contain non-empty `TOKEN_SIGNING_SECRET` and `INTEGRATION_SECRET_KEY` (random values are fine — copy `.dev.vars.example`). It is gitignored; the setup step already created one in the snapshot, so it normally persists across sessions. Recreate it if missing.
+- **Exercising a real chat turn offline (no model creds):** run the deterministic fake LLM `node scripts/fake-llm.mjs` (port `8788`) and start the dev server with `TEST_LLM_REPLAY_URL=http://localhost:8788` so `resolvePiModel` routes model calls to it. The fake echoes text after `Reply with:` (prefixed `[fake-llm] `). Full hello-world command:
+  ```bash
+  TEST_LLM_REPLAY_URL=http://localhost:8788 E2E_LOCAL=1 bun run dev:local-auth
+  ```
+- **Local Playwright E2E:** `E2E_LOCAL=1 bun run test:e2e` reuses an already-running `:3001` dev server (and `:8788` fake LLM) via `reuseExistingServer`; if you want Playwright to own both, stop your manual servers first. Chromium + system deps are already installed in the snapshot (`bunx playwright install --with-deps chromium` to refresh). The two `connections-local` specs can flake against a live Vite dev server (dialog open timing); the app page itself loads fine.
+- **CI does not gate `typecheck` or `lint`** (`.github/workflows/ci.yml` runs only `test:run`, `test:workers`, and self-host checks). As a result `bun run typecheck` and `bun run lint` currently report pre-existing failures on `main` (e.g. `tests/container-sizing.test.ts` TS5097; a `no-unused-vars` warning in `chat-thread-do.ts`) that are unrelated to environment setup — do not treat them as regressions you introduced.
+- **Bun** is installed at `~/.bun/bin/bun` and symlinked to `/usr/local/bin/bun` so it resolves in non-login shells (the update script's `bun install --frozen-lockfile` depends on this).

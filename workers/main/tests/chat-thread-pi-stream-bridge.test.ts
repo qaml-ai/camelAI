@@ -72,31 +72,19 @@ function seedPiCoreRow(instance: any, idx: number, message: AnyRecord): void {
 }
 
 describe('ChatThreadDO bounded render history', () => {
-  it('returns the first page without awaiting full-archive legacy repair', async () => {
+  it('returns the first derived page without background top-up or legacy heal', async () => {
     const fake = Object.create(ChatThreadDO.prototype) as any;
-    let finishTopUp: (() => void) | undefined;
-    const topUp = new Promise<void>((resolve) => {
-      finishTopUp = resolve;
-    });
-    let finishTimeRepair: (() => void) | undefined;
-    const timeRepair = new Promise<void>((resolve) => {
-      finishTimeRepair = resolve;
-    });
-    const background: Promise<unknown>[] = [];
     fake.withChatMemoryPhase = vi.fn(
       async (_operation: string, fn: () => Promise<unknown>) => fn(),
     );
     fake.sweepOrphanedActiveTurnMarker = vi.fn(async () => {});
-    fake.topUpUiMessagesFromPiCore = vi.fn(() => topUp);
-    fake.healLegacyUiMessageTimes = vi.fn(() => timeRepair);
-    fake.healLegacyUiMessageAuthors = vi.fn(async () => {});
-    fake.getRenderHistoryPage = vi.fn(() => ({
+    fake.getDerivedUiMessagePage = vi.fn(async () => ({
       messages: [{ id: 'resident', role: 'user', parts: [] }],
-      nextCursor: 'cursor',
+      nextCursor: 'd:0',
       hasMore: true,
     }));
     fake.ctx = {
-      waitUntil: vi.fn((promise: Promise<unknown>) => background.push(promise)),
+      waitUntil: vi.fn(),
     };
 
     const page = await ChatThreadDO.prototype.getUiMessagePage.call(fake);
@@ -104,17 +92,8 @@ describe('ChatThreadDO bounded render history', () => {
     expect(page.messages.map((message: AnyRecord) => message.id)).toEqual([
       'resident',
     ]);
-    expect(fake.topUpUiMessagesFromPiCore).toHaveBeenCalledTimes(1);
-    expect(fake.healLegacyUiMessageTimes).not.toHaveBeenCalled();
-    expect(fake.healLegacyUiMessageAuthors).not.toHaveBeenCalled();
-    expect(background).toHaveLength(1);
-
-    finishTopUp?.();
-    await Promise.resolve();
-    expect(fake.healLegacyUiMessageTimes).toHaveBeenCalledTimes(1);
-    finishTimeRepair?.();
-    await Promise.all(background);
-    expect(fake.healLegacyUiMessageAuthors).toHaveBeenCalledTimes(1);
+    expect(fake.getDerivedUiMessagePage).toHaveBeenCalledTimes(1);
+    expect(fake.ctx.waitUntil).not.toHaveBeenCalled();
   });
 
   it('keeps only the resident window in memory while retaining and paging every durable row', async () => {
@@ -523,7 +502,7 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
     expect(response).toBeUndefined();
   });
 
-  it('backfills pi_core render history with monotonic created_at and idempotent top-up', async () => {
+  it('derives settled UI messages from pi_core on read in pi order', async () => {
     const stub = await newChatThreadStub('thread-backfill');
     await runInDurableObject(stub, async (instance: any) => {
       instance.chatContext = { threadId: 'thread-backfill' };
@@ -546,36 +525,21 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
         'resp-1',
       ]);
       expect(first.map((m: AnyRecord) => m.role)).toEqual(['user', 'assistant']);
-
-      // Identical pi timestamps must not tie: created_at is strictly increasing.
-      const createdAts = () =>
-        (
-          instance.ctx.storage.sql
-            .exec(
-              'SELECT id, created_at FROM cf_ai_chat_agent_messages ORDER BY created_at',
-            )
-            .toArray() as Array<{ id: string; created_at: string }>
-        );
-      const afterFirst = createdAts();
-      expect(afterFirst.map((row) => row.id)).toEqual([
-        'pi_user_1000_0',
-        'resp-1',
-      ]);
-      expect(afterFirst[0].created_at < afterFirst[1].created_at).toBe(true);
+      // Derive-on-read does not require materializing the ai-chat mirror.
       expect(
-        instance.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx'),
-      ).toBe(2);
+        instance.ctx.storage.sql
+          .exec<{ count: number }>(
+            'SELECT COUNT(*) AS count FROM cf_ai_chat_agent_messages',
+          )
+          .one().count,
+      ).toBe(0);
 
-      // Idempotent: a second call with no new rows returns the same list and
-      // does not rewrite or reorder existing rows.
       const second = await instance.getUiMessages();
       expect(second.map((m: AnyRecord) => m.id)).toEqual([
         'pi_user_1000_0',
         'resp-1',
       ]);
-      expect(createdAts()).toEqual(afterFirst);
 
-      // Top-up of a newly appended pi_core row.
       seedPiCoreRow(instance, 2, {
         role: 'user',
         content: 'second question',
@@ -587,9 +551,6 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
         'resp-1',
         'pi_user_2000_2',
       ]);
-      expect(instance.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx')).toBe(3);
-      const afterThird = createdAts();
-      expect(afterThird[1].created_at < afterThird[2].created_at).toBe(true);
     });
   });
 
@@ -633,17 +594,13 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
       });
 
       const messages = await instance.getUiMessages();
-      // The pi_core rows were recognized as already-present and skipped: the
-      // live-written ids survive, no pi_user_*/resp duplicates were inserted.
+      // Derive-on-read overlays live skeletons onto matching pi rows by
+      // piCoreMessageKey / forkEntryId so client/minted ids win.
       expect(messages.map((m: AnyRecord) => m.id)).toEqual([
         'client-user-1',
         'turn-mint-1',
       ]);
-      // The high-water mark still advanced past the skipped rows.
-      expect(instance.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx')).toBe(2);
 
-      // A later genuinely-new pi_core row (one with no live-written counterpart)
-      // still backfills, and the live rows are not duplicated.
       seedPiCoreRow(instance, 2, {
         role: 'user',
         content: 'second question',
@@ -655,7 +612,6 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
       expect(ids).toContain('turn-mint-1');
       expect(ids).toContain('pi_user_2000_2');
       expect(ids).toHaveLength(3);
-      expect(instance.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx')).toBe(3);
     });
   });
 
@@ -697,16 +653,18 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
       }
       await instance.persistMessages(renderMessages);
       expect(instance.messages).toHaveLength(50);
-      instance.ctx.storage.kv.delete('uiMessagesPiCoreHighWaterIdx');
-      instance.ctx.storage.kv.delete('uiMessagesPiCoreRevisionV1');
 
-      await instance.getUiMessages();
+      const derived = await instance.getUiMessages();
+      // Live skeletons overlay matching derived rows; no duplicate pi_user_*/resp ids.
+      expect(derived).toHaveLength(50);
+      expect(new Set(derived.map((m: AnyRecord) => m.id)).size).toBe(50);
 
       const durableRows = instance.ctx.storage.sql
         .exec<{ count: number }>(
           'SELECT COUNT(*) AS count FROM cf_ai_chat_agent_messages',
         )
         .one().count;
+      // Derive-on-read does not rewrite the live/archive table on read.
       expect(durableRows).toBe(60);
       const durableIds = instance.ctx.storage.sql
         .exec<{ id: string }>(
@@ -720,9 +678,6 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
       expect(
         durableIds.some((id: string) => id.startsWith('legacy-response-')),
       ).toBe(false);
-      expect(instance.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx')).toBe(
-        60,
-      );
     });
   });
 
@@ -774,40 +729,18 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
       await target.replacePiCoreForkMessages(forkMessages);
 
       const messages = await target.getUiMessages();
-      // The sliced fork converts to render history in order with the
-      // deterministic fork ids; the later source turns are absent.
+      // Derive-on-read serves the forked pi_core slice; later source turns are absent.
       expect(messages.map((m: AnyRecord) => m.id)).toEqual([
         'pi_user_1000_0',
         'resp-1',
       ]);
       expect(messages.map((m: AnyRecord) => m.role)).toEqual(['user', 'assistant']);
 
-      // created_at strictly increases even though both fork rows share pi
-      // timestamp 1000 (replacePiCoreForkMessages also rewrites the row
-      // created_at column, so the monotonic stamp comes from the backfill).
-      const createdAts = () =>
-        (
-          target.ctx.storage.sql
-            .exec(
-              'SELECT id, created_at FROM cf_ai_chat_agent_messages ORDER BY created_at',
-            )
-            .toArray() as Array<{ id: string; created_at: string }>
-        );
-      const afterFork = createdAts();
-      expect(afterFork.map((row) => row.id)).toEqual(['pi_user_1000_0', 'resp-1']);
-      expect(afterFork[0].created_at < afterFork[1].created_at).toBe(true);
-      expect(
-        target.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx'),
-      ).toBe(2);
-
-      // Idempotent: a second render load returns the same list and does not
-      // rewrite or reorder the existing rows.
       const second = await target.getUiMessages();
       expect(second.map((m: AnyRecord) => m.id)).toEqual([
         'pi_user_1000_0',
         'resp-1',
       ]);
-      expect(createdAts()).toEqual(afterFork);
     });
   });
 
@@ -867,6 +800,7 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
         ],
         timestamp: 1100,
         responseId: 'resp-1',
+        uiMetadata: { renderMessageId: 'turn-mint-1' },
       });
       seedPiCoreRow(instance, 2, {
         role: 'toolResult',
@@ -880,6 +814,7 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
         content: [{ type: 'text', text: 'final answer' }],
         timestamp: 1300,
         responseId: 'resp-2',
+        uiMetadata: { renderMessageId: 'turn-mint-1' },
       });
 
       // Reload (the loader path).
@@ -899,8 +834,6 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
       expect(
         messages.some((m: AnyRecord) => m.id === 'resp-1' || m.id === 'resp-2'),
       ).toBe(false);
-      // The mark advanced past all skipped rows.
-      expect(instance.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx')).toBe(3);
 
       // A second reload stays stable.
       const again = await instance.getUiMessages();
@@ -947,7 +880,6 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
         'client-user-1',
         'turn-mint-1',
       ]);
-      expect(instance.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx')).toBe(2);
     });
   });
 
@@ -1004,17 +936,18 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
       });
 
       const messages = await instance.getUiMessages();
+      // Derive-on-read follows pi_core sequence: the channel-history user row
+      // lands after the assistant in pi_core, so it renders after the turn.
       expect(messages.map((m: AnyRecord) => m.id)).toEqual([
         'client-user-1',
         'client-user-2',
-        'channel-1',
         'turn-mint-1',
+        'channel-1',
       ]);
-      expect(instance.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx')).toBe(4);
     });
   });
 
-  it('defers the top-up while a Pi turn is in flight (active-turn marker gate)', async () => {
+  it('derives settled history while a Pi turn marker is set (no top-up gate)', async () => {
     const stub = await newChatThreadStub('thread-marker-gate');
     await runInDurableObject(stub, async (instance: any) => {
       instance.chatContext = { threadId: 'thread-marker-gate' };
@@ -1032,14 +965,11 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
         turnId: 'turn-live',
         openedAt: Date.now(),
       });
+      // Derive-on-read serves settled history even while a turn marker is set;
+      // the live open-turn row is overlaid when present.
       const during = await instance.getUiMessages();
-      expect(during).toEqual([]);
-      expect(
-        instance.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx'),
-      ).toBeUndefined();
+      expect(during.map((m: AnyRecord) => m.id)).toEqual(['pi_user_1000_0', 'resp-1']);
 
-      // Rollback simulation: the turn's terminal path cleared the marker but no
-      // live render row exists — the rows convert exactly once.
       instance.ctx.storage.kv.delete('piActiveTurn');
       const after = await instance.getUiMessages();
       expect(after.map((m: AnyRecord) => m.id)).toEqual(['pi_user_1000_0', 'resp-1']);
@@ -1067,7 +997,12 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
           metadata: { pi: { forkEntryId: 'resp-1' } },
         },
       ]);
-      seedPiCoreRow(instance, 0, { role: 'user', content: 'q', timestamp: 1000 });
+      seedPiCoreRow(instance, 0, {
+        role: 'user',
+        content: 'q',
+        timestamp: 1000,
+        uiMetadata: { renderMessageId: 'client-user-1' },
+      });
       seedPiCoreRow(instance, 1, {
         role: 'assistant',
         content: [{ type: 'text', text: 'streamed answer' }],
@@ -1076,13 +1011,11 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
         uiMetadata: { renderMessageId: 'turn-live' },
       });
 
-      // Stamped rows dedup by plain id-existence — no content heuristics.
       const after = await instance.getUiMessages();
       expect(after.map((m: AnyRecord) => m.id)).toEqual([
         'client-user-1',
         'turn-live',
       ]);
-      expect(instance.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx')).toBe(2);
     });
   });
 
@@ -1319,7 +1252,7 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
     });
   });
 
-  it('post-turn compaction preserves render history and re-pins the mark', async () => {
+  it('post-turn compaction keeps pre-compaction visible history via archive hybrid', async () => {
     const stub = await newChatThreadStub('thread-compaction-mark');
     await runInDurableObject(stub, async (instance: any) => {
       instance.chatContext = { threadId: 'thread-compaction-mark' };
@@ -1340,14 +1273,18 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
       });
       const before = await instance.getUiMessages();
       expect(before).toHaveLength(4);
-      expect(instance.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx')).toBe(4);
 
-      // Compaction rewrites pi_core to a summary + the kept tail. The render
-      // mirror must keep the user's full visible history, and the mark must be
-      // re-pinned to the new (shorter) parsed count instead of going stale.
+      // Compaction rewrites pi_core to a summary + the kept tail. Preserve
+      // materializes the prior derive into the ai-chat archive first; reads then
+      // derive the tail and prepend archive-only rows (summary stays model-only).
       await instance['replacePiCoreMessages'](
         [
-          { role: 'user', content: 'summary of earlier work', timestamp: 1000 },
+          {
+            role: 'user',
+            content: 'summary of earlier work',
+            timestamp: 1000,
+            metadata: { compactSummary: true },
+          },
           { role: 'user', content: 'new q', timestamp: 2000 },
           {
             role: 'assistant',
@@ -1362,16 +1299,13 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
       expect(preserved.map((m: AnyRecord) => m.id)).toEqual(
         before.map((m: AnyRecord) => m.id),
       );
-      expect(instance.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx')).toBe(3);
 
-      // A post-compaction turn's rows still top up exactly once.
       seedPiCoreRow(instance, 3, { role: 'user', content: 'later q', timestamp: 3000 });
       const after = await instance.getUiMessages();
       expect(after.map((m: AnyRecord) => m.id)).toEqual([
         ...before.map((m: AnyRecord) => m.id),
         'pi_user_3000_3',
       ]);
-      expect(instance.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx')).toBe(4);
     });
   });
 
@@ -1398,9 +1332,6 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
       // The render mirror was rebuilt from the repaired pi_core (the mark is
       // consistent with it), not left pointing at pre-repair indexes.
       const parsed = await instance.getPiCoreParsedMessages('thread-repair-rebuild');
-      expect(instance.ctx.storage.kv.get('uiMessagesPiCoreHighWaterIdx')).toBe(
-        parsed.length,
-      );
       const messages = await instance.getUiMessages();
       expect(messages.length).toBe(parsed.length);
     });
@@ -1423,14 +1354,15 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
         responseId: 'resp-old',
       });
 
-      const backfilled = await instance.getUiMessages();
-      expect(backfilled.map((m: AnyRecord) => m.id)).toEqual([
+      const derived = await instance.getUiMessages();
+      expect(derived.map((m: AnyRecord) => m.id)).toEqual([
         'pi_user_500_0',
         'resp-old',
       ]);
 
-      // A subsequent live persist (the CF_AGENT_CHAT_MESSAGES broadcast path)
-      // must not clobber the older backfilled rows.
+      // Materialize the derive into the archive table, then persist a new live
+      // row — older archive rows must remain (persist upserts, does not wipe).
+      await instance.resyncUiMessagesFromPiCore();
       await instance.persistMessages([
         ...instance.messages,
         {
@@ -1588,9 +1520,12 @@ describe('ChatThreadDO onConnect render-history delivery', () => {
       waitUntil: vi.fn((promise: Promise<unknown>) => background.push(promise)),
     };
     fake.sweepOrphanedActiveTurnMarker = vi.fn(async () => {});
-    fake.topUpUiMessagesFromPiCore = vi.fn(async () => {});
-    fake.healLegacyUiMessageTimes = vi.fn(async () => {});
-    fake.healLegacyUiMessageAuthors = vi.fn(async () => {});
+    fake.scheduleTranscriptLakeSync = vi.fn();
+    fake.getDerivedUiMessagePage = vi.fn(async () => ({
+      messages: fake.messages,
+      nextCursor: null,
+      hasMore: false,
+    }));
     fake.isThreadStreaming = vi.fn(() => false);
     fake.syncAgentState = vi.fn();
     fake.recordChatThreadObservabilityEvent = vi.fn();
@@ -1667,13 +1602,14 @@ describe('ChatThreadDO onConnect render-history delivery', () => {
     await Promise.all(fake.background);
   });
 
-  it('returns before repair gates resolve, then delivers corrected state and history', async () => {
+  it('returns before repair gates resolve, then delivers derived history after sweep', async () => {
     let releaseRepair!: () => void;
     const repairGate = new Promise<void>((resolve) => { releaseRepair = resolve; });
     const fake = makeConnectFake([{ id: 'stale', role: 'user', parts: [] }]);
     fake.sweepOrphanedActiveTurnMarker = vi.fn(() => repairGate);
-    fake.topUpUiMessagesFromPiCore = vi.fn(async () => {
+    fake.getDerivedUiMessagePage = vi.fn(async () => {
       fake.messages = [{ id: 'corrected', role: 'assistant', parts: [] }];
+      return { messages: fake.messages, nextCursor: null, hasMore: false };
     });
     const connection = { send: vi.fn(), close: vi.fn(), serializeAttachment: vi.fn() } as any;
 
@@ -1682,13 +1618,13 @@ describe('ChatThreadDO onConnect render-history delivery', () => {
     } as any);
 
     expect(fake.sweepOrphanedActiveTurnMarker).not.toHaveBeenCalled();
-    expect(fake.topUpUiMessagesFromPiCore).not.toHaveBeenCalled();
+    expect(fake.getDerivedUiMessagePage).not.toHaveBeenCalled();
     expect(connection.send).toHaveBeenCalledTimes(1);
     await connected;
     releaseRepair();
     await Promise.all(fake.background);
 
-    expect(fake.topUpUiMessagesFromPiCore).toHaveBeenCalledTimes(1);
+    expect(fake.getDerivedUiMessagePage).toHaveBeenCalledTimes(1);
     expect(fake.syncAgentState).toHaveBeenCalledTimes(2);
     const corrected = JSON.parse(connection.send.mock.calls.at(-1)?.[0] as string);
     expect(corrected.messages.map((message: AnyRecord) => message.id)).toEqual(['corrected']);

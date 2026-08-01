@@ -4,8 +4,11 @@ import { describe, expect, it } from "vitest";
 import {
   appendEvictedRenderMessages,
   classifyResidentRenderHistoryUpdate,
+  encodeDerivedRenderHistoryCursor,
   findEvictedRenderMessages,
   isCurrentRenderHistoryGeneration,
+  pageDerivedUiMessages,
+  parseDerivedRenderHistoryCursor,
   prependOlderRenderMessages,
   shouldHydrateRenderHistoryCursor,
 } from "@/lib/chat-render-history";
@@ -113,5 +116,41 @@ describe("resident render-history rollover", () => {
     ).toBe(false);
     expect(isCurrentRenderHistoryGeneration(0, 1)).toBe(false);
     expect(isCurrentRenderHistoryGeneration(1, 1)).toBe(true);
+  });
+});
+
+describe("pageDerivedUiMessages", () => {
+  it("returns the newest window with a d: cursor for older pages", () => {
+    const messages = Array.from({ length: 5 }, (_, index) =>
+      uiMessage(`m${index}`),
+    );
+    const first = pageDerivedUiMessages(messages, { maxMessages: 2 });
+    expect(first.messages.map((message) => message.id)).toEqual(["m3", "m4"]);
+    expect(first.hasMore).toBe(true);
+    expect(first.nextCursor).toBe(encodeDerivedRenderHistoryCursor(3));
+    expect(parseDerivedRenderHistoryCursor(first.nextCursor!)).toBe(3);
+
+    const older = pageDerivedUiMessages(messages, {
+      beforeCursor: first.nextCursor,
+      maxMessages: 2,
+    });
+    expect(older.messages.map((message) => message.id)).toEqual(["m1", "m2"]);
+    expect(older.nextCursor).toBe(encodeDerivedRenderHistoryCursor(1));
+
+    const oldest = pageDerivedUiMessages(messages, {
+      beforeCursor: older.nextCursor,
+      maxMessages: 2,
+    });
+    expect(oldest.messages.map((message) => message.id)).toEqual(["m0"]);
+    expect(oldest.hasMore).toBe(false);
+    expect(oldest.nextCursor).toBeNull();
+  });
+
+  it("rejects non-derived cursors", () => {
+    expect(() =>
+      pageDerivedUiMessages([uiMessage("m0")], {
+        beforeCursor: "i:not-derived",
+      }),
+    ).toThrow(/derived render-history cursor/);
   });
 });

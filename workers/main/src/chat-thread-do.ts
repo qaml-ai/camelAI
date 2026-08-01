@@ -53,14 +53,21 @@ import type { UIMessage, UIMessageStreamWriter } from 'ai';
 import {
   CHAT_RENDER_WINDOW_MAX_BYTES,
   CHAT_RENDER_WINDOW_MAX_MESSAGES,
+  formatAiChatCreatedAt,
+  pageDerivedUiMessages,
   type ChatRenderHistoryPage,
 } from '../../../src/lib/chat-render-history';
+import {
+  deriveUiMessagesFromParsedPiCore,
+  overlayLiveUiMessages,
+} from '../../../src/lib/derive-ui-messages-from-pi-core';
 import {
   PiChunkEncoder,
   PI_ERROR_PART_ID,
   type PiRuntimeEvent,
   type PiUiMessageChunk,
 } from '../../../src/lib/pi-chunk-encoder';
+import { uiMessageCreatedAtMs } from '../../../src/lib/ui-message-adapter';
 import { normalizePiUiMetadata, type PiUiMetadata, type RuntimeCallArtifact } from '../../../src/lib/runtime-artifacts';
 import type {
   LlmModel,
@@ -277,11 +284,7 @@ import {
 
 // pi_core → ai-chat render-mirror machinery (ChatThreadUiMirror): the top-up
 // backfill, legacy time heal, user render skeleton, and wipe-and-rebuild resync.
-import {
-  ChatThreadUiMirror,
-  UI_MESSAGES_PI_CORE_HIGH_WATER_KEY,
-  UI_MESSAGES_PI_CORE_REVISION_KEY,
-} from "./chat-thread/ui-mirror";
+import { ChatThreadUiMirror } from "./chat-thread/ui-mirror";
 
 // Thread metadata generation (ChatThreadMetadata): per-user-message org
 // metadata updates, title generation, chat group avatar/emoji generation, and
@@ -569,9 +572,6 @@ const HEADER_AUTH_DEGRADED = "X-Chiridion-Auth-Degraded";
 // The codeModeArtifacts: KV key prefix lives in
 // ./chat-thread/code-mode-artifacts with the methods that use it.
 
-// The UI_MESSAGES_* KV keys for the pi_core → ai-chat render mirror live in
-// ./chat-thread/ui-mirror (UI_MESSAGES_PI_CORE_HIGH_WATER_KEY is re-imported
-// above for replacePiCoreMessages' re-pin path).
 // Drop-oldest cap for the pre-attach chunk buffer so a turn that never attaches
 // a writer (e.g. saveMessages skipped) cannot grow memory without bound.
 const PI_STREAM_PRE_ATTACH_CHUNK_CAP = 5000;
@@ -633,7 +633,11 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   private automationRunInstance?: ChatThreadAutomationRun;
   private uiMirrorInstance?: ChatThreadUiMirror;
   private legacyUiMessageHealingPromise: Promise<void> | null = null;
-  private renderHistoryReconciliationPromise: Promise<void> | null = null;
+  /** Revision-keyed cache of derive-on-read settled UIMessages (+ compaction archive). */
+  private derivedUiMessagesCache: {
+    token: string;
+    messages: UIMessage[];
+  } | null = null;
   private piTurnJournalInstance?: PiTurnJournal;
   private chatAccessInstance?: ChatThreadAccess;
   private channelToolsInstance?: ChannelTools;
@@ -1393,12 +1397,36 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     }
   }
 
-  private sendRenderHistoryToConnection(connection: Connection): void {
-    if (this.messages.length === 0) return;
+  /**
+   * Handshake-only: push the in-memory resident window synchronously so
+   * onConnect stays bounded (no pi_core derive, no SQL page). Background
+   * reconcile follows with derive-on-read.
+   */
+  private sendResidentRenderHistoryToConnection(connection: Connection): void {
     try {
+      const messages = this.messages as UIMessage[];
+      if (!Array.isArray(messages) || messages.length === 0) return;
       connection.send(
         JSON.stringify({
-          messages: this.messages,
+          messages,
+          type: CHAT_MESSAGE_TYPES.CHAT_MESSAGES,
+        }),
+      );
+    } catch (error) {
+      console.error(
+        "[ChatThreadDO] failed to send resident render history on connect",
+        error,
+      );
+    }
+  }
+
+  private async sendRenderHistoryToConnection(connection: Connection): Promise<void> {
+    try {
+      const page = await this.getDerivedUiMessagePage();
+      if (page.messages.length === 0) return;
+      connection.send(
+        JSON.stringify({
+          messages: page.messages,
           type: CHAT_MESSAGE_TYPES.CHAT_MESSAGES,
         }),
       );
@@ -1411,10 +1439,9 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   private async reconcileConnectedClient(connection: Connection): Promise<void> {
     const startedAt = Date.now();
     try {
-      // None of these repairs belongs on the HTTP 101 critical path. Run them in
-      // order because the mirror top-up must precede legacy metadata healing.
+      // Settled history is derive-on-read from pi_core; only sweep a stranded
+      // active-turn marker before shipping the resident derived page.
       await this.sweepOrphanedActiveTurnMarker();
-      await this.reconcileRenderHistory();
       // Repair path for the lake export: catches rows whose post-commit sync was
       // lost to an eviction or a stream failure, and backfills threads whose
       // history predates the export entirely.
@@ -1426,7 +1453,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       } else {
         this.syncAgentState();
       }
-      this.sendRenderHistoryToConnection(connection);
+      await this.sendRenderHistoryToConnection(connection);
       this.recordChatThreadObservabilityEvent("chat_ws_connect_background_repair", {
         operation: "reconcile_connected_client",
         status: "completed",
@@ -1443,7 +1470,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       // Still deliver the best state/history currently available. A later
       // connection or getUiMessages read retries idempotent repairs.
       this.syncAgentState();
-      this.sendRenderHistoryToConnection(connection);
+      await this.sendRenderHistoryToConnection(connection);
     }
   }
 
@@ -1481,9 +1508,10 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     this.captureChatContextFromRequest(url, ctx.request, connection);
 
     // Keep the handshake path synchronous and bounded: publish the currently
-    // available state/history, then reconcile durable truth after the 101.
+    // resident ai-chat window, then derive-on-read after the 101 (and after any
+    // orphaned active-turn sweep) so settled order comes from pi_core.
     this.syncAgentState();
-    this.sendRenderHistoryToConnection(connection);
+    this.sendResidentRenderHistoryToConnection(connection);
     this.ctx.waitUntil(
       Promise.resolve()
         .then(() => this.reconcileConnectedClient(connection))
@@ -3043,6 +3071,11 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     options: { uiRender: "preserve" | "rebuild" },
   ): Promise<void> {
     this.ensurePiCoreTables();
+    // Before pi_core shrinks, snapshot the current visible derive into the
+    // ai-chat table so post-compaction reads can prepend those rows as archive.
+    if (options.uiRender === "preserve") {
+      await this.materializeSettledRenderArchiveFromPiCore();
+    }
     // Serialize first (this can await R2/image work); swap the table contents
     // with no await between DELETE and the INSERTs so an eviction or a
     // concurrent reader never observes a half-written history.
@@ -3062,19 +3095,39 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       );
     }
     this.piCoreStore.markPiCoreChanged(payloads.length);
+    // Invalidate derive-on-read cache; markPiCoreChanged already bumped generation.
+    this.derivedUiMessagesCache = null;
     if (options.uiRender === "rebuild") {
+      // Admin/fork rewrites: refresh the live/archive render table too so
+      // compaction-archive hybrid and any residual mirror consumers converge.
       await this.rebuildUiMessagesFromPiCore();
-    } else {
-      const parsed = await this.getPiCoreParsedMessages(
-        this.chatContext?.threadId ?? "",
-      );
-      this.ctx.storage.kv.put(UI_MESSAGES_PI_CORE_HIGH_WATER_KEY, parsed.length);
-      const revision = this.piCoreStore.getPiCoreRevision();
-      this.ctx.storage.kv.put(
-        UI_MESSAGES_PI_CORE_REVISION_KEY,
-        `${revision.generation}:${revision.count}`,
+    }
+    // uiRender: "preserve" keeps cf_ai_chat_agent_messages as the pre-compaction
+    // visible archive; settled reads derive from the new pi_core and prepend
+    // archive rows whose ids are absent from the derive.
+  }
+
+  /**
+   * Write the current pi_core-derived settled transcript into the ai-chat table
+   * (with pi timestamps as chronology) so a following compaction preserve can
+   * keep pre-compaction rows visible via the archive hybrid.
+   */
+  private async materializeSettledRenderArchiveFromPiCore(): Promise<void> {
+    const parsed = await this.getPiCoreParsedMessages(
+      this.chatContext?.threadId ?? "",
+    );
+    const derived = deriveUiMessagesFromParsedPiCore(parsed);
+    if (derived.length === 0) return;
+    await this.persistMessages(derived);
+    for (const message of derived) {
+      const createdAtMs = uiMessageCreatedAtMs(message);
+      if (createdAtMs === undefined) continue;
+      this._setRenderHistoryChronology(
+        message.id,
+        formatAiChatCreatedAt(createdAtMs),
       );
     }
+    this.messages = this.getRenderHistoryPage().messages;
   }
 
   private get uiMirror(): ChatThreadUiMirror {
@@ -7707,37 +7760,24 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   }
 
   /**
-   * Render history for the live-user chat loader (commit 3b). Returns the
-   * resident window immediately and reconciles pi_core in background.
-   * DO RPC only — intentionally NOT wired to any HTTP route (auth-sensitive; the
-   * loader wiring is commit 4).
+   * Settled render history for the live-user chat loader. Derived from pi_core
+   * on read (Phase C), with the live resident window overlaid for the open turn.
+   * DO RPC only — intentionally NOT wired to any HTTP route (auth-sensitive).
    */
   async getUiMessages(): Promise<UIMessage[]> {
     return this.withChatMemoryPhase("render_rpc_return_full", async () => {
       await this.sweepOrphanedActiveTurnMarker();
-      await this.reconcileRenderHistory();
-      return this.getRenderHistoryPage().messages;
+      return (await this.getDerivedUiMessagePage()).messages;
     });
   }
 
   async getUiMessagePage(): Promise<ChatRenderHistoryPage> {
     return this.withChatMemoryPhase("render_rpc_return", async () => {
-    // The SSR loader is the first page-open touch (before the websocket
-    // connects). Heal a provably-dead turn's stranded marker here so the load
-    // doesn't derive a busy indicator from it.
-    await this.sweepOrphanedActiveTurnMarker();
-    // Pi top-up and legacy metadata repair can both walk a full old transcript.
-    // They are idempotent and websocket reconciliation broadcasts the converged
-    // resident window, so keep all unbounded work outside this first-page RPC.
-    this.ctx.waitUntil(
-      this.reconcileRenderHistory().catch((error) => {
-        console.error(
-          "[ChatThreadDO] background render-history reconciliation failed",
-          error,
-        );
-      }),
-    );
-    return this.getRenderHistoryPage();
+      // The SSR loader is the first page-open touch (before the websocket
+      // connects). Heal a provably-dead turn's stranded marker here so the load
+      // doesn't derive a busy indicator from it.
+      await this.sweepOrphanedActiveTurnMarker();
+      return this.getDerivedUiMessagePage();
     });
   }
 
@@ -7750,64 +7790,144 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       throw new Error("A valid render-history cursor is required");
     }
     return this.withChatMemoryPhase("render_rpc_older_page", async () =>
-      this.getRenderHistoryPage({ beforeCursor }),
+      this.getDerivedUiMessagePage({ beforeCursor }),
     );
   }
 
+  /**
+   * Build the newest (or older) page of settled UI history from pi_core, plus
+   * pre-compaction archive rows still held in the ai-chat table, with the live
+   * stream's open-turn row overlaid.
+   */
+  private async getDerivedUiMessagePage(options?: {
+    beforeCursor?: string | null;
+  }): Promise<ChatRenderHistoryPage> {
+    const settled = await this.getSettledUiMessagesFromPiCore();
+    if (settled.length === 0) {
+      // No pi_core-derived history yet: serve the ai-chat table with its native
+      // chronology cursor (live-only / render-table tests / brand-new threads).
+      return this.getRenderHistoryPage(
+        options?.beforeCursor ? { beforeCursor: options.beforeCursor } : {},
+      );
+    }
+    const activeTurnId =
+      this.activePiStreamTurnId ?? this.readPiActiveTurn()?.turnId ?? null;
+    const overlaid = overlayLiveUiMessages(
+      settled,
+      this.messages as UIMessage[],
+      { activeTurnId },
+    );
+    return pageDerivedUiMessages(overlaid, {
+      beforeCursor: options?.beforeCursor,
+      maxMessages: CHAT_RENDER_WINDOW_MAX_MESSAGES,
+      maxBytes: CHAT_RENDER_WINDOW_MAX_BYTES,
+    });
+  }
+
+  private async getSettledUiMessagesFromPiCore(): Promise<UIMessage[]> {
+    const revision = this.piCoreStore.getPiCoreRevision();
+    const token = `${revision.generation}:${revision.count}`;
+    if (this.derivedUiMessagesCache?.token === token) {
+      return this.derivedUiMessagesCache.messages;
+    }
+
+    const parsed = await this.getPiCoreParsedMessages(
+      this.chatContext?.threadId ?? "",
+    );
+    const derived = deriveUiMessagesFromParsedPiCore(parsed);
+    const archived = await this.collectCompactionRenderArchive(derived);
+    const settled =
+      archived.length === 0 ? derived : [...archived, ...derived];
+    this.derivedUiMessagesCache = { token, messages: settled };
+    return settled;
+  }
+
+  /**
+   * Post-compaction `uiRender: "preserve"` keeps pre-compaction visible rows in
+   * cf_ai_chat_agent_messages after pi_core is rewritten to summary+tail. Pure
+   * derive only sees the tail (plus a model-only summary); prepend archive rows
+   * that are not already represented in the derive. Match by id OR by
+   * role+createdAtMs so index-based `pi_user_*` ids that renumber across
+   * compaction do not duplicate the kept tail.
+   */
+  private async collectCompactionRenderArchive(
+    derived: UIMessage[],
+  ): Promise<UIMessage[]> {
+    if (derived.length === 0) return [];
+
+    const derivedIds = new Set(derived.map((message) => message.id));
+    const derivedKeys = new Set(
+      derived.map((message) => this.renderMessageDedupeKey(message)),
+    );
+    const firstDerivedAt = uiMessageCreatedAtMs(derived[0]) ?? 0;
+    const archived: UIMessage[] = [];
+    const seenIds = new Set<string>();
+    const seenCursors = new Set<string>();
+    let beforeCursor: string | null = null;
+
+    for (;;) {
+      const page = this.getRenderHistoryPage(
+        beforeCursor ? { beforeCursor } : {},
+      );
+      for (const message of page.messages) {
+        if (!message?.id || derivedIds.has(message.id) || seenIds.has(message.id)) {
+          continue;
+        }
+        // Live skeletons without a pi timestamp are not pre-compaction archive.
+        const createdAt = uiMessageCreatedAtMs(message);
+        if (createdAt === undefined) {
+          continue;
+        }
+        if (derivedKeys.has(this.renderMessageDedupeKey(message))) {
+          continue;
+        }
+        // Same-era / newer rows arrive via derive or live overlay.
+        if (createdAt >= firstDerivedAt) {
+          continue;
+        }
+        seenIds.add(message.id);
+        archived.push(message);
+      }
+      if (!page.hasMore || !page.nextCursor) break;
+      if (seenCursors.has(page.nextCursor)) break;
+      seenCursors.add(page.nextCursor);
+      beforeCursor = page.nextCursor;
+    }
+
+    archived.sort(
+      (left, right) =>
+        (uiMessageCreatedAtMs(left) ?? 0) - (uiMessageCreatedAtMs(right) ?? 0),
+    );
+    return archived;
+  }
+
+  private renderMessageDedupeKey(message: UIMessage): string {
+    const createdAt = uiMessageCreatedAtMs(message);
+    if (createdAt !== undefined) return `${message.role}:${createdAt}`;
+    return `${message.role}:${message.id}`;
+  }
+
+  /** @deprecated Kept for focused legacy-heal unit tests; not on the read path. */
   private healLegacyUiMessageTimes(): Promise<void> {
     return this.uiMirror.healLegacyUiMessageTimes();
   }
 
+  /** @deprecated Kept for focused legacy-heal unit tests; not on the read path. */
   private healLegacyUiMessageAuthors(): Promise<void> {
     return this.uiMirror.healLegacyUiMessageAuthors();
   }
 
-  private healLegacyUiMessageMetadata(): Promise<void> {
-    if (this.legacyUiMessageHealingPromise) {
-      return this.legacyUiMessageHealingPromise;
-    }
-    const healing = (async () => {
-      await this.healLegacyUiMessageTimes();
-      await this.healLegacyUiMessageAuthors();
-    })();
-    let guarded: Promise<void>;
-    guarded = healing.finally(() => {
-      if (this.legacyUiMessageHealingPromise === guarded) {
-        this.legacyUiMessageHealingPromise = null;
-      }
-    });
-    this.legacyUiMessageHealingPromise = guarded;
-    return guarded;
-  }
-
-  private reconcileRenderHistory(): Promise<void> {
-    if (this.renderHistoryReconciliationPromise) {
-      return this.renderHistoryReconciliationPromise;
-    }
-    const reconciliation = (async () => {
-      await this.topUpUiMessagesFromPiCore();
-      await this.healLegacyUiMessageMetadata();
-    })();
-    let guarded: Promise<void>;
-    guarded = reconciliation.finally(() => {
-      if (this.renderHistoryReconciliationPromise === guarded) {
-        this.renderHistoryReconciliationPromise = null;
-      }
-    });
-    this.renderHistoryReconciliationPromise = guarded;
-    return guarded;
-  }
-
   /**
-   * Admin repair RPC (commit 3b): rebuild the entire ai-chat render history from
-   * pi_core. Clears the mirror + high-water mark, then re-runs the top-up. For
-   * flows that rewrite pi_core (fork repair, compaction repair) where the append-
-   * only high-water assumption no longer holds.
+   * Admin repair RPC: refresh the ai-chat live/archive table from pi_core and
+   * clear the derive-on-read cache. Settled reads already derive from pi_core;
+   * this keeps the compaction-archive hybrid and residual mirror consumers
+   * aligned after fork/admin rewrites.
    */
   async resyncUiMessagesFromPiCore(): Promise<{
     ok: true;
     messageCount: number;
   }> {
+    this.derivedUiMessagesCache = null;
     await this.rebuildUiMessagesFromPiCore();
     const row = this.ctx.storage.sql
       .exec<{ count: number }>(

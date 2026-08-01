@@ -302,6 +302,8 @@ export interface AgentEvalParsedMessage {
   renderMessageId?: string;
   /** User row accepted while its assistant turn was already streaming. */
   sentDuringStreaming?: boolean;
+  /** Compaction summary rows are model-facing only; omitted from UI derive. */
+  isCompactSummary?: boolean;
 }
 
 export interface AgentEvalSessionRequest extends InitialUserMessageRequest {

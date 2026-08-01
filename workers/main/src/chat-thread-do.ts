@@ -80,6 +80,7 @@ import {
 } from "../../../src/lib/llm-provider-config";
 import { isTransientDurableObjectRpcError } from "../../../src/lib/do-rpc-retry.server";
 import type { HostedCapability } from "../../../src/lib/capability-allowances";
+import { connectionsBindingEnabled } from "../../../src/lib/connections-binding";
 import {
   getEffectiveLlmProviderConfig,
   isSelfhostRuntime,
@@ -5496,6 +5497,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     const base = createPiSystemPrompt(context, {
       skillNames: PI_SKILL_NAMES,
       skillDescriptions: PI_SKILL_DESCRIPTIONS,
+      deployedConnectionsBindingEnabled: connectionsBindingEnabled(this.env),
     });
     const verifiedWorkState = formatVerifiedWorkStatePrompt(
       this.ctx?.storage?.kv?.get<unknown>(CHAT_VERIFIED_WORK_STATE_KEY),
@@ -5999,7 +6001,9 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     context: ChatContextState,
     isExplore: boolean,
   ): Promise<string> {
-    return createPiSubagentSystemPrompt(context, isExplore);
+    return createPiSubagentSystemPrompt(context, isExplore, {
+      deployedConnectionsBindingEnabled: connectionsBindingEnabled(this.env),
+    });
   }
 
   private pushPiRuntimeEvent(method: string, params: Record<string, unknown>): void {

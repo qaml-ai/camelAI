@@ -947,6 +947,9 @@ export async function runPiCapabilityAgentTool(
 export async function createPiSubagentSystemPrompt(
   context: ChatContextState,
   isExplore: boolean,
+  options: {
+    deployedConnectionsBindingEnabled?: boolean;
+  } = {},
 ): Promise<string> {
   return buildPiSubagentSystemPrompt(
     context,
@@ -954,6 +957,8 @@ export async function createPiSubagentSystemPrompt(
     {
       skillNames: PI_SKILL_NAMES,
       skillDescriptions: PI_SKILL_DESCRIPTIONS,
+      deployedConnectionsBindingEnabled:
+        options.deployedConnectionsBindingEnabled,
     },
   );
 }

@@ -172,6 +172,9 @@ When disabled:
 - `ConnectionsService` (and deployed-app `ANALYSIS`/`WAREHOUSE` connection
   catalog methods) fail closed, covering already-published apps
 - the health capability reports `connections_binding.state: "disabled"`
+- the agent system prompt and relevant `read_skill` results tell the model not
+  to build apps that call `env.CONNECTIONS` (chat/`js_exec` connection guidance
+  stays)
 - chat-agent tools, `js_exec`, and the Connections settings UI remain available
 
 Redeploy apps after flipping the flag so stored self-host worker records drop

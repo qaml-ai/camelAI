@@ -18,6 +18,10 @@ import { getPreferredAppUrl } from "../../../src/lib/app-url";
 import { findConnectionMethodEntry, getConnection, invokeConnectionMethod, listConnectionMethods, listConnections, listConnectionTools, testConnectionMethodEntry, verifyConnection } from "./connections-runtime";
 import { confirmDestructiveAction, DESTRUCTIVE_CONFIRM_LABEL } from "./confirmed-destructive-action";
 import { collectProjectDeletionTargets } from "./project-deletion";
+import {
+  connectionsBindingEnabled,
+} from "../../../src/lib/connections-binding";
+import { DEPLOYED_CONNECTIONS_BINDING_DISABLED_PROMPT } from "./pi-system-prompt";
 import { listPiBundledSkillFiles, readPiBundledSkillFile } from "./pi-skill-bundle-helpers";
 import { PI_SKILL_NAMES } from "./pi-skills-bundle";
 import { PiContainerTools, PI_CONTAINER_TOOL_DEFINITIONS } from "./pi-container-tools";
@@ -1352,6 +1356,33 @@ function hasProjectTarget(args: Record<string, unknown>): boolean {
 
 function hasR2Target(args: Record<string, unknown>): boolean {
   return args.location === "r2";
+}
+
+/** Skills that advertise deployed-app CONNECTIONS and need an override banner. */
+const DEPLOYED_CONNECTIONS_SKILL_OVERRIDES = new Set([
+  "developing-software",
+  "camelai-platform-faq",
+  "data-analysis",
+]);
+
+function withDeployedConnectionsSkillOverride(
+  skill: NonNullable<ReturnType<typeof readPiBundledSkillFile>>,
+  env: { CONNECTIONS_BINDING_ENABLED?: string },
+): NonNullable<ReturnType<typeof readPiBundledSkillFile>> {
+  if (connectionsBindingEnabled(env)) return skill;
+  if (!DEPLOYED_CONNECTIONS_SKILL_OVERRIDES.has(skill.skill)) return skill;
+  // CONNECTIONS-AND-STORAGE.md and SKILL.md for developing-software; FAQ and
+  // data-analysis also teach deployed-app CONNECTIONS. Deterministic
+  // automations keep their CONNECTIONS docs — those are workflow bindings, not
+  // the deployed-app broker this flag disables.
+  const banner =
+    `> **Deployment override:** ${DEPLOYED_CONNECTIONS_BINDING_DISABLED_PROMPT}\n\n`;
+  const text = `${banner}${skill.text}`;
+  return {
+    ...skill,
+    text,
+    size: text.length,
+  };
 }
 
 function bundledSkillReadResponse(skill: NonNullable<ReturnType<typeof readPiBundledSkillFile>>) {
@@ -2827,7 +2858,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
               `Available files: ${availableFiles.join(", ")}.`,
             );
           }
-          return bundledSkillReadResponse(skill);
+          return bundledSkillReadResponse(
+            withDeployedConnectionsSkillOverride(skill, this.env),
+          );
         }
 
         case "read":

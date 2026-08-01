@@ -6312,6 +6312,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       userEmail: null,
     };
     const fake = Object.create(ChatThreadDO.prototype) as any;
+    fake.env = {};
     fake.ctx = {
       exports: {
         CodeModeToolsBinding: vi.fn(() => ({
@@ -6375,6 +6376,29 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(jsExec?.description).not.toContain('tools.send_slack_message');
     expect(jsExec?.description).not.toContain('tools.send_telegram_message');
     expect(jsExec?.description).not.toContain('tools.send_discord_message');
+  });
+
+  it('tells the agent deployed-app CONNECTIONS is disabled when the binding kill switch is off', async () => {
+    const context = {
+      orgId: 'org1',
+      workspaceId: 'workspace1',
+      threadId: 'thread1',
+      userId: 'user1',
+    };
+    const fake = Object.create(ChatThreadDO.prototype) as any;
+    fake.env = { CONNECTIONS_BINDING_ENABLED: 'false' };
+
+    const prompt = ChatThreadDO.prototype['createPiSystemPrompt'].call(fake, context);
+    expect(prompt).toContain('Deployed-app CONNECTIONS binding is disabled on this deployment');
+    expect(prompt).toContain('Do not build, scaffold, or deploy apps that call workspace connections');
+    expect(prompt).toContain('await env.CONNECTIONS.find("provider-or-type")');
+
+    const subagentPrompt = await ChatThreadDO.prototype['createPiSubagentSystemPrompt'].call(
+      fake,
+      context,
+      false,
+    );
+    expect(subagentPrompt).toContain('Deployed-app CONNECTIONS binding is disabled on this deployment');
   });
 
   it('tells isolated subagents to hand external research back to the primary agent', async () => {
@@ -7000,9 +7024,35 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('prefixes deployed-CONNECTIONS skill reads with an override when the binding is disabled', async () => {
+    const fake = Object.create(CodeModeToolsBinding.prototype) as any;
+    Object.defineProperty(fake, 'env', {
+      value: { CONNECTIONS_BINDING_ENABLED: 'false' },
+    });
+    Object.defineProperty(fake, 'piContainerTools', {
+      value: { callTool: vi.fn() },
+    });
+
+    const skill = await CodeModeToolsBinding.prototype.callTool.call(fake, 'read_skill', {
+      skill: 'developing-software',
+      file: 'CONNECTIONS-AND-STORAGE.md',
+    });
+    const text = (skill as any).text as string;
+    expect(text.startsWith('> **Deployment override:**')).toBe(true);
+    expect(text).toContain('Deployed-app CONNECTIONS binding is disabled on this deployment');
+    expect(text).toContain('Use the virtual `CONNECTIONS` binding');
+
+    const faq = await CodeModeToolsBinding.prototype.callTool.call(fake, 'read_skill', {
+      skill: 'camelai-platform-faq',
+    });
+    expect((faq as any).text).toContain('Deployment override');
+    expect((faq as any).text).toContain('Are connections in chat the same as in deployed apps?');
+  });
+
   it('serves bundled skills through js_exec tools.read_skill without virtual file paths', async () => {
     const containerTool = vi.fn(async (name: string) => ({ text: `ordinary workspace ${name}` }));
     const fake = Object.create(CodeModeToolsBinding.prototype) as any;
+    Object.defineProperty(fake, 'env', { value: {} });
     Object.defineProperty(fake, 'piContainerTools', {
       value: { callTool: containerTool },
     });

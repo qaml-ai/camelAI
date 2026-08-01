@@ -87,6 +87,8 @@ export interface CloudflareEnv {
   DISCORD_CLIENT_ID?: string;
   DISCORD_CLIENT_SECRET?: string;
   DISCORD_CHANNEL_ENABLED?: string;
+  /** Deployed-app CONNECTIONS binding kill switch (default enabled). */
+  CONNECTIONS_BINDING_ENABLED?: string;
   TURNSTILE_SITE_KEY?: string;
   TURNSTILE_SECRET_KEY?: string;
   STRIPE_MODE?: string;

@@ -55,6 +55,7 @@ export async function loader({ context }: LoaderFunctionArgs) {
         projectBuild: Boolean(env.PROJECT_BUILD_SANDBOX),
         analysis: Boolean(env.ANALYSIS_SANDBOX),
         databaseQuery: Boolean(env.DB_QUERY_SANDBOX),
+        CONNECTIONS_BINDING_ENABLED: env.CONNECTIONS_BINDING_ENABLED,
       }),
     },
     { status: failed > 0 ? 503 : 200 },

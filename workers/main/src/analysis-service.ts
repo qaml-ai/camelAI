@@ -1,5 +1,6 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 
+import { assertConnectionsBindingEnabled } from "../../../src/lib/connections-binding";
 import { getWorkspaceR2Prefix } from "../../../src/lib/workspace-r2-paths";
 import { ANALYSIS_CONNECTIONS_HOST, type AnalysisConnectionsParams } from "./analysis-sandbox.js";
 import { listConnections, type ConnectionsRuntimeEnv } from "./connections-runtime.js";
@@ -1101,6 +1102,9 @@ export class AnalysisAppService extends WorkerEntrypoint<AnalysisEnv, AnalysisSe
   }
 
   async listConnections(): Promise<WarehouseConnection[]> {
+    // Honor CONNECTIONS_BINDING_ENABLED so deployed apps cannot read the
+    // connection catalog through ANALYSIS when the CONNECTIONS broker is off.
+    assertConnectionsBindingEnabled(this.env as { CONNECTIONS_BINDING_ENABLED?: string });
     return this.full().listConnections();
   }
 

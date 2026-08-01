@@ -101,6 +101,12 @@ export interface Env
   DISCORD_CLIENT_ID?: string;
   DISCORD_CLIENT_SECRET?: string;
   DISCORD_CHANNEL_ENABLED?: string;
+  /**
+   * Deployed-app CONNECTIONS binding kill switch. Default enabled; set to
+   * "false" for on-prem self-host installs that must not expose workspace
+   * connections to published apps.
+   */
+  CONNECTIONS_BINDING_ENABLED?: string;
   NOTION_CLIENT_ID?: string;
   NOTION_CLIENT_SECRET?: string;
   SALESFORCE_CLIENT_ID?: string;

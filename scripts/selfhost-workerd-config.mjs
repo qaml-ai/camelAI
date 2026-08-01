@@ -57,6 +57,9 @@ const SELFHOST_DEFAULT_VARS = {
   WORKSPACE_EMAIL_DOMAIN: 'localhost',
   TOKEN_SIGNING_SECRET: 'selfhost-token-signing-secret-change-me',
   INTEGRATION_SECRET_KEY: 'selfhost-integration-secret-32bytes',
+  // Deployed-app CONNECTIONS broker. Set to "false" for on-prem installs that
+  // must not let published apps pull workspace connection data.
+  CONNECTIONS_BINDING_ENABLED: 'true',
   WORKER_BASE_URL: 'http://localhost:3001',
   LOCAL_APP_VANITY_DOMAIN: '',
   LOCAL_APP_IFRAME_DOMAIN: '',

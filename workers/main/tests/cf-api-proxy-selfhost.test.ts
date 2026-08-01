@@ -60,7 +60,10 @@ function multipartBody(parts: Array<{
   };
 }
 
-function makeEnv(kv: MemoryKv): CfApiProxyEnv {
+function makeEnv(
+  kv: MemoryKv,
+  overrides: Partial<CfApiProxyEnv> = {},
+): CfApiProxyEnv {
   const orgStub = {
     getSlug: vi.fn(async () => "acme"),
     getWorkerScript: vi.fn(async () => null),
@@ -81,6 +84,7 @@ function makeEnv(kv: MemoryKv): CfApiProxyEnv {
     WORKSPACE: makeNamespace({}) as unknown as CfApiProxyEnv["WORKSPACE"],
     WORKSPACE_FS: makeNamespace({}) as unknown as CfApiProxyEnv["WORKSPACE_FS"],
     CHAT_THREAD: makeNamespace({}) as unknown as CfApiProxyEnv["CHAT_THREAD"],
+    ...overrides,
   };
 }
 
@@ -294,6 +298,59 @@ describe("proxyCloudflareApi self-host publishing", () => {
       { type: "durable_object_namespace", name: "COUNTER", class_name: "Counter" },
     ]);
     expect(record.bindings).not.toContainEqual({ type: "worker_loader", name: "LOADER" });
+  });
+
+  it("omits CONNECTIONS from stored self-host workers when the binding is disabled", async () => {
+    const kv = new MemoryKv();
+    const metadata = {
+      main_module: "index.js",
+      compatibility_date: "2026-06-09",
+      bindings: [
+        { type: "service", name: "CONNECTIONS", service: "demo", entrypoint: "LocalConnectionsService" },
+        { type: "service", name: "CAMELAI", service: "demo", entrypoint: "LocalCamelAiService" },
+      ],
+    };
+    const upload = multipartBody([
+      { name: "metadata", body: JSON.stringify(metadata) },
+      {
+        name: "index.js",
+        filename: "index.js",
+        contentType: "application/javascript+module",
+        body: "export default { fetch() { return new Response('ok') } };",
+      },
+    ]);
+
+    const response = await proxyCloudflareApi(
+      new Request("https://app.local/client/v4/accounts/wrangler/workers/dispatch/namespaces/wrangler/scripts/locked", {
+        method: "PUT",
+        headers: { "content-type": upload.contentType },
+        body: upload.body,
+      }),
+      makeEnv(kv, { CONNECTIONS_BINDING_ENABLED: "false" }),
+      {
+        trustedIdentity: {
+          orgId: "org_1",
+          orgSlug: "acme",
+          workspaceId: "workspace_1",
+        },
+        onDeploySideEffects: vi.fn(async () => {}),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    const stored = await kv.get(selfhostWorkerKey("locked--acme"));
+    expect(stored).toBeTruthy();
+    const record = JSON.parse(stored!) as SelfhostWorkerRecord;
+    expect(record.bindings.find((binding) => binding.name === "CONNECTIONS")).toBeUndefined();
+    expect(record.bindings).toEqual([
+      {
+        type: "service",
+        name: "CAMELAI",
+        service: "chiridion-selfhost",
+        entrypoint: "CamelAiService",
+        props: { workspaceId: "workspace_1", orgId: "org_1" },
+      },
+    ]);
   });
 
   it("preserves binary module and blob bytes for self-host uploads", async () => {

@@ -1,4 +1,5 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
+import { assertConnectionsBindingEnabled } from '../../../src/lib/connections-binding';
 import { isSqlDatabaseMcpIntegration } from './sql-database-mcp.js';
 import { isBigQueryMcpIntegration } from './bigquery-mcp.js';
 import { isClickHouseMcpIntegration } from './clickhouse-mcp.js';
@@ -147,6 +148,9 @@ export class WarehouseService extends WorkerEntrypoint<unknown, WarehouseService
   }
 
   async listConnections(): Promise<WarehouseConnection[]> {
+    // Legacy deployed-app WAREHOUSE binding — same kill switch as CONNECTIONS /
+    // AnalysisAppService so connection catalogs cannot leak when disabled.
+    assertConnectionsBindingEnabled(this.env as { CONNECTIONS_BINDING_ENABLED?: string });
     return this.analysis().listConnections();
   }
 

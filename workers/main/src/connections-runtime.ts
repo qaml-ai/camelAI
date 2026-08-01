@@ -58,8 +58,12 @@ export interface ConnectionsRuntimeEnv extends DataProxyEnv, ObservabilityEnv {
   DISCORD_CHANNEL_ENABLED?: string;
   DISCORD_CLIENT_ID?: string;
   DISCORD_CLIENT_SECRET?: string;
+  /**
+   * When "false"/"0"/"off"/"no"/"disabled", deployed-app CONNECTIONS bindings
+   * fail closed. Chat-agent / js_exec paths do not consult this flag.
+   */
+  CONNECTIONS_BINDING_ENABLED?: string;
 }
-
 export interface ConnectionsContext {
   orgId: string;
   workspaceId: string;

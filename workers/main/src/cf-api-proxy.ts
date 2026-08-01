@@ -13,6 +13,7 @@ import {
 import type { OrgDO } from "./auth.js";
 import type { WorkspaceDO } from "./workspace.js";
 import { getBillingPlanLimits } from "../../../src/lib/billing-plans.js";
+import { connectionsBindingEnabled } from "../../../src/lib/connections-binding.js";
 import type { WorkspaceFilesystemDO } from "./workspace-filesystem-do.js";
 import {
   selfhostWorkerKey,
@@ -292,6 +293,8 @@ export interface CfApiProxyEnv {
   TAIL_WORKER_NAME?: string;
   TOKEN_SIGNING_SECRET: string;
   INTEGRATION_SECRET_KEY: string;
+  /** Deployed-app CONNECTIONS binding kill switch (default enabled). */
+  CONNECTIONS_BINDING_ENABLED?: string;
   EMAIL_TO_USER: KVNamespace;
   APP_KV: KVNamespace;
   APP_DB?: D1Database;
@@ -1124,7 +1127,10 @@ function transformVirtualBindings(
   userId: string | undefined,
   workerServiceName: string,
   appId: string,
-  options?: { dropSelfhostIgnoredBindings?: boolean },
+  options?: {
+    dropSelfhostIgnoredBindings?: boolean;
+    connectionsBindingEnabled?: boolean;
+  },
 ): ArrayBuffer {
   const existingBindings = bindings ?? [];
   const kvBindings = existingBindings.filter((b) => b.type === "kv_namespace");
@@ -1165,6 +1171,9 @@ function transformVirtualBindings(
     userId,
     workerServiceName,
     appId,
+    {
+      connectionsBindingEnabled: options?.connectionsBindingEnabled,
+    },
   );
   metadata = withUsageGuardTracing(metadata);
 
@@ -1241,10 +1250,12 @@ export function mapVirtualizedBindings(
   userId: string | undefined,
   workerServiceName: string,
   appId: string,
+  options?: { connectionsBindingEnabled?: boolean },
 ): WorkerBinding[] {
-  const mapped = bindings.map((binding) => {
+  const allowConnectionsBinding = options?.connectionsBindingEnabled !== false;
+  const mapped = bindings.flatMap((binding): WorkerBinding[] => {
     if (binding.type === "kv_namespace") {
-      return {
+      return [{
         type: "service",
         name: binding.name,
         service: workerServiceName,
@@ -1254,40 +1265,40 @@ export function mapVirtualizedBindings(
           appId,
           namespaceId: binding.namespace_id ?? binding.name,
         },
-      };
+      }];
     }
 
     if (binding.type === "r2_bucket") {
-      return {
+      return [{
         type: "service",
         name: binding.name,
         service: workerServiceName,
         entrypoint: "R2VirtualBucket",
         props: { workspaceId, bucketName: binding.bucket_name ?? binding.name },
-      };
+      }];
     }
 
     if (binding.type === "assets") {
-      return {
+      return [{
         type: "service",
         name: binding.name,
         service: workerServiceName,
         entrypoint: "AssetsVirtualBinding",
         props: { appId },
-      };
+      }];
     }
 
     if (
       binding.type === "service" &&
       binding.name === VIRTUAL_DATA_PROXY_BINDING_NAME
     ) {
-      return {
+      return [{
         type: "service",
         name: binding.name,
         service: workerServiceName,
         entrypoint: "DataProxyService",
         props: { workspaceId, orgId },
-      };
+      }];
     }
 
     if (
@@ -1296,13 +1307,13 @@ export function mapVirtualizedBindings(
     ) {
       // Source-compat: already-deployed apps keep resolving WAREHOUSE to the
       // (still-present) WarehouseService entrypoint. New apps should bind ANALYSIS.
-      return {
+      return [{
         type: "service",
         name: binding.name,
         service: workerServiceName,
         entrypoint: "WarehouseService",
         props: { workspaceId, orgId },
-      };
+      }];
     }
 
     if (
@@ -1311,30 +1322,35 @@ export function mapVirtualizedBindings(
     ) {
       // Deployed apps get the narrowed entrypoint (runCode + listConnections
       // only) — never the full AnalysisService with project-filesystem access.
-      return {
+      return [{
         type: "service",
         name: binding.name,
         service: workerServiceName,
         entrypoint: "AnalysisAppService",
         props: { workspaceId, orgId },
-      };
+      }];
     }
 
     if (
       binding.type === "service" &&
       binding.name === VIRTUAL_CONNECTIONS_BINDING_NAME
     ) {
+      // On-prem installs can disable the deployed-app CONNECTIONS broker so
+      // published workers cannot pull connection-backed data.
+      if (!allowConnectionsBinding) {
+        return [];
+      }
       const props: Record<string, string> = { workspaceId, orgId };
       if (userId) {
         props.userId = userId;
       }
-      return {
+      return [{
         type: "service",
         name: binding.name,
         service: workerServiceName,
         entrypoint: "ConnectionsService",
         props,
-      };
+      }];
     }
 
     if (binding.type === "ai") {
@@ -1342,13 +1358,13 @@ export function mapVirtualizedBindings(
       if (userId) {
         props.userId = userId;
       }
-      return {
+      return [{
         type: "service",
         name: binding.name,
         service: workerServiceName,
         entrypoint: "AIVirtualBinding",
         props,
-      };
+      }];
     }
 
     if (
@@ -1359,22 +1375,25 @@ export function mapVirtualizedBindings(
       if (userId) {
         props.userId = userId;
       }
-      return {
+      return [{
         type: "service",
         name: binding.name,
         service: workerServiceName,
         entrypoint: "CamelAiService",
         props,
-      };
+      }];
     }
 
-    return binding;
+    return [binding];
   });
   const props: Record<string, string> = { workspaceId, orgId };
   if (userId) {
     props.userId = userId;
   }
-  if (!mapped.some((binding) => binding.name === VIRTUAL_CONNECTIONS_BINDING_NAME)) {
+  if (
+    allowConnectionsBinding &&
+    !mapped.some((binding) => binding.name === VIRTUAL_CONNECTIONS_BINDING_NAME)
+  ) {
     mapped.push({
       type: "service",
       name: VIRTUAL_CONNECTIONS_BINDING_NAME,
@@ -2336,6 +2355,9 @@ export async function proxyCloudflareApi(
               userId,
               env.CF_WORKER_NAME,
               dispatchScriptName ?? originalScriptName ?? "unknown",
+              {
+                connectionsBindingEnabled: connectionsBindingEnabled(env),
+              },
             );
             const changed =
               transformedBindings.some((binding, idx) => {
@@ -2427,7 +2449,10 @@ export async function proxyCloudflareApi(
           userId,
           env.CF_WORKER_NAME,
           dispatchScriptName ?? originalScriptName ?? "unknown",
-          { dropSelfhostIgnoredBindings: selfhostPublishingMode },
+          {
+            dropSelfhostIgnoredBindings: selfhostPublishingMode,
+            connectionsBindingEnabled: connectionsBindingEnabled(env),
+          },
         );
         headers.set("Content-Length", String(body.byteLength));
       }

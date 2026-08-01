@@ -1,4 +1,10 @@
-export const SELFHOST_CAPABILITY_CONTRACT_VERSION = 2;
+import {
+  CONNECTIONS_BINDING_DISABLED_MESSAGE,
+  connectionsBindingEnabled,
+  type ConnectionsBindingEnv,
+} from "./connections-binding";
+
+export const SELFHOST_CAPABILITY_CONTRACT_VERSION = 3;
 
 export const SELFHOST_OUTBOUND_EMAIL_DISABLED_MESSAGE =
   "Outbound email is disabled in self-host mode. No SMTP transport is implemented.";
@@ -12,6 +18,7 @@ export const SELFHOST_EMAIL_VERIFICATION_DISABLED_MESSAGE =
 export const SELFHOST_HELP_EMAIL_DISABLED_MESSAGE =
   "Email-based support requests are disabled in self-host mode. Contact your deployment administrator.";
 
+export { CONNECTIONS_BINDING_DISABLED_MESSAGE };
 export type SelfhostCapabilityState =
   | "configured"
   | "disabled"
@@ -43,6 +50,7 @@ export interface SelfhostCapabilityContract {
     project_deploys: SelfhostCapability;
     notebooks: SelfhostCapability;
     sql: SelfhostCapability;
+    connections_binding: SelfhostCapability;
     outbound_email: SelfhostCapability;
     smtp: SelfhostCapability;
   };
@@ -54,6 +62,11 @@ export interface SelfhostComputeBindings {
   databaseQuery: boolean;
 }
 
+export interface SelfhostCapabilityOptions extends ConnectionsBindingEnv {
+  projectBuild: boolean;
+  analysis: boolean;
+  databaseQuery: boolean;
+}
 function localDockerCapability(
   bindingAvailable: boolean,
   bindingName: string,
@@ -82,8 +95,9 @@ function localDockerCapability(
 }
 
 export function getSelfhostCapabilityContract(
-  bindings: SelfhostComputeBindings,
+  bindings: SelfhostComputeBindings | SelfhostCapabilityOptions,
 ): SelfhostCapabilityContract {
+  const connectionsEnabled = connectionsBindingEnabled(bindings);
   return {
     version: SELFHOST_CAPABILITY_CONTRACT_VERSION,
     features: {
@@ -107,6 +121,19 @@ export function getSelfhostCapabilityContract(
         "DB_QUERY_SANDBOX",
         "bun run selfhost:container:smoke:db-query",
       ),
+      connections_binding: connectionsEnabled
+        ? {
+            state: "configured",
+            available: true,
+            configured: true,
+            implementation: "ConnectionsService",
+          }
+        : {
+            state: "disabled",
+            available: false,
+            configured: false,
+            reason: CONNECTIONS_BINDING_DISABLED_MESSAGE,
+          },
       outbound_email: {
         state: "disabled",
         available: false,

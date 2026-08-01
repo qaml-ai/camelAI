@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { CONNECTIONS_BINDING_DISABLED_MESSAGE } from "@/lib/connections-binding";
 import {
   getSelfhostCapabilityContract,
   SELFHOST_CAPABILITY_CONTRACT_VERSION,
@@ -39,6 +40,12 @@ describe("self-host capability contract", () => {
     expect(contract.features.sql.verification?.command).toBe(
       "bun run selfhost:container:smoke:db-query",
     );
+    expect(contract.features.connections_binding).toMatchObject({
+      state: "configured",
+      available: true,
+      configured: true,
+      implementation: "ConnectionsService",
+    });
     expect(contract.features.outbound_email).toMatchObject({
       state: "disabled",
       available: false,
@@ -46,6 +53,22 @@ describe("self-host capability contract", () => {
     expect(contract.features.smtp).toMatchObject({
       state: "disabled",
       available: false,
+    });
+  });
+
+  it("reports connections_binding disabled when the kill switch is off", () => {
+    const contract = getSelfhostCapabilityContract({
+      projectBuild: true,
+      analysis: true,
+      databaseQuery: true,
+      CONNECTIONS_BINDING_ENABLED: "false",
+    });
+
+    expect(contract.features.connections_binding).toMatchObject({
+      state: "disabled",
+      available: false,
+      configured: false,
+      reason: CONNECTIONS_BINDING_DISABLED_MESSAGE,
     });
   });
 

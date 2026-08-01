@@ -1,8 +1,32 @@
 import { describe, expect, it, vi } from 'vitest';
+import {
+  CONNECTIONS_BINDING_DISABLED_CODE,
+  CONNECTIONS_BINDING_DISABLED_MESSAGE,
+} from '../../../src/lib/connections-binding';
 import { createConnections } from '../../../sandbox/create-worker/templates/starter/app/lib/connections';
 import { ConnectionsService } from '../src/connections-service';
 
 describe('ConnectionsService compatibility', () => {
+  it('fails closed when CONNECTIONS_BINDING_ENABLED is false', async () => {
+    const service = Object.create(ConnectionsService.prototype) as ConnectionsService;
+    Object.defineProperty(service, 'env', {
+      value: { CONNECTIONS_BINDING_ENABLED: 'false' },
+    });
+    Object.defineProperty(service, 'ctx', {
+      value: { props: { orgId: 'org_1', workspaceId: 'ws_1' } },
+    });
+
+    await expect(service.list()).rejects.toMatchObject({
+      message: CONNECTIONS_BINDING_DISABLED_MESSAGE,
+      status: 503,
+      code: CONNECTIONS_BINDING_DISABLED_CODE,
+    });
+    await expect(service.invoke({ connection: 'db', method: 'query' })).rejects.toMatchObject({
+      code: CONNECTIONS_BINDING_DISABLED_CODE,
+      status: 503,
+    });
+  });
+
   it('keeps the legacy hidden invoke entrypoint for already-deployed apps', async () => {
     const legacyInvokeMethod = ['_', '_', 'invoke'].join('');
     const invoke = vi.fn(async (request: unknown) => ({ ok: true, request }));

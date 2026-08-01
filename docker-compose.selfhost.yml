@@ -9,6 +9,7 @@ services:
       NODE_ENV: production
       TOKEN_SIGNING_SECRET: ${TOKEN_SIGNING_SECRET:?Run bun run selfhost:init}
       INTEGRATION_SECRET_KEY: ${INTEGRATION_SECRET_KEY:?Run bun run selfhost:init}
+      CONNECTIONS_BINDING_ENABLED: ${CONNECTIONS_BINDING_ENABLED:-true}
       WORKER_BASE_URL: ${SELFHOST_PUBLIC_BASE_URL:?Run bun run selfhost:init}
       LOCAL_ARTIFACTS_BASE_URL: http://127.0.0.1:7001
       LOCAL_ARTIFACTS_SECRET: ${LOCAL_ARTIFACTS_SECRET:?Run bun run selfhost:init}

@@ -83,7 +83,7 @@ versioned `capabilities` object:
   "status": "ok",
   "checks": [],
   "capabilities": {
-    "version": 2,
+    "version": 3,
     "features": {
       "project_builds": {
         "state": "configured",
@@ -125,6 +125,12 @@ versioned `capabilities` object:
           "command": "bun run selfhost:container:smoke:db-query"
         }
       },
+      "connections_binding": {
+        "state": "configured",
+        "available": true,
+        "configured": true,
+        "implementation": "ConnectionsService"
+      },
       "outbound_email": {
         "state": "disabled",
         "available": false,
@@ -148,6 +154,28 @@ bindings. If one is missing, its dependent features report
 For a present binding, `configured` means the namespace and image were wired;
 it does not claim Docker execution was tested by the lightweight HTTP probe.
 Run the named deep-smoke command in `verification.command` for that evidence.
+
+### Disable CONNECTIONS bindings for deployed apps
+
+Deployed apps normally receive an `env.CONNECTIONS` service binding that can
+list and invoke workspace connections (credentials stay platform-side; results
+can still return connection-backed data into the app). For on-prem installs that
+must keep that broker off:
+
+```dotenv
+CONNECTIONS_BINDING_ENABLED=false
+```
+
+When disabled:
+
+- new deploys do not rewrite or inject a `CONNECTIONS` binding
+- `ConnectionsService` (and deployed-app `ANALYSIS`/`WAREHOUSE` connection
+  catalog methods) fail closed, covering already-published apps
+- the health capability reports `connections_binding.state: "disabled"`
+- chat-agent tools, `js_exec`, and the Connections settings UI remain available
+
+Redeploy apps after flipping the flag so stored self-host worker records drop
+the binding. Runtime fail-closed still protects apps that were not redeployed.
 
 ## TLS front door
 

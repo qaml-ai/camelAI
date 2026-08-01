@@ -527,5 +527,35 @@ describe('Worker Binding Validation', () => {
       ]);
     });
 
+    it('strips and does not inject CONNECTIONS when the binding is disabled', () => {
+      const bindings: WorkerBinding[] = [
+        { type: 'plain_text', name: 'APP_ENV', text: 'prod' },
+        { type: 'service', name: 'CONNECTIONS', service: 'placeholder' },
+        { type: 'service', name: 'CAMELAI', service: 'placeholder' },
+      ];
+
+      const transformed = mapVirtualizedBindings(
+        bindings,
+        'ws_locked',
+        'org_locked',
+        'user_locked',
+        'chiridion-app',
+        'app_locked',
+        { connectionsBindingEnabled: false },
+      );
+
+      expect(transformed.find((binding) => binding.name === 'CONNECTIONS')).toBeUndefined();
+      expect(transformed).toEqual([
+        { type: 'plain_text', name: 'APP_ENV', text: 'prod' },
+        {
+          type: 'service',
+          name: 'CAMELAI',
+          service: 'chiridion-app',
+          entrypoint: 'CamelAiService',
+          props: { workspaceId: 'ws_locked', orgId: 'org_locked', userId: 'user_locked' },
+        },
+      ]);
+    });
+
   });
 });

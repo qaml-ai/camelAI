@@ -436,6 +436,11 @@ and `verification.status: "not_checked"` until an operator runs the indicated
 deep smoke. A missing compute namespace remains a readiness failure and returns
 HTTP 503.
 
+To keep workspace connection data out of published apps (recommended for
+paranoid on-prem installs), set `CONNECTIONS_BINDING_ENABLED=false` in
+`.env.selfhost`. Deployed apps then lose the `CONNECTIONS` broker; chat-agent
+connections remain available. See `SELF_HOSTING.md` for the full behavior.
+
 ```bash
 bun --env-file=.env.selfhost run selfhost:container:smoke:project
 bun --env-file=.env.selfhost run selfhost:container:smoke:analysis

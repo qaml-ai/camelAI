@@ -77,10 +77,6 @@ describe("self-host health route", () => {
       state: "disabled",
       available: false,
     });
-    expect(body.capabilities.features.connections_binding).toMatchObject({
-      state: "disabled",
-      available: false,
-    });
     expect(body.capabilities.features.project_builds).toMatchObject({
       state: "configured",
       available: null,

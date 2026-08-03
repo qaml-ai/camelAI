@@ -5,13 +5,14 @@ import { handleAuthenticatedConnectionsRpc } from "./routes/connections-rpc.js";
 import type { Env } from "./types.js";
 
 /**
- * Both of these mean "the prefix is already mounted" — the state we want — so a
- * mount attempt that hits either is a success, not a failure:
+ * Both of these mean "the prefix is already mounted" — recoverable presence, not
+ * a hard failure — so callers can unmount+remount (see `mountOrRecover`):
  *
- * - `S3FSMountError`: the prefix is still mounted at the kernel level from a
- *   previous container life (this DO instance was recreated, losing the SDK's
- *   in-memory mount registry, while the container kept the mount), so s3fs
- *   reports the mountpoint busy.
+ * - `S3FSMountError` whose message looks like a busy/nonempty mountpoint: the
+ *   prefix is still mounted at the kernel level from a previous container life
+ *   (this DO instance was recreated, losing the SDK's in-memory mount registry,
+ *   while the container kept the mount). We match the message so genuine s3fs
+ *   failures (auth, network, missing bucket) still surface.
  * - `InvalidMountConfigError` with an "already in use" message: the SDK's own
  *   in-memory registry already holds this path, so it rejects a second mount of
  *   it (e.g. a concurrent `ensureMounted` that mounted it first). We match the
@@ -21,11 +22,103 @@ import type { Env } from "./types.js";
  * Any other error (bad binding name, missing binding, invalid path) is genuine.
  */
 export function isMountAlreadyPresent(error: unknown): boolean {
-  if (error instanceof S3FSMountError) return true;
+  if (
+    error instanceof S3FSMountError &&
+    /not empty|MOUNTPOINT|busy|already mounted/i.test(String(error.message ?? error))
+  ) {
+    return true;
+  }
   if (error instanceof InvalidMountConfigError && /already in use/i.test(String(error.message))) {
     return true;
   }
   return false;
+}
+
+/** Options forwarded to `Sandbox.mountBucket` for R2 binding mounts. */
+export type R2MountBucketOptions = {
+  prefix: string;
+  readOnly?: boolean;
+  s3fsOptions?: string[];
+};
+
+/**
+ * Minimal surface `mountOrRecover` needs from a Sandbox. Kept narrow so the
+ * recovery path is unit-testable without spinning a container.
+ */
+export interface MountRecoverTarget {
+  mountBucket(bucket: string, mountPath: string, options: R2MountBucketOptions): Promise<void>;
+  unmountBucket(mountPath: string): Promise<void>;
+  exec(
+    command: string,
+    options?: { timeout?: number },
+  ): Promise<{ exitCode?: number; stdout?: string; stderr?: string }>;
+}
+
+/**
+ * Mount an R2 prefix, recovering from the warm-container remount hazard:
+ *
+ * When a Sandbox DO is recreated, the SDK loses its in-memory mount registry
+ * and `r2.internal` interception, but the container can keep the old FUSE
+ * mounts. A naive remount then fails with "MOUNTPOINT … is not empty". The SDK
+ * cleans up the failed attempt by calling `configureR2EgressOutbound` with the
+ * *remaining* (often empty) bucket set — which **removes** `r2.internal` —
+ * while the zombie FUSE mounts stay. Every subsequent read returns Errno 5.
+ *
+ * Swallowing that error (the old behaviour) left the workspace permanently
+ * wedged until the container was destroyed. Instead: unmount, remount (so
+ * egress is re-registered), and if the mount still only "looks" present, probe
+ * a directory listing and fail loudly when I/O is dead.
+ */
+export async function mountOrRecover(
+  target: MountRecoverTarget,
+  bucket: string,
+  mountPath: string,
+  options: R2MountBucketOptions,
+): Promise<void> {
+  try {
+    await target.mountBucket(bucket, mountPath, options);
+    return;
+  } catch (error) {
+    if (!isMountAlreadyPresent(error)) throw error;
+  }
+
+  try {
+    await target.unmountBucket(mountPath);
+  } catch (error) {
+    console.warn(`[sandbox] unmount ${mountPath} before remount failed`, error);
+  }
+
+  try {
+    await target.mountBucket(bucket, mountPath, options);
+    return;
+  } catch (error) {
+    if (!isMountAlreadyPresent(error)) throw error;
+  }
+
+  if (!(await mountAllowsList(target, mountPath))) {
+    throw new Error(
+      `R2 mount at ${mountPath} appears present but is not readable (I/O error). ` +
+        `Recreate the analysis sandbox container to recover.`,
+    );
+  }
+}
+
+/** True when `ls` against the mount path succeeds without an I/O error. */
+export async function mountAllowsList(
+  target: Pick<MountRecoverTarget, "exec">,
+  mountPath: string,
+): Promise<boolean> {
+  // Mount paths are platform-controlled (`/uploads`, `/outputs`, `/warehouse/<uuid>`).
+  if (!/^\/[A-Za-z0-9._/-]+$/.test(mountPath) || mountPath.includes("..")) return false;
+  try {
+    const result = await target.exec(`ls -ld -- ${mountPath}`, { timeout: 15_000 });
+    if ((result.exitCode ?? 1) !== 0) return false;
+    const combined = `${result.stderr ?? ""}\n${result.stdout ?? ""}`;
+    if (/Input\/output error|Errno 5/i.test(combined)) return false;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -151,7 +244,8 @@ export class AnalysisSandbox extends Sandbox<Env> {
    * The mount runs at most once per mount path per container life: the
    * single-flight gate coalesces concurrent callers and caches success; repeated
    * calls on a warm container are a no-op. An already-mounted error from a
-   * previous container life is treated as success (see isMountAlreadyPresent).
+   * previous container life is recovered via unmount+remount (see mountOrRecover)
+   * so `r2.internal` egress is re-registered instead of leaving zombie FUSE mounts.
    */
   async ensureMounted(
     bucketBinding: string,
@@ -168,19 +262,15 @@ export class AnalysisSandbox extends Sandbox<Env> {
     }
     const readOnly = options.readOnly ?? true;
     await gate(async () => {
-      try {
-        await this.mountBucket(bucketBinding, resolvedMountPath, {
-          prefix: `/${prefix}`,
-          readOnly,
-          // Shrink the s3fs stat cache (default 60s + negative caching) so a
-          // just-staged export/upload isn't read through a stale/partial view —
-          // which otherwise surfaces as a read failure. The stage → read gap
-          // exceeds 1s, so this adds no real overhead. Matches WarehouseSandbox.
-          s3fsOptions: ["stat_cache_expire=1"],
-        });
-      } catch (error) {
-        if (!isMountAlreadyPresent(error)) throw error;
-      }
+      await mountOrRecover(this, bucketBinding, resolvedMountPath, {
+        prefix: `/${prefix}`,
+        readOnly,
+        // Shrink the s3fs stat cache (default 60s + negative caching) so a
+        // just-staged export/upload isn't read through a stale/partial view —
+        // which otherwise surfaces as a read failure. The stage → read gap
+        // exceeds 1s, so this adds no real overhead. Matches WarehouseSandbox.
+        s3fsOptions: ["stat_cache_expire=1"],
+      });
       this.mountedPaths.add(resolvedMountPath);
     });
   }

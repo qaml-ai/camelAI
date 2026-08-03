@@ -806,6 +806,73 @@ routes.post(
 );
 
 // ---------------------------------------------------------------------------
+// POST /workspaces/:workspaceId/analysis-sandbox/reset
+// ---------------------------------------------------------------------------
+
+const AnalysisSandboxResetResponseSchema = z.object({
+  ok: z.boolean(),
+  workspace_id: z.string(),
+  destroyed: z.array(z.string()),
+  errors: z.array(z.object({ sandbox_id: z.string(), error: z.string() })),
+});
+
+routes.post(
+  "/workspaces/:workspaceId/analysis-sandbox/reset",
+  openApi({
+    summary:
+      "Destroy the workspace analysis sandbox containers so the next run gets fresh R2/s3fs mounts",
+    responses: {
+      200: AnalysisSandboxResetResponseSchema,
+      400: ErrorSchema,
+    },
+  }),
+  async (c) => {
+    const workspaceId = c.req.param("workspaceId");
+    if (!c.env.ANALYSIS_SANDBOX) {
+      return c.json({ error: "ANALYSIS_SANDBOX container binding is not configured" }, 400);
+    }
+
+    // Mirror AnalysisService.resolveSandbox ids: one agent container per
+    // workspace, plus a separate app-scoped container for deployed-app runCode.
+    const sandboxIds = [workspaceId, `app-${workspaceId}`];
+    const destroyed: string[] = [];
+    const errors: Array<{ sandbox_id: string; error: string }> = [];
+
+    for (const sandboxId of sandboxIds) {
+      try {
+        const sandbox = getSandbox(c.env.ANALYSIS_SANDBOX, sandboxId, {
+          normalizeId: true,
+        }) as { destroy: () => Promise<void> };
+        await sandbox.destroy();
+        destroyed.push(sandboxId);
+      } catch (error) {
+        errors.push({
+          sandbox_id: sandboxId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    recordObservabilityEvent(c.env, {
+      event: "analysis_sandbox_reset",
+      severity: errors.length > 0 ? "warn" : "info",
+      component: "admin",
+      operation: "analysis-sandbox-reset",
+      status: errors.length > 0 ? "partial" : "ok",
+      workspaceId,
+      count: destroyed.length,
+    });
+
+    return c.json({
+      ok: errors.length === 0,
+      workspace_id: workspaceId,
+      destroyed,
+      errors,
+    });
+  },
+);
+
+// ---------------------------------------------------------------------------
 // POST /db-query-sandbox/query
 // ---------------------------------------------------------------------------
 

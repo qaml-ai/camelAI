@@ -1,6 +1,6 @@
 import { Sandbox } from "@cloudflare/sandbox";
 
-import { createSingleFlight, isMountAlreadyPresent } from "./analysis-sandbox.js";
+import { createSingleFlight, mountOrRecover } from "./analysis-sandbox.js";
 import { DB_QUERY_SLEEP_AFTER } from "./container-sizing.js";
 import type { Env } from "./types.js";
 
@@ -70,7 +70,8 @@ export class DbQuerySandbox extends Sandbox<Env> {
    * so an export staged at R2 key `<prefix>/x` is written at `/<prefix>/x` —
    * the same `'/' + r2_key` contract the analysis container reads with. At
    * most one mount attempt per path per container life; an already-mounted
-   * error from a previous life counts as success.
+   * error from a previous life is recovered via unmount+remount (see
+   * mountOrRecover) so `r2.internal` egress is re-registered.
    */
   async ensureWarehouseExportMount(prefix: string): Promise<void> {
     const mountPath = `/${prefix}`;
@@ -81,17 +82,13 @@ export class DbQuerySandbox extends Sandbox<Env> {
       this.mountGates.set(mountPath, gate);
     }
     await gate(async () => {
-      try {
-        await this.mountBucket(WAREHOUSE_EXPORT_BUCKET_BINDING, mountPath, {
-          prefix: mountPath,
-          readOnly: false,
-          // Shrink the s3fs stat cache so a re-export of the same key doesn't
-          // read/write through a stale view (matches the analysis mounts).
-          s3fsOptions: ["stat_cache_expire=1"],
-        });
-      } catch (error) {
-        if (!isMountAlreadyPresent(error)) throw error;
-      }
+      await mountOrRecover(this, WAREHOUSE_EXPORT_BUCKET_BINDING, mountPath, {
+        prefix: mountPath,
+        readOnly: false,
+        // Shrink the s3fs stat cache so a re-export of the same key doesn't
+        // read/write through a stale view (matches the analysis mounts).
+        s3fsOptions: ["stat_cache_expire=1"],
+      });
       this.mountedPaths.add(mountPath);
     });
   }

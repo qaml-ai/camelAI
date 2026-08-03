@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { SELFHOST_CAPABILITY_CONTRACT_VERSION } from "@/lib/selfhost-capabilities";
 
 const getEnvMock = vi.fn();
 
@@ -71,8 +72,12 @@ describe("self-host health route", () => {
         expect.objectContaining({ name: "email", status: "warn" }),
       ]),
     );
-    expect(body.capabilities.version).toBe(2);
+    expect(body.capabilities.version).toBe(SELFHOST_CAPABILITY_CONTRACT_VERSION);
     expect(body.capabilities.features.outbound_email).toMatchObject({
+      state: "disabled",
+      available: false,
+    });
+    expect(body.capabilities.features.connections_binding).toMatchObject({
       state: "disabled",
       available: false,
     });

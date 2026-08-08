@@ -56,6 +56,47 @@ type OutputFileEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
 const testEnv = env as unknown as OutputFileEvalEnv;
 const maybeIt = testEnv.RUN_AGENT_EVALS === "1" ? it : it.skip;
 const SESSION_TIMEOUT_MS = getEvalTimeoutMs(testEnv, 300_000);
+const RUBRIC = {
+  version: 1,
+  objective:
+    "Turn the uploaded data into a correct spreadsheet and hand the user a download link that resolves to the file actually written to workspace outputs.",
+  passThreshold: 75,
+  criticalMinimum: 3,
+  criteria: [
+    {
+      id: "spreadsheet_delivery",
+      description:
+        "A non-empty, well-formed spreadsheet containing the requested calculation lands in workspace outputs.",
+      weight: 45,
+      critical: true,
+      evidenceHints: ["runtimeAssertions", "evaluation"],
+    },
+    {
+      id: "download_link_accuracy",
+      description:
+        "The final response links to the delivered output filename using the workspace output route and does not invent an unrelated host.",
+      weight: 30,
+      critical: true,
+      evidenceHints: ["result", "runtimeAssertions"],
+    },
+    {
+      id: "appropriate_delivery_path",
+      description:
+        "The agent uses the file-output workflow instead of deploying an app solely to serve one spreadsheet.",
+      weight: 15,
+      critical: false,
+      evidenceHints: ["trajectory", "runtimeAssertions.deployedAnApp"],
+    },
+    {
+      id: "clear_handoff",
+      description:
+        "The response briefly states what was exported and makes the download action obvious.",
+      weight: 10,
+      critical: false,
+      evidenceHints: ["result"],
+    },
+  ],
+} as const;
 
 /** A .xlsx is a ZIP: every real one starts with the local file header "PK\x03\x04". */
 const ZIP_MAGIC = [0x50, 0x4b, 0x03, 0x04];
@@ -170,6 +211,21 @@ describe("output file delivery agent eval", () => {
       const deployedAnApp = (signal.toolCallsByName?.deploy_project ?? 0) > 0;
 
       const answerText = JSON.stringify(result.messages);
+      const finalResult = result.result ?? "";
+      const deliveredFilename = deliveredKey?.split("/").at(-1) ?? null;
+      const finalMentionsDeliveredFile = Boolean(
+        deliveredFilename &&
+          (finalResult.includes(deliveredFilename) ||
+            finalResult.includes(encodeURIComponent(deliveredFilename))),
+      );
+      const finalUsesWorkspaceOutputRoute =
+        /(?:\/api\/workspaces\/[^)\s]+\/outputs\/|\/outputs\/)/i.test(finalResult);
+      const finalUsesWrongCamelAiHost =
+        /https?:\/\/(?:www\.)?camelai\.com(?:\/|$)/i.test(finalResult);
+      const downloadableHandoff =
+        finalMentionsDeliveredFile &&
+        finalUsesWorkspaceOutputRoute &&
+        !finalUsesWrongCamelAiHost;
       // 102*145.50 = 14841, 144*88.25 = 12708, 60*145.50 = 8730.
       const citedATotal = /14[,.]?841|12[,.]?708|8[,.]?730/.test(answerText);
 
@@ -206,6 +262,33 @@ describe("output file delivery agent eval", () => {
               : undefined,
             details: { toolCallsByName: signal.toolCallsByName },
           }),
+          passFailCriterion({
+            id: "final_response_links_delivered_file",
+            label: "Final response links to the file that exists in workspace outputs",
+            passed: downloadableHandoff,
+            reason: downloadableHandoff
+              ? undefined
+              : [
+                  finalMentionsDeliveredFile
+                    ? null
+                    : "final response did not reference the delivered filename",
+                  finalUsesWorkspaceOutputRoute
+                    ? null
+                    : "final response did not use a workspace output route",
+                  finalUsesWrongCamelAiHost
+                    ? "final response used the unrelated camelai.com host"
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join("; "),
+            details: {
+              deliveredFilename,
+              finalResult,
+              finalMentionsDeliveredFile,
+              finalUsesWorkspaceOutputRoute,
+              finalUsesWrongCamelAiHost,
+            },
+          }),
           buildNoAssistantErrorCriterion(result),
           buildRuntimeEventsCriterion(result),
           buildResultEventCriterion(result),
@@ -225,6 +308,7 @@ describe("output file delivery agent eval", () => {
 
       emitEvalTranscript({
         status: result.status,
+        rubric: RUBRIC,
         evaluation,
         error: result.error,
         model: testEnv.EVAL_MODEL,
@@ -234,15 +318,23 @@ describe("output file delivery agent eval", () => {
         messages: result.messages,
         runtimeAssertions: {
           deliveredKey,
+          deliveredFilename,
           byteLength: deliveredBytes?.length ?? 0,
           wellFormed,
           deployedAnApp,
+          downloadableHandoff,
+          finalMentionsDeliveredFile,
+          finalUsesWorkspaceOutputRoute,
+          finalUsesWrongCamelAiHost,
           citedATotal,
           outputKeys: listed.objects.map((object) => object.key).slice(0, 20),
           failures: [
             ...(deliveredFile ? [] : ["no file delivered to workspace outputs"]),
             ...(wellFormed ? [] : ["delivered file was empty or malformed"]),
             ...(deployedAnApp ? ["deployed an app to serve a file"] : []),
+            ...(downloadableHandoff
+              ? []
+              : ["final response did not provide a valid link to the delivered output file"]),
           ],
         },
       });

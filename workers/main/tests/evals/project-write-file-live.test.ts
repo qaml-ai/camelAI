@@ -41,6 +41,55 @@ const testEnv = env as unknown as ProjectWriteEvalEnv;
 const maybeIt = testEnv.RUN_AGENT_EVALS === "1" ? it : it.skip;
 const EXPECTED_FILE_CONTENT = "project write eval ok.";
 const SESSION_TIMEOUT_MS = getEvalTimeoutMs(testEnv, 180_000);
+const RUBRIC = {
+  version: 1,
+  objective:
+    "Write and verify an exact project file, then finish with a persisted assistant response that reports the verified contents.",
+  passThreshold: 75,
+  criticalMinimum: 3,
+  criteria: [
+    {
+      id: "exact_file",
+      description:
+        "The requested project file exists and contains exactly the supplied synthetic text.",
+      weight: 40,
+      critical: true,
+      evidenceHints: ["fileInspection", "runtimeAssertions"],
+    },
+    {
+      id: "verified_readback",
+      description:
+        "The agent reads the persisted file and grounds its response in that successful readback.",
+      weight: 25,
+      critical: true,
+      evidenceHints: ["trajectory", "runtimeAssertions"],
+    },
+    {
+      id: "assistant_completion",
+      description:
+        "The turn ends with a non-empty assistant response after the final tool result rather than silently stopping at the tool boundary.",
+      weight: 25,
+      critical: true,
+      evidenceHints: ["result", "runtimeAssertions"],
+    },
+    {
+      id: "concise_reply",
+      description:
+        "The final response provides the requested contents directly without unrelated narration.",
+      weight: 10,
+      critical: false,
+      evidenceHints: ["result"],
+    },
+  ],
+} as const;
+
+function messageRole(message: unknown): string | undefined {
+  if (!message || typeof message !== "object" || Array.isArray(message)) {
+    return undefined;
+  }
+  const role = (message as Record<string, unknown>).role;
+  return typeof role === "string" ? role : undefined;
+}
 
 describe("project write file agent eval", () => {
   maybeIt(
@@ -112,6 +161,7 @@ describe("project write file agent eval", () => {
       const finalResultExtra = finalResultLower
         .replace(EXPECTED_FILE_CONTENT, "")
         .trim();
+      const terminalRole = messageRole(result.messages.at(-1));
       const evaluation = buildEvalCriteriaSummary({
         passFail: [
           buildSessionCompletedCriterion(result),
@@ -142,6 +192,16 @@ describe("project write file agent eval", () => {
               : "Final response did not include the expected file contents.",
             details: { finalResult },
           }),
+          passFailCriterion({
+            id: "terminal_assistant_completion",
+            label: "Turn persisted a final assistant response after tool use",
+            passed: terminalRole === "assistant" && finalResult.length > 0,
+            reason:
+              terminalRole === "assistant" && finalResult.length > 0
+                ? undefined
+                : `Expected a non-empty assistant completion, got terminal role ${terminalRole ?? "missing"}.`,
+            details: { terminalRole, hasFinalResult: finalResult.length > 0 },
+          }),
           buildNoAssistantErrorCriterion(result),
           buildRuntimeEventsCriterion(result),
           buildResultEventCriterion(result),
@@ -168,6 +228,7 @@ describe("project write file agent eval", () => {
 
       emitEvalTranscript({
         status: result.status,
+        rubric: RUBRIC,
         evaluation,
         error: result.error,
         model: testEnv.EVAL_MODEL,
@@ -179,6 +240,12 @@ describe("project write file agent eval", () => {
           path: "/eval-output.txt",
           success: readResponse.success,
           contents: fileContents,
+        },
+        runtimeAssertions: {
+          terminalRole,
+          hasFinalResult: finalResult.length > 0,
+          exactFileContents:
+            normalizedFileContents === EXPECTED_FILE_CONTENT,
         },
       });
 

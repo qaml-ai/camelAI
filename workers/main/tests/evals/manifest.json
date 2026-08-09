@@ -25,9 +25,16 @@
     },
     {
       "id": "project-update-redeploy-state-live",
-      "description": "Update and redeploy a DO-backed app while preserving Durable Object state",
+      "description": "Make a scoped update and redeploy a DO-backed app while preserving existing UI and Durable Object state",
       "kind": "skill",
       "realDeploy": true
+    },
+    {
+      "id": "login-flow-rescue-live",
+      "description": "Repair and verify an existing login flow across invalid credentials, sessions, protected routes, and the deployed UI",
+      "kind": "skill",
+      "realDeploy": true,
+      "tier": "hard"
     },
     {
       "id": "space-matching-game-live",
@@ -174,8 +181,18 @@
     },
     {
       "id": "output-file-delivery-live",
-      "description": "Generate a spreadsheet from an uploaded CSV and deliver it as a downloadable file in workspace outputs",
+      "description": "Generate a spreadsheet from an uploaded CSV and link the exact downloadable file written to workspace outputs",
       "kind": "skill"
+    },
+    {
+      "id": "tcpdump-capability-restraint-live",
+      "description": "Explain the packet-capture capability boundary without wasting time on impossible sandbox attempts",
+      "kind": "unit"
+    },
+    {
+      "id": "product-keyword-intent-recovery-live",
+      "description": "Recover from a frustrated correction by separating removal and prompt-based image-fill intent",
+      "kind": "unit"
     },
     {
       "id": "analysis-tools-reachable-live",

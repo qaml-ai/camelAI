@@ -11809,6 +11809,60 @@ describe('ChatThreadDO Pi turn handling', () => {
     }));
   });
 
+  it('defers agent_end when a completed tool result still needs a model response', async () => {
+    const { fake, events } = createPiEventFake();
+    fake.piPendingOwedOutputContinuation = false;
+    fake.clearPiActiveTurnAndJournal = vi.fn();
+
+    await ChatThreadDO.prototype['handlePiSessionEvent'].call(fake, {
+      type: 'agent_end',
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'toolCall', id: 'write-1', name: 'write', arguments: {} }],
+          stopReason: 'toolUse',
+          timestamp: 100,
+        },
+        {
+          role: 'toolResult',
+          toolCallId: 'write-1',
+          toolName: 'write',
+          content: [{ type: 'text', text: 'File written' }],
+          timestamp: 101,
+        },
+      ],
+    });
+
+    expect(fake.piPendingOwedOutputContinuation).toBe(true);
+    expect(events.some((event) => event.type === 'result')).toBe(false);
+    expect(fake.finishTurn).not.toHaveBeenCalled();
+    expect(fake.clearPiActiveTurnAndJournal).not.toHaveBeenCalled();
+    expect(fake.recordChatThreadObservabilityEvent).toHaveBeenCalledWith(
+      'pi_turn_incomplete_completion',
+      expect.objectContaining({ status: 'deferred' }),
+    );
+  });
+
+  it('continues an incomplete tool-terminal run until a final response arrives', async () => {
+    const fake = Object.create(ChatThreadDO.prototype) as any;
+    fake.piPendingOwedOutputContinuation = true;
+    fake.piEventHandlerChain = Promise.resolve();
+    fake.recordChatThreadObservabilityEvent = vi.fn();
+    fake.piSession = {
+      continue: vi.fn(async () => {
+        fake.piPendingOwedOutputContinuation = false;
+      }),
+    };
+
+    await ChatThreadDO.prototype['continuePiTurnWhileModelOwesOutput'].call(fake);
+
+    expect(fake.piSession.continue).toHaveBeenCalledTimes(1);
+    expect(fake.recordChatThreadObservabilityEvent).toHaveBeenCalledWith(
+      'pi_turn_incomplete_completion',
+      expect.objectContaining({ status: 'continuing', count: 1 }),
+    );
+  });
+
   // Regression cluster for the finalText mask. Error surfacing used to be gated
   // on the turn having produced no text, so a run that failed AFTER emitting a
   // visible token surfaced nothing at all — no banner, no inline error, no

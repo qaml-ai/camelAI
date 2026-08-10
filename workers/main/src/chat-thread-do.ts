@@ -428,6 +428,10 @@ const PI_USER_STOP_TEXT = "Stopped by user";
 const PI_TURN_TRANSIENT_RETRY_ATTEMPTS = 2;
 const PI_TURN_TRANSIENT_RETRY_BASE_MS = 500;
 const PI_TURN_TRANSIENT_RETRY_MAX_MS = 4_000;
+// Some providers occasionally settle the run immediately after a tool result,
+// before the model produces the response that consumes it. Re-drive the warm
+// session instead of accepting an empty completion and clearing recovery state.
+const PI_TURN_OWED_OUTPUT_CONTINUATION_ATTEMPTS = 8;
 
 interface CachedLlmProviderConfig {
   orgId: string;
@@ -494,6 +498,16 @@ class PiTurnAbsoluteTimeoutError extends Error {
   constructor(message = PI_TURN_ABSOLUTE_TIMEOUT_MESSAGE) {
     super(message);
     this.name = "PiTurnAbsoluteTimeoutError";
+  }
+}
+
+class PiTurnIncompleteCompletionError extends Error {
+  constructor(
+    message =
+      "The model repeatedly stopped after a tool result without producing a final response.",
+  ) {
+    super(message);
+    this.name = "PiTurnIncompleteCompletionError";
   }
 }
 
@@ -743,6 +757,9 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     provider: string | null;
     model: string | null;
   } | null = null;
+  // Set by agent_end when the provider settles with a user/tool-result leaf.
+  // The prompt driver consumes it on the same open stream with continue().
+  private piPendingOwedOutputContinuation = false;
   private piTransientRetryBackoffAbort: AbortController | null = null;
   private recordedChatErrors = new Map<string, number>();
 
@@ -5114,7 +5131,10 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
           if (!this.piSession) {
             throw new Error("Pi session was not available for eval prompt");
           }
+          this.piPendingOwedOutputContinuation = false;
           await this.piSession.prompt(userMessage);
+          await this.piEventHandlerChain;
+          await this.continuePiTurnWhileModelOwesOutput();
         }),
         body.timeoutMs,
       );
@@ -6473,6 +6493,26 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     if (event.type === "agent_end") {
       const stoppedByUserAtMs = this.piUserStopRequestedAtMs;
       const stoppedByUser = stoppedByUserAtMs > 0;
+      const lastMessage = event.messages[event.messages.length - 1] as
+        | { role?: unknown }
+        | undefined;
+      const owesModelOutput =
+        lastMessage?.role === "user" || lastMessage?.role === "toolResult";
+      if (!stoppedByUser && owesModelOutput) {
+        // This run has not produced a response to its latest user/tool-result
+        // row. The normal branch below would emit result:"", mark the turn
+        // complete, and clear the recovery marker + journal.
+        this.piPendingOwedOutputContinuation = true;
+        this.recordChatThreadObservabilityEvent(
+          "pi_turn_incomplete_completion",
+          {
+            operation: "continue_owed_model_output",
+            status: "deferred",
+            severity: "warn",
+          },
+        );
+        return;
+      }
       // A run that settled with a RETRYABLE transient provider error is not
       // terminal yet: skip ALL terminal surfacing (no error/result events, no
       // finishTurn, marker + journal left set) and let the turn body's
@@ -7267,6 +7307,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
           // bounds those separately).
           this.piTurnTransientRetryAttempts = 0;
           this.piPendingTransientTurnRetry = null;
+          this.piPendingOwedOutputContinuation = false;
           try {
             if (freshPrompts) {
               // No bespoke inactivity race: the ai-chat stall watchdog
@@ -7305,6 +7346,9 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
             // Drain the Pi event handler chain so agent_end's turn/completed → the
             // encoder `finish` chunk is flushed before the stream closes.
             await this.piEventHandlerChain.catch(() => {});
+            // A provider may settle one step early with a completed tool result
+            // as the transcript leaf. Continue it before any terminal cleanup.
+            await this.continuePiTurnWhileModelOwesOutput();
             // If that agent_end deferred a retryable transient provider error,
             // regenerate in-process on this same open stream.
             await this.retryPiTurnWhileTransient();
@@ -7471,6 +7515,40 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
           : this.piSession?.state.model?.id ?? null,
     };
     return true;
+  }
+
+  /**
+   * Continue a provider run that emitted agent_end while its transcript still
+   * ended in a user or tool-result row. Pi normally performs this continuation
+   * internally; this guard covers providers that settle the run one step early.
+   * A genuine final assistant response takes the normal agent_end terminal path.
+   */
+  private async continuePiTurnWhileModelOwesOutput(): Promise<void> {
+    let attempts = 0;
+    while (this.piPendingOwedOutputContinuation) {
+      this.piPendingOwedOutputContinuation = false;
+      if (attempts >= PI_TURN_OWED_OUTPUT_CONTINUATION_ATTEMPTS) {
+        throw new PiTurnIncompleteCompletionError();
+      }
+      attempts += 1;
+      const session = this.piSession;
+      if (!session) {
+        throw new PiTurnIncompleteCompletionError(
+          "The model stopped after a tool result and the agent session was unavailable to continue.",
+        );
+      }
+      this.recordChatThreadObservabilityEvent(
+        "pi_turn_incomplete_completion",
+        {
+          operation: "continue_owed_model_output",
+          status: "continuing",
+          severity: "warn",
+          count: attempts,
+        },
+      );
+      await session.continue();
+      await this.piEventHandlerChain;
+    }
   }
 
   /**

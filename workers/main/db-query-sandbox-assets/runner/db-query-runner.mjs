@@ -898,6 +898,11 @@ async function createParquetSink(path) {
       for (const field of fields) {
         schemaFields[field.name] = { type: field.kind, optional: true, compression: "SNAPPY" };
       }
+      // Fresh prefix-scoped R2 mounts contain the workspace root, but not the
+      // per-connection directory embedded in DB_EXPORT_PATH. parquetjs opens
+      // the file directly and does not create parents, so the first export for
+      // a connection otherwise fails with ENOENT.
+      await ensureExportParentDirectory(path, (target, options) => fs.mkdir(target, options));
       writer = await parquet.ParquetWriter.openFile(new parquet.ParquetSchema(schemaFields), path);
       writer.setRowGroupSize(PARQUET_ROW_GROUP_SIZE);
     },
@@ -925,6 +930,12 @@ async function createParquetSink(path) {
       await fs.unlink(path).catch(() => {});
     },
   };
+}
+
+export async function ensureExportParentDirectory(path, mkdir) {
+  const separator = path.lastIndexOf("/");
+  if (separator <= 0) throw Object.assign(new Error("DB_EXPORT_PATH has no parent directory"), { status: 400 });
+  await mkdir(path.slice(0, separator), { recursive: true });
 }
 
 export async function exportFileSizeAfterClose(path, stat) {

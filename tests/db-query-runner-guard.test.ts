@@ -10,6 +10,7 @@ import {
   parquetKindForMysql,
   parquetKindForMssql,
   parquetValueFor,
+  ensureExportParentDirectory,
   exportFileSizeAfterClose,
   streamMysqlRows,
   DEFAULT_ROW_LIMIT,
@@ -20,6 +21,18 @@ import {
 } from '../workers/main/db-query-sandbox-assets/runner/db-query-runner.mjs';
 
 describe('Parquet export finalization', () => {
+  it('creates the per-connection parent directory before opening an export', async () => {
+    const mkdir = vi.fn(async () => undefined);
+    await ensureExportParentDirectory(
+      '/warehouse/workspace-id/connection-id/export.parquet',
+      mkdir,
+    );
+    expect(mkdir).toHaveBeenCalledWith(
+      '/warehouse/workspace-id/connection-id',
+      { recursive: true },
+    );
+  });
+
   it('tolerates an R2 mount evicting the local file after a successful close', async () => {
     await expect(exportFileSizeAfterClose('/warehouse/export.parquet', async () => {
       throw Object.assign(new Error('missing after upload'), { code: 'ENOENT' });

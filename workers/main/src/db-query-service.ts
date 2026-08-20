@@ -165,6 +165,8 @@ interface SandboxExecResult {
 
 /** The slice of the DbQuerySandbox stub this module uses (test seam). */
 export interface DbQuerySandboxStub {
+  /** Optional for compatibility with older test doubles/self-host bindings. */
+  ensureReady?(): Promise<void>;
   ensureRelayEgress(relayHostname: string): Promise<void>;
   ensureWarehouseExportMount(prefix: string): Promise<void>;
   startProcess(
@@ -249,6 +251,15 @@ function dbQuerySetupDeadline(deps: DbQueryDeps, operation: string): SandboxExec
     graceMs: SANDBOX_EXEC_DEADLINE_GRACE_MS,
     onExceeded: (event) => deps.onDeadlineExceeded?.(event),
   });
+}
+
+/**
+ * Cold container provisioning has its own SDK-bounded 120s budget. Keep it
+ * outside the warm relay/mount setup deadline: otherwise a healthy cold start
+ * can consume the entire 45s client-side setup budget before the first probe.
+ */
+async function ensureDbQuerySandboxReady(deps: DbQueryDeps): Promise<void> {
+  await deps.sandbox.ensureReady?.();
 }
 
 /** Probe whether the cloudflared forwarder's local port is accepting yet. */
@@ -352,6 +363,7 @@ function parseRunnerOutput(exec: SandboxExecResult): DbQueryResult {
  * bare `import "pg"` resolves against the baked node_modules.
  */
 export async function runDbQuery(deps: DbQueryDeps, request: DbQueryRequest): Promise<DbQueryResult> {
+  await ensureDbQuerySandboxReady(deps);
   await ensureRelayPrelude(deps, dbQuerySetupDeadline(deps, "db_query_setup"));
 
   const containerTimeoutMs = (request.timeoutMs ?? DEFAULT_QUERY_TIMEOUT_MS) + EXEC_OVERHEAD_MS;
@@ -410,6 +422,7 @@ export async function runDbExport(
   mountPrefix: string,
   exportPath: string,
 ): Promise<DbExportResult> {
+  await ensureDbQuerySandboxReady(deps);
   await ensureRelayPrelude(deps, dbQuerySetupDeadline(deps, "db_export_setup"));
   // The mount is an exec-class container call too: unbounded, it hung exports
   // exactly like the readiness probes did. Its OWN budget, not a share of the

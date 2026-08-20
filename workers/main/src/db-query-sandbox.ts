@@ -93,6 +93,16 @@ export class DbQuerySandbox extends Sandbox<Env> {
   }
 
   /**
+   * Provision the container and wait for its control port under the Sandbox
+   * SDK's dedicated startup budget (30s instance allocation + 90s port
+   * readiness by default). Query relay/mount deadlines are intentionally much
+   * shorter and must not spend their entire budget on a cold start.
+   */
+  async ensureReady(): Promise<void> {
+    await this.startAndWaitForPorts();
+  }
+
+  /**
    * Ensure the relay host is reachable through HTTPS interception for the
    * container's `cloudflared access tcp` forwarder. Called by db-query-service.ts
    * before each relay-mode run; cheap on a warm container.

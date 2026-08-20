@@ -400,6 +400,51 @@ describe('analysis tools under a client-side deadline', () => {
 
 
 describe('db-query under a client-side deadline', () => {
+  it('warms a cold sandbox before starting the short query setup deadline', async () => {
+    let releaseReady!: () => void;
+    const order: string[] = [];
+    const deps = {
+      relay: null,
+      sandbox: {
+        ensureReady: vi.fn(() => new Promise<void>((resolve) => {
+          order.push('ready-start');
+          releaseReady = () => {
+            order.push('ready-end');
+            resolve();
+          };
+        })),
+        ensureRelayEgress: vi.fn(async () => {}),
+        ensureWarehouseExportMount: vi.fn(async () => {}),
+        startProcess: vi.fn(async () => ({})),
+        exec: vi.fn(async () => {
+          order.push('exec');
+          return {
+            stdout: JSON.stringify({
+              ok: true,
+              rows: [{ ok: 1 }],
+              fields: [{ name: 'ok' }],
+              rowCount: 1,
+              truncated: false,
+              durationMs: 1,
+            }),
+            stderr: '',
+            exitCode: 0,
+          };
+        }),
+      },
+    } as unknown as DbQueryDeps;
+
+    const running = runDbQuery(deps, {
+      engine: 'postgres',
+      sql: 'select 1 as ok',
+    });
+    await vi.waitFor(() => expect(deps.sandbox.ensureReady).toHaveBeenCalledTimes(1));
+    expect(deps.sandbox.exec).not.toHaveBeenCalled();
+    releaseReady();
+    await expect(running).resolves.toMatchObject({ ok: true, rowCount: 1 });
+    expect(order).toEqual(['ready-start', 'ready-end', 'exec']);
+  });
+
   it('stops waiting on a container that never answers the runner', async () => {
     vi.useFakeTimers();
     const onDeadlineExceeded = vi.fn();

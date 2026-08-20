@@ -27,7 +27,12 @@ const DEFAULT_MYSQL_PORT = 3306;
 const DEFAULT_MSSQL_DATABASE = 'master';
 const DEFAULT_POSTGRES_DATABASE = 'postgres';
 const DEFAULT_QUERY_TIMEOUT_MS = 30_000;
-const DEFAULT_EXPORT_TIMEOUT_MS = 120_000;
+// Bulk exports are explicitly the no-row-cap path and can include remote
+// GROUP BY work over millions of rows. Two minutes was shorter than the real
+// SecLock D365 tier aggregation even though the connection and stream were
+// healthy; keep it below the 10-minute agent-turn stall budget while allowing
+// the database enough time to produce the first/remaining rows.
+const DEFAULT_EXPORT_TIMEOUT_MS = 300_000;
 
 export type LegacyEngine = 'postgres' | 'mysql' | 'mssql';
 

@@ -110,7 +110,7 @@ describe('exportRequestToDbQuery', () => {
     );
     expect(mapped.op).toBe('export');
     expect(mapped.mode).toBe('read'); // export ignores the body's mode, like the Go handler
-    expect(mapped.timeoutMs).toBe(120_000);
+    expect(mapped.timeoutMs).toBe(300_000);
   });
 });
 

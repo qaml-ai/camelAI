@@ -200,7 +200,7 @@ const READINESS_POLL_INTERVAL_MS = 500;
 const EXEC_OVERHEAD_MS = 15_000;
 /** Runner-side default when the caller declares no timeout. */
 const DEFAULT_QUERY_TIMEOUT_MS = 30_000;
-const DEFAULT_EXPORT_TIMEOUT_MS = 120_000;
+const DEFAULT_EXPORT_TIMEOUT_MS = 300_000;
 /** Matches the Sandbox SDK's 30s allocation + 90s port-readiness ceiling. */
 const DB_QUERY_CONTAINER_STARTUP_TIMEOUT_MS = 120_000;
 

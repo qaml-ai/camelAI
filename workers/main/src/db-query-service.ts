@@ -165,8 +165,7 @@ interface SandboxExecResult {
 
 /** The slice of the DbQuerySandbox stub this module uses (test seam). */
 export interface DbQuerySandboxStub {
-  /** Optional for compatibility with older test doubles/self-host bindings. */
-  ensureReady?(): Promise<void>;
+  ensureReady(): Promise<void>;
   ensureRelayEgress(relayHostname: string): Promise<void>;
   ensureWarehouseExportMount(prefix: string): Promise<void>;
   startProcess(
@@ -202,6 +201,8 @@ const EXEC_OVERHEAD_MS = 15_000;
 /** Runner-side default when the caller declares no timeout. */
 const DEFAULT_QUERY_TIMEOUT_MS = 30_000;
 const DEFAULT_EXPORT_TIMEOUT_MS = 120_000;
+/** Matches the Sandbox SDK's 30s allocation + 90s port-readiness ceiling. */
+const DB_QUERY_CONTAINER_STARTUP_TIMEOUT_MS = 120_000;
 
 /**
  * Client-side deadline for one runner exec.
@@ -259,7 +260,29 @@ function dbQuerySetupDeadline(deps: DbQueryDeps, operation: string): SandboxExec
  * can consume the entire 45s client-side setup budget before the first probe.
  */
 async function ensureDbQuerySandboxReady(deps: DbQueryDeps): Promise<void> {
-  await deps.sandbox.ensureReady?.();
+  await createSandboxExecDeadline({
+    operation: "db_query_container_start",
+    declaredTimeoutMs: DB_QUERY_CONTAINER_STARTUP_TIMEOUT_MS,
+    defaultTimeoutMs: DB_QUERY_CONTAINER_STARTUP_TIMEOUT_MS,
+    maxTimeoutMs: DB_QUERY_CONTAINER_STARTUP_TIMEOUT_MS,
+    graceMs: SANDBOX_EXEC_DEADLINE_GRACE_MS,
+    onExceeded: (event) => deps.onDeadlineExceeded?.(event),
+  }).run(() => deps.sandbox.ensureReady());
+
+  const relay = deps.relay;
+  if (!relay) return;
+  // setAllowedHosts is a container control-plane call of its own. On a newly
+  // provisioned or resource-constrained container it can legitimately take
+  // longer than forwarder readiness; don't charge that work to the 45s probe
+  // budget below.
+  await createSandboxExecDeadline({
+    operation: "db_query_relay_egress",
+    declaredTimeoutMs: DB_QUERY_CONTAINER_STARTUP_TIMEOUT_MS,
+    defaultTimeoutMs: DB_QUERY_CONTAINER_STARTUP_TIMEOUT_MS,
+    maxTimeoutMs: DB_QUERY_CONTAINER_STARTUP_TIMEOUT_MS,
+    graceMs: SANDBOX_EXEC_DEADLINE_GRACE_MS,
+    onExceeded: (event) => deps.onDeadlineExceeded?.(event),
+  }).run(() => deps.sandbox.ensureRelayEgress(relay.hostname));
 }
 
 /** Probe whether the cloudflared forwarder's local port is accepting yet. */
@@ -314,11 +337,10 @@ async function ensureRelayForwarder(
   }
 }
 
-/** Relay egress + forwarder readiness, all of it deadline-bounded. */
+/** Relay forwarder readiness, deadline-bounded after startup/egress setup. */
 async function ensureRelayPrelude(deps: DbQueryDeps, setup: SandboxExecDeadline): Promise<void> {
   const relay = deps.relay;
   if (!relay) return;
-  await setup.run(() => deps.sandbox.ensureRelayEgress(relay.hostname));
   await ensureRelayForwarder(deps, relay, setup);
 }
 

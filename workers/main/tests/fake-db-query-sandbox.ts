@@ -22,6 +22,7 @@ export function fakeDbQuerySandboxNamespace(respond: (request: DbQueryRequest) =
   const calls: FakeDbQueryCall[] = [];
   const mountPrefixes: string[] = [];
   const stub = {
+    ensureReady: vi.fn(async () => {}),
     ensureRelayEgress: vi.fn(async () => {}),
     ensureWarehouseExportMount: vi.fn(async (prefix: string) => {
       mountPrefixes.push(prefix);

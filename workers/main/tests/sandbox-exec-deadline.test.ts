@@ -445,6 +445,61 @@ describe('db-query under a client-side deadline', () => {
     expect(order).toEqual(['ready-start', 'ready-end', 'exec']);
   });
 
+  it('does not charge slow relay egress configuration to the short readiness budget', async () => {
+    vi.useFakeTimers();
+    let releaseRelayEgress!: () => void;
+    const order: string[] = [];
+    const deps = {
+      relay: {
+        hostname: 'db-relay.example.dev',
+        socksUsername: 'u',
+        socksPassword: 'p',
+      },
+      sandbox: {
+        ensureReady: vi.fn(async () => {
+          order.push('ready');
+        }),
+        ensureRelayEgress: vi.fn(() => new Promise<void>((resolve) => {
+          order.push('egress-start');
+          releaseRelayEgress = () => {
+            order.push('egress-end');
+            resolve();
+          };
+        })),
+        ensureWarehouseExportMount: vi.fn(async () => {}),
+        startProcess: vi.fn(async () => ({})),
+        exec: vi.fn(async () => {
+          if (!order.includes('probe')) {
+            order.push('probe');
+            return { stdout: 'up', stderr: '', exitCode: 0 };
+          }
+          order.push('query');
+          return {
+            stdout: JSON.stringify({
+              ok: true,
+              rows: [{ ok: 1 }],
+              fields: [{ name: 'ok' }],
+              rowCount: 1,
+              truncated: false,
+              durationMs: 1,
+            }),
+            stderr: '',
+            exitCode: 0,
+          };
+        }),
+      },
+    } as unknown as DbQueryDeps;
+
+    const running = runDbQuery(deps, { engine: 'postgres', sql: 'select 1 as ok' });
+    await vi.waitFor(() => expect(deps.sandbox.ensureRelayEgress).toHaveBeenCalledTimes(1));
+    // Longer than the 30s readiness + 15s grace that used to abandon this
+    // control-plane call even though the container was still progressing.
+    await vi.advanceTimersByTimeAsync(60_000);
+    releaseRelayEgress();
+    await expect(running).resolves.toMatchObject({ ok: true, rowCount: 1 });
+    expect(order).toEqual(['ready', 'egress-start', 'egress-end', 'probe', 'query']);
+  });
+
   it('stops waiting on a container that never answers the runner', async () => {
     vi.useFakeTimers();
     const onDeadlineExceeded = vi.fn();
@@ -452,6 +507,7 @@ describe('db-query under a client-side deadline', () => {
       relay: null,
       onDeadlineExceeded,
       sandbox: {
+        ensureReady: vi.fn(async () => {}),
         ensureRelayEgress: vi.fn(async () => {}),
         ensureWarehouseExportMount: vi.fn(async () => {}),
         startProcess: vi.fn(async () => ({})),
@@ -491,6 +547,7 @@ describe('db-query under a client-side deadline', () => {
       readinessTimeoutMs: 30_000,
       onDeadlineExceeded,
       sandbox: {
+        ensureReady: vi.fn(async () => {}),
         ensureRelayEgress: vi.fn(async () => {}),
         ensureWarehouseExportMount: vi.fn(async () => {}),
         startProcess: vi.fn(async () => ({})),
@@ -518,6 +575,7 @@ describe('db-query under a client-side deadline', () => {
       relay: { hostname: 'db-relay.example.dev', socksUsername: 'u', socksPassword: 'p' },
       readinessTimeoutMs: 30_000,
       sandbox: {
+        ensureReady: vi.fn(async () => {}),
         ensureRelayEgress: vi.fn(async () => {}),
         ensureWarehouseExportMount: vi.fn(async () => {}),
         startProcess: vi.fn(async () => ({})),

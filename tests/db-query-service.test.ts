@@ -37,6 +37,7 @@ function execResult(stdout: string, stderr = '', exitCode = 0) {
 
 function fakeSandbox(options: FakeOptions) {
   let readyCalls = 0;
+  const ensureReady = vi.fn(async () => {});
   const ensureRelayEgress = vi.fn(async () => {});
   const ensureWarehouseExportMount = vi.fn(async () => {});
   const startProcess = vi.fn(async () => {
@@ -59,8 +60,23 @@ function fakeSandbox(options: FakeOptions) {
       options.runnerExitCode ?? 0,
     );
   });
-  const sandbox: DbQuerySandboxStub = { ensureRelayEgress, ensureWarehouseExportMount, startProcess, exec };
-  return { sandbox, ensureRelayEgress, ensureWarehouseExportMount, startProcess, exec, execCommands, execEnvs };
+  const sandbox: DbQuerySandboxStub = {
+    ensureReady,
+    ensureRelayEgress,
+    ensureWarehouseExportMount,
+    startProcess,
+    exec,
+  };
+  return {
+    sandbox,
+    ensureReady,
+    ensureRelayEgress,
+    ensureWarehouseExportMount,
+    startProcess,
+    exec,
+    execCommands,
+    execEnvs,
+  };
 }
 
 describe('relayConfigFromEnv', () => {

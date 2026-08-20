@@ -227,7 +227,15 @@ export const QUERY_MODES = ["read", "modify"];
 export const DEFAULT_ROW_LIMIT = 1_000;
 export const MAX_ROW_LIMIT = 10_000;
 export const DEFAULT_TIMEOUT_MS = 30_000;
-export const MAX_TIMEOUT_MS = 120_000;
+export const MAX_QUERY_TIMEOUT_MS = 120_000;
+// Bulk exports stream to R2 and can legitimately spend longer in a remote
+// GROUP BY than inline queries. Keep this in sync with db-query-compat.ts and
+// db-query-service.ts: the Worker assigns 300s to export requests, while the
+// Python helper's 330s is only the outer HTTP transport wait.
+export const MAX_EXPORT_TIMEOUT_MS = 300_000;
+// Backward-compatible aggregate bound for callers/tests that imported the old
+// single maximum. Request validation below still keeps inline queries at 120s.
+export const MAX_TIMEOUT_MS = MAX_EXPORT_TIMEOUT_MS;
 export const DEFAULT_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 export const MAX_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 // "prefer" (mysql semantics): try TLS, fall back to plaintext when the server
@@ -279,9 +287,10 @@ export function validateQueryRequest(body) {
   if (rowLimit !== null && (!Number.isInteger(rowLimit) || rowLimit < 1 || rowLimit > MAX_ROW_LIMIT)) {
     fail(`rowLimit must be null (uncapped) or an integer in 1-${MAX_ROW_LIMIT}`);
   }
-  const timeoutMs = body.timeoutMs ?? (op === "export" ? MAX_TIMEOUT_MS : DEFAULT_TIMEOUT_MS);
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > MAX_TIMEOUT_MS) {
-    fail(`timeoutMs must be an integer in 1000-${MAX_TIMEOUT_MS}`);
+  const maxTimeoutMs = op === "export" ? MAX_EXPORT_TIMEOUT_MS : MAX_QUERY_TIMEOUT_MS;
+  const timeoutMs = body.timeoutMs ?? (op === "export" ? MAX_EXPORT_TIMEOUT_MS : DEFAULT_TIMEOUT_MS);
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > maxTimeoutMs) {
+    fail(`timeoutMs must be an integer in 1000-${maxTimeoutMs}`);
   }
   const maxResponseBytes = body.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
   if (!Number.isInteger(maxResponseBytes) || maxResponseBytes < 1 || maxResponseBytes > MAX_MAX_RESPONSE_BYTES) {

@@ -16,6 +16,8 @@ import {
   DEFAULT_ROW_LIMIT,
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
+  MAX_QUERY_TIMEOUT_MS,
+  MAX_EXPORT_TIMEOUT_MS,
   DEFAULT_MAX_RESPONSE_BYTES,
   PARQUET_KIND,
 } from '../workers/main/db-query-sandbox-assets/runner/db-query-runner.mjs';
@@ -259,8 +261,21 @@ describe('validateQueryRequest', () => {
   it('export op is read-only and defaults to the max timeout', () => {
     const request = validateQueryRequest({ ...validBody(), op: 'export' });
     expect(request.op).toBe('export');
-    expect(request.timeoutMs).toBe(MAX_TIMEOUT_MS);
+    expect(request.timeoutMs).toBe(MAX_EXPORT_TIMEOUT_MS);
+    expect(MAX_TIMEOUT_MS).toBe(MAX_EXPORT_TIMEOUT_MS);
     expect(() => validateQueryRequest({ ...validBody(), op: 'export', mode: 'modify' })).toThrow(/read-only/);
+  });
+
+  it('allows five-minute exports while keeping inline queries capped at two minutes', () => {
+    expect(validateQueryRequest({
+      ...validBody(),
+      op: 'export',
+      timeoutMs: MAX_EXPORT_TIMEOUT_MS,
+    }).timeoutMs).toBe(300_000);
+    expect(() => validateQueryRequest({
+      ...validBody(),
+      timeoutMs: MAX_QUERY_TIMEOUT_MS + 1,
+    })).toThrow(`1000-${MAX_QUERY_TIMEOUT_MS}`);
   });
 
   it.each([

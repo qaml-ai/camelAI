@@ -49,6 +49,54 @@ function runPython(script: string) {
 }
 
 describeIfPython('camelai Python helpers', () => {
+  it('uses an export-safe RPC timeout and supports a per-call override', () => {
+    const result = runPython(`
+import json
+import os
+from unittest.mock import patch
+
+os.environ["CAMELAI_CONNECTIONS_RPC_URL"] = "http://connections.internal/"
+from camelai import connections
+
+timeouts = []
+
+
+class Response:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def read(self):
+        return json.dumps({"ok": True, "result": {"ok": True}}).encode("utf-8")
+
+
+def fake_urlopen(request, timeout):
+    timeouts.append(timeout)
+    return Response()
+
+
+with patch("urllib.request.urlopen", fake_urlopen):
+    connections.rpc("methods")
+    connections.invoke("db", "export", {}, timeout_seconds=42)
+
+assert timeouts == [330, 42], timeouts
+
+try:
+    connections.rpc("methods", timeout_seconds=0)
+except ValueError as error:
+    assert "positive number" in str(error)
+else:
+    raise SystemExit("expected timeout validation error")
+
+print("TIMEOUTS OK")
+`);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('TIMEOUTS OK');
+  });
+
   it('extracts rows from every connection result shape', () => {
     const result = runPython(`
 import json

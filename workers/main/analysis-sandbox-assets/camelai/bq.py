@@ -54,18 +54,26 @@ def _payload(result):
     return result
 
 
-def _call(method, **input_kwargs):
+def _call(method, timeout_seconds=None, **input_kwargs):
     global _CONNECTION_ID
     args = {key: value for key, value in input_kwargs.items() if value is not None}
     try:
-        return _payload(connections.invoke(_connection(), method, args))
+        return _payload(
+            connections.invoke(
+                _connection(), method, args, timeout_seconds=timeout_seconds
+            )
+        )
     except connections.ConnectionsRpcError as error:
         # Cached id no longer resolves (connection re-created mid-session):
         # drop the cache and retry once with a fresh lookup.
         if "No connected integration matched" not in str(error):
             raise
         _CONNECTION_ID = None
-        return _payload(connections.invoke(_connection(), method, args))
+        return _payload(
+            connections.invoke(
+                _connection(), method, args, timeout_seconds=timeout_seconds
+            )
+        )
 
 
 def query_rows(sql, max_results=None, maximum_bytes_billed=None, dataset_id=None, timeout_ms=None):
@@ -109,14 +117,29 @@ def query(sql, max_results=1000, maximum_bytes_billed=None, dataset_id=None, tim
     return _coerce_types(df, schema)
 
 
-def query_full(sql, maximum_bytes_billed=None, dataset_id=None):
+def query_full(
+    sql,
+    maximum_bytes_billed=None,
+    dataset_id=None,
+    timeout_seconds=None,
+):
     """Uncapped query: export the full result to R2 and read it with DuckDB."""
     return connections.read_export(
-        export(sql, maximum_bytes_billed=maximum_bytes_billed, dataset_id=dataset_id)
+        export(
+            sql,
+            maximum_bytes_billed=maximum_bytes_billed,
+            dataset_id=dataset_id,
+            timeout_seconds=timeout_seconds,
+        )
     )
 
 
-def export(sql, maximum_bytes_billed=None, dataset_id=None):
+def export(
+    sql,
+    maximum_bytes_billed=None,
+    dataset_id=None,
+    timeout_seconds=None,
+):
     """Export the FULL query result to R2 as NDJSON.
 
     Returns {r2_key, path, rows, columns}; read ``path`` with DuckDB's
@@ -127,6 +150,7 @@ def export(sql, maximum_bytes_billed=None, dataset_id=None):
         query=sql,
         maximumBytesBilled=maximum_bytes_billed,
         datasetId=dataset_id,
+        timeout_seconds=timeout_seconds,
     )
     if not isinstance(result, dict) or not result.get("r2_key"):
         raise connections.ConnectionsRpcError(

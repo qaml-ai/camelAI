@@ -24,7 +24,11 @@ __all__ = [
     "query_full",
 ]
 
-_TIMEOUT_SECONDS = 120
+# Bulk exports can legitimately use the Worker-side five-minute query budget.
+# Keep the client just beyond that budget while still below the analysis tool's
+# default execution deadline, so the server can return its own useful timeout
+# instead of urllib cutting the request off first.
+_DEFAULT_TIMEOUT_SECONDS = 330
 
 # Keys that hold a row list (or nest one) across the connection method result
 # shapes: DATA_PROXY-style {ok, data: {recordset|rows}}, broker results with
@@ -46,12 +50,18 @@ def _endpoint():
     return url
 
 
-def rpc(action, **params):
+def rpc(action, timeout_seconds=None, **params):
     """POST one RPC action and return its unwrapped ``result``.
 
     Raises ConnectionsRpcError with the server's message (including hints such
     as candidate connections on an ambiguous ``find``) on any failure.
     """
+    request_timeout = (
+        _DEFAULT_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    )
+    if not isinstance(request_timeout, (int, float)) or request_timeout <= 0:
+        raise ValueError("timeout_seconds must be a positive number")
+
     payload = {"action": action, **params}
     request = urllib.request.Request(
         _endpoint(),
@@ -60,7 +70,7 @@ def rpc(action, **params):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=request_timeout) as response:
             raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as error:
         raw = error.read().decode("utf-8", errors="replace")
@@ -105,7 +115,7 @@ def find(query):
     return rpc("find", query=query)
 
 
-def invoke(connection, method, input=None):
+def invoke(connection, method, input=None, timeout_seconds=None):
     """Invoke a connection method and return the raw (unparsed) result.
 
     ``connection`` may be an id, alias, name, or type — resolution happens
@@ -113,7 +123,13 @@ def invoke(connection, method, input=None):
     says which call failed, not just why.
     """
     try:
-        return rpc("invoke", connection=connection, method=method, input=input or {})
+        return rpc(
+            "invoke",
+            connection=connection,
+            method=method,
+            input=input or {},
+            timeout_seconds=timeout_seconds,
+        )
     except ConnectionsRpcError as error:
         raise ConnectionsRpcError(
             "invoke %r on connection %r failed: %s" % (method, connection, error)
@@ -182,14 +198,19 @@ def query(connection, sql, method="query", **input_kwargs):
     return pd.DataFrame(query_rows(connection, sql, method=method, **input_kwargs))
 
 
-def export(connection, sql, **input_kwargs):
+def export(connection, sql, timeout_seconds=None, **input_kwargs):
     """Export a query's FULL result to R2 (no row cap).
 
     Returns the export result with the in-container read ``path`` added
     (exports are mounted read-only at ``'/' + r2_key``). SQL databases and
     ClickHouse export Parquet; BigQuery exports NDJSON.
     """
-    result = invoke(connection, "export", {"query": sql, **input_kwargs})
+    result = invoke(
+        connection,
+        "export",
+        {"query": sql, **input_kwargs},
+        timeout_seconds=timeout_seconds,
+    )
     if not isinstance(result, dict) or not result.get("r2_key"):
         raise ConnectionsRpcError(
             "export did not return an r2_key. This connection may not be exportable; "
@@ -217,6 +238,8 @@ def read_export(export_result):
     return duckdb.sql("SELECT * FROM %s(?)" % reader, params=[path]).df()
 
 
-def query_full(connection, sql, **input_kwargs):
+def query_full(connection, sql, timeout_seconds=None, **input_kwargs):
     """Uncapped query: export the full result to R2, read it back with DuckDB."""
-    return read_export(export(connection, sql, **input_kwargs))
+    return read_export(
+        export(connection, sql, timeout_seconds=timeout_seconds, **input_kwargs)
+    )

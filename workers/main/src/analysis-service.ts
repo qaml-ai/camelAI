@@ -90,7 +90,9 @@ export const ANALYSIS_PYTHONPATH = "/opt/camelai-python";
  */
 export const ANALYSIS_DEFAULT_NOTEBOOK_TIMEOUT_MS = 300_000;
 export const ANALYSIS_MAX_NOTEBOOK_TIMEOUT_MS = 900_000;
-export const ANALYSIS_DEFAULT_EXEC_TIMEOUT_MS = 300_000;
+// Long connection exports have a five-minute server budget. Leave enough room
+// for the request plus local DuckDB materialization in run_code/analysis_exec.
+export const ANALYSIS_DEFAULT_EXEC_TIMEOUT_MS = 360_000;
 export const ANALYSIS_DEFAULT_DEP_TIMEOUT_MS = 300_000;
 /** Fixed budget for the post-execution notebook validator leg. */
 export const ANALYSIS_NOTEBOOK_VALIDATE_TIMEOUT_MS = 60_000;

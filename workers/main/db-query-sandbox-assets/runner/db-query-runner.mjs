@@ -953,6 +953,50 @@ async function exportPostgres(socket, request, sink) {
   }
 }
 
+/**
+ * Consume mysql2's supported Readable stream surface with bounded buffering.
+ *
+ * The old manual `query.on("result")` + `connection.pause()/resume()` loop can
+ * lose its resume while another async sink operation is pending. The query
+ * then remains paused until the outer 120s database deadline destroys its
+ * socket (surfacing as the misleading `shutdown EINVAL`). mysql2's Readable
+ * owns that backpressure state and resumes from `_read`, so use it directly.
+ */
+export async function streamMysqlRows(raw, request, sink) {
+  const query = raw.query({
+    sql: request.sql,
+    values: request.params,
+    timeout: request.timeoutMs,
+  });
+  const stream = query.stream({ objectMode: true, highWaterMark: 16 });
+  let streamError;
+  const rememberError = (error) => {
+    streamError = error;
+  };
+  // Keep an error listener installed while sink.start awaits the mounted file;
+  // the async iterator attaches its own listener only once iteration begins.
+  stream.on("error", rememberError);
+  try {
+    const columns = await new Promise((resolve, reject) => {
+      stream.once("fields", resolve);
+      stream.once("error", reject);
+      stream.once("end", () => reject(new Error("export query returned no result set")));
+    });
+    await sink.start(
+      (columns ?? []).map((column) => ({
+        name: column.name,
+        kind: parquetKindForMysql(column.type ?? column.columnType, column.flags ?? 0),
+      })),
+    );
+    if (streamError) throw streamError;
+    for await (const record of stream) {
+      await sink.append(record);
+    }
+  } finally {
+    stream.off("error", rememberError);
+  }
+}
+
 async function exportMysql(socket, request, relay, sink) {
   let connection;
   try {
@@ -963,36 +1007,12 @@ async function exportMysql(socket, request, relay, sink) {
     connection = await connectMysql(socket, request, true /* plaintext */);
   }
   // The promise wrapper is fine for the tx statements; row streaming uses the
-  // underlying callback connection's event API so we can pause for backpressure.
+  // underlying callback connection's Readable surface for backpressure.
   const raw = connection.connection;
   try {
     await beginMysqlReadTransaction((sql) => connection.query(sql));
     try {
-      await new Promise((resolve, reject) => {
-        const query = raw.query({ sql: request.sql, values: request.params, timeout: request.timeoutMs });
-        let pending = Promise.resolve();
-        query.on("fields", (columns) => {
-          pending = pending.then(() =>
-            sink.start(
-              (columns ?? []).map((column) => ({
-                name: column.name,
-                kind: parquetKindForMysql(column.type ?? column.columnType, column.flags ?? 0),
-              })),
-            ),
-          );
-        });
-        query.on("result", (record) => {
-          raw.pause();
-          pending = pending
-            .then(() => sink.append(record))
-            .then(() => raw.resume())
-            .catch(reject);
-        });
-        query.on("error", reject);
-        query.on("end", () => {
-          pending.then(resolve, reject);
-        });
-      });
+      await streamMysqlRows(raw, request, sink);
     } finally {
       await connection.query("ROLLBACK").catch(() => {});
     }

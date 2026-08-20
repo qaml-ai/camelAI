@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { Readable } from 'node:stream';
+import { describe, it, expect, vi } from 'vitest';
 import {
   blockedAddressReason,
   blockedHostnameReason,
@@ -9,12 +10,42 @@ import {
   parquetKindForMysql,
   parquetKindForMssql,
   parquetValueFor,
+  streamMysqlRows,
   DEFAULT_ROW_LIMIT,
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
   DEFAULT_MAX_RESPONSE_BYTES,
   PARQUET_KIND,
 } from '../workers/main/db-query-sandbox-assets/runner/db-query-runner.mjs';
+
+describe('MySQL export streaming', () => {
+  it('uses the Readable stream to apply backpressure and drains every row', async () => {
+    const stream = new Readable({ objectMode: true, read() {} });
+    const query = { stream: vi.fn(() => stream) };
+    const raw = { query: vi.fn(() => query) };
+    const appended: unknown[] = [];
+    const sink = {
+      start: vi.fn(async () => {}),
+      append: vi.fn(async (row: unknown) => {
+        appended.push(row);
+      }),
+    };
+    const request = { sql: 'SELECT 1', params: undefined, timeoutMs: 120_000 };
+
+    const running = streamMysqlRows(raw, request, sink);
+    queueMicrotask(() => {
+      stream.emit('fields', [{ name: 'smoke_value', type: 3, flags: 0 }]);
+      stream.push({ smoke_value: 1 });
+      stream.push({ smoke_value: 2 });
+      stream.push(null);
+    });
+
+    await expect(running).resolves.toBeUndefined();
+    expect(query.stream).toHaveBeenCalledWith({ objectMode: true, highWaterMark: 16 });
+    expect(sink.start).toHaveBeenCalledTimes(1);
+    expect(appended).toEqual([{ smoke_value: 1 }, { smoke_value: 2 }]);
+  });
+});
 
 // The runner's client-side SSRF guard is the primary destination filter for
 // the static-IP db egress relay (the VM-side gost bypass list is the same

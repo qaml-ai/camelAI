@@ -913,13 +913,27 @@ async function createParquetSink(path) {
     async close() {
       if (!writer) throw Object.assign(new Error("export query returned no result set"), { status: 400 });
       await writer.close(); // footer + s3fs upload of the staged file
-      const stat = await fs.stat(path);
-      return { rowCount, bytes: stat.size };
+      // A successful close on the credential-less R2 FUSE mount can upload and
+      // immediately evict the local directory entry. Treat that post-close
+      // ENOENT as an unknown byte count instead of aborting (and unlinking) an
+      // object that is already in R2. The Worker HEAD-verifies the key before
+      // reporting export success, so 0 is only metadata — never proof of write.
+      const bytes = await exportFileSizeAfterClose(path, (target) => fs.stat(target));
+      return { rowCount, bytes };
     },
     async abort() {
       await fs.unlink(path).catch(() => {});
     },
   };
+}
+
+export async function exportFileSizeAfterClose(path, stat) {
+  try {
+    return (await stat(path)).size;
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") return 0;
+    throw error;
+  }
 }
 
 async function exportPostgres(socket, request, sink) {

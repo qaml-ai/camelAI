@@ -10,6 +10,7 @@ import {
   parquetKindForMysql,
   parquetKindForMssql,
   parquetValueFor,
+  exportFileSizeAfterClose,
   streamMysqlRows,
   DEFAULT_ROW_LIMIT,
   DEFAULT_TIMEOUT_MS,
@@ -17,6 +18,18 @@ import {
   DEFAULT_MAX_RESPONSE_BYTES,
   PARQUET_KIND,
 } from '../workers/main/db-query-sandbox-assets/runner/db-query-runner.mjs';
+
+describe('Parquet export finalization', () => {
+  it('tolerates an R2 mount evicting the local file after a successful close', async () => {
+    await expect(exportFileSizeAfterClose('/warehouse/export.parquet', async () => {
+      throw Object.assign(new Error('missing after upload'), { code: 'ENOENT' });
+    })).resolves.toBe(0);
+
+    await expect(exportFileSizeAfterClose('/warehouse/export.parquet', async () => {
+      throw Object.assign(new Error('I/O failure'), { code: 'EIO' });
+    })).rejects.toMatchObject({ code: 'EIO' });
+  });
+});
 
 describe('MySQL export streaming', () => {
   it('uses the Readable stream to apply backpressure and drains every row', async () => {

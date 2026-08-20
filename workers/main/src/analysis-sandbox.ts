@@ -232,7 +232,7 @@ export async function mountOrRecover(
   }
 }
 
-/** True when `ls` against the mount path succeeds without an I/O error. */
+/** True when listing the mount's contents succeeds without an I/O error. */
 export async function mountAllowsList(
   target: Pick<MountRecoverTarget, "exec">,
   mountPath: string,
@@ -240,7 +240,11 @@ export async function mountAllowsList(
   // Mount paths are platform-controlled (`/uploads`, `/outputs`, `/warehouse/<uuid>`).
   if (!/^\/[A-Za-z0-9._/-]+$/.test(mountPath) || mountPath.includes("..")) return false;
   try {
-    const result = await target.exec(`ls -ld -- ${mountPath}`, { timeout: 15_000 });
+    // `ls -ld <mountpoint>` only stats the mountpoint entry in its parent. A
+    // dead s3fs mount can satisfy that stat while any traversal of the mounted
+    // directory fails with EIO. Force a readdir so the probe exercises the
+    // FUSE connection the upcoming analysis code actually depends on.
+    const result = await target.exec(`ls -la -- ${mountPath} >/dev/null`, { timeout: 15_000 });
     if ((result.exitCode ?? 1) !== 0) return false;
     const combined = `${result.stderr ?? ""}\n${result.stdout ?? ""}`;
     if (/Input\/output error|Errno 5/i.test(combined)) return false;

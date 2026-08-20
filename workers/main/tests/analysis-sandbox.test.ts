@@ -323,7 +323,7 @@ describe('AnalysisSandbox zombie self-heal', () => {
       { readOnly: true },
     );
 
-    expect(sandbox.exec).toHaveBeenCalledWith('ls -ld -- /uploads', { timeout: 15_000 });
+    expect(sandbox.exec).toHaveBeenCalledWith('ls -la -- /uploads >/dev/null', { timeout: 15_000 });
     expect(sandbox.mountBucket).toHaveBeenCalledTimes(2);
   });
 
@@ -560,6 +560,15 @@ describe('mountAllowsList', () => {
         '/uploads',
       ),
     ).toBe(false);
+  });
+
+  it('traverses the mounted directory instead of only statting its mountpoint', async () => {
+    const exec = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }));
+    await expect(mountAllowsList({ exec }, '/warehouse/ws-1')).resolves.toBe(true);
+    expect(exec).toHaveBeenCalledWith(
+      'ls -la -- /warehouse/ws-1 >/dev/null',
+      { timeout: 15_000 },
+    );
   });
 });
 

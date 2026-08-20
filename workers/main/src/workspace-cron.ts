@@ -39,10 +39,12 @@ import {
 } from "./model-picker-config-reader";
 
 const MAX_DUE_JOBS_PER_ALARM = 20;
+/** Avoid hot-looping schedules that remain blocked by a billing-policy mismatch. */
+const BILLING_BLOCK_RECHECK_MS = 6 * 60 * 60 * 1000;
 const WORKSPACE_ID_KEY = "workspaceId";
 const AUTOMATION_WORKFLOW_BINDING = "DETERMINISTIC_AUTOMATION_WORKFLOWS";
-const SCHEDULE_DISABLED_BY_BILLING_PREFIX =
-  "Schedule disabled by billing plan:";
+const SCHEDULE_BLOCKED_BY_BILLING_PREFIX =
+  "Schedule blocked by billing plan:";
 
 function formatInterval(ms: number): string {
   if (ms % (24 * 60 * 60 * 1000) === 0) {
@@ -944,14 +946,14 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     );
   }
 
-  private formatScheduleDisabledByBillingMessage(message: string): string {
-    return `${SCHEDULE_DISABLED_BY_BILLING_PREFIX} ${message}`;
+  private formatScheduleBlockedByBillingMessage(message: string): string {
+    return `${SCHEDULE_BLOCKED_BY_BILLING_PREFIX} ${message}`;
   }
 
-  private isScheduleDisabledByBillingMessage(
+  private isScheduleBlockedByBillingMessage(
     message: string | null | undefined,
   ): boolean {
-    return Boolean(message?.startsWith(SCHEDULE_DISABLED_BY_BILLING_PREFIX));
+    return Boolean(message?.startsWith(SCHEDULE_BLOCKED_BY_BILLING_PREFIX));
   }
 
   private async resolveDefaultThreadModel(
@@ -1188,6 +1190,7 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
           workspaceId: workspace.id,
           automationId: prompt.id,
           runId,
+          requiresExplicitOutcome: true,
         },
       });
       switch (payload.status) {
@@ -1855,6 +1858,11 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     return true;
   }
 
+  /**
+   * Explicit workspace teardown only. Runtime/dispatch failures must never call
+   * this method: `enabled` records owner intent and may only be cleared by an
+   * owner edit or an explicit workspace archive/delete path.
+   */
   async disableAllScheduledPrompts(
     workspaceId: string,
     reason = "disabled",
@@ -1924,10 +1932,16 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     ) {
       nextRunAt = getNextCronRunAt(existing.cron_expression, runStartedAt);
     }
-    const enabledAfterRun = existing.enabled && !scheduleDisableReason;
+    const enabledAfterRun = existing.enabled;
     const billingDisabledMessage = scheduleDisableReason
-      ? this.formatScheduleDisabledByBillingMessage(scheduleDisableReason)
+      ? this.formatScheduleBlockedByBillingMessage(scheduleDisableReason)
       : null;
+    if (existing.enabled && scheduleDisableReason) {
+      nextRunAt = getNextCronRunAt(
+        existing.cron_expression,
+        runStartedAt + BILLING_BLOCK_RECHECK_MS,
+      );
+    }
 
     this.sql.exec(
       `UPDATE scheduled_prompts
@@ -1986,10 +2000,16 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     ) {
       nextRunAt = getNextCronRunAt(existing.cron_expression, runStartedAt);
     }
-    const enabledAfterRun = existing.enabled && !scheduleDisableReason;
+    const enabledAfterRun = existing.enabled;
     const billingDisabledMessage = scheduleDisableReason
-      ? this.formatScheduleDisabledByBillingMessage(scheduleDisableReason)
+      ? this.formatScheduleBlockedByBillingMessage(scheduleDisableReason)
       : null;
+    if (existing.enabled && scheduleDisableReason) {
+      nextRunAt = getNextCronRunAt(
+        existing.cron_expression,
+        runStartedAt + BILLING_BLOCK_RECHECK_MS,
+      );
+    }
 
     let dispatch: DeterministicAutomationDispatchResult;
     if (!this.env.DETERMINISTIC_AUTOMATION_WORKFLOWS) {
@@ -2136,9 +2156,8 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     const currentPrompt = this.getPromptRow(promptId);
     const preserveBillingDisabledSummary =
       input.status === "success" &&
-      currentPrompt?.enabled === 0 &&
-      currentPrompt.last_run_status === "error" &&
-      this.isScheduleDisabledByBillingMessage(currentPrompt.last_run_error);
+      currentPrompt?.last_run_status === "error" &&
+      this.isScheduleBlockedByBillingMessage(currentPrompt.last_run_error);
     if (preserveBillingDisabledSummary) {
       this.sql.exec(
         `UPDATE scheduled_prompts
@@ -2201,9 +2220,8 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     const currentAutomation = this.getAutomationRow(automationId);
     const preserveBillingDisabledSummary =
       input.status === "success" &&
-      currentAutomation?.enabled === 0 &&
-      currentAutomation.last_run_status === "error" &&
-      this.isScheduleDisabledByBillingMessage(
+      currentAutomation?.last_run_status === "error" &&
+      this.isScheduleBlockedByBillingMessage(
         currentAutomation.last_run_error,
       );
 
@@ -2240,8 +2258,7 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
   /**
    * Whether any scheduled prompt or deterministic automation is actually due as
    * of `now`. Used so a spurious early alarm (or race after another writer
-   * advanced next_run_at) never takes the destructive "workspace unavailable"
-   * disable path on a transient failure.
+   * advanced next_run_at) does not record a failed run before its due time.
    */
   private hasDueScheduledWork(now: number): boolean {
     const row = this.sql
@@ -2258,6 +2275,94 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     return (row?.due_count ?? 0) > 0;
   }
 
+  /**
+   * Record one failed attempt for every currently-due job while preserving the
+   * owner's enabled state. Advancing each cron is essential: leaving a due
+   * `next_run_at` behind would re-arm the DO alarm every second and turn one
+   * transient WorkspaceDO lookup failure into a hot loop.
+   */
+  private async recordDueWorkspaceUnavailable(
+    now: number,
+    message = "workspace_unavailable",
+  ): Promise<void> {
+    const duePrompts = this.sql
+      .exec(
+        `SELECT * FROM scheduled_prompts
+         WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?
+         ORDER BY next_run_at ASC
+         LIMIT ?`,
+        now,
+        MAX_DUE_JOBS_PER_ALARM,
+      )
+      .toArray() as unknown as ScheduledPromptRow[];
+    for (const row of duePrompts) {
+      const runId = crypto.randomUUID();
+      const scheduledFor = row.next_run_at ?? now;
+      const nextRunAt = getNextCronRunAt(row.cron_expression, now);
+      this.insertAutomationRun({
+        id: runId,
+        kind: "scheduled_prompt",
+        automationId: row.id,
+        trigger: "schedule",
+        status: "error",
+        startedAt: scheduledFor,
+        completedAt: now,
+        message,
+        threadId: row.thread_id,
+      });
+      this.sql.exec(
+        `UPDATE scheduled_prompts
+         SET updated_at = ?, next_run_at = ?, last_run_at = ?, last_run_id = ?,
+             last_run_status = 'error', last_run_error = ?, run_count = run_count + 1
+         WHERE id = ? AND enabled = 1`,
+        now,
+        nextRunAt,
+        now,
+        runId,
+        message,
+        row.id,
+      );
+    }
+
+    const dueAutomations = this.sql
+      .exec(
+        `SELECT * FROM deterministic_automations
+         WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?
+         ORDER BY next_run_at ASC
+         LIMIT ?`,
+        now,
+        MAX_DUE_JOBS_PER_ALARM,
+      )
+      .toArray() as unknown as DeterministicAutomationRow[];
+    for (const row of dueAutomations) {
+      const scheduledFor = row.next_run_at ?? now;
+      const nextRunAt = getNextCronRunAt(row.cron_expression, now);
+      this.insertAutomationRun({
+        id: crypto.randomUUID(),
+        kind: "deterministic_automation",
+        automationId: row.id,
+        trigger: "schedule",
+        status: "error",
+        startedAt: scheduledFor,
+        completedAt: now,
+        message,
+      });
+      this.sql.exec(
+        `UPDATE deterministic_automations
+         SET updated_at = ?, next_run_at = ?, last_run_at = ?, last_run_status = 'error',
+             last_run_error = ?, last_instance_id = NULL, run_count = run_count + 1
+         WHERE id = ? AND enabled = 1`,
+        now,
+        nextRunAt,
+        now,
+        message,
+        row.id,
+      );
+    }
+
+    await this.scheduleNextAlarm();
+  }
+
   async alarm(): Promise<void> {
     const workspaceId = this.getStoredWorkspaceId();
     if (!workspaceId) {
@@ -2266,8 +2371,8 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     }
 
     const now = Date.now();
-    // Only a wake with actually-due work may take the destructive disable path
-    // below; a spurious early alarm must not tear down future schedules.
+    // Only a wake with actually-due work should record a failed attempt;
+    // a spurious early alarm must not change future schedules.
     const hasDueWork = this.hasDueScheduledWork(now);
 
     let workspace: WorkspaceInfo;
@@ -2280,14 +2385,10 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
         error: error instanceof Error ? error.message : String(error),
       });
       if (hasDueWork) {
-        await this.disableAllScheduledPrompts(
-          workspaceId,
-          "workspace_unavailable",
-        );
+        await this.recordDueWorkspaceUnavailable(now);
         return;
       }
-      // Nothing due yet: don't disable on a transient failure. Re-arm so the
-      // real run time gets its own (destructive-on-failure) attempt.
+      // Nothing due yet: re-arm so the real run time gets its own attempt.
       await this.scheduleNextAlarm();
       return;
     }
@@ -2326,6 +2427,10 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       );
       if (billingViolation) {
         const errorMessage = `Blocked by billing plan: ${billingViolation}`;
+        const nextRunAt = getNextCronRunAt(
+          prompt.cron_expression,
+          runStartedAt + BILLING_BLOCK_RECHECK_MS,
+        );
         this.insertAutomationRun({
           id: runId,
           kind: "scheduled_prompt",
@@ -2338,9 +2443,10 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
         });
         this.sql.exec(
           `UPDATE scheduled_prompts
-           SET updated_at = ?, enabled = 0, next_run_at = NULL, last_run_at = ?, last_run_id = ?, last_run_status = ?, last_run_error = ?, run_count = run_count + 1
+           SET updated_at = ?, next_run_at = ?, last_run_at = ?, last_run_id = ?, last_run_status = ?, last_run_error = ?, run_count = run_count + 1
            WHERE id = ?`,
           Date.now(),
+          nextRunAt,
           runStartedAt,
           runId,
           "error",
@@ -2412,6 +2518,10 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
 
       if (billingViolation) {
         const errorMessage = `Blocked by billing plan: ${billingViolation}`;
+        const nextRunAt = getNextCronRunAt(
+          automation.cron_expression,
+          runStartedAt + BILLING_BLOCK_RECHECK_MS,
+        );
         this.insertAutomationRun({
           id: crypto.randomUUID(),
           kind: "deterministic_automation",
@@ -2424,9 +2534,10 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
         });
         this.sql.exec(
           `UPDATE deterministic_automations
-           SET updated_at = ?, enabled = 0, next_run_at = NULL, last_run_at = ?, last_run_status = ?, last_run_error = ?, last_instance_id = NULL, run_count = run_count + 1
+           SET updated_at = ?, next_run_at = ?, last_run_at = ?, last_run_status = ?, last_run_error = ?, last_instance_id = NULL, run_count = run_count + 1
            WHERE id = ?`,
           Date.now(),
+          nextRunAt,
           runStartedAt,
           "error",
           errorMessage,

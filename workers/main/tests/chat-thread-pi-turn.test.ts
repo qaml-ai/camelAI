@@ -5458,6 +5458,55 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(containerTool).not.toHaveBeenCalled();
   });
 
+  it('adds an explicit scheduled-automation outcome tool only to the root agent', async () => {
+    const fake = Object.create(ChatThreadDO.prototype) as any;
+    fake.ctx = {
+      exports: {
+        CodeModeToolsBinding: vi.fn(() => ({ callTool: vi.fn() })),
+      },
+    };
+    fake.activeAutomationRun = {
+      workspaceId: 'workspace1',
+      automationId: 'prompt1',
+      runId: 'run1',
+      requiresExplicitOutcome: true,
+    };
+    fake.setActiveAutomationRun = vi.fn((value) => {
+      fake.activeAutomationRun = value;
+    });
+    const context = {
+      orgId: 'org1',
+      workspaceId: 'workspace1',
+      threadId: 'thread1',
+    };
+
+    const rootTools = ChatThreadDO.prototype['createPiToolDefinitions'].call(fake, context);
+    const outcomeTool = rootTools.find((tool: any) => tool.name === 'report_automation_outcome');
+    expect(outcomeTool).toBeDefined();
+    await outcomeTool.execute('outcome-1', {
+      status: 'success',
+      summary: '  Export and readback verified.  ',
+    });
+    expect(fake.setActiveAutomationRun).toHaveBeenCalledWith({
+      ...fake.activeAutomationRun,
+      reportedOutcome: {
+        status: 'success',
+        summary: 'Export and readback verified.',
+      },
+    });
+
+    fake.activeAutomationRun = {
+      workspaceId: 'workspace1',
+      automationId: 'prompt1',
+      runId: 'run2',
+      requiresExplicitOutcome: true,
+    };
+    const childTools = ChatThreadDO.prototype['createPiToolDefinitions'].call(fake, context, {
+      includeSubagents: false,
+    });
+    expect(childTools.some((tool: any) => tool.name === 'report_automation_outcome')).toBe(false);
+  });
+
   it('does not dispatch a file edit after its tool signal is aborted', async () => {
     const callTool = vi.fn(async () => ({ text: 'edited' }));
     const fake = Object.create(ChatThreadDO.prototype) as any;

@@ -443,6 +443,83 @@ describe("ChatThreadDO completion summaries", () => {
     expect(fake.activeAutomationRun).toBe(activeAutomationRun);
   });
 
+  it("records success only when an explicit automation outcome reports success", async () => {
+    const { fake, waitUntilPromises } = createFakeThread();
+    fake.activeAutomationRun = {
+      workspaceId: "workspace1",
+      automationId: "prompt1",
+      runId: "run1",
+      requiresExplicitOutcome: true,
+      reportedOutcome: {
+        status: "success",
+        summary: "Both exports were read back and verified.",
+      },
+    };
+    fake.updateActiveAutomationRun = vi.fn();
+
+    ChatThreadDO.prototype["finishTurn"].call(fake, {
+      markUnread: true,
+      completedAt: 123,
+      summarySource: null,
+    });
+    await Promise.all(waitUntilPromises);
+
+    expect(fake.updateActiveAutomationRun).toHaveBeenCalledWith({
+      status: "success",
+      message: "Both exports were read back and verified.",
+      completedAt: 123,
+      clear: true,
+    });
+  });
+
+  it("records a scheduled run as failed when an explicit outcome is missing or non-success", async () => {
+    const { fake, waitUntilPromises } = createFakeThread();
+    fake.updateActiveAutomationRun = vi.fn();
+    fake.activeAutomationRun = {
+      workspaceId: "workspace1",
+      automationId: "prompt1",
+      runId: "run1",
+      requiresExplicitOutcome: true,
+    };
+
+    ChatThreadDO.prototype["finishTurn"].call(fake, {
+      markUnread: true,
+      completedAt: 123,
+      summarySource: null,
+    });
+    await Promise.all(waitUntilPromises);
+    expect(fake.updateActiveAutomationRun).toHaveBeenLastCalledWith({
+      status: "error",
+      message: "Automation completed without explicitly reporting an outcome",
+      completedAt: 123,
+      clear: true,
+    });
+
+    fake.assistantCompletionRecordedAt = null;
+    fake.activeAutomationRun = {
+      workspaceId: "workspace1",
+      automationId: "prompt1",
+      runId: "run2",
+      requiresExplicitOutcome: true,
+      reportedOutcome: {
+        status: "partial",
+        summary: "The database export worked, but readback failed.",
+      },
+    };
+    ChatThreadDO.prototype["finishTurn"].call(fake, {
+      markUnread: true,
+      completedAt: 456,
+      summarySource: null,
+    });
+    await Promise.all(waitUntilPromises);
+    expect(fake.updateActiveAutomationRun).toHaveBeenLastCalledWith({
+      status: "error",
+      message: "[partial] The database export worked, but readback failed.",
+      completedAt: 456,
+      clear: true,
+    });
+  });
+
   it("reuses one WorkspaceDO stub for ordered status writes", async () => {
     const { fake, waitUntilPromises } = createFakeThread();
 

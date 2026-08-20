@@ -3,6 +3,7 @@ import { Sandbox } from "@cloudflare/sandbox";
 import {
   createSingleFlight,
   ensureLocalMountAlias,
+  mountAllowsList,
   mountOrRecover,
   sandboxR2MountPath,
   sandboxR2MountOptions,
@@ -62,6 +63,22 @@ export class DbQuerySandbox extends Sandbox<Env> {
   // DO — not a module-level cache — so nothing leaks across containers.
   private mountedPaths = new Set<string>();
   private mountGates = new Map<string, (run: () => Promise<void>) => Promise<void>>();
+  /** Container generation described by the mount bookkeeping above. */
+  private mountedContainerGeneration: number | undefined;
+
+  private clearMountBookkeeping(): void {
+    this.mountedPaths = new Set<string>();
+    this.mountGates = new Map<string, (run: () => Promise<void>) => Promise<void>>();
+  }
+
+  /** Never reuse a successful mount verdict after the underlying container changed. */
+  private syncMountBookkeepingToContainer(): void {
+    const sdk = this as unknown as { containerGeneration?: number };
+    const generation = typeof sdk.containerGeneration === "number" ? sdk.containerGeneration : 0;
+    if (this.mountedContainerGeneration === generation) return;
+    this.mountedContainerGeneration = generation;
+    this.clearMountBookkeeping();
+  }
 
   /**
    * Container went away: everything mounted into it went with it, and the DO
@@ -71,8 +88,7 @@ export class DbQuerySandbox extends Sandbox<Env> {
    * "succeeds" into a plain directory.
    */
   override async onStop(): Promise<void> {
-    this.mountedPaths = new Set<string>();
-    this.mountGates = new Map<string, (run: () => Promise<void>) => Promise<void>>();
+    this.clearMountBookkeeping();
     await super.onStop();
   }
 
@@ -95,21 +111,27 @@ export class DbQuerySandbox extends Sandbox<Env> {
    */
   async ensureWarehouseExportMount(prefix: string): Promise<void> {
     const mountPath = `/${prefix}`;
-    if (this.mountedPaths.has(mountPath)) return;
+    this.syncMountBookkeepingToContainer();
+    const mountOptions = sandboxR2MountOptions(this.env, {
+      prefix: mountPath,
+      readOnly: false,
+      // Shrink the s3fs stat cache so a re-export of the same key doesn't
+      // read/write through a stale view. Self-host local sync drops this.
+      s3fsOptions: ["stat_cache_expire=1"],
+    });
+    const actualMountPath = sandboxR2MountPath(mountPath, mountOptions);
+    if (this.mountedPaths.has(mountPath)) {
+      if (await mountAllowsList(this, actualMountPath)) return;
+      console.warn(`[db-query] cached R2 mount ${actualMountPath} is unreadable; remounting`);
+      this.mountedPaths.delete(mountPath);
+      this.mountGates.delete(mountPath);
+    }
     let gate = this.mountGates.get(mountPath);
     if (!gate) {
       gate = createSingleFlight();
       this.mountGates.set(mountPath, gate);
     }
     await gate(async () => {
-      const mountOptions = sandboxR2MountOptions(this.env, {
-        prefix: mountPath,
-        readOnly: false,
-        // Shrink the s3fs stat cache so a re-export of the same key doesn't
-        // read/write through a stale view. Self-host local sync drops this.
-        s3fsOptions: ["stat_cache_expire=1"],
-      });
-      const actualMountPath = sandboxR2MountPath(mountPath, mountOptions);
       await mountOrRecover(
         this,
         WAREHOUSE_EXPORT_BUCKET_BINDING,

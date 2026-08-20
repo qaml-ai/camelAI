@@ -635,7 +635,7 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
     expect(pausedAutomation?.next_run_at).toBeNull();
   });
 
-  it('blocks and disables a legacy over-frequent scheduled prompt after downgrade', async () => {
+  it('blocks but preserves a legacy over-frequent scheduled prompt after downgrade', async () => {
     useFixedTime('2030-01-01T00:00:00.000Z');
     const { userId } = await createUser(testEnv, testEmail(), 'password123', 'Legacy Prompt Owner');
     const { org } = await createOrg(testEnv, 'Legacy Prompt Org', userId);
@@ -677,8 +677,8 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
     );
 
     const afterBlock = (await cronStub.listScheduledPrompts(workspaceId!))[0];
-    expect(afterBlock?.enabled).toBe(false);
-    expect(afterBlock?.next_run_at).toBeNull();
+    expect(afterBlock?.enabled).toBe(true);
+    expect(afterBlock?.next_run_at).toBeGreaterThan(created.next_run_at!);
     expect(afterBlock?.last_run_status).toBe('error');
     expect(afterBlock?.last_run_error).toContain('Blocked by billing plan');
 
@@ -692,7 +692,7 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
     expect(runsAfterSecondAlarm.runs).toHaveLength(1);
   });
 
-  it('blocks and disables a legacy over-frequent deterministic workflow after downgrade', async () => {
+  it('blocks but preserves a legacy over-frequent deterministic workflow after downgrade', async () => {
     useFixedTime('2030-01-02T00:00:00.000Z');
     const { userId } = await createUser(testEnv, testEmail(), 'password123', 'Legacy Workflow Owner');
     const { org } = await createOrg(testEnv, 'Legacy Workflow Org', userId);
@@ -735,8 +735,8 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
     );
 
     const afterBlock = (await cronStub.listDeterministicAutomations(workspaceId!))[0];
-    expect(afterBlock?.enabled).toBe(false);
-    expect(afterBlock?.next_run_at).toBeNull();
+    expect(afterBlock?.enabled).toBe(true);
+    expect(afterBlock?.next_run_at).toBeGreaterThan(created.next_run_at!);
     expect(afterBlock?.last_run_status).toBe('error');
     expect(afterBlock?.last_run_error).toContain('Blocked by billing plan');
     expect(afterBlock?.last_instance_id).toBeNull();
@@ -812,8 +812,8 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
 
     const afterBlock = (await cronStub.listDeterministicAutomations(workspaceId!))
       .find((automation) => automation.id === second.id);
-    expect(afterBlock?.enabled).toBe(false);
-    expect(afterBlock?.next_run_at).toBeNull();
+    expect(afterBlock?.enabled).toBe(true);
+    expect(afterBlock?.next_run_at).toBeGreaterThan(second.next_run_at!);
 
     await cronStub.runDueAutomationsForTest(workspaceId!);
     const secondRunsAfterSecondAlarm = await cronStub.listAutomationRunsPage(workspaceId!, {
@@ -824,7 +824,7 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
     expect(secondRunsAfterSecondAlarm.runs).toHaveLength(secondRuns.runs.length);
   });
 
-  it('manual scheduled prompt runs disable noncompliant saved schedules', async () => {
+  it('manual scheduled prompt runs preserve noncompliant saved schedules', async () => {
     useFixedTime('2030-01-05T00:00:00.000Z');
     const { userId } = await createUser(testEnv, testEmail(), 'password123', 'Manual Cadence Owner');
     const { org } = await createOrg(testEnv, 'Manual Cadence Org', userId);
@@ -854,11 +854,11 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
     const run = await cronStub.runScheduledPromptNow(workspaceId!, created.id);
 
     expect(run?.dispatch.thread_id).toBeTypeOf('string');
-    expect(run?.prompt.enabled).toBe(false);
-    expect(run?.prompt.next_run_at).toBeNull();
+    expect(run?.prompt.enabled).toBe(true);
+    expect(run?.prompt.next_run_at).toBeGreaterThan(created.next_run_at!);
     expect(run?.prompt.last_run_status).toBe('error');
     expect(run?.prompt.last_run_error).toContain(
-      'Schedule disabled by billing plan:',
+      'Schedule blocked by billing plan:',
     );
 
     const runsAfterManual = await cronStub.listAutomationRunsPage(workspaceId!, {
@@ -879,11 +879,11 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
 
     const afterCompletion = (await cronStub.listScheduledPrompts(workspaceId!))
       .find((prompt) => prompt.id === created.id);
-    expect(afterCompletion?.enabled).toBe(false);
-    expect(afterCompletion?.next_run_at).toBeNull();
+    expect(afterCompletion?.enabled).toBe(true);
+    expect(afterCompletion?.next_run_at).toBe(run?.prompt.next_run_at);
     expect(afterCompletion?.last_run_status).toBe('error');
     expect(afterCompletion?.last_run_error).toContain(
-      'Schedule disabled by billing plan:',
+      'Schedule blocked by billing plan:',
     );
 
     const runsAfterCompletion = await cronStub.listAutomationRunsPage(workspaceId!, {
@@ -894,7 +894,7 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
     expect(runsAfterCompletion.runs[0]?.status).toBe('success');
   });
 
-  it('manual deterministic runs disable noncompliant saved schedules', async () => {
+  it('manual deterministic runs preserve noncompliant saved schedules', async () => {
     useFixedTime('2030-01-06T00:00:00.000Z');
     const { userId } = await createUser(testEnv, testEmail(), 'password123', 'Manual Workflow Owner');
     const { org } = await createOrg(testEnv, 'Manual Workflow Org', userId);
@@ -925,11 +925,11 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
     const run = await cronStub.runDeterministicAutomationNow(workspaceId!, created.id);
 
     expect(run?.dispatch.instance_id).toBeTypeOf('string');
-    expect(run?.automation.enabled).toBe(false);
-    expect(run?.automation.next_run_at).toBeNull();
+    expect(run?.automation.enabled).toBe(true);
+    expect(run?.automation.next_run_at).toBeGreaterThan(created.next_run_at!);
     expect(run?.automation.last_run_status).toBe('error');
     expect(run?.automation.last_run_error).toContain(
-      'Schedule disabled by billing plan:',
+      'Schedule blocked by billing plan:',
     );
 
     await cronStub.recordDeterministicAutomationRunResult({
@@ -942,11 +942,11 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
     const afterCompletion = (await cronStub.listDeterministicAutomations(
       workspaceId!,
     )).find((automation) => automation.id === created.id);
-    expect(afterCompletion?.enabled).toBe(false);
-    expect(afterCompletion?.next_run_at).toBeNull();
+    expect(afterCompletion?.enabled).toBe(true);
+    expect(afterCompletion?.next_run_at).toBe(run?.automation.next_run_at);
     expect(afterCompletion?.last_run_status).toBe('error');
     expect(afterCompletion?.last_run_error).toContain(
-      'Schedule disabled by billing plan:',
+      'Schedule blocked by billing plan:',
     );
 
     const runsAfterCompletion = await cronStub.listAutomationRunsPage(workspaceId!, {
@@ -1054,7 +1054,7 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
     expect(after?.run_count).toBe(0);
   });
 
-  it('does not disable schedules on an early alarm when the workspace lookup fails, but still disables on the real due run', async () => {
+  it('preserves schedules when the workspace lookup fails before or during a due run', async () => {
     const { userId } = await createUser(testEnv, testEmail(), 'password123', 'Cron Owner');
     const { org } = await createOrg(testEnv, 'Cron Org', userId);
     const workspaces = await listUserWorkspaces(testEnv, userId, org.id);
@@ -1093,13 +1093,23 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
     expect(afterLead?.next_run_at).toBe(nextRun);
     expect(afterLead?.last_run_error).toBeNull();
 
-    // Real due wake (at next_run_at): the same lookup failure is now destructive
-    // — this is a genuinely due run against a gone workspace, so it disables.
+    // Real due wake (at next_run_at): record a failed attempt and advance the
+    // schedule, but preserve the owner's enabled intent for a later retry.
     useFixedTime(new Date(nextRun).toISOString());
     await cronStub.runDueAutomationsForTest(workspaceId!);
     const afterDue = (await cronStub.listScheduledPrompts(workspaceId!))[0];
-    expect(afterDue?.enabled).toBe(false);
-    expect(afterDue?.next_run_at).toBeNull();
+    expect(afterDue?.enabled).toBe(true);
+    expect(afterDue?.next_run_at).toBeGreaterThan(nextRun);
+    expect(afterDue?.last_run_status).toBe('error');
     expect(afterDue?.last_run_error).toBe('workspace_unavailable');
+    expect(afterDue?.run_count).toBe(1);
+
+    const runs = await cronStub.listAutomationRunsPage(workspaceId!, {
+      kind: 'scheduled_prompt',
+      automationId: created.id,
+      limit: 1,
+    });
+    expect(runs.runs[0]?.status).toBe('error');
+    expect(runs.runs[0]?.message).toBe('workspace_unavailable');
   });
 });

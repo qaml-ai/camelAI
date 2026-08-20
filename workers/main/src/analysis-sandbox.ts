@@ -494,23 +494,31 @@ export class AnalysisSandbox extends Sandbox<Env> {
     // destroyed: short-circuiting there is what silently runs a query against
     // missing mounts.
     this.syncMountBookkeepingToContainer();
-    if (this.mountedPaths.has(resolvedMountPath)) return;
+    const readOnly = options.readOnly ?? true;
+    const mountOptions = sandboxR2MountOptions(this.env, {
+      prefix: `/${prefix}`,
+      readOnly,
+      // Shrink the s3fs stat cache (default 60s + negative caching) so a
+      // just-staged export/upload isn't read through a stale/partial view.
+      // Self-host local sync deliberately drops this s3fs-only option.
+      s3fsOptions: ["stat_cache_expire=1"],
+    });
+    const actualMountPath = sandboxR2MountPath(resolvedMountPath, mountOptions);
+    if (this.mountedPaths.has(resolvedMountPath)) {
+      if (await mountAllowsList(this, actualMountPath)) return;
+      // A mount can die without a container stop (the exact production Errno 5
+      // failure mode). Do not trust the cached success: reopen the single-flight
+      // gate so this call unmounts/remounts before dispatching user code.
+      console.warn(`[sandbox] cached R2 mount ${actualMountPath} is unreadable; remounting`);
+      this.mountedPaths.delete(resolvedMountPath);
+      this.mountGates.delete(resolvedMountPath);
+    }
     let gate = this.mountGates.get(resolvedMountPath);
     if (!gate) {
       gate = createSingleFlight();
       this.mountGates.set(resolvedMountPath, gate);
     }
-    const readOnly = options.readOnly ?? true;
     await gate(async () => {
-      const mountOptions = sandboxR2MountOptions(this.env, {
-        prefix: `/${prefix}`,
-        readOnly,
-        // Shrink the s3fs stat cache (default 60s + negative caching) so a
-        // just-staged export/upload isn't read through a stale/partial view.
-        // Self-host local sync deliberately drops this s3fs-only option.
-        s3fsOptions: ["stat_cache_expire=1"],
-      });
-      const actualMountPath = sandboxR2MountPath(resolvedMountPath, mountOptions);
       await mountOrRecover(
         this,
         bucketBinding,

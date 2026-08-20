@@ -292,6 +292,69 @@ describe('AnalysisSandbox zombie self-heal', () => {
 
     expect(sandbox.mountBucket).toHaveBeenCalledTimes(1);
   });
+
+  it('remounts an AnalysisSandbox mount when its cached path becomes unreadable', async () => {
+    const sandbox = Object.create(AnalysisSandbox.prototype) as any;
+    sandbox.env = { CF_ACCOUNT_ID: 'cloudflare-account' };
+    sandbox.containerGeneration = 1;
+    sandbox.mountedContainerGeneration = 1;
+    sandbox.mountedPaths = new Set<string>();
+    sandbox.mountGates = new Map();
+    sandbox.mountBucket = vi.fn(async () => undefined);
+    sandbox.unmountBucket = vi.fn(async () => undefined);
+    sandbox.exec = vi.fn(async () => ({
+      exitCode: 0,
+      stdout: '',
+      stderr: 'ls: /uploads: Input/output error',
+    }));
+
+    await AnalysisSandbox.prototype.ensureMounted.call(
+      sandbox,
+      'R2_BUCKET',
+      'org1/workspace1/uploads',
+      '/uploads',
+      { readOnly: true },
+    );
+    await AnalysisSandbox.prototype.ensureMounted.call(
+      sandbox,
+      'R2_BUCKET',
+      'org1/workspace1/uploads',
+      '/uploads',
+      { readOnly: true },
+    );
+
+    expect(sandbox.exec).toHaveBeenCalledWith('ls -ld -- /uploads', { timeout: 15_000 });
+    expect(sandbox.mountBucket).toHaveBeenCalledTimes(2);
+  });
+
+  it('remounts DbQuerySandbox exports after a generation change or failed health check', async () => {
+    const sandbox = Object.create(DbQuerySandbox.prototype) as any;
+    sandbox.env = { CF_ACCOUNT_ID: 'cloudflare-account' };
+    sandbox.containerGeneration = 1;
+    sandbox.mountedContainerGeneration = 0;
+    sandbox.mountedPaths = new Set(['/warehouse/ws-1']);
+    sandbox.mountGates = new Map([['/warehouse/ws-1', createSingleFlight()]]);
+    sandbox.mountBucket = vi.fn(async () => undefined);
+    sandbox.unmountBucket = vi.fn(async () => undefined);
+    sandbox.exec = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }));
+
+    await DbQuerySandbox.prototype.ensureWarehouseExportMount.call(
+      sandbox,
+      'warehouse/ws-1',
+    );
+    expect(sandbox.mountBucket).toHaveBeenCalledTimes(1);
+
+    sandbox.exec.mockResolvedValue({
+      exitCode: 1,
+      stdout: '',
+      stderr: 'ls: Input/output error',
+    });
+    await DbQuerySandbox.prototype.ensureWarehouseExportMount.call(
+      sandbox,
+      'warehouse/ws-1',
+    );
+    expect(sandbox.mountBucket).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('sandboxR2MountPath', () => {

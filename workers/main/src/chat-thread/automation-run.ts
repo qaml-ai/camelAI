@@ -19,6 +19,11 @@ export interface ActiveAutomationRunState {
   workspaceId: string;
   automationId: string;
   runId: string;
+  requiresExplicitOutcome?: boolean;
+  reportedOutcome?: {
+    status: "success" | "failed" | "partial" | "needs_attention";
+    summary: string;
+  };
 }
 
 // The slice of the DO's env the automation-run cluster touches: the
@@ -74,7 +79,30 @@ export class ChatThreadAutomationRun {
       typeof record.automationId === "string" ? record.automationId.trim() : "";
     const runId = typeof record.runId === "string" ? record.runId.trim() : "";
     if (!workspaceId || !automationId || !runId) return null;
-    return { workspaceId, automationId, runId };
+    const requiresExplicitOutcome = record.requiresExplicitOutcome === true;
+    const rawOutcome = record.reportedOutcome;
+    let reportedOutcome: ActiveAutomationRunState["reportedOutcome"];
+    if (rawOutcome && typeof rawOutcome === "object" && !Array.isArray(rawOutcome)) {
+      const outcome = rawOutcome as Record<string, unknown>;
+      const status = outcome.status;
+      const summary = typeof outcome.summary === "string" ? outcome.summary.trim() : "";
+      if (
+        (status === "success" ||
+          status === "failed" ||
+          status === "partial" ||
+          status === "needs_attention") &&
+        summary
+      ) {
+        reportedOutcome = { status, summary };
+      }
+    }
+    return {
+      workspaceId,
+      automationId,
+      runId,
+      ...(requiresExplicitOutcome ? { requiresExplicitOutcome: true } : {}),
+      ...(reportedOutcome ? { reportedOutcome } : {}),
+    };
   }
 
   setActiveAutomationRun(value: ActiveAutomationRunState | null): void {

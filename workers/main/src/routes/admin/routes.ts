@@ -929,6 +929,62 @@ routes.post(
 );
 
 // ---------------------------------------------------------------------------
+// POST /workspaces/:workspaceId/db-query-sandbox/reset
+// ---------------------------------------------------------------------------
+
+routes.post(
+  "/workspaces/:workspaceId/db-query-sandbox/reset",
+  openApi({
+    summary:
+      "Destroy the workspace database-query sandbox so the next query/export gets fresh relay and R2 mounts",
+    responses: {
+      200: AnalysisSandboxResetResponseSchema,
+      400: ErrorSchema,
+    },
+  }),
+  async (c) => {
+    const workspaceId = c.req.param("workspaceId");
+    if (!c.env.DB_QUERY_SANDBOX) {
+      return c.json({ error: "DB_QUERY_SANDBOX container binding is not configured" }, 400);
+    }
+
+    // Keep this key identical to data-proxy.ts resolveDbQueryDeps().
+    const sandboxId = `ws-${workspaceId}`;
+    const destroyed: string[] = [];
+    const errors: Array<{ sandbox_id: string; error: string }> = [];
+    try {
+      const sandbox = getSandbox(c.env.DB_QUERY_SANDBOX, sandboxId, {
+        normalizeId: true,
+      }) as { destroy: () => Promise<void> };
+      await sandbox.destroy();
+      destroyed.push(sandboxId);
+    } catch (error) {
+      errors.push({
+        sandbox_id: sandboxId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    recordObservabilityEvent(c.env, {
+      event: "db_query_sandbox_reset",
+      severity: errors.length > 0 ? "warn" : "info",
+      component: "admin",
+      operation: "db-query-sandbox-reset",
+      status: errors.length > 0 ? "partial" : "ok",
+      workspaceId,
+      count: destroyed.length,
+    });
+
+    return c.json({
+      ok: errors.length === 0,
+      workspace_id: workspaceId,
+      destroyed,
+      errors,
+    });
+  },
+);
+
+// ---------------------------------------------------------------------------
 // POST /db-query-sandbox/query
 // ---------------------------------------------------------------------------
 

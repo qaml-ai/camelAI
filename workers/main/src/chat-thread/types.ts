@@ -286,6 +286,8 @@ export interface InitialUserMessageRequest {
     workspaceId: string;
     automationId: string;
     runId: string;
+    /** New scheduled runs must explicitly report their business outcome. */
+    requiresExplicitOutcome?: boolean;
   };
 }
 

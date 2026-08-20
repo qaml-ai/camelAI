@@ -5,6 +5,7 @@ import {
   type ConnectionContext,
   type WSMessage,
 } from "agents";
+import { Type } from "typebox";
 import { AIChatAgent } from "@cloudflare/ai-chat";
 import type {
   ChatRecoveryConfig,
@@ -7220,8 +7221,22 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       this.activeAutomationRun &&
       this.browserPrompts.pendingQuestionCount === 0
     ) {
+      const run = this.activeAutomationRun;
+      const outcome = run.reportedOutcome;
+      const requiresOutcome = run.requiresExplicitOutcome === true;
+      const status = !requiresOutcome || outcome?.status === "success"
+        ? "success"
+        : "error";
+      const message = requiresOutcome
+        ? outcome
+          ? outcome.status === "success"
+            ? outcome.summary
+            : `[${outcome.status}] ${outcome.summary}`
+          : "Automation completed without explicitly reporting an outcome"
+        : null;
       this.updateActiveAutomationRun({
-        status: "success",
+        status,
+        message,
         completedAt:
           typeof options.completedAt === "number" &&
           Number.isFinite(options.completedAt)
@@ -8002,7 +8017,17 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     const verifiedWorkState = formatVerifiedWorkStatePrompt(
       this.ctx?.storage?.kv?.get<unknown>(CHAT_VERIFIED_WORK_STATE_KEY),
     );
-    return verifiedWorkState ? `${base}\n\n${verifiedWorkState}` : base;
+    const automationOutcomeInstruction = this.activeAutomationRun?.requiresExplicitOutcome
+      ? [
+          "## Scheduled Automation Outcome",
+          "Before your final response, you MUST call `report_automation_outcome` exactly once.",
+          "Use `success` only when the requested business objective was actually completed and verified. A clean turn, partial data extraction, or a decision not to deploy is not success.",
+          "Use `failed` when the objective was not completed, `partial` when only part completed, and `needs_attention` when operator action is required. Give a concise factual summary.",
+        ].join("\n")
+      : null;
+    return [base, verifiedWorkState, automationOutcomeInstruction]
+      .filter((part): part is string => Boolean(part))
+      .join("\n\n");
   }
 
   /**
@@ -9186,7 +9211,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     context: ChatContextState,
     options: PiToolDefinitionOptions = {},
   ): AgentTool[] {
-    return createPiToolDefinitions(this.piToolSurfaceDeps(), context, {
+    const definitions = createPiToolDefinitions(this.piToolSurfaceDeps(), context, {
       ...options,
       outboundEmailEnabled:
         options.outboundEmailEnabled !== false &&
@@ -9195,6 +9220,59 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         options.appVisibilityConfigurable !== false &&
         !isSelfhostRuntime(this.env),
     });
+    if (
+      this.activeAutomationRun?.requiresExplicitOutcome &&
+      options.includeSubagents !== false
+    ) {
+      definitions.push({
+        name: "report_automation_outcome",
+        label: "Report automation outcome",
+        description:
+          "Required final status for this scheduled automation. Report success only if the requested objective actually completed and was verified; otherwise report failed, partial, or needs_attention.",
+        parameters: Type.Object({
+          status: Type.Union([
+            Type.Literal("success"),
+            Type.Literal("failed"),
+            Type.Literal("partial"),
+            Type.Literal("needs_attention"),
+          ]),
+          summary: Type.String({
+            minLength: 1,
+            maxLength: 2_000,
+            description: "Concise factual outcome, including the blocker when not successful.",
+          }),
+        }),
+        execute: async (_toolUseId, params, signal) => {
+          if (signal?.aborted) throw new Error("Operation aborted");
+          const run = this.activeAutomationRun;
+          if (!run?.requiresExplicitOutcome) {
+            throw new Error("No scheduled automation run is active");
+          }
+          if (run.reportedOutcome) {
+            throw new Error("Automation outcome was already reported for this run");
+          }
+          const raw = params as {
+            status: "success" | "failed" | "partial" | "needs_attention";
+            summary: string;
+          };
+          const summary = raw.summary.trim();
+          if (!summary) throw new Error("Automation outcome summary is required");
+          this.setActiveAutomationRun({
+            ...run,
+            reportedOutcome: { status: raw.status, summary },
+          });
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Automation outcome recorded: ${raw.status}`,
+            }],
+            details: { status: raw.status },
+          };
+        },
+        executionMode: "sequential",
+      });
+    }
+    return definitions;
   }
 
   private async runPiSubagentTool(

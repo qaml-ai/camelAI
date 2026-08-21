@@ -26,6 +26,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ExternalLink, Trash2 } from 'lucide-react';
 import { NoWorkspacesError } from '@/components/no-workspaces-error';
 import { getPreferredAppUrl } from '@/lib/app-url';
+import { getAppUrlContext } from '@/lib/app-url.server';
 import { refreshWorkerScriptCustomDomainStates } from '@/lib/custom-domain.server';
 import { loadUserProfileSummaries } from '@/lib/user-profiles.server';
 import type { WorkerScriptWithCreator } from '@/types';
@@ -113,6 +114,7 @@ export async function loader({ request, context }: Route.LoaderArgs) {
   await requireOrgAdmin(request, context, authContext.currentOrg.id);
   const env = getEnv(context);
   const authEnv = getAuthEnvFromCloudflare(env);
+  const appUrlContext = getAppUrlContext(env, request);
 
   const url = new URL(request.url);
   const filter = url.searchParams.get('filter') || 'this-workspace';
@@ -127,6 +129,7 @@ export async function loader({ request, context }: Route.LoaderArgs) {
       filter,
       orgSlug,
       orgCustomDomain: null,
+      appUrlContext,
       selfhostRuntime: isSelfhostRuntime(env),
     };
   }
@@ -177,6 +180,7 @@ export async function loader({ request, context }: Route.LoaderArgs) {
     filter,
     orgSlug,
     orgCustomDomain: null,
+    appUrlContext,
     selfhostRuntime: isSelfhostRuntime(env),
   };
 }
@@ -187,6 +191,7 @@ export default function WorkspaceAppsPage() {
     hasWorkspace,
     orgSlug,
     orgCustomDomain,
+    appUrlContext,
     selfhostRuntime,
   } = useLoaderData<typeof loader>();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -253,66 +258,74 @@ export default function WorkspaceAppsPage() {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {apps.map((app) => (
-              <TableRow key={app.script_name}>
-                <TableCell className="font-medium font-mono text-sm">
-                  <a
-                    href={getPreferredAppUrl(app, { orgSlug, orgCustomDomain })}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="hover:underline"
-                  >
-                    {app.script_name}
-                  </a>
-                </TableCell>
-                {showWorkspaceColumn ? (
+            {apps.map((app) => {
+              const appUrl = getPreferredAppUrl(app, {
+                hostname: appUrlContext,
+                orgSlug,
+                orgCustomDomain,
+              });
+
+              return (
+                <TableRow key={app.script_name}>
+                  <TableCell className="font-medium font-mono text-sm">
+                    <a
+                      href={appUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="hover:underline"
+                    >
+                      {app.script_name}
+                    </a>
+                  </TableCell>
+                  {showWorkspaceColumn ? (
+                    <TableCell className="text-muted-foreground text-sm">
+                      {app.workspace_name}
+                    </TableCell>
+                  ) : null}
                   <TableCell className="text-muted-foreground text-sm">
-                    {app.workspace_name}
+                    {app.creator?.name ?? app.creator?.email ?? '—'}
                   </TableCell>
-                ) : null}
-                <TableCell className="text-muted-foreground text-sm">
-                  {app.creator?.name ?? app.creator?.email ?? '—'}
-                </TableCell>
-                <TableCell className="text-muted-foreground text-sm">
-                  {formatDate(app.created_at)}
-                </TableCell>
-                <TableCell className="text-muted-foreground text-sm">
-                  {formatDate(app.updated_at)}
-                </TableCell>
-                {!selfhostRuntime ? (
+                  <TableCell className="text-muted-foreground text-sm">
+                    {formatDate(app.created_at)}
+                  </TableCell>
+                  <TableCell className="text-muted-foreground text-sm">
+                    {formatDate(app.updated_at)}
+                  </TableCell>
+                  {!selfhostRuntime ? (
+                    <TableCell>
+                      <Badge variant={app.is_public ? 'secondary' : 'outline'}>
+                        {app.is_public ? 'Public' : 'Private'}
+                      </Badge>
+                    </TableCell>
+                  ) : null}
                   <TableCell>
-                    <Badge variant={app.is_public ? 'secondary' : 'outline'}>
-                      {app.is_public ? 'Public' : 'Private'}
-                    </Badge>
-                  </TableCell>
-                ) : null}
-                <TableCell>
-                  <div className="flex items-center gap-1">
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      asChild
-                    >
-                      <a
-                        href={getPreferredAppUrl(app, { orgSlug, orgCustomDomain })}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        title="Open in new tab"
+                    <div className="flex items-center gap-1">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        asChild
                       >
-                        <ExternalLink className="h-4 w-4" />
-                      </a>
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => setDeleteTarget(app)}
-                    >
-                      <Trash2 className="h-4 w-4 text-destructive" />
-                    </Button>
-                  </div>
-                </TableCell>
-              </TableRow>
-            ))}
+                        <a
+                          href={appUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title="Open in new tab"
+                        >
+                          <ExternalLink className="h-4 w-4" />
+                        </a>
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => setDeleteTarget(app)}
+                      >
+                        <Trash2 className="h-4 w-4 text-destructive" />
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
           </TableBody>
         </Table>
       )}

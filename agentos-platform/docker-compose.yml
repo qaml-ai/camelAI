@@ -1,0 +1,94 @@
+# Rivetkit embedded mode: the Rivet engine runs in-process inside each app
+# container (no separate rivet-engine image). Use two app replicas to practice
+# versioned graceful drain during deploys.
+#
+# Rolling deploy (summary):
+#   1. Bump RIVET_ENVOY_VERSION (build arg + env) for the new image.
+#   2. Start app-canary (or scale a second runner) on the new version.
+#   3. Route new actor placements to the new version; old actors drain on the
+#      previous runner via Rivet version tags + keepAwake on in-flight turns.
+#   4. Stop the old runner once its actors have finalized.
+#
+# See README.md and plans/agentos-full-rewrite.md for the full procedure.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+      args:
+        RIVET_ENVOY_VERSION: ${RIVET_ENVOY_VERSION:-1}
+    container_name: agentos-app
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: "6420"
+      DATA_DIR: /data
+      RIVET_ENVOY_VERSION: ${RIVET_ENVOY_VERSION:-1}
+    volumes:
+      - agentos-data:/data
+    ports:
+      - "${PORT:-6420}:6420"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bun -e \"fetch('http://127.0.0.1:'+(process.env.PORT||6420)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Second runner for drain testing. Enable with: docker compose --profile canary up -d
+  app-canary:
+    profiles: ["canary"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+      args:
+        RIVET_ENVOY_VERSION: ${RIVET_ENVOY_VERSION_NEXT:-2}
+    container_name: agentos-app-canary
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: "6420"
+      DATA_DIR: /data
+      RIVET_ENVOY_VERSION: ${RIVET_ENVOY_VERSION_NEXT:-2}
+    volumes:
+      - agentos-data:/data
+    ports:
+      - "6421:6420"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bun -e \"fetch('http://127.0.0.1:'+(process.env.PORT||6420)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: web
+    container_name: agentos-web
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8080}:80"
+
+volumes:
+  agentos-data:
+    name: agentos-data

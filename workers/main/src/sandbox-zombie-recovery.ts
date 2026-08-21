@@ -70,7 +70,10 @@ export const SANDBOX_ZOMBIE_PROBE_THRESHOLD = 3;
 export const SANDBOX_ZOMBIE_EXEC_DEATH_THRESHOLD = 2;
 
 /** Why a restart was requested. Low-cardinality; goes straight to telemetry. */
-export type SandboxZombieRestartTrigger = "exec_session_death" | "probe_session_death";
+export type SandboxZombieRestartTrigger =
+  | "exec_session_death"
+  | "probe_session_death"
+  | "mount_io_error";
 
 export type SandboxZombieRestartOutcome =
   | {
@@ -399,9 +402,10 @@ async function notifyContainerDestroyed(
  * Self-heal entry point for a sandbox DO: destroy a container whose shell layer
  * is dead, rate-limited to one restart per cooldown window.
  *
- * Callers pass the error that triggered it; anything that is NOT session-death
- * is ignored outright, which is what keeps a slow boot (transport errors,
- * timeouts, 503s) from ever reaching the hammer.
+ * Callers reach this only after a narrow health check proves the container is
+ * unrecoverable in place: repeated session death or an R2 mount that still
+ * fails traversal after unmount/remount. Slow boots, transport errors,
+ * timeouts, and ordinary 503s never call this helper.
  */
 export async function healZombieSandboxContainer(
   sandbox: ZombieHealableSandbox,

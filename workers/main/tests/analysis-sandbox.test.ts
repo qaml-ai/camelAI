@@ -8,6 +8,7 @@ import {
   mountOrRecover,
   sandboxR2MountOptions,
   sandboxR2MountPath,
+  UnreadableR2MountError,
   waitForWritableLocalMount,
   type MountRecoverTarget,
 } from '../src/analysis-sandbox.js';
@@ -327,6 +328,43 @@ describe('AnalysisSandbox zombie self-heal', () => {
     expect(sandbox.mountBucket).toHaveBeenCalledTimes(2);
   });
 
+  it('recreates the container once when unmount/remount cannot clear mount EIO', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { sandbox } = healableSandbox();
+      sandbox.containerGeneration = 1;
+      sandbox.mountedContainerGeneration = 1;
+      sandbox.mountedPaths = new Set(['/warehouse/ws-1']);
+      sandbox.mountGates = new Map();
+      let destroyed = false;
+      sandbox.destroy = vi.fn(async () => { destroyed = true; });
+      sandbox.unmountBucket = vi.fn(async () => undefined);
+      sandbox.mountBucket = vi.fn(async () => {
+        if (!destroyed) {
+          throw new S3FSMountError(
+            'S3FS mount failed: s3fs: MOUNTPOINT directory /warehouse/ws-1 is not empty',
+          );
+        }
+      });
+      sandbox.exec = vi.fn(async () => destroyed
+        ? { exitCode: 0, stdout: '', stderr: '' }
+        : { exitCode: 1, stdout: '', stderr: 'ls: Input/output error' });
+
+      await AnalysisSandbox.prototype.ensureMounted.call(
+        sandbox,
+        'WAREHOUSE_EXPORT_BUCKET',
+        'warehouse/ws-1',
+      );
+
+      expect(sandbox.destroy).toHaveBeenCalledTimes(1);
+      expect(sandbox.mountBucket).toHaveBeenCalledTimes(3);
+      expect(sandbox.mountedPaths.has('/warehouse/ws-1')).toBe(true);
+      expect(sandbox.env.OBSERVABILITY_EVENTS.writeDataPoint).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('remounts DbQuerySandbox exports after a generation change or failed health check', async () => {
     const sandbox = Object.create(DbQuerySandbox.prototype) as any;
     sandbox.env = { CF_ACCOUNT_ID: 'cloudflare-account' };
@@ -509,9 +547,8 @@ describe('mountOrRecover', () => {
       },
     });
 
-    await expect(mountOrRecover(target, 'R2_BUCKET', '/uploads', options)).rejects.toThrow(
-      /not readable \(I\/O error\)/,
-    );
+    await expect(mountOrRecover(target, 'R2_BUCKET', '/uploads', options))
+      .rejects.toBeInstanceOf(UnreadableR2MountError);
     expect(target.unmounts).toEqual(['/uploads']);
   });
 

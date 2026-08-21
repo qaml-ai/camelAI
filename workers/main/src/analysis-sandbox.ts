@@ -133,6 +133,16 @@ export interface MountRecoverTarget {
   ): Promise<{ exitCode?: number; stdout?: string; stderr?: string }>;
 }
 
+export class UnreadableR2MountError extends Error {
+  constructor(mountPath: string) {
+    super(
+      `R2 mount at ${mountPath} appears present but is not readable (I/O error). ` +
+        `Recreate the analysis sandbox container to recover.`,
+    );
+    this.name = "UnreadableR2MountError";
+  }
+}
+
 interface WritableLocalMountTarget {
   writeFile(path: string, content: string): Promise<unknown>;
   deleteFile(path: string): Promise<unknown>;
@@ -225,10 +235,7 @@ export async function mountOrRecover(
   }
 
   if (!(await mountAllowsList(target, mountPath))) {
-    throw new Error(
-      `R2 mount at ${mountPath} appears present but is not readable (I/O error). ` +
-        `Recreate the analysis sandbox container to recover.`,
-    );
+    throw new UnreadableR2MountError(mountPath);
   }
 }
 
@@ -523,12 +530,34 @@ export class AnalysisSandbox extends Sandbox<Env> {
       this.mountGates.set(resolvedMountPath, gate);
     }
     await gate(async () => {
-      await mountOrRecover(
-        this,
-        bucketBinding,
-        actualMountPath,
-        mountOptions,
-      );
+      try {
+        await mountOrRecover(
+          this,
+          bucketBinding,
+          actualMountPath,
+          mountOptions,
+        );
+      } catch (error) {
+        if (!(error instanceof UnreadableR2MountError)) throw error;
+        // Unmount/remount already failed and a real directory traversal still
+        // returned EIO. That state cannot recover inside the current container.
+        // Reuse the bounded, cooldown-fenced sandbox restart path, then mount
+        // once against the fresh container before any user code is dispatched.
+        const outcome = await healZombieSandboxContainer(
+          this.zombieHealTarget,
+          "AnalysisSandbox",
+          { operation: "ensure_mounted", trigger: "mount_io_error", error },
+        );
+        if (!outcome.restarted && outcome.reason !== "container_not_running") {
+          throw error;
+        }
+        await mountOrRecover(
+          this,
+          bucketBinding,
+          actualMountPath,
+          mountOptions,
+        );
+      }
       await ensureLocalMountAlias(this, resolvedMountPath, actualMountPath);
       if ("localBucket" in mountOptions && mountOptions.localBucket && !readOnly) {
         const bucket = this.env[bucketBinding as keyof Env];

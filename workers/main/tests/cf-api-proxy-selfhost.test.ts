@@ -4,6 +4,11 @@ import {
   type CfApiProxyEnv,
 } from "../src/cf-api-proxy";
 import { selfhostWorkerKey, type SelfhostWorkerRecord } from "../src/selfhost-worker-registry";
+import { selfhostAssetsKey } from "../src/selfhost-assets-registry";
+import {
+  OBJECT_METADATA_HEADER,
+  encodeObjectMetadata,
+} from "../src/binding-facades/object-store";
 
 class MemoryKv {
   store = new Map<string, string>();
@@ -168,6 +173,77 @@ describe("proxyCloudflareApi self-host publishing", () => {
     expect(payload.exp).toBeGreaterThan(Math.floor(Date.now() / 1000));
     expect(payload.max_file_count_allowed).toBe(1);
     expect(responseBody.result.buckets).toEqual([["hash-1"]]);
+  });
+
+  it("stores self-host asset uploads through the object-store facade", async () => {
+    const kv = new MemoryKv();
+    const storedObjects = new Map<string, Uint8Array>();
+    const objectStoreService = {
+      fetch: vi.fn(async (request: Request) => {
+        const url = new URL(request.url);
+        expect(url.pathname).toBe("/v1/object-store/object");
+        expect(url.searchParams.get("binding")).toBe("R2_BUCKET");
+        const key = url.searchParams.get("key")!;
+        const bytes = new Uint8Array(await request.arrayBuffer());
+        storedObjects.set(key, bytes);
+        return new Response(null, {
+          headers: {
+            [OBJECT_METADATA_HEADER]: encodeObjectMetadata({
+              key,
+              size: bytes.byteLength,
+              etag: "etag-1",
+              uploaded: "2026-08-23T12:00:00.000Z",
+            }),
+          },
+        });
+      }),
+    };
+    const env = makeEnv(kv, {
+      R2_BUCKET: undefined,
+      OBJECT_STORE_SERVICE: objectStoreService as unknown as Fetcher,
+    });
+    const identity = {
+      trustedIdentity: {
+        orgId: "org_1",
+        orgSlug: "acme",
+        workspaceId: "workspace_1",
+      },
+    };
+    const sessionResponse = await proxyCloudflareApi(
+      new Request("https://app.local/client/v4/accounts/selfhost/workers/dispatch/namespaces/selfhost/scripts/demo/assets-upload-session", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          manifest: { "index.html": { hash: "hash-1", size: 5 } },
+        }),
+      }),
+      env,
+      identity,
+    );
+    const sessionBody = await sessionResponse.json() as { result: { jwt: string } };
+    const upload = multipartBody([{
+      name: "hash-1",
+      body: btoa("hello"),
+      contentType: "text/html",
+    }]);
+
+    const uploadResponse = await proxyCloudflareApi(
+      new Request("https://app.local/client/v4/accounts/selfhost/workers/assets/upload?base64=true", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${sessionBody.result.jwt}`,
+          "content-type": upload.contentType,
+        },
+        body: upload.body,
+      }),
+      env,
+      identity,
+    );
+
+    expect(uploadResponse.status).toBe(200);
+    expect(objectStoreService.fetch).toHaveBeenCalledOnce();
+    expect([...storedObjects.values()][0]).toEqual(new TextEncoder().encode("hello"));
+    await expect(kv.get(selfhostAssetsKey("demo--acme"))).resolves.toBeTruthy();
   });
 
   it("stores module worker uploads in the self-host worker registry", async () => {

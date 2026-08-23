@@ -36,11 +36,14 @@ import {
 } from './db-query-compat.js';
 import { recordObservabilityEvent, type ObservabilityEnv } from './observability.js';
 import { warehouseWorkspacePrefix } from './warehouse-export.js';
+import { resolveComputeSandbox } from './binding-facades/compute.js';
 
 const DEFAULT_DATA_PROXY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
 export interface DataProxyEnv extends DbEgressRelayEnv, ObservabilityEnv {
   DB_QUERY_SANDBOX?: DurableObjectNamespace<import('./db-query-sandbox.js').DbQuerySandbox>;
+  COMPUTE_SERVICE?: Fetcher;
+  OBJECT_STORE_SERVICE?: Fetcher;
   DATA_PROXY_MAX_RESPONSE_BYTES?: string;
 }
 
@@ -80,12 +83,18 @@ function resolveMaxResponseBytes(env: DataProxyEnv): number {
  * tenants never share one.
  */
 function resolveDbQueryDeps(env: DataProxyEnv, context: DataProxyContext): DbQueryDeps {
-  if (!env.DB_QUERY_SANDBOX) {
+  if (!env.DB_QUERY_SANDBOX && !env.COMPUTE_SERVICE) {
     throw createDataProxyError('DB_QUERY_SANDBOX container binding is not configured', 500);
   }
-  const sandbox = getSandbox(env.DB_QUERY_SANDBOX, `ws-${context.workspaceId}`, {
-    normalizeId: true,
-  }) as unknown as DbQuerySandboxStub;
+  const sandboxId = `ws-${context.workspaceId}`;
+  const sandbox = resolveComputeSandbox<DbQuerySandboxStub>(env, {
+    kind: 'db-query',
+    id: sandboxId,
+    nativeAvailable: Boolean(env.DB_QUERY_SANDBOX),
+    native: () => getSandbox(env.DB_QUERY_SANDBOX!, sandboxId, {
+      normalizeId: true,
+    }) as unknown as DbQuerySandboxStub,
+  });
   return {
     sandbox,
     relay: relayConfigFromEnv(env),

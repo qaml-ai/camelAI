@@ -94,6 +94,10 @@ import { deployWorkerModulesDirect, rollbackWorkerDeployFromArtifactCache, type 
 import { handleDeploySideEffects } from "./services/deploy";
 import { editAutomationVirtualFile, listAutomationVirtualFiles, normalizeAutomationVirtualPath, readAutomationVirtualFile, writeAutomationVirtualFile } from "./deterministic-automation-virtual-files";
 import { applyTextEdits, normalizeTextEditArguments } from "./text-edit";
+import { resolveComputeSandbox } from "./binding-facades/compute";
+import { resolveObjectStore } from "./binding-facades/object-store";
+import { resolveImagesBinding } from "./binding-facades/images";
+import { resolveBrowserBinding } from "./binding-facades/managed";
 import type { DynamicIntegrationSchema } from "../../../src/lib/integration-registry";
 import type { ChatThreadDO } from "./chat-thread-do";
 import { ChannelTools } from "./chat-channels";
@@ -2032,6 +2036,17 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return new WorkspaceFilesystemClient(this.env, workspaceId);
   }
 
+  private get r2(): R2Bucket {
+    return resolveObjectStore(this.env);
+  }
+
+  private get browserEnv(): ChatEnv {
+    const browser = resolveBrowserBinding(this.env);
+    return browser
+      ? { ...this.env, BROWSER: browser as unknown as Fetcher }
+      : this.env;
+  }
+
   private get connectionsContext() {
     const { workspaceId, orgId, userId, threadId } = this.ctx.props;
     if (!workspaceId || !orgId) {
@@ -2041,7 +2056,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private get piContainerTools(): PiContainerTools {
-    return new PiContainerTools(this.workspaceFs, { images: this.env.IMAGES });
+    return new PiContainerTools(this.workspaceFs, { images: resolveImagesBinding(this.env) });
   }
 
   private async projectFileStore(args: Record<string, unknown>): Promise<ProjectFilesystemClient> {
@@ -2053,19 +2068,25 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async projectContainerTools(args: Record<string, unknown>): Promise<PiContainerTools> {
-    return new PiContainerTools(await this.projectFileStore(args), { images: this.env.IMAGES });
+    return new PiContainerTools(await this.projectFileStore(args), { images: resolveImagesBinding(this.env) });
   }
 
   private projectBuildSandbox(): ProjectBuildSandboxLike {
     const { orgId } = this.ctx.props;
     if (!orgId) throw new Error("Project builds require org scope");
-    if (!this.env.PROJECT_BUILD_SANDBOX) {
+    if (!this.env.PROJECT_BUILD_SANDBOX && !this.env.COMPUTE_SERVICE) {
       throw new Error("PROJECT_BUILD_SANDBOX container binding is not configured");
     }
-    return getSandbox(this.env.PROJECT_BUILD_SANDBOX, projectBuildSandboxKey(orgId), {
-      normalizeId: true,
-      transport: "rpc",
-    }) as unknown as ProjectBuildSandboxLike;
+    const sandboxId = projectBuildSandboxKey(orgId);
+    return resolveComputeSandbox<ProjectBuildSandboxLike>(this.env, {
+      kind: "project-build",
+      id: sandboxId,
+      nativeAvailable: Boolean(this.env.PROJECT_BUILD_SANDBOX),
+      native: () => getSandbox(this.env.PROJECT_BUILD_SANDBOX!, sandboxId, {
+        normalizeId: true,
+        transport: "rpc",
+      }) as unknown as ProjectBuildSandboxLike,
+    });
   }
 
   /**
@@ -2519,14 +2540,14 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const limit = typeof args.limit === "number"
       ? clampCodeModeInteger(args.limit, PI_TOOL_RESULT_MAX_LINES, 1, PI_TOOL_RESULT_MAX_LINES)
       : undefined;
-    const head = await this.env.R2_BUCKET.head(target.key);
+    const head = await this.r2.head(target.key);
     if (!head) {
       throw new Error(`R2 object not found: ${target.path}`);
     }
     const contentTypeImageMimeType = getSupportedImageMimeTypeFromContentType(
       head.httpMetadata?.contentType,
     );
-    const object = await this.env.R2_BUCKET.get(target.key);
+    const object = await this.r2.get(target.key);
     if (!object) {
       throw new Error(`R2 object not found: ${target.path}`);
     }
@@ -2540,11 +2561,11 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           ? contentTypeImageMimeType
           : null;
       if (imageMimeType) {
-        const images = this.env.IMAGES;
+        const images = resolveImagesBinding(this.env);
         if (!images) throw new Error("IMAGES binding is required for image reads");
         const inlineImage = await prepareInlineImageFromStream(sniffed.stream, imageMimeType, images, {
           createRetryStream: async () => {
-            const retryObject = await this.env.R2_BUCKET.get(target.key);
+            const retryObject = await this.r2.get(target.key);
             if (!retryObject?.body) throw new Error(`R2 image object is not streamable: ${target.path}`);
             return retryObject.body;
           },
@@ -2643,7 +2664,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const contentType = typeof args.content_type === "string" && args.content_type.trim()
       ? args.content_type.trim()
       : "text/plain; charset=utf-8";
-    const object = await this.env.R2_BUCKET.put(target.key, content, {
+    const object = await this.r2.put(target.key, content, {
       ...(options.expectedEtag ? { onlyIf: { etagMatches: options.expectedEtag } } : {}),
       httpMetadata: { contentType },
       customMetadata: {
@@ -2678,14 +2699,14 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const target = this.resolveCodeModeR2Path(args, { requireWritable: true });
     const edits = normalizeTextEditArguments(args);
 
-    const head = await this.env.R2_BUCKET.head(target.key);
+    const head = await this.r2.head(target.key);
     if (!head) throw new Error(`R2 object not found: ${target.path}`);
     if (head.size > CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES) {
       throw new Error(
         `R2 object is too large for text edit (${head.size} bytes; max ${CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES} bytes)`,
       );
     }
-    const object = await this.env.R2_BUCKET.get(target.key);
+    const object = await this.r2.get(target.key);
     if (!object) throw new Error(`R2 object not found: ${target.path}`);
     const originalContent = await object.text();
     const applied = applyTextEdits(originalContent, edits, target.path);
@@ -2721,7 +2742,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       ? `${target.relativePath}/`
       : "";
     const baseKey = this.r2MountBaseKey(target.mount);
-    const result = await this.env.R2_BUCKET.list({
+    const result = await this.r2.list({
       prefix: `${baseKey}${directoryRelativePath}`,
       delimiter: "/",
       limit,
@@ -2767,7 +2788,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
 
   private async deleteR2File(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const target = this.resolveCodeModeR2Path(args, { requireWritable: true });
-    await this.env.R2_BUCKET.delete(target.key);
+    await this.r2.delete(target.key);
     const text = `Deleted ${target.path}`;
     return {
       text,
@@ -2851,7 +2872,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   private async collectR2MoveFiles(source: CodeModeMoveEndpoint): Promise<{ files: CodeModeMoveFile[]; sourceIsDirectory: boolean }> {
     const target = this.resolveCodeModeR2Path(source as unknown as Record<string, unknown>, { allowDirectory: true });
     if (target.relativePath) {
-      const head = await this.env.R2_BUCKET.head(target.key);
+      const head = await this.r2.head(target.key);
       if (head) {
         return {
           files: [{
@@ -2872,7 +2893,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const files: CodeModeMoveFile[] = [];
     let cursor: string | undefined;
     do {
-      const listed = await this.env.R2_BUCKET.list({
+      const listed = await this.r2.list({
         prefix,
         cursor,
         limit: 1000,
@@ -2927,7 +2948,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       };
     }
     const target = this.resolveCodeModeR2Path({ ...source, path: file.path });
-    const object = await this.env.R2_BUCKET.get(target.key);
+    const object = await this.r2.get(target.key);
     if (!object) throw new Error(`R2 object not found: ${target.path}`);
     return {
       bytes: new Uint8Array(await object.arrayBuffer()),
@@ -2955,7 +2976,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       return { path: normalizedPath, bytes: bytes.byteLength };
     }
     const target = this.resolveCodeModeR2Path({ ...destination, path }, { requireWritable: true });
-    await this.env.R2_BUCKET.put(target.key, bytes, {
+    await this.r2.put(target.key, bytes, {
       httpMetadata: { contentType: destination.contentType ?? contentType ?? "application/octet-stream" },
       customMetadata: {
         type: "code-mode-move-file",
@@ -2983,7 +3004,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (target.mount === "uploads") throw new Error("uploads/ is read-only");
     for (const file of files) {
       const fileTarget = this.resolveCodeModeR2Path({ ...source, path: file.path }, { requireWritable: true });
-      await this.env.R2_BUCKET.delete(fileTarget.key);
+      await this.r2.delete(fileTarget.key);
     }
   }
 
@@ -3847,7 +3868,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         // Retry briefly so a preview set the moment before the producer
         // finishes writing to R2 validates instead of failing the race.
         const object = await retryR2Read(() =>
-          this.env.R2_BUCKET.head(
+          this.r2.head(
             buildWorkspaceScopedR2Key(orgId, workspaceId, `${bucketDir}/${relativePath}`),
           ),
         );
@@ -4234,7 +4255,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     try {
       const filename = `${Date.now()}-${label}-${crypto.randomUUID().slice(0, 8)}.log`;
       const key = `${this.r2MountBaseKey("tmp")}${filename}`;
-      await this.env.R2_BUCKET.put(key, text, {
+      await this.r2.put(key, text, {
         httpMetadata: { contentType: "text/plain; charset=utf-8" },
       });
       const path = `tmp/${filename}`;
@@ -4623,7 +4644,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async browserLaunch(args: Record<string, unknown>): Promise<unknown> {
-    const session = await launchAppBrowserSession(this.env, {
+    const session = await launchAppBrowserSession(this.browserEnv, {
       orgId: this.ctx.props.orgId,
       workspaceId: this.ctx.props.workspaceId,
     }, this.browserLaunchInput(args));
@@ -4653,7 +4674,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (!this.browserMethodAllowlist().has(method)) {
       throw new Error(`Unsupported browser session method: ${method || "(empty)"}`);
     }
-    const session = await connectAppBrowserSession(this.env, {
+    const session = await connectAppBrowserSession(this.browserEnv, {
       orgId: this.ctx.props.orgId,
       workspaceId: this.ctx.props.workspaceId,
     }, { sessionId, scriptName });
@@ -5369,7 +5390,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     onProviderFailure?: (result: unknown) => Promise<void>,
   ): CodeModeWebSearch {
     return new CodeModeWebSearch(
-      this.env,
+      this.browserEnv,
       this.ctx.props.threadId || this.ctx.props.workspaceId,
       { onProviderFailure },
     );

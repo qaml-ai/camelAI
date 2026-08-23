@@ -14,6 +14,7 @@ import { normalizeProjectBuildId } from "./project-build-result-policy.js";
 import { projectBuildSandboxKey } from "./project-build-sandbox-lifecycle.js";
 import type { ProjectBuildSandboxLike } from "./project-worker-bundle.js";
 import { ProjectFilesystemClient } from "./workspace-filesystem-do.js";
+import { resolveComputeSandbox } from "./binding-facades/compute.js";
 
 export { __testing, DEFAULT_BUILD_TIMEOUT_MS, runProjectAddDependency, runProjectBuild } from "./project-build-commands.js";
 export type {
@@ -59,15 +60,21 @@ function resolveProjectBuildRuntime(
   orgId: string,
   value: string,
 ): { projectId: string; sandbox: ProjectBuildSandboxLike } {
-  if (!env.PROJECT_BUILD_SANDBOX) {
+  if (!env.PROJECT_BUILD_SANDBOX && !env.COMPUTE_SERVICE) {
     throw new Error("PROJECT_BUILD_SANDBOX container binding is not configured");
   }
   if (!orgId) throw new Error("Project build service requires org scope");
   const projectId = normalizeProjectBuildId(value);
-  const sandbox = getSandbox(
-    env.PROJECT_BUILD_SANDBOX,
-    projectBuildSandboxKey(orgId),
-    { normalizeId: true, transport: "rpc" },
-  ) as unknown as ProjectBuildSandboxLike;
+  const sandboxKey = projectBuildSandboxKey(orgId);
+  const sandbox = resolveComputeSandbox<ProjectBuildSandboxLike>(env, {
+    kind: "project-build",
+    id: sandboxKey,
+    nativeAvailable: Boolean(env.PROJECT_BUILD_SANDBOX),
+    native: () => getSandbox(
+      env.PROJECT_BUILD_SANDBOX!,
+      sandboxKey,
+      { normalizeId: true, transport: "rpc" },
+    ) as unknown as ProjectBuildSandboxLike,
+  });
   return { projectId, sandbox };
 }

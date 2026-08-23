@@ -3,6 +3,7 @@ import { getProviderMcpDefinition } from '../../../src/lib/provider-mcp-registry
 import { mintBigQueryAccessTokenFromServiceAccount } from './google-service-account';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 import { warehouseExportKey, stageWarehouseExport } from './warehouse-export.js';
+import { resolveObjectStoreBinding } from './binding-facades/object-store.js';
 
 /** Minimal context the export path needs to namespace the R2 staging key. */
 export interface BigQueryMcpContext {
@@ -19,6 +20,7 @@ type JsonValue =
 
 interface BigQueryMcpEnv {
   INTEGRATION_SECRET_KEY: string;
+  OBJECT_STORE_SERVICE?: Fetcher;
   /** Auto-expiring R2 staging bucket for warehouse exports. */
   WAREHOUSE_EXPORT_BUCKET?: R2Bucket;
 }
@@ -605,13 +607,11 @@ async function runBigQueryWarehouseExport(
   datasetId: string | null,
   maximumBytesBilled: string,
 ): Promise<Record<string, JsonValue>> {
-  const bucket = env.WAREHOUSE_EXPORT_BUCKET;
-  if (!bucket) {
-    throw Object.assign(
-      new Error('BigQuery warehouse export is not enabled in this deployment (WAREHOUSE_EXPORT_BUCKET is not bound).'),
-      { status: 501 },
-    );
-  }
+  const bucket = resolveObjectStoreBinding(
+    env,
+    'WAREHOUSE_EXPORT_BUCKET',
+    env.WAREHOUSE_EXPORT_BUCKET,
+  );
   // Reject writes/DDL before launching the export job (export is read-only).
   assertBigQueryReadOnly(await bigQueryStatementType(client, query, datasetId));
   // Fold the default dataset into the cache key: the same query text resolves to

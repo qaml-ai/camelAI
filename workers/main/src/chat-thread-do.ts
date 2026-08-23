@@ -157,6 +157,8 @@ import {
   mergeVerifiedWorkState,
   type VerifiedWorkEvidence,
 } from "./chat-thread/verified-work-state";
+import { resolveObjectStore } from "./binding-facades/object-store";
+import { runPortableCode } from "./binding-facades/code-executor";
 
 export type { ConnectionSetupResponse } from "./chat-thread-browser-prompts";
 export {
@@ -1663,13 +1665,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       throw new Error("Code mode requires org and workspace scope");
     }
 
-    const loader = this.env.CODE_MODE_LOADER as (WorkerLoader & {
-      load?: (code: WorkerLoaderWorkerCode) => WorkerStub;
-    }) | undefined;
-    if (!loader) {
-      throw new Error("CODE_MODE_LOADER binding is not configured");
-    }
-
     const timeoutMs = clampCodeModeInteger(
       request.timeoutMs,
       CODE_MODE_DEFAULT_TIMEOUT_MS,
@@ -1682,6 +1677,24 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       1000,
       CODE_MODE_MAX_OUTPUT_CHARACTERS,
     );
+    const loader = this.env.CODE_MODE_LOADER as (WorkerLoader & {
+      load?: (code: WorkerLoaderWorkerCode) => WorkerStub;
+    }) | undefined;
+    if (!loader) {
+      const result = await runPortableCode(this.env, {
+        code,
+        orgId: request.orgId,
+        workspaceId: request.workspaceId,
+        userId: request.userId,
+        threadId: request.threadId,
+        toolUseId: request.toolUseId,
+        timeoutMs,
+        maxOutputCharacters,
+      });
+      return {
+        text: truncateCodeModeText(result.text, maxOutputCharacters),
+      };
+    }
     const tools = (this.ctx.exports as unknown as {
       CodeModeToolsBinding: (options: { props: CodeModeToolsProps }) => unknown;
     }).CodeModeToolsBinding({
@@ -4757,7 +4770,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   private get piCoreStore(): PiCoreMessageStore {
     return (this.piCoreStoreInstance ??= new PiCoreMessageStore({
       sql: () => this.ctx.storage.sql,
-      r2: () => this.env.R2_BUCKET,
+      r2: () => resolveObjectStore(this.env),
       chatContext: () => this.chatContext,
       takeToolDurationMs: (toolCallId) => this.takePiToolDurationMs(toolCallId),
       // Wired in PRODUCTION, not just in focused tests. Two of these operations
@@ -5380,7 +5393,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     // Defensive on both bindings: export is opt-in per environment, and this
     // runs from connect/commit paths that must never fail because telemetry
     // plumbing is absent.
-    if (!this.env?.TRANSCRIPT_LAKE || !this.ctx?.waitUntil) return;
+    if (!(this.env?.TRANSCRIPT_LAKE || this.env?.PIPELINE_SERVICE) || !this.ctx?.waitUntil) return;
     this.ctx.waitUntil(
       this.transcriptLake.syncTranscriptLake().catch((error) => {
         console.error("[ChatThreadDO] transcript lake sync failed", error);

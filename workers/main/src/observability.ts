@@ -1,6 +1,9 @@
+import { bindingFacadeJson, jsonRequest } from "./binding-facades/transport";
+
 export interface ObservabilityEnv {
   OBSERVABILITY_EVENTS?: AnalyticsEngineDataset;
   ERROR_ANALYTICS?: AnalyticsEngineDataset;
+  OBSERVABILITY_SERVICE?: Fetcher;
 }
 
 export interface RequestObservabilityContext {
@@ -90,7 +93,10 @@ export function recordObservabilityEvent(
   event: ObservabilityEvent,
 ): void {
   const dataset = env?.OBSERVABILITY_EVENTS;
-  if (!dataset) return;
+  if (!dataset) {
+    sendFacadeEvent(env, "events", event);
+    return;
+  }
 
   const now = event.timestamp ?? Date.now();
   try {
@@ -149,7 +155,11 @@ export function recordErrorEvent(
   recordObservabilityEvent(env, observabilityEvent);
 
   try {
-    env?.ERROR_ANALYTICS?.writeDataPoint({
+    if (!env?.ERROR_ANALYTICS) {
+      sendFacadeEvent(env, "errors", observabilityEvent);
+      return;
+    }
+    env.ERROR_ANALYTICS.writeDataPoint({
       blobs: [
         safeBlob(event.event, 128),
         safeBlob(event.component, 128),
@@ -178,6 +188,63 @@ export function recordErrorEvent(
   } catch (analyticsError) {
     console.warn("[observability] failed to write error analytics event", analyticsError);
   }
+}
+
+function sendFacadeEvent(
+  env: ObservabilityEnv | undefined,
+  path: "events" | "errors",
+  event: ObservabilityEvent,
+): void {
+  if (!env?.OBSERVABILITY_SERVICE) return;
+  try {
+    // This module is shared with the React Router test/runtime graph, where
+    // `cloudflare:workers` is intentionally unavailable. Start the service
+    // request eagerly and contain failures; native Analytics Engine remains
+    // the durable production fast path until callers can supply a portable
+    // request-lifetime scheduler here.
+    void bindingFacadeJson(
+      env.OBSERVABILITY_SERVICE,
+      "observability",
+      path,
+      jsonRequest({ event: facadeObservabilityEvent(event) }, { method: "POST" }),
+    ).catch((error) => {
+      console.warn(`[observability] failed to write facade ${path}`, error);
+    });
+  } catch (error) {
+    console.warn(`[observability] failed to schedule facade ${path}`, error);
+  }
+}
+
+function facadeObservabilityEvent(event: ObservabilityEvent): ObservabilityEvent {
+  return {
+    event: safeBlob(event.event, 128),
+    severity: event.severity ?? "info",
+    component: safeBlob(event.component, 128),
+    operation: safeBlob(event.operation, 128),
+    status: safeBlob(event.status, 128),
+    route: safeBlob(event.route, 256),
+    method: safeBlob(event.method, 16),
+    path: safeBlob(event.path, 256),
+    threadId: safeBlob(event.threadId, 128),
+    workspaceId: safeBlob(event.workspaceId, 128),
+    orgId: safeBlob(event.orgId, 128),
+    userId: safeBlob(event.userId, 128),
+    requestId: safeBlob(event.requestId, 128),
+    provider: safeBlob(event.provider, 64),
+    model: safeBlob(event.model, 128),
+    errorName: safeBlob(event.errorName, 128),
+    errorMessage: safeBlob(event.errorMessage, 2048),
+    errorStack: safeBlob(event.errorStack, 4096),
+    durationMs: safeNumber(event.durationMs),
+    statusCode: safeNumber(event.statusCode),
+    count: safeNumber(event.count),
+    size: safeNumber(event.size),
+    timestamp: safeNumber(event.timestamp ?? Date.now()),
+    sampleIndex: safeIndex(event.sampleIndex ?? event.threadId ?? event.workspaceId ?? event.component),
+    extraCounts: (event.extraCounts ?? [])
+      .slice(0, MAX_EXTRA_COUNTS)
+      .map((value) => safeNumber(value)),
+  };
 }
 
 function safeBlob(value: unknown, maxLength: number): string {

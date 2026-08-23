@@ -4,6 +4,7 @@ export interface ProjectBuildEnv {
   WORKSPACE_FS: DurableObjectNamespace;
   R2_BUCKET: R2Bucket;
   PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<ProjectBuildSandbox>;
+  COMPUTE_SERVICE?: Fetcher;
 }
 
 export interface ProjectBuildProps {
@@ -74,4 +75,5 @@ export interface ProjectBuildTimings {
 
 export interface ProjectBuildSandboxNamespaceEnv {
   PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<ProjectBuildSandbox>;
+  COMPUTE_SERVICE?: Fetcher;
 }

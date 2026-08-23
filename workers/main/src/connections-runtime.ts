@@ -54,6 +54,7 @@ export interface ConnectionsRuntimeEnv extends DataProxyEnv, ObservabilityEnv {
   ORG: DurableObjectNamespace<OrgDO>;
   /** Auto-expiring R2 staging bucket for warehouse exports (connection `export` method). */
   WAREHOUSE_EXPORT_BUCKET?: R2Bucket;
+  OBJECT_STORE_SERVICE?: Fetcher;
   DISCORD_BRIDGE?: DiscordBridgeFetcher;
   DISCORD_CHANNEL_ENABLED?: string;
   DISCORD_CLIENT_ID?: string;

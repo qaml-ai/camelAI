@@ -13,6 +13,7 @@
 // readers dedupe on (thread_id, idx) keeping the newest ingested_at_ms.
 import {
   boundLakeErrorMessage,
+  hasLakeStream,
   sendPiMessageRecords,
   truncateForLake,
   type LakeStreamEnv,
@@ -166,7 +167,7 @@ export class TranscriptLakeMirror {
   private inFlightSync?: Promise<void>;
 
   private async runSync(options: { force?: boolean }): Promise<void> {
-    if (!this.deps.env().TRANSCRIPT_LAKE) return;
+    if (!hasLakeStream(this.deps.env(), "TRANSCRIPT_LAKE")) return;
     const context = this.deps.chatContext();
     const threadId = context?.threadId ?? "";
     if (!threadId) return;

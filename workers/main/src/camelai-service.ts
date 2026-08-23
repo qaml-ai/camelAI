@@ -15,6 +15,8 @@ import {
   transcribeAudioBytes,
   type AudioTranscriptionResult,
 } from "./audio-transcription.js";
+import { resolveAiBinding } from "./binding-facades/managed.js";
+import { resolveObjectStore } from "./binding-facades/object-store.js";
 
 export type CamelAiServiceProps = AIVirtualBindingProps;
 export type TranscribeAudioInput =
@@ -59,7 +61,7 @@ export class CamelAiService extends WorkerEntrypoint<
   async transcribeAudio(
     input: TranscribeAudioInput,
   ): Promise<AudioTranscriptionResult> {
-    const ai = this.env.AI;
+    const ai = resolveAiBinding(this.env) as Ai | undefined;
     if (!ai) {
       throw new Error("Audio transcription is not configured");
     }
@@ -79,10 +81,7 @@ export class CamelAiService extends WorkerEntrypoint<
   }
 
   private async readMountedAudioObject(path: string): Promise<ArrayBuffer> {
-    const bucket = this.env.R2_BUCKET;
-    if (!bucket) {
-      throw new Error("Workspace file storage is not configured");
-    }
+    const bucket = resolveObjectStore(this.env);
     const resolved = resolveMountedAudioPath(path);
     if (!resolved) {
       throw new Error(

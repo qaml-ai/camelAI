@@ -3,6 +3,7 @@ import { requireWorkspaceAccess } from './workspaces.utils';
 import { getEnv } from '@/lib/cloudflare.server';
 import { isSelfhostRuntime } from '@/lib/selfhost-runtime';
 import { buildWorkspaceScopedR2Key } from '@/lib/workspace-r2-paths';
+import { resolveObjectStore } from '../../../workers/main/src/binding-facades/object-store';
 
 function generateUniqueFilename(originalName: string): string {
   const timestamp = Date.now();
@@ -115,7 +116,7 @@ async function handleMultipartCreate(
     });
   }
 
-  const multipartUpload = await env.R2_BUCKET.createMultipartUpload(r2Key, {
+  const multipartUpload = await resolveObjectStore(env).createMultipartUpload(r2Key, {
     httpMetadata: { contentType },
     customMetadata: {
       originalName,
@@ -153,7 +154,7 @@ async function handleDirectUpload(
     || filename;
   const contentType = request.headers.get('Content-Type')?.trim() || DEFAULT_CONTENT_TYPE;
   const r2Key = buildUploadKey(orgId, workspaceId, filename);
-  const object = await env.R2_BUCKET.put(r2Key, request.body, {
+  const object = await resolveObjectStore(env).put(r2Key, request.body, {
     httpMetadata: { contentType },
     customMetadata: {
       originalName,
@@ -191,7 +192,7 @@ async function handleMultipartUploadPart(
   }
 
   const r2Key = buildUploadKey(orgId, workspaceId, filename);
-  const multipartUpload = env.R2_BUCKET.resumeMultipartUpload(r2Key, uploadId);
+  const multipartUpload = resolveObjectStore(env).resumeMultipartUpload(r2Key, uploadId);
 
   try {
     const uploadedPart = await multipartUpload.uploadPart(partNumber, request.body);
@@ -226,7 +227,7 @@ async function handleMultipartComplete(
   }
 
   const r2Key = buildUploadKey(orgId, workspaceId, filename);
-  const multipartUpload = env.R2_BUCKET.resumeMultipartUpload(r2Key, uploadId);
+  const multipartUpload = resolveObjectStore(env).resumeMultipartUpload(r2Key, uploadId);
 
   try {
     const object = await multipartUpload.complete(parts);
@@ -256,7 +257,7 @@ async function handleMultipartAbort(
   }
 
   const r2Key = buildUploadKey(orgId, workspaceId, filename);
-  const multipartUpload = env.R2_BUCKET.resumeMultipartUpload(r2Key, uploadId);
+  const multipartUpload = resolveObjectStore(env).resumeMultipartUpload(r2Key, uploadId);
 
   try {
     await multipartUpload.abort();

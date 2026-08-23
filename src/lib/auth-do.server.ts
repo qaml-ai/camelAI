@@ -36,6 +36,7 @@ import {
   deleteDeployedAppRuntime,
   getDispatchScriptName,
 } from "./deployed-app-delete.server";
+import { resolveObjectStore } from "../../workers/main/src/binding-facades/object-store";
 import {
   getAppIndexDatabase,
   getAppIndexReadDatabase,
@@ -1350,32 +1351,39 @@ export async function hardDeleteAdminOrgWithEnv(
     warnings.push(`Failed to clean worker sessions: ${toErrorMessage(error)}`);
   }
 
-  // Best-effort cleanup of R2 artifacts (uploads/outputs/previews/workspace storage).
+  // Best-effort cleanup of object-store artifacts (uploads/outputs/previews/workspace storage).
   try {
-    await deleteR2Prefix(env.R2_BUCKET, `${PREVIEW_PREFIX}${orgId}/`);
-  } catch (error) {
-    warnings.push(
-      `Failed to clean app previews in R2: ${toErrorMessage(error)}`,
-    );
-  }
+    const objectStore = resolveObjectStore(env);
+    try {
+      await deleteR2Prefix(objectStore, `${PREVIEW_PREFIX}${orgId}/`);
+    } catch (error) {
+      warnings.push(
+        `Failed to clean app previews in R2: ${toErrorMessage(error)}`,
+      );
+    }
 
-  try {
-    await deleteR2Prefix(env.R2_BUCKET, `${orgId}/`);
-  } catch (error) {
-    warnings.push(
-      `Failed to clean workspace uploads/outputs in R2: ${toErrorMessage(error)}`,
-    );
-  }
+    try {
+      await deleteR2Prefix(objectStore, `${orgId}/`);
+    } catch (error) {
+      warnings.push(
+        `Failed to clean workspace uploads/outputs in R2: ${toErrorMessage(error)}`,
+      );
+    }
 
-  try {
-    const orgSafe = sanitizeStorageName(orgId);
-    for (const workspaceId of workspaceIds) {
-      const wsSafe = sanitizeStorageName(workspaceId);
-      await deleteR2Prefix(env.R2_BUCKET, `chiridion-${orgSafe}-${wsSafe}/`);
+    try {
+      const orgSafe = sanitizeStorageName(orgId);
+      for (const workspaceId of workspaceIds) {
+        const wsSafe = sanitizeStorageName(workspaceId);
+        await deleteR2Prefix(objectStore, `chiridion-${orgSafe}-${wsSafe}/`);
+      }
+    } catch (error) {
+      warnings.push(
+        `Failed to clean workspace storage in R2: ${toErrorMessage(error)}`,
+      );
     }
   } catch (error) {
     warnings.push(
-      `Failed to clean workspace storage in R2: ${toErrorMessage(error)}`,
+      `Skipped object-store cleanup because storage is unavailable: ${toErrorMessage(error)}`,
     );
   }
 

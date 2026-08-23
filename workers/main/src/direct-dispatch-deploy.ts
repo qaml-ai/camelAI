@@ -22,6 +22,10 @@ import {
   acquireUsageGuardOperationLeaseWithRetry,
   releaseUsageGuardOperationLease,
 } from "./usage-guard-state.js";
+import {
+  hasObjectStore,
+  resolveObjectStore,
+} from "./binding-facades/object-store.js";
 
 const DIRECT_DEPLOY_WRITE_CONCURRENCY = 16;
 const CLOUDFLARE_STATIC_ASSET_MAX_BYTES = 25 * 1024 * 1024;
@@ -49,6 +53,7 @@ export interface DirectDispatchDeployEnv {
   APP_KV?: KVNamespace;
   APP_DB?: D1Database;
   R2_BUCKET?: R2Bucket;
+  OBJECT_STORE_SERVICE?: Fetcher;
 }
 
 export interface DirectDispatchDeployIdentity {
@@ -859,11 +864,12 @@ export async function rollbackWorkerDeployFromArtifactCache(
   if (!cfApiToken) throw new Error("CF_API_TOKEN is required for direct rollback");
   if (!accountId) throw new Error("CF_ACCOUNT_ID is required for direct rollback");
   if (!dispatchNamespace) throw new Error("CF_DISPATCH_NAMESPACE is required for direct rollback");
-  if (!env.R2_BUCKET) throw new Error("R2_BUCKET is required for direct rollback");
+  if (!hasObjectStore(env)) throw new Error("R2_BUCKET is required for direct rollback");
+  const bucket = resolveObjectStore(env);
 
   const artifactCacheKey = request.artifactCacheKey.trim();
   if (!artifactCacheKey) throw new Error("artifactCacheKey is required for direct rollback");
-  const object = await env.R2_BUCKET.get(artifactCacheKey);
+  const object = await bucket.get(artifactCacheKey);
   if (!object) throw new Error(`Deploy artifact cache not found: ${artifactCacheKey}`);
   const record = validateArtifactCacheRecord(JSON.parse(await object.text()), artifactCacheKey);
   if (request.expected?.orgId && record.identity.orgId !== request.expected.orgId) {
@@ -984,14 +990,13 @@ function loadDirectAssetsFromRecord(
   appId: string,
   record: SelfhostAssetsRecord,
 ): DirectDeployAsset[] {
-  if (!env.R2_BUCKET) throw new Error("R2_BUCKET is required for direct deploy assets");
+  const bucket = resolveObjectStore(env);
   return Object.entries(record.manifest).map(([path, entry]) => ({
     path,
     size: entry.size ?? 0,
     ...(entry.contentType ? { contentType: entry.contentType } : {}),
     read: async () => {
-      if (!env.R2_BUCKET) throw new Error("R2_BUCKET is required for direct deploy assets");
-      const object = await env.R2_BUCKET.get(selfhostAssetObjectKey(appId, entry.hash));
+      const object = await bucket.get(selfhostAssetObjectKey(appId, entry.hash));
       if (!object) throw new Error(`Deploy artifact asset blob not found: ${path}`);
       return new Uint8Array(await object.arrayBuffer());
     },
@@ -1076,7 +1081,8 @@ function prepareDirectAssetsRecord(
   const hasAssetsBinding = request.metadata.bindings?.some((binding) => binding.type === "assets") || Boolean(request.metadata.assets);
   if (!hasAssetsBinding) return { record: null, store: null };
   if (!env.APP_KV) throw new Error("APP_KV is required for direct deploy assets");
-  if (preparedAssets.length > 0 && !env.R2_BUCKET) throw new Error("R2_BUCKET is required for direct deploy assets");
+  if (preparedAssets.length > 0 && !hasObjectStore(env)) throw new Error("R2_BUCKET is required for direct deploy assets");
+  const bucket = preparedAssets.length > 0 ? resolveObjectStore(env) : undefined;
 
   const manifest: SelfhostAssetsRecord["manifest"] = {};
   for (const asset of preparedAssets) {
@@ -1097,8 +1103,7 @@ function prepareDirectAssetsRecord(
   // so at most DIRECT_DEPLOY_ASSET_BATCH_SIZE payloads are resident at a time.
   const store = preparedAssets.length > 0
     ? mapWithConcurrency(preparedAssets, DIRECT_DEPLOY_ASSET_BATCH_SIZE, async (asset) => {
-      if (!env.R2_BUCKET) throw new Error("R2_BUCKET is required for direct deploy assets");
-      await env.R2_BUCKET.put(
+      await bucket!.put(
         selfhostAssetObjectKey(appId, asset.r2Hash),
         await asset.read(),
         asset.contentType ? { httpMetadata: { contentType: asset.contentType } } : undefined,
@@ -1128,7 +1133,7 @@ async function prepareDeployArtifactCache(
     assetsRecord: SelfhostAssetsRecord | null;
   },
 ): Promise<PreparedDeployArtifactCache | undefined> {
-  if (!env.R2_BUCKET) return undefined;
+  if (!hasObjectStore(env)) return undefined;
   const moduleFingerprints = await mapWithConcurrency(input.modules, DIRECT_DEPLOY_WRITE_CONCURRENCY, async (module) => {
     const bytes = contentBytes(module.content);
     return {
@@ -1172,9 +1177,9 @@ async function storePreparedDeployArtifactCache(
   env: DirectDispatchDeployEnv,
   prepared: PreparedDeployArtifactCache,
 ): Promise<void> {
-  if (!env.R2_BUCKET) return;
+  if (!hasObjectStore(env)) return;
   const record = await prepared.record;
-  await env.R2_BUCKET.put(prepared.key, JSON.stringify(record), {
+  await resolveObjectStore(env).put(prepared.key, JSON.stringify(record), {
     httpMetadata: { contentType: "application/json; charset=utf-8" },
     customMetadata: {
       type: "direct-deploy-artifact-cache",

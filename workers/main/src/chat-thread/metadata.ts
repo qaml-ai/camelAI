@@ -32,6 +32,7 @@ import type {
 import type { OrgDO, UserDO } from "../auth";
 import type { ChatGroupIconGenerationClaim } from "../identity/user-do";
 import type { WorkspaceThreadStreamingOptions } from "../thread-status";
+import { resolveAiBinding } from "../binding-facades/managed";
 import type { ChatContextState } from "./types";
 
 export type AssistantCompletionPersistenceResult =
@@ -45,7 +46,8 @@ export type AssistantCompletionPersistenceResult =
 export interface ChatThreadMetadataEnv {
   ORG: DurableObjectNamespace<OrgDO>;
   USER: DurableObjectNamespace<UserDO>;
-  AI: Ai;
+  AI?: Ai;
+  AI_SERVICE?: Fetcher;
   CF_GATEWAY_NAME?: string;
 }
 
@@ -135,6 +137,10 @@ export interface ChatThreadMetadataDeps {
 
 export class ChatThreadMetadata {
   constructor(private readonly deps: ChatThreadMetadataDeps) {}
+
+  private ai(): Ai | undefined {
+    return resolveAiBinding(this.deps.env()) as Ai | undefined;
+  }
 
   async recordThreadAssistantCompletion(
     context: ChatContextState,
@@ -303,7 +309,7 @@ export class ChatThreadMetadata {
   ): Promise<void> {
     try {
       const summary = await generateThreadCompletionSummaryWithOpenAI(
-        this.deps.env().AI,
+        this.ai(),
         sourceText,
         {
           orgId: context.orgId,
@@ -416,7 +422,7 @@ export class ChatThreadMetadata {
     let selectionOutcome: ChatGroupIconSelectionOutcome = "ai_error";
     try {
       generatedIcon = await generateChatGroupIconWithOpenAI(
-        this.deps.env().AI,
+        this.ai(),
         claim.name,
         {
           orgId: context.orgId,
@@ -570,7 +576,7 @@ export class ChatThreadMetadata {
     ) {
       return;
     }
-    if (!this.deps.env().AI || typeof this.deps.env().AI.run !== "function") {
+    if (!this.ai()) {
       console.warn("[ChatThreadDO] skipping chat group avatar generation", {
         reason: "missing_ai",
         threadId: normalizedThreadId,
@@ -614,7 +620,7 @@ export class ChatThreadMetadata {
       }
 
       const title = await generateThreadTitleWithOpenAI(
-        this.deps.env().AI,
+        this.ai(),
         message,
         {
           orgId: context.orgId,

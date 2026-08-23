@@ -47,6 +47,8 @@ import {
 import { getAppIndexReadDatabase } from "../app-index-db.js";
 import type { OrgDO } from "../auth.js";
 import type { WorkspaceIntegrationRecord } from "../workspace.js";
+import { resolveQueueBinding } from "../binding-facades/managed.js";
+import { resolveObjectStore } from "../binding-facades/object-store.js";
 
 interface SlackCredentials {
   access_token?: string;
@@ -1066,7 +1068,7 @@ async function uploadSlackEventFiles(
         installation.workspaceId,
         `user-uploads/${storedFilename}`,
       );
-      await env.R2_BUCKET.put(r2Key, body, {
+      await resolveObjectStore(env).put(r2Key, body, {
         httpMetadata: { contentType },
         customMetadata: {
           originalName,
@@ -1458,7 +1460,7 @@ async function uploadTelegramFile(args: {
     args.contentType ||
     response.headers.get("content-type") ||
     "application/octet-stream";
-  await args.env.R2_BUCKET.put(r2Key, body, {
+  await resolveObjectStore(args.env).put(r2Key, body, {
     httpMetadata: {
       contentType,
     },
@@ -1819,9 +1821,14 @@ export async function handleSlackEvents({
     });
   }
 
-  if (env.SLACK_EVENTS_QUEUE) {
+  const slackEventsQueue = resolveQueueBinding(
+    env,
+    "SLACK_EVENTS_QUEUE",
+    env.SLACK_EVENTS_QUEUE,
+  );
+  if (slackEventsQueue) {
     try {
-      await env.SLACK_EVENTS_QUEUE.send({
+      await slackEventsQueue.send({
         payload,
         received_at: Date.now(),
       });

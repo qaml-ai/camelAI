@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const configPath = path.join(repoRoot, "build/server/wrangler.celld.json");
 const prepareScript = path.join(repoRoot, "scripts/prepare-celld-deployment.mjs");
+const deployScript = path.join(repoRoot, "scripts/celld-deploy.mjs");
 
 execFileSync(process.execPath, [prepareScript], { cwd: repoRoot, stdio: "inherit" });
 
@@ -38,6 +39,19 @@ assert.equal(config.vars.CF_DISPATCH_NAMESPACE, "selfhost");
 assert.equal(config.vars.CELLD_RUNTIME, "1");
 assert.equal(config.vars.LOCAL_APP_VANITY_DOMAIN, "localhost");
 assert.equal(config.assets.directory, "celld-assets");
+const facadeBindings = [
+  "OBJECT_STORE_SERVICE",
+  "ARTIFACTS_SERVICE",
+  "COMPUTE_SERVICE",
+  "CODE_EXECUTOR_SERVICE",
+  "AI_SERVICE",
+  "EMAIL_SERVICE",
+  "BROWSER_SERVICE",
+  "IMAGES_SERVICE",
+  "QUEUE_SERVICE",
+  "PIPELINE_SERVICE",
+  "OBSERVABILITY_SERVICE",
+];
 assert.deepEqual(config.services, [
   {
     binding: "APP_KV",
@@ -58,6 +72,10 @@ assert.deepEqual(config.services, [
     binding: "WORKER_SELF_REFERENCE",
     service: "chiridion-celld",
   },
+  ...facadeBindings.map((binding) => ({
+    binding,
+    service: "chiridion-celld-facades",
+  })),
 ]);
 assert.deepEqual(config.d1_databases, [
   {
@@ -105,6 +123,23 @@ const stagedAssetIgnore = path.join(
 await assert.rejects(
   fs.access(stagedAssetIgnore),
   "celld rejects Wrangler's generated .assetsignore file",
+);
+
+const deploySource = await fs.readFile(deployScript, "utf8");
+assert.match(
+  deploySource,
+  /FACADE_GATEWAY_TOKEN is required/,
+  "facade deployment must fail closed without its gateway token",
+);
+assert.match(
+  deploySource,
+  /mode: 0o600/,
+  "the runtime facade manifest containing the gateway token must be private",
+);
+assert.match(
+  deploySource,
+  /rmSync\(temporaryDirectory, \{ recursive: true, force: true \}\)/,
+  "the runtime facade manifest must be removed after deployment",
 );
 
 console.log("celld deployment config checks passed.");

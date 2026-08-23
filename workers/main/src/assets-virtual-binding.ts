@@ -5,10 +5,12 @@ import {
   selfhostAssetsKey,
   type SelfhostAssetsRecord,
 } from "./selfhost-assets-registry.js";
+import { resolveObjectStore } from "./binding-facades/object-store.js";
 
 interface AssetsVirtualBindingEnv {
   APP_KV: KVNamespace;
-  R2_BUCKET: R2Bucket;
+  R2_BUCKET?: R2Bucket;
+  OBJECT_STORE_SERVICE?: Fetcher;
 }
 
 interface AssetsVirtualBindingProps {
@@ -40,7 +42,7 @@ export class AssetsVirtualBinding extends WorkerEntrypoint<AssetsVirtualBindingE
     const entry = lookupAsset(record, decodeURIComponent(url.pathname));
     if (!entry) return new Response("Not Found", { status: 404 });
 
-    const object = await this.env.R2_BUCKET.get(
+    const object = await resolveObjectStore(this.env).get(
       selfhostAssetObjectKey(record.appId, entry.hash),
     );
     if (!object) return new Response("Not Found", { status: 404 });

@@ -3,9 +3,11 @@ import { getEnv, type CloudflareEnv } from '@/lib/cloudflare.server';
 import { type AuthEnv } from '@/lib/auth-helpers';
 import { getSession } from '@/lib/auth.server';
 import { isOrgMember } from '@/lib/auth-do';
+import { resolveObjectStore } from '../../../workers/main/src/binding-facades/object-store';
 
 interface R2Env extends AuthEnv {
-  R2_BUCKET: R2Bucket;
+  R2_BUCKET?: R2Bucket;
+  OBJECT_STORE_SERVICE?: Fetcher;
 }
 
 function getR2Env(env: CloudflareEnv): R2Env {
@@ -18,6 +20,7 @@ function getR2Env(env: CloudflareEnv): R2Env {
     APP_KV: env.APP_KV,
     TOKEN_SIGNING_SECRET: env.TOKEN_SIGNING_SECRET,
     R2_BUCKET: env.R2_BUCKET,
+    OBJECT_STORE_SERVICE: env.OBJECT_STORE_SERVICE,
   };
 }
 
@@ -47,7 +50,7 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
       return Response.json({ error: 'Preview not available' }, { status: 404 });
     }
 
-    const object = await env.R2_BUCKET.get(script.preview_key);
+    const object = await resolveObjectStore(env).get(script.preview_key);
     if (!object) {
       return Response.json({ error: 'Preview not available' }, { status: 404 });
     }

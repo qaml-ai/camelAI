@@ -19,15 +19,17 @@ export async function loader({ context }: LoaderFunctionArgs) {
   }
 
   const checks: HealthCheck[] = [];
+  const facadePlane = await checkBindingFacadePlane(env);
+  if (facadePlane.check) checks.push(facadePlane.check);
 
   checks.push(required("APP_KV", env.APP_KV));
   checks.push(required("SESSIONS", env.SESSIONS));
-  checks.push(required("R2_BUCKET", env.R2_BUCKET));
+  checks.push(requiredAlternative("R2_BUCKET", env.R2_BUCKET, "OBJECT_STORE_SERVICE", env.OBJECT_STORE_SERVICE, facadePlane.ready));
   checks.push(required("APP_DB", env.APP_DB));
-  checks.push(required("ARTIFACTS", env.ARTIFACTS));
-  checks.push(configuredComputeBinding("PROJECT_BUILD_SANDBOX", env.PROJECT_BUILD_SANDBOX));
-  checks.push(configuredComputeBinding("ANALYSIS_SANDBOX", env.ANALYSIS_SANDBOX));
-  checks.push(configuredComputeBinding("DB_QUERY_SANDBOX", env.DB_QUERY_SANDBOX));
+  checks.push(requiredAlternative("ARTIFACTS", env.ARTIFACTS, "ARTIFACTS_SERVICE", env.ARTIFACTS_SERVICE, facadePlane.ready));
+  checks.push(configuredComputeBinding("PROJECT_BUILD_SANDBOX", env.PROJECT_BUILD_SANDBOX, env.COMPUTE_SERVICE, facadePlane.ready));
+  checks.push(configuredComputeBinding("ANALYSIS_SANDBOX", env.ANALYSIS_SANDBOX, env.COMPUTE_SERVICE, facadePlane.ready));
+  checks.push(configuredComputeBinding("DB_QUERY_SANDBOX", env.DB_QUERY_SANDBOX, env.COMPUTE_SERVICE, facadePlane.ready));
   checks.push(requiredVar("WORKER_BASE_URL", env.WORKER_BASE_URL));
   checks.push(requiredVar("LOCAL_APP_VANITY_DOMAIN", env.LOCAL_APP_VANITY_DOMAIN));
   checks.push(requiredVar("LOCAL_APP_IFRAME_DOMAIN", env.LOCAL_APP_IFRAME_DOMAIN));
@@ -38,7 +40,15 @@ export async function loader({ context }: LoaderFunctionArgs) {
     checks.push(await checkD1(env.APP_DB));
   }
 
-  if (env.LOCAL_ARTIFACTS_BASE_URL) {
+  if (env.ARTIFACTS_SERVICE) {
+    checks.push({
+      name: "local-artifacts",
+      status: facadePlane.ready ? "ok" : "fail",
+      message: facadePlane.ready
+        ? "ARTIFACTS_SERVICE facade gateway is healthy"
+        : "ARTIFACTS_SERVICE is configured but the facade gateway is unhealthy",
+    });
+  } else if (env.LOCAL_ARTIFACTS_BASE_URL) {
     checks.push(await checkHttp("local-artifacts", `${env.LOCAL_ARTIFACTS_BASE_URL.replace(/\/+$/, "")}/health`));
   } else {
     checks.push({ name: "local-artifacts", status: "warn", message: "LOCAL_ARTIFACTS_BASE_URL is not configured" });
@@ -53,9 +63,9 @@ export async function loader({ context }: LoaderFunctionArgs) {
       status: failed > 0 ? "fail" : warned > 0 ? "warn" : "ok",
       checks,
       capabilities: getSelfhostCapabilityContract({
-        projectBuild: Boolean(env.PROJECT_BUILD_SANDBOX),
-        analysis: Boolean(env.ANALYSIS_SANDBOX),
-        databaseQuery: Boolean(env.DB_QUERY_SANDBOX),
+        projectBuild: Boolean(env.PROJECT_BUILD_SANDBOX || (env.COMPUTE_SERVICE && facadePlane.ready)),
+        analysis: Boolean(env.ANALYSIS_SANDBOX || (env.COMPUTE_SERVICE && facadePlane.ready)),
+        databaseQuery: Boolean(env.DB_QUERY_SANDBOX || (env.COMPUTE_SERVICE && facadePlane.ready)),
         CONNECTIONS_BINDING_ENABLED: env.CONNECTIONS_BINDING_ENABLED,
       }),
     },
@@ -73,15 +83,104 @@ function required(name: string, value: unknown): HealthCheck {
     : { name, status: "fail", message: "binding is not configured" };
 }
 
-function configuredComputeBinding(name: string, value: unknown): HealthCheck {
-  return value
-    ? {
-        name,
-        status: "ok",
-        message:
-          "namespace configured; Docker execution is verified separately by the self-host container smoke",
-      }
-    : { name, status: "fail", message: "binding is not configured" };
+function requiredAlternative(
+  nativeName: string,
+  nativeValue: unknown,
+  facadeName: string,
+  facadeValue: unknown,
+  facadeReady: boolean,
+): HealthCheck {
+  if (nativeValue) return { name: nativeName, status: "ok" };
+  if (facadeValue) {
+    return {
+      name: nativeName,
+      status: facadeReady ? "ok" : "fail",
+      message: facadeReady
+        ? `provided by healthy ${facadeName}`
+        : `${facadeName} is configured but its gateway is unhealthy`,
+    };
+  }
+  return {
+    name: nativeName,
+    status: "fail",
+    message: `configure ${nativeName} or ${facadeName}`,
+  };
+}
+
+function configuredComputeBinding(
+  name: string,
+  value: unknown,
+  computeService: unknown,
+  facadeReady: boolean,
+): HealthCheck {
+  if (value) {
+    return {
+      name,
+      status: "ok",
+      message: "namespace configured; Docker execution is verified separately by the self-host container smoke",
+    };
+  }
+  if (computeService) {
+    return {
+      name,
+      status: facadeReady ? "ok" : "fail",
+      message: facadeReady
+        ? "provided by healthy COMPUTE_SERVICE; runner execution is verified separately"
+        : "COMPUTE_SERVICE is configured but its gateway is unhealthy",
+    };
+  }
+  return {
+    name,
+    status: "fail",
+    message: `configure ${name} or COMPUTE_SERVICE`,
+  };
+}
+
+async function checkBindingFacadePlane(
+  env: ReturnType<typeof getEnv>,
+): Promise<{ ready: boolean; check: HealthCheck | null }> {
+  const service = env.OBJECT_STORE_SERVICE ??
+    env.ARTIFACTS_SERVICE ??
+    env.COMPUTE_SERVICE ??
+    env.CODE_EXECUTOR_SERVICE ??
+    env.AI_SERVICE ??
+    env.EMAIL_SERVICE ??
+    env.BROWSER_SERVICE ??
+    env.IMAGES_SERVICE ??
+    env.QUEUE_SERVICE ??
+    env.PIPELINE_SERVICE ??
+    env.OBSERVABILITY_SERVICE;
+  if (!service) return { ready: false, check: null };
+
+  try {
+    const response = await service.fetch(new Request(
+      "https://camelai-binding-facade.invalid/__celld/health",
+      { signal: AbortSignal.timeout(3_000) },
+    ));
+    return {
+      ready: response.ok,
+      check: response.ok
+        ? {
+            name: "binding-facades",
+            status: "ok",
+            message: "facade proxy and host gateway are healthy",
+          }
+        : {
+            name: "binding-facades",
+            status: "fail",
+            message: `facade health returned ${response.status}`,
+          },
+    };
+  } catch (error) {
+    return {
+      ready: false,
+      check: {
+        name: "binding-facades",
+        status: "fail",
+        message: `facade health probe failed: ${error instanceof Error ? error.message : "unknown error"}`,
+      },
+    };
+  }
 }
 
 function requiredVar(name: string, value: unknown): HealthCheck {

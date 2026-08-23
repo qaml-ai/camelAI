@@ -12,9 +12,11 @@
  */
 
 import { WorkerEntrypoint } from 'cloudflare:workers';
+import { resolveObjectStore } from './binding-facades/object-store.js';
 
 interface R2VirtualBucketEnv {
-  R2_BUCKET: R2Bucket;
+  R2_BUCKET?: R2Bucket;
+  OBJECT_STORE_SERVICE?: Fetcher;
 }
 
 interface R2VirtualBucketProps {
@@ -90,7 +92,7 @@ export class R2VirtualBucket extends WorkerEntrypoint<R2VirtualBucketEnv, R2Virt
   }
 
   private get bucket(): R2Bucket {
-    return this.env.R2_BUCKET;
+    return resolveObjectStore(this.env);
   }
 
   /** Full prefix for this workspace + bucket. */

@@ -10,6 +10,7 @@ import {
 } from './data-proxy.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 import { buildSqlExportPlan } from './warehouse-export.js';
+import { resolveObjectStoreBinding } from './binding-facades/object-store.js';
 
 type JsonValue =
   | null
@@ -211,13 +212,11 @@ async function runSqlWarehouseExport(
   context: DataProxyContext,
   plan: ReturnType<typeof buildSqlExportPlan>,
 ): Promise<Record<string, JsonValue>> {
-  const bucket = env.WAREHOUSE_EXPORT_BUCKET;
-  if (!bucket) {
-    throw Object.assign(
-      new Error('Warehouse export is not enabled in this deployment (WAREHOUSE_EXPORT_BUCKET is not bound).'),
-      { status: 501 },
-    );
-  }
+  const bucket = resolveObjectStoreBinding(
+    env,
+    'WAREHOUSE_EXPORT_BUCKET',
+    env.WAREHOUSE_EXPORT_BUCKET,
+  );
   await sqlExportToWarehouse(env, context, { engine: plan.engine, body: plan.body, r2Key: plan.r2Key });
   // Self-host local mounts synchronize container writes back to the R2 binding
   // asynchronously. Cloudflare R2 can also have a brief read-after-reference

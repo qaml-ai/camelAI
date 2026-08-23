@@ -32,6 +32,8 @@ import type {
   ChannelHistoryEventRequest,
   ChannelHistoryEventResult,
 } from "./chat-thread-do";
+import { resolveEmailBinding } from "./binding-facades/managed";
+import { resolveObjectStore } from "./binding-facades/object-store";
 
 export interface ChannelToolAttachmentInput {
   path: string;
@@ -247,7 +249,7 @@ export class ChannelTools {
       context.workspaceId,
       `${resolved.bucketDir}/${resolved.relativePath}`,
     );
-    const object = await this.env.R2_BUCKET.get(key);
+    const object = await resolveObjectStore(this.env).get(key);
     if (!object) {
       throw new Error(`Attachment not found: ${input.path}`);
     }
@@ -375,7 +377,8 @@ export class ChannelTools {
       throw new Error("send_email requires text, html, or attachments");
     }
 
-    if (!this.env.EMAIL) {
+    const email = resolveEmailBinding(this.env);
+    if (!email) {
       throw new Error("Cloudflare Email Sending binding EMAIL is not configured");
     }
     const fallbackFrom = originatingEmailThread?.channel_connection_id?.trim() || "";
@@ -423,7 +426,7 @@ export class ChannelTools {
         disposition: "attachment",
       }));
     }
-    const response = await this.env.EMAIL.send(body);
+    const response = await email.send(body);
     if (response.messageId) {
       const nextReferenceIds = appendEmailThreadReferenceIds(
         emailReferenceIds,

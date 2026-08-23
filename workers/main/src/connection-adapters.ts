@@ -23,6 +23,7 @@ import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 export interface HostedConnectionAdapterEnv extends DataProxyEnv {
   INTEGRATION_SECRET_KEY: string;
+  OBJECT_STORE_SERVICE?: Fetcher;
   WAREHOUSE_EXPORT_BUCKET?: R2Bucket;
 }
 

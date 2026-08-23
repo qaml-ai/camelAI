@@ -8,6 +8,11 @@ import {
   type TextEdit,
   type TextEditDetails,
 } from "./text-edit";
+import {
+  hasObjectStore,
+  resolveObjectStore,
+} from "./binding-facades/index.js";
+import { resolveArtifactsBinding } from "./binding-facades/artifacts.js";
 
 const WORKSPACE_ROOT = "/workspace";
 const DEFAULT_INLINE_THRESHOLD = 1_500_000;
@@ -27,8 +32,10 @@ const WORKSPACE_STORE_TABLE = `cf_workspace_${WORKSPACE_STORE_NAMESPACE}`;
 
 export interface WorkspaceFilesystemEnv {
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
-  R2_BUCKET: R2Bucket;
+  R2_BUCKET?: R2Bucket;
+  OBJECT_STORE_SERVICE?: Fetcher;
   ARTIFACTS?: ArtifactsBinding;
+  ARTIFACTS_SERVICE?: Fetcher;
   CF_ACCOUNT_ID?: string;
   ARTIFACTS_NAMESPACE?: string;
 }
@@ -280,6 +287,7 @@ interface ReadyArtifactsRepoInfo extends ArtifactsRepoInfo {
 export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv> {
   private workspaceFiles?: Workspace;
   private projectFiles?: Workspace;
+  private objectStore?: R2Bucket;
   private readonly fileMutationQueues = new Map<string, Promise<void>>();
 
   constructor(ctx: DurableObjectState, env: WorkspaceFilesystemEnv) {
@@ -300,11 +308,15 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
     const durableId = this.ctx.id.toString();
     return new Workspace({
       sql: this.ctx.storage.sql,
-      r2: this.env.R2_BUCKET,
+      r2: this.r2,
       r2Prefix: fileStoreR2Prefix(scope, durableId),
       inlineThreshold: DEFAULT_INLINE_THRESHOLD,
       name: durableId,
     });
+  }
+
+  private get r2(): R2Bucket {
+    return (this.objectStore ??= resolveObjectStore(this.env));
   }
 
   private async withFileMutationQueue<T>(
@@ -536,7 +548,7 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
     if (normalized === "/") {
       return { success: false, error: "Cannot adopt an R2 object as the root directory", code: "EISDIR" };
     }
-    if (!this.env.R2_BUCKET) {
+    if (!hasObjectStore(this.env)) {
       return { success: false, error: "R2 bucket is not configured", code: "ENOR2" };
     }
     const mimeType = normalizeContentType(contentType);
@@ -562,9 +574,9 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
       if (!Number.isFinite(expectedSize) || expectedSize < 0 || Math.floor(expectedSize) !== expectedSize) {
         return { success: false, error: `Adopting a file requires its exact byte size; got ${expectedSize}`, code: "ESIZE" };
       }
-      const measured = await streamToR2(this.env.R2_BUCKET, key, stream, mimeType, expectedSize);
+      const measured = await streamToR2(this.r2, key, stream, mimeType, expectedSize);
       if (Number.isFinite(expectedSize) && expectedSize >= 0 && measured.size !== expectedSize) {
-        await this.env.R2_BUCKET.delete(key).catch(() => {});
+        await this.r2.delete(key).catch(() => {});
         return {
           success: false,
           error: `Adopted object size ${measured.size} does not match the reported source size ${expectedSize}`,
@@ -574,7 +586,7 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
 
       // Drop a previously-spilled object if this path used a different key.
       if (existing?.storage_backend === "r2" && existing.r2_key && existing.r2_key !== key) {
-        await this.env.R2_BUCKET.delete(existing.r2_key).catch(() => {});
+        await this.r2.delete(existing.r2_key).catch(() => {});
       }
 
       const now = Math.floor(Date.now() / 1000);
@@ -602,7 +614,7 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
           now,
         );
       } catch (sqlError) {
-        await this.env.R2_BUCKET.delete(key).catch(() => {});
+        await this.r2.delete(key).catch(() => {});
         throw sqlError;
       }
 
@@ -634,7 +646,7 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
   async projectRegisterUploadedR2Objects(
     input: { cursor?: string; limit?: number } = {},
   ): Promise<{ success: boolean; registered: number; cursor: string | null; done: boolean; error?: string }> {
-    if (!this.env.R2_BUCKET) {
+    if (!hasObjectStore(this.env)) {
       return { success: false, registered: 0, cursor: null, done: false, error: "R2 bucket is not configured" };
     }
     const keyPrefix = `${fileStoreR2Prefix("project", this.ctx.id.toString())}/${WORKSPACE_STORE_NAMESPACE}`;
@@ -642,7 +654,7 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
     try {
       // Materialize the store table + root via the store's own init logic.
       await this.projectWorkspace.stat("/");
-      const listing = await this.env.R2_BUCKET.list({
+      const listing = await this.r2.list({
         prefix: `${keyPrefix}/`,
         cursor: input.cursor,
         limit,
@@ -824,7 +836,7 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
         )
         .toArray()[0] as { storage_backend?: string; r2_key?: string } | undefined;
       if (spilled?.storage_backend === "r2" && spilled.r2_key) {
-        const source = await this.env.R2_BUCKET.get(spilled.r2_key);
+        const source = await this.r2.get(spilled.r2_key);
         if (!source) continue;
         const size = source.size;
         // workers-runtime global; the ambient Crypto type in this tsconfig
@@ -833,13 +845,13 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
         await source.body.pipeTo(digestStream);
         const sha256 = Array.from(new Uint8Array(await digestStream.digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
         const blobKey = projectSnapshotBlobKey(this.ctx.id.toString(), sha256);
-        const existingBlob = await this.env.R2_BUCKET.head(blobKey);
+        const existingBlob = await this.r2.head(blobKey);
         if (!existingBlob) {
-          const copySource = await this.env.R2_BUCKET.get(spilled.r2_key);
+          const copySource = await this.r2.get(spilled.r2_key);
           if (!copySource) continue;
           const fixed = new FixedLengthStream(size);
           const pump = copySource.body.pipeTo(fixed.writable);
-          await this.env.R2_BUCKET.put(blobKey, fixed.readable, {
+          await this.r2.put(blobKey, fixed.readable, {
             customMetadata: { type: "project-source-snapshot", sha256 },
           });
           await pump;
@@ -853,9 +865,9 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
       if (!bytes) continue;
       const sha256 = await sha256Hex(bytes);
       const blobKey = projectSnapshotBlobKey(this.ctx.id.toString(), sha256);
-      const existingBlob = await this.env.R2_BUCKET.head(blobKey);
+      const existingBlob = await this.r2.head(blobKey);
       if (!existingBlob) {
-        await this.env.R2_BUCKET.put(blobKey, bytes, {
+        await this.r2.put(blobKey, bytes, {
           customMetadata: { type: "project-source-snapshot", sha256 },
         });
       }
@@ -893,7 +905,7 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
       await this.projectWorkspace.rm(`/${path}`, { force: true });
     }
     for (const entry of snapshot.entries) {
-      const object = await this.env.R2_BUCKET.get(entry.blobKey);
+      const object = await this.r2.get(entry.blobKey);
       if (!object) throw new Error(`Project source snapshot blob missing: ${entry.path}`);
       const bytes = new Uint8Array(await object.arrayBuffer());
       const actualSha = await sha256Hex(bytes);
@@ -930,7 +942,7 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
     await this.ctx.storage.kv.put(PROJECT_SNAPSHOT_INDEX_KEY, []);
     let blobsDeleted = 0;
     for (const key of blobKeys) {
-      await this.env.R2_BUCKET.delete(key);
+      await this.r2.delete(key);
       blobsDeleted += 1;
     }
     return { snapshotsDeleted, blobsDeleted };
@@ -1124,7 +1136,7 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
     if (!project) {
       throw new Error(`Project not found: ${String(projectId)}`);
     }
-    const artifacts = this.env.ARTIFACTS;
+    const artifacts = resolveArtifactsBinding(this.env);
     if (!artifacts) {
       throw new Error("ARTIFACTS binding is not configured");
     }
@@ -1160,7 +1172,7 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
   }
 
   private async ensureProjectArtifactRepo(project: WorkspaceProject): Promise<WorkspaceProject> {
-    const artifacts = this.env.ARTIFACTS;
+    const artifacts = resolveArtifactsBinding(this.env);
     if (!artifacts) return project;
 
     const repoName = project.artifactRepoName || artifactRepoName(this.ctx.id.toString(), project.id);

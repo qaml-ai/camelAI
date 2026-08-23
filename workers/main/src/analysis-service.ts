@@ -13,6 +13,11 @@ import {
   sandboxSessionExitCode,
 } from "./sandbox-session-death.js";
 import { ProjectFilesystemClient, type WorkspaceFileStoreLike } from "./workspace-filesystem-do.js";
+import { resolveComputeSandbox } from "./binding-facades/compute.js";
+import {
+  hasObjectStoreBinding,
+  resolveObjectStoreBinding,
+} from "./binding-facades/object-store.js";
 
 /**
  * Unified analysis compute service — the successor to (and absorption of)
@@ -1118,6 +1123,8 @@ function annotateSessionRecovered<T>(value: T): T {
 
 interface AnalysisEnv extends ObservabilityEnv {
   ANALYSIS_SANDBOX?: unknown;
+  COMPUTE_SERVICE?: Fetcher;
+  OBJECT_STORE_SERVICE?: Fetcher;
   WAREHOUSE_EXPORT_BUCKET?: R2Bucket;
   R2_BUCKET?: R2Bucket;
   /** Same bucket as R2_BUCKET; separate binding so /outputs can mount alongside /uploads. */
@@ -1206,7 +1213,7 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
       // seal is re-applied on a recovery retry because a restarted container
       // starts from the class-level allowlist again.
       await sandbox.sealAppEgress();
-      if (this.env.WAREHOUSE_EXPORT_BUCKET) {
+      if (hasObjectStoreBinding(this.env, this.env.WAREHOUSE_EXPORT_BUCKET)) {
         await sandbox.ensureMounted(ANALYSIS_EXPORT_BUCKET_BINDING, warehouseWorkspacePrefix(this.ctx.props.workspaceId));
       }
       return runAnalysisCode(request, { sandbox, scratchId: crypto.randomUUID(), connections: false, dispatch });
@@ -1356,15 +1363,20 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
    * idempotent-cheap on a warm container.
    */
   private async prepareWorkspaceAccess(sandbox: AnalysisSandboxStub): Promise<void> {
-    if (this.env.WAREHOUSE_EXPORT_BUCKET) {
+    if (hasObjectStoreBinding(this.env, this.env.WAREHOUSE_EXPORT_BUCKET)) {
       await sandbox.ensureMounted(ANALYSIS_EXPORT_BUCKET_BINDING, warehouseWorkspacePrefix(this.ctx.props.workspaceId));
     }
-    if (this.env.R2_BUCKET && this.ctx.props.orgId) {
+    if (hasObjectStoreBinding(this.env, this.env.R2_BUCKET) && this.ctx.props.orgId) {
       // Mounted at the stable /uploads alias — the agent's `uploads/<name>`
       // reference with a leading slash — because the raw org/workspace R2
       // prefix is neither shown to the agent nor derivable in the container.
       const uploadsPrefix = `${getWorkspaceR2Prefix(this.ctx.props.orgId, this.ctx.props.workspaceId)}/user-uploads`;
-      if (await r2PrefixHasObjects(this.env.R2_BUCKET, uploadsPrefix)) {
+      const uploadsBucket = resolveObjectStoreBinding(
+        this.env,
+        ANALYSIS_UPLOADS_BUCKET_BINDING,
+        this.env.R2_BUCKET,
+      );
+      if (await r2PrefixHasObjects(uploadsBucket, uploadsPrefix)) {
         await sandbox.ensureMounted(ANALYSIS_UPLOADS_BUCKET_BINDING, uploadsPrefix, ANALYSIS_UPLOADS_MOUNT_PATH);
       }
       // Writable, and deliberately NOT gated on the prefix already having
@@ -1376,7 +1388,7 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
       // and code execution entirely — a much larger regression than the one
       // this mount exists to fix.
       const outputsPrefix = `${getWorkspaceR2Prefix(this.ctx.props.orgId, this.ctx.props.workspaceId)}/user-outputs`;
-      if (this.env.R2_OUTPUTS_BUCKET) {
+      if (hasObjectStoreBinding(this.env, this.env.R2_OUTPUTS_BUCKET)) {
         try {
           await sandbox.ensureMounted(
             ANALYSIS_OUTPUTS_BUCKET_BINDING,
@@ -1430,16 +1442,23 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
   private async resolveSandbox(scope: "agent" | "app" = "agent"): Promise<AnalysisSandboxStub> {
     const cached = this.sandboxes.get(scope);
     if (cached) return cached;
-    if (!this.env.ANALYSIS_SANDBOX) throw new Error("ANALYSIS_SANDBOX container binding is not configured");
+    if (!this.env.ANALYSIS_SANDBOX && !this.env.COMPUTE_SERVICE) {
+      throw new Error("ANALYSIS_SANDBOX container binding is not configured");
+    }
     const { getSandbox } = await import("@cloudflare/sandbox");
     // One warm container per workspace and scope; per-call isolation is via
     // working dirs.
     const sandboxId = scope === "app" ? `app-${this.ctx.props.workspaceId}` : this.ctx.props.workspaceId;
-    const sandbox = getSandbox(
-      this.env.ANALYSIS_SANDBOX as Parameters<typeof getSandbox>[0],
-      sandboxId,
-      { normalizeId: true, transport: "rpc" },
-    ) as unknown as AnalysisSandboxStub;
+    const sandbox = resolveComputeSandbox<AnalysisSandboxStub>(this.env, {
+      kind: "analysis",
+      id: sandboxId,
+      nativeAvailable: Boolean(this.env.ANALYSIS_SANDBOX),
+      native: () => getSandbox(
+        this.env.ANALYSIS_SANDBOX as Parameters<typeof getSandbox>[0],
+        sandboxId,
+        { normalizeId: true, transport: "rpc" },
+      ) as unknown as AnalysisSandboxStub,
+    });
     this.sandboxes.set(scope, sandbox);
     return sandbox;
   }

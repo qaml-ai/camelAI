@@ -15,6 +15,7 @@ export interface DOEnv {
   APP_DB?: D1Database;
   OBSERVABILITY_EVENTS?: AnalyticsEngineDataset;
   ERROR_ANALYTICS?: AnalyticsEngineDataset;
+  OBSERVABILITY_SERVICE?: Fetcher;
   EMAIL_TO_USER: KVNamespace;
   SIGNUP: DurableObjectNamespace<SignupDO>;
   APP_KV: KVNamespace;

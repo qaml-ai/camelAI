@@ -66,6 +66,19 @@ export interface Env
   // Trusted query-execution container with static-IP database egress via the
   // sandbox-host SOCKS relay (docs/db-egress-relay.md).
   DB_QUERY_SANDBOX?: DurableObjectNamespace<import('./db-query-sandbox.js').DbQuerySandbox>;
+  // Portable capability facades. Cloudflare deployments keep using native
+  // bindings; celld and other runtimes provide these Fetcher-shaped services.
+  OBJECT_STORE_SERVICE?: Fetcher;
+  ARTIFACTS_SERVICE?: Fetcher;
+  COMPUTE_SERVICE?: Fetcher;
+  CODE_EXECUTOR_SERVICE?: Fetcher;
+  AI_SERVICE?: Fetcher;
+  EMAIL_SERVICE?: Fetcher;
+  BROWSER_SERVICE?: Fetcher;
+  IMAGES_SERVICE?: Fetcher;
+  QUEUE_SERVICE?: Fetcher;
+  PIPELINE_SERVICE?: Fetcher;
+  OBSERVABILITY_SERVICE?: Fetcher;
   // Static-IP database egress relay coordinates (see infra/db-egress-relay/):
   // hostname is a var; the token/credential pairs are secrets.
   DB_EGRESS_RELAY_HOSTNAME?: string;
@@ -136,6 +149,7 @@ export interface Env
   LOCAL_AUTH_BYPASS_HOSTS?: string;
   LOCAL_AUTH_USER_EMAIL?: string;
   LOCAL_AUTH_USER_NAME?: string;
+  CELLD_RUNTIME?: string;
   RUN_AGENT_EVALS?: string;
   // Within agent eval runs, deploys go for real to the testing-grounds namespace by
   // default whenever CF_API_TOKEN is set. Set to "0"/"false" to disable real deploys

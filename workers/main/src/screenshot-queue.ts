@@ -7,6 +7,7 @@ import {
   shouldUseDispatchInterceptionForScreenshot,
   type WorkspaceAppFetcherEnv,
 } from './workspace-app-fetcher.js';
+import { resolveObjectStore } from './binding-facades/object-store.js';
 
 export interface AppScreenshotJob {
   script_name: string;
@@ -20,7 +21,8 @@ export interface AppScreenshotJob {
 
 export interface ScreenshotEnv extends WorkspaceAppFetcherEnv {
   BROWSER?: Fetcher;
-  R2_BUCKET: R2Bucket;
+  R2_BUCKET?: R2Bucket;
+  OBJECT_STORE_SERVICE?: Fetcher;
   ORG: DurableObjectNamespace<OrgDO>;
 }
 
@@ -81,7 +83,8 @@ export async function captureScreenshot(
     );
 
     const { currentKey, versionedKey } = buildPreviewKeys(job);
-    await env.R2_BUCKET.put(versionedKey, image, {
+    const bucket = resolveObjectStore(env);
+    await bucket.put(versionedKey, image, {
       httpMetadata: {
         contentType: 'image/jpeg',
         cacheControl: 'public, max-age=31536000, immutable',
@@ -93,7 +96,7 @@ export async function captureScreenshot(
         deploy_ts: String(job.deploy_ts),
       },
     });
-    await env.R2_BUCKET.put(currentKey, image, {
+    await bucket.put(currentKey, image, {
       httpMetadata: {
         contentType: 'image/jpeg',
         cacheControl: 'public, max-age=300',

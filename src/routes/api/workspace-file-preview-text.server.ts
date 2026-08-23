@@ -4,6 +4,7 @@ import { FULL_TEXT_PREVIEW_BYTE_LIMIT } from '@/lib/file-preview-limits';
 import { getR2ObjectWithRetry } from '@/lib/r2-read-retry';
 import { buildWorkspaceScopedR2Key } from '@/lib/workspace-r2-paths';
 import { ProjectFilesystemClient, WorkspaceFilesystemClient } from '../../../workers/main/src/workspace-filesystem-do';
+import { resolveObjectStore } from '../../../workers/main/src/binding-facades/object-store';
 import {
   hasNormalizableWhitespace,
   normalizeWorkspacePath,
@@ -193,7 +194,7 @@ async function resolvePreviewStream({
   // Retry briefly: a preview can reference the file the moment before its R2
   // write lands, which would otherwise 404 for a few seconds.
   const object = await getR2ObjectWithRetry(
-    env.R2_BUCKET,
+    resolveObjectStore(env),
     buildWorkspaceScopedR2Key(access.orgId, workspaceId, `${bucketDir}/${filePath}`)
   );
   if (!object?.body) {

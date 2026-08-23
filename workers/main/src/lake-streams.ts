@@ -17,6 +17,7 @@
 // no-ops on a missing binding exactly like recordObservabilityEvent does for a
 // missing Analytics Engine dataset.
 import { waitUntil } from "cloudflare:workers";
+import { resolveLakeStream } from "./binding-facades/managed";
 
 /**
  * Structural shape of a Pipelines stream binding. Declared locally rather than
@@ -31,6 +32,7 @@ export interface LakeStream<TRecord> {
 export interface LakeStreamEnv {
   TRANSCRIPT_LAKE?: LakeStream<PiMessageLakeRecord>;
   TOOL_CALLS_LAKE?: LakeStream<ToolCallLakeRecord>;
+  PIPELINE_SERVICE?: Fetcher;
 }
 
 /** One row per persisted pi_core message. */
@@ -144,7 +146,9 @@ export async function sendPiMessageRecords(
   env: LakeStreamEnv | undefined,
   records: PiMessageLakeRecord[],
 ): Promise<boolean> {
-  const stream = env?.TRANSCRIPT_LAKE;
+  const stream = env
+    ? resolveLakeStream(env, "TRANSCRIPT_LAKE", env.TRANSCRIPT_LAKE)
+    : undefined;
   if (!stream || records.length === 0) return false;
   try {
     await sendInBatches(stream, records);
@@ -164,11 +168,20 @@ export function sendToolCallRecords(
   env: LakeStreamEnv | undefined,
   records: ToolCallLakeRecord[],
 ): void {
-  const stream = env?.TOOL_CALLS_LAKE;
+  const stream = env
+    ? resolveLakeStream(env, "TOOL_CALLS_LAKE", env.TOOL_CALLS_LAKE)
+    : undefined;
   if (!stream || records.length === 0) return;
   waitUntil(
     sendInBatches(stream, records).catch((error) => {
       console.error("[lake] tool-call stream send failed", error);
     }),
   );
+}
+
+export function hasLakeStream(
+  env: LakeStreamEnv | undefined,
+  bindingName: "TRANSCRIPT_LAKE" | "TOOL_CALLS_LAKE",
+): boolean {
+  return Boolean(env?.[bindingName] || env?.PIPELINE_SERVICE);
 }

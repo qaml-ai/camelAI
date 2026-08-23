@@ -23,6 +23,27 @@ or artifacts in it.
 The tested node ran locally against AWS S3. No EC2, load balancer, NAT
 gateway, or public DNS resources have been created yet.
 
+## Binding facade boundary
+
+The application now has provider-neutral service-binding facades for object
+storage, artifacts, project/analysis/query compute, Code Mode execution, AI,
+email, browser automation, images, queues, pipelines, and observability. The
+celld manifest binds every one to the internal `chiridion-celld-facades`
+Worker, which forwards only allowlisted `/v1/<capability>/...` requests to the
+loopback gateway on port 7002. The bearer token is a celld secret and must not
+be placed in the checked-in manifest. The deploy command requires
+`FACADE_GATEWAY_TOKEN`, injects it through a mode-0600 temporary manifest, and
+removes that manifest after deployment.
+
+The request retains the original logical binding name. This lets one gateway
+map `R2_BUCKET`, `R2_OUTPUTS_BUCKET`, and `WAREHOUSE_EXPORT_BUCKET` to separate
+S3 buckets while Cloudflare production continues using its native bindings.
+The same application adapter is used in both cases.
+
+Durable Objects, D1, assets, workflows, and Fetcher-shaped internal services
+remain celld-native. The existing DO-backed KV service stays as a compatibility
+service until celld provides KV directly.
+
 ## Why compute is not provisioned yet
 
 Provisioning an upstream celld EC2 node now would knowingly fail to load the
@@ -51,9 +72,9 @@ a celld prototype module.
 - `CELLD_STORAGE_PROBE=1`
 - no idle eviction
 
-Build, analysis, and query containers run through a loopback-only runner that
-owns Docker. The celld process and Worker isolates do not receive the Docker
-socket.
+Build, analysis, query, and Code Mode execution run through the loopback-only
+facade gateway. The gateway owns the container runner; the celld process and
+Worker isolates do not receive the Docker socket.
 
 ## Three-node target
 

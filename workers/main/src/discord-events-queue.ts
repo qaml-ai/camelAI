@@ -17,6 +17,7 @@ import type { OrgDO } from "./auth.js";
 import type { Env } from "./types.js";
 import { buildWorkspaceScopedR2Key } from "../../../src/lib/workspace-r2-paths.js";
 import { recordErrorEvent, recordObservabilityEvent } from "./observability.js";
+import { resolveObjectStore } from "./binding-facades/object-store.js";
 
 const MAX_DISCORD_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const DISCORD_ATTACHMENT_TIMEOUT_MS = 15_000;
@@ -116,7 +117,8 @@ async function ingestDiscordAttachments(
       event.workspaceId,
       `user-uploads/${storedFilename}`,
     );
-    const existing = await env.R2_BUCKET.head(r2Key);
+    const bucket = resolveObjectStore(env);
+    const existing = await bucket.head(r2Key);
     if (existing) {
       const existingSize = Number(existing.size || attachment.size);
       if (
@@ -175,7 +177,7 @@ async function ingestDiscordAttachments(
         attachment.contentType ||
         response.headers.get("content-type") ||
         "application/octet-stream";
-      await env.R2_BUCKET.put(r2Key, body, {
+      await bucket.put(r2Key, body, {
         httpMetadata: { contentType },
         customMetadata: {
           originalName: displayName,

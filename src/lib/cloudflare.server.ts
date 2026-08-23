@@ -33,6 +33,20 @@ export interface CloudflareEnv {
   ANALYSIS_SANDBOX?: DurableObjectNamespace;
   DB_QUERY_SANDBOX?: DurableObjectNamespace;
 
+  // Portable service-binding facades used by celld and other non-Cloudflare
+  // runtimes. Native bindings remain the preferred hosted implementation.
+  OBJECT_STORE_SERVICE?: Fetcher;
+  ARTIFACTS_SERVICE?: Fetcher;
+  COMPUTE_SERVICE?: Fetcher;
+  CODE_EXECUTOR_SERVICE?: Fetcher;
+  AI_SERVICE?: Fetcher;
+  EMAIL_SERVICE?: Fetcher;
+  BROWSER_SERVICE?: Fetcher;
+  IMAGES_SERVICE?: Fetcher;
+  QUEUE_SERVICE?: Fetcher;
+  PIPELINE_SERVICE?: Fetcher;
+  OBSERVABILITY_SERVICE?: Fetcher;
+
   // KV Namespaces
   EMAIL_TO_USER: KVNamespace;
   APP_KV: KVNamespace;
@@ -127,6 +141,7 @@ export interface CloudflareEnv {
   LOCAL_AUTH_USER_NAME?: string;
   /** Comma/whitespace-separated bootstrap superuser emails (prefer wrangler secret). */
   SUPERUSER_EMAILS?: string;
+  CELLD_RUNTIME?: string;
 }
 
 /**

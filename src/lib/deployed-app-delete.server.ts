@@ -6,6 +6,7 @@ import {
   type SelfhostAssetsRecord,
 } from "../../workers/main/src/selfhost-assets-registry";
 import { selfhostWorkerKey } from "../../workers/main/src/selfhost-worker-registry";
+import { resolveObjectStore } from "../../workers/main/src/binding-facades/object-store";
 
 const R2_DELETE_BATCH_SIZE = 1_000;
 
@@ -14,7 +15,8 @@ export interface DeployedAppDeleteEnv {
   CF_DISPATCH_NAMESPACE?: string;
   CF_API_TOKEN?: string;
   APP_KV: KVNamespace;
-  R2_BUCKET: R2Bucket;
+  R2_BUCKET?: R2Bucket;
+  OBJECT_STORE_SERVICE?: Fetcher;
 }
 
 export function getDispatchScriptName(
@@ -67,6 +69,7 @@ async function deleteSelfhostAppRuntime(
   const storedAssets = await env.APP_KV.get(assetsKey);
 
   if (storedAssets) {
+    const bucket = resolveObjectStore(env);
     const record = parseSelfhostAssetsRecord(storedAssets, dispatchScriptName);
     const objectKeys = Array.from(
       new Set(
@@ -77,7 +80,7 @@ async function deleteSelfhostAppRuntime(
     );
 
     for (let offset = 0; offset < objectKeys.length; offset += R2_DELETE_BATCH_SIZE) {
-      await env.R2_BUCKET.delete(
+      await bucket.delete(
         objectKeys.slice(offset, offset + R2_DELETE_BATCH_SIZE),
       );
     }

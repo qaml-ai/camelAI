@@ -3,6 +3,7 @@ import { getEnv } from '@/lib/cloudflare.server';
 import { getR2ObjectWithRetry } from '@/lib/r2-read-retry';
 import { buildWorkspaceScopedR2Key } from '@/lib/workspace-r2-paths';
 import { requireWorkspaceAuth } from './workspaces.utils';
+import { resolveObjectStore } from '../../../workers/main/src/binding-facades/object-store';
 
 // Common MIME types for file serving
 const MIME_TYPES: Record<string, string> = {
@@ -131,7 +132,7 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
     );
     // Retry briefly: a preview can reference an output the moment before its
     // R2 write lands, which would otherwise 404 for a few seconds.
-    const object = await getR2ObjectWithRetry(env.R2_BUCKET, r2Key);
+    const object = await getR2ObjectWithRetry(resolveObjectStore(env), r2Key);
 
     if (!object) {
       return Response.json({ error: 'File not found' }, { status: 404 });

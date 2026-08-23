@@ -14,6 +14,7 @@ import {
   markUsageGuardEligible,
   type UsageGuardRegistryFields,
 } from '../usage-guard-state.js';
+import { resolveQueueBinding } from '../binding-facades/managed.js';
 
 // KV key prefix for script access info (namespaced by org-slug)
 const SCRIPT_PREFIX = 'script:';
@@ -97,7 +98,12 @@ export async function handleDeploySideEffects(env: Env, info: DeploySideEffectsI
   if (previewResult.stale) return;
 
   // Queue screenshot
-  if (!env.APP_SCREENSHOT_QUEUE) return;
+  const screenshotQueue = resolveQueueBinding(
+    env,
+    'APP_SCREENSHOT_QUEUE',
+    env.APP_SCREENSHOT_QUEUE,
+  );
+  if (!screenshotQueue) return;
 
   const jobBase: AppScreenshotJob = {
     script_name: scriptName,
@@ -114,7 +120,7 @@ export async function handleDeploySideEffects(env: Env, info: DeploySideEffectsI
       contentType: 'json',
       messageId: `${scriptName}:${script.updated_at}`,
     } as unknown as QueueSendOptions;
-    await env.APP_SCREENSHOT_QUEUE.send(jobBase, sendOptions);
+    await screenshotQueue.send(jobBase, sendOptions);
   } catch (err) {
     await orgStub.updateWorkerScriptPreview(scriptName, {
       status: 'failed',

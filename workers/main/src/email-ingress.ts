@@ -19,6 +19,7 @@ import {
   getEmailThreadReferencesKey,
   getOrCreateChannelThread,
 } from "./channels.js";
+import { resolveObjectStore } from "./binding-facades/object-store.js";
 
 interface AuthorizedSender {
   userId: string;
@@ -339,7 +340,7 @@ async function uploadEmailAttachments(
     const r2Key = buildUploadKey(args.orgId, args.workspaceId, storedFilename);
 
     try {
-      await env.R2_BUCKET.put(r2Key, payload.body, {
+      await resolveObjectStore(env).put(r2Key, payload.body, {
         httpMetadata: { contentType },
         customMetadata: {
           originalName,

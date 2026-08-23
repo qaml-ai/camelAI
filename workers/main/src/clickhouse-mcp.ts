@@ -2,6 +2,7 @@ import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { parseJsonObject, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 import { warehouseExportKey, stageWarehouseExport } from './warehouse-export.js';
+import { resolveObjectStoreBinding } from './binding-facades/object-store.js';
 
 /** Minimal context the export path needs to namespace the R2 staging key. */
 export interface ClickHouseMcpContext {
@@ -18,6 +19,7 @@ type JsonValue =
 
 interface ClickHouseMcpEnv {
   INTEGRATION_SECRET_KEY: string;
+  OBJECT_STORE_SERVICE?: Fetcher;
   /** Auto-expiring R2 staging bucket for warehouse exports. */
   WAREHOUSE_EXPORT_BUCKET?: R2Bucket;
 }
@@ -157,13 +159,11 @@ async function callClickHouseTool(
     case 'execute_sql_readonly':
       return textToolResult(await executeClickHouseJson(client, requireString(args.query, 'query')));
     case 'export': {
-      const bucket = env.WAREHOUSE_EXPORT_BUCKET;
-      if (!bucket) {
-        throw Object.assign(
-          new Error('ClickHouse warehouse export is not enabled in this deployment (WAREHOUSE_EXPORT_BUCKET is not bound).'),
-          { status: 501 },
-        );
-      }
+      const bucket = resolveObjectStoreBinding(
+        env,
+        'WAREHOUSE_EXPORT_BUCKET',
+        env.WAREHOUSE_EXPORT_BUCKET,
+      );
       // ClickHouse emits Parquet natively (`FORMAT Parquet`); stream it straight
       // into the auto-expiring warehouse bucket without buffering. The sealed
       // DuckDB container then reads `r2_key` via mountBucket.

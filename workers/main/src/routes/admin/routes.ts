@@ -16,6 +16,7 @@ import { Hono } from "hono";
 import { openApi } from "hono-zod-openapi";
 import { z } from "zod";
 import type { Env } from "../../types.js";
+import { resolveObjectStore } from "../../binding-facades/object-store.js";
 import type { LlmModel } from "../../../../../src/types.js";
 import {
   buildPublicLlmProviderConfig,
@@ -2707,6 +2708,7 @@ routes.get(
   }),
   async (c) => {
     const env = c.env;
+    const objectStore = resolveObjectStore(env);
     const { prefix } = c.req.valid("query");
     const objects: Array<{
       key: string;
@@ -2717,7 +2719,7 @@ routes.get(
     let cursor: string | undefined;
 
     while (true) {
-      const list = await env.R2_BUCKET.list({ prefix, cursor, limit: 1000 });
+      const list = await objectStore.list({ prefix, cursor, limit: 1000 });
       for (const obj of list.objects) {
         objects.push({
           key: obj.key,
@@ -3189,7 +3191,7 @@ routes.get(
       return c.json({ error: "Not found" }, 404);
     }
 
-    const obj = await c.env.R2_BUCKET.head(key);
+    const obj = await resolveObjectStore(c.env).head(key);
     if (!obj) {
       return c.json({ error: "Object not found" }, 404);
     }

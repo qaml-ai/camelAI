@@ -33,6 +33,10 @@ import {
   acquireUsageGuardOperationLeaseWithRetry,
   releaseUsageGuardOperationLease,
 } from "./usage-guard-state.js";
+import {
+  hasObjectStore,
+  resolveObjectStore,
+} from "./binding-facades/object-store.js";
 
 const VIRTUAL_DATA_PROXY_BINDING_NAME = "DATA_PROXY";
 const VIRTUAL_CONNECTIONS_BINDING_NAME = "CONNECTIONS";
@@ -299,6 +303,7 @@ export interface CfApiProxyEnv {
   APP_KV: KVNamespace;
   APP_DB?: D1Database;
   R2_BUCKET: R2Bucket;
+  OBJECT_STORE_SERVICE?: Fetcher;
   WORKSPACE: DurableObjectNamespace<WorkspaceDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   ORG: DurableObjectNamespace<OrgDO>;
@@ -1033,7 +1038,7 @@ async function storeLocalSelfhostUploadedAssets(input: {
   body: ArrayBuffer | null;
   contentType: string;
 }): Promise<Response> {
-  if (!input.env.R2_BUCKET) {
+  if (!hasObjectStore(input.env)) {
     return cfApiError(10006, "Self-host asset upload requires R2_BUCKET.", 500);
   }
   if (!input.body) {
@@ -1068,6 +1073,7 @@ async function storeLocalSelfhostUploadedAssets(input: {
   }
 
   const uploaded = new Set<string>();
+  const objectStore = resolveObjectStore(input.env);
   for (const part of parts) {
     const hash = part.name ?? part.filename;
     if (!hash) continue;
@@ -1076,7 +1082,7 @@ async function storeLocalSelfhostUploadedAssets(input: {
       part.contentType && part.contentType !== "application/null"
         ? part.contentType
         : undefined;
-    await input.env.R2_BUCKET.put(
+    await objectStore.put(
       selfhostAssetObjectKey(session.appId, hash),
       content,
       contentType ? { httpMetadata: { contentType } } : undefined,

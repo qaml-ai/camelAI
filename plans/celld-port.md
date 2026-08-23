@@ -25,6 +25,10 @@ Status: active staff-only pilot. This is not a production cutover plan yet.
 - Added a DO-backed KV compatibility service for APP_KV, EMAIL_TO_USER, and
   SESSIONS. Its real celld smoke passed text, JSON, metadata, binary structured
   clone, cursor pagination, delete, and namespace isolation.
+- Added provider-neutral application facades for object storage, artifacts,
+  compute, Code Mode, AI, email, browser/images, queues, pipelines, and
+  observability. The celld deployment binds them to one allowlisted internal
+  proxy, while Cloudflare keeps its native fast paths.
 
 The application health endpoint intentionally remains 503. APP_KV, SESSIONS,
 and APP_DB are now green; it still reports the missing R2_BUCKET, ARTIFACTS,
@@ -66,8 +70,8 @@ Upstream-shaped patches:
 
 camelAI-specific or fork-only work:
 
-1. R2-on-S3 binding backed by a separate application-data bucket
-2. external compute service binding
+1. the internal facade proxy and signed loopback capability gateway
+2. runtime security patches that are not application capabilities
 3. dynamic application scheduling and dispatch
 
 Do not change celld ownership, fencing, or replication without coordinating
@@ -84,8 +88,10 @@ with upstream. Rebase onto v0.3.1 as soon as its workflow code is public.
       TTL-aware reads, cursor pagination, and namespace isolation.
 - [ ] Add concurrent-session and node-restore integration coverage for the KV
       service.
-- [ ] Implement S3-backed R2 in the celld fork, with streaming/range reads,
-      metadata, conditionals, list, and multipart upload.
+- [x] Add the R2-compatible application facade, including streaming/range
+      transport, metadata, conditionals, list, and multipart operations.
+- [ ] Back the object-storage gateway contract with the pilot application-data
+      S3 bucket and pass its conformance suite.
 - [ ] Route WorkspaceFilesystemDO streaming operations through DO fetch until
       celld supports cross-isolate RPC streams.
 - [ ] Run APP_DB migrations through `celld d1 migrations apply`.
@@ -95,8 +101,12 @@ with upstream. Rebase onto v0.3.1 as soon as its workflow code is public.
 
 ### P1: coding
 
-- [ ] Add a signed Code Mode capability gateway. A child gets only a short
-      lived run token and gateway URL, never provider credentials.
+- [x] Add the application-side Code Mode execution facade with a local deadline;
+      provider credentials never enter the Worker request.
+- [x] Authenticate the internal facade proxy to the loopback gateway with an
+      operator-provisioned bearer secret and fail closed when it is absent.
+- [ ] Implement per-execution token minting and verification in the loopback
+      gateway.
 - [ ] Scope tokens to org, workspace, thread, tool use, allowed operations,
       expiry, and replay policy.
 - [ ] Pass `js_exec` tool listing and workspace edits.
@@ -105,10 +115,9 @@ with upstream. Rebase onto v0.3.1 as soon as its workflow code is public.
 
 ### P2: build and deploy
 
-- [ ] Add a host-local authenticated container runner implementing the
-      existing ProjectBuildSandboxLike boundary.
-- [ ] Add analysis and database-query adapters without giving celld the Docker
-      socket.
+- [x] Add application adapters for project-build, analysis, and database-query
+      compute without giving celld the Docker socket.
+- [ ] Implement the host-local authenticated runner behind those contracts.
 - [ ] Support static and fetch-only user apps in an isolated dispatcher.
 - [ ] Add virtual bindings through the same signed capability gateway.
 

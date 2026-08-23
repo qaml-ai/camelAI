@@ -21,6 +21,7 @@ import {
 import type { OrgThread } from '../identity/org-do.js';
 import { isSelfhostRuntime } from '../../../../src/lib/selfhost-runtime.js';
 import { SELFHOST_OUTBOUND_EMAIL_DISABLED_MESSAGE } from '../../../../src/lib/selfhost-capabilities.js';
+import { resolveEmailBinding } from '../binding-facades/managed.js';
 
 // ---------------------------------------------------------------------------
 // Rate limit constants
@@ -231,7 +232,8 @@ export async function handleEmailSendProxy({ req, env }: RouteContext): Promise<
   }
 
   // 2. Require Cloudflare Email Sending binding
-  if (!env.EMAIL) {
+  const email = resolveEmailBinding(env);
+  if (!email) {
     return errorResponse('Cloudflare Email Sending binding EMAIL is not configured', 503);
   }
 
@@ -334,7 +336,7 @@ export async function handleEmailSendProxy({ req, env }: RouteContext): Promise<
   // 8. Send through Cloudflare Email Sending (always from workspace address)
   let emailResult: { messageId?: string };
   try {
-    emailResult = await env.EMAIL.send(sendBody);
+    emailResult = await email.send(sendBody);
   } catch (error) {
     console.error('[email-send-proxy] upstream error', {
       error: error instanceof Error ? error.message : String(error),

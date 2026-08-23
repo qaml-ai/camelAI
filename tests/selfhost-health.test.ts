@@ -151,4 +151,73 @@ describe("self-host health route", () => {
     });
     expect(body.capabilities.features.project_deploys.available).toBe(false);
   });
+
+  it("requires the configured facade plane to pass its live gateway probe", async () => {
+    const facade = {
+      fetch: vi.fn(async () => Response.json({ ok: false }, { status: 503 })),
+    };
+    getEnvMock.mockReturnValue({
+      ...getEnvMock(),
+      R2_BUCKET: undefined,
+      ARTIFACTS: undefined,
+      PROJECT_BUILD_SANDBOX: undefined,
+      ANALYSIS_SANDBOX: undefined,
+      DB_QUERY_SANDBOX: undefined,
+      LOCAL_ARTIFACTS_BASE_URL: undefined,
+      OBJECT_STORE_SERVICE: facade,
+      ARTIFACTS_SERVICE: facade,
+      COMPUTE_SERVICE: facade,
+    });
+
+    const response = await loader({ context: {} } as never);
+    const body = await response.json() as {
+      ok: boolean;
+      checks: Array<{ name: string; status: string }>;
+      capabilities: { features: Record<string, { available: boolean | null }> };
+    };
+
+    expect(response.status).toBe(503);
+    expect(body.ok).toBe(false);
+    expect(facade.fetch).toHaveBeenCalledOnce();
+    expect(body.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "binding-facades", status: "fail" }),
+      expect.objectContaining({ name: "R2_BUCKET", status: "fail" }),
+      expect.objectContaining({ name: "PROJECT_BUILD_SANDBOX", status: "fail" }),
+    ]));
+    expect(body.capabilities.features.project_builds.available).toBe(false);
+  });
+
+  it("accepts facade-backed capabilities only after the host gateway is healthy", async () => {
+    const facade = {
+      fetch: vi.fn(async () => Response.json({ ok: true })),
+    };
+    getEnvMock.mockReturnValue({
+      ...getEnvMock(),
+      R2_BUCKET: undefined,
+      ARTIFACTS: undefined,
+      PROJECT_BUILD_SANDBOX: undefined,
+      ANALYSIS_SANDBOX: undefined,
+      DB_QUERY_SANDBOX: undefined,
+      LOCAL_ARTIFACTS_BASE_URL: undefined,
+      OBJECT_STORE_SERVICE: facade,
+      ARTIFACTS_SERVICE: facade,
+      COMPUTE_SERVICE: facade,
+    });
+
+    const response = await loader({ context: {} } as never);
+    const body = await response.json() as {
+      ok: boolean;
+      checks: Array<{ name: string; status: string }>;
+      capabilities: { features: Record<string, { state: string }> };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "binding-facades", status: "ok" }),
+      expect.objectContaining({ name: "R2_BUCKET", status: "ok" }),
+      expect.objectContaining({ name: "PROJECT_BUILD_SANDBOX", status: "ok" }),
+    ]));
+    expect(body.capabilities.features.project_builds.state).toBe("configured");
+  });
 });

@@ -22,6 +22,8 @@ export interface AIVirtualBindingEnv {
   ORG: DurableObjectNamespace<OrgDO>;
   AI?: Ai;
   R2_BUCKET?: R2Bucket;
+  OBJECT_STORE_SERVICE?: Fetcher;
+  AI_SERVICE?: Fetcher;
   CF_ACCOUNT_ID?: string;
   CF_GATEWAY_NAME?: string;
   CF_GATEWAY_BASE_URL?: string;

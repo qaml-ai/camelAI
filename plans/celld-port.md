@@ -26,10 +26,9 @@ Status: active staff-only pilot. This is not a production cutover plan yet.
   SESSIONS. Its real celld smoke passed text, JSON, metadata, binary structured
   clone, cursor pagination, delete, and namespace isolation.
 
-The application health endpoint intentionally remains 503. It reports the
-remaining missing application bindings instead of hiding them: APP_KV,
-SESSIONS, R2_BUCKET, ARTIFACTS, the three compute sandboxes, and an AI
-provider.
+The application health endpoint intentionally remains 503. APP_KV, SESSIONS,
+and APP_DB are now green; it still reports the missing R2_BUCKET, ARTIFACTS,
+three compute sandboxes, and AI provider instead of hiding them.
 
 ## Architecture boundary
 

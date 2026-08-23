@@ -1,0 +1,23 @@
+{
+  "name": "chiridion-celld-kv-smoke",
+  "main": "smoke.ts",
+  "compatibility_date": "2026-03-24",
+  "compatibility_flags": ["nodejs_compat"],
+  "services": [
+    {
+      "binding": "APP_KV",
+      "service": "chiridion-celld-kv",
+      "entrypoint": "AppKv"
+    },
+    {
+      "binding": "EMAIL_TO_USER",
+      "service": "chiridion-celld-kv",
+      "entrypoint": "EmailToUserKv"
+    },
+    {
+      "binding": "SESSIONS",
+      "service": "chiridion-celld-kv",
+      "entrypoint": "SessionsKv"
+    }
+  ]
+}

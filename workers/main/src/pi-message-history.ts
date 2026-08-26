@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { VerifiedWorkEvidence } from "./chat-thread/verified-work-state";
 
 export interface PiMessageHistoryRepairStats {
   droppedToolResults: number;
@@ -38,6 +39,7 @@ const INTERRUPTED_TOOL_RESULT_TEXT =
 
 export function repairPiMessageHistoryForReplay(
   messages: AgentMessage[],
+  verifiedWork: VerifiedWorkEvidence[] = [],
 ): PiMessageHistoryRepairResult {
   const repaired: AgentMessage[] = [];
   let pendingToolCallIds: Map<string, number> | null = null;
@@ -50,17 +52,23 @@ export function repairPiMessageHistoryForReplay(
     if (!pendingToolCallIds) return;
     for (const [id, remaining] of pendingToolCallIds.entries()) {
       for (let i = 0; i < remaining; i++) {
+        const toolName = pendingToolCallNames?.get(id) ?? "";
+        const recovered = verifiedWork.find(
+          (evidence) => evidence.id === id && evidence.toolName === toolName,
+        );
         repaired.push({
           role: "toolResult",
           toolCallId: id,
-          toolName: pendingToolCallNames?.get(id) ?? "",
+          toolName,
           content: [
             {
               type: "text",
-              text: INTERRUPTED_TOOL_RESULT_TEXT,
+              text: recovered
+                ? `Tool result recovered from durable completion evidence: ${JSON.stringify(recovered)}`
+                : INTERRUPTED_TOOL_RESULT_TEXT,
             },
           ],
-          isError: true,
+          isError: recovered?.status !== "succeeded",
           timestamp: Date.now(),
         } as unknown as AgentMessage);
         syntheticToolResults += 1;

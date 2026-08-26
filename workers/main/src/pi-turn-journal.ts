@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { VerifiedWorkEvidence } from "./chat-thread/verified-work-state";
 import { repairPiMessageHistoryForReplay } from "./pi-message-history";
 
 /**
@@ -60,11 +61,12 @@ function lastRole(messages: AgentMessage[]): string | undefined {
 export function planPiTurnResume(
   committedMessages: AgentMessage[],
   journalTail: AgentMessage[],
+  verifiedWork: VerifiedWorkEvidence[] = [],
 ): PiTurnResumePlan {
   const repaired = repairPiMessageHistoryForReplay([
     ...committedMessages,
     ...journalTail,
-  ]);
+  ], verifiedWork);
   const role = lastRole(repaired.messages);
   return {
     messages: repaired.messages,

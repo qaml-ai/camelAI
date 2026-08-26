@@ -155,6 +155,7 @@ import {
   deriveVerifiedWorkEvidence,
   formatVerifiedWorkStatePrompt,
   mergeVerifiedWorkState,
+  normalizeVerifiedWorkState,
   type VerifiedWorkEvidence,
 } from "./chat-thread/verified-work-state";
 import { resolveObjectStore } from "./binding-facades/object-store";
@@ -7948,7 +7949,9 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       const plan = planPiTurnResume(persistedMessages, [
         ...uncommittedTail,
         ...pendingSteer,
-      ]);
+      ], normalizeVerifiedWorkState(
+        this.ctx.storage.kv.get<unknown>(CHAT_VERIFIED_WORK_STATE_KEY),
+      ));
       initialMessages = [...plan.messages];
       this.recordChatThreadObservabilityEvent("pi_turn_recovered", {
         operation: "resume_interrupted_turn",

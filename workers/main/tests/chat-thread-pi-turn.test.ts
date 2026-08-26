@@ -4944,7 +4944,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(result.text).toBe(`${'x'.repeat(1000)}\n\n[Truncated: 1000 of 1200 characters]`);
   });
 
-  it('allows js_exec callers to request a longer wall-clock timeout and explains how to raise it', async () => {
+  it('allows js_exec callers to choose a shorter wall-clock timeout and explains the maximum', async () => {
     vi.useFakeTimers();
 
     const fake = Object.create(ChatThreadDO.prototype) as any;
@@ -4991,6 +4991,36 @@ describe('ChatThreadDO Pi turn handling', () => {
 
     await vi.advanceTimersByTimeAsync(150_000);
     await rejection;
+  });
+
+  it('defaults js_exec to the full platform timeout so long tool calls are not cut off at 60 seconds', async () => {
+    const run = vi.fn(async () => ({ text: 'done' }));
+    const fake = Object.create(ChatThreadDO.prototype) as any;
+    fake.env = {
+      CODE_MODE_LOADER: {
+        load: vi.fn(() => ({
+          getEntrypoint: vi.fn(() => ({ run })),
+        })),
+      },
+    };
+    fake.ctx = {
+      exports: {
+        CodeModeToolsBinding: vi.fn(() => ({})),
+        AIVirtualBinding: vi.fn(() => ({})),
+        CamelAiService: vi.fn(() => ({})),
+        SecureFetchBinding: vi.fn(() => ({ fetch: vi.fn() })),
+        AppScreenshotBinding: vi.fn(() => ({ capture: vi.fn() })),
+        AppBrowserBinding: vi.fn(() => ({ launch: vi.fn() })),
+      },
+    };
+
+    await expect(ChatThreadDO.prototype.runCodeModeJavascript.call(fake, {
+      code: 'await tools.deploy_project({ project: "demo" })',
+      orgId: 'org_1',
+      workspaceId: 'ws_1',
+    })).resolves.toEqual({ text: 'done' });
+
+    expect(run).toHaveBeenCalledWith(600_000, 600_000);
   });
 
   it('clamps js_exec wall-clock timeouts to the platform maximum', async () => {
@@ -5146,7 +5176,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect((byName.get('set_project_description') as any).parameters.properties.projectId).toBeUndefined();
     expect((byName.get('set_project_description') as any).parameters.properties.description).toBeDefined();
     expect((byName.get('add_dependency') as any).parameters.properties.project).toBeDefined();
-    expect((byName.get('deploy_project') as any).description).toContain('when validation, build, or deploy fails');
+    expect((byName.get('deploy_project') as any).description).toContain('validation, build, or deploy failure');
     expect((byName.get('deploy_project') as any).description).toContain("publish_intent='user_requested'");
     expect((byName.get('run_notebook') as any).description).toContain('open a clean successful run in preview automatically');
     expect((byName.get('run_notebook') as any).description).toContain("don't drive nbconvert/validate or call set_preview by hand");
@@ -8830,6 +8860,7 @@ describe('ChatThreadDO Pi turn handling', () => {
 
   it('builds and directly deploys a DO-backed project through the deploy action', async () => {
     const { fake, env, orgStub, chatThreadStub } = createProjectToolFake({ deploy: true });
+    delete fake.ctx.props.parentToolUseId;
     const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     const fetchMock = vi.fn(async () => Response.json({ success: true, result: { id: 'version-1' } }, { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
@@ -8837,6 +8868,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     const result = await CodeModeToolsBinding.prototype.callTool.call(fake, 'deploy_project', {
       project: 'Demo App',
       script_name: 'Demo App',
+      toolUseId: 'deploy-direct-1',
     });
 
     expect(result).toMatchObject({
@@ -8881,6 +8913,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     });
     expect(chatThreadStub.recordVerifiedWorkEvidence).toHaveBeenCalledWith(
       expect.objectContaining({
+        id: 'deploy-direct-1',
         toolName: 'deploy_project',
         status: 'succeeded',
         supportedClaims: ['deployed', 'published'],
@@ -10145,6 +10178,32 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(byName.get('bash')).toBeUndefined();
     expect(byName.get('grep')).toBeUndefined();
     expect(byName.get('find')).toBeUndefined();
+  });
+
+  it('exposes deploy_project directly instead of forcing deploys through js_exec', async () => {
+    const callTool = vi.fn(async () => ({ success: true, url: 'https://demo.camelai.app' }));
+    const fake = Object.create(ChatThreadDO.prototype) as any;
+    fake.ctx = {
+      exports: {
+        CodeModeToolsBinding: vi.fn(() => ({ callTool })),
+      },
+    };
+    fake.keepPiTurnToolProgressAliveWhile = (run: () => Promise<unknown>) => run();
+
+    const tools = ChatThreadDO.prototype['createPiToolDefinitions'].call(fake, {
+      orgId: 'org1',
+      workspaceId: 'workspace1',
+      threadId: 'thread1',
+      userId: 'user1',
+    });
+    const deploy = tools.find((tool: any) => tool.name === 'deploy_project');
+
+    expect(deploy).toBeDefined();
+    await deploy.execute('deploy-1', { project: 'demo' });
+    expect(callTool).toHaveBeenCalledWith('deploy_project', {
+      project: 'demo',
+      toolUseId: 'deploy-1',
+    });
   });
 
   it('routes restored search tools through workspace file operations', async () => {

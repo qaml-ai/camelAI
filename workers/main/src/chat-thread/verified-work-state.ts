@@ -43,7 +43,7 @@ function failedResult(result: unknown, isError: boolean): boolean {
     details.status === "failed" || details.status === "error";
 }
 
-function safeTarget(toolName: string, args: unknown, details: Record<string, unknown>): string | undefined {
+function safeTarget(toolName: string, args: unknown): string | undefined {
   const input = objectRecord(args) ?? {};
   if (toolName === "deploy_project") {
     return typeof input.project === "string" ? input.project.slice(0, 160) : undefined;
@@ -58,10 +58,6 @@ function safeTarget(toolName: string, args: unknown, details: Record<string, unk
     return path?.slice(0, 160);
   }
   if (toolName.startsWith("send_")) return "external destination";
-  if (toolName === "deploy_project") {
-    const url = typeof details.url === "string" ? details.url : details.appUrl;
-    return typeof url === "string" ? url.slice(0, 160) : undefined;
-  }
   return undefined;
 }
 
@@ -83,8 +79,8 @@ export function deriveVerifiedWorkEvidence(input: {
     status: failed ? "failed" : "succeeded",
     supportedClaims: failed ? [] : [...defaultClaims],
     ...(failed ? { unsupportedClaims: [...defaultClaims] } : {}),
-    target: safeTarget(input.toolName, input.args, details),
-    operationKey: `${input.toolName}:${safeTarget(input.toolName, input.args, details) ?? ""}`,
+    target: safeTarget(input.toolName, input.args),
+    operationKey: `${input.toolName}:${safeTarget(input.toolName, input.args) ?? ""}`,
     updatedAt: input.now ?? Date.now(),
   };
 

@@ -21,7 +21,6 @@ import type {
 import type { Model } from "@earendil-works/pi-ai";
 import {
   CODE_MODE_DEFAULT_TIMEOUT_MS,
-  CODE_MODE_MAX_TIMEOUT_MS,
   CODE_MODE_PI_PASSTHROUGH_TOOL_DEFINITIONS,
   CODE_MODE_TOOL_DEFINITIONS,
   type CodeModeToolsBinding,
@@ -472,7 +471,7 @@ export function createPiToolDefinitions(
         code: Type.String(),
         timeoutMs: Type.Optional(Type.Number({
           description:
-            `Optional wall-clock timeout in milliseconds for this JavaScript run. Defaults to ${CODE_MODE_DEFAULT_TIMEOUT_MS}ms and can be raised up to ${CODE_MODE_MAX_TIMEOUT_MS}ms for longer-running scripts.`,
+            `Optional wall-clock timeout in milliseconds for this JavaScript run. Defaults to ${CODE_MODE_DEFAULT_TIMEOUT_MS}ms and can be shortened for bounded work.`,
         })),
         maxOutputCharacters: Type.Optional(Type.Number()),
       }),

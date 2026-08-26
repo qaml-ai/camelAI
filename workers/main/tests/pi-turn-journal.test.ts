@@ -43,6 +43,31 @@ describe('planPiTurnResume', () => {
     expect(plan.owesModelOutput).toBe(true);
   });
 
+  it('uses durable completion evidence when reconnecting after a tool result was lost', () => {
+    const committed = [userMessage('run a deploy')] as AgentMessage[];
+    const journalTail = [
+      assistantWithToolCalls([{ id: 'deploy-1', name: 'deploy_project' }]),
+    ] as AgentMessage[];
+
+    const plan = planPiTurnResume(committed, journalTail, [{
+      id: 'deploy-1',
+      toolName: 'deploy_project',
+      status: 'succeeded',
+      supportedClaims: ['deployed', 'published'],
+      target: 'https://demo.camelai.app',
+      updatedAt: 300,
+    }]);
+
+    expect(plan.interruptedToolResults).toBe(1);
+    expect((plan.messages.at(-1) as any)).toMatchObject({
+      role: 'toolResult',
+      toolName: 'deploy_project',
+      isError: false,
+    });
+    expect((plan.messages.at(-1) as any).content[0].text).toContain('https://demo.camelai.app');
+    expect(plan.owesModelOutput).toBe(true);
+  });
+
   it('keeps a completed tool result from the journal and never re-runs it', () => {
     const committed = [userMessage('read a file')] as AgentMessage[];
     const journalTail = [

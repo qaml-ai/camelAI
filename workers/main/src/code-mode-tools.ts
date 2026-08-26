@@ -245,8 +245,8 @@ interface CodeModeMoveFile {
 }
 
 export const CODE_MODE_COMPATIBILITY_DATE = "2026-05-11";
-export const CODE_MODE_DEFAULT_TIMEOUT_MS = 60_000;
 export const CODE_MODE_MAX_TIMEOUT_MS = 600_000;
+export const CODE_MODE_DEFAULT_TIMEOUT_MS = CODE_MODE_MAX_TIMEOUT_MS;
 export const CODE_MODE_DEFAULT_MAX_OUTPUT_CHARACTERS = 60_000;
 export const CODE_MODE_MAX_OUTPUT_CHARACTERS = 200_000;
 const CODE_MODE_R2_READ_NOTICE_RESERVED_BYTES = 1024;
@@ -837,9 +837,9 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
     }, { additionalProperties: false }),
     { category: "workspace" },
   ),
-  codeModeTool(
+  codeModePassthroughTool(
     "deploy_project",
-    "Build, deploy, return the live URL, and open a DO-backed project in preview through the platform direct deploy path. A successful call proves publication, not feature correctness or live-data quality. Pass dry_run=true to validate without publishing or changing preview. In js_exec the call resolves ok: false when validation, build, or deploy fails. Data-analysis notebook publication is an external side effect and requires publish_intent='user_requested'; creating or previewing a report alone does not authorize publication. Run run_notebook first so outputs are fresh. Arguments: { project, script_name?, path?, timeoutMs?, dry_run?, publish_intent? }.",
+    "Build, deploy, return the live URL, and open a DO-backed project in preview through the platform direct deploy path. A successful call proves publication, not feature correctness or live-data quality. Pass dry_run=true to validate without publishing or changing preview. A validation, build, or deploy failure is returned with diagnostics. Data-analysis notebook publication is an external side effect and requires publish_intent='user_requested'; creating or previewing a report alone does not authorize publication. Run run_notebook first so outputs are fresh. Arguments: { project, script_name?, path?, timeoutMs?, dry_run?, publish_intent? }.",
     Type.Object({
       project: Type.String(),
       script_name: Type.Optional(Type.String()),
@@ -2120,12 +2120,11 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   /**
    * Best-effort live progress for the human watching the turn.
    *
-   * deploy_project/add_dependency are code-mode tools (piPassthrough: false):
-   * they only run inside js_exec, in the CodeModeToolsBinding isolate, so the
-   * agent-loop `onUpdate` callback is not reachable from here. The ChatThreadDO
-   * stub is — the same seam recordCodeModeArtifact uses — and it can push the
-   * `item/commandExecution/outputDelta` runtime event the client already
-   * renders as streamed tool output, keyed by the parent js_exec tool call.
+   * add_dependency and compatibility deploy_project calls can run inside
+   * js_exec, where the agent-loop `onUpdate` callback is not reachable. The
+   * ChatThreadDO stub is — the same seam recordCodeModeArtifact uses — and it
+   * can push the `item/commandExecution/outputDelta` runtime event the client
+   * already renders as streamed tool output, keyed by the parent js_exec call.
    */
   private async streamProjectBuildProgress(message: string): Promise<void> {
     const parentToolUseId = this.ctx?.props?.parentToolUseId?.trim();
@@ -3438,10 +3437,14 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     error?: unknown,
   ): Promise<void> {
     const parentToolUseId = this.ctx?.props?.parentToolUseId?.trim();
+    const directToolUseId = typeof args.toolUseId === "string" ? args.toolUseId.trim() : "";
     const threadId = this.ctx?.props?.threadId?.trim();
-    if (!parentToolUseId || !threadId) return;
+    const evidenceId = parentToolUseId
+      ? `${parentToolUseId}:${name}:${crypto.randomUUID()}`
+      : directToolUseId;
+    if (!evidenceId || !threadId) return;
     const evidence = deriveVerifiedWorkEvidence({
-      toolCallId: `${parentToolUseId}:${name}:${crypto.randomUUID()}`,
+      toolCallId: evidenceId,
       toolName: name,
       args,
       result,

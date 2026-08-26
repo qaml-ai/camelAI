@@ -51,6 +51,35 @@ describe('repairPiMessageHistoryForReplay', () => {
     expect(result.repairedCount).toBe(1);
   });
 
+  it('recovers a completed tool result from durable evidence instead of reporting an unknown outcome', () => {
+    const messages = [
+      assistantWithToolCalls([{ id: 'deploy-1', name: 'deploy_project' }]),
+      { role: 'user', content: 'continue', timestamp: 400 },
+    ] as AgentMessage[];
+
+    const result = repairPiMessageHistoryForReplay(messages, [{
+      id: 'deploy-1',
+      toolName: 'deploy_project',
+      status: 'succeeded',
+      supportedClaims: ['deployed', 'published'],
+      target: 'https://demo.camelai.app',
+      updatedAt: 300,
+    }]);
+
+    expect(result.messages[1]).toMatchObject({
+      role: 'toolResult',
+      toolCallId: 'deploy-1',
+      toolName: 'deploy_project',
+      isError: false,
+      content: [{
+        type: 'text',
+        text: expect.stringContaining('Tool result recovered from durable completion evidence'),
+      }],
+    });
+    expect((result.messages[1] as any).content[0].text).toContain('https://demo.camelai.app');
+    expect((result.messages[1] as any).content[0].text).not.toContain('MAY OR MAY NOT');
+  });
+
   it('synthesizes missing Pi tool results when assistant turn ends the history', () => {
     const messages = [
       assistantWithToolCalls([

@@ -3,7 +3,6 @@ import { getEnv } from '@/lib/cloudflare.server';
 import type { AuthEnv } from '@/lib/auth-helpers';
 import { getWorkerScript } from '@/lib/auth-do';
 import { requireWorkspaceAccess } from './workspaces.utils';
-import { isSelfhostRuntime } from '@/lib/selfhost-runtime';
 
 export async function loader({ request, context, params }: Route.LoaderArgs) {
   try {
@@ -23,7 +22,7 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
 
     return Response.json({
       script_name: script.script_name,
-      is_public: isSelfhostRuntime(env) ? false : script.is_public,
+      is_public: script.is_public,
     });
   } catch (error) {
     if (error instanceof Response) return error;

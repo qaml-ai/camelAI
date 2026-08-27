@@ -8015,7 +8015,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       promptPrepend: catalog.promptPrepend,
       promptAppend: catalog.promptAppend,
       deployedConnectionsBindingEnabled: connectionsBindingEnabled(this.env),
-      selfhostAppAccessSsoOnly: isSelfhostRuntime(this.env),
     });
     const verifiedWorkState = formatVerifiedWorkStatePrompt(
       this.ctx?.storage?.kv?.get<unknown>(CHAT_VERIFIED_WORK_STATE_KEY),
@@ -9220,8 +9219,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         options.outboundEmailEnabled !== false &&
         !isSelfhostRuntime(this.env),
       appVisibilityConfigurable:
-        options.appVisibilityConfigurable !== false &&
-        !isSelfhostRuntime(this.env),
+        options.appVisibilityConfigurable !== false,
     });
     if (
       this.activeAutomationRun?.requiresExplicitOutcome &&

@@ -32,7 +32,7 @@ describe("self-host dispatcher authentication", () => {
     expect(headers.has("X-Pomerium-Jwt-Assertion")).toBe(false);
   });
 
-  it("redirects a stale-public app through main-app auth instead of dispatching", async () => {
+  it("dispatches a public self-host app without main-app authentication", async () => {
     const appFetch = vi.fn(async () => new Response("app"));
     const kvPut = vi.fn(async () => undefined);
     const env = {
@@ -45,6 +45,43 @@ describe("self-host dispatcher authentication", () => {
                 org_id: "org-1",
                 org_slug: "acme-85b",
                 is_public: true,
+              })
+            : null),
+        put: kvPut,
+      },
+      SELFHOST_APP_RUNNER: {
+        idFromName: (name: string) => name,
+        get: () => ({ fetch: appFetch }),
+      },
+    };
+
+    const response = await handleWorkerRequest(
+      new Request("https://demo--acme-85b.apps.example.test/"),
+      env as never,
+      {} as ExecutionContext,
+      "demo",
+      "demo--acme-85b",
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe("app");
+    expect(kvPut).not.toHaveBeenCalled();
+    expect(appFetch).toHaveBeenCalledOnce();
+  });
+
+  it("redirects a private self-host app through main-app authentication", async () => {
+    const appFetch = vi.fn(async () => new Response("app"));
+    const kvPut = vi.fn(async () => undefined);
+    const env = {
+      CF_ACCOUNT_ID: "selfhost",
+      MAIN_APP_URL: "https://camel.example.test",
+      APP_KV: {
+        get: vi.fn(async (key: string) =>
+          key === "script:demo--acme-85b"
+            ? JSON.stringify({
+                org_id: "org-1",
+                org_slug: "acme-85b",
+                is_public: false,
               })
             : null),
         put: kvPut,

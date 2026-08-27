@@ -45,7 +45,7 @@ describe("self-host Pomerium configuration", () => {
     );
   });
 
-  it("requires SSO on app routes and allows the camelAI origin to frame them", () => {
+  it("lets the dispatcher enforce per-app access and allows the camelAI origin to frame apps", () => {
     const config = buildPomeriumConfig(bundledPomeriumEnv());
     expect(config).not.toBeNull();
 
@@ -60,8 +60,13 @@ describe("self-host Pomerium configuration", () => {
       "https://*.preview.example.com",
     ]);
     for (const route of appRoutes) {
-      expect(route.allow_any_authenticated_user).toBe(true);
-      expect(route).not.toHaveProperty("allow_public_unauthenticated_access");
+      expect("allow_public_unauthenticated_access" in route).toBe(true);
+      expect(
+        "allow_public_unauthenticated_access" in route
+          ? route.allow_public_unauthenticated_access
+          : undefined,
+      ).toBe(true);
+      expect(route).not.toHaveProperty("allow_any_authenticated_user");
       expect(
         "set_response_headers" in route
           ? route.set_response_headers

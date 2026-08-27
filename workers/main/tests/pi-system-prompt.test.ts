@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   DEPLOYED_CONNECTIONS_BINDING_DISABLED_PROMPT,
-  SELFHOST_APP_ACCESS_SSO_PROMPT,
   createPiSystemPrompt,
   createPiSubagentSystemPrompt,
 } from "../src/pi-system-prompt";
@@ -51,27 +50,5 @@ describe("createPiSystemPrompt deployed CONNECTIONS binding", () => {
 
     expect(prompt).toContain(DEPLOYED_CONNECTIONS_BINDING_DISABLED_PROMPT);
     expect(prompt).toContain("## Subagent Mode");
-  });
-});
-
-describe("createPiSystemPrompt self-host app access", () => {
-  it("replaces public/private guidance with the fixed SSO policy", () => {
-    const prompt = createPiSystemPrompt(context, {
-      skillNames: ["developing-software"],
-      selfhostAppAccessSsoOnly: true,
-    });
-
-    expect(prompt).toContain(SELFHOST_APP_ACCESS_SSO_PROMPT);
-    expect(prompt).toContain("deploying it behind the installation's SSO policy");
-    expect(prompt).not.toContain("public publishing, schedules, visibility changes");
-  });
-
-  it("keeps hosted visibility guidance by default", () => {
-    const prompt = createPiSystemPrompt(context, {
-      skillNames: ["developing-software"],
-    });
-
-    expect(prompt).not.toContain(SELFHOST_APP_ACCESS_SSO_PROMPT);
-    expect(prompt).toContain("public publishing, schedules, visibility changes");
   });
 });

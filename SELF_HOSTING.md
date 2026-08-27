@@ -406,10 +406,11 @@ the server boundary.
 
 The chat preview embeds a deployed-app hostname inside the camelAI page, so it
 is cross-origin even when `LOCAL_APP_IFRAME_DOMAIN` and
-`LOCAL_APP_VANITY_DOMAIN` are the same. Self-host deployments do not expose a
-per-app public/private setting: every deployed app requires the configured
-Pomerium or Cloudflare Access identity proxy. In bundled-Pomerium mode,
-`selfhost:configure` requires an authenticated user and adds this response
+`LOCAL_APP_VANITY_DOMAIN` are the same. Self-host deployments support the same
+per-app public/private setting as hosted camelAI. In bundled-Pomerium mode,
+deployed-app wildcard routes allow unauthenticated requests to reach the
+dispatcher, which serves public apps directly and redirects private apps
+through camelAI authentication. `selfhost:configure` also adds this response
 policy to both deployed-app wildcard routes:
 
 ```http
@@ -422,11 +423,11 @@ It preserves same-origin app framing and permits only the configured camelAI
 origin as an additional parent. The live `selfhost:doctor` check sends a
 synthetic app-host request through Pomerium and verifies that policy whenever
 the stack is running. Operators using external Pomerium, Cloudflare Access, or
-another ingress must configure an authenticated policy on both
-`*.LOCAL_APP_VANITY_DOMAIN` and `*.LOCAL_APP_IFRAME_DOMAIN`, plus the equivalent
-response policy there. Do not create an authentication bypass for either
-wildcard; camelAI also treats every self-host app as private at the dispatcher
-in case stale app metadata says it was public.
+another ingress must allow both `*.LOCAL_APP_VANITY_DOMAIN` and
+`*.LOCAL_APP_IFRAME_DOMAIN` to reach the dispatcher if public apps are required,
+and configure the equivalent response policy there. A deployment-wide ingress
+authentication rule on either wildcard intentionally overrides camelAI's
+per-app public setting.
 
 The preview sandbox lets user-initiated popups escape into a normal top-level
 window and permits top-level navigation only after a user gesture. This supports

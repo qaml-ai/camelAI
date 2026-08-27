@@ -13,7 +13,6 @@ import { AppDangerZone } from '@/components/admin/app-danger-zone';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { ExternalLink } from 'lucide-react';
-import { isSelfhostRuntime } from '@/lib/selfhost-runtime';
 
 const dateFormatter = new Intl.DateTimeFormat('en-US', {
   dateStyle: 'medium',
@@ -55,11 +54,6 @@ export async function action({ request, context, params }: Route.ActionArgs) {
   const authEnv = getAuthEnv(env);
 
   if (intent === 'updateApp') {
-    if (isSelfhostRuntime(env)) {
-      return {
-        error: 'App visibility is fixed to private by the self-host SSO policy',
-      };
-    }
     const isPublic = formData.get('isPublic') === 'true';
     await setWorkerScriptPublic(authEnv, app.org_id, decodedScriptName, isPublic, 'system-admin');
     return { success: true };
@@ -91,7 +85,6 @@ export async function action({ request, context, params }: Route.ActionArgs) {
 
 export async function loader({ request, context, params }: Route.LoaderArgs) {
   await requireSuperuser(request, context);
-  const env = getEnv(context);
 
   const { scriptName } = params;
   const decodedScriptName = decodeURIComponent(scriptName);
@@ -121,15 +114,11 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
 
   const vanityDomain = await getVanityDomain(request);
 
-  return {
-    app: safeApp,
-    vanityDomain,
-    selfhostRuntime: isSelfhostRuntime(env),
-  };
+  return { app: safeApp, vanityDomain };
 }
 
 export default function AdminAppDetailPage() {
-  const { app, vanityDomain, selfhostRuntime } = useLoaderData<typeof loader>();
+  const { app, vanityDomain } = useLoaderData<typeof loader>();
   const appHost = getAdminAppHost(app.script_name, app.org_slug, vanityDomain);
 
   return (
@@ -207,14 +196,14 @@ export default function AdminAppDetailPage() {
                       )}
                     </dd>
                   </div>
-                  {!selfhostRuntime ? <div>
+                  <div>
                     <dt className="text-sm font-medium text-muted-foreground">Status</dt>
                     <dd>
                       <Badge variant={app.is_public ? 'default' : 'secondary'}>
                         {app.is_public ? 'Public' : 'Private'}
                       </Badge>
                     </dd>
-                  </div> : null}
+                  </div>
                   <div>
                     <dt className="text-sm font-medium text-muted-foreground">Preview</dt>
                     <dd className="space-y-1">
@@ -250,7 +239,7 @@ export default function AdminAppDetailPage() {
               </CardContent>
             </Card>
 
-            {!selfhostRuntime ? <Card>
+            <Card>
               <CardHeader>
                 <CardTitle>Edit App</CardTitle>
                 <CardDescription>Update app visibility</CardDescription>
@@ -258,7 +247,7 @@ export default function AdminAppDetailPage() {
               <CardContent>
                 <AppEditForm app={app} />
               </CardContent>
-            </Card> : null}
+            </Card>
 
             <AppDangerZone app={app} />
           </div>

@@ -386,9 +386,9 @@ terminates on the VM, `selfhost:up` also adds
 keys through the VM's local HTTPS endpoint. Pomerium runs in all-in-one mode
 with a persistent file-backed databroker. The control-plane hostname requires
 an authenticated user and forwards a signed `X-Pomerium-Jwt-Assertion`.
-Deployed app wildcard hostnames route separately but also require an
-authenticated Pomerium user; self-host deployments have no per-app public
-access mode.
+Deployed app wildcard hostnames route separately and allow requests to reach
+the dispatcher, which honors each app's public/private setting and redirects
+private-app requests through camelAI authentication.
 
 Pomerium is pinned by immutable digest. Its client, cookie, and shared secrets
 are passed through mounted files rather than container environment values.

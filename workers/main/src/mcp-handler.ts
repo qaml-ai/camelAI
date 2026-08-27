@@ -48,7 +48,6 @@ import {
   discordChannelCatalogAvailable,
   type DiscordBridgeFetcher,
 } from './discord-types';
-import { isSelfhostRuntime } from '../../../src/lib/selfhost-runtime';
 
 export interface McpEnv {
   ORG: DurableObjectNamespace<OrgDO>;
@@ -327,9 +326,7 @@ export class ChiridionMcp extends McpAgent<any, Record<string, unknown>, Record<
     // List deployed apps/workers
     this.server.tool(
       'list_apps',
-      isSelfhostRuntime(this.env)
-        ? 'List deployed apps/workers for the current workspace. Returns script names, SSO-protected URLs, and creation info.'
-        : 'List deployed apps/workers for the current workspace. Returns script names, URLs, visibility status, and creation info.',
+      'List deployed apps/workers for the current workspace. Returns script names, URLs, visibility status, and creation info.',
       {},
       async () => {
         const { workspaceId } = this.requireAuth();
@@ -344,7 +341,7 @@ export class ChiridionMcp extends McpAgent<any, Record<string, unknown>, Record<
         const apps = await Promise.all(scripts.map(async (s: WorkerScript) => ({
           name: s.script_name,
           url: await this.getAppUrl(s),
-          ...(!isSelfhostRuntime(this.env) ? { is_public: s.is_public } : {}),
+          is_public: s.is_public,
           created_by: s.created_by,
           created_at: new Date(s.created_at).toISOString(),
           updated_at: new Date(s.updated_at).toISOString(),
@@ -355,9 +352,8 @@ export class ChiridionMcp extends McpAgent<any, Record<string, unknown>, Record<
       }
     );
 
-    if (!isSelfhostRuntime(this.env)) {
-      // Set app visibility (public/private)
-      this.server.tool(
+    // Set app visibility (public/private)
+    this.server.tool(
         'set_app_visibility',
         'Change the visibility of a deployed app in the current workspace. Public apps are accessible to anyone, private apps require authentication.',
         {
@@ -397,8 +393,7 @@ export class ChiridionMcp extends McpAgent<any, Record<string, unknown>, Record<
             message: `App '${script_name}' is now ${is_public ? 'public' : 'private'}`,
           });
         }
-      );
-    }
+    );
 
     // Set preview panel to a file
     this.server.tool(
@@ -542,7 +537,7 @@ export class ChiridionMcp extends McpAgent<any, Record<string, unknown>, Record<
         const target: PreviewTarget = {
           kind: 'app',
           scriptName: script.script_name,
-          isPublic: isSelfhostRuntime(this.env) ? false : script.is_public,
+          isPublic: script.is_public,
         };
 
         const chatThreadStub = this.getChatThreadStub(threadId);
@@ -554,9 +549,7 @@ export class ChiridionMcp extends McpAgent<any, Record<string, unknown>, Record<
           app: {
             name: script.script_name,
             url: await this.getAppUrl(script),
-            ...(!isSelfhostRuntime(this.env)
-              ? { is_public: script.is_public }
-              : {}),
+            is_public: script.is_public,
           },
           message: `Preview set to app '${script.script_name}'`,
         });

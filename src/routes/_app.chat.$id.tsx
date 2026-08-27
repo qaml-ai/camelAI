@@ -459,7 +459,6 @@ async function buildChatData(
     skipBanCheck?: boolean;
   },
 ): Promise<ChatData> {
-  const selfhostRuntime = isSelfhostRuntime(getEnv(context));
   const previewDataPromise = (async () => {
     const previewStateRaw = await chatDO
       .getThreadPreviewState(context, threadId)
@@ -486,7 +485,7 @@ async function buildChatData(
       }
       return {
         ...target,
-        isPublic: selfhostRuntime ? false : script.is_public,
+        isPublic: script.is_public,
       };
     };
 

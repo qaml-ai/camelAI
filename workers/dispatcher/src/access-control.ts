@@ -24,9 +24,9 @@ export function isSelfhostPublishingMode(env: {
 
 export function isPublicAppRequest(
   accessInfo: Pick<WorkerAccessInfo, "is_public">,
-  env: { CF_ACCOUNT_ID?: string; CF_DISPATCH_NAMESPACE?: string },
+  _env: { CF_ACCOUNT_ID?: string; CF_DISPATCH_NAMESPACE?: string },
 ): boolean {
-  return !isSelfhostPublishingMode(env) && accessInfo.is_public;
+  return accessInfo.is_public;
 }
 
 /**

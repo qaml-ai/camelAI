@@ -275,9 +275,9 @@ executed notebook with the platform notebook renderer into a static Cloudflare
 Worker, registers it like any other deployed app, returns the live URL, and opens
 the deployed app in preview automatically. No manual `set_preview` or `list_apps`
 call is needed after deploy; `set_preview` remains available when you explicitly
-want to reopen or switch previews. Hosted camelAI supports custom domains;
-self-host app hostnames and SSO routes are operator-managed. Rollback remains
-available. Always run `run_notebook` first so the published outputs are fresh;
+want to reopen or switch previews. The app supports `set_app_visibility` and
+rollback. Hosted camelAI supports custom domains; self-host app hostnames and
+ingress routes are operator-managed. Always run `run_notebook` first so the published outputs are fresh;
 pass `path` if the project has more than one notebook. Pass `dry_run: true` only
 to validate publishing without deploying or changing preview.
 

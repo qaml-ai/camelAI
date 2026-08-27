@@ -299,11 +299,11 @@ Other session methods: `goto`, `type`, `press`, `select`, `hover`, `waitForSelec
 **Limitation:** for **access-controlled** apps, server-streamed responses (Server-Sent
 Events / streaming `fetch`) are buffered by the session's request proxy, so
 realtime/SSE-driven UI updates will not arrive mid-session. Standard
-request/response and interaction testing works normally. On hosted camelAI, a
-public deploy avoids this proxy limitation only when the user has authorized
-public visibility. Self-hosted enterprise apps cannot be made public; use
-direct authenticated browser/E2E coverage where available, or unit/integration
-tests for the streaming path.
+request/response and interaction testing works normally. A public deploy avoids
+this proxy limitation only when the user has authorized public visibility and
+no deployment-wide self-host ingress policy overrides it. Otherwise, use direct
+authenticated browser/E2E coverage where available, or unit/integration tests
+for the streaming path.
 
 ### When to Use Visual Checks vs Unit Tests
 

@@ -18,7 +18,6 @@ import AppsClient from '@/components/pages/apps/apps-client';
 import { AppsLoadingSkeleton } from '@/components/pages/apps/apps-loading';
 import { NoWorkspacesError } from '@/components/no-workspaces-error';
 import type { WorkerScriptWithCreator } from '@/types';
-import { isSelfhostRuntime } from '@/lib/selfhost-runtime';
 
 function getAuthEnv(env: CloudflareEnv): AuthEnv {
   return {
@@ -48,11 +47,6 @@ export async function action({ request, context }: Route.ActionArgs) {
   const intent = formData.get('intent');
 
   if (intent === 'setAppPublic') {
-    if (isSelfhostRuntime(env)) {
-      return {
-        error: 'App visibility is fixed to private by the self-host SSO policy',
-      };
-    }
     const scriptName = formData.get('scriptName') as string;
     const isPublic = formData.get('isPublic') === 'true';
     const threadId = formData.get('threadId') as string | null;
@@ -218,7 +212,6 @@ export async function loader({ request, context }: Route.LoaderArgs) {
     renderedAt,
     hasWorkspace: Boolean(workspaceId),
     orgCustomDomain: null,
-    selfhostRuntime: isSelfhostRuntime(env),
   };
 }
 
@@ -230,7 +223,6 @@ export default function AppsPage() {
     renderedAt,
     hasWorkspace,
     orgCustomDomain,
-    selfhostRuntime,
   } = useLoaderData<typeof loader>();
 
   if (!hasWorkspace) {
@@ -247,7 +239,6 @@ export default function AppsPage() {
             hostname={hostname}
             initialNow={renderedAt}
             orgCustomDomain={orgCustomDomain}
-            selfhostRuntime={selfhostRuntime}
           />
         )}
       </Await>

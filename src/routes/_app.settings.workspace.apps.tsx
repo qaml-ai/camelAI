@@ -30,7 +30,6 @@ import { getAppUrlContext } from '@/lib/app-url.server';
 import { refreshWorkerScriptCustomDomainStates } from '@/lib/custom-domain.server';
 import { loadUserProfileSummaries } from '@/lib/user-profiles.server';
 import type { WorkerScriptWithCreator } from '@/types';
-import { isSelfhostRuntime } from '@/lib/selfhost-runtime';
 
 interface AppRow extends WorkerScriptWithCreator {
   workspace_name: string;
@@ -130,7 +129,6 @@ export async function loader({ request, context }: Route.LoaderArgs) {
       orgSlug,
       orgCustomDomain: null,
       appUrlContext,
-      selfhostRuntime: isSelfhostRuntime(env),
     };
   }
 
@@ -181,7 +179,6 @@ export async function loader({ request, context }: Route.LoaderArgs) {
     orgSlug,
     orgCustomDomain: null,
     appUrlContext,
-    selfhostRuntime: isSelfhostRuntime(env),
   };
 }
 
@@ -192,7 +189,6 @@ export default function WorkspaceAppsPage() {
     orgSlug,
     orgCustomDomain,
     appUrlContext,
-    selfhostRuntime,
   } = useLoaderData<typeof loader>();
   const [searchParams, setSearchParams] = useSearchParams();
   const fetcher = useFetcher<{ success?: boolean; error?: string }>();
@@ -227,9 +223,7 @@ export default function WorkspaceAppsPage() {
     <div className="space-y-6">
       <SettingsHeader
         title="Apps"
-        description={selfhostRuntime
-          ? 'View and manage apps protected by your deployment SSO.'
-          : 'View and manage deployed apps across workspaces.'}
+        description="View and manage deployed apps across workspaces."
       />
       <Separator />
 
@@ -253,7 +247,7 @@ export default function WorkspaceAppsPage() {
               <TableHead>Created By</TableHead>
               <TableHead>Created</TableHead>
               <TableHead>Last Modified</TableHead>
-              {!selfhostRuntime ? <TableHead>Visibility</TableHead> : null}
+              <TableHead>Visibility</TableHead>
               <TableHead></TableHead>
             </TableRow>
           </TableHeader>
@@ -291,13 +285,11 @@ export default function WorkspaceAppsPage() {
                   <TableCell className="text-muted-foreground text-sm">
                     {formatDate(app.updated_at)}
                   </TableCell>
-                  {!selfhostRuntime ? (
-                    <TableCell>
-                      <Badge variant={app.is_public ? 'secondary' : 'outline'}>
-                        {app.is_public ? 'Public' : 'Private'}
-                      </Badge>
-                    </TableCell>
-                  ) : null}
+                  <TableCell>
+                    <Badge variant={app.is_public ? 'secondary' : 'outline'}>
+                      {app.is_public ? 'Public' : 'Private'}
+                    </Badge>
+                  </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1">
                       <Button

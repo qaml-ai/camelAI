@@ -40,17 +40,23 @@ describe('dispatcher visibility enforcement', () => {
     ).resolves.toBeNull();
   });
 
-  it('never treats a self-host app as public, including stale public records', () => {
+  it('honors configurable visibility for self-host deployments', () => {
     expect(
       isPublicAppRequest(
         { is_public: true },
         { CF_ACCOUNT_ID: 'selfhost' },
       ),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       isPublicAppRequest(
         { is_public: true },
         { CF_DISPATCH_NAMESPACE: 'selfhost' },
+      ),
+    ).toBe(true);
+    expect(
+      isPublicAppRequest(
+        { is_public: false },
+        { CF_ACCOUNT_ID: 'selfhost' },
       ),
     ).toBe(false);
   });

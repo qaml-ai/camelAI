@@ -3098,9 +3098,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         definition.name !== "send_email" || !isSelfhostRuntime(this.env)
       ))
       .filter((definition) => (
-        definition.name !== "set_app_visibility" || !isSelfhostRuntime(this.env)
-      ))
-      .filter((definition) => (
         this.ctx?.props?.allowWebTools !== false || !AGENT_WEB_TOOL_NAMES.has(definition.name)
       ));
   }
@@ -3231,11 +3228,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   async callTool(name: string, rawArgs: unknown = {}): Promise<unknown> {
     if (name === "send_email" && isSelfhostRuntime(this.env)) {
       throw new Error(SELFHOST_OUTBOUND_EMAIL_DISABLED_MESSAGE);
-    }
-    if (name === "set_app_visibility" && isSelfhostRuntime(this.env)) {
-      throw new Error(
-        "App visibility is fixed to private by the self-host SSO policy",
-      );
     }
     if (this.ctx?.props?.allowWebTools === false && AGENT_WEB_TOOL_NAMES.has(name)) {
       throw new Error(`${name} is reserved for the Research agent; delegate web lookup to Research instead`);
@@ -3761,11 +3753,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       const target: PreviewTarget = {
         kind: "app",
         scriptName,
-        isPublic: isSelfhostRuntime(this.env)
-          ? false
-          : typeof args.is_public === "boolean"
-            ? args.is_public
-            : script.is_public,
+        isPublic: typeof args.is_public === "boolean"
+          ? args.is_public
+          : script.is_public,
       };
       await this.chatThreadStub.setPreviewTarget(target);
       return { success: true, target, app: { name: scriptName, url: await this.getAppUrl(script), is_public: target.isPublic } };
@@ -3899,7 +3889,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       apps: await Promise.all(scripts.map(async (script) => ({
         name: script.script_name,
         url: await this.getAppUrl(script),
-        ...(!isSelfhostRuntime(this.env) ? { is_public: script.is_public } : {}),
+        is_public: script.is_public,
         created_by: script.created_by,
         created_at: new Date(script.created_at).toISOString(),
         updated_at: new Date(script.updated_at).toISOString(),
@@ -3912,11 +3902,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async setAppVisibility(args: Record<string, unknown>): Promise<unknown> {
-    if (isSelfhostRuntime(this.env)) {
-      throw new Error(
-        "App visibility is fixed to private by the self-host SSO policy",
-      );
-    }
     const scriptName = typeof args.script_name === "string" ? args.script_name.trim() : "";
     if (!scriptName) throw new Error("script_name is required");
     if (typeof args.is_public !== "boolean") throw new Error("is_public must be a boolean");

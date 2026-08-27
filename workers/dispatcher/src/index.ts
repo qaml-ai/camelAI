@@ -1283,8 +1283,9 @@ export async function handleWorkerRequest(
     return response;
   }
 
-  // Hosted deployments honor per-app public access. Self-host deployments
-  // always continue through authenticated app access, even for stale records.
+  // Every deployment mode honors the canonical per-app visibility flag.
+  // In self-host mode the identity proxy leaves deployed-app hosts reachable,
+  // and this dispatcher remains the enforcement point for private apps.
   if (isPublicAppRequest(accessInfo, env)) {
     return dispatchToWorker(request, env, ctx, dispatchScriptName, scriptName);
   }

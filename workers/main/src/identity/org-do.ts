@@ -72,7 +72,6 @@ import {
   type HostedCapability,
 } from "../../../../src/lib/capability-allowances";
 import { dispatchAdminEvent } from "./admin-events";
-import { getAppIndexDatabase } from "../app-index-db.js";
 import { normalizeOrgBillingFields } from "./billing-state";
 import { recordErrorEvent, recordObservabilityEvent } from "../observability";
 import {
@@ -92,7 +91,6 @@ import { usageCost, usageInteger, usageText } from "./usage";
 import { generateEmailHandle } from "../../../../src/lib/workspace-email";
 import type { EmailHandleDO } from "../email-handle-registry";
 import type { WorkspaceIntegrationDefinitionRecord } from "../../../../src/lib/integration-definition";
-import { isSelfhostRuntime } from "../../../../src/lib/selfhost-runtime";
 import {
   getCustomDomain as getOrgCustomDomain,
   removeCustomDomain as removeOrgCustomDomain,
@@ -877,9 +875,6 @@ export class OrgDO extends DurableObject<DOEnv> {
 
     ctx.blockConcurrencyWhile(async () => {
       this.migrate();
-      if (isSelfhostRuntime(this.env)) {
-        await this.enforceSelfhostPrivateAppAccess();
-      }
     });
   }
 
@@ -891,60 +886,6 @@ export class OrgDO extends DurableObject<DOEnv> {
         this.sql.exec("SELECT 1 FROM members WHERE user_id = ?", userId).toArray().length > 0,
       transactionSync: (callback) => this.ctx.storage.transactionSync(callback),
     }));
-  }
-
-  private async enforceSelfhostPrivateAppAccess(): Promise<void> {
-    const publicScripts = [
-      ...this.sql.exec<{ script_name: string }>(
-        "SELECT script_name FROM worker_scripts WHERE is_public != 0",
-      ),
-    ];
-    if (publicScripts.length === 0) return;
-
-    const info = this.getInfoSync();
-    if (!info?.slug) return;
-
-    for (const { script_name: scriptName } of publicScripts) {
-      try {
-        const script = await this.getWorkerScript(scriptName);
-        const dispatchScriptName = `${scriptName}--${info.slug}`;
-        const registryKey = `script:${dispatchScriptName}`;
-        let existing: Record<string, unknown> = {};
-        const raw = await this.env.APP_KV.get(registryKey);
-        if (raw) existing = JSON.parse(raw) as Record<string, unknown>;
-        await this.env.APP_KV.put(
-          registryKey,
-          JSON.stringify({
-            ...existing,
-            org_id: info.id,
-            org_slug: info.slug,
-            is_public: false,
-          }),
-        );
-
-        const appIndex = getAppIndexDatabase(this.env);
-        if (appIndex && script) {
-          await appIndex.applyAdminEvent({
-            type: "app_upsert",
-            payload: { ...script, org_id: info.id, is_public: false },
-          });
-        }
-
-        // Clear SQL last. If either external index update fails, retain the
-        // public marker so the next DO construction retries the migration.
-        this.sql.exec(
-          "UPDATE worker_scripts SET is_public = 0 WHERE script_name = ?",
-          scriptName,
-        );
-      } catch (error) {
-        // Dispatcher enforcement ignores stale public flags in self-host mode,
-        // so a transient migration failure must not prevent the OrgDO starting.
-        console.warn("[OrgDO] failed to normalize self-host app access", {
-          scriptName,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
   }
 
   private getOrgIndexKey(orgId: string): string {
@@ -5729,13 +5670,12 @@ export class OrgDO extends DurableObject<DOEnv> {
         );
       }
 
-      // Same workspace - update the script (redeploy). Self-host deployments
-      // have one deployment-wide SSO policy, so legacy public metadata is
-      // normalized on every redeploy as well as during DO initialization.
+      // Same workspace - update the script (redeploy) while preserving its
+      // configured visibility.
       this.sql.exec(
         "UPDATE worker_scripts SET updated_at = ?, is_public = ?, config_path = ?, project_id = ?, commit_sha = ?, artifact_cache_key = ? WHERE script_name = ?",
         now,
-        isSelfhostRuntime(this.env) ? 0 : existing.is_public ? 1 : 0,
+        existing.is_public ? 1 : 0,
         configPath ?? null,
         projectId ?? null,
         commitSha ?? null,
@@ -5762,7 +5702,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       return {
         ...existing,
         updated_at: now,
-        is_public: isSelfhostRuntime(this.env) ? false : existing.is_public,
+        is_public: existing.is_public,
         config_path: configPath ?? existing.config_path,
         project_id: projectId ?? null,
         commit_sha: commitSha ?? null,
@@ -5770,7 +5710,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       };
     }
 
-    const isPublic = !isSelfhostRuntime(this.env);
+    const isPublic = true;
     this.sql.exec(
       "INSERT INTO worker_scripts (script_name, workspace_id, created_by, created_at, updated_at, is_public, config_path, project_id, commit_sha, artifact_cache_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       scriptName,
@@ -6091,11 +6031,6 @@ export class OrgDO extends DurableObject<DOEnv> {
     isPublic: boolean,
     actorId: string,
   ): Promise<WorkerScript | null> {
-    if (isSelfhostRuntime(this.env) && isPublic) {
-      throw new Error(
-        "App visibility is fixed to private by the self-host SSO policy",
-      );
-    }
     const existing = await this.getWorkerScript(scriptName);
     if (!existing) return null;
     const now = Date.now();

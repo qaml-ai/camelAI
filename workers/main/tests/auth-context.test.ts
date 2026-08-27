@@ -495,6 +495,31 @@ describe('Auth context building (parallel DO calls)', () => {
       ]));
     });
 
+    it('keeps the dispatcher visibility index in sync with app visibility', async () => {
+      const email = testEmail();
+      const { userId } = await createUser(testEnv, email, 'password', 'Visibility User');
+      const { org, defaultWorkspaceId } = await createOrg(testEnv, 'Visibility Org', userId);
+      const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
+
+      await orgStub.registerWorkerScript('visibility-app', defaultWorkspaceId, userId);
+      await orgStub.setWorkerScriptPublic('visibility-app', false, userId);
+
+      const orgInfo = await orgStub.getInfo();
+      const indexKey = `script:visibility-app--${orgInfo?.slug}`;
+      await expect(testEnv.APP_KV.get(indexKey, 'json')).resolves.toEqual({
+        org_id: org.id,
+        org_slug: orgInfo?.slug,
+        is_public: false,
+      });
+
+      await orgStub.setWorkerScriptPublic('visibility-app', true, userId);
+      await expect(testEnv.APP_KV.get(indexKey, 'json')).resolves.toEqual({
+        org_id: org.id,
+        org_slug: orgInfo?.slug,
+        is_public: true,
+      });
+    });
+
     it('hydrates legacy WorkspaceDO restrictions when workspace access has not been migrated', async () => {
       const ownerEmail = testEmail();
       const memberEmail = testEmail();

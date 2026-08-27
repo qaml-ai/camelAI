@@ -46,13 +46,12 @@ function buildAuthEnv() {
 }
 
 describe('worker script KV index writes', () => {
-  it('writes visibility updates using script--org dispatch key format', async () => {
+  it('delegates visibility updates to the OrgDO that owns the dispatcher index', async () => {
     const { env, appKv } = buildAuthEnv();
 
     await setWorkerScriptPublic(env, 'org-1', 'my-app', false, 'user-1');
 
-    const keys = appKv.put.mock.calls.map((call: [string, string]) => call[0]);
-    expect(keys).toEqual(['script:my-app--acme-85b']);
+    expect(appKv.put).not.toHaveBeenCalled();
   });
 
   it('deletes dispatch index entries using script--org dispatch key format', async () => {

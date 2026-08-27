@@ -74,6 +74,7 @@ import {
 import { dispatchAdminEvent } from "./admin-events";
 import { normalizeOrgBillingFields } from "./billing-state";
 import { recordErrorEvent, recordObservabilityEvent } from "../observability";
+import { SCRIPT_PREFIX } from "../types";
 import {
   buildChatErrorEventPayload,
   mergeModelHistory,
@@ -6033,6 +6034,24 @@ export class OrgDO extends DurableObject<DOEnv> {
   ): Promise<WorkerScript | null> {
     const existing = await this.getWorkerScript(scriptName);
     if (!existing) return null;
+    const info = await this.getInfo();
+    const visibilityIndexKey = info?.slug
+      ? `${SCRIPT_PREFIX}${scriptName}--${info.slug}`
+      : null;
+    const visibilityIndexValue = info
+      ? JSON.stringify({
+          org_id: info.id,
+          org_slug: info.slug,
+          is_public: isPublic,
+        })
+      : null;
+
+    // Keep visibility changes fail-closed across the OrgDO + KV boundary:
+    // lock private apps before changing the product record, and only publish
+    // apps to the dispatcher after the product record is public.
+    if (!isPublic && visibilityIndexKey && visibilityIndexValue) {
+      await this.env.APP_KV.put(visibilityIndexKey, visibilityIndexValue);
+    }
     const now = Date.now();
     this.sql.exec(
       "UPDATE worker_scripts SET is_public = ?, updated_at = ? WHERE script_name = ?",
@@ -6048,7 +6067,9 @@ export class OrgDO extends DurableObject<DOEnv> {
       is_public: isPublic,
       updated_at: now,
     };
-    const info = await this.getInfo();
+    if (isPublic && visibilityIndexKey && visibilityIndexValue) {
+      await this.env.APP_KV.put(visibilityIndexKey, visibilityIndexValue);
+    }
     if (info)
       dispatchAdminEvent(this.ctx, this.env, {
         type: "app_upsert",

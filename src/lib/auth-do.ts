@@ -1816,27 +1816,9 @@ export async function setWorkerScriptPublic(
   actorId: string,
 ): Promise<WorkerScript | null> {
   const stub = env.ORG.get(env.ORG.idFromName(orgId));
-  const script = await stub.setWorkerScriptPublic(
+  return stub.setWorkerScriptPublic(
     scriptName,
     isPublic,
     actorId,
   );
-  if (script) {
-    // Get org slug to build dispatch script name
-    const orgInfo = await stub.getInfo();
-    const orgSlug = orgInfo?.slug;
-    if (orgSlug) {
-      const dispatchScriptName = `${scriptName}--${orgSlug}`;
-      // Update the new format KV index
-      await env.APP_KV.put(
-        `${SCRIPT_PREFIX}${dispatchScriptName}`,
-        JSON.stringify({
-          org_id: orgId,
-          org_slug: orgSlug,
-          is_public: script.is_public,
-        }),
-      );
-    }
-  }
-  return script;
 }

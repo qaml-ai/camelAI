@@ -7,6 +7,63 @@ on:
     branches: [main]
 
 jobs:
+  chat-lifecycle-model:
+    name: chat lifecycle model (${{ matrix.config }} - ${{ matrix.coverage }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - config: A
+            coverage: dedupe-thread-full
+          - config: B
+            coverage: fifo-two-row
+          - config: C
+            coverage: batch-two-call-recovery
+          - config: D
+            coverage: queue-bound
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Download pinned TLA+ tools
+        run: |
+          curl -fL --retry 3 \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar \
+            -o /tmp/tla2tools.jar
+          echo '936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  /tmp/tla2tools.jar' \
+            | sha256sum --check --strict
+      - name: Model-check bounded chat lifecycle
+        working-directory: plans/chat-runtime-correctness/formal
+        env:
+          TLC_CONFIG: ${{ matrix.config }}
+        run: |
+          set -euo pipefail
+          sha256sum --check SHA256SUMS
+          tlc_state_dir="$(mktemp -d "${RUNNER_TEMP}/chat-tlc-${TLC_CONFIG}.XXXXXX")"
+          case "$tlc_state_dir" in
+            "${RUNNER_TEMP}"/chat-tlc-*) ;;
+            *) echo "Unexpected TLC state directory: $tlc_state_dir" >&2; exit 1 ;;
+          esac
+          cleanup() {
+            rm -rf -- "$tlc_state_dir"
+          }
+          trap cleanup EXIT
+          /usr/bin/time -v timeout --signal=INT --kill-after=30s 50m \
+            java -Xmx4g -XX:+UseParallelGC \
+            -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config "ChatLifecycle${TLC_CONFIG}.cfg" \
+            -workers 2 -lncheck final -checkpoint 1000 \
+            -metadir "$tlc_state_dir" ChatLifecycle.tla
+      - name: Check TypeScript/model action conformance
+        run: node scripts/check-chat-runtime-conformance.mjs
+      - name: Enforce chat runtime source-size budget
+        run: node scripts/check-chat-runtime-size.mjs
+
   selfhost:
     name: self-host Docker and workerd
     runs-on: ubuntu-latest
@@ -14,7 +71,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun run selfhost:init
@@ -67,7 +124,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
       - uses: oven-sh/setup-bun@v2
       - uses: docker/setup-buildx-action@v3
       - run: bun install --frozen-lockfile
@@ -138,7 +195,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun run ${{ matrix.command }} -- --shard=${{ matrix.shard }}/${{ matrix.total }}

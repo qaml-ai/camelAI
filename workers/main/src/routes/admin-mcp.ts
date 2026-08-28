@@ -4,10 +4,6 @@
 
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Env, RouteContext } from "../types.js";
-import type {
-  PiCoreMessageHistoryRepairReport,
-  PiCoreMessageRow,
-} from "../chat-thread-do.js";
 import {
   ADMIN_MCP_SCOPE,
   AdminMcpOAuthProvider,
@@ -56,8 +52,6 @@ const TOOL_SEARCH_THREADS = "search_threads";
 const TOOL_QUERY_CHAT_ERRORS = "query_chat_errors";
 const TOOL_GET_THREAD_MESSAGES = "get_thread_messages";
 const TOOL_GET_THREAD_JSONL = "get_thread_jsonl";
-const TOOL_MANAGE_THREAD_MESSAGE_ROWS = "manage_thread_message_rows";
-const TOOL_REPAIR_PI_MESSAGE_HISTORY = "repair_pi_message_history";
 const TOOL_UPDATE_THREAD = "update_thread";
 const TOOL_SEARCH_WORKSPACES = "search_workspaces";
 const TOOL_VERIFY_PROJECT_BUILD = "verify_project_build";
@@ -334,42 +328,10 @@ function adminTools() {
     {
       name: TOOL_GET_THREAD_JSONL,
       description:
-        "Get a reconstructed JSONL transcript for one Pi-backed thread. The text content is raw JSONL with one parsed message per line.",
+        "Get the bounded canonical JSONL transcript for one thread. The text content has one visible message per line.",
       inputSchema: {
         type: "object",
         properties: { thread_id: { type: "string" } },
-        required: ["thread_id"],
-        additionalProperties: false,
-      },
-    },
-    {
-      name: TOOL_MANAGE_THREAD_MESSAGE_ROWS,
-      description:
-        "Inspect or repair persisted pi_core_messages rows for any chat thread. Use read mode to inspect and write mode to insert/update a row by index.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          thread_id: { type: "string", description: "Thread ID whose pi_core_messages rows should be inspected or repaired." },
-          mode: { type: "string", enum: ["read", "write"], description: "Whether to read rows or write one row." },
-          limit: { type: "integer", minimum: 1, maximum: 2000, description: "For read mode: max rows to return. Defaults to 200." },
-          idx: { type: "integer", minimum: 0, description: "For write mode: row index to insert/update." },
-          payload: { type: "string", description: "For write mode: JSON string payload for the pi_core_messages row." },
-          created_at: { type: "integer", description: "For write mode: optional millisecond timestamp override." },
-        },
-        required: ["thread_id", "mode"],
-        additionalProperties: false,
-      },
-    },
-    {
-      name: TOOL_REPAIR_PI_MESSAGE_HISTORY,
-      description:
-        "Dry-run or persistently repair stored pi_core_messages for a chat thread. Dry-run reports dropped/orphan tool results, synthetic missing tool results, trimmed assistant tail blocks, and invalid rows without writing. Repair rewrites pi_core_messages atomically with normalized repaired history.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          thread_id: { type: "string", description: "Thread ID whose persisted pi_core_messages should be audited or repaired." },
-          mode: { type: "string", enum: ["dry_run", "repair"], description: "Use dry_run to inspect only, or repair to persist normalized repaired pi_core_messages. Defaults to dry_run." },
-        },
         required: ["thread_id"],
         additionalProperties: false,
       },
@@ -817,18 +779,6 @@ function normalizeAdminApiPath(path: unknown): string | null {
   return trimmed;
 }
 
-type ChatThreadMessageRowsStub = {
-  getPiCoreMessageRows(limit?: number): Promise<PiCoreMessageRow[]> | PiCoreMessageRow[];
-  repairPiCoreMessageHistory(input?: {
-    mode?: "dry_run" | "repair";
-  }): Promise<PiCoreMessageHistoryRepairReport> | PiCoreMessageHistoryRepairReport;
-  putPiCoreMessageRow(input: {
-    idx: number;
-    payload: string;
-    created_at?: number;
-  }): Promise<{ ok: true; inserted: boolean; idx: number }> | { ok: true; inserted: boolean; idx: number };
-};
-
 type ChatThreadParsedMessagesStub = {
   getPiCoreParsedMessages(threadId: string): Promise<unknown[]> | unknown[];
 };
@@ -844,13 +794,6 @@ type AdminThreadContext = {
 type AdminThreadContextLookup = {
   getThreadContextById(threadId: string): Promise<AdminThreadContext | null>;
 };
-
-function getChatThreadMessageRowsStub(env: Env, threadId: string): ChatThreadMessageRowsStub | null {
-  if (!("CHAT_THREAD" in env) || !env.CHAT_THREAD) return null;
-  return env.CHAT_THREAD.get(
-    env.CHAT_THREAD.idFromName(threadId),
-  ) as unknown as ChatThreadMessageRowsStub;
-}
 
 function getChatThreadParsedMessagesStub(env: Env, threadId: string): ChatThreadParsedMessagesStub | null {
   if (!("CHAT_THREAD" in env) || !env.CHAT_THREAD) return null;
@@ -2166,90 +2109,6 @@ async function getThreadJsonlTool(env: Env, args: Record<string, unknown>) {
   };
 }
 
-async function repairPiMessageHistoryTool(env: Env, args: Record<string, unknown>) {
-  const threadId = requiredStringArg(args, "thread_id");
-  if (typeof threadId !== "string") return toolText(threadId, true);
-
-  const mode = stringArg(args, "mode") ?? "dry_run";
-  if (mode !== "dry_run" && mode !== "repair") {
-    return toolText({ error: "mode must be dry_run or repair" }, true);
-  }
-
-  const chatThreadStub = getChatThreadMessageRowsStub(env, threadId);
-  if (!chatThreadStub) {
-    return toolText({ error: "CHAT_THREAD binding is not available" }, true);
-  }
-
-  try {
-    const result = await Promise.resolve(
-      chatThreadStub.repairPiCoreMessageHistory({ mode }),
-    );
-    return toolText({
-      success: true,
-      thread_id: threadId,
-      ...result,
-    });
-  } catch (error) {
-    return toolText(
-      { error: error instanceof Error ? error.message : "Failed to repair Pi message history" },
-      true,
-    );
-  }
-}
-
-async function manageThreadMessageRowsTool(env: Env, args: Record<string, unknown>) {
-  const threadId = requiredStringArg(args, "thread_id");
-  if (typeof threadId !== "string") return toolText(threadId, true);
-
-  const mode = stringArg(args, "mode");
-  if (mode !== "read" && mode !== "write") {
-    return toolText({ error: "mode must be read or write" }, true);
-  }
-
-  const chatThreadStub = getChatThreadMessageRowsStub(env, threadId);
-  if (!chatThreadStub) {
-    return toolText({ error: "CHAT_THREAD binding is not available" }, true);
-  }
-
-  try {
-    if (mode === "read") {
-      const rows = await Promise.resolve(
-        chatThreadStub.getPiCoreMessageRows(integerArg(args, "limit") ?? undefined),
-      );
-      return toolText({
-        success: true,
-        thread_id: threadId,
-        count: rows.length,
-        rows,
-      });
-    }
-
-    const idx = integerArg(args, "idx");
-    const payload = stringArg(args, "payload");
-    if (idx === null || payload === null) {
-      return toolText({ error: "idx and payload are required for write mode" }, true);
-    }
-
-    const result = await Promise.resolve(
-      chatThreadStub.putPiCoreMessageRow({
-        idx,
-        payload,
-        created_at: integerArg(args, "created_at") ?? undefined,
-      }),
-    );
-    return toolText({
-      success: true,
-      thread_id: threadId,
-      ...result,
-    });
-  } catch (error) {
-    return toolText(
-      { error: error instanceof Error ? error.message : "Failed to manage thread message rows" },
-      true,
-    );
-  }
-}
-
 async function fetchAdminApiTool(
   req: Request,
   env: Env,
@@ -2463,12 +2322,6 @@ async function callTool(
   }
   if (name === TOOL_GET_THREAD_JSONL) {
     return getThreadJsonlTool(env, input);
-  }
-  if (name === TOOL_MANAGE_THREAD_MESSAGE_ROWS) {
-    return manageThreadMessageRowsTool(env, input);
-  }
-  if (name === TOOL_REPAIR_PI_MESSAGE_HISTORY) {
-    return repairPiMessageHistoryTool(env, input);
   }
   if (name === TOOL_UPDATE_THREAD) {
     const threadId = requiredStringArg(input, "thread_id");

@@ -1,7 +1,6 @@
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { useConnectionSetupResponse } from "@/components/chat-preview/use-connection-setup-response";
-import { SSE_READY_STATE_OPEN } from "@/lib/sse-agent-client";
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -15,12 +14,9 @@ function deferred<T = void>() {
 
 describe("useConnectionSetupResponse", () => {
   it("clears the submitted connection setup prompt after a successful save", async () => {
-    const call = vi.fn().mockResolvedValue(undefined);
-    const chatAgentRef = {
-      current: { readyState: SSE_READY_STATE_OPEN, call },
-    };
+    const submitResponse = vi.fn().mockResolvedValue(undefined);
     const { result } = renderHook(() =>
-      useConnectionSetupResponse({ chatAgentRef }),
+      useConnectionSetupResponse({ submitResponse }),
     );
 
     act(() => {
@@ -43,20 +39,17 @@ describe("useConnectionSetupResponse", () => {
       });
     });
 
-    expect(call).toHaveBeenCalledWith("submitConnectionSetupResponse", [
+    expect(submitResponse).toHaveBeenCalledWith(
       expect.objectContaining({ requestId: "prompt-a" }),
-    ]);
+    );
     expect(result.current.connectionSetupPrompt).toBeNull();
   });
 
   it("does not clear a newer connection setup prompt that arrives while save is in flight", async () => {
     const pendingSave = deferred();
-    const call = vi.fn().mockReturnValue(pendingSave.promise);
-    const chatAgentRef = {
-      current: { readyState: SSE_READY_STATE_OPEN, call },
-    };
+    const submitResponse = vi.fn().mockReturnValue(pendingSave.promise);
     const { result } = renderHook(() =>
-      useConnectionSetupResponse({ chatAgentRef }),
+      useConnectionSetupResponse({ submitResponse }),
     );
 
     act(() => {

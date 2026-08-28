@@ -1,4 +1,12 @@
 import { transform as sucraseTransform } from "sucrase";
+import { CHAT_RUNTIME_BOUNDS } from "../../../src/lib/chat-runtime-bounds";
+import {
+  CODE_MODE_DEFAULT_MAX_OUTPUT_CHARACTERS,
+  CODE_MODE_MAX_OUTPUT_CHARACTERS,
+} from "./code-mode-tools";
+
+export const CODE_MODE_MAX_NESTED_TOOL_CALLS =
+  CHAT_RUNTIME_BOUNDS.toolCallsPerTurn - 1;
 
 // js_exec user code runs inside an async function body, so wrap it the same way
 // before handing it to sucrase: that makes top-level `return`/`await` parse. The
@@ -57,6 +65,9 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 
 const USER_CODE_START_LINE = __USER_CODE_START_LINE__;
 const USER_CODE_END_LINE = __USER_CODE_END_LINE__;
+const DEFAULT_MAX_OUTPUT_CHARACTERS = __DEFAULT_MAX_OUTPUT_CHARACTERS__;
+const MAX_OUTPUT_CHARACTERS = __MAX_OUTPUT_CHARACTERS__;
+const MAX_NESTED_TOOL_CALLS = __MAX_NESTED_TOOL_CALLS__;
 const store = new Map();
 
 function stringifyOutput(value) {
@@ -108,6 +119,48 @@ function userCodeLocationFromStack(stack) {
     };
   }
   return null;
+}
+
+function createOutputBuffer(requestedLimit) {
+  const parsed = Number.isFinite(requestedLimit) ? Math.trunc(requestedLimit) : DEFAULT_MAX_OUTPUT_CHARACTERS;
+  const limit = Math.max(1000, Math.min(MAX_OUTPUT_CHARACTERS, parsed));
+  const chunks = [];
+  let entries = 0;
+  let kept = 0;
+  let total = 0;
+  return Object.freeze({
+    push(value) {
+      const text = String(value ?? "");
+      const separator = entries++ > 0 ? 1 : 0;
+      total += separator + text.length;
+      if (kept >= limit) return;
+      if (separator) {
+        chunks.push("\n");
+        kept += 1;
+      }
+      const selected = text.slice(0, Math.max(0, limit - kept));
+      if (selected) chunks.push(selected);
+      kept += selected.length;
+    },
+    empty: () => entries === 0,
+    text() {
+      const prefix = chunks.join("");
+      if (total <= limit) return prefix;
+      const marker = "\n\n[Truncated: " + limit + " of " + total + " characters]";
+      return prefix.slice(0, Math.max(0, limit - marker.length)) + marker.slice(0, limit);
+    },
+  });
+}
+
+function createNestedToolBudget(requestedLimit) {
+  const parsed = Number.isFinite(requestedLimit) ? Math.trunc(requestedLimit) : MAX_NESTED_TOOL_CALLS;
+  const limit = Math.max(0, Math.min(MAX_NESTED_TOOL_CALLS, parsed));
+  let used = 0;
+  return (invoke) => {
+    if (used >= limit) throw new Error("Nested tool-call limit reached (" + limit + ")");
+    used += 1;
+    return invoke();
+  };
 }
 
 function createOutputConsole(output) {
@@ -1223,7 +1276,10 @@ async function runUserCode() {
   const userCodeEndLine = userCodeStartLine + Math.max(1, executableUserCode.split("\n").length) - 1;
   const workerPrefix = workerPrefixTemplate
     .replace("__USER_CODE_START_LINE__", String(userCodeStartLine))
-    .replace("__USER_CODE_END_LINE__", String(userCodeEndLine));
+    .replace("__USER_CODE_END_LINE__", String(userCodeEndLine))
+    .replace("__DEFAULT_MAX_OUTPUT_CHARACTERS__", String(CODE_MODE_DEFAULT_MAX_OUTPUT_CHARACTERS))
+    .replace("__MAX_OUTPUT_CHARACTERS__", String(CODE_MODE_MAX_OUTPUT_CHARACTERS))
+    .replace("__MAX_NESTED_TOOL_CALLS__", String(CODE_MODE_MAX_NESTED_TOOL_CALLS));
   return `${workerPrefix}${executableUserCode}${String.raw`
 }
 
@@ -1261,9 +1317,10 @@ function installSecureFetch(secureFetchBinding) {
 }
 
 export class CodeModeRunner extends WorkerEntrypoint {
-  async run(timeoutMs, maxTimeoutMs) {
+  async run(timeoutMs, maxTimeoutMs, maxOutputCharacters, maxNestedToolCalls) {
     hardenTimingSurface();
-    const output = [];
+    const output = createOutputBuffer(maxOutputCharacters);
+    const nestedToolCall = createNestedToolBudget(maxNestedToolCalls);
     globalThis.console = createOutputConsole(output);
     const cleanupSecureFetch = installSecureFetch(this.env.SECURE_FETCH);
     const registeredTools = Object.freeze((await this.env.TOOLS.listTools()).map((tool) => Object.freeze({
@@ -1281,8 +1338,8 @@ export class CodeModeRunner extends WorkerEntrypoint {
       TOOL_DESCRIBE_DEFINITION,
       ...registeredTools.filter((tool) => !tool.hidden),
     ]);
-    const callTool = (name, args = {}) => this.env.TOOLS.callTool(name, args);
-    const invokeEnvelope = (name, args = {}) => this.env.TOOLS.callToolEnvelope(name, args);
+    const callTool = (name, args = {}) => nestedToolCall(() => this.env.TOOLS.callTool(name, args));
+    const invokeEnvelope = (name, args = {}) => nestedToolCall(() => this.env.TOOLS.callToolEnvelope(name, args));
     const help = createToolHelp(ALL_TOOLS);
     const search = createToolSearch(ALL_TOOLS);
     const describe = createToolDescribe(ALL_TOOLS);
@@ -1355,7 +1412,7 @@ export class CodeModeRunner extends WorkerEntrypoint {
         }),
       ]);
       if (result !== undefined) output.push(stringifyOutput(result));
-      if (output.length === 0) {
+      if (output.empty()) {
         // A silent blank reads as a rendering failure and sends agents down
         // rabbit holes. Common cause: the script's last statement is a block
         // (if/else, loop), so bare expressions inside it are evaluated and
@@ -1367,12 +1424,12 @@ export class CodeModeRunner extends WorkerEntrypoint {
             "expressions inside if/else or loop blocks are not), or print with console.log(...).",
         };
       }
-      return { text: output.join("\n") };
+      return { text: output.text() };
     } catch (error) {
       if (error && error.name === "CodeModeTimeoutError") throw error;
       const formatted = formatRuntimeError(error);
-      const prefix = output.length ? output.join("\n") + "\n\n" : "";
-      throw new Error(prefix + "JavaScript execution failed: " + formatted);
+      output.push((output.empty() ? "" : "\n") + "JavaScript execution failed: " + formatted);
+      throw new Error(output.text());
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
       await browserRuntime.cleanup();

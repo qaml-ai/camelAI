@@ -89,9 +89,7 @@
       "max_instances": 2,
     },
   ],
-  "artifacts": [
-    { "binding": "ARTIFACTS", "namespace": "staging" },
-  ],
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "staging" }],
   "send_email": [
     {
       "name": "EMAIL",
@@ -103,17 +101,24 @@
     // refuses to mount one binding at two prefixes, so writable /outputs
     // needs its own binding to coexist with read-only /uploads.
     { "binding": "R2_OUTPUTS_BUCKET", "bucket_name": "chiridion-sandbox" },
-    { "binding": "WAREHOUSE_EXPORT_BUCKET", "bucket_name": "chiridion-warehouse-exports-staging" },
+    {
+      "binding": "WAREHOUSE_EXPORT_BUCKET",
+      "bucket_name": "chiridion-warehouse-exports-staging",
+    },
   ],
   "analytics_engine_datasets": [
     { "binding": "ERROR_ANALYTICS", "dataset": "chiridion_errors_staging" },
-    { "binding": "OBSERVABILITY_EVENTS", "dataset": "chiridion_observability_staging" },
+    {
+      "binding": "OBSERVABILITY_EVENTS",
+      "dataset": "chiridion_observability_staging",
+    },
   ],
-  // Transcript data lake (config/pipelines/README.md). Streams land in the
-  // chiridion-transcript-lake-staging R2 Data Catalog as Iceberg tables.
+  // Best-effort code-mode tool timings; never transcript or turn state.
   "pipelines": [
-    { "binding": "TRANSCRIPT_LAKE", "stream": "02a2d092797b4903bd1f259752d563d2" },
-    { "binding": "TOOL_CALLS_LAKE", "stream": "51df244b1d8f4098adf032cd1c35256f" },
+    {
+      "binding": "TOOL_CALLS_LAKE",
+      "stream": "51df244b1d8f4098adf032cd1c35256f",
+    },
   ],
   "kv_namespaces": [
     { "binding": "EMAIL_TO_USER", "id": "ab267c4f44b847dda8bdca400a4e1884" },
@@ -147,13 +152,13 @@
         "max_batch_size": 10,
         "max_batch_timeout": 1,
         "max_retries": 5,
-        "dead_letter_queue": "chiridion-app-discord-events-dlq-staging"
+        "dead_letter_queue": "chiridion-app-discord-events-dlq-staging",
       },
       {
         "queue": "chiridion-app-discord-events-dlq-staging",
         "max_batch_size": 10,
         "max_batch_timeout": 1,
-        "max_retries": 3
+        "max_retries": 3,
       },
     ],
   },
@@ -161,9 +166,12 @@
     { "binding": "WORKER_SELF_REFERENCE", "service": "chiridion-app-staging" },
     {
       "binding": "DISPATCHER",
-      "service": "chiridion-dispatcher-staging"
+      "service": "chiridion-dispatcher-staging",
     },
-    { "binding": "DISCORD_BRIDGE", "service": "chiridion-discord-bridge-staging" }
+    {
+      "binding": "DISCORD_BRIDGE",
+      "service": "chiridion-discord-bridge-staging",
+    },
   ],
   "durable_objects": {
     "bindings": [
@@ -177,32 +185,35 @@
       { "name": "SLACK_TEAM_REGISTRY", "class_name": "SlackTeamRegistryDO" },
       { "name": "WORKSPACE", "class_name": "WorkspaceDO" },
       { "name": "WORKSPACE_CRON", "class_name": "WorkspaceCronDO" },
-	      { "name": "MCP_OBJECT", "class_name": "ChiridionMcp" },
-	      { "name": "WORKER_LOGS", "class_name": "WorkerLogsDO" },
-	      { "name": "WORKSPACE_FS", "class_name": "WorkspaceFilesystemDO" },
-	      { "name": "ANALYSIS_SANDBOX", "class_name": "AnalysisSandbox" },
-	      { "name": "PROJECT_BUILD_SANDBOX", "class_name": "ProjectBuildSandbox" },
-	      { "name": "DB_QUERY_SANDBOX", "class_name": "DbQuerySandbox" },
-	    ],
-	  },
+      { "name": "MCP_OBJECT", "class_name": "ChiridionMcp" },
+      { "name": "WORKER_LOGS", "class_name": "WorkerLogsDO" },
+      { "name": "WORKSPACE_FS", "class_name": "WorkspaceFilesystemDO" },
+      { "name": "ANALYSIS_SANDBOX", "class_name": "AnalysisSandbox" },
+      { "name": "PROJECT_BUILD_SANDBOX", "class_name": "ProjectBuildSandbox" },
+      { "name": "DB_QUERY_SANDBOX", "class_name": "DbQuerySandbox" },
+    ],
+  },
   "workflows": [
     {
       "name": "chiridion-deterministic-automations-staging",
       "binding": "DETERMINISTIC_AUTOMATION_WORKFLOWS",
-      "class_name": "DeterministicAutomationWorkflow"
-    }
+      "class_name": "DeterministicAutomationWorkflow",
+    },
   ],
   "migrations": [
     { "tag": "v27" },
     { "tag": "v28" },
-    { "tag": "v29", "new_sqlite_classes": ["TelegramRegistryDO", "SlackTeamRegistryDO"] },
-	    { "tag": "v30", "new_sqlite_classes": ["WorkspaceFilesystemDO"] },
+    {
+      "tag": "v29",
+      "new_sqlite_classes": ["TelegramRegistryDO", "SlackTeamRegistryDO"],
+    },
+    { "tag": "v30", "new_sqlite_classes": ["WorkspaceFilesystemDO"] },
     { "tag": "v31", "new_sqlite_classes": ["MigrationPlanningAgent"] },
     { "tag": "v32", "new_sqlite_classes": ["WarehouseSandbox"] },
-	    { "tag": "v33", "new_sqlite_classes": ["ProjectBuildSandbox"] },
-	    { "tag": "v34", "new_sqlite_classes": ["AnalysisSandbox"] },
-	    { "tag": "v35", "deleted_classes": ["WarehouseSandbox"] },
-	    { "tag": "v36", "new_sqlite_classes": ["DbQuerySandbox"] },
-	    { "tag": "v37", "new_sqlite_classes": ["SignupDO"] },
-	  ],
-	}
+    { "tag": "v33", "new_sqlite_classes": ["ProjectBuildSandbox"] },
+    { "tag": "v34", "new_sqlite_classes": ["AnalysisSandbox"] },
+    { "tag": "v35", "deleted_classes": ["WarehouseSandbox"] },
+    { "tag": "v36", "new_sqlite_classes": ["DbQuerySandbox"] },
+    { "tag": "v37", "new_sqlite_classes": ["SignupDO"] },
+  ],
+}

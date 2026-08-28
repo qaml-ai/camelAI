@@ -1,8 +1,7 @@
 /**
- * Header hygiene for the HTTP chat transport. Both partyserver and the Agents
- * SDK take routing input from request headers, and the SSE/POST routes forward a
- * browser-shaped request to the DO — so a client that sets those headers itself
- * must never have them reach the framework.
+ * Header hygiene for the V2 HTTP chat transport. The routes forward a
+ * browser-shaped request to the DO, so client-supplied framework routing
+ * headers must never cross that boundary.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -46,14 +45,14 @@ describe('stripReservedTransportHeaders', () => {
 
 describe('withoutReservedTransportHeaders', () => {
   it('returns the same request when nothing is reserved', () => {
-    const request = new Request('https://camelai.dev/agents/chat-thread/t1/sse', {
+    const request = new Request('https://camelai.dev/agents/chat-thread/t1/v2/events', {
       headers: { Accept: 'text/event-stream' },
     });
     expect(withoutReservedTransportHeaders(request)).toBe(request);
   });
 
   it('clones without the reserved headers, preserving the rest', () => {
-    const request = new Request('https://camelai.dev/agents/chat-thread/t1/sse', {
+    const request = new Request('https://camelai.dev/agents/chat-thread/t1/v2/events', {
       headers: {
         Accept: 'text/event-stream',
         'X-Chiridion-User-Id': 'user-1',

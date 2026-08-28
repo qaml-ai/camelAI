@@ -11,29 +11,23 @@ import { text } from "./response.js";
 import { getWorkspaceStub, getOrgStub } from "./stubs.js";
 import { isOrgBanned, isUserBanned } from "../ban-list.js";
 import { validateSessionMapsToOrg } from "./proxy-auth-providers.js";
-import {
-  isDegradableChatWebSocketAuthError,
-  retryTransientDurableObjectRpc,
-} from "../../../../src/lib/do-rpc-retry.server";
+import { isDegradableChatWebSocketAuthError } from "../../../../src/lib/do-rpc-retry.server";
+import { CHAT_RUNTIME_BOUNDS } from "../../../../src/lib/chat-runtime-bounds";
 import { getAppIndexReadDatabase } from "../app-index-db.js";
 import { validateOrgSsoSession } from "../org-sso.js";
 import { ENTERPRISE_OIDC_AUTH_SOURCE } from "../signed-session.js";
 
 export type AuthResult = { session: SessionData } | { error: Response };
 
-// Per-RPC budget for the chat WS auth chain. Client connectionTimeout is 20s;
-// at most three sequential timed phases (UserDO invalidation, workspace→org
-// resolution, one OrgDO validation) × two 2.5s attempts stay below that bound,
-// including the short retry delays.
-const CHAT_WS_AUTH_RPC_TIMEOUT_MS = 2_500;
-const CHAT_WS_AUTH_RPC_ATTEMPTS = 2;
 const WORKSPACE_ORG_INDEX_PREFIX = "workspace_org:";
 
 async function getWorkspaceOrgId(
   env: Env,
   workspaceId: string,
 ): Promise<string | null> {
-  const indexed = await env.APP_KV.get(`${WORKSPACE_ORG_INDEX_PREFIX}${workspaceId}`);
+  const indexed = await env.APP_KV.get(
+    `${WORKSPACE_ORG_INDEX_PREFIX}${workspaceId}`,
+  );
   if (indexed) return indexed;
   const appIndex = getAppIndexReadDatabase(env);
   const orgId = appIndex ? await appIndex.getWorkspaceOrgId(workspaceId) : null;
@@ -44,8 +38,8 @@ async function getWorkspaceOrgId(
 }
 
 class ChatWebSocketAuthRpcTimeoutError extends Error {
-  // Picked up by isTransientDurableObjectRpcError so timeouts retry and
-  // degrade like dropped RPC channels instead of failing closed.
+  // Classified with dropped RPC channels so the HTTP transport can return a
+  // bounded temporary-unavailability response instead of treating it as denial.
   retryable = true;
 
   constructor(operation: string) {
@@ -55,27 +49,21 @@ class ChatWebSocketAuthRpcTimeoutError extends Error {
 }
 
 function chatWsAuthRpc<T>(operation: string, fn: () => Promise<T>): Promise<T> {
-  return retryTransientDurableObjectRpc(
-    operation,
-    () => {
-      return new Promise<T>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          reject(new ChatWebSocketAuthRpcTimeoutError(operation));
-        }, CHAT_WS_AUTH_RPC_TIMEOUT_MS);
-        fn().then(
-          (value) => {
-            clearTimeout(timer);
-            resolve(value);
-          },
-          (error) => {
-            clearTimeout(timer);
-            reject(error);
-          },
-        );
-      });
-    },
-    { attempts: CHAT_WS_AUTH_RPC_ATTEMPTS, initialDelayMs: 50 },
-  );
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new ChatWebSocketAuthRpcTimeoutError(operation));
+    }, CHAT_RUNTIME_BOUNDS.authRpcMs);
+    fn().then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 const LOCAL_AUTH_USER_ID = "local-dev-user";
@@ -101,7 +89,11 @@ export async function requireSession(
   if (!(await validateOrgSsoSession(env, signedSession))) {
     return { error: text("Unauthorized", 401) };
   }
-  const proxyValidation = await validateSessionMapsToOrg(req, env, signedSession);
+  const proxyValidation = await validateSessionMapsToOrg(
+    req,
+    env,
+    signedSession,
+  );
   if (proxyValidation === "unavailable") {
     return {
       error: text("Identity proxy validation is temporarily unavailable", 503),
@@ -129,10 +121,12 @@ export async function requireSession(
   let invalidatedAt: number | null;
   if (options.failOpenOnInvalidationCheckError) {
     try {
-      invalidatedAt = await chatWsAuthRpc("UserDO.getSessionInvalidatedAt", () =>
-        userNs
-          .get(userNs.idFromName(signedSession.user_id))
-          .getSessionInvalidatedAt(),
+      invalidatedAt = await chatWsAuthRpc(
+        "UserDO.getSessionInvalidatedAt",
+        () =>
+          userNs
+            .get(userNs.idFromName(signedSession.user_id))
+            .getSessionInvalidatedAt(),
       );
     } catch (error) {
       if (!isDegradableChatWebSocketAuthError(error)) {
@@ -194,7 +188,10 @@ async function getLocalAuthBypassSession(
   req: Request,
   env: Env,
 ): Promise<SessionData | null> {
-  if (!envFlagEnabled(env.LOCAL_AUTH_BYPASS) || !isLocalhostRequest(req, env.LOCAL_AUTH_BYPASS_HOSTS)) {
+  if (
+    !envFlagEnabled(env.LOCAL_AUTH_BYPASS) ||
+    !isLocalhostRequest(req, env.LOCAL_AUTH_BYPASS_HOSTS)
+  ) {
     return null;
   }
 
@@ -301,10 +298,9 @@ export interface ChatWebSocketAccess {
 
 /**
  * Returned when the user has a valid signed session but the authorization
- * Durable Objects (WorkspaceDO/OrgDO) were unreachable after retries. The
- * route may forward the upgrade to ChatThreadDO marked as degraded; the DO
- * only admits users it has previously seen pass full authorization for the
- * same thread.
+ * Durable Objects (WorkspaceDO/OrgDO) were unavailable within the bounded auth
+ * deadline. The HTTP chat boundary converts this result to 503 and never
+ * forwards the request to ChatThreadDO.
  */
 export interface ChatWebSocketDegradedAccess {
   degraded: true;
@@ -336,17 +332,15 @@ export async function requireChatWebSocketAccess(
   // session's currently-selected workspace.
   // The session selection is a shared per-browser cookie that other tabs
   // mutate; using it here breaks open threads in other workspaces/orgs.
-  const workspaceId =
-    workspaceIdFromUrl?.trim() || session.workspace_id || "";
+  const workspaceId = workspaceIdFromUrl?.trim() || session.workspace_id || "";
   if (!workspaceId) {
     return { error: text("No workspace selected", 400) };
   }
 
   try {
     const wsStub = getWorkspaceStub(env, workspaceId);
-    const resolvedOrgId = await chatWsAuthRpc(
-      "workspace_org_index.get",
-      () => getWorkspaceOrgId(env, workspaceId),
+    const resolvedOrgId = await chatWsAuthRpc("workspace_org_index.get", () =>
+      getWorkspaceOrgId(env, workspaceId),
     );
     const workspaceOrgId = resolvedOrgId || sessionOrgId;
     if (
@@ -386,14 +380,12 @@ export async function requireChatWebSocketAccess(
   } catch (error) {
     if (isDegradableChatWebSocketAuthError(error)) {
       // The authorization DOs are unreachable or overloaded, not denying
-      // access. Fall back to degraded auth: the session is verified, and
-      // ChatThreadDO will only admit users it has already seen pass full
-      // authorization.
+      // access. Preserve that distinction so the HTTP boundary returns a
+      // retryable 503 without forwarding the request to ChatThreadDO.
       return { degraded: true, session, userId, threadId };
     }
-    // Unknown/application errors are not authoritative denials. Return 503 so
-    // the upgrade path closes with reconnectable 1013 instead of terminal 4403
-    // (which would permanently kill tabs during a bad deploy window).
+    // Unknown/application errors are not authoritative denials. HTTP callers
+    // receive a retryable 503 rather than a terminal authorization response.
     return { error: text("Authorization temporarily unavailable", 503) };
   }
 }

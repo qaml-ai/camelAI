@@ -1,4 +1,8 @@
-const INLINE_IMAGE_MAX_BASE64_CHARS = Math.floor(4.5 * 1024 * 1024);
+import { CHAT_RUNTIME_BOUNDS } from "../../../src/lib/chat-runtime-bounds";
+
+const INLINE_IMAGE_MAX_BASE64_CHARS = Math.floor(
+  CHAT_RUNTIME_BOUNDS.toolResultBytes / 2,
+);
 const IMAGE_TYPE_SNIFF_BYTES = 4100;
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
@@ -122,23 +126,43 @@ function streamFromBytes(bytes: Uint8Array): ReadableStream<Uint8Array> {
   });
 }
 
-export async function readStreamBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+export async function readStreamBytes(
+  stream: ReadableStream<Uint8Array>,
+  maximumBytes: number,
+): Promise<Uint8Array> {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) {
+    throw new RangeError("maximumBytes must be a non-negative safe integer");
+  }
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    total += value.byteLength;
+  let chunkCount = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunkCount += 1;
+      if (chunkCount > CHAT_RUNTIME_BOUNDS.streamReadChunks) {
+        void reader.cancel("stream exceeded chunk limit").catch(() => undefined);
+        throw new RangeError("Stream exceeds chunk limit");
+      }
+      if (value.byteLength > maximumBytes - total) {
+        void reader.cancel("stream exceeded byte limit").catch(() => undefined);
+        throw new RangeError(`Stream exceeds ${maximumBytes} byte limit`);
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+    const all = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      all.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return all;
+  } finally {
+    reader.releaseLock();
   }
-  const all = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    all.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return all;
 }
 
 async function readStreamText(
@@ -149,10 +173,23 @@ async function readStreamText(
   const decoder = new TextDecoder();
   const chunks: string[] = [];
   let totalChars = 0;
+  let chunkCount = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      chunkCount += 1;
+      if (chunkCount > CHAT_RUNTIME_BOUNDS.streamReadChunks) {
+        void reader.cancel("inline image output exceeded chunk limit").catch(() => undefined);
+        throw new RangeError("Stream exceeds chunk limit");
+      }
+      if (
+        options.maxChars !== undefined &&
+        value.byteLength > options.maxChars - totalChars
+      ) {
+        await reader.cancel("inline image output exceeded base64 limit");
+        return null;
+      }
       const chunk = decoder.decode(value, { stream: true });
       chunks.push(chunk);
       totalChars += chunk.length;
@@ -179,9 +216,16 @@ export async function readImageSniffBytesAndReplayStream(
   const reader = source.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
+  let chunkCount = 0;
   while (total < IMAGE_TYPE_SNIFF_BYTES) {
     const { done, value } = await reader.read();
     if (done) break;
+    chunkCount += 1;
+    if (chunkCount > CHAT_RUNTIME_BOUNDS.streamReadChunks) {
+      void reader.cancel("image sniff exceeded chunk limit").catch(() => undefined);
+      reader.releaseLock();
+      throw new RangeError("Stream exceeds chunk limit");
+    }
     chunks.push(value);
     total += value.byteLength;
   }
@@ -295,14 +339,17 @@ export async function prepareInlineImageFromStream(
   ];
   for (const [index, candidate] of candidates.entries()) {
     if (index > 0 && !options.createRetryStream) return null;
+    let candidateStream: ReadableStream<Uint8Array> | null = null;
+    let accepted = false;
     try {
-      const candidateStream = index === 0 ? stream : await options.createRetryStream!();
+      candidateStream = index === 0 ? stream : await options.createRetryStream!();
       const transformed = await outputImageFromStream(images, candidateStream, format, {
         width: candidate.maxDimension,
         height: candidate.maxDimension,
         quality: candidate.quality,
       });
       if (transformed.data.length <= INLINE_IMAGE_MAX_BASE64_CHARS) {
+        accepted = true;
         return {
           data: transformed.data,
           mimeType: transformed.mimeType,
@@ -314,6 +361,10 @@ export async function prepareInlineImageFromStream(
       }
     } catch {
       // Try the next smaller/cheaper candidate if a fresh source stream is available.
+    } finally {
+      if (candidateStream && !accepted) {
+        await candidateStream.cancel("inline image transform candidate failed").catch(() => undefined);
+      }
     }
   }
   return null;

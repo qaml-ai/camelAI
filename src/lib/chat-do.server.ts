@@ -1,6 +1,4 @@
 import type { AppLoadContext } from "react-router";
-import type { UIMessage } from "ai";
-import type { ChatRenderHistoryPage } from "./chat-render-history";
 import { getEnv, type CloudflareEnv } from "./cloudflare.server";
 import type {
   Thread,
@@ -14,9 +12,7 @@ import type {
   PreviewTarget,
   WorkspaceModelPickerConfig,
 } from "@/types";
-import {
-  generateThreadTitleWithOpenAI,
-} from "./thread-title-generation.server";
+import { generateThreadTitleWithOpenAI } from "./thread-title-generation.server";
 import { OrgDO, type OrgThread } from "../../workers/main/src/auth";
 import { WorkspaceDO } from "../../workers/main/src/workspace";
 import {
@@ -36,10 +32,7 @@ import {
 } from "./llm-provider-config";
 import { getEffectiveLlmProviderConfig } from "./selfhost-ai-provider";
 import { isSelfhostRuntime } from "./selfhost-runtime";
-import {
-  MODEL_CATALOG,
-  resolveModelPickerCatalog,
-} from "./model-catalog";
+import { MODEL_CATALOG, resolveModelPickerCatalog } from "./model-catalog";
 import {
   deriveHostedCreditPause,
   findCheapestSelectableModel,
@@ -110,9 +103,9 @@ interface ModelPickerStateOptions extends KnownOrgOptions {
   > | null;
 }
 
-export function normalizeStoredThreadModel(
-  rawModel: unknown,
-): { model: LlmModel } {
+export function normalizeStoredThreadModel(rawModel: unknown): {
+  model: LlmModel;
+} {
   return { model: normalizeLlmModel(rawModel) };
 }
 
@@ -163,14 +156,14 @@ function toThread(env: CloudflareEnv, orgThread: OrgThread): Thread {
 
 // List and history surfaces should not serialize full prompt text. Keep this
 // mapper separate from toThread so transcript hydration keeps full metadata.
-function toThreadListPreview(
-  env: CloudflareEnv,
-  orgThread: OrgThread,
-): Thread {
+function toThreadListPreview(env: CloudflareEnv, orgThread: OrgThread): Thread {
   const thread = toThread(env, orgThread);
   return {
     ...thread,
-    first_user_message: truncateThreadPreviewText(thread.first_user_message, 500),
+    first_user_message: truncateThreadPreviewText(
+      thread.first_user_message,
+      500,
+    ),
     last_user_message: truncateThreadPreviewText(thread.last_user_message, 500),
   };
 }
@@ -183,8 +176,9 @@ async function getWorkspaceInfo(
   const wsStub = env.WORKSPACE.get(
     env.WORKSPACE.idFromName(workspaceId),
   ) as unknown as WorkspaceDO;
-  const info = await retryTransientDurableObjectRead("WorkspaceDO.getInfo", () =>
-    wsStub.getInfo(),
+  const info = await retryTransientDurableObjectRead(
+    "WorkspaceDO.getInfo",
+    () => wsStub.getInfo(),
   );
   if (!info) return null;
   return { org_id: info.org_id };
@@ -197,10 +191,9 @@ export interface WorkspaceModelPickerState {
   customModelId: string | null;
   awsRegion: string | null;
   allowOpenAiSubscription: boolean;
-  billingAccessMode: Extract<
-    OrgBillingAccessState,
-    { kind: "ready" }
-  >["mode"] | null;
+  billingAccessMode:
+    | Extract<OrgBillingAccessState, { kind: "ready" }>["mode"]
+    | null;
   modelOptions: ModelPickerOption[];
   allowedThreadModels: LlmModel[];
   effectivePickerDefaultModel: LlmModel | null;
@@ -213,11 +206,7 @@ export interface WorkspaceModelPickerState {
 
 const UNLOCKABLE_CATALOG_IDS = (
   Object.keys(MODEL_CATALOG) as LlmModel[]
-).filter(
-  (id) =>
-    id !== CUSTOM_LLM_MODEL &&
-    id !== CAMEL_CODE_LLM_MODEL,
-);
+).filter((id) => id !== CUSTOM_LLM_MODEL && id !== CAMEL_CODE_LLM_MODEL);
 
 export function isBillingLockedModel(
   modelId: LlmModel,
@@ -259,7 +248,7 @@ export function applyHostedCreditPause(
   );
   const fallbackModel = findCheapestSelectableModel(modelOptions)?.id ?? null;
   const replaceLockedDefault = (model: LlmModel | null): LlmModel | null =>
-    model && lockedIds.has(model) ? fallbackModel ?? model : model;
+    model && lockedIds.has(model) ? (fallbackModel ?? model) : model;
 
   return {
     ...pickerState,
@@ -303,7 +292,12 @@ export async function getWorkspaceModelPickerState(
     orgId = wsInfo.org_id;
   }
 
-  return getWorkspaceModelPickerStateForOrg(context, orgId, workspaceId, options);
+  return getWorkspaceModelPickerStateForOrg(
+    context,
+    orgId,
+    workspaceId,
+    options,
+  );
 }
 
 async function getWorkspaceModelPickerStateForOrg(
@@ -342,7 +336,9 @@ async function getWorkspaceModelPickerStateForOrg(
     llmProviderConfig,
   );
   const customApi = getStoredCustomLlmProviderApi(effectiveLlmProviderConfig);
-  const customModelId = getStoredCustomLlmProviderModelId(effectiveLlmProviderConfig);
+  const customModelId = getStoredCustomLlmProviderModelId(
+    effectiveLlmProviderConfig,
+  );
   const awsRegion = getStoredBedrockAwsRegion(effectiveLlmProviderConfig);
   const [orgPickerConfig, workspacePickerConfig] = await Promise.all([
     readOrgModelPickerConfig(orgStub),
@@ -421,7 +417,7 @@ async function getWorkspaceModelPickerStateForOrg(
   );
   const fallbackModel = findCheapestSelectableModel(modelOptions)?.id ?? null;
   const effectivePickerDefaultModel = configuredDefaultIsLocked
-    ? fallbackModel ?? configuredDefault
+    ? (fallbackModel ?? configuredDefault)
     : configuredDefault;
   const defaultModel = resolveDefaultModelForChat({
     effectiveDefaultModel: effectivePickerDefaultModel,
@@ -437,7 +433,8 @@ async function getWorkspaceModelPickerStateForOrg(
 
   return {
     orgId,
-    llmProvider: (effectiveLlmProviderConfig?.provider ?? null) as LlmProvider | null,
+    llmProvider: (effectiveLlmProviderConfig?.provider ??
+      null) as LlmProvider | null,
     customApi,
     customModelId,
     awsRegion,
@@ -471,24 +468,18 @@ async function resolveCreateThreadModel(
   }
 
   const selectedModel =
-    requestedModel == null
-      ? pickerState.defaultModel
-      : requestedModel;
+    requestedModel == null ? pickerState.defaultModel : requestedModel;
   if (!selectedModel) {
     throw new Error("No models are available");
   }
   if (
     !isLlmModel(selectedModel) ||
-    !isLlmModelAllowedForNewThread(
-      selectedModel,
-      pickerState.llmProvider,
-      {
-        customApi: pickerState.customApi,
-        customModelId: pickerState.customModelId,
-        awsRegion: pickerState.awsRegion,
-        allowOpenAiSubscription: pickerState.allowOpenAiSubscription,
-      },
-    ) ||
+    !isLlmModelAllowedForNewThread(selectedModel, pickerState.llmProvider, {
+      customApi: pickerState.customApi,
+      customModelId: pickerState.customModelId,
+      awsRegion: pickerState.awsRegion,
+      allowOpenAiSubscription: pickerState.allowOpenAiSubscription,
+    }) ||
     !pickerState.allowedThreadModels.includes(selectedModel)
   ) {
     throw new Error("Invalid thread model");
@@ -799,23 +790,18 @@ export async function updateThreadModel(
   const orgStub = env.ORG.get(env.ORG.idFromName(orgId));
   const existing = await orgStub.getThread(id);
   if (!existing || existing.workspace_id !== workspaceId) return null;
-  const pickerState = await getWorkspaceModelPickerState(
-    context,
-    workspaceId,
-    { ...options, orgId },
-  );
+  const pickerState = await getWorkspaceModelPickerState(context, workspaceId, {
+    ...options,
+    orgId,
+  });
   if (
     !pickerState ||
-    !isLlmModelAllowedForNewThread(
-      model,
-      pickerState.llmProvider,
-      {
-        customApi: pickerState.customApi,
-        customModelId: pickerState.customModelId,
-        awsRegion: pickerState.awsRegion,
-        allowOpenAiSubscription: pickerState.allowOpenAiSubscription,
-      },
-    ) ||
+    !isLlmModelAllowedForNewThread(model, pickerState.llmProvider, {
+      customApi: pickerState.customApi,
+      customModelId: pickerState.customModelId,
+      awsRegion: pickerState.awsRegion,
+      allowOpenAiSubscription: pickerState.allowOpenAiSubscription,
+    }) ||
     !pickerState.allowedThreadModels.includes(model)
   ) {
     throw new Error("Invalid thread model");
@@ -894,8 +880,9 @@ export async function generateThreadTitle(
     const orgStub = env.ORG.get(env.ORG.idFromName(wsInfo.org_id));
     const updated = await orgStub.updateThread(threadId, title);
     if (userId) {
-      await env.USER.get(env.USER.idFromName(userId))
-        .renameEmptySingleThreadGroupForThread(threadId, title);
+      await env.USER.get(
+        env.USER.idFromName(userId),
+      ).renameEmptySingleThreadGroupForThread(threadId, title);
     }
 
     const threadStub = env.CHAT_THREAD.get(
@@ -932,7 +919,9 @@ export async function getPiCoreMessages(
   const messages = await Promise.resolve(
     (
       threadStub as unknown as {
-        getPiCoreParsedMessages(threadId: string): Promise<ParsedThreadMessage[]> | ParsedThreadMessage[];
+        getPiCoreParsedMessages(
+          threadId: string,
+        ): Promise<ParsedThreadMessage[]> | ParsedThreadMessage[];
       }
     ).getPiCoreParsedMessages(threadId),
   );
@@ -961,9 +950,9 @@ export async function getGroupNewChatRecentSource(
   const source = await Promise.resolve(
     (
       threadStub as unknown as {
-        getGroupNewChatRecentSource(threadId: string):
-          | Promise<GroupNewChatRecentSource>
-          | GroupNewChatRecentSource;
+        getGroupNewChatRecentSource(
+          threadId: string,
+        ): Promise<GroupNewChatRecentSource> | GroupNewChatRecentSource;
       }
     ).getGroupNewChatRecentSource(threadId),
   );
@@ -972,46 +961,6 @@ export async function getGroupNewChatRecentSource(
     projectActivity: Array.isArray(source?.projectActivity)
       ? source.projectActivity
       : [],
-  };
-}
-
-export async function getUiMessages(
-  context: AppLoadContext,
-  threadId: string,
-): Promise<UIMessage[]> {
-  return (await getUiMessagePage(context, threadId)).messages;
-}
-
-export async function getUiMessagePage(
-  context: AppLoadContext,
-  threadId: string,
-): Promise<ChatRenderHistoryPage> {
-  const env = getEnv(context);
-  if (
-    !env ||
-    typeof env !== "object" ||
-    !("CHAT_THREAD" in env) ||
-    !env.CHAT_THREAD
-  ) {
-    throw new Error("CHAT_THREAD binding is not available");
-  }
-  const threadStub = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId));
-  const page = await Promise.resolve(
-    (
-      threadStub as unknown as {
-        getUiMessagePage():
-          | Promise<ChatRenderHistoryPage>
-          | ChatRenderHistoryPage;
-      }
-    ).getUiMessagePage(),
-  );
-  return {
-    messages: Array.isArray(page?.messages) ? page.messages : [],
-    nextCursor:
-      typeof page?.nextCursor === "string" && page.nextCursor
-        ? page.nextCursor
-        : null,
-    hasMore: page?.hasMore === true,
   };
 }
 
@@ -1095,7 +1044,10 @@ export async function getThreadPreviewState(
 ): Promise<ThreadPreviewState> {
   const env = getEnv(context);
   const stub = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId));
-  const state = await stub.getPreviewState() as ThreadPreviewState | null | undefined;
+  const state = (await stub.getPreviewState()) as
+    | ThreadPreviewState
+    | null
+    | undefined;
   return {
     target: state?.target ?? null,
     tabs: Array.isArray(state?.tabs) ? state.tabs : [],

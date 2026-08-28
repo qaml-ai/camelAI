@@ -40,8 +40,8 @@ terminates with an unknown-outcome error. The product promise is:
 - a crash cannot duplicate a possibly side-effecting tool, and one safe
   checkpoint recovery cannot reset the original deadline or call budgets;
 - reconnecting clients converge from canonical bounded state;
-- the first V2 admission triggers at most one bounded legacy-history import,
-  without placing migration work on transport attach or renewing the turn;
+- the first authenticated page open or V2 admission requests at most one
+  bounded legacy-history import after the transport's first byte;
 - no request, wake, replay, queue, context load, or output can grow with the
   lifetime size of the thread.
 
@@ -361,9 +361,10 @@ remains typed DO RPC, not generic Agents frames.
 
 ## Bounded JIT legacy migration
 
-The first durable V2 admission creates the only authority to inspect legacy
-history. Opening or reconnecting an SSE stream never starts migration and never
-waits for it. The durable marker moves monotonically through
+The first authenticated page open or durable V2 admission creates authority to
+inspect legacy history. SSE enqueues its heartbeat before scope or storage work;
+the post-open path then durably requests alarm-owned migration without waiting
+for it. The durable marker moves monotonically through
 `unseen -> pending -> complete|failed`; `complete` and `failed` are permanent.
 
 `BeginLegacyMigration` records a fresh migration token, attempt one, and a fixed
@@ -513,8 +514,9 @@ Required safety properties:
 - admission, queue, checkpoint, provider/tool, migration, transport, and clock
   quantities remain within their finite formal bounds;
 - a transport open action is independent of runner/recovery state;
-- legacy reads begin only after durable V2 admission, use at most two fresh
-  tokens under one absolute deadline, and are impossible after a terminal marker;
+- legacy reads begin only after admission or a durable authenticated post-open
+  request, use at most two fresh tokens under one absolute deadline, and are
+  impossible after a terminal marker;
 - turn claim is disabled until migration is complete or failed, and migration
   never resets queued-turn deadlines or execution counters.
 
@@ -704,9 +706,10 @@ Instead:
   while non-browser callers retained bounded typed RPC methods on the same stub;
 - `ChatRuntimeClient`/`useChatRuntime` replaced the Agents client directly; there
   is no feature flag, dual writer, runtime-version resolver, or cohort split;
-- the new SQLite tables are authoritative for V2 turns. After the first durable
-  V2 admission, one alarm-owned bounded JIT migration may read legacy history;
-  transport attach, ordinary requests, and later model-context paths never do;
+- the new SQLite tables are authoritative for V2 turns. After the first
+  authenticated open or durable V2 admission, one alarm-owned bounded JIT
+  migration may read legacy history; the first-byte path and later model-context
+  paths never do;
 - that one-way importer scans read-only legacy state within fixed row/byte/time
   bounds, atomically commits at most 128 settled turns, and leaves a permanent
   `complete` or `failed` marker. There is no exporter or reverse migration;
@@ -774,7 +777,7 @@ the before/after report; no hand-maintained total decides the gate.
 | Crash during provider work or before an unstarted checkpointed call     | Recover once with a fresh token from the bounded checkpoint; preserve original deadline and counters                                                                         |
 | Crash after claiming work with an uncertain call                        | Terminalize and exclude from canonical context; no second recovery or tool replay                                                                                            |
 | Slow/disconnected client misses events                                  | Bounded cursor catch-up or reset to canonical bounded history; no unbounded replay                                                                                           |
-| Existing huge thread                                                    | The first V2 admission permits one 30-second, two-attempt bounded scan; only the newest 128 completed turns within 8 MiB import, then a permanent marker fences legacy state |
+| Existing huge thread                                                    | The first authenticated open or V2 admission permits one 30-second, two-attempt bounded scan; only the newest 128 completed turns within 8 MiB import, then a permanent marker fences legacy state |
 | Long coding task exceeds the new limit                                  | Explicit timeout and preserved workspace effects; user may start another turn                                                                                                |
 | User question or approval would block                                   | Initial v2 returns an unavailable/needs-follow-up result; a later bounded workflow requires a separate formal design                                                         |
 | New config arrives mid-turn                                             | Current attempt uses its snapshot; next attempt/turn reads the new generation                                                                                                |
@@ -790,9 +793,9 @@ The replacement is complete only when all of the following are true:
 - every accepted turn has one canonical row, at most two fenced tokens, and
   reaches a terminal state under the declared fairness assumption;
 - SSE opens before any runtime/history/runner work;
-- JIT legacy migration starts only after durable admission, never on transport
-  attach, uses at most two tokens under one fixed deadline, and leaves a
-  permanent terminal marker before claim;
+- JIT legacy migration starts only after durable admission or an authenticated
+  post-heartbeat request, uses at most two tokens under one fixed deadline, and
+  leaves a permanent terminal marker before claim;
 - every configured invariant and temporal property passes TLC in each focused
   finite A-D instance, and the reducer trace tests pass;
 - deterministic tests cover admission, ownership, atomic provider batches,

@@ -15,10 +15,11 @@ The model composes five finite state machines:
   a prerequisite for the transport decision. The model does not falsely
   promise that a disconnected caller always observes an open stream.
 - A JIT legacy import moves `unseen -> pending -> complete|failed` only after a
-  V2 turn is durable. Attempt one establishes one absolute migration deadline;
+  V2 turn is durable or transport has opened and durably requested it. Attempt
+  one establishes one absolute migration deadline;
   the only retry uses a fresh token without renewing that deadline or any queued
   turn deadline/counter. Claim is disabled until the permanent terminal marker.
-  Transport attach never begins or waits for migration.
+  The first-byte path never begins or waits for migration.
 - `ClientPost` pre-arms the alarm. `DurablyAdmit` is the server-side durable ACK
   decision: it records an id exactly once, appends a bounded FIFO queue, and
   starts one accepted-to-terminal deadline. A lifetime admission cap makes its
@@ -76,9 +77,9 @@ TLC checks:
 
 - transport first-byte work is independent and reaches open or explicit
   timeout-close;
-- legacy reads require admitted V2 work, use at most two fresh fences under one
-  absolute deadline, block claim while unresolved, and cannot occur after a
-  terminal marker;
+- legacy reads require admitted V2 work or a durable authenticated post-open
+  request, use at most two fresh fences under one absolute deadline, block claim
+  while unresolved, and cannot occur after a terminal marker;
 - admission ids never disappear, duplicate ids never re-enter the queue, and
   queue/admission slot and byte bounds always hold;
 - work implies an alarm, while a pre-arm rejected before insert may leave one

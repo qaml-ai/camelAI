@@ -606,7 +606,7 @@ describe("ChatRuntimeController events", () => {
     expect(readOutbox).not.toHaveBeenCalled();
   });
 
-  it("publishes cursor-ordered resets once and kicks cold wake once", async () => {
+  it("publishes cursor-ordered resets and durably kicks every open", async () => {
     const events: Array<Record<string, unknown>> = [];
     let messages: Array<Record<string, unknown>> = [];
     const readOutbox = vi.fn((after: number | null) => ({
@@ -640,7 +640,12 @@ describe("ChatRuntimeController events", () => {
       await reader.read();
     }
     await state.flush();
-    expect(kick).toHaveBeenCalledOnce();
+    expect(kick).toHaveBeenCalledTimes(2);
+    expect(kick).toHaveBeenCalledWith(expect.objectContaining({
+      threadId: "thread-1",
+      workspaceId: "workspace-1",
+      orgId: "org-1",
+    }));
 
     events.push({
       seq: 1,

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { PiContainerTools } from "../src/pi-container-tools";
 import type { WorkspaceFilesystemLike } from "../src/workspace-filesystem-do";
+import { CHAT_RUNTIME_BOUNDS } from "../../../src/lib/chat-runtime-bounds";
 
 describe("PiContainerTools", () => {
   it("uses the store-owned atomic edit operation when available", async () => {
@@ -149,6 +150,64 @@ describe("PiContainerTools", () => {
 
     expect(result.text).toBe("hello");
     expect(readFile).toHaveBeenCalledWith("/workspace/notes.txt");
+  });
+
+  it("rejects a known oversized text stream before pulling it", async () => {
+    let pulls = 0;
+    const cancel = vi.fn();
+    const readFileStream = vi.fn(async () => ({
+      success: true,
+      size: CHAT_RUNTIME_BOUNDS.toolSourceReadBytes + 1,
+      mimeType: "text/plain",
+      stream: new ReadableStream<Uint8Array>({
+        pull(controller) {
+          pulls += 1;
+          controller.enqueue(new Uint8Array(1));
+        },
+        cancel,
+      }),
+    }));
+    const tools = new PiContainerTools({ readFileStream } as unknown as WorkspaceFilesystemLike);
+
+    await expect(tools.callTool("read", { path: "large.txt" })).rejects.toThrow(
+      "File is too large for text read",
+    );
+    // The Web Streams implementation may perform one eager pull at creation,
+    // but the tool itself never consumes the known-oversized body.
+    expect(pulls).toBeLessThanOrEqual(1);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("rejects an oversized fallback string before splitting it into lines", async () => {
+    const readFile = vi.fn(async () => ({
+      success: true,
+      content: "x".repeat(CHAT_RUNTIME_BOUNDS.toolSourceReadBytes + 1),
+      isBinary: false,
+    }));
+    const tools = new PiContainerTools({ readFile } as unknown as WorkspaceFilesystemLike);
+
+    await expect(tools.callTool("read", { path: "large.txt" })).rejects.toThrow(
+      "File is too large for text read",
+    );
+  });
+
+  it("omits a known oversized fallback binary before base64 decoding", async () => {
+    const readFile = vi.fn(async () => ({
+      success: true,
+      content: "iVBORw0KGgo=",
+      size: CHAT_RUNTIME_BOUNDS.toolSourceReadBytes + 1,
+      isBinary: true,
+      mimeType: "image/png",
+    }));
+    const images = { input: vi.fn() };
+    const tools = new PiContainerTools(
+      { readFile } as unknown as WorkspaceFilesystemLike,
+      { images: images as never },
+    );
+
+    await expect(tools.callTool("read", { path: "large.png" })).resolves
+      .toMatchObject({ details: { isBinary: true } });
+    expect(images.input).not.toHaveBeenCalled();
   });
 
   it("sniffs workspace binary image bytes even when mime type and extension are missing", async () => {

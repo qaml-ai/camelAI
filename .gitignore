@@ -29,6 +29,11 @@
 # Internal planning and documentation
 /docs/
 /plans/
+!/plans/
+/plans/*
+!/plans/chat-runtime-correctness/
+!/plans/chat-runtime-correctness/**
+/plans/chat-runtime-correctness/formal/states/
 
 # misc
 .DS_Store

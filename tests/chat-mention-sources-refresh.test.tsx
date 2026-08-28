@@ -2,31 +2,20 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
 
-// Chat connects through the SSE transport (`useSseAgent`). This test does not
-// exercise the live connection, so mock the hook with an inert client.
-vi.mock('@/lib/use-sse-agent', () => {
-  const client = {
-    readyState: 0,
-    send: vi.fn(),
-    call: vi.fn(() => Promise.resolve()),
-    reconnect: vi.fn(),
-    start: vi.fn(),
-    close: vi.fn(),
-  };
-  return { useSseAgent: () => client };
-});
-
-// Chat owns its transcript through ai-chat (useAgentChat) now; this test does
-// not exercise the live stream, so stub the projection hook. An empty history
-// makes Chat fall back to `initialMessages`, matching the pre-cutover behavior.
-vi.mock('@/lib/use-pi-chat-stream', () => ({
-  usePiChatStream: () => ({
+vi.mock('@/lib/use-chat-runtime', () => ({
+  useChatRuntime: () => ({
+    runtimeMessages: [],
     messages: [],
-    uiMessages: [],
-    status: 'ready',
-    isStreaming: false,
-    streamingMessageId: null,
-    setUiMessages: vi.fn(),
+    state: undefined,
+    activeTurn: null,
+    status: 'idle',
+    connectionStatus: 'ready',
+    ready: true,
+    connecting: false,
+    offline: false,
+    reconnect: vi.fn(),
+    sendMessage: vi.fn(),
+    control: vi.fn(),
   }),
 }));
 
@@ -391,6 +380,7 @@ describe('Chat mention source refresh', () => {
       created_at: 1,
       updated_at: 1,
       is_public: false,
+      environment: 'production',
       preview_key: null,
       preview_updated_at: null,
       preview_status: null,

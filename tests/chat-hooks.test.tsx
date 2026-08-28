@@ -1,5 +1,4 @@
 import { act, renderHook } from "@testing-library/react";
-import type { UIMessage } from "ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 
@@ -28,41 +27,20 @@ function message(id: string, role: Message["role"] = "user"): Message {
   };
 }
 
-function uiMessage(id: string): UIMessage {
-  return {
-    id,
-    role: "assistant",
-    parts: [{ type: "text", text: `content-${id}` }],
-  };
-}
-
 afterEach(() => {
   vi.useRealTimers();
 });
 
 describe("chat transcript hooks", () => {
-  it("derives a legacy seed from UI messages and captures loader error ids", () => {
-    const initialUiMessages = [
-      {
-        id: "assistant-1",
-        role: "assistant",
-        parts: [
-          { type: "text", text: "hello", state: "done" },
-          { type: "data-pi-error", data: { id: "error-1" } },
-        ],
-      } as unknown as UIMessage,
-    ];
-
+  it("parses the canonical loader seed", () => {
     const { result } = renderHook(() =>
       useInitialChatTranscript({
-        threadId: "thread-1",
-        initialUiMessages,
+        initialMessages: [message("assistant-1", "assistant")],
       }),
     );
 
     expect(result.current.parsedInitialMessages).toHaveLength(1);
     expect(result.current.parsedInitialMessages[0].id).toBe("assistant-1");
-    expect(result.current.loaderErrorIdsRef.current.has("error-1")).toBe(true);
   });
 
   it("overlays only optimistic messages that have not echoed from the server", () => {
@@ -77,7 +55,6 @@ describe("chat transcript hooks", () => {
     const { result } = renderHook(() =>
       useChatTranscriptProjection({
         liveMessages: [liveEcho],
-        liveUiMessages: [],
         optimisticMessages: [echoedOptimistic, pendingOptimistic],
         parsedInitialMessages: [],
         readOnly: false,
@@ -90,56 +67,19 @@ describe("chat transcript hooks", () => {
     ]);
   });
 
-  it("prepends render-only archived pages without replacing resident duplicate ids", () => {
+  it("uses the canonical loader seed until the live stream has messages", () => {
     const { result } = renderHook(() =>
       useChatTranscriptProjection({
-        archivedUiMessages: [
-          uiMessage("older-1"),
-          uiMessage("boundary"),
-        ],
-        liveMessages: [
-          message("boundary", "assistant"),
-          message("resident", "assistant"),
-        ],
-        liveUiMessages: [uiMessage("boundary"), uiMessage("resident")],
+        liveMessages: [],
         optimisticMessages: [],
-        parsedInitialMessages: [],
+        parsedInitialMessages: [message("assistant-1", "assistant")],
         readOnly: false,
-        threadId: "thread-1",
       }),
     );
 
     expect(result.current.displayMessages.map(({ id }) => id)).toEqual([
-      "older-1",
-      "boundary",
-      "resident",
+      "assistant-1",
     ]);
-    expect(result.current.displayMessages[0].thread_id).toBe("thread-1");
-  });
-
-  it("expires the snapshot bridge when a resumed stream never arrives", () => {
-    vi.useFakeTimers();
-    const bridgedMessage = message("assistant-1", "assistant");
-    const { result } = renderHook(() =>
-      useChatTranscriptProjection({
-        bridgedStreamingMessageId: "assistant-1",
-        liveMessages: [message("user-1")],
-        liveUiMessages: [],
-        optimisticMessages: [],
-        parsedInitialMessages: [bridgedMessage],
-        readOnly: false,
-      }),
-    );
-
-    expect(result.current.displayMessages.map(({ id }) => id)).toContain(
-      "assistant-1",
-    );
-
-    act(() => vi.advanceTimersByTime(15_000));
-
-    expect(result.current.displayMessages.map(({ id }) => id)).not.toContain(
-      "assistant-1",
-    );
   });
 });
 

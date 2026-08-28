@@ -2,11 +2,6 @@
  * Shared types and constants for the main worker
  */
 
-import type {
-  LakeStream,
-  PiMessageLakeRecord,
-  ToolCallLakeRecord,
-} from "./lake-streams.js";
 import type { ChatEnv } from "./chat-thread-do.js";
 import type { DOEnv } from "./auth.js";
 import type { DataProxyEnv } from "./data-proxy.js";
@@ -60,12 +55,18 @@ export interface Env
   WORKER_LOGS: DurableObjectNamespace<WorkerLogsDO>;
   // Unified analysis container (notebooks + shell + DuckDB) — successor to the
   // warehouse tier; SDK-allowlisted egress, one warm container per workspace.
-  ANALYSIS_SANDBOX?: DurableObjectNamespace<import('./analysis-sandbox.js').AnalysisSandbox>;
+  ANALYSIS_SANDBOX?: DurableObjectNamespace<
+    import("./analysis-sandbox.js").AnalysisSandbox
+  >;
   // Warm native-toolchain build container for DO+R2-backed projects (per-org).
-  PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<import('./project-build-sandbox.js').ProjectBuildSandbox>;
+  PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<
+    import("./project-build-sandbox.js").ProjectBuildSandbox
+  >;
   // Trusted query-execution container with static-IP database egress via the
   // sandbox-host SOCKS relay (docs/db-egress-relay.md).
-  DB_QUERY_SANDBOX?: DurableObjectNamespace<import('./db-query-sandbox.js').DbQuerySandbox>;
+  DB_QUERY_SANDBOX?: DurableObjectNamespace<
+    import("./db-query-sandbox.js").DbQuerySandbox
+  >;
   // Static-IP database egress relay coordinates (see infra/db-egress-relay/):
   // hostname is a var; the token/credential pairs are secrets.
   DB_EGRESS_RELAY_HOSTNAME?: string;
@@ -78,10 +79,6 @@ export interface Env
   SESSIONS: KVNamespace;
   OBSERVABILITY_EVENTS?: AnalyticsEngineDataset;
   ERROR_ANALYTICS?: AnalyticsEngineDataset;
-  // Transcript data lake streams (Cloudflare Pipelines -> R2 Data Catalog).
-  // Optional everywhere: absent bindings disable export, they never fail a turn.
-  TRANSCRIPT_LAKE?: LakeStream<PiMessageLakeRecord>;
-  TOOL_CALLS_LAKE?: LakeStream<ToolCallLakeRecord>;
   APP_SCREENSHOT_QUEUE?: Queue<AppScreenshotJob>;
   SLACK_EVENTS_QUEUE?: Queue<SlackEventQueueMessage>;
   DISCORD_EVENTS_QUEUE?: Queue<DiscordEventQueueMessage>;

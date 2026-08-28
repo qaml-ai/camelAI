@@ -11,7 +11,6 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import React from "react";
 import { BYOK_PROVIDERS } from "@/lib/byok-providers";
-import { CHAT_SSE_CLOSE_UNAUTHORIZED } from "@/lib/chat-sse-close";
 
 const mockNavigate = vi.fn();
 const mockRevalidate = vi.fn();
@@ -51,10 +50,7 @@ vi.mock("react-router", async () => {
 
 const mockToast = vi.hoisted(() => Object.assign(vi.fn(), { error: vi.fn() }));
 
-vi.mock("sonner", () => ({
-  toast: mockToast,
-}));
-
+vi.mock("sonner", () => ({ toast: mockToast }));
 vi.mock("@/hooks/use-auth-data", () => ({
   useAuthData: () => ({
     user: { id: "user-1", name: "Illiana" },
@@ -63,25 +59,20 @@ vi.mock("@/hooks/use-auth-data", () => ({
     orgs: [{ org_id: "org-1", role: "owner" }],
   }),
 }));
-
-vi.mock("@/hooks/use-mobile", () => ({
-  useIsMobile: () => false,
-}));
-
-vi.mock("@/components/page-header", () => ({
-  PageHeader: () => null,
-}));
-
+vi.mock("@/hooks/use-mobile", () => ({ useIsMobile: () => false }));
+vi.mock("@/components/page-header", () => ({ PageHeader: () => null }));
 vi.mock("@/components/prompt-input", () => ({
   PromptInput: ({
     value,
     onChange,
     onSubmit,
+    onStop,
     textareaRef,
   }: {
     value: string;
     onChange: (value: string) => void;
     onSubmit: () => void;
+    onStop: () => void;
     textareaRef?: React.RefObject<HTMLTextAreaElement | null>;
   }) => (
     <form
@@ -97,10 +88,12 @@ vi.mock("@/components/prompt-input", () => ({
         onChange={(event) => onChange(event.currentTarget.value)}
       />
       <button type="submit">Send message</button>
+      <button type="button" onClick={onStop}>
+        Stop
+      </button>
     </form>
   ),
 }));
-
 vi.mock("@/components/ask-user-question", () => ({
   AskUserQuestion: ({
     onSubmit,
@@ -115,36 +108,23 @@ vi.mock("@/components/ask-user-question", () => ({
     </button>
   ),
 }));
-
 vi.mock("@/components/message-bubble", () => ({
   MessageBubble: () => null,
   isInterruptMessage: () => false,
   parseSlashCommand: () => null,
   parseLocalCommandStdout: () => null,
 }));
-
-vi.mock("@/components/loading-dots", () => ({
-  LoadingDots: () => null,
-}));
-
-vi.mock("@/components/welcome-screen", () => ({
-  WelcomeScreen: () => null,
-}));
-
-vi.mock("@/components/floating-todo", () => ({
-  FloatingTodoList: () => null,
-}));
-
+vi.mock("@/components/loading-dots", () => ({ LoadingDots: () => null }));
+vi.mock("@/components/welcome-screen", () => ({ WelcomeScreen: () => null }));
+vi.mock("@/components/floating-todo", () => ({ FloatingTodoList: () => null }));
 vi.mock("@/components/connection-setup-prompt", () => ({
   ConnectionSetupPrompt: () => null,
 }));
-
 vi.mock("@/components/ui/button", () => ({
   Button: ({ children, ...props }: React.ComponentProps<"button">) => (
     <button {...props}>{children}</button>
   ),
 }));
-
 vi.mock("@/components/ui/tooltip", () => ({
   TooltipProvider: ({ children }: { children: React.ReactNode }) => (
     <>{children}</>
@@ -157,13 +137,11 @@ vi.mock("@/components/ui/tooltip", () => ({
     <>{children}</>
   ),
 }));
-
 vi.mock("@/components/ui/tabs", () => ({
   Tabs: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   TabsList: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   TabsTrigger: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
-
 vi.mock("@/components/ui/resizable", () => ({
   ResizablePanelGroup: ({ children }: { children: React.ReactNode }) => (
     <>{children}</>
@@ -173,7 +151,6 @@ vi.mock("@/components/ui/resizable", () => ({
   ),
   ResizableHandle: () => null,
 }));
-
 vi.mock("@/components/ui/dropdown-menu", () => ({
   DropdownMenu: ({ children }: { children: React.ReactNode }) => (
     <>{children}</>
@@ -195,150 +172,84 @@ vi.mock("@/components/ui/dropdown-menu", () => ({
   ),
 }));
 
-// Chat connects through the SSE transport (`useSseAgent`). Mock the hook so tests
-// can drive the connection directly instead of scripting fetch/SSE frames.
-const agentRuntime = vi.hoisted(() => {
-  type AgentOptions = {
-    agent: string;
-    name: string;
-    enabled?: boolean;
-    query?: Record<string, string | null | undefined>;
-    onOpen?: () => void;
-    onMessage?: (event: { data: string }) => void;
-    onClose?: (event?: unknown) => void;
-    onConnectionError?: (error: {
-      code?: number;
-      reason?: string;
-      wasClean?: boolean;
-    }) => void;
-    onStateUpdate?: (state: unknown) => void;
+const runtime = vi.hoisted(() => {
+  const sendMessage = vi.fn();
+  const control = vi.fn();
+  const reconnect = vi.fn();
+  const listeners = new Set<() => void>();
+  let options: Record<string, unknown> | null = null;
+  let snapshot: Record<string, unknown>;
+
+  const reset = () => {
+    sendMessage.mockReset().mockResolvedValue({
+      accepted: true,
+      duplicate: false,
+      turnId: "turn-1",
+      status: "queued",
+    });
+    control.mockReset().mockResolvedValue({ ok: true });
+    reconnect.mockReset();
+    options = null;
+    snapshot = {
+      runtimeMessages: [],
+      messages: [],
+      state: undefined,
+      activeTurn: null,
+      status: "idle",
+      connectionStatus: "ready",
+      ready: true,
+      connecting: false,
+      offline: false,
+      reconnect,
+      sendMessage,
+      control,
+    };
   };
+  reset();
 
-  class MockAgentClient {
-    static instances: MockAgentClient[] = [];
-
-    options: AgentOptions;
-    // 0 = CONNECTING, 1 = OPEN, 3 = CLOSED (SseAgentClient keeps the numbers).
-    readyState = 0;
-    send = vi.fn();
-    call = vi.fn(
-      async (
-        _method: string,
-        _args?: unknown[],
-        _options?: { timeout?: number },
-      ): Promise<unknown> => undefined,
-    );
-    reconnect = vi.fn();
-    start = vi.fn();
-    close = vi.fn();
-
-    constructor(options: AgentOptions) {
-      this.options = options;
-      MockAgentClient.instances.push(this);
-    }
-
-    emitOpen() {
-      this.readyState = 1;
-      this.options.onOpen?.();
-    }
-
-    emitMessage(payload: unknown) {
-      this.options.onMessage?.({ data: JSON.stringify(payload) });
-    }
-
-    emitStateUpdate(state: unknown) {
-      this.options.onStateUpdate?.(state);
-    }
-
-    emitClose(event?: unknown) {
-      this.readyState = 3;
-      this.options.onClose?.(event);
-    }
-
-    /** Server parked the stream (`bye {"reason":"idle"}`): still OPEN for sends. */
-    emitIdlePark() {
-      this.readyState = 1;
-      this.options.onClose?.({
-        byeReason: "idle",
-        status: null,
-        reason: "idle",
-        aborted: false,
-        wasClean: true,
-      });
-    }
-
-    emitConnectionError(error: {
-      code?: number;
-      reason?: string;
-      wasClean?: boolean;
-    }) {
-      this.readyState = 3;
-      this.options.onConnectionError?.(error);
-    }
-  }
-
-  const registry = new Map<string, MockAgentClient>();
-
-  function useSseAgent(options: AgentOptions) {
-    const key = `${options.agent}:${options.name}`;
-    let instance = registry.get(key);
-    if (!instance) {
-      instance = new MockAgentClient(options);
-      registry.set(key, instance);
-    } else {
-      // Refresh the captured callbacks so emits run the latest handlers.
-      instance.options = options;
-    }
-    return instance;
-  }
-
-  function reset() {
-    registry.clear();
-    MockAgentClient.instances = [];
-  }
-
-  return { useSseAgent, reset, MockAgentClient };
+  return {
+    sendMessage,
+    control,
+    reconnect,
+    reset,
+    setOptions: (value: Record<string, unknown>) => {
+      options = value;
+    },
+    get options() {
+      return options;
+    },
+    subscribe: (listener: () => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    getSnapshot: () => snapshot,
+    update: (patch: Record<string, unknown>) => {
+      snapshot = { ...snapshot, ...patch };
+      for (const listener of listeners) listener();
+    },
+  };
 });
 
-vi.mock("@/lib/use-sse-agent", () => ({
-  useSseAgent: agentRuntime.useSseAgent,
-}));
-
-// Chat owns its transcript through ai-chat (useAgentChat) now; this test drives
-// pendingQuestion via Agent state, not the live stream, so stub the projection
-// hook to keep the real ai-chat client out of the render.
-vi.mock("@/lib/use-pi-chat-stream", () => ({
-  usePiChatStream: () => ({
-    messages: [],
-    uiMessages: [],
-    status: "ready",
-    isStreaming: false,
-    streamingMessageId: null,
-    setUiMessages: vi.fn(),
-  }),
-}));
+vi.mock("@/lib/use-chat-runtime", async () => {
+  const ReactModule = await vi.importActual<typeof import("react")>("react");
+  return {
+    useChatRuntime: (options: Record<string, unknown>) => {
+      runtime.setOptions(options);
+      return ReactModule.useSyncExternalStore(
+        runtime.subscribe,
+        runtime.getSnapshot,
+        runtime.getSnapshot,
+      );
+    },
+  };
+});
 
 import Chat from "@/components/Chat";
 
 const RATE_LIMIT_ERROR =
   '429 {"error":{"type":"rate_limit_error","message":"Type 2b rate limited. Please try again later."}}';
 
-type MockAgentClient = InstanceType<typeof agentRuntime.MockAgentClient>;
-
-function getMainAgent(): MockAgentClient {
-  const agent = agentRuntime.MockAgentClient.instances.find(
-    (candidate) =>
-      candidate.options.agent === "chat-thread" &&
-      candidate.options.name === "thread-1",
-  );
-  if (!agent) {
-    throw new Error("Main chat agent was not created");
-  }
-
-  return agent;
-}
-
-describe("Chat AskUserQuestion composer focus", () => {
+describe("Chat V2 runtime controls", () => {
   beforeAll(() => {
     if (!HTMLElement.prototype.scrollTo) {
       Object.defineProperty(HTMLElement.prototype, "scrollTo", {
@@ -346,7 +257,6 @@ describe("Chat AskUserQuestion composer focus", () => {
         writable: true,
       });
     }
-
     if (!HTMLElement.prototype.scrollIntoView) {
       Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
         value: vi.fn(),
@@ -357,7 +267,7 @@ describe("Chat AskUserQuestion composer focus", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    agentRuntime.reset();
+    runtime.reset();
     localStorage.clear();
   });
 
@@ -366,179 +276,186 @@ describe("Chat AskUserQuestion composer focus", () => {
     vi.unstubAllGlobals();
   });
 
-  it("returns focus to the composer after sending a question response", async () => {
+  it("answers through the control endpoint and restores focus", async () => {
     const user = userEvent.setup();
-
     render(
-      <Chat
-        threadId="thread-1"
-        workspaceId="ws-1"
-        initialMessages={[]}
-        isLoadingMessages
-      />,
+      <Chat threadId="thread-1" workspaceId="ws-1" initialMessages={[]} />,
     );
-
-    const agent = getMainAgent();
-    act(() => {
-      agent.emitOpen();
-    });
-
     const prompt = screen.getByLabelText("Prompt");
     prompt.focus();
-    expect(prompt).toHaveFocus();
 
-    act(() => {
-      agent.emitStateUpdate({
-        pendingQuestion: {
-          questionId: "question-1",
-          questions: [
-            {
-              header: "Framework",
-              question: "Which framework do you want?",
-              multiSelect: false,
-              options: [
-                { label: "Next.js", description: "" },
-                { label: "Remix", description: "" },
-              ],
-            },
-          ],
+    act(() =>
+      runtime.update({
+        state: {
+          pendingQuestion: {
+            questionId: "question-1",
+            questions: [
+              {
+                header: "Framework",
+                question: "Which framework do you want?",
+                multiSelect: false,
+                options: [{ label: "Remix", description: "" }],
+              },
+            ],
+          },
         },
-      });
-    });
-
+      }),
+    );
     await user.click(screen.getByRole("button", { name: "Answer question" }));
 
-    expect(agent.call).toHaveBeenCalledWith("answerQuestion", [
-      "question-1",
-      { "Which framework do you want?": "Remix" },
-    ]);
-
-    await waitFor(() => {
-      expect(screen.getByLabelText("Prompt")).toHaveFocus();
+    expect(runtime.control).toHaveBeenCalledWith("answer_question", {
+      questionId: "question-1",
+      answers: { "Which framework do you want?": "Remix" },
     });
+    await waitFor(() => expect(prompt).toHaveFocus());
   });
 
-  it("reconnects and retransmits an unacknowledged send instead of restoring it as failed", async () => {
+  it("posts while the receive stream is offline", async () => {
     const user = userEvent.setup();
-    let rejectFirstSend: (error: Error) => void = () => {};
-
-    render(
-      <Chat
-        threadId="thread-1"
-        workspaceId="ws-1"
-        initialMessages={[]}
-      />,
-    );
-
-    const agent = getMainAgent();
-    agent.call
-      .mockImplementationOnce(
-        () =>
-          new Promise((_resolve, reject) => {
-            rejectFirstSend = reject;
-          }),
-      )
-      .mockResolvedValueOnce({ status: "accepted" });
-
-    act(() => {
-      agent.emitOpen();
+    runtime.update({
+      connectionStatus: "offline",
+      ready: false,
+      offline: true,
     });
-
-    const prompt = screen.getByLabelText("Prompt");
-    await user.type(prompt, "keep this message");
+    render(
+      <Chat threadId="thread-1" workspaceId="ws-1" initialMessages={[]} />,
+    );
+    await user.type(screen.getByLabelText("Prompt"), "send independently");
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
-    expect(agent.call).toHaveBeenCalledWith(
-      "sendMessage",
-      ["keep this message", expect.stringMatching(/^client_/)],
-      { timeout: 15_000 },
-    );
-    expect(prompt).toHaveValue("keep this message");
-
-    await act(async () => {
-      rejectFirstSend(new Error("Connection closed"));
-      await Promise.resolve();
+    expect(runtime.sendMessage).toHaveBeenCalledWith({
+      clientMessageId: expect.stringMatching(/^client_/),
+      content: "send independently",
+      display: "send independently",
     });
-
-    expect(agent.reconnect).toHaveBeenCalledTimes(1);
-    expect(prompt).toHaveValue("keep this message");
-
-    act(() => {
-      agent.emitClose();
-      agent.emitOpen();
-    });
-
-    await waitFor(() => {
-      const sends = agent.call.mock.calls.filter(
-        ([method]) => method === "sendMessage",
-      );
-      expect(sends).toHaveLength(2);
-      expect(sends[1]?.[1]).toEqual(sends[0]?.[1]);
-      expect(prompt).toHaveValue("");
-    });
-
-    expect(screen.queryByText(/restored your message/i)).not.toBeInTheDocument();
   });
 
-  it("keeps a rejected message in the composer without reconnecting", async () => {
+  it("stops the active turn through the bounded control endpoint", async () => {
     const user = userEvent.setup();
-
+    runtime.update({ status: "running" });
     render(
-      <Chat
-        threadId="thread-1"
-        workspaceId="ws-1"
-        initialMessages={[]}
-      />,
+      <Chat threadId="thread-1" workspaceId="ws-1" initialMessages={[]} />,
     );
 
-    const agent = getMainAgent();
-    agent.call.mockResolvedValueOnce({
-      status: "busy",
-      error: "Thread is busy",
-    });
-    act(() => agent.emitOpen());
+    await user.click(screen.getByRole("button", { name: "Stop" }));
+    expect(runtime.control).toHaveBeenCalledWith("stop");
+  });
 
+  it("restores a message when admission rejects it", async () => {
+    const user = userEvent.setup();
+    runtime.sendMessage.mockRejectedValueOnce(new Error("Queue is full"));
+    render(
+      <Chat threadId="thread-1" workspaceId="ws-1" initialMessages={[]} />,
+    );
     const prompt = screen.getByLabelText("Prompt");
     await user.type(prompt, "try this later");
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() => expect(prompt).toHaveValue("try this later"));
-    expect(agent.reconnect).not.toHaveBeenCalled();
+    expect(screen.getByText("Queue is full")).toBeInTheDocument();
   });
 
-  it("does not restore an accepted message after a later agent error", async () => {
+  it("reuses the exact client id when every admission ACK is lost", async () => {
     const user = userEvent.setup();
-
+    runtime.sendMessage
+      .mockRejectedValueOnce(new TypeError("response lost"))
+      .mockResolvedValueOnce({
+        accepted: true,
+        duplicate: true,
+        turnId: "turn-1",
+        status: "queued",
+      });
     render(
-      <Chat
-        threadId="thread-1"
-        workspaceId="ws-1"
-        initialMessages={[]}
-      />,
+      <Chat threadId="thread-1" workspaceId="ws-1" initialMessages={[]} />,
+    );
+    const prompt = screen.getByLabelText("Prompt");
+    await user.type(prompt, "deduplicate me");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(prompt).toHaveValue("deduplicate me"));
+    const first = runtime.sendMessage.mock.calls[0][0];
+
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(runtime.sendMessage).toHaveBeenCalledTimes(2));
+    expect(runtime.sendMessage.mock.calls[1][0]).toEqual(first);
+    await waitFor(() => expect(prompt).toHaveValue(""));
+  });
+
+  it("treats a matching durable snapshot as the lost admission ACK", async () => {
+    const user = userEvent.setup();
+    runtime.sendMessage.mockRejectedValueOnce(new TypeError("response lost"));
+    render(
+      <Chat threadId="thread-1" workspaceId="ws-1" initialMessages={[]} />,
+    );
+    const prompt = screen.getByLabelText("Prompt");
+    await user.type(prompt, "already durable");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(prompt).toHaveValue("already durable"));
+    const clientMessageId =
+      runtime.sendMessage.mock.calls[0][0].clientMessageId;
+
+    act(() =>
+      runtime.update({
+        messages: [
+          {
+            id: clientMessageId,
+            clientMessageId,
+            role: "user",
+            content: "already durable",
+            createdAt: 1,
+            status: "queued",
+          },
+        ],
+      }),
     );
 
-    const agent = getMainAgent();
-    agent.call.mockResolvedValueOnce({ status: "accepted" });
-    act(() => agent.emitOpen());
+    await waitFor(() => expect(prompt).toHaveValue(""));
+    expect(runtime.sendMessage).toHaveBeenCalledTimes(1);
+  });
 
+  it("does not restore a durably accepted message after a later error", async () => {
+    const user = userEvent.setup();
+    render(
+      <Chat threadId="thread-1" workspaceId="ws-1" initialMessages={[]} />,
+    );
     const prompt = screen.getByLabelText("Prompt");
     await user.type(prompt, "already accepted");
     await user.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(prompt).toHaveValue(""));
 
-    act(() => {
-      agent.emitStateUpdate({
-        lastError: {
-          id: "post-accept-error",
-          error: "The model failed after accepting the message",
-        },
-      });
-    });
-
+    act(() =>
+      runtime.update({
+        state: { lastError: { id: "post-accept", error: "Model failed" } },
+      }),
+    );
     expect(prompt).toHaveValue("");
   });
 
-  it("uses worker provider metadata for BYOK rate-limit errors via agent state", async () => {
+  it("surfaces a legacy-history restoration failure without rejecting the queued message", async () => {
+    render(
+      <Chat threadId="thread-1" workspaceId="ws-1" initialMessages={[]} />,
+    );
+
+    act(() =>
+      runtime.update({
+        state: {
+          legacyMigrationError: {
+            id: "legacy-migration:1",
+            error:
+              "Recent chat history could not be restored. This message will continue without older context.",
+          },
+        },
+      }),
+    );
+
+    expect(
+      await screen.findByText(
+        "Recent chat history could not be restored. This message will continue without older context.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("uses worker provider metadata for BYOK errors", async () => {
     render(
       <Chat
         threadId="thread-1"
@@ -547,32 +464,28 @@ describe("Chat AskUserQuestion composer focus", () => {
         llmProvider={null}
       />,
     );
-
-    const agent = getMainAgent();
-    act(() => {
-      agent.emitOpen();
-      agent.emitStateUpdate({
-        lastError: {
-          id: "error-1",
-          error: RATE_LIMIT_ERROR,
-          billingSource: "byok",
-          provider: "bedrock",
-          status: null,
-          errorType: null,
+    act(() =>
+      runtime.update({
+        state: {
+          lastError: {
+            id: "error-1",
+            error: RATE_LIMIT_ERROR,
+            billingSource: "byok",
+            provider: "bedrock",
+          },
         },
-      });
-    });
+      }),
+    );
 
     expect(
       await screen.findByText("Your Bedrock API key is rate limited"),
     ).toBeInTheDocument();
-    const link = screen.getByRole("link", {
-      name: /Open the AWS Bedrock console/,
-    });
-    expect(link).toHaveAttribute("href", BYOK_PROVIDERS.bedrock.getKeyUrl);
+    expect(
+      screen.getByRole("link", { name: /Open the AWS Bedrock console/ }),
+    ).toHaveAttribute("href", BYOK_PROVIDERS.bedrock.getKeyUrl);
   });
 
-  it("falls back to the current provider when error provider metadata is absent", async () => {
+  it("falls back to the selected provider when error metadata omits it", async () => {
     render(
       <Chat
         threadId="thread-1"
@@ -581,91 +494,42 @@ describe("Chat AskUserQuestion composer focus", () => {
         llmProvider="anthropic"
       />,
     );
-
-    const agent = getMainAgent();
-    act(() => {
-      agent.emitOpen();
-      agent.emitStateUpdate({
-        lastError: {
-          id: "error-2",
-          error: RATE_LIMIT_ERROR,
-          billingSource: "byok",
-          provider: null,
-          status: null,
-          errorType: null,
+    act(() =>
+      runtime.update({
+        state: {
+          lastError: {
+            id: "error-2",
+            error: RATE_LIMIT_ERROR,
+            billingSource: "byok",
+          },
         },
-      });
-    });
+      }),
+    );
 
     expect(
       await screen.findByText("Your Anthropic API key is rate limited"),
     ).toBeInTheDocument();
-    const link = screen.getByRole("link", {
-      name: /Open Anthropic API settings/,
-    });
-    expect(link).toHaveAttribute("href", BYOK_PROVIDERS.anthropic.getKeyUrl);
+    expect(
+      screen.getByRole("link", { name: /Open Anthropic API settings/ }),
+    ).toHaveAttribute("href", BYOK_PROVIDERS.anthropic.getKeyUrl);
   });
 
-  it("mounts the SSE transport for the thread without the WebSocket timing knobs", () => {
-    render(
-      <Chat threadId="thread-1" workspaceId="ws-1" initialMessages={[]} />,
-    );
-
-    const agent = getMainAgent();
-    expect(agent.options.enabled).toBe(true);
-    expect(agent.options.query).toEqual({
-      threadId: "thread-1",
-      workspaceId: "ws-1",
-    });
-    // PartySocket knobs have no meaning for fetch+SSE; passing them through
-    // would silently do nothing.
-    expect(agent.options).not.toHaveProperty("connectionTimeout");
-    expect(agent.options).not.toHaveProperty("minReconnectionDelay");
-    expect(agent.options).not.toHaveProperty("maxReconnectionDelay");
-  });
-
-  it("still dispatches a send while the server has parked the stream as idle", async () => {
+  it("mounts V2 for the thread and exposes reconnect", async () => {
     const user = userEvent.setup();
-
+    runtime.update({
+      connectionStatus: "offline",
+      ready: false,
+      offline: true,
+    });
     render(
       <Chat threadId="thread-1" workspaceId="ws-1" initialMessages={[]} />,
     );
 
-    const agent = getMainAgent();
-    agent.call.mockResolvedValue({ status: "accepted" });
-    act(() => {
-      agent.emitOpen();
-      agent.emitIdlePark();
+    expect(runtime.options).toMatchObject({
+      threadId: "thread-1",
+      enabled: true,
     });
-
-    await user.type(screen.getByLabelText("Prompt"), "wake the stream");
-    await user.click(screen.getByRole("button", { name: "Send message" }));
-
-    expect(agent.call).toHaveBeenCalledWith(
-      "sendMessage",
-      ["wake the stream", expect.stringMatching(/^client_/)],
-      { timeout: 15_000 },
-    );
-  });
-
-  it("surfaces the SSE terminal-close copy when the transport gives up", () => {
-    render(
-      <Chat threadId="thread-1" workspaceId="ws-1" initialMessages={[]} />,
-    );
-
-    const agent = getMainAgent();
-    act(() => {
-      agent.emitOpen();
-      agent.emitConnectionError({
-        code: CHAT_SSE_CLOSE_UNAUTHORIZED,
-        reason: "Unauthorized",
-        wasClean: false,
-      });
-    });
-
-    expect(mockToast.error).toHaveBeenCalledWith(
-      expect.stringMatching(/session expired/i),
-      expect.objectContaining({ id: "chat-sse-terminal-close" }),
-    );
+    await user.click(screen.getByRole("button", { name: "Reconnect" }));
+    expect(runtime.reconnect).toHaveBeenCalledTimes(1);
   });
 });

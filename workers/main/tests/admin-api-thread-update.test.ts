@@ -214,11 +214,9 @@ describe('admin API thread patch route', () => {
 
     const setTitle = vi.fn().mockResolvedValue(undefined);
     const setModel = vi.fn().mockResolvedValue(undefined);
-    const refreshRunnerConfig = vi.fn().mockResolvedValue(undefined);
     const chatThreadGet = vi.fn().mockReturnValue({
       setTitle,
       setModel,
-      refreshRunnerConfig,
     });
     const chatThreadIdFromName = vi.fn((id: string) => `chat-thread:${id}`);
     const request = new Request(`http://example/api/admin/threads/${thread.id}`, {
@@ -258,6 +256,5 @@ describe('admin API thread patch route', () => {
       'opus-5',
       result.updated_at,
     );
-    expect(refreshRunnerConfig).toHaveBeenCalledTimes(1);
   });
 });

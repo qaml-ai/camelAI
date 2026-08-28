@@ -9,7 +9,6 @@ import {
   useLayoutEffect,
 } from "react";
 import type { CSSProperties } from "react";
-import type { UIMessage } from "ai";
 import {
   useNavigate,
   useFetcher,
@@ -35,8 +34,6 @@ import type {
   GroupNewChatAttachmentCard,
   GroupNewChatPayload,
   GroupNewChatTranscriptCard,
-  ChatGroupAvatar,
-  ChatGroupAvatarStatus,
 } from "@/types";
 import { useAuthData } from "@/hooks/use-auth-data";
 import {
@@ -55,14 +52,6 @@ import { useFreeTierUpgradePrompt } from "@/hooks/use-free-tier-upgrade-prompt";
 import { useBillingDialogPresence } from "@/hooks/use-billing-dialog-presence";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { APP_BUILD_ID } from "@/lib/app-build-id";
-import {
-  appendEvictedRenderMessages,
-  classifyResidentRenderHistoryUpdate,
-  isCurrentRenderHistoryGeneration,
-  prependOlderRenderMessages,
-  shouldHydrateRenderHistoryCursor,
-  type ChatRenderHistoryPage,
-} from "@/lib/chat-render-history";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { PromptInput } from "@/components/prompt-input";
 import { FloatingTodoList, type TodoItem } from "@/components/floating-todo";
@@ -124,7 +113,6 @@ import { CAMEL_CODE_LLM_MODEL } from "@/lib/llm-provider-config";
 import { resolveMessageAuthorDisplayName } from "@/lib/message-author";
 import { buildSlugMap, type MentionableProject } from "@/lib/mentions";
 import { isFileDrag } from "@/lib/file-drag";
-import { uiMessagesEquivalent } from "@/lib/ui-message-adapter";
 import {
   deriveIsAwaitingAssistant,
   deriveShowGlobalAssistantIndicator,
@@ -135,7 +123,8 @@ import {
   type ChatAgentModelFallbackNotice,
   type ChatAgentStatePayload,
 } from "@/lib/chat-agent-state";
-import { usePiChatStream } from "@/lib/use-pi-chat-stream";
+import { useChatRuntime } from "@/lib/use-chat-runtime";
+import type { ChatRuntimeTurnStatus } from "@/lib/chat-runtime-client";
 import {
   checkForVersionSkew,
   isReloadSafeNow,
@@ -154,23 +143,6 @@ import {
   transitionBillingDialogState,
   type BillingDialogState,
 } from "@/lib/billing-dialog-state";
-import {
-  SEND_ACK_TIMEOUT_MS,
-  trackChatReconnectFlush,
-  trackChatSendDispatched,
-  trackChatSendQueuedOffline,
-  trackChatStreamClose,
-  trackChatStreamError,
-  trackChatStreamOpen,
-  trackChatStreamTerminalClose,
-} from "@/lib/chat-sse-telemetry";
-import { terminalChatSseUserMessage } from "@/lib/chat-sse-close";
-import {
-  SSE_READY_STATE_OPEN,
-  type SseAgentCloseEvent,
-  type SseAgentMessageEvent,
-} from "@/lib/sse-agent-client";
-import { useSseAgent } from "@/lib/use-sse-agent";
 import { type AppUrlInput, getAppUrl, getAppIframeUrl } from "@/lib/app-url";
 import {
   collectProjectReferencesFromMessages,
@@ -257,20 +229,11 @@ type ChatAgentState = Partial<
   >
 >;
 
-type ChatAgentClient = {
-  readyState: number;
-  send(data: string): void;
-  reconnect(): void;
-  call<T = unknown>(
-    method: string,
-    args?: unknown[],
-    options?: { timeout?: number },
-  ): Promise<T>;
-};
-
 type SendMessageResult = {
-  status: "accepted" | "busy" | "error";
-  error?: string;
+  accepted: true;
+  duplicate: boolean;
+  turnId: string;
+  status: ChatRuntimeTurnStatus;
 };
 
 type ChatBillingAccessMode =
@@ -285,10 +248,7 @@ export function isModelVisibleForChatRuntime(
   model: LlmModel,
   billingAccessMode: ChatBillingAccessMode | null,
 ): boolean {
-  return (
-    billingAccessMode !== "selfhost" ||
-    model !== CAMEL_CODE_LLM_MODEL
-  );
+  return billingAccessMode !== "selfhost" || model !== CAMEL_CODE_LLM_MODEL;
 }
 
 function sameJson(left: unknown, right: unknown): boolean {
@@ -326,22 +286,8 @@ function getThreadRunningState(
 interface ChatBaseProps {
   threadId?: string;
   workspaceId: string;
-  /**
-   * Legacy `Message` transcript. Supplied by the admin read-only loader branch
-   * (pi_core, rendered directly) and the client snapshot cache. The live
-   * loader branch leaves it empty — its
-   * fallback view is derived from `initialUiMessages`.
-   */
+  /** Loader-owned first paint; V2 replaces it with a bounded snapshot. */
   initialMessages?: Message[];
-  /**
-   * ai-chat-owned durable render history (commit 4). Seeds `useAgentChat`; the
-   * live-user loader branch supplies it and the hook owns the transcript from
-   * there. The admin read-only branch leaves it empty and renders `initialMessages`
-   * (pi_core) directly.
-   */
-  initialUiMessages?: UIMessage[];
-  /** Cursor for fetching render messages older than the resident window. */
-  olderUiMessagesCursor?: string | null;
   initialTodos?: TodoItem[];
   threadModel?: LlmModel | null;
   llmProvider?: LlmProvider | null;
@@ -373,18 +319,8 @@ interface ChatBaseProps {
   projects?: MentionableProject[] | Promise<MentionableProject[]>;
   onSnapshotChange?: (snapshot: {
     messages: Message[];
-    uiMessages: UIMessage[];
-    streamingMessageId: string | null;
     todos: TodoItem[];
   }) => void;
-  /**
-   * Id of the assistant message the instant-paint snapshot captured mid-stream
-   * and EXCLUDED from `initialUiMessages` (see resolveDisplayChatData). Chat
-   * keeps painting it from the legacy snapshot view until the resumed stream
-   * re-delivers it (or a bounded window lapses — a turn that died renders
-   * whatever the loader/broadcast says instead).
-   */
-  bridgedStreamingMessageId?: string | null;
 }
 
 interface ChatWelcomeData {
@@ -495,8 +431,8 @@ export function shouldIgnoreStaleThreadModelResult(args: {
 }): boolean {
   return Boolean(
     args.threadId &&
-      args.optimistic?.threadId === args.threadId &&
-      args.optimistic.model !== args.nextModel,
+    args.optimistic?.threadId === args.threadId &&
+    args.optimistic.model !== args.nextModel,
   );
 }
 
@@ -563,49 +499,6 @@ function dispatchLocalThreadSummaryUpdate(
   window.dispatchEvent(
     new CustomEvent("camelai:thread-status", {
       detail: { threadId, ...patch, updatedAt },
-    }),
-  );
-}
-
-function isChatGroupAvatarStatus(
-  value: unknown,
-): value is ChatGroupAvatarStatus {
-  return (
-    value === "pending" ||
-    value === "generated" ||
-    value === "user" ||
-    value === "default"
-  );
-}
-
-function isChatGroupAvatar(value: unknown): value is ChatGroupAvatar {
-  if (!value || typeof value !== "object") return false;
-  const avatar = value as {
-    color?: unknown;
-    content?: unknown;
-    status?: unknown;
-  };
-  return (
-    typeof avatar.color === "string" &&
-    typeof avatar.content === "string" &&
-    (avatar.status === undefined || isChatGroupAvatarStatus(avatar.status))
-  );
-}
-
-function dispatchLocalChatGroupAvatarUpdate(
-  threadId: string | null | undefined,
-  groupId: string | null | undefined,
-  avatar: ChatGroupAvatar | null | undefined,
-): void {
-  if (typeof window === "undefined" || !threadId || !groupId || !avatar) return;
-  window.dispatchEvent(
-    new CustomEvent("camelai:chat-group-avatar", {
-      detail: {
-        threadId,
-        groupId,
-        avatar,
-        updatedAt: Date.now(),
-      },
     }),
   );
 }
@@ -700,6 +593,17 @@ function buildMessageContent(text: string, attachments: Attachment[]): string {
   );
 }
 
+function messageText(message: Message): string {
+  if (typeof message.content === "string") return message.content;
+  return message.content
+    .flatMap((block) => {
+      if (block.type === "text") return block.text;
+      if (block.type === "error") return block.error;
+      return [];
+    })
+    .join("\n\n");
+}
+
 function sanitizeGeneratedFilename(value: string): string {
   const basename = value
     .trim()
@@ -720,8 +624,6 @@ export default function Chat({
   threadId,
   workspaceId,
   initialMessages,
-  initialUiMessages,
-  olderUiMessagesCursor = null,
   initialTodos = [],
   threadModel: providedThreadModel,
   llmProvider,
@@ -750,7 +652,6 @@ export default function Chat({
   connections,
   projects,
   onSnapshotChange,
-  bridgedStreamingMessageId,
   welcomeData,
 }: ChatProps) {
   const threadModel =
@@ -812,14 +713,8 @@ export default function Chat({
   const isSubmittingNewThread =
     navigation.state !== "idle" &&
     navigation.formData?.get("intent") === "createThreadAndStart";
-  const {
-    loaderErrorIdsRef,
-    parsedInitialMessages,
-    stableInitialUiMessages,
-  } = useInitialChatTranscript({
-    threadId,
+  const { parsedInitialMessages } = useInitialChatTranscript({
     initialMessages,
-    initialUiMessages,
   });
   const initialPreviewSession = useMemo(
     () =>
@@ -831,10 +726,7 @@ export default function Chat({
     [initialPreviewTabs, initialActiveTabId],
   );
 
-  // ai-chat owns the durable render history now. `messages` here holds only
-  // optimistic pending user bubbles (the just-sent message before its persisted
-  // skeleton echoes back through the hook); the transcript itself lives in the
-  // stream hook below and is reconciled by id/clientMessageId at render time.
+  // Only optimistic user bubbles live locally; V2 owns durable history.
   const {
     state: messages,
     stateRef: messagesRef,
@@ -876,124 +768,27 @@ export default function Chat({
   const [currentTodos, setCurrentTodos] = useState<TodoItem[]>(initialTodos);
 
   const agentEnabled = !readOnly && Boolean(threadId && resolvedWorkspaceId);
-  // The transport's lifecycle callbacks reference many callbacks defined later in
-  // the component; stable wrappers read them from a ref so the connection can
-  // mount here, ahead of the render-history projection that depends on it.
-  const agentCallbacksRef = useRef<{
-    onOpen: () => void;
-    onMessage: (event: SseAgentMessageEvent) => void;
-    onClose: (event?: SseAgentCloseEvent) => void;
-    onError: (error?: unknown) => void;
-    onConnectionError: (error: {
-      code?: number;
-      reason?: string;
-      wasClean?: boolean;
-    }) => void;
-    onStateUpdate: (state: ChatAgentState) => void;
-  }>({
-    onOpen: () => {},
-    onMessage: () => {},
-    onClose: () => {},
-    onError: () => {},
-    onConnectionError: () => {},
-    onStateUpdate: () => {},
-  });
-  const agentSocket = useSseAgent<ChatAgentState>({
-    agent: "chat-thread",
-    name: threadId ?? "disabled",
-    enabled: agentEnabled,
-    query: {
-      threadId: threadId ?? null,
-      workspaceId: resolvedWorkspaceId ?? null,
-    },
-    onOpen: () => agentCallbacksRef.current.onOpen(),
-    onMessage: (event) => agentCallbacksRef.current.onMessage(event),
-    onClose: (event) => agentCallbacksRef.current.onClose(event),
-    onError: (error) => agentCallbacksRef.current.onError(error),
-    onConnectionError: (error) =>
-      agentCallbacksRef.current.onConnectionError(error),
-    onStateUpdate: (state) => agentCallbacksRef.current.onStateUpdate(state),
-  });
-  const piChat = usePiChatStream({
-    agent: agentSocket,
+  const chatRuntime = useChatRuntime<ChatAgentState>({
     threadId,
-    initialUiMessages: stableInitialUiMessages,
+    enabled: agentEnabled,
   });
-  const piChatRef = useRef(piChat);
-  piChatRef.current = piChat;
-  const [archivedUiMessages, setArchivedUiMessages] = useState<UIMessage[]>([]);
-  const [olderMessagesCursor, setOlderMessagesCursor] = useState<string | null>(
-    olderUiMessagesCursor,
-  );
-  const [isLoadingOlderMessages, setIsLoadingOlderMessages] = useState(false);
-  const [olderMessagesError, setOlderMessagesError] = useState<string | null>(
-    null,
-  );
-  const renderHistoryGenerationRef = useRef(0);
-  const lastHydratedCursorPropRef = useRef(olderUiMessagesCursor);
-  const residentUiMessagesRef = useRef<UIMessage[]>(
-    piChat.uiMessages.length > 0
-      ? piChat.uiMessages
-      : (initialUiMessages ?? []),
-  );
-  const observedLiveResidentRef = useRef(piChat.uiMessages.length > 0);
-  useEffect(() => {
-    // Cached tab data can mount before its loader page resolves. Accept a later
-    // cursor prop only during that initial generation; an authoritative
-    // replacement permanently retires the old boundary.
-    if (shouldHydrateRenderHistoryCursor(
-      renderHistoryGenerationRef.current,
-      lastHydratedCursorPropRef.current,
-      olderUiMessagesCursor,
-    )) {
-      lastHydratedCursorPropRef.current = olderUiMessagesCursor;
-      setOlderMessagesCursor(olderUiMessagesCursor);
-    }
-  }, [olderUiMessagesCursor]);
-  useLayoutEffect(() => {
-    const nextResident = piChat.uiMessages;
-    // Some hook versions briefly expose an empty live list before applying the
-    // loader seed. Do not mistake that hydration gap for an authoritative
-    // clear; after the first non-empty live state, empty is a real reset.
-    if (nextResident.length === 0 && !observedLiveResidentRef.current) return;
-    const update = classifyResidentRenderHistoryUpdate(
-      residentUiMessagesRef.current,
-      nextResident,
-    );
-    residentUiMessagesRef.current = nextResident;
-    observedLiveResidentRef.current = nextResident.length > 0;
-    if (update.kind === "replacement") {
-      renderHistoryGenerationRef.current += 1;
-      setArchivedUiMessages([]);
-      setOlderMessagesCursor(null);
-      setOlderMessagesError(null);
-      setIsLoadingOlderMessages(false);
-    } else if (update.evicted.length > 0) {
-      setArchivedUiMessages((current) =>
-        appendEvictedRenderMessages(current, update.evicted),
-      );
-    }
-  }, [piChat.uiMessages]);
-  const isStreaming = piChat.isStreaming;
+  const isStreaming =
+    chatRuntime.status === "queued" || chatRuntime.status === "running";
   const isStreamingRef = useRef(false);
   isStreamingRef.current = isStreaming;
 
-  // Snapshot the rendered transcript for instant paint on thread switch. Keyed
-  // on the hook history + optimistic bubbles; `displayMessagesRef` holds the
-  // merged view (defined below, read at effect time).
+  // Preserve settled snapshots for tab switches. A cumulative live frame may
+  // be several MiB and is attempt-local, so it must never enter the tab cache.
   useEffect(() => {
-    if (!threadId || readOnly) return;
+    if (!threadId || readOnly || chatRuntime.activeAssistantMessageId) return;
     onSnapshotChange?.({
       messages: displayMessagesRef.current,
-      uiMessages: piChat.uiMessages,
-      streamingMessageId: piChat.streamingMessageId,
       todos: currentTodos,
     });
   }, [
+    chatRuntime.activeAssistantMessageId,
+    chatRuntime.messages,
     currentTodos,
-    piChat.messages,
-    piChat.uiMessages,
-    piChat.streamingMessageId,
     messages,
     onSnapshotChange,
     readOnly,
@@ -1009,10 +804,7 @@ export default function Chat({
   const transitionBillingDialog = useCallback(
     (next: BillingDialogState) => {
       const previous = billingDialogRef.current;
-      const transition = transitionBillingDialogState(
-        previous,
-        next,
-      );
+      const transition = transitionBillingDialogState(previous, next);
       if (previous.kind === "byok" && next.kind !== "byok") {
         resetByokForm();
       }
@@ -1049,10 +841,7 @@ export default function Chat({
     transitionBillingDialog({ kind: "none" });
   }, [billingIdentityKey, resetByokForm, transitionBillingDialog]);
   useEffect(() => {
-    if (
-      billingDialog.kind !== "none" ||
-      !billingIdentityKey
-    ) {
+    if (billingDialog.kind !== "none" || !billingIdentityKey) {
       return;
     }
 
@@ -1259,19 +1048,12 @@ export default function Chat({
     skillSheetsByToolId,
     visibleMessages,
   } = useChatTranscriptProjection({
-    archivedUiMessages,
-    bridgedStreamingMessageId,
-    threadId,
-    liveMessages: piChat.messages,
-    liveUiMessages: piChat.uiMessages,
+    liveMessages: chatRuntime.messages,
     optimisticMessages: messages,
     parsedInitialMessages,
     readOnly,
   });
-  // Turn duration/completion badges keyed by the assistant message id, plus the
-  // one-shot "freshly completed" highlight. Derived from each completed turn's
-  // metadata (turnDurationMs / completedAtMs ride message-metadata.pi on the
-  // assistant message). Replaces the retired Agent-state lastCompletedTurn channel.
+  // Loader messages may still include duration metadata during migration.
   const {
     completedTurns,
     freshlyCompletedTurnId,
@@ -1290,6 +1072,7 @@ export default function Chat({
   // The most recent terminal error already surfaced, so the state-driven error
   // is shown exactly once even across re-renders/reconnects.
   const lastAppliedErrorIdRef = useRef<string | null>(null);
+  const lastLegacyMigrationErrorIdRef = useRef<string | null>(null);
   const pendingMessagesRef = useRef(pendingMessages);
   const acceptedPendingMessageIdsRef = useRef<Set<string>>(new Set());
   const billingRefreshSequenceRef = useRef(0);
@@ -1304,7 +1087,6 @@ export default function Chat({
     readOnly,
   };
 
-  const prevInitialUiMessagesRef = useRef(stableInitialUiMessages);
   const prevInitialTodosRef = useRef(initialTodos);
   const hasSyncedInitialPreviewRef = useRef(false);
   const previousPreviewThreadIdRef = useRef(threadId);
@@ -1321,32 +1103,11 @@ export default function Chat({
     [],
   );
 
-  // Reconcile the loader's ai-chat render history into the hook. Covers the
-  // deferred initial load (hook seeded empty at mount, payload resolves after)
-  // and the missed-turn revalidation (a turn that finished while disconnected).
-  // The hook owns history once it has any, so we never clobber a live turn or
-  // overwrite a populated transcript with an empty loader result.
-  useEffect(() => {
-    if (stableInitialUiMessages === prevInitialUiMessagesRef.current) return;
-    prevInitialUiMessagesRef.current = stableInitialUiMessages;
-    if (readOnly) return;
-    if (isStreamingRef.current || pendingMessagesRef.current.length > 0) return;
-    const currentUiMessages = piChatRef.current.uiMessages;
-    if (stableInitialUiMessages.length === 0 && currentUiMessages.length > 0) {
-      return;
-    }
-    if (uiMessagesEquivalent(currentUiMessages, stableInitialUiMessages))
-      return;
-    piChatRef.current.setUiMessages(stableInitialUiMessages);
-  }, [stableInitialUiMessages, readOnly]);
-
-  // Drop optimistic pending bubbles once their persisted skeleton has echoed
-  // back through the hook (matched by id / clientMessageId), so the local list
-  // stays bounded to genuinely in-flight sends.
+  // Drop optimistic bubbles once the bounded durable snapshot contains them.
   useEffect(() => {
     if (messagesRef.current.length === 0) return;
     const baseKeys = new Set<string>();
-    for (const message of piChat.messages) {
+    for (const message of chatRuntime.messages) {
       baseKeys.add(message.id);
       if (message.clientMessageId) baseKeys.add(message.clientMessageId);
     }
@@ -1358,7 +1119,7 @@ export default function Chat({
     if (remaining.length !== messagesRef.current.length) {
       setMessages(remaining);
     }
-  }, [piChat.messages, setMessages]);
+  }, [chatRuntime.messages, setMessages]);
 
   useLayoutEffect(() => {
     const initialTodosChanged = initialTodos !== prevInitialTodosRef.current;
@@ -1379,9 +1140,7 @@ export default function Chat({
     setCurrentTodos(initialTodos);
   }, [currentTodos.length, initialTodos, isStreaming, loading]);
 
-  // The streaming assistant message is the transcript tail while the hook
-  // reports an active stream (see usePiChatStream.streamingMessageId).
-  const activeAssistantMessageId = piChat.streamingMessageId;
+  const activeAssistantMessageId = chatRuntime.activeAssistantMessageId;
   const activeThreadRunningState = useMemo(
     () => getThreadRunningState(chatGroupsContext?.groups, threadId ?? null),
     [chatGroupsContext?.groups, threadId],
@@ -1392,7 +1151,7 @@ export default function Chat({
     ? activeThreadRunningState.startedAt
     : null;
   const [input, setInput] = useState("");
-  const [ready, setReady] = useState(false);
+  const ready = chatRuntime.ready;
   const [error, setError] = useState<ChatApiErrorPresentation | null>(() =>
     initialError
       ? getChatApiErrorPresentation(initialError, {
@@ -1536,12 +1295,11 @@ export default function Chat({
     availableThreadModels,
     effectiveHostedCreditsPaused,
   );
-  const noModelsMessage =
-    shouldAddCamelCodeToPicker
-      ? "Add camelCode to the model picker to continue for free."
-      : selectableThreadModels.length === 0 && !(threadId && threadModel)
-        ? "No models are available. Ask an admin to add a model in Settings > Models."
-        : null;
+  const noModelsMessage = shouldAddCamelCodeToPicker
+    ? "Add camelCode to the model picker to continue for free."
+    : selectableThreadModels.length === 0 && !(threadId && threadModel)
+      ? "No models are available. Ask an admin to add a model in Settings > Models."
+      : null;
   const openUnlockPremium = useCallback(
     (triggerModel: LlmModel | null) => {
       if (
@@ -1741,98 +1499,9 @@ export default function Chat({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const messageColumnRef = useRef<HTMLDivElement>(null);
-  const olderPageScrollAnchorRef = useRef<{
-    scrollHeight: number;
-    scrollTop: number;
-  } | null>(null);
   const initialScrollDoneRef = useRef(false);
   const stickToBottomRef = useRef(true);
   const forceScrollOnNextUpdate = useRef(false);
-  const chatAgentRef = useRef<ChatAgentClient | null>(null);
-
-  const loadOlderMessages = useCallback(async () => {
-    const cursor = olderMessagesCursor;
-    if (!cursor || isLoadingOlderMessages) return;
-    const requestGeneration = renderHistoryGenerationRef.current;
-
-    setIsLoadingOlderMessages(true);
-    setOlderMessagesError(null);
-    try {
-      const page = (await agentSocket.call("getOlderUiMessages", [
-        cursor,
-      ])) as ChatRenderHistoryPage;
-      if (!page || !Array.isArray(page.messages)) {
-        throw new Error("Invalid render-history page");
-      }
-      if (
-        !isCurrentRenderHistoryGeneration(
-          requestGeneration,
-          renderHistoryGenerationRef.current,
-        )
-      ) {
-        return;
-      }
-
-      const container = scrollContainerRef.current;
-      if (container) {
-        olderPageScrollAnchorRef.current = {
-          scrollHeight: container.scrollHeight,
-          scrollTop: container.scrollTop,
-        };
-      }
-      // A page can come back carrying a message that is neither archived nor
-      // resident — a legacy `d:` cursor rewinds the server to the NEWEST page,
-      // and another session's turn can land in it. Prepending that to the head
-      // of the archived array would render a brand-new message at the OLDEST end
-      // of the transcript, so drop anything already resident (the resident copy
-      // is authoritative and renders in its own place).
-      const residentIds = new Set(
-        residentUiMessagesRef.current.map((message) => message.id),
-      );
-      const olderOnly = page.messages.filter(
-        (message) => !residentIds.has(message.id),
-      );
-      setArchivedUiMessages((current) =>
-        prependOlderRenderMessages(current, olderOnly),
-      );
-      setOlderMessagesCursor(
-        page.hasMore &&
-          typeof page.nextCursor === "string" &&
-          page.nextCursor.length > 0
-          ? page.nextCursor
-          : null,
-      );
-    } catch (error) {
-      if (
-        !isCurrentRenderHistoryGeneration(
-          requestGeneration,
-          renderHistoryGenerationRef.current,
-        )
-      ) {
-        return;
-      }
-      console.error("Failed to load earlier chat messages:", error);
-      setOlderMessagesError("Could not load earlier messages.");
-    } finally {
-      if (
-        isCurrentRenderHistoryGeneration(
-          requestGeneration,
-          renderHistoryGenerationRef.current,
-        )
-      ) {
-        setIsLoadingOlderMessages(false);
-      }
-    }
-  }, [agentSocket, isLoadingOlderMessages, olderMessagesCursor]);
-
-  useLayoutEffect(() => {
-    const anchor = olderPageScrollAnchorRef.current;
-    const container = scrollContainerRef.current;
-    if (!anchor || !container) return;
-    olderPageScrollAnchorRef.current = null;
-    container.scrollTop =
-      anchor.scrollTop + (container.scrollHeight - anchor.scrollHeight);
-  }, [archivedUiMessages]);
 
   const optimisticallyClearedConnectionSetupRequestIdRef = useRef<
     string | null
@@ -1843,7 +1512,8 @@ export default function Chat({
     handleConnectionSetupResponse,
     setConnectionSetupPrompt,
   } = useConnectionSetupResponse({
-    chatAgentRef,
+    submitResponse: (response) =>
+      chatRuntime.control("connection_setup", response),
   });
   const handleConnectionSetupCancel = useCallback(() => {
     if (connectionSetupPrompt?.requestId) {
@@ -1852,7 +1522,6 @@ export default function Chat({
     }
     handleConnectionSetupCancelBase();
   }, [connectionSetupPrompt?.requestId, handleConnectionSetupCancelBase]);
-  const lastRunnerModelSelectionRef = useRef<string | null>(null);
   const iframeRefreshTimeoutsRef = useRef<
     Record<string, ReturnType<typeof setTimeout>>
   >({});
@@ -1870,6 +1539,7 @@ export default function Chat({
     setPendingQuestion(null);
     setContextUsedPercent(null);
     lastAppliedErrorIdRef.current = null;
+    lastLegacyMigrationErrorIdRef.current = null;
     setModelFallbackNotice(null);
     compactingPriorMessageIdRef.current = null;
     setCompactingPriorMessageId(null);
@@ -1953,9 +1623,10 @@ export default function Chat({
   const IFRAME_MAX_RETRIES = 3;
   const IFRAME_RETRY_DELAY_MS = 2000;
   useEffect(() => {
-    const appOriginContext = hostname && resolvedOrgSlug
-      ? { hostname, orgSlug: resolvedOrgSlug }
-      : null;
+    const appOriginContext =
+      hostname && resolvedOrgSlug
+        ? { hostname, orgSlug: resolvedOrgSlug }
+        : null;
 
     function handlePreviewError(event: MessageEvent) {
       if (
@@ -1974,7 +1645,11 @@ export default function Chat({
             if (tab.target.kind !== "app") return false;
             const s = tab.target.scriptName;
             const expectedOrigin = new URL(
-              getAppIframeUrl(s, appOriginContext.hostname, appOriginContext.orgSlug),
+              getAppIframeUrl(
+                s,
+                appOriginContext.hostname,
+                appOriginContext.orgSlug,
+              ),
             ).origin;
             return event.origin === expectedOrigin;
           })
@@ -2476,8 +2151,28 @@ export default function Chat({
       pendingDraft.text,
       pendingDraft.attachments,
     );
-    removeDeliveryDraft(pendingDraft.workspaceId, pendingDraft.threadId);
+    // Admission may have committed even when every bounded ACK was lost. Keep
+    // this exact client id so a resend deduplicates until a snapshot confirms
+    // it or the user changes/discards the restored draft.
   }, [getStoredPendingDeliveryDraft, syncNormalDraftAfterSubmitted]);
+
+  useEffect(() => {
+    const pendingDraft =
+      pendingDeliveryDraftRef.current ?? getStoredPendingDeliveryDraft();
+    if (!pendingDraft || pendingDraft.acceptedAt) return;
+    const accepted = chatRuntime.messages.some(
+      (message) =>
+        message.id === pendingDraft.clientMessageId ||
+        message.clientMessageId === pendingDraft.clientMessageId,
+    );
+    if (accepted) {
+      markPendingDeliveryDraftAccepted(pendingDraft.clientMessageId);
+    }
+  }, [
+    chatRuntime.messages,
+    getStoredPendingDeliveryDraft,
+    markPendingDeliveryDraftAccepted,
+  ]);
 
   const normalizeChatError = useCallback(
     (
@@ -2533,7 +2228,7 @@ export default function Chat({
   );
 
   const failPendingMessageDelivery = useCallback(
-    (message: string, options?: { preserveReady?: boolean }): boolean => {
+    (message: string): boolean => {
       const failedMessages = getUnacceptedPendingUserMessages();
       if (failedMessages.length === 0) {
         return false;
@@ -2552,9 +2247,6 @@ export default function Chat({
       );
       setPendingMessages(remainingPendingMessages);
       setLoading(remainingPendingMessages.length > 0 || isStreamingRef.current);
-      if (!options?.preserveReady) {
-        setReady(false);
-      }
       if (remainingPendingMessages.length === 0) {
         dispatchLocalThreadStatus(
           pendingThreadContextRef.current.threadId,
@@ -2663,22 +2355,6 @@ export default function Chat({
     [activeTabId],
   );
 
-  const syncPreviewTabsStateBestEffort = useCallback(
-    (nextTabs: PreviewTab[], nextActiveTabId: string | null) => {
-      if (!threadId) return;
-      const agent = chatAgentRef.current;
-      if (!agent || agent.readyState !== SSE_READY_STATE_OPEN) return;
-
-      void agent
-        .call("setPreviewTabsState", [
-          nextTabs.map((tab) => tab.target),
-          nextActiveTabId,
-        ])
-        .catch(() => {});
-    },
-    [threadId],
-  );
-
   useEffect(() => {
     if (!threadId || hasSyncedInitialPreviewRef.current) return;
     if (previewTabsRef.current.length > 0) {
@@ -2750,7 +2426,7 @@ export default function Chat({
   );
 
   const openTabForTarget = useCallback(
-    (target: PreviewTarget, options?: { sync?: boolean }) => {
+    (target: PreviewTarget) => {
       const id = getPreviewTabId(target);
       const prevTabs = previewTabsRef.current;
       const existing = prevTabs.find((tab) => tab.id === id);
@@ -2758,11 +2434,8 @@ export default function Chat({
         ? prevTabs.map((tab) => (tab.id === id ? { ...tab, target } : tab))
         : [...prevTabs, { id, target }];
       setLocalPreviewSessionState(nextTabs, id);
-      if (options?.sync) {
-        syncPreviewTabsStateBestEffort(nextTabs, id);
-      }
     },
-    [setLocalPreviewSessionState, syncPreviewTabsStateBestEffort],
+    [setLocalPreviewSessionState],
   );
 
   const selectTab = useCallback(
@@ -2772,9 +2445,8 @@ export default function Chat({
       );
       if (!nextActiveTab) return;
       setLocalPreviewSessionState(previewTabsRef.current, tabId);
-      syncPreviewTabsStateBestEffort(previewTabsRef.current, tabId);
     },
-    [setLocalPreviewSessionState, syncPreviewTabsStateBestEffort],
+    [setLocalPreviewSessionState],
   );
 
   const closeTab = useCallback(
@@ -2798,14 +2470,9 @@ export default function Chat({
       }
 
       setLocalPreviewSessionState(nextTabs, nextActiveTabId);
-      syncPreviewTabsStateBestEffort(nextTabs, nextActiveTabId);
       cleanupClosedTabState(tabId);
     },
-    [
-      setLocalPreviewSessionState,
-      syncPreviewTabsStateBestEffort,
-      cleanupClosedTabState,
-    ],
+    [setLocalPreviewSessionState, cleanupClosedTabState],
   );
 
   const handleTabNotebookStateChange = useCallback(
@@ -2917,80 +2584,40 @@ export default function Chat({
     [bumpFilePreviewKey, bumpIframeKey, setLocalPreviewSessionState],
   );
 
-  const sendPendingMessageToAgent = useCallback(
+  const sendPendingMessage = useCallback(
     (message: Message, activeThreadId: string) => {
-      const agent = chatAgentRef.current;
-      const content =
-        typeof message.content === "string"
-          ? message.content
-          : JSON.stringify(message.content);
+      const content = messageText(message);
       const clientMessageId = message.clientMessageId ?? message.id;
 
-      if (!agent || agent.readyState !== SSE_READY_STATE_OPEN) {
-        return;
-      }
-
-      const sendTracker = trackChatSendDispatched({
-        threadId: activeThreadId,
-        getReadyState: () => chatAgentRef.current?.readyState ?? null,
-      });
-      void agent
-        .call<SendMessageResult>(
-          "sendMessage",
-          [content, clientMessageId],
-          { timeout: SEND_ACK_TIMEOUT_MS },
-        )
+      void chatRuntime
+        .sendMessage<SendMessageResult>({
+          clientMessageId,
+          content,
+          display: content,
+        })
         .then((result) => {
-          if (result.status === "accepted") {
-            sendTracker.accepted();
-            void trackNewCamelActivationAfterAcceptedMessage();
-          } else {
-            sendTracker.rejected(result.status ?? "error");
-          }
           if (activeThreadId !== pendingThreadContextRef.current.threadId) {
             return;
           }
-          if (result.status === "accepted") {
+          if (result.accepted) {
             markPendingDeliveryDraftAccepted(clientMessageId);
-            return;
+            acceptedPendingMessageIdsRef.current.add(clientMessageId);
+            // A durable ACK closes the local admission wait. The bounded
+            // snapshot will independently report queued/running execution.
+            setLoading(false);
+            void trackNewCamelActivationAfterAcceptedMessage();
           }
-
-          failPendingMessageDelivery(
-            result.error ||
-              (result.status === "busy"
-                ? "The agent is busy. I restored your message as a draft so you can try again."
-                : "Failed to send message"),
-            { preserveReady: agent.readyState === SSE_READY_STATE_OPEN },
-          );
         })
         .catch((error) => {
-          sendTracker.failed(error);
           if (activeThreadId !== pendingThreadContextRef.current.threadId) {
             return;
           }
-          // A rejected AgentClient call is a transport failure, not a server
-          // rejection (sendMessage reports those as a resolved status). The
-          // server may already have accepted the message and lost only the RPC
-          // response, so keep the same clientMessageId queued and retransmit it
-          // after reconnect. ChatThreadDO durably deduplicates/re-acks that id.
-          //
-          // The transport can still report OPEN here (a parked stream does by
-          // design). Force a fresh stream so the normal onOpen queue flush runs
-          // instead of leaving the composer busy forever; a closed transport is
-          // reconnecting automatically. This is no longer the half-open
-          // detector — sends ride their own POSTs, so a dead receive path is
-          // owned by the transport's silence watchdog
-          // (STREAM_SILENCE_TIMEOUT_MS), not by an RPC failing.
-          const transportOpen =
-            chatAgentRef.current?.readyState === SSE_READY_STATE_OPEN;
-          setReady(false);
-          setLoading(true);
-          if (transportOpen) {
-            agent.reconnect();
-          }
+          failPendingMessageDelivery(
+            error instanceof Error ? error.message : "Failed to send message",
+          );
         });
     },
-    [failPendingMessageDelivery, markPendingDeliveryDraftAccepted],
+    [chatRuntime, failPendingMessageDelivery, markPendingDeliveryDraftAccepted],
   );
 
   // Version-skew check (src/lib/version-skew.ts): a stale bundle that just
@@ -3001,7 +2628,7 @@ export default function Chat({
   // The visibility trigger lives at the app shell now
   // (src/hooks/use-version-skew-watch.ts, mounted by ChatGroupsProvider) so
   // non-chat routes self-heal too; this component contributes the chat-specific
-  // reload-safety guard and the stream_open trigger.
+  // reload-safety guard and the runtime-ready trigger.
   const versionSkewSafetyRef = useRef({
     input: "",
     welcomeInput: "",
@@ -3029,67 +2656,30 @@ export default function Chat({
     () => registerReloadSafetyGuard(isChatReloadSafe),
     [isChatReloadSafe],
   );
-  const runVersionSkewCheck = useCallback(
-    (trigger: VersionSkewTrigger) => {
-      void checkForVersionSkew({
-        trigger,
-        // Global: an unrelated component's unsaved state must veto the reload
-        // just as the composer's own draft does.
-        safeToReload: isReloadSafeNow,
-        onUpdateAvailable: (reload) => {
-          toast("camelAI has been updated", {
-            id: "camelai-version-skew",
-            description: "Reload to get the latest version.",
-            duration: 60_000,
-            action: { label: "Reload", onClick: reload },
-          });
-        },
-      });
-    },
-    [],
-  );
-
-  const handleAgentOpen = useCallback(() => {
-    const id = threadId;
-    if (!id) return;
-    setReady(true);
-    trackChatStreamOpen(id);
-    runVersionSkewCheck("stream_open");
-
-    // History sync on (re)connect is owned by the ai-chat hook now: `resume: true`
-    // replays an in-flight turn's stream and the CHAT_MESSAGES broadcast folds in
-    // any turn that finished while we were disconnected. The loader is cold-load
-    // only — no reconnect revalidation.
-
-    const queuedMessages = pendingMessagesRef.current.filter((message) => {
-      if (message.role !== "user") return false;
-      const deliveryKey = message.clientMessageId ?? message.id;
-      return !isPendingMessageAccepted(deliveryKey);
+  const runVersionSkewCheck = useCallback((trigger: VersionSkewTrigger) => {
+    void checkForVersionSkew({
+      trigger,
+      // Global: an unrelated component's unsaved state must veto the reload
+      // just as the composer's own draft does.
+      safeToReload: isReloadSafeNow,
+      onUpdateAvailable: (reload) => {
+        toast("camelAI has been updated", {
+          id: "camelai-version-skew",
+          description: "Reload to get the latest version.",
+          duration: 60_000,
+          action: { label: "Reload", onClick: reload },
+        });
+      },
     });
-    if (queuedMessages.length === 0) return;
-    trackChatReconnectFlush(id, queuedMessages.length);
+  }, []);
 
-    setLoading(true);
-    const currentMessages = messagesRef.current;
-    const existingIds = new Set(currentMessages.map((message) => message.id));
-    const missing = queuedMessages.filter(
-      (message) => !existingIds.has(message.id),
-    );
-    if (missing.length > 0) {
-      setMessages([...currentMessages, ...missing]);
+  const wasRuntimeReadyRef = useRef(false);
+  useEffect(() => {
+    if (ready && !wasRuntimeReadyRef.current) {
+      runVersionSkewCheck("stream_open");
     }
-    for (const message of queuedMessages) {
-      sendPendingMessageToAgent(message, id);
-    }
-    setPendingMessages((prev) => prev);
-  }, [
-    isPendingMessageAccepted,
-    runVersionSkewCheck,
-    sendPendingMessageToAgent,
-    setMessages,
-    setPendingMessages,
-    threadId,
-  ]);
+    wasRuntimeReadyRef.current = ready;
+  }, [ready, runVersionSkewCheck]);
 
   // Apply a terminal error (delivered through Agent state, not the stream, so
   // it survives a reconnect after a disconnected/early failure).
@@ -3147,86 +2737,23 @@ export default function Chat({
     ],
   );
 
-  const handleAgentMessage = useCallback(
-    (event: SseAgentMessageEvent) => {
-      const id = threadId;
-      if (!id) return;
-      const data = JSON.parse(event.data);
-
-      // Reject messages stamped for a different thread (a late broadcast that
-      // arrives after switching threads must never apply to the new one).
-      if (typeof data?.threadId === "string" && data.threadId !== id) return;
-
-      // The transcript (streaming tokens, tool output, turn end) now rides
-      // ai-chat's native stream, consumed by useAgentChat. This raw handler only
-      // covers the remaining out-of-band broadcasts.
-      if (
-        data.type === "chat_group_avatar_updated" &&
-        typeof data.groupId === "string" &&
-        isChatGroupAvatar(data.avatar)
-      ) {
-        dispatchLocalChatGroupAvatarUpdate(id, data.groupId, data.avatar);
-      }
-    },
-    [threadId],
-  );
-
-  const handleAgentClose = useCallback(
-    (event?: SseAgentCloseEvent) => {
-      // `bye {"reason":"idle"}` parks the stream by design; the transport stays
-      // OPEN, sends are POSTs, and dispatching one wakes the stream. Clearing
-      // `ready` here would queue the next message with nothing to flush it.
-      if (event?.byeReason !== "idle") setReady(false);
-      if (threadId) trackChatStreamClose(threadId, event);
-    },
-    [threadId],
-  );
-
-  const handleAgentError = useCallback((event?: unknown) => {
-    if (threadId) trackChatStreamError(threadId, event);
-  }, [threadId]);
-
-  const handleAgentConnectionError = useCallback(
-    (error: { code?: number; reason?: string; wasClean?: boolean }) => {
-      const code = error.code ?? null;
-      if (threadId) {
-        trackChatStreamTerminalClose(threadId, {
-          code: error.code,
-          reason: error.reason,
-          wasClean: error.wasClean,
-        });
-      }
-      const message = terminalChatSseUserMessage(code, error.reason);
-      // Terminal closes do not reconnect, so a queued delivery cannot make
-      // progress. This is the one transport failure that should release the
-      // pending bubble and restore its durable draft.
-      if (!failPendingMessageDelivery(message)) {
-        toast.error(message, {
-          id: "chat-sse-terminal-close",
-          duration: 12_000,
-        });
-      }
-    },
-    [failPendingMessageDelivery, threadId],
-  );
-
-  const handleAgentStateUpdate = useCallback(
+  const applyRuntimeState = useCallback(
     (state: ChatAgentState) => {
-      // Streaming/loading and turn duration/completion badges are derived from the
-      // ai-chat hook + render history now (isStreaming from the hook; completedTurns
-      // from message-metadata.pi on the assistant messages). Agent state carries
-      // only the coarse fields below (terminal error, preview, todos, etc.).
-      // Terminal errors ride Agent state now; show each once (recovers a failure
-      // missed while disconnected).
+      // V2 state is deliberately coarse: errors, preview, todos, and metadata.
       const lastError = state.lastError;
       if (lastError?.id && lastError.id !== lastAppliedErrorIdRef.current) {
         lastAppliedErrorIdRef.current = lastError.id;
         // Suppress the banner when the error already renders as an inline
         // block from the loader payload (reload-after-error); see
-        // loaderErrorIdsRef. Live/reconnect errors are new ids and still fire.
-        if (!loaderErrorIdsRef.current.has(lastError.id)) {
-          handleTerminalError(lastError);
-        }
+        handleTerminalError(lastError);
+      }
+      const migrationError = state.legacyMigrationError;
+      if (
+        migrationError?.id &&
+        migrationError.id !== lastLegacyMigrationErrorIdRef.current
+      ) {
+        lastLegacyMigrationErrorIdRef.current = migrationError.id;
+        showChatError(migrationError.error);
       }
       const fallbackNotice = state.modelFallbackNotice;
       const optimisticFallbackModel = resolveAgentFallbackOptimisticModel({
@@ -3258,8 +2785,8 @@ export default function Chat({
           billingAccessMode === "selfhost"
             ? null
             : current?.id === fallbackNotice?.id
-            ? current
-            : (fallbackNotice ?? null),
+              ? current
+              : (fallbackNotice ?? null),
         );
       }
       applyAgentPreviewState(state);
@@ -3350,29 +2877,24 @@ export default function Chat({
       billingAccessMode,
       setConnectionSetupPrompt,
       handleTerminalError,
+      showChatError,
       threadId,
     ],
   );
 
-  // Route the transport's lifecycle callbacks (mounted at the top of the
-  // component) to the handlers defined above.
-  agentCallbacksRef.current = {
-    onOpen: handleAgentOpen,
-    onMessage: handleAgentMessage,
-    onClose: handleAgentClose,
-    onError: handleAgentError,
-    onConnectionError: handleAgentConnectionError,
-    onStateUpdate: handleAgentStateUpdate,
-  };
+  const appliedRuntimeStateRef = useRef<ChatAgentState | undefined>(undefined);
+  useEffect(() => {
+    if (
+      !chatRuntime.state ||
+      appliedRuntimeStateRef.current === chatRuntime.state
+    ) {
+      return;
+    }
+    appliedRuntimeStateRef.current = chatRuntime.state;
+    applyRuntimeState(chatRuntime.state);
+  }, [applyRuntimeState, chatRuntime.state]);
 
-  // Turn lifecycle: the ai-chat stream owns streaming state, so the "turn just
-  // finished" side effects (previously the legacy `result` frame) fire when the
-  // hook transitions out of a busy window. `submitted` covers the awaiting-first-
-  // token gap; `isServerStreaming` (folded into isStreaming) spans tool rounds.
-  const isTurnBusy =
-    isStreaming ||
-    piChat.status === "submitted" ||
-    piChat.status === "streaming";
+  const isTurnBusy = isStreaming;
   const wasTurnBusyRef = useRef(false);
   useEffect(() => {
     const wasBusy = wasTurnBusyRef.current;
@@ -3404,17 +2926,9 @@ export default function Chat({
     getUnacceptedPendingUserMessages,
   ]);
 
-  useEffect(() => {
-    chatAgentRef.current = agentEnabled ? agentSocket : null;
-    return () => {
-      if (chatAgentRef.current === agentSocket) chatAgentRef.current = null;
-    };
-  }, [agentEnabled, agentSocket]);
-
   useLayoutEffect(() => {
-    setReady(false);
-    // Drop the previous context's optimistic bubbles; the hook remounts with the
-    // new thread's history (Chat is keyed by threadId).
+    // Drop the previous context's optimistic bubbles. The V2 hook reconnects
+    // with a fresh bounded snapshot for the new thread.
     setMessages([]);
     compactingPriorMessageIdRef.current = null;
     setCompactingPriorMessageId(null);
@@ -3469,7 +2983,7 @@ export default function Chat({
   const showGlobalAssistantIndicator = deriveShowGlobalAssistantIndicator({
     assistantTurnActive,
     isCompacting,
-    isStreamStallClamped: piChat.isStallClamped,
+    isStreamStallClamped: false,
   });
   const handleFreshlyCompletedTurnAnimationScheduled =
     clearFreshlyCompletedTurnId;
@@ -3944,28 +3458,17 @@ export default function Chat({
       ) {
         authoritativeThreadModelRef.current = null;
       }
-      const nextSelectionKey = nextModel;
       optimisticThreadModelRef.current = null;
       setSelectedThreadModel(nextModel);
       dispatchLocalThreadSummaryUpdate(threadId, {
         model: nextModel,
         updatedAt,
       });
-      const agent = chatAgentRef.current;
-      if (
-        lastRunnerModelSelectionRef.current !== nextSelectionKey &&
-        agent?.readyState === SSE_READY_STATE_OPEN &&
-        ready
-      ) {
-        lastRunnerModelSelectionRef.current = nextSelectionKey;
-        void agent.call("refreshModel").catch(() => {});
-      }
     }
   }, [
     llmProvider,
     billingAccessMode,
     threadId,
-    ready,
     threadModel,
     updateThreadModelFetcher.state,
     updateThreadModelFetcher.data,
@@ -4050,10 +3553,8 @@ export default function Chat({
     if (
       !threadId ||
       readOnly ||
-      resolveRefreshedThreadModel(
-        selectedThreadModel,
-        refreshedThreadModel,
-      ) !== null ||
+      resolveRefreshedThreadModel(selectedThreadModel, refreshedThreadModel) !==
+        null ||
       updateThreadModelFetcher.state !== "idle" ||
       !cheapestSelectableModel ||
       !shouldSwitchExhaustedThreadModel(
@@ -4276,30 +3777,26 @@ export default function Chat({
   }
 
   function stopGeneration() {
-    if (chatAgentRef.current?.readyState !== SSE_READY_STATE_OPEN) return;
-    void chatAgentRef.current.call("requestStop").catch(() => {});
+    if (!isStreaming) return;
+    void chatRuntime.control("stop").catch(() => {});
   }
 
   const handleQuestionResponse = useCallback(
     (answers: Record<string, string>) => {
-      const agent = chatAgentRef.current;
-      if (
-        !pendingQuestion ||
-        !agent ||
-        agent.readyState !== SSE_READY_STATE_OPEN
-      ) {
-        return;
-      }
+      if (!pendingQuestion) return;
 
       optimisticallyAnsweredQuestionIdRef.current = pendingQuestion.questionId;
-      void agent.call("answerQuestion", [pendingQuestion.questionId, answers]);
+      void chatRuntime.control("answer_question", {
+        questionId: pendingQuestion.questionId,
+        answers,
+      });
 
       // Optimistically clear the question
       setPendingQuestion(null);
 
       window.setTimeout(() => composerTextareaRef.current?.focus(), 0);
     },
-    [pendingQuestion],
+    [chatRuntime, pendingQuestion],
   );
 
   const resetPreviewTabsState = useCallback(() => {
@@ -4316,43 +3813,15 @@ export default function Chat({
     (target: PreviewTarget | null) => {
       if (!threadId) return;
 
-      if (readOnly) {
-        if (target === null) {
-          resetPreviewTabsState();
-          setMobileView("chat");
-          return;
-        }
-        openTabForTarget(target, { sync: false });
-        return;
-      }
-
-      const agent = chatAgentRef.current;
-      if (!agent || agent.readyState !== SSE_READY_STATE_OPEN) {
-        if (target === null) {
-          resetPreviewTabsState();
-          setMobileView("chat");
-          return;
-        }
-        toast.error("Preview is unavailable while reconnecting.");
-        return;
-      }
-
       if (target === null) {
         resetPreviewTabsState();
-        syncPreviewTabsStateBestEffort([], null);
         setMobileView("chat");
         return;
       }
 
-      openTabForTarget(target, { sync: true });
+      openTabForTarget(target);
     },
-    [
-      threadId,
-      readOnly,
-      resetPreviewTabsState,
-      openTabForTarget,
-      syncPreviewTabsStateBestEffort,
-    ],
+    [threadId, resetPreviewTabsState, openTabForTarget],
   );
 
   const openPreviewTarget = useCallback(
@@ -4417,9 +3886,19 @@ export default function Chat({
     }
 
     const wasSentDuringStreaming = assistantTurnActive;
-    const clientMessageId = `client_${Date.now()}_${Math.random()
-      .toString(36)
-      .slice(2, 10)}`;
+    const retryDraft =
+      !opts?.preserveDraft && !opts?.contentOverride
+        ? loadDeliveryDraft(resolvedWorkspaceId, threadId)
+        : null;
+    const reuseDeliveryId = Boolean(
+      retryDraft &&
+      !retryDraft.acceptedAt &&
+      retryDraft.text === currentInput &&
+      areDraftAttachmentsEqual(currentAttachments, retryDraft.attachments),
+    );
+    const clientMessageId = reuseDeliveryId
+      ? retryDraft!.clientMessageId
+      : `client_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
     const shouldIncludeAttachmentRefs =
       !opts?.skipAttachmentRefs && !opts?.contentOverride;
@@ -4503,7 +3982,7 @@ export default function Chat({
       return [...prev, userMsg];
     });
 
-    // If the transport is connected and ready, send immediately
+    // Admission is an independent bounded POST; it never waits for SSE readiness.
     const previewUserMessage = normalizeThreadPreviewUserMessage(rawContent);
     const userMessageAt = Date.now();
     const isFirstUserTurn = !displayMessagesRef.current.some(
@@ -4518,19 +3997,8 @@ export default function Chat({
       runningActivityAt: userMessageAt,
       runningStartedAt: userMessageAt,
     });
-    if (chatAgentRef.current?.readyState === SSE_READY_STATE_OPEN && ready) {
-      setLoading(true);
-      sendPendingMessageToAgent(userMsg, threadId);
-      setPendingMessages((prev) => prev);
-    } else {
-      // Queue the full message object for later delivery (with file refs in content).
-      // The SSE client reconnects automatically; the ready handler flushes the queue.
-      trackChatSendQueuedOffline(threadId, {
-        readyState: chatAgentRef.current?.readyState ?? null,
-        ready,
-      });
-      setLoading(true);
-    }
+    setLoading(true);
+    sendPendingMessage(userMsg, threadId);
     return true;
   }
 
@@ -4600,7 +4068,15 @@ export default function Chat({
         onStatusChange={setAppIsPublic}
       />
     );
-  }, [readOnly, billingAccessMode, previewTarget, threadId, appIsPublic, isAdmin, setAppIsPublic]);
+  }, [
+    readOnly,
+    billingAccessMode,
+    previewTarget,
+    threadId,
+    appIsPublic,
+    isAdmin,
+    setAppIsPublic,
+  ]);
   const previewPanelBody = (
     <PreviewPanelShell
       previewTabs={previewTabs}
@@ -4637,6 +4113,19 @@ export default function Chat({
           </div>
         </div>
       )}
+      {!readOnly && chatRuntime.offline && (
+        <div className="mx-auto flex w-full max-w-3xl items-center justify-between gap-3 px-4 pt-3 text-xs text-muted-foreground md:px-6">
+          <span>Live updates paused. Messages can still be submitted.</span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={chatRuntime.reconnect}
+          >
+            Reconnect
+          </Button>
+        </div>
+      )}
       {/* Chat Body - Single Scroll Container */}
       <div
         ref={scrollContainerRef}
@@ -4652,28 +4141,6 @@ export default function Chat({
           ref={messageColumnRef}
           className="max-w-3xl mx-auto w-full px-4 md:px-6 pt-2 pb-6 flex flex-col"
         >
-          {!readOnly && (olderMessagesCursor || olderMessagesError) ? (
-            <div className="flex flex-col items-center gap-1 pb-2">
-              {olderMessagesCursor ? (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  disabled={isLoadingOlderMessages}
-                  onClick={() => void loadOlderMessages()}
-                >
-                  {isLoadingOlderMessages
-                    ? "Loading earlier messages…"
-                    : "Load earlier messages"}
-                </Button>
-              ) : null}
-              {olderMessagesError ? (
-                <p className="text-xs text-destructive" role="status">
-                  {olderMessagesError}
-                </p>
-              ) : null}
-            </div>
-          ) : null}
           <ChatTranscriptErrorBoundary>
             <ChatMessagesView
               visibleMessages={visibleMessages}
@@ -4744,10 +4211,7 @@ export default function Chat({
                       />
                     )}
                     {currentTodos.length > 0 && (
-                      <FloatingTodoList
-                        todos={currentTodos}
-                        className="mb-3"
-                      />
+                      <FloatingTodoList todos={currentTodos} className="mb-3" />
                     )}
                   </div>
                 )}
@@ -4772,8 +4236,7 @@ export default function Chat({
                   onOpenAiSignIn={openOpenAiSignIn}
                   className="mb-2 shrink-0"
                 />
-                {displayedBillingCreditStatus &&
-                !shouldAddCamelCodeToPicker ? (
+                {displayedBillingCreditStatus && !shouldAddCamelCodeToPicker ? (
                   <BillingCreditNotice
                     status={displayedBillingCreditStatus}
                     onOpenUsage={() => navigate("/settings/organization/usage")}
@@ -5005,9 +4468,7 @@ export default function Chat({
           open={billingDialog.kind === "unlock"}
           onOpenChange={handleBillingDialogOpenChange}
           triggerModel={
-            billingDialog.kind === "unlock"
-              ? billingDialog.triggerModel
-              : null
+            billingDialog.kind === "unlock" ? billingDialog.triggerModel : null
           }
           isOrgAdmin={isOrgAdmin}
           orgId={currentOrg.id}
@@ -5016,10 +4477,9 @@ export default function Chat({
           onAddKey={openByokDialog}
           onOpenAiSignIn={openOpenAiSignIn}
           variant={
-            effectiveHostedCreditsPaused?.reason ===
-            "subscription_unavailable"
+            effectiveHostedCreditsPaused?.reason === "subscription_unavailable"
               ? "unlock"
-              : effectiveHostedCreditsPaused?.reason ?? "unlock"
+              : (effectiveHostedCreditsPaused?.reason ?? "unlock")
           }
         />
       ) : null}

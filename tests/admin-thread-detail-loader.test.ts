@@ -95,11 +95,9 @@ describe('admin thread detail loader', () => {
     });
     const setTitleMock = vi.fn().mockResolvedValue(undefined);
     const setModelMock = vi.fn().mockResolvedValue(undefined);
-    const refreshRunnerConfigMock = vi.fn().mockResolvedValue(undefined);
     const chatThreadGetMock = vi.fn().mockReturnValue({
       setTitle: setTitleMock,
       setModel: setModelMock,
-      refreshRunnerConfig: refreshRunnerConfigMock,
     });
     const chatThreadIdFromNameMock = vi.fn((id: string) => `chat-thread:${id}`);
     const env = {
@@ -158,6 +156,5 @@ describe('admin thread detail loader', () => {
       'sonnet',
       1_710_000_200_000,
     );
-    expect(refreshRunnerConfigMock).toHaveBeenCalledTimes(1);
   });
 });

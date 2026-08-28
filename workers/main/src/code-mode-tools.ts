@@ -33,6 +33,7 @@ import {
   type AgentSkillReadResult,
 } from "./selfhost-agent-pack";
 import { PiContainerTools, PI_CONTAINER_TOOL_DEFINITIONS } from "./pi-container-tools";
+import { selectTextLineWindow, truncateTextHead } from "./bounded-text-lines";
 import { parseFilePreviewPath } from "./preview-paths";
 import type { ConnectionSetupResponse } from "./chat-thread-browser-prompts";
 import { CodeModeWebSearch } from "./code-mode-web-search";
@@ -92,15 +93,23 @@ import { addShadcnComponentsToProject, normalizeShadcnComponentList, SUPPORTED_S
 import { connectAppBrowserSession, launchAppBrowserSession } from "./app-browser-binding";
 import { deployWorkerModulesDirect, rollbackWorkerDeployFromArtifactCache, type DirectDispatchDeployResult } from "./direct-dispatch-deploy";
 import { handleDeploySideEffects } from "./services/deploy";
+import {
+  deployEnvironmentFromArg,
+  isStagingScriptName,
+  productionScriptNameFromStaging,
+  promoteAppToProduction,
+  stagingScriptName,
+} from "./services/app-environments";
+import type { AppEnvironment } from "../../../src/types";
+import { CHAT_RUNTIME_BOUNDS } from "../../../src/lib/chat-runtime-bounds";
+import { boundedCanonicalJsonResult } from "./chat-thread/bounded-canonical-json";
+import { boundedErrorValue } from "./chat-thread/bounded-error-text";
+import { sha256Hex } from "./sha256";
 import { editAutomationVirtualFile, listAutomationVirtualFiles, normalizeAutomationVirtualPath, readAutomationVirtualFile, writeAutomationVirtualFile } from "./deterministic-automation-virtual-files";
 import { applyTextEdits, normalizeTextEditArguments } from "./text-edit";
 import type { DynamicIntegrationSchema } from "../../../src/lib/integration-registry";
 import type { ChatThreadDO } from "./chat-thread-do";
 import { ChannelTools } from "./chat-channels";
-import {
-  PI_TOOL_RESULT_MAX_BYTES,
-  PI_TOOL_RESULT_MAX_LINES,
-} from "./pi-message-storage";
 import type {
   ChatEnv,
   ChatContextState,
@@ -140,12 +149,193 @@ function measureResultChars(value: unknown): number {
   }
 }
 
+/** Bounds a tool value before artifact, telemetry, RPC, or prompt copies exist. */
+export function boundCodeModeToolResult(value: unknown): unknown {
+  return boundedCodeModeToolResultProjection(value).value;
+}
+
+function boundedCodeModeToolResultProjection(value: unknown): {
+  value: unknown;
+  complete: boolean;
+} {
+  const encoded = boundedCanonicalJsonResult(
+    value,
+    CHAT_RUNTIME_BOUNDS.toolResultBytes,
+    {
+      maxDepth: CHAT_RUNTIME_BOUNDS.providerJsonDepth,
+      maxEntries: CHAT_RUNTIME_BOUNDS.providerJsonEntries,
+      maxNodes: CHAT_RUNTIME_BOUNDS.providerJsonNodes,
+    },
+  );
+  return {
+    value: JSON.parse(encoded.json) as unknown,
+    complete: encoded.complete,
+  };
+}
+
+type ToolResultOverflowFormat = "text" | "json";
+
+interface ToolResultOverflowDetails {
+  stored: boolean;
+  path?: string;
+  format: ToolResultOverflowFormat;
+  bytes?: number;
+  sha256?: string;
+  complete: boolean;
+  reason?: string;
+}
+
+interface SerializedToolResultOverflow {
+  format: ToolResultOverflowFormat;
+  bytes: Uint8Array;
+  contentType: string;
+}
+
+const codeModeOverflowEncoder = new TextEncoder();
+
+function codeModeOverflowByteLength(value: string): number {
+  return codeModeOverflowEncoder.encode(value).byteLength;
+}
+
+/**
+ * Counts the UTF-8 representation of a string without first allocating it.
+ * Stops as soon as the overflow cap is crossed, so a huge string cannot create
+ * a second huge copy merely to decide that it is ineligible for storage.
+ */
+function boundedCodeModeStringBytes(value: string, maxBytes: number): number | null {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else {
+        // TextEncoder replaces an unpaired surrogate with U+FFFD.
+        bytes += 3;
+      }
+    } else {
+      // Includes BMP code points and unpaired low surrogates.
+      bytes += 3;
+    }
+    if (bytes > maxBytes) return null;
+  }
+  return bytes;
+}
+
+function codeModeOverflowFormat(value: unknown): ToolResultOverflowFormat {
+  return typeof value === "string" ? "text" : "json";
+}
+
+function serializeCodeModeToolResultOverflow(
+  value: unknown,
+): SerializedToolResultOverflow | null {
+  const maxBytes = CHAT_RUNTIME_BOUNDS.toolResultOverflowBytes;
+  if (typeof value === "string") {
+    if (boundedCodeModeStringBytes(value, maxBytes) === null) return null;
+    const bytes = codeModeOverflowEncoder.encode(value);
+    if (bytes.byteLength > maxBytes) return null;
+    return {
+      format: "text",
+      bytes,
+      contentType: "text/plain; charset=utf-8",
+    };
+  }
+
+  const encoded = boundedCanonicalJsonResult(value, maxBytes, {
+    maxDepth: CHAT_RUNTIME_BOUNDS.providerJsonDepth,
+    maxEntries: CHAT_RUNTIME_BOUNDS.providerJsonEntries,
+    maxNodes: CHAT_RUNTIME_BOUNDS.providerJsonNodes,
+  });
+  if (!encoded.complete) return null;
+  const bytes = codeModeOverflowEncoder.encode(encoded.json);
+  if (bytes.byteLength > maxBytes) return null;
+  return { format: "json", bytes, contentType: "application/json" };
+}
+
+function safeCodeModeOverflowName(value: string, fallback: string): string {
+  const safe = value
+    .normalize("NFKD")
+    .replace(/[^a-zA-Z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return safe || fallback;
+}
+
+function codeModeOverflowPreview(value: unknown, maxBytes: number): unknown {
+  const encoded = boundedCanonicalJsonResult(value, Math.max(1, maxBytes), {
+    maxDepth: CHAT_RUNTIME_BOUNDS.providerJsonDepth,
+    maxEntries: CHAT_RUNTIME_BOUNDS.providerJsonEntries,
+    maxNodes: CHAT_RUNTIME_BOUNDS.providerJsonNodes,
+  });
+  return JSON.parse(encoded.json) as unknown;
+}
+
+/** Build a stable overflow envelope while keeping its serialized form <=4KiB. */
+function codeModeOverflowProjection(
+  value: unknown,
+  overflow: ToolResultOverflowDetails,
+  hint: string,
+): { $overflow: ToolResultOverflowDetails; hint: string; preview: unknown } {
+  const maxBytes = CHAT_RUNTIME_BOUNDS.toolResultOverflowStubBytes;
+  let previewBudget = Math.max(1, maxBytes - 1_024);
+  for (;;) {
+    const projection = {
+      $overflow: overflow,
+      hint,
+      preview: codeModeOverflowPreview(value, previewBudget),
+    };
+    if (codeModeOverflowByteLength(JSON.stringify(projection)) <= maxBytes) {
+      return projection;
+    }
+    if (previewBudget === 1) break;
+    previewBudget = Math.max(1, Math.floor(previewBudget / 2));
+  }
+
+  // All variable envelope fields are bounded before reaching this function;
+  // this final form is intentionally tiny and cannot exceed the stub budget.
+  return {
+    $overflow: overflow,
+    hint: "Tool result exceeded the inline limit; only a bounded preview is available.",
+    preview: null,
+  };
+}
+
+function codeModeOverflowFallbackProjection(
+  format: ToolResultOverflowFormat,
+  reason: string,
+): { $overflow: ToolResultOverflowDetails; hint: string; preview: null } {
+  return {
+    $overflow: {
+      stored: false,
+      format,
+      complete: false,
+      reason,
+    },
+    hint: "Tool result exceeded the inline limit; only a bounded preview is available.",
+    preview: null,
+  };
+}
+
+function codeModeOverflowAbortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("Tool-result overflow was aborted");
+}
+
 function simplifyAgentWebToolResult(name: string, value: unknown): unknown {
   if (name !== "WebSearch" && name !== "WebFetch") return value;
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return name === "WebSearch" ? [] : "";
   }
   const record = value as Record<string, unknown>;
+  const overflow = Object.getOwnPropertyDescriptor(record, "$overflow");
+  if (overflow && "value" in overflow && overflow.value) return value;
   const results = Array.isArray(record.results)
     ? record.results.filter((result): result is Record<string, unknown> => (
       Boolean(result) && typeof result === "object" && !Array.isArray(result)
@@ -249,6 +439,14 @@ export const CODE_MODE_DEFAULT_TIMEOUT_MS = 60_000;
 export const CODE_MODE_MAX_TIMEOUT_MS = 600_000;
 export const CODE_MODE_DEFAULT_MAX_OUTPUT_CHARACTERS = 60_000;
 export const CODE_MODE_MAX_OUTPUT_CHARACTERS = 200_000;
+export const CODE_MODE_MOVE_MAX_FILES = 256;
+export const CODE_MODE_MOVE_MAX_FILE_BYTES = 8 * 1024 * 1024;
+export const CODE_MODE_MOVE_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+const CODE_MODE_R2_READ_MAX_LINES = 2_000;
+const CODE_MODE_R2_READ_MAX_BYTES = 50 * 1024;
+// R2 read results carry text twice (`text` plus a content block). At 16 KiB,
+// even worst-case JSON escaping of control bytes stays below toolResultBytes.
+const CODE_MODE_R2_BYTE_WINDOW_MAX_BYTES = 16 * 1024;
 const CODE_MODE_R2_READ_NOTICE_RESERVED_BYTES = 1024;
 const CODE_MODE_R2_MAX_WRITE_BYTES = 10 * 1024 * 1024;
 const ARCHIVE_TOOL_COMMAND = "python /usr/local/bin/camelai-archive";
@@ -294,7 +492,43 @@ export function assertNotBase64IntoBinaryFile(path: string, content: string): vo
     `which writes real bytes to the same outputs/ object the user downloads.`,
   );
 }
-const CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES = 10 * 1024 * 1024;
+const CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES = CHAT_RUNTIME_BOUNDS.toolSourceReadBytes;
+
+function codeModeMoveFileSize(file: CodeModeMoveFile): number {
+  if (
+    typeof file.size !== "number" ||
+    !Number.isSafeInteger(file.size) ||
+    file.size < 0
+  ) {
+    throw new Error(`Cannot move '${file.path}': source size is unavailable or invalid`);
+  }
+  if (file.size > CODE_MODE_MOVE_MAX_FILE_BYTES) {
+    throw new Error(
+      `Cannot move '${file.path}': file is ${file.size} bytes; max ${CODE_MODE_MOVE_MAX_FILE_BYTES} bytes`,
+    );
+  }
+  return file.size;
+}
+
+function assertCodeModeMoveBounds(files: readonly CodeModeMoveFile[]): number {
+  if (files.length > CODE_MODE_MOVE_MAX_FILES) {
+    throw new Error(
+      `Move source has ${files.length} files; max ${CODE_MODE_MOVE_MAX_FILES} files`,
+    );
+  }
+  let totalBytes = 0;
+  for (const file of files) {
+    const size = codeModeMoveFileSize(file);
+    if (size > CODE_MODE_MOVE_MAX_TOTAL_BYTES - totalBytes) {
+      throw new Error(
+        `Move source exceeds ${CODE_MODE_MOVE_MAX_TOTAL_BYTES} aggregate bytes`,
+      );
+    }
+    totalBytes += size;
+  }
+  return totalBytes;
+}
+
 const JS_EXEC_EXCLUDED_TOOL_NAMES = new Set([
   // This tool waits for human input and can outlive js_exec's short sandbox
   // timeout. Keep it as a top-level Pi tool so the agent sees the submission.
@@ -302,6 +536,9 @@ const JS_EXEC_EXCLUDED_TOOL_NAMES = new Set([
   "delete_connection",
   "delete_app",
   "delete_project",
+  // Publishing to production is a user decision; keep it a top-level tool the
+  // user sees rather than a call buried inside a js_exec script.
+  "promote_to_production",
   // Blocks on human input the same way; keep it out of the js_exec catalog so
   // tools.search() can't advertise burying a user prompt inside the sandbox
   // timeout. It stays a top-level Pi tool.
@@ -551,10 +788,24 @@ const CODE_MODE_CONTAINER_TOOL_NAMES = [
   "delete",
 ] as const;
 
+const CODE_MODE_R2_READ_PARAMETERS = Type.Object({
+  ...PI_CONTAINER_TOOL_DEFINITIONS.read.parameters.properties,
+  byte_offset: Type.Optional(Type.Number({
+    description:
+      "0-indexed byte offset for a bounded R2 text window. Use details.nextByteOffset to page large single-line objects without splitting UTF-8. Only valid with location='r2'.",
+  })),
+}, { additionalProperties: false });
+
 const CODE_MODE_CONTAINER_TOOL_DEFINITIONS = CODE_MODE_CONTAINER_TOOL_NAMES.map(
   (name) => {
     const definition = PI_CONTAINER_TOOL_DEFINITIONS[name];
-    return codeModeTool(definition.name, definition.description, definition.parameters, {
+    const parameters = name === "read"
+      ? CODE_MODE_R2_READ_PARAMETERS
+      : definition.parameters;
+    const description = name === "read"
+      ? `${definition.description} For large single-line R2 text, pass byte_offset=0 and continue with details.nextByteOffset.`
+      : definition.description;
+    return codeModeTool(definition.name, description, parameters, {
       category: "workspace",
       sideEffect: ["write", "edit"].includes(definition.name),
     });
@@ -839,10 +1090,16 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   ),
   codeModeTool(
     "deploy_project",
-    "Build, deploy, return the live URL, and open a DO-backed project in preview through the platform direct deploy path. A successful call proves publication, not feature correctness or live-data quality. Pass dry_run=true to validate without publishing or changing preview. In js_exec the call resolves ok: false when validation, build, or deploy fails. Data-analysis notebook publication is an external side effect and requires publish_intent='user_requested'; creating or previewing a report alone does not authorize publication. Run run_notebook first so outputs are fresh. Arguments: { project, script_name?, path?, timeoutMs?, dry_run?, publish_intent? }.",
+    "Build, deploy, return the live URL, and open a DO-backed project in preview through the platform direct deploy path. A successful call proves publication, not feature correctness or live-data quality. Pass dry_run=true to validate without publishing or changing preview. In js_exec the call resolves ok: false when validation, build, or deploy fails. environment='staging' deploys to the project's separate staging app (script name suffixed '-staging', private by default) and is never policy-gated, so prefer it while iterating; environment='production' (the default) publishes the live app and may require an org admin plus publish_intent='user_requested' depending on org policy. Promote a verified staging build with promote_to_production instead of rebuilding straight to production. Data-analysis notebook publication is an external side effect and requires publish_intent='user_requested'; creating or previewing a report alone does not authorize publication. Run run_notebook first so outputs are fresh. Arguments: { project, script_name?, environment?, path?, timeoutMs?, dry_run?, publish_intent? }.",
     Type.Object({
       project: Type.String(),
       script_name: Type.Optional(Type.String()),
+      environment: Type.Optional(Type.Union([
+        Type.Literal("staging"),
+        Type.Literal("production"),
+      ], {
+        description: "Target app environment. Defaults to production.",
+      })),
       path: Type.Optional(Type.String({
         description: "Notebook path inside the project to publish (data-analysis projects only). Defaults to analysis.ipynb or the project's single notebook.",
       })),
@@ -873,6 +1130,20 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
       limit: Type.Optional(Type.Number()),
     }, { additionalProperties: false }),
     { category: "apps" },
+  ),
+  codeModePassthroughTool(
+    "promote_to_production",
+    "Promote a staging app's live build to its production app, republishing the exact artifact staging is running under the production script name (the staging name minus '-staging') with the production app's own env vars. Nothing is rebuilt, so verify staging first. Promotion publishes, so it always requires publish_intent='user_requested' after the user explicitly asks; org policy may additionally require an org admin. Use this as a top-level tool, not from js_exec. Arguments: { script_name, publish_intent }.",
+    Type.Object({
+      script_name: Type.String({ description: "The staging app name, e.g. 'poll-maker-staging'." }),
+      publish_intent: Type.Literal("user_requested", {
+        description: "Confirms the user explicitly asked to promote, publish, or go live.",
+      }),
+    }, { additionalProperties: false }),
+    {
+      category: "apps",
+      sideEffect: true,
+    },
   ),
   codeModePassthroughTool(
     "delete_app",
@@ -951,7 +1222,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   ),
   codeModePassthroughTool(
     "list_apps",
-    "List previously deployed apps for discovery or inspection. deploy_project already returns the new app URL and confirms successful publishing, so list_apps is not needed merely to verify a successful deploy. Optional filters keep output small: name matches app/custom-domain names, project matches project_id or app name, limit caps results, and sort defaults to updated_desc. Arguments: { name?, project?, limit?, sort? }.",
+    "List previously deployed apps for discovery or inspection. deploy_project already returns the new app URL and confirms successful publishing, so list_apps is not needed merely to verify a successful deploy. Each app reports its environment ('staging' or 'production'). Optional filters keep output small: name matches app/custom-domain names, project matches project_id or app name, limit caps results, and sort defaults to updated_desc. Arguments: { name?, project?, limit?, sort? }.",
     Type.Object({
       name: Type.Optional(Type.String()),
       project: Type.Optional(Type.String()),
@@ -1301,7 +1572,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   }),
   codeModePassthroughTool(
     "set_custom_domain",
-    "Set an exact custom hostname for an app. Arguments: { app_name, hostname }.",
+    "Set an exact custom hostname for a production app; staging apps cannot take custom domains. Arguments: { app_name, hostname }.",
     Type.Object({
       app_name: Type.String(),
       hostname: Type.String(),
@@ -1977,6 +2248,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     prompt_connection_setup: (binding, args) => binding.promptConnectionSetup(args),
     delete_connection: (binding, args) => binding.deleteConnection(args),
     delete_app: (binding, args) => binding.deleteApp(args),
+    promote_to_production: (binding, args) => binding.promoteToProduction(args),
     delete_project: (binding, args) => binding.deleteProject(args),
     send_email: (binding, args) => binding.sendEmail(args),
     send_slack_message: (binding, args) => binding.sendSlackMessage(args),
@@ -2023,6 +2295,16 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
    * never runs field initializers.
    */
   private recordedToolFailures?: Set<string>;
+
+  /**
+   * Per-binding overflow reservations. These are lazy because focused tests
+   * construct the binding with Object.create() and skip field initializers.
+   * Reservations are never refunded: after an uncertain/failed put, retrying
+   * the same capacity could exceed the bounded per-attempt contract.
+   */
+  private toolResultOverflowReservedBytes?: number;
+  private toolResultOverflowReservedFiles?: number;
+  private toolResultOverflowStorageFailed?: boolean;
 
   private get workspaceFs(): WorkspaceFilesystemClient {
     const { workspaceId } = this.ctx.props;
@@ -2387,10 +2669,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
   }
 
-  private textByteLength(value: string): number {
-    return new TextEncoder().encode(value).byteLength;
-  }
-
   private truncateR2ReadHead(
     content: string,
     maxBytes: number,
@@ -2402,72 +2680,18 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     totalBytes: number;
     outputLines: number;
     outputBytes: number;
+    firstLineBytes: number;
     firstLineExceedsLimit: boolean;
     maxLines: number;
     maxBytes: number;
   } {
-    const lines = content.split("\n");
-    const totalLines = lines.length;
-    const totalBytes = this.textByteLength(content);
-    if (totalLines <= PI_TOOL_RESULT_MAX_LINES && totalBytes <= maxBytes) {
-      return {
-        content,
-        truncated: false,
-        truncatedBy: null,
-        totalLines,
-        totalBytes,
-        outputLines: totalLines,
-        outputBytes: totalBytes,
-        firstLineExceedsLimit: false,
-        maxLines: PI_TOOL_RESULT_MAX_LINES,
-        maxBytes,
-      };
-    }
-    if (this.textByteLength(lines[0] ?? "") > maxBytes) {
-      return {
-        content: "",
-        truncated: true,
-        truncatedBy: "bytes",
-        totalLines,
-        totalBytes,
-        outputLines: 0,
-        outputBytes: 0,
-        firstLineExceedsLimit: true,
-        maxLines: PI_TOOL_RESULT_MAX_LINES,
-        maxBytes,
-      };
-    }
-    const selected: string[] = [];
-    let outputBytes = 0;
-    let truncatedBy: "lines" | "bytes" = "lines";
-    for (let index = 0; index < lines.length && index < PI_TOOL_RESULT_MAX_LINES; index += 1) {
-      const line = lines[index] ?? "";
-      if (selected.length >= PI_TOOL_RESULT_MAX_LINES) {
-        truncatedBy = "lines";
-        break;
-      }
-      const lineBytes = this.textByteLength(line) + (selected.length > 0 ? 1 : 0);
-      if (outputBytes + lineBytes > maxBytes) {
-        truncatedBy = "bytes";
-        break;
-      }
-      selected.push(line);
-      outputBytes += lineBytes;
-    }
-    if (selected.length >= PI_TOOL_RESULT_MAX_LINES && outputBytes <= maxBytes) {
-      truncatedBy = "lines";
-    }
-    const outputContent = selected.join("\n");
+    const truncated = truncateTextHead(content, CODE_MODE_R2_READ_MAX_LINES, maxBytes);
     return {
-      content: outputContent,
-      truncated: true,
-      truncatedBy,
-      totalLines,
-      totalBytes,
-      outputLines: selected.length,
-      outputBytes: this.textByteLength(outputContent),
-      firstLineExceedsLimit: false,
-      maxLines: PI_TOOL_RESULT_MAX_LINES,
+      ...truncated,
+      ...(truncated.firstLineExceedsLimit
+        ? { content: "", outputLines: 0, outputBytes: 0 }
+        : {}),
+      maxLines: CODE_MODE_R2_READ_MAX_LINES,
       maxBytes,
     };
   }
@@ -2513,12 +2737,103 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
   }
 
+  private async readR2ByteWindow(
+    target: CodeModeR2Path,
+    head: R2Object,
+    requestedOffset: number,
+  ): Promise<Record<string, unknown>> {
+    if (!Number.isSafeInteger(head.size) || head.size < 0) {
+      throw new Error("R2 object has an invalid size");
+    }
+    if (head.size > CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES) {
+      throw new Error(
+        `R2 object is too large for text read (${head.size} bytes; max ${CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES} bytes)`,
+      );
+    }
+    if (!Number.isSafeInteger(requestedOffset) || requestedOffset < 0) {
+      throw new Error("byte_offset must be a non-negative safe integer");
+    }
+    if (requestedOffset > head.size || (requestedOffset === head.size && head.size > 0)) {
+      throw new Error(`Byte offset ${requestedOffset} is beyond end of R2 object`);
+    }
+
+    const maxContentBytes = Math.min(
+      CODE_MODE_R2_BYTE_WINDOW_MAX_BYTES,
+      CODE_MODE_R2_READ_MAX_BYTES - CODE_MODE_R2_READ_NOTICE_RESERVED_BYTES,
+    );
+    const fetchStart = Math.max(0, requestedOffset - 3);
+    const prefixBytes = requestedOffset - fetchStart;
+    const fetchLength = Math.min(
+      head.size - fetchStart,
+      prefixBytes + maxContentBytes + 4,
+    );
+    let bytes = new Uint8Array(0);
+    if (fetchLength > 0) {
+      const object = await this.env.R2_BUCKET.get(target.key, {
+        range: { offset: fetchStart, length: fetchLength },
+      });
+      if (!object) throw new Error(`R2 object not found: ${target.path}`);
+      if (object.body) {
+        bytes = new Uint8Array(await readStreamBytes(object.body, fetchLength));
+      } else {
+        bytes = typeof object.arrayBuffer === "function"
+          ? new Uint8Array(await object.arrayBuffer())
+          : new TextEncoder().encode(await object.text());
+        if (bytes.byteLength > fetchLength) {
+          throw new Error("R2 range read returned more bytes than requested");
+        }
+      }
+    }
+
+    const continuation = (byte: number): boolean => (byte & 0xc0) === 0x80;
+    let start = prefixBytes;
+    // An arbitrary caller offset may point into a multibyte code point. Move
+    // forward to the next boundary; nextByteOffset values returned below are
+    // already exact boundaries and do not need adjustment.
+    while (start < bytes.byteLength && continuation(bytes[start])) start += 1;
+    let end = Math.min(bytes.byteLength, start + maxContentBytes);
+    if (fetchStart + end < head.size) {
+      while (end > start && continuation(bytes[end])) end -= 1;
+    }
+    const actualOffset = fetchStart + start;
+    const windowBytes = bytes.subarray(start, end);
+    let content: string;
+    try {
+      content = new TextDecoder("utf-8", { fatal: true }).decode(windowBytes);
+    } catch {
+      throw new Error("R2 byte window is not valid UTF-8 text");
+    }
+    const nextByteOffset = actualOffset + windowBytes.byteLength < head.size
+      ? actualOffset + windowBytes.byteLength
+      : null;
+    let text = content;
+    if (nextByteOffset !== null) {
+      const endDisplay = Math.max(actualOffset, nextByteOffset - 1);
+      text +=
+        `${text ? "\n\n" : ""}` +
+        `[Showing bytes ${actualOffset}-${endDisplay} of ${head.size}. Use byte_offset=${nextByteOffset} to continue.]`;
+    }
+
+    return {
+      text,
+      content: [{ type: "text", text }],
+      details: {
+        ...this.formatR2ObjectMetadata(head, target),
+        offset: null,
+        nextOffset: null,
+        totalLines: null,
+        truncation: null,
+        requestedByteOffset: requestedOffset,
+        byteOffset: actualOffset,
+        nextByteOffset,
+        windowBytes: windowBytes.byteLength,
+        totalBytes: head.size,
+      },
+    };
+  }
+
   private async readR2File(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const target = this.resolveCodeModeR2Path(args);
-    const offset = clampCodeModeInteger(args.offset, 1, 1, Number.MAX_SAFE_INTEGER);
-    const limit = typeof args.limit === "number"
-      ? clampCodeModeInteger(args.limit, PI_TOOL_RESULT_MAX_LINES, 1, PI_TOOL_RESULT_MAX_LINES)
-      : undefined;
     const head = await this.env.R2_BUCKET.head(target.key);
     if (!head) {
       throw new Error(`R2 object not found: ${target.path}`);
@@ -2526,6 +2841,26 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const contentTypeImageMimeType = getSupportedImageMimeTypeFromContentType(
       head.httpMetadata?.contentType,
     );
+    if (args.byte_offset !== undefined) {
+      if (args.offset !== undefined || args.limit !== undefined) {
+        throw new Error("byte_offset cannot be combined with line offset or limit");
+      }
+      if (contentTypeImageMimeType) {
+        throw new Error("byte_offset is only supported for R2 text objects");
+      }
+      if (
+        typeof args.byte_offset !== "number" ||
+        !Number.isSafeInteger(args.byte_offset) ||
+        args.byte_offset < 0
+      ) {
+        throw new Error("byte_offset must be a non-negative safe integer");
+      }
+      return this.readR2ByteWindow(target, head, args.byte_offset);
+    }
+    const offset = clampCodeModeInteger(args.offset, 1, 1, Number.MAX_SAFE_INTEGER);
+    const limit = typeof args.limit === "number"
+      ? clampCodeModeInteger(args.limit, CODE_MODE_R2_READ_MAX_LINES, 1, CODE_MODE_R2_READ_MAX_LINES)
+      : undefined;
     const object = await this.env.R2_BUCKET.get(target.key);
     if (!object) {
       throw new Error(`R2 object not found: ${target.path}`);
@@ -2557,8 +2892,20 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           `R2 object is too large for text read (${head.size} bytes; max ${CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES} bytes)`,
         );
       }
-      bytes = await readStreamBytes(sniffed.stream);
+      bytes = await readStreamBytes(
+        sniffed.stream,
+        CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES,
+      );
     } else {
+      const materializedSize = typeof object.size === "number" ? object.size : head.size;
+      if (!Number.isSafeInteger(materializedSize) || materializedSize < 0) {
+        throw new Error("R2 object has an invalid size; refusing to materialize it");
+      }
+      if (materializedSize > CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES) {
+        throw new Error(
+          `R2 object is too large for text read (${materializedSize} bytes; max ${CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES} bytes)`,
+        );
+      }
       bytes = typeof object.arrayBuffer === "function"
         ? new Uint8Array(await object.arrayBuffer())
         : new TextEncoder().encode(await object.text());
@@ -2576,28 +2923,17 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       );
     }
     const fullText = new TextDecoder().decode(bytes);
-    const allLines = fullText.split("\n");
     const startLine = offset - 1;
-    if (startLine >= allLines.length) {
-      throw new Error(`Offset ${offset} is beyond end of R2 object (${allLines.length} lines total)`);
-    }
-    let selectedContent: string;
-    let userLimitedLines: number | undefined;
-    if (limit !== undefined) {
-      const endLine = Math.min(startLine + limit, allLines.length);
-      selectedContent = allLines.slice(startLine, endLine).join("\n");
-      userLimitedLines = endLine - startLine;
-    } else {
-      selectedContent = allLines.slice(startLine).join("\n");
-    }
-    const maxBytes = PI_TOOL_RESULT_MAX_BYTES - CODE_MODE_R2_READ_NOTICE_RESERVED_BYTES;
-    const truncation = this.truncateR2ReadHead(selectedContent, maxBytes);
+    const window = selectTextLineWindow(fullText, startLine, limit);
+    if (!window) throw new Error(`Offset ${offset} is beyond end of R2 object`);
+    const maxBytes = CODE_MODE_R2_READ_MAX_BYTES - CODE_MODE_R2_READ_NOTICE_RESERVED_BYTES;
+    const truncation = this.truncateR2ReadHead(window.content, maxBytes);
     const startLineDisplay = startLine + 1;
     let text: string;
     let nextOffset: number | null = null;
     if (truncation.firstLineExceedsLimit) {
       text =
-        `[Line ${startLineDisplay} is ${this.textByteLength(allLines[startLine] ?? "")} bytes, exceeds ${maxBytes} byte read budget. R2 path: ${target.path}]`;
+        `[Line ${startLineDisplay} is ${truncation.firstLineBytes} bytes, exceeds ${maxBytes} byte read budget. R2 path: ${target.path}]`;
     } else if (truncation.truncated) {
       const endLineDisplay = startLine + truncation.outputLines;
       nextOffset = endLineDisplay + 1;
@@ -2607,10 +2943,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       text = truncation.content;
       text +=
         `${text ? "\n\n" : ""}` +
-        `[Showing lines ${startLineDisplay}-${endLineDisplay} of ${allLines.length}${limitLabel}. Use offset=${nextOffset} to continue.]`;
-    } else if (userLimitedLines !== undefined && startLine + userLimitedLines < allLines.length) {
-      const remaining = allLines.length - (startLine + userLimitedLines);
-      nextOffset = startLine + userLimitedLines + 1;
+        `[Showing lines ${startLineDisplay}-${endLineDisplay} of ${window.totalLines}${limitLabel}. Use offset=${nextOffset} to continue.]`;
+    } else if (startLine + window.outputLines < window.totalLines) {
+      const remaining = window.totalLines - startLine - window.outputLines;
+      nextOffset = startLine + window.outputLines + 1;
       text = `${truncation.content}\n\n[${remaining} more lines in R2 object. Use offset=${nextOffset} to continue.]`;
     } else {
       text = truncation.content;
@@ -2623,7 +2959,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         ...this.formatR2ObjectMetadata(head, target),
         offset,
         nextOffset,
-        totalLines: allLines.length,
+        totalLines: window.totalLines,
         truncation,
       },
     };
@@ -2833,8 +3169,17 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       };
     }
     if (!exists.isDirectory) throw new Error(`Path is not a file or directory: ${path}`);
-    const listing = await fileStore.listFiles(path, { recursive: true, includeHidden: true });
+    const listing = await fileStore.listFiles(path, {
+      recursive: true,
+      includeHidden: true,
+      limit: CODE_MODE_MOVE_MAX_FILES + 1,
+    });
     if (!listing.success) throw new Error(listing.error || `Failed to list ${path}`);
+    if (listing.files.length > CODE_MODE_MOVE_MAX_FILES) {
+      throw new Error(
+        `Move source has more than ${CODE_MODE_MOVE_MAX_FILES} entries; cannot prove its file-count bound`,
+      );
+    }
     const rootName = basenameForMove(path);
     const files = listing.files
       .filter((entry) => entry.type === "file")
@@ -2870,12 +3215,17 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const prefix = `${baseKey}${directoryRelativePath}`;
     const rootName = basenameForMove(target.path);
     const files: CodeModeMoveFile[] = [];
+    let listedBytes = 0;
     let cursor: string | undefined;
     do {
+      const remainingFileSlots = CODE_MODE_MOVE_MAX_FILES + 1 - files.length;
+      if (remainingFileSlots <= 0) {
+        throw new Error(`Move source has more than ${CODE_MODE_MOVE_MAX_FILES} files`);
+      }
       const listed = await this.env.R2_BUCKET.list({
         prefix,
         cursor,
-        limit: 1000,
+        limit: Math.min(1000, remainingFileSlots),
         include: ["httpMetadata"],
       });
       for (const object of listed.objects) {
@@ -2883,14 +3233,25 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           ? object.key.slice(prefix.length)
           : object.key.slice(baseKey.length);
         if (!objectRelativePath) continue;
-        files.push({
+        const file = {
           path: this.r2PathFromRelative(target.mount, target.relativePath
             ? `${target.relativePath}/${objectRelativePath}`
             : objectRelativePath),
           relativePath: joinRelativeMovePath(rootName, objectRelativePath),
           size: object.size,
           contentType: object.httpMetadata?.contentType,
-        });
+        } satisfies CodeModeMoveFile;
+        if (files.length >= CODE_MODE_MOVE_MAX_FILES) {
+          throw new Error(`Move source has more than ${CODE_MODE_MOVE_MAX_FILES} files`);
+        }
+        const fileSize = codeModeMoveFileSize(file);
+        if (fileSize > CODE_MODE_MOVE_MAX_TOTAL_BYTES - listedBytes) {
+          throw new Error(
+            `Move source exceeds ${CODE_MODE_MOVE_MAX_TOTAL_BYTES} aggregate bytes`,
+          );
+        }
+        listedBytes += fileSize;
+        files.push(file);
       }
       cursor = listed.truncated ? listed.cursor : undefined;
     } while (cursor);
@@ -2929,8 +3290,23 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const target = this.resolveCodeModeR2Path({ ...source, path: file.path });
     const object = await this.env.R2_BUCKET.get(target.key);
     if (!object) throw new Error(`R2 object not found: ${target.path}`);
+    const expectedSize = codeModeMoveFileSize(file);
+    if (object.size !== expectedSize) {
+      await object.body?.cancel("move source changed after listing").catch(() => undefined);
+      throw new Error(
+        `Cannot move '${file.path}': source size changed from ${expectedSize} to ${object.size} bytes`,
+      );
+    }
+    const bytes = object.body
+      ? await readStreamBytes(object.body, CODE_MODE_MOVE_MAX_FILE_BYTES)
+      : new Uint8Array(await object.arrayBuffer());
+    if (bytes.byteLength !== expectedSize) {
+      throw new Error(
+        `Cannot move '${file.path}': read ${bytes.byteLength} bytes; expected ${expectedSize}`,
+      );
+    }
     return {
-      bytes: new Uint8Array(await object.arrayBuffer()),
+      bytes,
       contentType: object.httpMetadata?.contentType ?? file.contentType,
     };
   }
@@ -3035,6 +3411,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
 
     const { files, sourceIsDirectory } = await this.collectMoveSourceFiles(source);
     if (files.length === 0) throw new Error(`No files found at ${source.path}`);
+    assertCodeModeMoveBounds(files);
     if (deleteSource) {
       await this.assertSafeMoveDeleteDestination(source, destination, sourceIsDirectory);
     }
@@ -3104,6 +3481,177 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       .filter((definition) => (
         this.ctx?.props?.allowWebTools !== false || !AGENT_WEB_TOOL_NAMES.has(definition.name)
       ));
+  }
+
+  /**
+   * Best-effort externalization for a result that cannot fit its current
+   * durable/prompt budget. Only a complete, bounded representation is written;
+   * every other outcome is an explicit preview-only projection.
+   */
+  async overflowToolResult(
+    toolName: string,
+    toolCallId: string,
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    const format = codeModeOverflowFormat(value);
+    const previewOnly = (reason: string, hint: string): unknown =>
+      codeModeOverflowProjection(value, {
+        stored: false,
+        format,
+        complete: false,
+        reason,
+      }, hint);
+
+    try {
+      if (signal?.aborted) throw codeModeOverflowAbortError(signal);
+      if (this.toolResultOverflowStorageFailed === true) {
+        return previewOnly(
+          "storage_disabled",
+          "Overflow storage failed earlier in this turn; only a bounded preview is available.",
+        );
+      }
+
+      let tmpBaseKey: string;
+      try {
+        tmpBaseKey = this.r2MountBaseKey("tmp");
+      } catch {
+        return previewOnly(
+          "scope_unavailable",
+          "Overflow storage requires org, workspace, and chat-thread scope; only a bounded preview is available.",
+        );
+      }
+
+      const serialized = serializeCodeModeToolResultOverflow(value);
+      if (!serialized) {
+        return previewOnly(
+          "source_limit",
+          `The full result could not be safely serialized within ${CHAT_RUNTIME_BOUNDS.toolResultOverflowBytes} bytes; only a bounded preview is available.`,
+        );
+      }
+
+      const reservedFiles = this.toolResultOverflowReservedFiles ?? 0;
+      const reservedBytes = this.toolResultOverflowReservedBytes ?? 0;
+      if (reservedFiles >= CHAT_RUNTIME_BOUNDS.toolResultOverflowFilesPerAttempt) {
+        return previewOnly(
+          "file_limit",
+          "The per-attempt overflow file limit is exhausted; only a bounded preview is available.",
+        );
+      }
+      if (
+        serialized.bytes.byteLength >
+        CHAT_RUNTIME_BOUNDS.toolResultOverflowPerAttemptBytes - reservedBytes
+      ) {
+        return previewOnly(
+          "aggregate_limit",
+          "The per-attempt overflow byte limit is exhausted; only a bounded preview is available.",
+        );
+      }
+
+      // Reserve synchronously before hashing or starting the R2 write. Parallel
+      // calls on one binding therefore cannot all observe the same capacity.
+      this.toolResultOverflowReservedFiles = reservedFiles + 1;
+      this.toolResultOverflowReservedBytes =
+        reservedBytes + serialized.bytes.byteLength;
+
+      const safeToolName = safeCodeModeOverflowName(
+        typeof toolName === "string" ? toolName : "",
+        "tool",
+      );
+      const safeToolCallId = safeCodeModeOverflowName(
+        typeof toolCallId === "string" ? toolCallId : "",
+        "call",
+      );
+      const nonce = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+      const extension = serialized.format === "text" ? "txt" : "json";
+      const filename = `tool-result-${safeToolName}-${safeToolCallId}-${nonce}.${extension}`;
+      const path = `tmp/${filename}`;
+      const key = `${tmpBaseKey}${filename}`;
+      const storedAt = new Date().toISOString();
+      let timedOut = false;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let removeAbortListener: (() => void) | undefined;
+
+      try {
+        const store = (async () => {
+          const sha256 = await sha256Hex(serialized.bytes);
+          if (signal?.aborted) throw codeModeOverflowAbortError(signal);
+          if (timedOut) throw new Error("Tool-result overflow storage deadline exceeded");
+          await this.env.R2_BUCKET.put(key, serialized.bytes, {
+            httpMetadata: { contentType: serialized.contentType },
+            customMetadata: {
+              type: "tool-result-overflow",
+              sha256,
+              size: String(serialized.bytes.byteLength),
+              storedAt,
+            },
+          });
+          if (signal?.aborted || timedOut) {
+            // R2 puts do not accept an AbortSignal. If the race was lost while
+            // a put was in flight, remove the now-unreferenced object before
+            // this late task settles.
+            try {
+              await this.env.R2_BUCKET.delete(key);
+            } catch {
+              console.error("[CodeModeTools] failed to clean up late tool-result overflow");
+            }
+            if (signal?.aborted) throw codeModeOverflowAbortError(signal);
+            throw new Error("Tool-result overflow storage deadline exceeded");
+          }
+          return sha256;
+        })();
+        // Promise.race installs a rejection handler, but this explicit observer
+        // also covers the late rejection after a deadline/abort already won.
+        void store.catch(() => undefined);
+        const deadline = new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => {
+            timedOut = true;
+            reject(new Error("Tool-result overflow storage deadline exceeded"));
+          }, CHAT_RUNTIME_BOUNDS.toolResultOverflowDeadlineMs);
+        });
+        const aborted = signal
+          ? new Promise<never>((_resolve, reject) => {
+              const onAbort = () => reject(codeModeOverflowAbortError(signal));
+              signal.addEventListener("abort", onAbort, { once: true });
+              removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+            })
+          : null;
+        const sha256 = await Promise.race(
+          aborted ? [store, deadline, aborted] : [store, deadline],
+        );
+        if (timeout !== undefined) clearTimeout(timeout);
+        removeAbortListener?.();
+        return codeModeOverflowProjection(value, {
+          stored: true,
+          path,
+          format: serialized.format,
+          bytes: serialized.bytes.byteLength,
+          sha256,
+          complete: true,
+        }, `Tool result exceeded the inline limit. Read the full result in bounded windows with read({ location: "r2", path: "${path}", byte_offset: 0 }) and continue with details.nextByteOffset.`);
+      } catch {
+        if (timeout !== undefined) clearTimeout(timeout);
+        removeAbortListener?.();
+        if (signal?.aborted) throw codeModeOverflowAbortError(signal);
+        this.toolResultOverflowStorageFailed = true;
+        console.error("[CodeModeTools] failed to store tool-result overflow in R2", {
+          toolName: safeToolName,
+          reason: timedOut ? "storage_deadline" : "storage_failure",
+        });
+        return previewOnly(
+          timedOut ? "storage_deadline" : "storage_failure",
+          timedOut
+            ? "Overflow storage exceeded its deadline; only a bounded preview is available."
+            : "Overflow storage is unavailable; only a bounded preview is available.",
+        );
+      }
+    } catch {
+      if (signal?.aborted) throw codeModeOverflowAbortError(signal);
+      // A tool result can include hostile proxies. The serializer deliberately
+      // avoids getters/toJSON, and this final fallback also avoids touching the
+      // value so overflow handling can never fail an otherwise-successful tool.
+      return codeModeOverflowFallbackProjection(format, "overflow_failure");
+    }
   }
 
   // Executor-style result envelope for js_exec's `tools.<name>()` calls. Catching
@@ -3415,7 +3963,15 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     execute: () => Promise<unknown> | unknown,
   ): Promise<unknown> {
     try {
-      const result = await execute();
+      const rawResult = await execute();
+      const inline = boundedCodeModeToolResultProjection(rawResult);
+      const result = inline.complete
+        ? inline.value
+        : await this.overflowToolResult(
+            name,
+            this.ctx?.props?.parentToolUseId?.trim() || crypto.randomUUID(),
+            rawResult,
+          );
       await Promise.all([
         this.recordCodeModeArtifactBestEffort(name, args, result),
         this.recordProjectActivityBestEffort(name, args, result),
@@ -3423,11 +3979,14 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       ]);
       return result;
     } catch (error) {
+      const bounded = boundedErrorValue(error, CHAT_RUNTIME_BOUNDS.toolResultBytes);
+      const boundedError = new Error(bounded.message);
+      boundedError.name = bounded.name;
       await Promise.all([
-        this.recordCodeModeArtifactBestEffort(name, args, undefined, error),
-        this.recordVerifiedWorkEvidenceBestEffort(name, args, undefined, error),
+        this.recordCodeModeArtifactBestEffort(name, args, undefined, bounded),
+        this.recordVerifiedWorkEvidenceBestEffort(name, args, undefined, bounded),
       ]);
-      throw error;
+      throw boundedError;
     }
   }
 
@@ -3686,9 +4245,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private codeModeArtifactError(error: unknown): { name: string; message: string } {
-    return error instanceof Error
-      ? { name: error.name || "Error", message: error.message || "Unknown error" }
-      : { name: "Error", message: String(error || "Unknown error") };
+    return boundedErrorValue(error, CHAT_RUNTIME_BOUNDS.toolResultBytes);
   }
 
   private truncateArtifactPreviewText(text: string): string {
@@ -3896,6 +4453,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       apps: await Promise.all(scripts.map(async (script) => ({
         name: script.script_name,
         url: await this.getAppUrl(script),
+        environment: script.environment,
         ...(!isSelfhostRuntime(this.env) ? { is_public: script.is_public } : {}),
         created_by: script.created_by,
         created_at: new Date(script.created_at).toISOString(),
@@ -4731,6 +5289,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     );
     return gate.annotate(await withProjectBuildServiceErrorMapping("deploy_project", async () => {
       const project = await this.resolveDoBackedProjectForAction(args, "deploy_project");
+      const environment = deployEnvironmentFromArg(args.environment);
+      if (args.dry_run !== true) await this.assertDeployEnvironmentAllowed(environment, args);
       const notebookProjectFiles = new ProjectFilesystemClient(this.env, project.id);
       const notebookPath = await resolveNotebookDeployPath(
         notebookProjectFiles,
@@ -4743,7 +5303,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
             "Creating or previewing an analysis does not authorize deployment; ask the user to publish or use run_notebook for chat preview.",
           );
         }
-        return await this.deployNotebookProject(project, notebookProjectFiles, notebookPath, args);
+        return await this.deployNotebookProject(project, notebookProjectFiles, notebookPath, args, environment);
       }
       const sandbox = this.projectBuildSandbox();
       // Cold-boot waiting is charged to the GATE's own 240s budget, not to the
@@ -4816,10 +5376,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       // name. VM-era deploys were driven by the config name, so honoring it
       // keeps a migrated project's app identity and URL instead of forking a
       // duplicate app under the durable project name.
-      const scriptName = normalizeDeployScriptName(
-        typeof args.script_name === "string" && args.script_name.trim()
-          ? args.script_name
-          : bundle.configName || project.name,
+      const scriptName = this.resolveDeployScriptName(
+        args,
+        bundle.configName || project.name,
+        environment,
       );
       const deploy = await deployWorkerModulesDirect(this.env, {
         scriptName,
@@ -4837,7 +5397,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         assets: bundle.assets,
         commitSha: snapshot.id,
       }, {
-        onDeploySideEffects: (info) => handleDeploySideEffects(this.env as never, info),
+        onDeploySideEffects: (info) => handleDeploySideEffects(this.env as never, info, { environment }),
       });
       if (!deploy.success) {
         return {
@@ -4855,11 +5415,14 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       const appUrl = await this.appUrlForScriptName(scriptName);
       const warnings = [...(deploy.warnings ?? []), ...this.localDeployReachabilityWarnings()];
       const preview = await this.setPreview({ app_name: scriptName });
-      const message = `Deployed and previewed at ${appUrl}`;
+      const message = environment === "staging"
+        ? `Deployed to staging and previewed at ${appUrl}. Promote it with promote_to_production once the user has verified it.`
+        : `Deployed and previewed at ${appUrl}`;
       console.log(message);
       return {
         success: true,
         project: project.name,
+        environment,
         scriptName: deploy.scriptName,
         dispatchScriptName: deploy.dispatchScriptName,
         status: deploy.status,
@@ -4905,6 +5468,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     projectFiles: ProjectFilesystemClient,
     notebookPath: string,
     args: Record<string, unknown>,
+    environment: AppEnvironment,
   ): Promise<unknown> {
     const rendererAssets = this.env.ASSETS;
     if (!rendererAssets) {
@@ -4940,9 +5504,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const snapshot = await projectFiles.createSourceSnapshot({ message: `Deploy ${project.name}` });
     const orgSlug = await this.getOrgSlug();
     if (!orgSlug) throw new Error("Current org has no slug; cannot deploy project");
-    const scriptName = normalizeDeployScriptName(
-      typeof args.script_name === "string" && args.script_name.trim() ? args.script_name : project.name,
-    );
+    const scriptName = this.resolveDeployScriptName(args, project.name, environment);
     const deploy = await deployWorkerModulesDirect(this.env, {
       scriptName,
       hostname: this.deployHostname(),
@@ -4959,7 +5521,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       assets: bundle.assets,
       commitSha: snapshot.id,
     }, {
-      onDeploySideEffects: (info) => handleDeploySideEffects(this.env as never, info),
+      onDeploySideEffects: (info) => handleDeploySideEffects(this.env as never, info, { environment }),
     });
     if (!deploy.success) {
       return {
@@ -4984,6 +5546,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       success: true,
       mode: "notebook",
       project: project.name,
+      environment,
       notebook: notebookPath,
       scriptName: deploy.scriptName,
       dispatchScriptName: deploy.dispatchScriptName,
@@ -5035,6 +5598,90 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     );
   }
 
+  /**
+   * Resolve which app a deploy targets. Staging apps live under a
+   * reserved `-staging` suffix so a project's two environments can never be the
+   * same dispatch script; a production deploy may not claim that suffix.
+   */
+  private resolveDeployScriptName(
+    args: Record<string, unknown>,
+    fallbackName: string,
+    environment: AppEnvironment,
+  ): string {
+    const scriptName = normalizeDeployScriptName(
+      typeof args.script_name === "string" && args.script_name.trim()
+        ? args.script_name
+        : fallbackName,
+    );
+    if (environment === "staging") return stagingScriptName(scriptName);
+    if (isStagingScriptName(scriptName)) {
+      throw new Error(
+        `App name '${scriptName}' is reserved: the '-staging' suffix identifies staging apps and is added automatically. ` +
+        `Deploy to production as '${productionScriptNameFromStaging(scriptName)}', or pass environment: 'staging' to publish the staging app.`,
+      );
+    }
+    return scriptName;
+  }
+
+  private async assertDeployEnvironmentAllowed(
+    environment: AppEnvironment,
+    args: Record<string, unknown>,
+  ): Promise<void> {
+    if (environment !== "production") return;
+    if (!(await this.productionDeploysRestricted())) return;
+    if (!(await this.isOrgAdminActor())) {
+      throw new Error(
+        "Production deploys in this organization require an org admin. " +
+        "Deploy with environment: 'staging' instead, then ask an org admin to promote it.",
+      );
+    }
+    if (args.publish_intent !== "user_requested") {
+      throw new Error(
+        "Production deploys require explicit user intent — ask the user to confirm, then retry with publish_intent: 'user_requested'.",
+      );
+    }
+  }
+
+  private async productionDeploysRestricted(): Promise<boolean> {
+    return (await this.orgStub.getProductionDeployPolicy()) === "admin_only";
+  }
+
+  private async isOrgAdminActor(): Promise<boolean> {
+    const userId = this.ctx.props.userId;
+    return userId ? await this.orgStub.isAdmin(userId) : false;
+  }
+
+  private async promoteToProduction(args: Record<string, unknown>): Promise<unknown> {
+    const scriptName = typeof args.script_name === "string" ? args.script_name.trim() : "";
+    if (!scriptName) return { success: false, error: "script_name is required" };
+    if (args.publish_intent !== "user_requested") {
+      return {
+        success: false,
+        error: "Promoting to production publishes the app and requires publish_intent: 'user_requested'. " +
+          "Ask the user to confirm the promotion, then retry.",
+      };
+    }
+    const orgSlug = await this.getOrgSlug();
+    if (!orgSlug) return { success: false, error: "Current org has no slug; cannot promote app" };
+    const promoted = await promoteAppToProduction(this.env as never, {
+      orgId: this.ctx.props.orgId,
+      orgSlug,
+      workspaceId: this.ctx.props.workspaceId,
+      stagingScriptName: scriptName,
+      userId: this.ctx.props.userId || "",
+    });
+    if (!promoted.ok) return { success: false, error: promoted.error };
+    return {
+      success: true,
+      app: promoted.scriptName,
+      environment: "production",
+      url: promoted.url,
+      appUrl: promoted.url,
+      promoted_from: scriptName,
+      message: `Promoted ${scriptName} to production at ${promoted.url}`,
+    };
+  }
+
   private async rollbackDeploy(args: Record<string, unknown>): Promise<unknown> {
     const scriptName = typeof args.script_name === "string" ? args.script_name.trim() : "";
     if (!scriptName) throw new Error("script_name is required");
@@ -5042,6 +5689,15 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (!script) throw new Error(`App '${scriptName}' not found`);
     if (script.workspace_id !== this.ctx.props.workspaceId) {
       throw new Error(`App '${scriptName}' belongs to a different workspace`);
+    }
+    if (
+      script.environment === "production" &&
+      await this.productionDeploysRestricted() &&
+      !(await this.isOrgAdminActor())
+    ) {
+      throw new Error(
+        `Rolling back the production app '${scriptName}' in this organization requires an org admin.`,
+      );
     }
     const artifactCacheKey = typeof args.artifact_cache_key === "string" && args.artifact_cache_key.trim()
       ? args.artifact_cache_key.trim()
@@ -5059,7 +5715,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       },
       threadId: this.ctx.props.threadId,
     }, {
-      onDeploySideEffects: (info) => handleDeploySideEffects(this.env as never, info),
+      onDeploySideEffects: (info) => handleDeploySideEffects(this.env as never, info, { environment: script.environment }),
     });
     if (!deploy.success) {
       return { success: false, app: scriptName, deploy };

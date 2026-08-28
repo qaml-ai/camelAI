@@ -87,15 +87,13 @@ export async function action({ request, context, params }: Route.ActionArgs) {
       ) as unknown as {
         setTitle(title: string, updatedAt?: number): Promise<void>;
         setModel(model: string, updatedAt?: number): Promise<void>;
-        refreshRunnerConfig(): Promise<void>;
       };
       await chatThread.setTitle(title.trim(), updated?.updated_at);
       if (model !== null) {
         await chatThread.setModel(model, updated?.updated_at);
-        await chatThread.refreshRunnerConfig();
       }
     } catch (error) {
-      console.error('Failed to refresh runner after admin thread model update:', error);
+      console.error('Failed to broadcast admin thread metadata update:', error);
     }
     return { success: true };
   }

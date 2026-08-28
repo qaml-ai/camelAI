@@ -482,7 +482,6 @@ async function notifyThreadMetadataChange(
     ) as unknown as {
       setTitle(title: string): Promise<void>;
       setModel(model: LlmModel, updatedAt?: number): Promise<void>;
-      refreshRunnerConfig(): Promise<void>;
     };
 
     if (updates.title) {
@@ -490,7 +489,6 @@ async function notifyThreadMetadataChange(
     }
     if (updates.model) {
       await chatThread.setModel(updates.model, updatedAt);
-      await chatThread.refreshRunnerConfig();
     }
   } catch (error) {
     console.error(

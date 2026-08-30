@@ -2,16 +2,19 @@
 
 Status: active staff-only pilot. This is not a production cutover plan yet.
 
-## Proven on 2026-08-23
+## Proven through 2026-08-29
 
-- Forked celld v0.3.0 at [`qaml-ai/celld`](https://github.com/qaml-ai/celld).
-- Added a generic fix for side-effect-only builtin imports on
-  `camelai/scan-side-effect-builtins` (`1d27d2d`).
-- Added the v0.3.0-only workflow export loading shim on
-  `camelai/pilot-v0.3.0` (`6536e1f`). Remove it when rebasing onto the
-  upstream v0.3.1 workflow implementation.
+- Rebased the runtime fork onto upstream celld v0.4.0 at
+  [`qaml-ai/celld:camelai/pilot-v0.4.0`](https://github.com/qaml-ai/celld/tree/camelai/pilot-v0.4.0)
+  (`fcff8f7`). Upstream v0.4 supplies native Workflows and the streaming
+  lifecycle fix, so the old workflow shim and response-stream patch retired.
+- Ported only three runtime patches: side-effect-only builtin import
+  registration (`5d3122b`), scoped `ctx.exports` capabilities in Worker Loader
+  env (`54011d2`), and link-local outbound fetch denial (`58a6e0c`).
+- The fork's five focused unit tests pass on v0.4.0; the generated camelAI
+  deployment also passes the v0.4 config check and dry-run.
 - Generated a celld-only camelAI manifest from the production build. celld
-  v0.3.0 bundles it as one 29 MB Worker with 415 static assets, 13 SQLite
+  v0.4.0 bundles it as one 29 MB Worker with 415 static assets, 13 SQLite
   Durable Object classes, D1, and a self service binding.
 - Uploaded main version `e10dde736f9177a0` and KV service version
   `9c8655bbae108f2b` to the private AWS pilot fleet bucket.
@@ -42,7 +45,7 @@ celld owns the stateful Worker control plane:
 - Durable Objects, alarms, scalar RPC, and chat HTTP/SSE
 - D1
 - cron
-- Worker Loader after the Code Mode capability adapter lands
+- Worker Loader with the scoped Code Mode capability adapter
 
 Companion AWS services own capabilities that are not Durable Object shapes:
 
@@ -61,12 +64,11 @@ apps into the trusted main celld process.
 
 Keep the fork thin and every runtime patch independently testable.
 
-Upstream-shaped patches:
+Remaining upstream-shaped patches:
 
 1. side-effect builtin import registration
-2. active streaming-response lifecycle / celld issue 159
-3. Worker Loader capabilities across isolates
-4. outbound fetch denial for IMDS and link-local control endpoints
+2. Worker Loader capabilities across isolates
+3. outbound fetch denial for IMDS and link-local control endpoints
 
 camelAI-specific or fork-only work:
 
@@ -75,7 +77,8 @@ camelAI-specific or fork-only work:
 3. dynamic application scheduling and dispatch
 
 Do not change celld ownership, fencing, or replication without coordinating
-with upstream. Rebase onto v0.3.1 as soon as its workflow code is public.
+with upstream. Keep the v0.4 branch rebased and retire each patch when its
+upstream equivalent lands.
 
 ## Delivery slices
 
@@ -110,8 +113,8 @@ with upstream. Rebase onto v0.3.1 as soon as its workflow code is public.
 - [ ] Scope tokens to org, workspace, thread, tool use, allowed operations,
       expiry, and replay policy.
 - [ ] Pass `js_exec` tool listing and workspace edits.
-- [ ] Fix and test active SSE response lifecycle before enabling eviction or
-      pressure handoff.
+- [ ] Pass the camelAI SSE reconnect and pressure-handoff suite on the v0.4
+      response lifecycle before enabling eviction.
 
 ### P2: build and deploy
 
@@ -136,7 +139,8 @@ with upstream. Rebase onto v0.3.1 as soon as its workflow code is public.
 
 ## Security gates
 
-- celld v0.3.0 calls itself alpha and is not a hostile multi-tenant boundary.
+- celld v0.4.0 remains an early runtime and is not treated as a hostile
+  multi-tenant boundary.
   The pilot is staff-only.
 - Worker outbound fetch must be unable to reach EC2 IMDS or link-local
   endpoints before the instance role is attached to public or user-authored
@@ -148,7 +152,7 @@ with upstream. Rebase onto v0.3.1 as soon as its workflow code is public.
 - The internal celld listener is private and security-group restricted.
 - Keep `CELLD_OUTPUT_GATE=1`, `CELLD_STORAGE_PROBE=1`, and
   `CELLD_DURABILITY=bucket` during the pilot. Leave idle eviction disabled
-  until streaming response issue 159 is fixed.
+  until the v0.4 response lifecycle passes the camelAI SSE soak.
 
 ## Commands
 

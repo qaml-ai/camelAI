@@ -100,6 +100,13 @@ describe('code mode runner connection facade', () => {
     expect(source).toContain('cleanupSecureFetch();');
   });
 
+  it('includes a default fetch handler for Worker Loader runtimes', () => {
+    const source = codeModeWorkerModule('return 1;');
+
+    expect(source).toContain('export class CodeModeRunner extends WorkerEntrypoint');
+    expect(source).toContain('return new Response("Not Found", { status: 404 });');
+  });
+
   it('does not inject projects as a standalone user-code binding', () => {
     const source = codeModeWorkerModule('const projects = ["local"]; return projects.length;');
 

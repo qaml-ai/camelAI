@@ -31,7 +31,7 @@ const supportedKeys = new Set([
 assert.deepEqual(
   Object.keys(config).filter((key) => !supportedKeys.has(key)),
   [],
-  "generated config must contain only celld v0.3.0-supported keys",
+  "generated config must contain only celld v0.4.0-supported keys",
 );
 assert.equal(config.name, "chiridion-celld");
 assert.equal(config.vars.CF_ACCOUNT_ID, "selfhost");

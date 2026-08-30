@@ -1381,5 +1381,14 @@ export class CodeModeRunner extends WorkerEntrypoint {
     }
   }
 }
+
+// Worker Loader runtimes compile the main module as a Worker as well as
+// exposing its named entrypoints. Keep a harmless default handler so the
+// generated module is valid on celld v0.4 without another runtime patch.
+export default {
+  fetch() {
+    return new Response("Not Found", { status: 404 });
+  },
+};
 `}`;
 }

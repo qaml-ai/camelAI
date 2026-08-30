@@ -12,8 +12,8 @@ The first real durability smoke uses:
 - state bucket: `camelai-celld-pilot-904534089871-us-west-2`
 - deployed camelAI version: `e10dde736f9177a0`
 - deployed KV service version: `9c8655bbae108f2b`
-- runtime fork branch: `qaml-ai/celld:camelai/pilot-v0.3.0`
-- runtime fork commit: `6536e1f`
+- runtime fork branch: `qaml-ai/celld:camelai/pilot-v0.4.0`
+- runtime fork commit: `fcff8f7`
 
 The bucket has Block Public Access, bucket-owner-enforced ownership,
 versioning, default SSE-KMS encryption, an HTTPS-only bucket policy, and
@@ -41,17 +41,20 @@ S3 buckets while Cloudflare production continues using its native bindings.
 The same application adapter is used in both cases.
 
 Durable Objects, D1, assets, workflows, and Fetcher-shaped internal services
-remain celld-native. The existing DO-backed KV service stays as a compatibility
-service until celld provides KV directly.
+remain celld-native. celld v0.4 also provides native KV, R2, and queues. The
+existing DO-backed KV service stays until the native KV binding passes camelAI's
+conformance suite and its state migration is planned. Application R2 stays
+behind the separate object-store facade because the celld fleet bucket must not
+also hold workspace data.
 
 ## Why compute is not provisioned yet
 
-Provisioning an upstream celld EC2 node now would knowingly fail to load the
-camelAI bundle and would expose an alpha runtime before the required security
-patches exist. The next AWS compute gate is a digest-pinned image containing:
+The patched v0.4 runtime now loads the deployment in dry-run and has focused
+coverage for the remaining compatibility and security patches. The next AWS
+compute gate is a digest-pinned image containing:
 
 1. side-effect builtin import registration
-2. the temporary v0.3.0 workflow export shim (or upstream v0.3.1)
+2. scoped Worker Loader env capabilities
 3. an outbound IMDS/link-local denylist
 
 Only then should the existing single-node self-host Terraform be factored into

@@ -10,7 +10,7 @@ import {
 
 // The tool builders are the shared source of tool_use name/input and
 // tool_result error status for both the live chunk encoder
-// (the canonical turn stream) and durable snapshots. These cases were previously
+// (pi-chunk-encoder.ts) and durable backfill. These cases were previously
 // exercised indirectly through the now-deleted runtime reducer; they test the
 // builders directly.
 

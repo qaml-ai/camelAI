@@ -9,6 +9,7 @@ const adminGetThreadContextByIdMock = vi.fn();
 const getThreadMock = vi.fn();
 const getThreadPreviewStateMock = vi.fn();
 const getTodoStateMock = vi.fn();
+const getUiMessagesMock = vi.fn();
 const getWorkspaceModelPickerStateMock = vi.fn();
 const getOrgBillingOverviewMock = vi.fn();
 const getOrgMock = vi.fn();
@@ -44,6 +45,7 @@ vi.mock('@/lib/chat-do.server', () => ({
   getThread: getThreadMock,
   getThreadPreviewState: getThreadPreviewStateMock,
   getTodoState: getTodoStateMock,
+  getUiMessagePage: getUiMessagesMock,
   getWorkspaceModelPickerState: getWorkspaceModelPickerStateMock,
 }));
 
@@ -96,6 +98,11 @@ describe('chat loader admin readonly mode', () => {
       version: 0,
     });
     getTodoStateMock.mockResolvedValue([]);
+    getUiMessagesMock.mockResolvedValue({
+      messages: [],
+      nextCursor: null,
+      hasMore: false,
+    });
     getWorkspaceModelPickerStateMock.mockResolvedValue({
       llmProvider: null,
       allowedThreadModels: ['sonnet'],
@@ -178,6 +185,8 @@ describe('chat loader admin readonly mode', () => {
     expect(await result.chatData).toEqual({
       messages: [],
       messagesError: null,
+      initialUiMessages: [],
+      olderUiMessagesCursor: null,
       todos: [],
       previewTabs: [],
       activeTabId: null,
@@ -204,6 +213,11 @@ describe('chat loader workspace mismatch handling', () => {
       version: 0,
     });
     getTodoStateMock.mockResolvedValue([]);
+    getUiMessagesMock.mockResolvedValue({
+      messages: [],
+      nextCursor: null,
+      hasMore: false,
+    });
     requireSessionWorkspaceAccessMock.mockResolvedValue({
       orgId: 'org_active',
       workspaceId: 'ws_active',
@@ -275,6 +289,8 @@ describe('chat loader workspace mismatch handling', () => {
     expect(await result.chatData).toEqual({
       messages: [],
       messagesError: null,
+      initialUiMessages: [],
+      olderUiMessagesCursor: null,
       todos: [],
       previewTabs: [],
       activeTabId: null,
@@ -327,18 +343,17 @@ describe('chat loader workspace mismatch handling', () => {
       params: { id: 'thread_123' },
     } as never);
 
-    expect(result.chatDataSeed.messages).toEqual([
+    expect(result.chatDataSeed.initialUiMessages).toEqual([
       expect.objectContaining({
         id: 'thread-seed:thread_123',
         role: 'user',
-        content: 'Build an analytics dashboard',
-        authorDisplayName: 'Illiana Reed',
-        messageSource: 'web',
+        parts: [{ type: 'text', text: 'Build an analytics dashboard', state: 'done' }],
+        metadata: expect.objectContaining({ authorDisplayName: 'Illiana Reed', source: 'web' }),
       }),
     ]);
     // The same deferred durable transcript path runs for every thread shape.
     await result.chatData;
-    expect(readThreadMessagesMock).toHaveBeenCalled();
+    expect(getUiMessagesMock).toHaveBeenCalled();
   });
 
   it('uses the same seed and transcript path for an API-created thread', async () => {
@@ -364,14 +379,21 @@ describe('chat loader workspace mismatch handling', () => {
       params: { id: 'thread_123' },
     } as never);
 
-    expect(result.chatDataSeed.messages[0]).not.toHaveProperty('authorDisplayName');
+    expect(result.chatDataSeed.initialUiMessages[0]?.metadata).not.toHaveProperty('authorDisplayName');
     await result.chatData;
-    expect(readThreadMessagesMock).toHaveBeenCalled();
+    expect(getUiMessagesMock).toHaveBeenCalled();
+    expect(readThreadMessagesMock).not.toHaveBeenCalled();
   });
 
   it('does not block existing-thread navigation on chat data resolution', async () => {
-    let resolveMessages: ((messages: []) => void) | undefined;
-    const pendingMessages = new Promise<[]>((resolve) => {
+    let resolveMessages:
+      | ((page: { messages: []; nextCursor: null; hasMore: false }) => void)
+      | undefined;
+    const pendingMessages = new Promise<{
+      messages: [];
+      nextCursor: null;
+      hasMore: false;
+    }>((resolve) => {
       resolveMessages = resolve;
     });
     requireAuthContextMock.mockResolvedValue({
@@ -384,7 +406,7 @@ describe('chat loader workspace mismatch handling', () => {
       workspace_id: 'ws_active',
       title: 'Workspace Thread',
     });
-    readThreadMessagesMock.mockReturnValue(pendingMessages);
+    getUiMessagesMock.mockReturnValue(pendingMessages);
 
     const result = await loader({
       request: new Request('https://camelai.com/chat/thread_123'),
@@ -402,10 +424,12 @@ describe('chat loader workspace mismatch handling', () => {
     await Promise.resolve();
     expect(chatDataResolved).toBe(false);
 
-    resolveMessages?.([]);
+    resolveMessages?.({ messages: [], nextCursor: null, hasMore: false });
     expect(await result.chatData).toEqual({
       messages: [],
       messagesError: null,
+      initialUiMessages: [],
+      olderUiMessagesCursor: null,
       todos: [],
       previewTabs: [],
       activeTabId: null,
@@ -430,9 +454,9 @@ describe('chat loader workspace mismatch handling', () => {
       context,
       params: { id: 'thread_123' },
     } as never);
-    expect(readThreadMessagesMock).toHaveBeenCalledTimes(1);
+    expect(getUiMessagesMock).toHaveBeenCalledTimes(1);
 
-    readThreadMessagesMock.mockClear();
+    getUiMessagesMock.mockClear();
     const sameThreadShouldRevalidate = shouldRevalidate({
       currentUrl: new URL('https://camelai.com/chat/thread_123'),
       nextUrl: new URL('https://camelai.com/chat/thread_123'),
@@ -447,13 +471,9 @@ describe('chat loader workspace mismatch handling', () => {
         params: { id: 'thread_123' },
       } as never);
     }
-    expect(readThreadMessagesMock).toHaveBeenCalledTimes(1);
-    expect(readThreadMessagesMock).toHaveBeenCalledWith(context, {
-      orgId: 'org_active',
-      threadId: 'thread_123',
-      workspaceId: 'ws_active',
-    });
-    readThreadMessagesMock.mockClear();
+    expect(getUiMessagesMock).toHaveBeenCalledTimes(1);
+    expect(getUiMessagesMock).toHaveBeenCalledWith(context, 'thread_123');
+    getUiMessagesMock.mockClear();
 
     const threadChangeShouldRevalidate = shouldRevalidate({
       currentUrl: new URL('https://camelai.com/chat/thread_123'),
@@ -470,11 +490,9 @@ describe('chat loader workspace mismatch handling', () => {
       params: { id: 'thread_456' },
     } as never);
 
-    expect(readThreadMessagesMock).toHaveBeenCalledWith(context, {
-      orgId: 'org_active',
-      threadId: 'thread_456',
-      workspaceId: 'ws_active',
-    });
+    expect(getUiMessagesMock).toHaveBeenCalledWith(context, 'thread_456');
+    // Live loads never touch the legacy pi_core transcript RPC.
+    expect(readThreadMessagesMock).not.toHaveBeenCalled();
   });
 
   it('loads todo state into chat data for existing threads', async () => {

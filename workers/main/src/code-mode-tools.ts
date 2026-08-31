@@ -13,6 +13,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { WorkspaceDO } from "./workspace";
 import type { WorkspaceCronDO } from "./workspace-cron";
 import { ProjectFilesystemClient, WorkspaceFilesystemClient, normalizeWorkspacePath as normalizeDurableWorkspacePath, type WorkspaceFileStoreLike, type WorkspaceProject, type WorkspaceProjectCloneSummary, projectNameKey } from "./workspace-filesystem-do";
+import type { RuntimeCallArtifact, RuntimeCallArtifactKind } from "../../../src/lib/runtime-artifacts";
 import { getPreferredAppUrl } from "../../../src/lib/app-url";
 import {
   deleteDeployedAppRuntime,
@@ -32,7 +33,6 @@ import {
   type AgentSkillReadResult,
 } from "./selfhost-agent-pack";
 import { PiContainerTools, PI_CONTAINER_TOOL_DEFINITIONS } from "./pi-container-tools";
-import { selectTextLineWindow, truncateTextHead } from "./bounded-text-lines";
 import { parseFilePreviewPath } from "./preview-paths";
 import type { ConnectionSetupResponse } from "./chat-thread-browser-prompts";
 import { CodeModeWebSearch } from "./code-mode-web-search";
@@ -52,6 +52,10 @@ import { detectImageMimeType as detectSharedImageMimeType, getSupportedImageMime
 import { CodeModeScheduledPrompts } from "./code-mode-scheduled-prompts";
 import { CodeModeDeterministicAutomations } from "./code-mode-deterministic-automations";
 import { CodeModeIntegrations } from "./code-mode-integrations";
+import {
+  deriveVerifiedWorkEvidence,
+  type VerifiedWorkEvidence,
+} from "./chat-thread/verified-work-state";
 import { PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS } from "./container-sizing";
 import { recordErrorEvent, recordObservabilityEvent } from "./observability";
 import { buildLogTail, cleanBuildLog, DEFAULT_BUILD_TIMEOUT_MS, projectBuildSandboxKey, runProjectAddDependency, runProjectBuild, type ProjectBuildResult } from "./project-build-service";
@@ -88,15 +92,15 @@ import { addShadcnComponentsToProject, normalizeShadcnComponentList, SUPPORTED_S
 import { connectAppBrowserSession, launchAppBrowserSession } from "./app-browser-binding";
 import { deployWorkerModulesDirect, rollbackWorkerDeployFromArtifactCache, type DirectDispatchDeployResult } from "./direct-dispatch-deploy";
 import { handleDeploySideEffects } from "./services/deploy";
-import { CHAT_RUNTIME_BOUNDS } from "../../../src/lib/chat-runtime-bounds";
-import { boundedCanonicalJsonResult } from "./chat-thread/bounded-canonical-json";
-import { boundedErrorValue } from "./chat-thread/bounded-error-text";
-import { sha256Hex } from "./sha256";
 import { editAutomationVirtualFile, listAutomationVirtualFiles, normalizeAutomationVirtualPath, readAutomationVirtualFile, writeAutomationVirtualFile } from "./deterministic-automation-virtual-files";
 import { applyTextEdits, normalizeTextEditArguments } from "./text-edit";
 import type { DynamicIntegrationSchema } from "../../../src/lib/integration-registry";
 import type { ChatThreadDO } from "./chat-thread-do";
 import { ChannelTools } from "./chat-channels";
+import {
+  PI_TOOL_RESULT_MAX_BYTES,
+  PI_TOOL_RESULT_MAX_LINES,
+} from "./pi-message-storage";
 import type {
   ChatEnv,
   ChatContextState,
@@ -136,193 +140,12 @@ function measureResultChars(value: unknown): number {
   }
 }
 
-/** Bounds a tool value before artifact, telemetry, RPC, or prompt copies exist. */
-export function boundCodeModeToolResult(value: unknown): unknown {
-  return boundedCodeModeToolResultProjection(value).value;
-}
-
-function boundedCodeModeToolResultProjection(value: unknown): {
-  value: unknown;
-  complete: boolean;
-} {
-  const encoded = boundedCanonicalJsonResult(
-    value,
-    CHAT_RUNTIME_BOUNDS.toolResultBytes,
-    {
-      maxDepth: CHAT_RUNTIME_BOUNDS.providerJsonDepth,
-      maxEntries: CHAT_RUNTIME_BOUNDS.providerJsonEntries,
-      maxNodes: CHAT_RUNTIME_BOUNDS.providerJsonNodes,
-    },
-  );
-  return {
-    value: JSON.parse(encoded.json) as unknown,
-    complete: encoded.complete,
-  };
-}
-
-type ToolResultOverflowFormat = "text" | "json";
-
-interface ToolResultOverflowDetails {
-  stored: boolean;
-  path?: string;
-  format: ToolResultOverflowFormat;
-  bytes?: number;
-  sha256?: string;
-  complete: boolean;
-  reason?: string;
-}
-
-interface SerializedToolResultOverflow {
-  format: ToolResultOverflowFormat;
-  bytes: Uint8Array;
-  contentType: string;
-}
-
-const codeModeOverflowEncoder = new TextEncoder();
-
-function codeModeOverflowByteLength(value: string): number {
-  return codeModeOverflowEncoder.encode(value).byteLength;
-}
-
-/**
- * Counts the UTF-8 representation of a string without first allocating it.
- * Stops as soon as the overflow cap is crossed, so a huge string cannot create
- * a second huge copy merely to decide that it is ineligible for storage.
- */
-function boundedCodeModeStringBytes(value: string, maxBytes: number): number | null {
-  let bytes = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code < 0x80) {
-      bytes += 1;
-    } else if (code < 0x800) {
-      bytes += 2;
-    } else if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        bytes += 4;
-        index += 1;
-      } else {
-        // TextEncoder replaces an unpaired surrogate with U+FFFD.
-        bytes += 3;
-      }
-    } else {
-      // Includes BMP code points and unpaired low surrogates.
-      bytes += 3;
-    }
-    if (bytes > maxBytes) return null;
-  }
-  return bytes;
-}
-
-function codeModeOverflowFormat(value: unknown): ToolResultOverflowFormat {
-  return typeof value === "string" ? "text" : "json";
-}
-
-function serializeCodeModeToolResultOverflow(
-  value: unknown,
-): SerializedToolResultOverflow | null {
-  const maxBytes = CHAT_RUNTIME_BOUNDS.toolResultOverflowBytes;
-  if (typeof value === "string") {
-    if (boundedCodeModeStringBytes(value, maxBytes) === null) return null;
-    const bytes = codeModeOverflowEncoder.encode(value);
-    if (bytes.byteLength > maxBytes) return null;
-    return {
-      format: "text",
-      bytes,
-      contentType: "text/plain; charset=utf-8",
-    };
-  }
-
-  const encoded = boundedCanonicalJsonResult(value, maxBytes, {
-    maxDepth: CHAT_RUNTIME_BOUNDS.providerJsonDepth,
-    maxEntries: CHAT_RUNTIME_BOUNDS.providerJsonEntries,
-    maxNodes: CHAT_RUNTIME_BOUNDS.providerJsonNodes,
-  });
-  if (!encoded.complete) return null;
-  const bytes = codeModeOverflowEncoder.encode(encoded.json);
-  if (bytes.byteLength > maxBytes) return null;
-  return { format: "json", bytes, contentType: "application/json" };
-}
-
-function safeCodeModeOverflowName(value: string, fallback: string): string {
-  const safe = value
-    .normalize("NFKD")
-    .replace(/[^a-zA-Z0-9_-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 48);
-  return safe || fallback;
-}
-
-function codeModeOverflowPreview(value: unknown, maxBytes: number): unknown {
-  const encoded = boundedCanonicalJsonResult(value, Math.max(1, maxBytes), {
-    maxDepth: CHAT_RUNTIME_BOUNDS.providerJsonDepth,
-    maxEntries: CHAT_RUNTIME_BOUNDS.providerJsonEntries,
-    maxNodes: CHAT_RUNTIME_BOUNDS.providerJsonNodes,
-  });
-  return JSON.parse(encoded.json) as unknown;
-}
-
-/** Build a stable overflow envelope while keeping its serialized form <=4KiB. */
-function codeModeOverflowProjection(
-  value: unknown,
-  overflow: ToolResultOverflowDetails,
-  hint: string,
-): { $overflow: ToolResultOverflowDetails; hint: string; preview: unknown } {
-  const maxBytes = CHAT_RUNTIME_BOUNDS.toolResultOverflowStubBytes;
-  let previewBudget = Math.max(1, maxBytes - 1_024);
-  for (;;) {
-    const projection = {
-      $overflow: overflow,
-      hint,
-      preview: codeModeOverflowPreview(value, previewBudget),
-    };
-    if (codeModeOverflowByteLength(JSON.stringify(projection)) <= maxBytes) {
-      return projection;
-    }
-    if (previewBudget === 1) break;
-    previewBudget = Math.max(1, Math.floor(previewBudget / 2));
-  }
-
-  // All variable envelope fields are bounded before reaching this function;
-  // this final form is intentionally tiny and cannot exceed the stub budget.
-  return {
-    $overflow: overflow,
-    hint: "Tool result exceeded the inline limit; only a bounded preview is available.",
-    preview: null,
-  };
-}
-
-function codeModeOverflowFallbackProjection(
-  format: ToolResultOverflowFormat,
-  reason: string,
-): { $overflow: ToolResultOverflowDetails; hint: string; preview: null } {
-  return {
-    $overflow: {
-      stored: false,
-      format,
-      complete: false,
-      reason,
-    },
-    hint: "Tool result exceeded the inline limit; only a bounded preview is available.",
-    preview: null,
-  };
-}
-
-function codeModeOverflowAbortError(signal: AbortSignal): Error {
-  return signal.reason instanceof Error
-    ? signal.reason
-    : new Error("Tool-result overflow was aborted");
-}
-
 function simplifyAgentWebToolResult(name: string, value: unknown): unknown {
   if (name !== "WebSearch" && name !== "WebFetch") return value;
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return name === "WebSearch" ? [] : "";
   }
   const record = value as Record<string, unknown>;
-  const overflow = Object.getOwnPropertyDescriptor(record, "$overflow");
-  if (overflow && "value" in overflow && overflow.value) return value;
   const results = Array.isArray(record.results)
     ? record.results.filter((result): result is Record<string, unknown> => (
       Boolean(result) && typeof result === "object" && !Array.isArray(result)
@@ -426,14 +249,6 @@ export const CODE_MODE_MAX_TIMEOUT_MS = 600_000;
 export const CODE_MODE_DEFAULT_TIMEOUT_MS = CODE_MODE_MAX_TIMEOUT_MS;
 export const CODE_MODE_DEFAULT_MAX_OUTPUT_CHARACTERS = 60_000;
 export const CODE_MODE_MAX_OUTPUT_CHARACTERS = 200_000;
-export const CODE_MODE_MOVE_MAX_FILES = 256;
-export const CODE_MODE_MOVE_MAX_FILE_BYTES = 8 * 1024 * 1024;
-export const CODE_MODE_MOVE_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
-const CODE_MODE_R2_READ_MAX_LINES = 2_000;
-const CODE_MODE_R2_READ_MAX_BYTES = 50 * 1024;
-// R2 read results carry text twice (`text` plus a content block). At 16 KiB,
-// even worst-case JSON escaping of control bytes stays below toolResultBytes.
-const CODE_MODE_R2_BYTE_WINDOW_MAX_BYTES = 16 * 1024;
 const CODE_MODE_R2_READ_NOTICE_RESERVED_BYTES = 1024;
 const CODE_MODE_R2_MAX_WRITE_BYTES = 10 * 1024 * 1024;
 const ARCHIVE_TOOL_COMMAND = "python /usr/local/bin/camelai-archive";
@@ -479,43 +294,7 @@ export function assertNotBase64IntoBinaryFile(path: string, content: string): vo
     `which writes real bytes to the same outputs/ object the user downloads.`,
   );
 }
-const CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES = CHAT_RUNTIME_BOUNDS.toolSourceReadBytes;
-
-function codeModeMoveFileSize(file: CodeModeMoveFile): number {
-  if (
-    typeof file.size !== "number" ||
-    !Number.isSafeInteger(file.size) ||
-    file.size < 0
-  ) {
-    throw new Error(`Cannot move '${file.path}': source size is unavailable or invalid`);
-  }
-  if (file.size > CODE_MODE_MOVE_MAX_FILE_BYTES) {
-    throw new Error(
-      `Cannot move '${file.path}': file is ${file.size} bytes; max ${CODE_MODE_MOVE_MAX_FILE_BYTES} bytes`,
-    );
-  }
-  return file.size;
-}
-
-function assertCodeModeMoveBounds(files: readonly CodeModeMoveFile[]): number {
-  if (files.length > CODE_MODE_MOVE_MAX_FILES) {
-    throw new Error(
-      `Move source has ${files.length} files; max ${CODE_MODE_MOVE_MAX_FILES} files`,
-    );
-  }
-  let totalBytes = 0;
-  for (const file of files) {
-    const size = codeModeMoveFileSize(file);
-    if (size > CODE_MODE_MOVE_MAX_TOTAL_BYTES - totalBytes) {
-      throw new Error(
-        `Move source exceeds ${CODE_MODE_MOVE_MAX_TOTAL_BYTES} aggregate bytes`,
-      );
-    }
-    totalBytes += size;
-  }
-  return totalBytes;
-}
-
+const CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES = 10 * 1024 * 1024;
 const JS_EXEC_EXCLUDED_TOOL_NAMES = new Set([
   // This tool waits for human input and can outlive js_exec's short sandbox
   // timeout. Keep it as a top-level Pi tool so the agent sees the submission.
@@ -772,24 +551,10 @@ const CODE_MODE_CONTAINER_TOOL_NAMES = [
   "delete",
 ] as const;
 
-const CODE_MODE_R2_READ_PARAMETERS = Type.Object({
-  ...PI_CONTAINER_TOOL_DEFINITIONS.read.parameters.properties,
-  byte_offset: Type.Optional(Type.Number({
-    description:
-      "0-indexed byte offset for a bounded R2 text window. Use details.nextByteOffset to page large single-line objects without splitting UTF-8. Only valid with location='r2'.",
-  })),
-}, { additionalProperties: false });
-
 const CODE_MODE_CONTAINER_TOOL_DEFINITIONS = CODE_MODE_CONTAINER_TOOL_NAMES.map(
   (name) => {
     const definition = PI_CONTAINER_TOOL_DEFINITIONS[name];
-    const parameters = name === "read"
-      ? CODE_MODE_R2_READ_PARAMETERS
-      : definition.parameters;
-    const description = name === "read"
-      ? `${definition.description} For large single-line R2 text, pass byte_offset=0 and continue with details.nextByteOffset.`
-      : definition.description;
-    return codeModeTool(definition.name, description, parameters, {
+    return codeModeTool(definition.name, definition.description, definition.parameters, {
       category: "workspace",
       sideEffect: ["write", "edit"].includes(definition.name),
     });
@@ -2259,16 +2024,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
    */
   private recordedToolFailures?: Set<string>;
 
-  /**
-   * Per-binding overflow reservations. These are lazy because focused tests
-   * construct the binding with Object.create() and skip field initializers.
-   * Reservations are never refunded: after an uncertain/failed put, retrying
-   * the same capacity could exceed the bounded per-attempt contract.
-   */
-  private toolResultOverflowReservedBytes?: number;
-  private toolResultOverflowReservedFiles?: number;
-  private toolResultOverflowStorageFailed?: boolean;
-
   private get workspaceFs(): WorkspaceFilesystemClient {
     const { workspaceId } = this.ctx.props;
     if (!workspaceId) {
@@ -2342,6 +2097,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           message,
           orgId: this.ctx?.props?.orgId,
         });
+        // User-facing: stream the same text as tool output so the person
+        // watching the turn sees "starting", not silence, for the whole boot.
+        void this.streamProjectBuildProgress(message);
       },
       onEvent: (event) => this.recordProjectBuildReadinessEvent(operation, event),
     });
@@ -2352,8 +2110,35 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         attempts: readiness.attempts,
         orgId: this.ctx?.props?.orgId,
       });
+      void this.streamProjectBuildProgress(
+        `Build environment ready after ${Math.round(readiness.waitedMs / 1000)}s; building…`,
+      );
     }
     return readiness;
+  }
+
+  /**
+   * Best-effort live progress for the human watching the turn.
+   *
+   * add_dependency and compatibility deploy_project calls can run inside
+   * js_exec, where the agent-loop `onUpdate` callback is not reachable. The
+   * ChatThreadDO stub is — the same seam recordCodeModeArtifact uses — and it
+   * can push the `item/commandExecution/outputDelta` runtime event the client
+   * already renders as streamed tool output, keyed by the parent js_exec call.
+   */
+  private async streamProjectBuildProgress(message: string): Promise<void> {
+    const parentToolUseId = this.ctx?.props?.parentToolUseId?.trim();
+    if (!parentToolUseId) return;
+    try {
+      await (this.chatThreadStub as unknown as {
+        streamToolProgress(parentToolUseId: string, delta: string): Promise<void>;
+      }).streamToolProgress(parentToolUseId, message);
+    } catch (error) {
+      console.warn("[project-build] failed to stream readiness progress", {
+        parentToolUseId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**
@@ -2601,6 +2386,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
   }
 
+  private textByteLength(value: string): number {
+    return new TextEncoder().encode(value).byteLength;
+  }
+
   private truncateR2ReadHead(
     content: string,
     maxBytes: number,
@@ -2612,18 +2401,72 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     totalBytes: number;
     outputLines: number;
     outputBytes: number;
-    firstLineBytes: number;
     firstLineExceedsLimit: boolean;
     maxLines: number;
     maxBytes: number;
   } {
-    const truncated = truncateTextHead(content, CODE_MODE_R2_READ_MAX_LINES, maxBytes);
+    const lines = content.split("\n");
+    const totalLines = lines.length;
+    const totalBytes = this.textByteLength(content);
+    if (totalLines <= PI_TOOL_RESULT_MAX_LINES && totalBytes <= maxBytes) {
+      return {
+        content,
+        truncated: false,
+        truncatedBy: null,
+        totalLines,
+        totalBytes,
+        outputLines: totalLines,
+        outputBytes: totalBytes,
+        firstLineExceedsLimit: false,
+        maxLines: PI_TOOL_RESULT_MAX_LINES,
+        maxBytes,
+      };
+    }
+    if (this.textByteLength(lines[0] ?? "") > maxBytes) {
+      return {
+        content: "",
+        truncated: true,
+        truncatedBy: "bytes",
+        totalLines,
+        totalBytes,
+        outputLines: 0,
+        outputBytes: 0,
+        firstLineExceedsLimit: true,
+        maxLines: PI_TOOL_RESULT_MAX_LINES,
+        maxBytes,
+      };
+    }
+    const selected: string[] = [];
+    let outputBytes = 0;
+    let truncatedBy: "lines" | "bytes" = "lines";
+    for (let index = 0; index < lines.length && index < PI_TOOL_RESULT_MAX_LINES; index += 1) {
+      const line = lines[index] ?? "";
+      if (selected.length >= PI_TOOL_RESULT_MAX_LINES) {
+        truncatedBy = "lines";
+        break;
+      }
+      const lineBytes = this.textByteLength(line) + (selected.length > 0 ? 1 : 0);
+      if (outputBytes + lineBytes > maxBytes) {
+        truncatedBy = "bytes";
+        break;
+      }
+      selected.push(line);
+      outputBytes += lineBytes;
+    }
+    if (selected.length >= PI_TOOL_RESULT_MAX_LINES && outputBytes <= maxBytes) {
+      truncatedBy = "lines";
+    }
+    const outputContent = selected.join("\n");
     return {
-      ...truncated,
-      ...(truncated.firstLineExceedsLimit
-        ? { content: "", outputLines: 0, outputBytes: 0 }
-        : {}),
-      maxLines: CODE_MODE_R2_READ_MAX_LINES,
+      content: outputContent,
+      truncated: true,
+      truncatedBy,
+      totalLines,
+      totalBytes,
+      outputLines: selected.length,
+      outputBytes: this.textByteLength(outputContent),
+      firstLineExceedsLimit: false,
+      maxLines: PI_TOOL_RESULT_MAX_LINES,
       maxBytes,
     };
   }
@@ -2669,103 +2512,12 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
   }
 
-  private async readR2ByteWindow(
-    target: CodeModeR2Path,
-    head: R2Object,
-    requestedOffset: number,
-  ): Promise<Record<string, unknown>> {
-    if (!Number.isSafeInteger(head.size) || head.size < 0) {
-      throw new Error("R2 object has an invalid size");
-    }
-    if (head.size > CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES) {
-      throw new Error(
-        `R2 object is too large for text read (${head.size} bytes; max ${CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES} bytes)`,
-      );
-    }
-    if (!Number.isSafeInteger(requestedOffset) || requestedOffset < 0) {
-      throw new Error("byte_offset must be a non-negative safe integer");
-    }
-    if (requestedOffset > head.size || (requestedOffset === head.size && head.size > 0)) {
-      throw new Error(`Byte offset ${requestedOffset} is beyond end of R2 object`);
-    }
-
-    const maxContentBytes = Math.min(
-      CODE_MODE_R2_BYTE_WINDOW_MAX_BYTES,
-      CODE_MODE_R2_READ_MAX_BYTES - CODE_MODE_R2_READ_NOTICE_RESERVED_BYTES,
-    );
-    const fetchStart = Math.max(0, requestedOffset - 3);
-    const prefixBytes = requestedOffset - fetchStart;
-    const fetchLength = Math.min(
-      head.size - fetchStart,
-      prefixBytes + maxContentBytes + 4,
-    );
-    let bytes = new Uint8Array(0);
-    if (fetchLength > 0) {
-      const object = await this.env.R2_BUCKET.get(target.key, {
-        range: { offset: fetchStart, length: fetchLength },
-      });
-      if (!object) throw new Error(`R2 object not found: ${target.path}`);
-      if (object.body) {
-        bytes = new Uint8Array(await readStreamBytes(object.body, fetchLength));
-      } else {
-        bytes = typeof object.arrayBuffer === "function"
-          ? new Uint8Array(await object.arrayBuffer())
-          : new TextEncoder().encode(await object.text());
-        if (bytes.byteLength > fetchLength) {
-          throw new Error("R2 range read returned more bytes than requested");
-        }
-      }
-    }
-
-    const continuation = (byte: number): boolean => (byte & 0xc0) === 0x80;
-    let start = prefixBytes;
-    // An arbitrary caller offset may point into a multibyte code point. Move
-    // forward to the next boundary; nextByteOffset values returned below are
-    // already exact boundaries and do not need adjustment.
-    while (start < bytes.byteLength && continuation(bytes[start])) start += 1;
-    let end = Math.min(bytes.byteLength, start + maxContentBytes);
-    if (fetchStart + end < head.size) {
-      while (end > start && continuation(bytes[end])) end -= 1;
-    }
-    const actualOffset = fetchStart + start;
-    const windowBytes = bytes.subarray(start, end);
-    let content: string;
-    try {
-      content = new TextDecoder("utf-8", { fatal: true }).decode(windowBytes);
-    } catch {
-      throw new Error("R2 byte window is not valid UTF-8 text");
-    }
-    const nextByteOffset = actualOffset + windowBytes.byteLength < head.size
-      ? actualOffset + windowBytes.byteLength
-      : null;
-    let text = content;
-    if (nextByteOffset !== null) {
-      const endDisplay = Math.max(actualOffset, nextByteOffset - 1);
-      text +=
-        `${text ? "\n\n" : ""}` +
-        `[Showing bytes ${actualOffset}-${endDisplay} of ${head.size}. Use byte_offset=${nextByteOffset} to continue.]`;
-    }
-
-    return {
-      text,
-      content: [{ type: "text", text }],
-      details: {
-        ...this.formatR2ObjectMetadata(head, target),
-        offset: null,
-        nextOffset: null,
-        totalLines: null,
-        truncation: null,
-        requestedByteOffset: requestedOffset,
-        byteOffset: actualOffset,
-        nextByteOffset,
-        windowBytes: windowBytes.byteLength,
-        totalBytes: head.size,
-      },
-    };
-  }
-
   private async readR2File(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const target = this.resolveCodeModeR2Path(args);
+    const offset = clampCodeModeInteger(args.offset, 1, 1, Number.MAX_SAFE_INTEGER);
+    const limit = typeof args.limit === "number"
+      ? clampCodeModeInteger(args.limit, PI_TOOL_RESULT_MAX_LINES, 1, PI_TOOL_RESULT_MAX_LINES)
+      : undefined;
     const head = await this.env.R2_BUCKET.head(target.key);
     if (!head) {
       throw new Error(`R2 object not found: ${target.path}`);
@@ -2773,26 +2525,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const contentTypeImageMimeType = getSupportedImageMimeTypeFromContentType(
       head.httpMetadata?.contentType,
     );
-    if (args.byte_offset !== undefined) {
-      if (args.offset !== undefined || args.limit !== undefined) {
-        throw new Error("byte_offset cannot be combined with line offset or limit");
-      }
-      if (contentTypeImageMimeType) {
-        throw new Error("byte_offset is only supported for R2 text objects");
-      }
-      if (
-        typeof args.byte_offset !== "number" ||
-        !Number.isSafeInteger(args.byte_offset) ||
-        args.byte_offset < 0
-      ) {
-        throw new Error("byte_offset must be a non-negative safe integer");
-      }
-      return this.readR2ByteWindow(target, head, args.byte_offset);
-    }
-    const offset = clampCodeModeInteger(args.offset, 1, 1, Number.MAX_SAFE_INTEGER);
-    const limit = typeof args.limit === "number"
-      ? clampCodeModeInteger(args.limit, CODE_MODE_R2_READ_MAX_LINES, 1, CODE_MODE_R2_READ_MAX_LINES)
-      : undefined;
     const object = await this.env.R2_BUCKET.get(target.key);
     if (!object) {
       throw new Error(`R2 object not found: ${target.path}`);
@@ -2824,20 +2556,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           `R2 object is too large for text read (${head.size} bytes; max ${CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES} bytes)`,
         );
       }
-      bytes = await readStreamBytes(
-        sniffed.stream,
-        CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES,
-      );
+      bytes = await readStreamBytes(sniffed.stream);
     } else {
-      const materializedSize = typeof object.size === "number" ? object.size : head.size;
-      if (!Number.isSafeInteger(materializedSize) || materializedSize < 0) {
-        throw new Error("R2 object has an invalid size; refusing to materialize it");
-      }
-      if (materializedSize > CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES) {
-        throw new Error(
-          `R2 object is too large for text read (${materializedSize} bytes; max ${CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES} bytes)`,
-        );
-      }
       bytes = typeof object.arrayBuffer === "function"
         ? new Uint8Array(await object.arrayBuffer())
         : new TextEncoder().encode(await object.text());
@@ -2855,17 +2575,28 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       );
     }
     const fullText = new TextDecoder().decode(bytes);
+    const allLines = fullText.split("\n");
     const startLine = offset - 1;
-    const window = selectTextLineWindow(fullText, startLine, limit);
-    if (!window) throw new Error(`Offset ${offset} is beyond end of R2 object`);
-    const maxBytes = CODE_MODE_R2_READ_MAX_BYTES - CODE_MODE_R2_READ_NOTICE_RESERVED_BYTES;
-    const truncation = this.truncateR2ReadHead(window.content, maxBytes);
+    if (startLine >= allLines.length) {
+      throw new Error(`Offset ${offset} is beyond end of R2 object (${allLines.length} lines total)`);
+    }
+    let selectedContent: string;
+    let userLimitedLines: number | undefined;
+    if (limit !== undefined) {
+      const endLine = Math.min(startLine + limit, allLines.length);
+      selectedContent = allLines.slice(startLine, endLine).join("\n");
+      userLimitedLines = endLine - startLine;
+    } else {
+      selectedContent = allLines.slice(startLine).join("\n");
+    }
+    const maxBytes = PI_TOOL_RESULT_MAX_BYTES - CODE_MODE_R2_READ_NOTICE_RESERVED_BYTES;
+    const truncation = this.truncateR2ReadHead(selectedContent, maxBytes);
     const startLineDisplay = startLine + 1;
     let text: string;
     let nextOffset: number | null = null;
     if (truncation.firstLineExceedsLimit) {
       text =
-        `[Line ${startLineDisplay} is ${truncation.firstLineBytes} bytes, exceeds ${maxBytes} byte read budget. R2 path: ${target.path}]`;
+        `[Line ${startLineDisplay} is ${this.textByteLength(allLines[startLine] ?? "")} bytes, exceeds ${maxBytes} byte read budget. R2 path: ${target.path}]`;
     } else if (truncation.truncated) {
       const endLineDisplay = startLine + truncation.outputLines;
       nextOffset = endLineDisplay + 1;
@@ -2875,10 +2606,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       text = truncation.content;
       text +=
         `${text ? "\n\n" : ""}` +
-        `[Showing lines ${startLineDisplay}-${endLineDisplay} of ${window.totalLines}${limitLabel}. Use offset=${nextOffset} to continue.]`;
-    } else if (startLine + window.outputLines < window.totalLines) {
-      const remaining = window.totalLines - startLine - window.outputLines;
-      nextOffset = startLine + window.outputLines + 1;
+        `[Showing lines ${startLineDisplay}-${endLineDisplay} of ${allLines.length}${limitLabel}. Use offset=${nextOffset} to continue.]`;
+    } else if (userLimitedLines !== undefined && startLine + userLimitedLines < allLines.length) {
+      const remaining = allLines.length - (startLine + userLimitedLines);
+      nextOffset = startLine + userLimitedLines + 1;
       text = `${truncation.content}\n\n[${remaining} more lines in R2 object. Use offset=${nextOffset} to continue.]`;
     } else {
       text = truncation.content;
@@ -2891,7 +2622,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         ...this.formatR2ObjectMetadata(head, target),
         offset,
         nextOffset,
-        totalLines: window.totalLines,
+        totalLines: allLines.length,
         truncation,
       },
     };
@@ -3101,17 +2832,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       };
     }
     if (!exists.isDirectory) throw new Error(`Path is not a file or directory: ${path}`);
-    const listing = await fileStore.listFiles(path, {
-      recursive: true,
-      includeHidden: true,
-      limit: CODE_MODE_MOVE_MAX_FILES + 1,
-    });
+    const listing = await fileStore.listFiles(path, { recursive: true, includeHidden: true });
     if (!listing.success) throw new Error(listing.error || `Failed to list ${path}`);
-    if (listing.files.length > CODE_MODE_MOVE_MAX_FILES) {
-      throw new Error(
-        `Move source has more than ${CODE_MODE_MOVE_MAX_FILES} entries; cannot prove its file-count bound`,
-      );
-    }
     const rootName = basenameForMove(path);
     const files = listing.files
       .filter((entry) => entry.type === "file")
@@ -3147,17 +2869,12 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const prefix = `${baseKey}${directoryRelativePath}`;
     const rootName = basenameForMove(target.path);
     const files: CodeModeMoveFile[] = [];
-    let listedBytes = 0;
     let cursor: string | undefined;
     do {
-      const remainingFileSlots = CODE_MODE_MOVE_MAX_FILES + 1 - files.length;
-      if (remainingFileSlots <= 0) {
-        throw new Error(`Move source has more than ${CODE_MODE_MOVE_MAX_FILES} files`);
-      }
       const listed = await this.env.R2_BUCKET.list({
         prefix,
         cursor,
-        limit: Math.min(1000, remainingFileSlots),
+        limit: 1000,
         include: ["httpMetadata"],
       });
       for (const object of listed.objects) {
@@ -3165,25 +2882,14 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           ? object.key.slice(prefix.length)
           : object.key.slice(baseKey.length);
         if (!objectRelativePath) continue;
-        const file = {
+        files.push({
           path: this.r2PathFromRelative(target.mount, target.relativePath
             ? `${target.relativePath}/${objectRelativePath}`
             : objectRelativePath),
           relativePath: joinRelativeMovePath(rootName, objectRelativePath),
           size: object.size,
           contentType: object.httpMetadata?.contentType,
-        } satisfies CodeModeMoveFile;
-        if (files.length >= CODE_MODE_MOVE_MAX_FILES) {
-          throw new Error(`Move source has more than ${CODE_MODE_MOVE_MAX_FILES} files`);
-        }
-        const fileSize = codeModeMoveFileSize(file);
-        if (fileSize > CODE_MODE_MOVE_MAX_TOTAL_BYTES - listedBytes) {
-          throw new Error(
-            `Move source exceeds ${CODE_MODE_MOVE_MAX_TOTAL_BYTES} aggregate bytes`,
-          );
-        }
-        listedBytes += fileSize;
-        files.push(file);
+        });
       }
       cursor = listed.truncated ? listed.cursor : undefined;
     } while (cursor);
@@ -3222,23 +2928,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const target = this.resolveCodeModeR2Path({ ...source, path: file.path });
     const object = await this.env.R2_BUCKET.get(target.key);
     if (!object) throw new Error(`R2 object not found: ${target.path}`);
-    const expectedSize = codeModeMoveFileSize(file);
-    if (object.size !== expectedSize) {
-      await object.body?.cancel("move source changed after listing").catch(() => undefined);
-      throw new Error(
-        `Cannot move '${file.path}': source size changed from ${expectedSize} to ${object.size} bytes`,
-      );
-    }
-    const bytes = object.body
-      ? await readStreamBytes(object.body, CODE_MODE_MOVE_MAX_FILE_BYTES)
-      : new Uint8Array(await object.arrayBuffer());
-    if (bytes.byteLength !== expectedSize) {
-      throw new Error(
-        `Cannot move '${file.path}': read ${bytes.byteLength} bytes; expected ${expectedSize}`,
-      );
-    }
     return {
-      bytes,
+      bytes: new Uint8Array(await object.arrayBuffer()),
       contentType: object.httpMetadata?.contentType ?? file.contentType,
     };
   }
@@ -3343,7 +3034,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
 
     const { files, sourceIsDirectory } = await this.collectMoveSourceFiles(source);
     if (files.length === 0) throw new Error(`No files found at ${source.path}`);
-    assertCodeModeMoveBounds(files);
     if (deleteSource) {
       await this.assertSafeMoveDeleteDestination(source, destination, sourceIsDirectory);
     }
@@ -3410,177 +3100,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       .filter((definition) => (
         this.ctx?.props?.allowWebTools !== false || !AGENT_WEB_TOOL_NAMES.has(definition.name)
       ));
-  }
-
-  /**
-   * Best-effort externalization for a result that cannot fit its current
-   * durable/prompt budget. Only a complete, bounded representation is written;
-   * every other outcome is an explicit preview-only projection.
-   */
-  async overflowToolResult(
-    toolName: string,
-    toolCallId: string,
-    value: unknown,
-    signal?: AbortSignal,
-  ): Promise<unknown> {
-    const format = codeModeOverflowFormat(value);
-    const previewOnly = (reason: string, hint: string): unknown =>
-      codeModeOverflowProjection(value, {
-        stored: false,
-        format,
-        complete: false,
-        reason,
-      }, hint);
-
-    try {
-      if (signal?.aborted) throw codeModeOverflowAbortError(signal);
-      if (this.toolResultOverflowStorageFailed === true) {
-        return previewOnly(
-          "storage_disabled",
-          "Overflow storage failed earlier in this turn; only a bounded preview is available.",
-        );
-      }
-
-      let tmpBaseKey: string;
-      try {
-        tmpBaseKey = this.r2MountBaseKey("tmp");
-      } catch {
-        return previewOnly(
-          "scope_unavailable",
-          "Overflow storage requires org, workspace, and chat-thread scope; only a bounded preview is available.",
-        );
-      }
-
-      const serialized = serializeCodeModeToolResultOverflow(value);
-      if (!serialized) {
-        return previewOnly(
-          "source_limit",
-          `The full result could not be safely serialized within ${CHAT_RUNTIME_BOUNDS.toolResultOverflowBytes} bytes; only a bounded preview is available.`,
-        );
-      }
-
-      const reservedFiles = this.toolResultOverflowReservedFiles ?? 0;
-      const reservedBytes = this.toolResultOverflowReservedBytes ?? 0;
-      if (reservedFiles >= CHAT_RUNTIME_BOUNDS.toolResultOverflowFilesPerAttempt) {
-        return previewOnly(
-          "file_limit",
-          "The per-attempt overflow file limit is exhausted; only a bounded preview is available.",
-        );
-      }
-      if (
-        serialized.bytes.byteLength >
-        CHAT_RUNTIME_BOUNDS.toolResultOverflowPerAttemptBytes - reservedBytes
-      ) {
-        return previewOnly(
-          "aggregate_limit",
-          "The per-attempt overflow byte limit is exhausted; only a bounded preview is available.",
-        );
-      }
-
-      // Reserve synchronously before hashing or starting the R2 write. Parallel
-      // calls on one binding therefore cannot all observe the same capacity.
-      this.toolResultOverflowReservedFiles = reservedFiles + 1;
-      this.toolResultOverflowReservedBytes =
-        reservedBytes + serialized.bytes.byteLength;
-
-      const safeToolName = safeCodeModeOverflowName(
-        typeof toolName === "string" ? toolName : "",
-        "tool",
-      );
-      const safeToolCallId = safeCodeModeOverflowName(
-        typeof toolCallId === "string" ? toolCallId : "",
-        "call",
-      );
-      const nonce = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
-      const extension = serialized.format === "text" ? "txt" : "json";
-      const filename = `tool-result-${safeToolName}-${safeToolCallId}-${nonce}.${extension}`;
-      const path = `tmp/${filename}`;
-      const key = `${tmpBaseKey}${filename}`;
-      const storedAt = new Date().toISOString();
-      let timedOut = false;
-      let timeout: ReturnType<typeof setTimeout> | undefined;
-      let removeAbortListener: (() => void) | undefined;
-
-      try {
-        const store = (async () => {
-          const sha256 = await sha256Hex(serialized.bytes);
-          if (signal?.aborted) throw codeModeOverflowAbortError(signal);
-          if (timedOut) throw new Error("Tool-result overflow storage deadline exceeded");
-          await this.env.R2_BUCKET.put(key, serialized.bytes, {
-            httpMetadata: { contentType: serialized.contentType },
-            customMetadata: {
-              type: "tool-result-overflow",
-              sha256,
-              size: String(serialized.bytes.byteLength),
-              storedAt,
-            },
-          });
-          if (signal?.aborted || timedOut) {
-            // R2 puts do not accept an AbortSignal. If the race was lost while
-            // a put was in flight, remove the now-unreferenced object before
-            // this late task settles.
-            try {
-              await this.env.R2_BUCKET.delete(key);
-            } catch {
-              console.error("[CodeModeTools] failed to clean up late tool-result overflow");
-            }
-            if (signal?.aborted) throw codeModeOverflowAbortError(signal);
-            throw new Error("Tool-result overflow storage deadline exceeded");
-          }
-          return sha256;
-        })();
-        // Promise.race installs a rejection handler, but this explicit observer
-        // also covers the late rejection after a deadline/abort already won.
-        void store.catch(() => undefined);
-        const deadline = new Promise<never>((_resolve, reject) => {
-          timeout = setTimeout(() => {
-            timedOut = true;
-            reject(new Error("Tool-result overflow storage deadline exceeded"));
-          }, CHAT_RUNTIME_BOUNDS.toolResultOverflowDeadlineMs);
-        });
-        const aborted = signal
-          ? new Promise<never>((_resolve, reject) => {
-              const onAbort = () => reject(codeModeOverflowAbortError(signal));
-              signal.addEventListener("abort", onAbort, { once: true });
-              removeAbortListener = () => signal.removeEventListener("abort", onAbort);
-            })
-          : null;
-        const sha256 = await Promise.race(
-          aborted ? [store, deadline, aborted] : [store, deadline],
-        );
-        if (timeout !== undefined) clearTimeout(timeout);
-        removeAbortListener?.();
-        return codeModeOverflowProjection(value, {
-          stored: true,
-          path,
-          format: serialized.format,
-          bytes: serialized.bytes.byteLength,
-          sha256,
-          complete: true,
-        }, `Tool result exceeded the inline limit. Read the full result in bounded windows with read({ location: "r2", path: "${path}", byte_offset: 0 }) and continue with details.nextByteOffset.`);
-      } catch {
-        if (timeout !== undefined) clearTimeout(timeout);
-        removeAbortListener?.();
-        if (signal?.aborted) throw codeModeOverflowAbortError(signal);
-        this.toolResultOverflowStorageFailed = true;
-        console.error("[CodeModeTools] failed to store tool-result overflow in R2", {
-          toolName: safeToolName,
-          reason: timedOut ? "storage_deadline" : "storage_failure",
-        });
-        return previewOnly(
-          timedOut ? "storage_deadline" : "storage_failure",
-          timedOut
-            ? "Overflow storage exceeded its deadline; only a bounded preview is available."
-            : "Overflow storage is unavailable; only a bounded preview is available.",
-        );
-      }
-    } catch {
-      if (signal?.aborted) throw codeModeOverflowAbortError(signal);
-      // A tool result can include hostile proxies. The serializer deliberately
-      // avoids getters/toJSON, and this final fallback also avoids touching the
-      // value so overflow handling can never fail an otherwise-successful tool.
-      return codeModeOverflowFallbackProjection(format, "overflow_failure");
-    }
   }
 
   // Executor-style result envelope for js_exec's `tools.<name>()` calls. Catching
@@ -3883,26 +3402,293 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
 
   private async callToolWithArtifactCapture(
     name: string,
-    _args: Record<string, unknown>,
+    args: Record<string, unknown>,
     execute: () => Promise<unknown> | unknown,
   ): Promise<unknown> {
     try {
-      const rawResult = await execute();
-      const inline = boundedCodeModeToolResultProjection(rawResult);
-      const result = inline.complete
-        ? inline.value
-        : await this.overflowToolResult(
-            name,
-            this.ctx?.props?.parentToolUseId?.trim() || crypto.randomUUID(),
-            rawResult,
-          );
+      const result = await execute();
+      await Promise.all([
+        this.recordCodeModeArtifactBestEffort(name, args, result),
+        this.recordProjectActivityBestEffort(name, args, result),
+        this.recordVerifiedWorkEvidenceBestEffort(name, args, result),
+      ]);
       return result;
     } catch (error) {
-      const bounded = boundedErrorValue(error, CHAT_RUNTIME_BOUNDS.toolResultBytes);
-      const boundedError = new Error(bounded.message);
-      boundedError.name = bounded.name;
-      throw boundedError;
+      await Promise.all([
+        this.recordCodeModeArtifactBestEffort(name, args, undefined, error),
+        this.recordVerifiedWorkEvidenceBestEffort(name, args, undefined, error),
+      ]);
+      throw error;
     }
+  }
+
+  private async recordVerifiedWorkEvidenceBestEffort(
+    name: string,
+    args: Record<string, unknown>,
+    result?: unknown,
+    error?: unknown,
+  ): Promise<void> {
+    const parentToolUseId = this.ctx?.props?.parentToolUseId?.trim();
+    const directToolUseId = typeof args.toolUseId === "string" ? args.toolUseId.trim() : "";
+    const threadId = this.ctx?.props?.threadId?.trim();
+    const evidenceId = parentToolUseId
+      ? `${parentToolUseId}:${name}:${crypto.randomUUID()}`
+      : directToolUseId;
+    if (!evidenceId || !threadId) return;
+    const evidence = deriveVerifiedWorkEvidence({
+      toolCallId: evidenceId,
+      toolName: name,
+      args,
+      result,
+      isError: error !== undefined,
+    });
+    if (!evidence) return;
+    try {
+      await (this.chatThreadStub as unknown as {
+        recordVerifiedWorkEvidence(evidence: VerifiedWorkEvidence): Promise<void>;
+      }).recordVerifiedWorkEvidence(evidence);
+    } catch (recordError) {
+      console.error("Failed to record verified work evidence", {
+        toolName: name,
+        threadId,
+        error: recordError instanceof Error ? recordError.message : String(recordError),
+      });
+    }
+  }
+
+  private async recordProjectActivityBestEffort(
+    name: string,
+    args: Record<string, unknown>,
+    result: unknown,
+  ): Promise<void> {
+    const props = this.ctx?.props;
+    const threadId = props?.threadId?.trim();
+    if (!threadId) return;
+
+    try {
+      let projectName = '';
+      let activityType: 'created' | 'deployed' | null = null;
+      const resultRecord =
+        result && typeof result === 'object' && !Array.isArray(result)
+          ? (result as Record<string, unknown>)
+          : null;
+
+      if (name === 'create_project') {
+        projectName =
+          (typeof resultRecord?.name === 'string' && resultRecord.name.trim()) ||
+          (typeof args.name === 'string' && args.name.trim()) ||
+          '';
+        activityType = 'created';
+      } else if (
+        name === 'deploy_project' &&
+        resultRecord?.success === true &&
+        resultRecord.dryRun !== true
+      ) {
+        projectName =
+          (typeof resultRecord.project === 'string' &&
+            resultRecord.project.trim()) ||
+          (typeof args.project === 'string' && args.project.trim()) ||
+          '';
+        activityType = 'deployed';
+      }
+
+      if (!activityType) return;
+      if (!projectName) {
+        throw new Error(`Successful ${name} result did not identify a project`);
+      }
+
+      const project = await this.workspaceFs.getProjectByName(projectName);
+      if (!project) {
+        throw new Error('Project activity target was not found');
+      }
+      await (
+        this.chatThreadStub as unknown as {
+          recordProjectActivity(input: {
+            projectId: string;
+            activityType: 'created' | 'deployed';
+          }): Promise<void>;
+        }
+      ).recordProjectActivity({ projectId: project.id, activityType });
+    } catch (error) {
+      console.error('Failed to record thread project activity', {
+        toolName: name,
+        workspaceId: props?.workspaceId,
+        threadId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      recordErrorEvent(this.env, {
+        event: 'thread_project_activity_record_failed',
+        component: 'CodeModeToolsBinding',
+        operation: `recordProjectActivity:${name}`,
+        status: 'error',
+        workspaceId: props?.workspaceId,
+        threadId,
+        orgId: props?.orgId,
+        userId: props?.userId,
+        error,
+      });
+    }
+  }
+
+  private async recordCodeModeArtifactBestEffort(
+    name: string,
+    args: Record<string, unknown>,
+    result?: unknown,
+    error?: unknown,
+  ): Promise<void> {
+    try {
+      await this.maybeRecordCodeModeArtifact(name, args, result, error);
+    } catch (recordError) {
+      console.error("Failed to record code mode artifact", {
+        toolName: name,
+        threadId: this.ctx?.props?.threadId,
+        parentToolUseId: this.ctx?.props?.parentToolUseId,
+        error: recordError instanceof Error ? recordError.message : String(recordError),
+      });
+    }
+  }
+
+  private async maybeRecordCodeModeArtifact(
+    name: string,
+    args: Record<string, unknown>,
+    result?: unknown,
+    error?: unknown,
+  ): Promise<void> {
+    const props = this.ctx?.props;
+    const parentToolUseId = props?.parentToolUseId?.trim();
+    const threadId = props?.threadId?.trim();
+    if (!parentToolUseId || !threadId) return;
+    const artifact = this.buildCodeModeArtifact(name, args, result, error);
+    if (!artifact) return;
+    await (this.chatThreadStub as unknown as {
+      recordCodeModeArtifact(parentToolUseId: string, artifact: RuntimeCallArtifact): Promise<void>;
+    }).recordCodeModeArtifact(parentToolUseId, artifact);
+  }
+
+  private buildCodeModeArtifact(
+    name: string,
+    args: Record<string, unknown>,
+    result?: unknown,
+    error?: unknown,
+  ): RuntimeCallArtifact | null {
+    const kindByTool: Record<string, RuntimeCallArtifactKind> = {
+      send_email: "outbound_email",
+      send_slack_message: "outbound_slack_message",
+      send_telegram_message: "outbound_telegram_message",
+      send_discord_message: "outbound_discord_message",
+    };
+    const kind = kindByTool[name];
+    if (!kind) return null;
+    const now = Date.now();
+    const status = error ? "failed" : "sent";
+    const details = this.codeModeArtifactDetails(result);
+    const summary = this.summarizeCodeModeArtifactArgs(name, args);
+    const titleByKind: Record<RuntimeCallArtifactKind, string> = {
+      outbound_email: status === "sent" ? "Email sent" : "Email failed",
+      outbound_slack_message: status === "sent" ? "Slack message sent" : "Slack message failed",
+      outbound_telegram_message: status === "sent" ? "Telegram message sent" : "Telegram message failed",
+      outbound_discord_message: status === "sent" ? "Discord message sent" : "Discord message failed",
+    };
+    return {
+      id: `${this.ctx.props.parentToolUseId}:${name}:${crypto.randomUUID()}`,
+      kind,
+      toolName: name as RuntimeCallArtifact["toolName"],
+      status,
+      title: titleByKind[kind],
+      subtitle: this.codeModeArtifactSubtitle(kind, summary, details),
+      createdAt: now,
+      updatedAt: now,
+      summary,
+      ...(Object.keys(details).length > 0 ? { result: details } : {}),
+      ...(error ? { error: this.codeModeArtifactError(error) } : {}),
+    };
+  }
+
+  private summarizeCodeModeArtifactArgs(
+    name: string,
+    args: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const attachmentCount = Array.isArray(args.attachments) ? args.attachments.length : 0;
+    const text = typeof args.text === "string" ? args.text : "";
+    switch (name) {
+      case "send_email": {
+        const to = typeof args.to === "string" ? args.to.trim() : "";
+        return {
+          to,
+          toDomain: to.includes("@") ? to.split("@").pop() : undefined,
+          subject: typeof args.subject === "string" ? args.subject : undefined,
+          hasText: typeof args.text === "string" && args.text.length > 0,
+          hasHtml: typeof args.html === "string" && args.html.length > 0,
+          attachmentCount,
+        };
+      }
+      case "send_slack_message":
+        return {
+          channelId: typeof args.channel_id === "string" ? args.channel_id : undefined,
+          teamId: typeof args.team_id === "string" ? args.team_id : undefined,
+          integrationId: typeof args.integration_id === "string" ? args.integration_id : undefined,
+          threadTs: typeof args.thread_ts === "string" ? args.thread_ts : undefined,
+          hasText: text.length > 0,
+          textPreview: text ? this.truncateArtifactPreviewText(text) : undefined,
+          attachmentCount,
+        };
+      case "send_telegram_message":
+        return {
+          chatId: typeof args.chat_id === "string" ? args.chat_id : undefined,
+          integrationId: typeof args.integration_id === "string" ? args.integration_id : undefined,
+          hasText: text.length > 0,
+          textPreview: text ? this.truncateArtifactPreviewText(text) : undefined,
+          attachmentCount,
+        };
+      case "send_discord_message":
+        return {
+          integrationId: typeof args.integration_id === "string" ? args.integration_id : undefined,
+          hasText: text.length > 0,
+          textPreview: text ? this.truncateArtifactPreviewText(text) : undefined,
+          attachmentCount,
+        };
+      default:
+        return { attachmentCount };
+    }
+  }
+
+  private codeModeArtifactDetails(result: unknown): Record<string, unknown> {
+    if (!result || typeof result !== "object" || Array.isArray(result)) return {};
+    const details = (result as { details?: unknown }).details;
+    return details && typeof details === "object" && !Array.isArray(details)
+      ? details as Record<string, unknown>
+      : {};
+  }
+
+  private codeModeArtifactSubtitle(
+    kind: RuntimeCallArtifactKind,
+    summary: Record<string, unknown>,
+    result: Record<string, unknown>,
+  ): string | undefined {
+    if (kind === "outbound_email") {
+      return typeof summary.to === "string" && summary.to ? summary.to : undefined;
+    }
+    if (kind === "outbound_slack_message") {
+      const channelId = typeof result.channelId === "string" ? result.channelId : summary.channelId;
+      return typeof channelId === "string" && channelId ? `Channel ${channelId}` : undefined;
+    }
+    if (kind === "outbound_discord_message") {
+      const threadId = typeof result.threadId === "string" ? result.threadId : undefined;
+      return threadId ? `Thread ${threadId}` : undefined;
+    }
+    const chatId = typeof result.chatId === "string" ? result.chatId : summary.chatId;
+    return typeof chatId === "string" && chatId ? `Chat ${chatId}` : undefined;
+  }
+
+  private codeModeArtifactError(error: unknown): { name: string; message: string } {
+    return error instanceof Error
+      ? { name: error.name || "Error", message: error.message || "Unknown error" }
+      : { name: "Error", message: String(error || "Unknown error") };
+  }
+
+  private truncateArtifactPreviewText(text: string): string {
+    const normalized = text.replace(/\s+/g, " ").trim();
+    return normalized.length > 160 ? `${normalized.slice(0, 157)}...` : normalized;
   }
 
   private askUserQuestion(args: Record<string, unknown>): Promise<unknown> {

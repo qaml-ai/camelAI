@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { CodeModeToolsBinding } from "../src/code-mode-tools.js";
+import { buildJsExecDescription } from "../src/chat-thread/pi-tools.js";
 
 describe("self-host tool discovery", () => {
   it("keeps app visibility available while disabling unsupported outbound email", async () => {
@@ -12,6 +13,7 @@ describe("self-host tool discovery", () => {
 
     expect(tools.map((tool) => tool.name)).not.toContain("send_email");
     expect(tools.map((tool) => tool.name)).toContain("set_app_visibility");
+    expect(buildJsExecDescription(false)).not.toContain("send_email");
     await expect(
       CodeModeToolsBinding.prototype.callTool.call(binding, "send_email", {}),
     ).rejects.toThrow(

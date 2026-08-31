@@ -7,6 +7,7 @@ import {
   useRevalidator,
 } from "react-router";
 import type { Route } from "./+types/_app.chat.$id";
+import type { UIMessage } from "ai";
 import {
   requireAuthContext,
   requireSuperuser,
@@ -49,6 +50,7 @@ import type { ProxyAuthValidationEnv } from "../../workers/main/src/helpers/prox
 import { getChatDebugFlags } from "@/lib/chat-debug-flags";
 import { shouldRevalidateActiveChatRoute } from "@/lib/chat-route-revalidation";
 import { resolveMessageAuthorDisplayName } from "@/lib/message-author";
+import { messageToUiMessage } from "@/lib/ui-message-adapter";
 import {
   saveChatGroupRename,
   type ChatGroupRenameInput,
@@ -262,8 +264,10 @@ export async function action({ request, context, params }: Route.ActionArgs) {
         env.CHAT_THREAD.idFromName(params.id),
       ) as unknown as {
         setModel(model: LlmModel, updatedAt?: number): Promise<void>;
+        refreshRunnerConfig(): Promise<void>;
       };
       await chatThread.setModel(updated.model, updated.updated_at);
+      await chatThread.refreshRunnerConfig();
     } catch (error) {
       console.error("Failed to broadcast thread model update:", error);
     }
@@ -277,6 +281,11 @@ export async function action({ request, context, params }: Route.ActionArgs) {
 interface ChatData {
   messages: Message[];
   messagesError: string | null;
+  // ai-chat-owned durable render history (commit 4). The live-user loader branch
+  // fetches this via getUiMessages(); useAgentChat mounts it as its initial
+  // messages. The admin-readonly branch leaves it empty (it renders pi_core).
+  initialUiMessages: UIMessage[];
+  olderUiMessagesCursor: string | null;
   todos: TodoItem[];
   previewTabs: PreviewTarget[];
   activeTabId: string | null;
@@ -287,6 +296,8 @@ type ChatDataValue = ChatData | Promise<ChatData>;
 const EMPTY_CHAT_DATA: ChatData = {
   messages: [],
   messagesError: null,
+  initialUiMessages: [],
+  olderUiMessagesCursor: null,
   todos: [],
   previewTabs: [],
   activeTabId: null,
@@ -322,6 +333,7 @@ function buildChatDataError(error: unknown): ChatData {
   console.error("Failed to load chat data:", error);
   return {
     ...EMPTY_CHAT_DATA,
+    initialUiMessages: [],
     messagesError: "Failed to load chat messages",
   };
 }
@@ -435,6 +447,15 @@ async function buildChatData(
   options: {
     orgId: string;
     workspaceId: string;
+    // Admin-readonly branch only: fetch the legacy pi_core transcript
+    // (readThreadMessages) it renders directly. The live branch leaves it off —
+    // its transcript is the ai-chat render history, so a normal chat load makes
+    // exactly ONE transcript RPC (Chat.tsx derives any fallback Message view
+    // from initialUiMessages).
+    loadLegacyMessages: boolean;
+    // Live-user branch only: fetch the ai-chat render history (getUiMessages)
+    // that useAgentChat mounts. Admin-readonly leaves it off (renders pi_core).
+    loadUiMessages: boolean;
     skipBanCheck?: boolean;
   },
 ): Promise<ChatData> {
@@ -484,25 +505,59 @@ async function buildChatData(
     };
   })();
 
-  const messagesPromise = readThreadMessages(context, {
-    workspaceId: options.workspaceId,
-    orgId: options.orgId,
-    threadId,
-    skipBanCheck: options.skipBanCheck,
-  }).then((messages) => ({ messages, messagesError: null }));
+  const messagesPromise = options.loadLegacyMessages
+    ? readThreadMessages(context, {
+        workspaceId: options.workspaceId,
+        orgId: options.orgId,
+        threadId,
+        skipBanCheck: options.skipBanCheck,
+      })
+        .then((messages) => ({ messages, messagesError: null }))
+    : Promise.resolve({ messages: [], messagesError: null });
+  // The live branch has no legacy transcript to fall back on, so a failed
+  // render-history read must surface as messagesError instead of silently
+  // rendering an empty thread.
+  const uiMessagesPromise = options.loadUiMessages
+    ? chatDO
+        .getUiMessagePage(context, threadId)
+        .then((page) => ({ page, uiMessagesError: null }))
+        .catch((error) => {
+          console.error("Failed to load ai-chat render history:", error);
+          return {
+            page: {
+              messages: [] as UIMessage[],
+              nextCursor: null,
+              hasMore: false,
+            },
+            uiMessagesError: "Failed to load chat messages",
+          };
+        })
+    : Promise.resolve({
+        page: {
+          messages: [] as UIMessage[],
+          nextCursor: null,
+          hasMore: false,
+        },
+        uiMessagesError: null,
+      });
   const todosPromise = chatDO
     .getTodoState(context, threadId)
     .catch(() => [] as unknown[]);
 
-  const [previewData, messageData, todos] = await Promise.all([
+  const [previewData, messageData, uiMessageData, todos] = await Promise.all([
     previewDataPromise,
     messagesPromise,
+    uiMessagesPromise,
     todosPromise,
   ]);
   return {
     ...previewData,
     messages: messageData.messages,
-    messagesError: messageData.messagesError,
+    messagesError: messageData.messagesError ?? uiMessageData.uiMessagesError,
+    initialUiMessages: uiMessageData.page.messages,
+    olderUiMessagesCursor: uiMessageData.page.hasMore
+      ? uiMessageData.page.nextCursor
+      : null,
     todos: Array.isArray(todos) ? (todos as TodoItem[]) : [],
   };
 }
@@ -565,6 +620,8 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
       chatData: await buildChatData(context, authEnv, params.id, {
         orgId: threadContext.org_id,
         workspaceId: threadContext.workspace_id,
+        loadLegacyMessages: true,
+        loadUiMessages: false,
         skipBanCheck: true,
       }),
       threadTitle: thread?.title ?? threadContext.title ?? null,
@@ -785,8 +842,10 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
     },
   ).map((option) => option.value);
 
-  // Seed first paint from the warm thread record while bounded canonical
-  // history resolves. It is presentation data, never execution state.
+  // Seed the ordinary transcript path from the warm thread record while the
+  // durable ai-chat render history resolves. This applies uniformly to new,
+  // existing, API-created, forked, and reloaded threads; it is paint data only,
+  // never a signal that a turn is running.
   const firstMessage = thread.first_user_message?.trim();
   const seededFirstMessage = firstMessage
     ? threadRecordFirstUserMessage(
@@ -798,7 +857,7 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
   const chatDataSeed: ChatData = seededFirstMessage
     ? {
         ...EMPTY_CHAT_DATA,
-        messages: [seededFirstMessage],
+        initialUiMessages: [messageToUiMessage(seededFirstMessage)],
       }
     : EMPTY_CHAT_DATA;
   const chatDataStartedAt = Date.now();
@@ -806,6 +865,8 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
     ? buildChatData(context, authEnv, params.id, {
         orgId,
         workspaceId,
+        loadLegacyMessages: false,
+        loadUiMessages: true,
       })
         .then((resolvedChatData) => {
           recordChatThreadRouteLoaderStage(
@@ -817,7 +878,7 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
             {
               status: "loaded",
               model: thread.model,
-              count: resolvedChatData.messages.length,
+              count: resolvedChatData.initialUiMessages.length,
               size: resolvedChatData.previewTabs.length,
             },
           );
@@ -1253,6 +1314,8 @@ export default function ChatPage() {
   const handleSnapshotChange = useCallback(
     (snapshot: {
       messages: Message[];
+      uiMessages: UIMessage[];
+      streamingMessageId: string | null;
       todos: TodoItem[];
     }) => {
       if (!displayThreadId || isLoadingDisplayMessages) return;
@@ -1300,6 +1363,9 @@ export default function ChatPage() {
             workspaceId={workspaceId}
             chatGroupId={liveActiveChatGroup?.id ?? resolvedActiveGroupId}
             initialMessages={displayChatData.messages}
+            initialUiMessages={displayChatData.initialUiMessages}
+            olderUiMessagesCursor={displayChatData.olderUiMessagesCursor}
+            bridgedStreamingMessageId={displayChatData.bridgedStreamingMessageId}
             initialTodos={displayChatData.todos}
             threadModel={displayThreadModel}
             llmProvider={llmProvider}

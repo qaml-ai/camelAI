@@ -19,8 +19,6 @@ import {
   generateTextEditDetails,
   normalizeTextEditArguments,
 } from "./text-edit";
-import { CHAT_RUNTIME_BOUNDS } from "../../../src/lib/chat-runtime-bounds";
-import { selectTextLineWindow, truncateTextHead } from "./bounded-text-lines";
 
 const CONTAINER_CWD = "/workspace";
 const DEFAULT_MAX_LINES = 2000;
@@ -208,17 +206,33 @@ function result(text: string, details?: Record<string, unknown>): PiContainerToo
 }
 
 function truncateHead(text: string, maxLines = DEFAULT_MAX_LINES, maxBytes = DEFAULT_MAX_BYTES) {
-  const bounded = truncateTextHead(text, maxLines, maxBytes);
+  const lines = text.split("\n");
+  const selected: string[] = [];
+  let usedBytes = 0;
+  let truncatedBy: "lines" | "bytes" | null = null;
+  for (const line of lines) {
+    if (selected.length >= maxLines) {
+      truncatedBy = "lines";
+      break;
+    }
+    const lineBytes = bytes(line) + (selected.length > 0 ? 1 : 0);
+    if (usedBytes + lineBytes > maxBytes) {
+      truncatedBy = "bytes";
+      break;
+    }
+    selected.push(line);
+    usedBytes += lineBytes;
+  }
   return {
-    content: bounded.content,
-    truncation: bounded.truncated
+    content: selected.join("\n"),
+    truncation: truncatedBy
       ? {
           truncated: true,
-          truncatedBy: bounded.truncatedBy,
-          totalLines: bounded.totalLines,
-          outputLines: bounded.outputLines,
-          outputBytes: bounded.outputBytes,
-          totalBytes: bounded.totalBytes,
+          truncatedBy,
+          totalLines: lines.length,
+          outputLines: selected.length,
+          outputBytes: usedBytes,
+          totalBytes: bytes(text),
           maxLines,
           maxBytes,
         }
@@ -338,25 +352,10 @@ export class PiContainerTools {
     let file: WorkspaceReadFileResponse;
     if (typeof this.workspace.readFileStream === "function") {
       const streamed = await this.readWorkspaceFileStream(path);
-      const declaredImageMime = streamed.mimeType && isSupportedImageMimeType(streamed.mimeType)
-        ? streamed.mimeType
-        : null;
-      const pathImageMime = imageMime(path);
-      if (
-        typeof streamed.size === "number" &&
-        streamed.size > CHAT_RUNTIME_BOUNDS.toolSourceReadBytes &&
-        !declaredImageMime &&
-        !pathImageMime
-      ) {
-        await streamed.stream!.cancel("workspace text file exceeds read limit").catch(() => undefined);
-        throw new Error(
-          `File is too large for text read (${streamed.size} bytes; max ${CHAT_RUNTIME_BOUNDS.toolSourceReadBytes} bytes)`,
-        );
-      }
       const sniffed = await readImageSniffBytesAndReplayStream(streamed.stream!);
       const mimeType = detectSupportedImageMimeType(sniffed.prefix)
-        || declaredImageMime
-        || pathImageMime;
+        || (streamed.mimeType && isSupportedImageMimeType(streamed.mimeType) ? streamed.mimeType : null)
+        || imageMime(path);
       if (mimeType?.startsWith("image/")) {
         if (!this.options.images) throw new Error("IMAGES binding is required for image reads");
         const prepared = await prepareInlineImageFromStream(sniffed.stream, mimeType, this.options.images, {
@@ -372,19 +371,7 @@ export class PiContainerTools {
           prepared,
         });
       }
-      if (
-        typeof streamed.size === "number" &&
-        streamed.size > CHAT_RUNTIME_BOUNDS.toolSourceReadBytes
-      ) {
-        await sniffed.stream.cancel("workspace text file exceeds read limit").catch(() => undefined);
-        throw new Error(
-          `File is too large for text read (${streamed.size} bytes; max ${CHAT_RUNTIME_BOUNDS.toolSourceReadBytes} bytes)`,
-        );
-      }
-      const bytes = await readStreamBytes(
-        sniffed.stream,
-        CHAT_RUNTIME_BOUNDS.toolSourceReadBytes,
-      );
+      const bytes = await readStreamBytes(sniffed.stream);
       const decoded = decodeMaybeText(bytes);
       file = {
         success: true,
@@ -397,19 +384,6 @@ export class PiContainerTools {
     } else {
       file = await this.readWorkspaceFile(path);
       if (file.isBinary && typeof file.content === "string") {
-        const maxBase64Chars = Math.ceil(
-          CHAT_RUNTIME_BOUNDS.toolSourceReadBytes / 3,
-        ) * 4;
-        if (
-          (typeof file.size === "number" &&
-            file.size > CHAT_RUNTIME_BOUNDS.toolSourceReadBytes) ||
-          file.content.length > maxBase64Chars
-        ) {
-          return result("[Binary file omitted: fallback read exceeds byte limit.]", {
-            isBinary: true,
-            size: file.size ?? 0,
-          });
-        }
         const imageBytes = base64ToBytes(file.content);
         const mimeType = detectSupportedImageMimeType(imageBytes)
           || (file.mimeType && isSupportedImageMimeType(file.mimeType) ? file.mimeType : null)
@@ -430,35 +404,18 @@ export class PiContainerTools {
       return result("[Binary file omitted. Use js_exec with tools.move for binary inspection.]", { isBinary: true, size: file.size ?? 0 });
     }
 
-    if (
-      typeof file.size === "number" &&
-      file.size > CHAT_RUNTIME_BOUNDS.toolSourceReadBytes
-    ) {
-      throw new Error(
-        `File is too large for text read (${file.size} bytes; max ${CHAT_RUNTIME_BOUNDS.toolSourceReadBytes} bytes)`,
-      );
-    }
-
-    const text = String(file.content ?? "");
-    if (
-      text.length > CHAT_RUNTIME_BOUNDS.toolSourceReadBytes ||
-      bytes(text) > CHAT_RUNTIME_BOUNDS.toolSourceReadBytes
-    ) {
-      throw new Error(
-        `File is too large for text read (max ${CHAT_RUNTIME_BOUNDS.toolSourceReadBytes} bytes)`,
-      );
-    }
-    const start = typeof args.offset === "number" ? Math.max(0, Math.floor(args.offset) - 1) : 0;
-    const limit = typeof args.limit === "number" ? Math.max(1, Math.floor(args.limit)) : undefined;
-    const window = selectTextLineWindow(text, start, limit);
-    if (!window) throw new Error(`Offset ${args.offset} is beyond end of file`);
-    const { content, truncation } = truncateHead(window.content);
+    const lines = String(file.content ?? "").split("\n");
+    const start = typeof args.offset === "number" ? Math.max(0, args.offset - 1) : 0;
+    if (start >= lines.length) throw new Error(`Offset ${args.offset} is beyond end of file (${lines.length} lines total)`);
+    const end = typeof args.limit === "number" ? Math.min(start + args.limit, lines.length) : lines.length;
+    const selected = lines.slice(start, end).join("\n");
+    const { content, truncation } = truncateHead(selected);
     const notices: string[] = [];
     if (truncation) {
       const nextOffset = start + truncation.outputLines + 1;
-      notices.push(`Showing lines ${start + 1}-${start + truncation.outputLines} of ${window.totalLines}. Use offset=${nextOffset} to continue.`);
-    } else if (start + window.outputLines < window.totalLines) {
-      notices.push(`${window.totalLines - start - window.outputLines} more lines in file. Use offset=${start + window.outputLines + 1} to continue.`);
+      notices.push(`Showing lines ${start + 1}-${start + truncation.outputLines} of ${lines.length}. Use offset=${nextOffset} to continue.`);
+    } else if (end < lines.length) {
+      notices.push(`${lines.length - end} more lines in file. Use offset=${end + 1} to continue.`);
     }
     return result(`${content}${notices.length ? `\n\n[${notices.join(" ")}]` : ""}`, truncation ? { truncation } : undefined);
   }
@@ -615,29 +572,19 @@ export class PiContainerTools {
       if (globRegex && !globRegex.test(displayPath)) continue;
       const file = await this.workspace.readFile(entry.absolutePath);
       if (!file.success || file.isBinary) continue;
-      const source = String(file.content ?? "");
-      if (
-        source.length > CHAT_RUNTIME_BOUNDS.toolSourceReadBytes ||
-        bytes(source) > CHAT_RUNTIME_BOUNDS.toolSourceReadBytes
-      ) continue;
-      let lineStart = 0;
-      let lineNumber = 1;
-      while (lineStart <= source.length) {
-        const newline = source.indexOf("\n", lineStart);
-        const line = source.slice(lineStart, newline < 0 ? source.length : newline);
+      const lines = String(file.content ?? "").split("\n");
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index];
         const haystack = args.ignoreCase ? line.toLowerCase() : line;
         if (matcher ? matcher.test(line) : haystack.includes(literal)) {
           const text = line.length > GREP_MAX_LINE_LENGTH
             ? `${line.slice(0, GREP_MAX_LINE_LENGTH)}... [truncated]`
             : line;
           lineTruncated ||= text !== line;
-          matches.push(`${displayPath}:${lineNumber}: ${text.trimStart()}`);
+          matches.push(`${displayPath}:${index + 1}: ${text.trimStart()}`);
           if (matches.length >= limit) break;
         }
         if (matcher) matcher.lastIndex = 0;
-        if (newline < 0) break;
-        lineStart = newline + 1;
-        lineNumber += 1;
       }
       if (matches.length >= limit) break;
     }

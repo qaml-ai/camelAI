@@ -1,10 +1,10 @@
 /**
  * Chat transport access guard regression tests using Cloudflare Vitest pool.
  *
- * The V2 chat transport is HTTP: an event attach admits with 200 +
- * text/event-stream, message admission uses POST, and a denial is a real
- * status the client can classify as terminal (400/401/403/404) or retryable
- * (409/429/5xx).
+ * The chat transport is HTTP now: an SSE attach admits with 200 +
+ * text/event-stream, and a denial is a real status the client can classify as
+ * terminal (400/401/403/404) or retryable (409/429/5xx) — replacing the
+ * accept-then-close-with-4403 trick the WebSocket upgrade needed.
  *
  * The legacy upgrade routes are gone entirely (2026-08-15), so the guard cases
  * below are joined by removal regressions: an upgrade attempt must 404 without
@@ -69,7 +69,7 @@ describe('Chat transport access guard', () => {
 
   const attach = (threadId: string, workspaceId: string, signedToken: string) =>
     SELF.fetch(
-      `http://example/agents/chat-thread/${threadId}/v2/events?workspaceId=${workspaceId}&after=0`,
+      `http://example/agents/chat-thread/${threadId}/sse?workspaceId=${workspaceId}&_pk=pk-1`,
       {
         headers: {
           Accept: 'text/event-stream',
@@ -78,7 +78,7 @@ describe('Chat transport access guard', () => {
       },
     );
 
-  it('opens the V2 event stream for authorized workspace access', async () => {
+  it('opens the SSE stream for authorized workspace access', async () => {
     const { workspaceId, threadId, signedToken } = await setupMemberSession();
 
     const response = await attach(threadId, workspaceId, signedToken);
@@ -90,7 +90,7 @@ describe('Chat transport access guard', () => {
     await response.body?.cancel();
   });
 
-  it('denies the V2 event stream for denied workspace access', async () => {
+  it('denies the SSE stream for denied workspace access', async () => {
     const { ownerId, memberId, workspaceId, threadId, signedToken } = await setupMemberSession();
 
     await setWorkspaceAccess(testEnv, workspaceId, memberId, 'none', ownerId);
@@ -101,7 +101,7 @@ describe('Chat transport access guard', () => {
     expect(response.headers.get('content-type')).not.toBe('text/event-stream');
   });
 
-  it('denies the V2 event stream when org membership is removed', async () => {
+  it('denies the SSE stream when org membership is removed', async () => {
     const { ownerId, memberId, orgId, workspaceId, threadId, signedToken } = await setupMemberSession();
 
     await removeOrgMember(testEnv, orgId, memberId, ownerId);
@@ -114,10 +114,13 @@ describe('Chat transport access guard', () => {
   it('strips client-supplied framework routing headers from the attach', async () => {
     const { workspaceId, threadId, signedToken } = await setupMemberSession();
 
-    // Unlike a WS handshake, an HTTP attach lets the browser set arbitrary
-    // framework-looking headers. They must not reach the thread DO.
+    // Unlike a WS handshake, an HTTP attach lets the browser set any header.
+    // `x-cf-agents-subagent-url` is the Agents SDK's sub-agent routing input and
+    // is preferred over the connection's own uri, so a forwarded value diverts
+    // the attach out of the chat protocol chain entirely (bye instead of
+    // identity/state/history). The route must not forward it.
     const response = await SELF.fetch(
-      `http://example/agents/chat-thread/${threadId}/v2/events?workspaceId=${workspaceId}&after=0`,
+      `http://example/agents/chat-thread/${threadId}/sse?workspaceId=${workspaceId}&_pk=pk-hdr`,
       {
         headers: {
           Accept: 'text/event-stream',
@@ -131,47 +134,23 @@ describe('Chat transport access guard', () => {
     expect(response.status).toBe(200);
     const reader = response.body!.getReader();
     const first = new TextDecoder().decode((await reader.read()).value);
-    expect(first).toBe(':hb\n\n');
-    const next = new TextDecoder().decode((await reader.read()).value);
-    expect(next).toContain('"type":"hello"');
-    expect(next).not.toContain('"type":"bye"');
+    expect(first).toContain('cf_agent_identity');
+    expect(first).not.toContain('event: bye');
     await reader.cancel();
   });
 
-  it('rejects an unauthenticated V2 message admission', async () => {
+  it('rejects an unauthenticated POST send', async () => {
     const { workspaceId, threadId } = await setupMemberSession();
 
     const response = await SELF.fetch(
-      `http://example/agents/chat-thread/${threadId}/v2/messages?workspaceId=${workspaceId}`,
+      `http://example/agents/chat-thread/${threadId}/call?workspaceId=${workspaceId}&_pk=pk-1`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          clientMessageId: 'message-1',
-          content: 'hello',
-          display: 'hello',
-        }),
+        body: JSON.stringify({ type: 'rpc', id: 'r1', method: 'requestStop', args: [] }),
       },
     );
 
     expect(response.status).toBe(401);
-  });
-
-  it('404s the removed legacy HTTP chat routes', async () => {
-    const { workspaceId, threadId, signedToken } = await setupMemberSession();
-    const headers = { 'X-Chiridion-Session-Id': signedToken };
-
-    const stream = await SELF.fetch(
-      `http://example/agents/chat-thread/${threadId}/sse?workspaceId=${workspaceId}`,
-      { headers },
-    );
-    const call = await SELF.fetch(
-      `http://example/agents/chat-thread/${threadId}/call?workspaceId=${workspaceId}`,
-      { method: 'POST', headers, body: '{}' },
-    );
-
-    expect(stream.status).toBe(404);
-    expect(call.status).toBe(404);
   });
 
   it('404s an /agents/ path that matches no transport route', async () => {

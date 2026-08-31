@@ -10,14 +10,24 @@
 // exists to keep the DO file smaller.
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { LakeStream, ToolCallLakeRecord } from "../lake-streams";
+import type {
+  LakeStream,
+  PiMessageLakeRecord,
+  ToolCallLakeRecord,
+} from "../lake-streams";
 import type { OrgDO, UserDO } from "../auth";
 import type { WorkspaceDO } from "../workspace";
 import type { WorkspaceCronDO } from "../workspace-cron";
 import type { WorkerLogsDO } from "../worker-logs-do";
 import type { WorkspaceFilesystemEnv } from "../workspace-filesystem-do";
-import type { ChatThreadRuntimeDO } from "./chat-thread-runtime-do";
+import type {
+  PendingConnectionSetupPromptData,
+  PendingQuestionInfo,
+} from "../chat-thread-browser-prompts";
+import type { ChatThreadDO } from "../chat-thread-do";
+import type { ChatAgentStatePayload } from "../../../../src/lib/chat-agent-state";
 import type { RuntimeCallArtifact } from "../../../../src/lib/runtime-artifacts";
+import type { LlmModel } from "../../../../src/types";
 
 export type PreviewTarget =
   | {
@@ -90,16 +100,14 @@ export interface ChatEnv extends WorkspaceFilesystemEnv {
   // Main app static assets. Notebook deploys read the pre-built renderer SPA
   // from /notebook-renderer/ to synthesize published-notebook workers.
   ASSETS?: Fetcher;
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadRuntimeDO>;
+  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   ORG: DurableObjectNamespace<OrgDO>;
   USER: DurableObjectNamespace<UserDO>;
   WORKSPACE: DurableObjectNamespace<WorkspaceDO>;
   WORKSPACE_CRON?: DurableObjectNamespace<WorkspaceCronDO>;
   DETERMINISTIC_AUTOMATION_WORKFLOWS?: Workflow;
   WORKER_LOGS?: DurableObjectNamespace<WorkerLogsDO>;
-  PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<
-    import("../project-build-sandbox.js").ProjectBuildSandbox
-  >;
+  PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<import("../project-build-sandbox.js").ProjectBuildSandbox>;
   MCP_OBJECT: DurableObjectNamespace;
   APP_KV: KVNamespace;
   R2_BUCKET: R2Bucket;
@@ -142,7 +150,9 @@ export interface ChatEnv extends WorkspaceFilesystemEnv {
   CODE_MODE_LOADER?: WorkerLoader;
   OBSERVABILITY_EVENTS?: AnalyticsEngineDataset;
   ERROR_ANALYTICS?: AnalyticsEngineDataset;
-  // Best-effort code-mode tool timings. Never owns turn completion.
+  // Transcript data lake streams (Cloudflare Pipelines -> R2 Data Catalog).
+  // Optional everywhere: absent bindings disable export, they never fail a turn.
+  TRANSCRIPT_LAKE?: LakeStream<PiMessageLakeRecord>;
   TOOL_CALLS_LAKE?: LakeStream<ToolCallLakeRecord>;
   CF_ZONE_ID?: string;
   CF_API_TOKEN?: string;
@@ -166,6 +176,8 @@ export interface ChatEnv extends WorkspaceFilesystemEnv {
   APP_DB?: D1Database;
   RUN_AGENT_EVALS?: string;
 }
+
+export type ChatAgentEnv = Cloudflare.Env & Omit<ChatEnv, keyof Cloudflare.Env>;
 
 export interface ChatContextState {
   threadId: string;
@@ -195,6 +207,17 @@ export interface ChatThreadForkStateTarget {
   userId?: string | null;
 }
 
+// The Agent-state payload synced to the browser. Structure (field set /
+// nullability / lastError shape) is fixed in the shared module so the DO and the
+// client can't drift; the DO instantiates the generic sub-types with its own
+// worker-side types.
+export type ChatThreadAgentState = ChatAgentStatePayload<
+  PreviewTarget,
+  PendingQuestionInfo,
+  PendingConnectionSetupPromptData,
+  LlmModel
+>;
+
 export interface AdminExplorerThreadSummary {
   userMessageCount: number;
   userMessageCountCapped: boolean;
@@ -213,12 +236,40 @@ export interface ChatThreadPiCoreForkResult {
   code?: "NO_PI_CORE_MESSAGES" | "TARGET_NOT_FOUND";
 }
 
+export interface PiCoreMessageRow {
+  idx: number;
+  payload: string;
+  created_at: number;
+}
+
+export interface PiCoreMessageHistoryRepairReport {
+  ok: true;
+  mode: "dry_run" | "repair";
+  persisted: boolean;
+  changed: boolean;
+  beforeCount: number;
+  validBeforeCount: number;
+  afterCount: number;
+  invalidRows: number;
+  repairedCount: number;
+  stats: {
+    droppedToolResults: number;
+    syntheticToolResults: number;
+    reorderedAssistantBlocks: number;
+  };
+}
+
 export type NormalizedTodoStatus = "pending" | "in_progress" | "completed";
 
 export interface NormalizedTodoItem {
   content: string;
   status: NormalizedTodoStatus;
   activeForm: string;
+}
+
+export interface ChatUserMessageInput {
+  content?: string;
+  clientMessageId?: string;
 }
 
 export interface InitialUserMessageRequest {
@@ -311,4 +362,19 @@ export interface ChatThreadRuntimeStatus {
   pendingQuestionCount: number;
   oldestPendingQuestion: string | null;
   updatedAt: number | null;
+}
+
+export interface CodeModeJavascriptRequest {
+  code: string;
+  orgId: string;
+  workspaceId: string;
+  threadId?: string;
+  userId?: string;
+  toolUseId?: string;
+  timeoutMs?: number | null;
+  maxOutputCharacters?: number | null;
+}
+
+export interface CodeModeJavascriptResult {
+  text: string;
 }

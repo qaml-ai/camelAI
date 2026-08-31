@@ -1,10 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import {
-  codeModeWorkerModule,
-  CODE_MODE_MAX_NESTED_TOOL_CALLS,
-  prepareCodeModeUserCode,
-  stripTypeScriptFromUserCode,
-} from '../src/code-mode-runner';
+import { codeModeWorkerModule, prepareCodeModeUserCode, stripTypeScriptFromUserCode } from '../src/code-mode-runner';
 
 function createConnectionsFacade(binding: any): Record<string, unknown> {
   const legacyInvokeMethod = ['_', '_', 'invoke'].join('');
@@ -227,30 +222,11 @@ describe('code mode runner js_exec module', () => {
   it('enforces the wall-clock timeout inside the loaded worker invocation', () => {
     const source = codeModeWorkerModule('await tools.analysis_exec({ command: "sleep 600" });');
 
-    expect(source).toContain('async run(timeoutMs, maxTimeoutMs, maxOutputCharacters, maxNestedToolCalls)');
+    expect(source).toContain('async run(timeoutMs, maxTimeoutMs)');
     expect(source).toContain('const result = await Promise.race([');
     expect(source).toContain('error.name = "CodeModeTimeoutError"');
     expect(source).toContain('Do not retry this js_exec in the same turn.');
     expect(source).toContain('if (timeoutHandle) clearTimeout(timeoutHandle)');
-  });
-
-  it('bounds retained output and nested registered tool calls inside the worker', () => {
-    const { createOutputBuffer, createNestedToolBudget } = loadGeneratedBoundHelpers();
-    const output = createOutputBuffer(1_000);
-    output.push('x'.repeat(2_000));
-    output.push('y'.repeat(2_000));
-    expect(output.text()).toContain('[Truncated: 1000 of 4001 characters]');
-    expect(output.text().length).toBeLessThanOrEqual(1_000);
-
-    const invoke = vi.fn(() => 'ok');
-    const nested = createNestedToolBudget(Number.MAX_SAFE_INTEGER);
-    for (let index = 0; index < CODE_MODE_MAX_NESTED_TOOL_CALLS; index += 1) {
-      expect(nested(invoke)).toBe('ok');
-    }
-    expect(() => nested(invoke)).toThrow(
-      `Nested tool-call limit reached (${CODE_MODE_MAX_NESTED_TOOL_CALLS})`,
-    );
-    expect(invoke).toHaveBeenCalledTimes(CODE_MODE_MAX_NESTED_TOOL_CALLS);
   });
 
   it('does not pass runtime helper names as runUserCode parameters', () => {
@@ -423,28 +399,6 @@ function loadGeneratedRuntimeErrorHelpers(userCode = ''): {
   expect(end).toBeGreaterThan(start);
   const slice = source.slice(start, end);
   return new Function(`${slice}; return { formatRuntimeError, USER_CODE_START_LINE, USER_CODE_END_LINE };`)();
-}
-
-function loadGeneratedBoundHelpers(): {
-  createOutputBuffer: (limit: number) => {
-    push(value: unknown): void;
-    empty(): boolean;
-    text(): string;
-  };
-  createNestedToolBudget: (limit: number) => <T>(invoke: () => T) => T;
-} {
-  const source = codeModeWorkerModule('');
-  const start = source.indexOf('function createOutputBuffer');
-  const end = source.indexOf('\n\nfunction createOutputConsole', start);
-  const constantsStart = source.indexOf('const DEFAULT_MAX_OUTPUT_CHARACTERS');
-  const constantsEnd = source.indexOf('const store = new Map()', constantsStart);
-  expect(start).toBeGreaterThanOrEqual(0);
-  expect(end).toBeGreaterThan(start);
-  expect(constantsStart).toBeGreaterThanOrEqual(0);
-  expect(constantsEnd).toBeGreaterThan(constantsStart);
-  return new Function(
-    `${source.slice(constantsStart, constantsEnd)}${source.slice(start, end)}; return { createOutputBuffer, createNestedToolBudget };`,
-  )();
 }
 
 function loadGeneratedToolSearch(): {
@@ -747,7 +701,7 @@ describe('empty js_exec output', () => {
     // name the if/else pitfall since block-final scripts are the common cause.
     expect(source).toContain('js_exec completed: no return value and no console output');
     expect(source).toContain('expressions inside if/else or loop blocks are not');
-    expect(source).toMatch(/if \(output\.empty\(\)\)/);
+    expect(source).toMatch(/if \(output\.length === 0\)/);
   });
 
   it('auto-return still skips block-closing final lines (the pitfall the message covers)', () => {

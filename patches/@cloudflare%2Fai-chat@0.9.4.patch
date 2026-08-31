@@ -1,0 +1,528 @@
+diff --git a/dist/index.d.ts b/dist/index.d.ts
+index 4c78cfd00e1b7ac8df16f5b4b405e297d8aea9cc..5736c01c330138b0c59e7a32492bdf02ee35835e 100644
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -51,6 +51,19 @@ type ChatRecoveryContinueData = {
+   lastClientTools?: ClientToolSchema$1[] | null;
+ };
+ type ChatMessage = UIMessage;
++type RenderHistoryWindowConfig = {
++  /** Maximum number of render messages kept resident in the Durable Object. */
++  maxMessages: number;
++  /** Maximum serialized message bytes kept resident in the Durable Object. */
++  maxBytes: number;
++};
++type RenderHistoryPage = {
++  /** Messages in oldest-to-newest render order. */
++  messages: UIMessage[];
++  /** Immutable chronology cursor; older pages overlap the boundary row. */
++  nextCursor: string | null;
++  hasMore: boolean;
++};
+ /**
+  * Options passed to the onChatMessage handler.
+  */
+@@ -263,6 +276,26 @@ declare class AIChatAgent<
+    * @internal
+    */
+   private _persistedMessageCache;
++  private _renderHistoryWindowConfig;
++  private _ensureRenderHistoryMetadata;
++  private _selectRenderHistoryRows;
++  private _parseRenderHistoryRows;
++  private _upsertRenderHistoryMessage;
++  /** Assign canonical chronology before a historical row becomes pageable. */
++  protected _setRenderHistoryChronology(id: string, createdAt: string): void;
++  /**
++   * Optional subclass-level resident render-history budget. This must be static
++   * because the base constructor loads history before subclass fields run.
++   * Durable rows outside the window remain in SQLite and are available through
++   * `getRenderHistoryPage`.
++   */
++  static renderHistoryWindow?: RenderHistoryWindowConfig;
++  /** Read a bounded cursor page without adding older rows to resident state. */
++  protected getRenderHistoryPage(options?: {
++    beforeCursor?: string | null;
++    maxMessages?: number;
++    maxBytes?: number;
++  }): RenderHistoryPage;
+   /**
+    * Shared auto-continuation barrier (#1649 / #1650): owns the coalesce timer
+    * and the double-fire guard. Parameterized by this agent's stream-active
+@@ -458,6 +491,56 @@ declare class AIChatAgent<
+   /** @internal Delegate to _resumableStream. Also advances the recovery
+    *  progress counter at production time (see `_maybeBumpRecoveryProgress`). */
+   protected _storeStreamChunk(streamId: string, body: string): Promise<void>;
++  /**
++   * Whether this chunk must stay OUT of the replay buffer: a transient data
++   * chunk (nothing to replay) or a stream past its byte ceiling (degraded).
++   * Live delivery is unaffected — callers broadcast separately from storing.
++   */
++  protected _shouldSkipStreamChunkStorage(streamId: string, body: string): boolean;
++  /**
++   * Bytes one chunk costs ON DISK once `flushBuffer` packs it — the escaped form
++   * plus array punctuation, i.e. an upper bound on the packed row bytes for every
++   * segment shape. Keeps the live tally and the restore-time
++   * `sum(length(cast(body as blob)))` recompute in the same currency, so the two
++   * can never disagree about whether a stream's replay buffer was capped.
++   */
++  protected _streamChunkStoredCost(body: string): number;
++  /** Top-level `{"transient":true}` on a `data-*` chunk: applied live, never
++   *  worth replaying. Fails open on anything unparseable. */
++  protected _isTransientStreamChunk(body: string): boolean;
++  /** Cumulative stored bytes per stream id; cleared on `_startStream`. */
++  private _streamStoredBytes;
++  private _streamStoredBytesMap;
++  /** Stored bytes for a stream, computed from SQLite the first time the stream
++   *  is seen (re-detects a degraded stream adopted by restore) and tracked
++   *  incrementally after that. */
++  protected _streamStoredBytesFor(streamId: string): number;
++  /** Stream ids whose replay buffer is capped; cleared on `_startStream`. */
++  private _replayDegradedStreams;
++  /**
++   * Whether a stream's replay buffer is incomplete, so replaying it would show
++   * the client a truncated turn. Settles an unknown stream from stored bytes,
++   * so it answers correctly after hibernation.
++   */
++  protected _isStreamReplayDegraded(streamId: string | null): boolean;
++  protected _markStreamReplayDegraded(streamId: string, storedBytes: number): void;
++  /**
++   * Called ONCE per stream when its replay buffer hits the ceiling. Hosts
++   * override to record telemetry; the default logs.
++   */
++  protected _onStreamReplayDegraded(info: {
++    streamId: string;
++    storedBytes: number;
++    limitBytes: number;
++  }): void;
++  /** Per-instance replay-buffer ceiling override (tests). */
++  protected _streamReplayMaxStoredBytesOverride?: number;
++  protected _streamReplayMaxStoredBytes(): number;
++  /**
++   * Host-level replay-buffer ceiling in bytes. Static because the funnel runs
++   * before subclass fields are initialized.
++   */
++  static streamReplayMaxStoredBytes?: number;
+   /** Per-isolate throttle for crediting recovery progress from mid-segment
+    *  streaming-content deltas (the shared `agents/chat` rule); reset per isolate
+    *  so the first delta after a restart always credits. */
+@@ -1600,6 +1683,8 @@ declare class AIChatAgent<
+ export {
+   AIChatAgent,
+   ChatMessage,
++  type RenderHistoryPage,
++  type RenderHistoryWindowConfig,
+   type ChatRecoveryConfig,
+   type ChatRecoveryContext,
+   type ChatRecoveryExhaustedContext,
+diff --git a/dist/index.js b/dist/index.js
+index 2aceaf4f6f9364cf972a6cfcb3c3446c35d37f03..9a716890d1371151f20267d43969642c700c3311 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -40,6 +40,17 @@ function isValidMessageStructure(msg) {
+ const decoder = new TextDecoder();
+ const agentToolChunkEncoder = new TextEncoder();
+ /**
++* Default ceiling on the bytes ONE stream may keep in its replay buffer.
++* Unbounded buffers are what OOM-kill a chat DO on wake: every resume and every
++* recovery classification materializes the whole buffer at once, and the aged-
++* buffer sweep never gets to run because the read dies first. 16MB is far above
++* any real turn's persisted content (transient tool output is not stored at all,
++* see `_isTransientStreamChunk`) and far below the isolate's memory budget.
++* Override per host via `static streamReplayMaxStoredBytes`.
++*/
++const STREAM_REPLAY_MAX_STORED_BYTES = 16 * 1024 * 1024;
++const streamChunkEncoder = new TextEncoder();
++/**
+ * Extension of Agent with built-in chat capabilities
+ * @template Env Environment type containing bindings
+ */
+@@ -187,8 +198,12 @@ var AIChatAgent = class AIChatAgent extends Agent {
+ 				this.sql`create table if not exists cf_ai_chat_agent_messages (
+               id text primary key,
+               message text not null,
+-              created_at datetime default current_timestamp
++              created_at datetime default current_timestamp,
++              render_seq integer,
++              serialized_bytes integer,
++              chronology_key text
+             )`;
++				if (this._renderHistoryWindowConfig()) this._ensureRenderHistoryMetadata();
+ 				this.sql`create table if not exists cf_ai_chat_request_context (
+               key text primary key,
+               value text not null
+@@ -584,6 +599,8 @@ var AIChatAgent = class AIChatAgent extends Agent {
+ 	}
+ 	/** @internal Delegate to _resumableStream */
+ 	_startStream(requestId, options = {}) {
++		this._streamStoredBytes?.clear();
++		this._replayDegradedStreams?.clear();
+ 		const streamId = this._resumableStream.start(requestId, options);
+ 		this._preStream.flushOnStreamStart((c) => this._notifyStreamResuming(c));
+ 		if (this._continuation.pending?.requestId === requestId) {
+@@ -631,13 +648,149 @@ var AIChatAgent = class AIChatAgent extends Agent {
+ 	/** @internal Delegate to _resumableStream. Also advances the recovery
+ 	*  progress counter at production time (see `_maybeBumpRecoveryProgress`). */
+ 	async _storeStreamChunk(streamId, body) {
+-		this._resumableStream.storeChunk(streamId, body);
++		if (!this._shouldSkipStreamChunkStorage(streamId, body)) this._resumableStream.storeChunk(streamId, body);
+ 		let type;
+ 		try {
+ 			type = JSON.parse(body).type;
+ 		} catch {}
+ 		await this._maybeBumpRecoveryProgress(type);
+ 	}
++	/**
++	* Whether this chunk must stay OUT of the replay buffer. Live clients are
++	* unaffected either way — every caller broadcasts separately from storing.
++	* Both reasons bound what one buffer read can ever materialize:
++	*   - a transient data chunk appends no message part on the client, so
++	*     replaying it is pure waste (see {@link _isTransientStreamChunk});
++	*   - past the byte ceiling the stream is marked degraded and stops storing,
++	*     so a resume attaches to live instead of replaying (the host repairs the
++	*     gap from persisted history).
++	* The ceiling is re-tested AFTER the tally is advanced, not only before the
++	* next store: a turn that ends on the chunk that fills the buffer would
++	* otherwise be reported healthy by this isolate and degraded by the
++	* post-eviction recompute, so a resume would replay a buffer at capacity as if
++	* it were guaranteed complete.
++	* Fails OPEN: anything unrecognized or unreadable is stored as before.
++	* @internal
++	*/
++	_shouldSkipStreamChunkStorage(streamId, body) {
++		if (this._isTransientStreamChunk(body)) return true;
++		const limit = this._streamReplayMaxStoredBytes();
++		const stored = this._streamStoredBytesFor(streamId);
++		if (stored >= limit) {
++			this._markStreamReplayDegraded(streamId, stored);
++			return true;
++		}
++		const next = stored + this._streamChunkStoredCost(body);
++		this._streamStoredBytesMap().set(streamId, next);
++		if (next >= limit) this._markStreamReplayDegraded(streamId, next);
++		return false;
++	}
++	/**
++	* What one chunk costs in the currency the RESTORE-time recompute uses: bytes
++	* on disk. `flushBuffer` packs 2-10 bodies into `JSON.stringify(bodies)`, which
++	* re-escapes every quote and backslash inside each body, so the raw body length
++	* is 20-30% short of what actually lands in SQLite — and the same stream would
++	* then get one verdict from the live tally and a different one from the
++	* `sum(length(cast(body as blob)))` recompute after an eviction, flipping a
++	* never-capped buffer to degraded (or, in the other direction, replaying a
++	* truncated buffer as if complete).
++	*
++	* Counting the ESCAPED form plus 2 bytes of array punctuation is an upper bound
++	* on the packed row bytes for every segment shape: a packed segment of N bodies
++	* costs sum(escaped) + N + 1 on disk against sum(escaped) + 2N here, and a lone
++	* chunk is stored RAW, which is smaller still. So the ceiling can never be
++	* overshot on disk, and a recompute can only ever agree or under-count — never
++	* declare a capped buffer healthy. (It also absorbs the opposite skew from
++	* `storeChunk` silently dropping a chunk over its own per-chunk ceiling after
++	* this tally already counted it.)
++	* @internal
++	*/
++	_streamChunkStoredCost(body) {
++		return streamChunkEncoder.encode(JSON.stringify(body)).byteLength + 2;
++	}
++	/**
++	* A chunk the client applies live and then forgets: top-level
++	* `{"transient":true}` on a `data-*` part (streaming tool output tails,
++	* heartbeats). The settled value arrives in the part's final chunk, so replay
++	* only re-sends bytes the client throws away.
++	* @internal
++	*/
++	_isTransientStreamChunk(body) {
++		if (typeof body !== "string" || !body.includes("\"transient\":true")) return false;
++		try {
++			const parsed = JSON.parse(body);
++			return parsed?.transient === true && typeof parsed.type === "string" && parsed.type.startsWith("data-");
++		} catch {
++			return false;
++		}
++	}
++	/** @internal */
++	_streamStoredBytesMap() {
++		return this._streamStoredBytes ??= /* @__PURE__ */ new Map();
++	}
++	/**
++	* Bytes already stored for a stream. Computed from SQLite the first time a
++	* stream is seen — which is what re-detects a degraded stream ADOPTED BY
++	* RESTORE after an eviction, without reading a single body into memory — and
++	* tracked incrementally from then on.
++	* @internal
++	*/
++	_streamStoredBytesFor(streamId) {
++		const bytesByStream = this._streamStoredBytesMap();
++		const known = bytesByStream.get(streamId);
++		if (known !== void 0) return known;
++		let stored = 0;
++		try {
++			const rows = this.sql`
++        select sum(length(cast(body as blob))) as bytes from cf_ai_chat_stream_chunks
++        where stream_id = ${streamId}
++      `;
++			const bytes = rows?.[0]?.bytes;
++			if (typeof bytes === "number" && Number.isFinite(bytes)) stored = bytes;
++		} catch {}
++		bytesByStream.set(streamId, stored);
++		if (stored >= this._streamReplayMaxStoredBytes()) this._markStreamReplayDegraded(streamId, stored);
++		return stored;
++	}
++	/**
++	* Whether a stream's replay buffer is incomplete (capped). Settles an unknown
++	* stream from stored bytes, so this answers correctly for a stream restored
++	* after hibernation — callers use it to skip chunk replay entirely.
++	* @internal
++	*/
++	_isStreamReplayDegraded(streamId) {
++		if (!streamId) return false;
++		if (this._replayDegradedStreams?.has(streamId)) return true;
++		this._streamStoredBytesFor(streamId);
++		return this._replayDegradedStreams?.has(streamId) === true;
++	}
++	/** @internal */
++	_markStreamReplayDegraded(streamId, storedBytes) {
++		const degraded = this._replayDegradedStreams ??= /* @__PURE__ */ new Set();
++		if (degraded.has(streamId)) return;
++		degraded.add(streamId);
++		try {
++			this._onStreamReplayDegraded({
++				streamId,
++				storedBytes,
++				limitBytes: this._streamReplayMaxStoredBytes()
++			});
++		} catch {}
++	}
++	/**
++	* Called ONCE per stream when its replay buffer hits the ceiling. Hosts
++	* override to record telemetry; the default keeps the signal in logs.
++	* @internal
++	*/
++	_onStreamReplayDegraded({ streamId, storedBytes, limitBytes }) {
++		console.warn(`[AIChatAgent] stream ${streamId} exceeded the replay buffer ceiling (${storedBytes} >= ${limitBytes} bytes); further chunks are not stored and resumes attach to live instead of replaying.`);
++	}
++	/** @internal Effective replay-buffer ceiling: per-instance override (tests),
++	*  then the host subclass's static, then {@link STREAM_REPLAY_MAX_STORED_BYTES}. */
++	_streamReplayMaxStoredBytes() {
++		const override = this._streamReplayMaxStoredBytesOverride ?? this.constructor.streamReplayMaxStoredBytes;
++		return Number.isFinite(override) && override > 0 ? Math.floor(override) : STREAM_REPLAY_MAX_STORED_BYTES;
++	}
+ 	/** Advance the recovery-progress counter when a chunk represents genuinely
+ 	*  new produced content. Uses the shared host-agnostic rule
+ 	*  ({@link shouldCreditStreamProgress}): a milestone (started segment / settled
+@@ -881,8 +1034,80 @@ var AIChatAgent = class AIChatAgent extends Agent {
+ 		});
+ 	}
+ 	_loadMessagesFromDb() {
+-		const rows = this.sql`select * from cf_ai_chat_agent_messages order by created_at` || [];
+-		this._persistedMessageCache.clear();
++		const limits = this._renderHistoryWindowConfig();
++		if (limits) return this._parseRenderHistoryRows(this._selectRenderHistoryRows(null, limits).rows, true);
++		const rows = this.sql`select id, message from cf_ai_chat_agent_messages order by created_at` || [];
++		return this._parseRenderHistoryRows(rows, true);
++	}
++	_renderHistoryWindowConfig() {
++		const config = this.constructor.renderHistoryWindow;
++		if (!config || !Number.isFinite(config.maxMessages) || !Number.isFinite(config.maxBytes)) return null;
++		return {
++			maxMessages: Math.max(1, Math.floor(config.maxMessages)),
++			maxBytes: Math.max(1, Math.floor(config.maxBytes))
++		};
++	}
++	_ensureRenderHistoryMetadata() {
++		this.sql`create table if not exists cf_ai_chat_render_history_meta (
++      key text primary key,
++      value integer not null
++    )`;
++		const migrated = (this.sql`select value from cf_ai_chat_render_history_meta where key = 'metadata_v1' limit 1` || [])[0];
++		if (migrated?.value === 1) return;
++		const columns = new Set((this.sql`pragma table_info(cf_ai_chat_agent_messages)` || []).map((row) => row.name));
++		if (!columns.has("render_seq")) this.sql`alter table cf_ai_chat_agent_messages add column render_seq integer`;
++		if (!columns.has("serialized_bytes")) this.sql`alter table cf_ai_chat_agent_messages add column serialized_bytes integer`;
++		if (!columns.has("chronology_key")) this.sql`alter table cf_ai_chat_agent_messages add column chronology_key text`;
++		this.sql`update cf_ai_chat_agent_messages set render_seq = rowid where render_seq is null`;
++		this.sql`update cf_ai_chat_agent_messages set serialized_bytes = length(cast(message as blob)) where serialized_bytes is null`;
++		this.sql`update cf_ai_chat_agent_messages set chronology_key = created_at || ':' || printf('%020d', render_seq) || ':' || id where chronology_key is null`;
++		this.sql`create unique index if not exists cf_ai_chat_agent_messages_render_seq on cf_ai_chat_agent_messages(render_seq)`;
++		this.sql`create unique index if not exists cf_ai_chat_agent_messages_chronology on cf_ai_chat_agent_messages(chronology_key)`;
++		this.sql`insert or replace into cf_ai_chat_render_history_meta (key, value) values ('metadata_v1', 1)`;
++	}
++	_selectRenderHistoryRows(beforeCursor, limits) {
++		const metadataLimit = limits.maxMessages + 1;
++		const encodedCursor = beforeCursor == null ? null : String(beforeCursor);
++		const cursorInclusive = encodedCursor?.startsWith("i:") === true;
++		const cursorKey = encodedCursor == null ? null : encodedCursor.startsWith("i:") || encodedCursor.startsWith("e:") ? encodedCursor.slice(2) : encodedCursor;
++		const metadata = (cursorKey == null ? this.sql`
++      select id, render_seq, chronology_key, coalesce(serialized_bytes, length(cast(message as blob))) as serialized_bytes
++      from cf_ai_chat_agent_messages
++      order by chronology_key desc
++      limit ${metadataLimit}
++    ` : cursorInclusive ? this.sql`
++      select id, render_seq, chronology_key, coalesce(serialized_bytes, length(cast(message as blob))) as serialized_bytes
++      from cf_ai_chat_agent_messages
++      where chronology_key <= ${cursorKey}
++      order by chronology_key desc
++      limit ${metadataLimit}
++    ` : this.sql`
++      select id, render_seq, chronology_key, coalesce(serialized_bytes, length(cast(message as blob))) as serialized_bytes
++      from cf_ai_chat_agent_messages
++      where chronology_key < ${cursorKey}
++      order by chronology_key desc
++      limit ${metadataLimit}
++    `) || [];
++		const selected = [];
++		let bytes = 0;
++		for (const row of metadata) {
++			const rowBytes = Math.max(0, Number(row.serialized_bytes) || 0);
++			if (selected.length > 0 && (selected.length >= limits.maxMessages || bytes + rowBytes > limits.maxBytes)) break;
++			selected.push(row);
++			bytes += rowBytes;
++		}
++		const rows = [];
++		for (const row of selected) {
++			const body = (this.sql`select id, message from cf_ai_chat_agent_messages where id = ${row.id} limit 1` || [])[0];
++			if (body) rows.push({ ...body, chronology_key: row.chronology_key });
++		}
++		rows.sort((a, b) => String(a.chronology_key).localeCompare(String(b.chronology_key)));
++		const hasMore = metadata.length > selected.length;
++		const nextCursor = hasMore && selected.length > 0 ? `${beforeCursor == null || selected.length > 1 ? "i" : "e"}:${String(selected[selected.length - 1].chronology_key)}` : null;
++		return { rows, nextCursor, hasMore };
++	}
++	_parseRenderHistoryRows(rows, populateCache) {
++		if (populateCache) this._persistedMessageCache.clear();
+ 		return rows.map((row) => {
+ 			try {
+ 				const messageStr = row.message;
+@@ -891,7 +1116,7 @@ var AIChatAgent = class AIChatAgent extends Agent {
+ 					console.warn(`[AIChatAgent] Skipping invalid message ${row.id}: missing or malformed id, role, or parts`);
+ 					return null;
+ 				}
+-				this._persistedMessageCache.set(parsed.id, messageStr);
++				if (populateCache) this._persistedMessageCache.set(parsed.id, messageStr);
+ 				return parsed;
+ 			} catch (error) {
+ 				console.error(`Failed to parse message ${row.id}:`, error);
+@@ -899,6 +1124,59 @@ var AIChatAgent = class AIChatAgent extends Agent {
+ 			}
+ 		}).filter((msg) => msg !== null);
+ 	}
++	getRenderHistoryPage(options = {}) {
++		const configured = this._renderHistoryWindowConfig();
++		if (!configured) {
++			const rows = this.sql`select id, message from cf_ai_chat_agent_messages order by created_at` || [];
++			return {
++				messages: autoTransformMessages(this._parseRenderHistoryRows(rows, false)),
++				nextCursor: null,
++				hasMore: false
++			};
++		}
++		const beforeCursor = options.beforeCursor == null ? null : String(options.beforeCursor);
++		const limits = {
++			maxMessages: Math.max(1, Math.min(configured.maxMessages, Math.floor(options.maxMessages ?? configured.maxMessages))),
++			maxBytes: Math.max(1, Math.min(configured.maxBytes, Math.floor(options.maxBytes ?? configured.maxBytes)))
++		};
++		const page = this._selectRenderHistoryRows(beforeCursor, limits);
++		return {
++			messages: autoTransformMessages(this._parseRenderHistoryRows(page.rows, false)),
++			nextCursor: page.nextCursor,
++			hasMore: page.hasMore
++		};
++	}
++	_upsertRenderHistoryMessage(id, json) {
++		if (!this._renderHistoryWindowConfig()) {
++			this.sql`
++        insert into cf_ai_chat_agent_messages (id, message)
++        values (${id}, ${json})
++        on conflict(id) do update set message = excluded.message
++      `;
++			return;
++		}
++		this.sql`
++      insert into cf_ai_chat_agent_messages (id, message, render_seq, serialized_bytes, chronology_key)
++      values (
++        ${id},
++        ${json},
++        (select coalesce(max(render_seq), 0) + 1 from cf_ai_chat_agent_messages),
++        length(cast(${json} as blob)),
++        current_timestamp || ':' || printf('%020d', (select coalesce(max(render_seq), 0) + 1 from cf_ai_chat_agent_messages)) || ':' || ${id}
++      )
++      on conflict(id) do update set
++        message = excluded.message,
++        serialized_bytes = excluded.serialized_bytes
++    `;
++	}
++	_setRenderHistoryChronology(id, createdAt) {
++		this.sql`
++      update cf_ai_chat_agent_messages
++      set created_at = ${createdAt},
++          chronology_key = ${createdAt} || ':' || printf('%020d', render_seq) || ':' || id
++      where id = ${id}
++    `;
++	}
+ 	async _tryCatchChat(fn) {
+ 		try {
+ 			return await fn();
+@@ -2894,20 +3172,17 @@ var AIChatAgent = class AIChatAgent extends Agent {
+ 			const safe = this._enforceRowSizeLimit(resolved);
+ 			const json = JSON.stringify(safe);
+ 			if (this._persistedMessageCache.get(safe.id) === json) continue;
+-			this.sql`
+-        insert into cf_ai_chat_agent_messages (id, message)
+-        values (${safe.id}, ${json})
+-        on conflict(id) do update set message = excluded.message
+-      `;
++			this._upsertRenderHistoryMessage(safe.id, json);
+ 			this._persistedMessageCache.set(safe.id, json);
+ 		}
+ 		if (options?._deleteStaleRows) {
+ 			const serverIds = new Set(this.messages.map((m) => m.id));
+ 			if (mergedMessages.every((m) => serverIds.has(m.id))) {
+ 				const keepIds = new Set(mergedMessages.map((m) => m.id));
+-				const staleIds = (this.sql`
++				const candidates = this._renderHistoryWindowConfig() ? this.messages.map((message) => message.id) : (this.sql`
+             select id from cf_ai_chat_agent_messages
+-          ` || []).map((row) => row.id).filter((id) => !keepIds.has(id));
++          ` || []).map((row) => row.id);
++				const staleIds = candidates.filter((id) => !keepIds.has(id));
+ 				this._deleteMessagesByIds(staleIds);
+ 			}
+ 		}
+@@ -2915,7 +3190,7 @@ var AIChatAgent = class AIChatAgent extends Agent {
+ 		const persisted = this._loadMessagesFromDb();
+ 		this.messages = autoTransformMessages(persisted);
+ 		this._broadcastChatMessage({
+-			messages: mergedMessages,
++			messages: this._renderHistoryWindowConfig() ? this.messages : mergedMessages,
+ 			type: MessageType.CF_AGENT_CHAT_MESSAGES
+ 		}, excludeBroadcastIds);
+ 	}
+@@ -3157,8 +3432,13 @@ var AIChatAgent = class AIChatAgent extends Agent {
+ 				});
+ 				const safe = this._enforceRowSizeLimit(updatedMessage);
+ 				const json = JSON.stringify(safe);
+-				this.sql`
+-          update cf_ai_chat_agent_messages 
++				if (this._renderHistoryWindowConfig()) this.sql`
++          update cf_ai_chat_agent_messages
++          set message = ${json}, serialized_bytes = length(cast(${json} as blob))
++          where id = ${message.id}
++        `;
++				else this.sql`
++          update cf_ai_chat_agent_messages
+           set message = ${json}
+           where id = ${message.id}
+         `;
+@@ -3376,11 +3656,7 @@ var AIChatAgent = class AIChatAgent extends Agent {
+ 					};
+ 					const sanitized = this._sanitizeMessageForPersistence(snapshot);
+ 					const json = JSON.stringify(sanitized);
+-					this.sql`
+-                INSERT INTO cf_ai_chat_agent_messages (id, message)
+-                VALUES (${sanitized.id}, ${json})
+-                ON CONFLICT(id) DO UPDATE SET message = excluded.message
+-              `;
++					this._upsertRenderHistoryMessage(sanitized.id, json);
+ 					this._approvalPersistedMessageId = sanitized.id;
+ 				}
+ 				if ((data.type === "tool-output-available" || data.type === "tool-output-error") && data.toolCallId) {

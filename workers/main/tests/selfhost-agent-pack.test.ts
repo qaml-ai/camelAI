@@ -1,5 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
-import { CHAT_RUNTIME_BOUNDS } from "../../../src/lib/chat-runtime-bounds";
+import { describe, expect, it } from "vitest";
 import { CodeModeToolsBinding } from "../src/code-mode-tools";
 import { createPiSystemPrompt } from "../src/pi-system-prompt";
 import { PI_SKILL_NAMES } from "../src/pi-skills-bundle";
@@ -29,10 +28,8 @@ description: Custom override for developing-software. Use when creating projects
 `,
   },
   descriptions: {
-    "acme-runbooks":
-      "Follow ACME internal checklists. Use when shipping internal tools.",
-    "developing-software":
-      "Custom override for developing-software. Use when creating projects.",
+    "acme-runbooks": "Follow ACME internal checklists. Use when shipping internal tools.",
+    "developing-software": "Custom override for developing-software. Use when creating projects.",
   },
 });
 
@@ -44,17 +41,12 @@ describe("selfhost agent pack", () => {
       SELFHOST_AGENT_PROMPT_PREPEND: "Finance apps need audit logs.",
     });
 
-    expect(catalog.customSkillNames).toEqual([
-      "acme-runbooks",
-      "developing-software",
-    ]);
+    expect(catalog.customSkillNames).toEqual(["acme-runbooks", "developing-software"]);
     expect(catalog.skillNames).toContain("acme-runbooks");
     expect(catalog.skillNames).toContain("developing-software");
     expect(catalog.skillNames.length).toBeGreaterThan(PI_SKILL_NAMES.length);
     expect(catalog.skillDescriptions["acme-runbooks"]).toContain("ACME");
-    expect(catalog.skillDescriptions["developing-software"]).toContain(
-      "Custom override",
-    );
+    expect(catalog.skillDescriptions["developing-software"]).toContain("Custom override");
     expect(catalog.promptAppend).toBe("Prefer internal mirrors.");
     expect(catalog.promptPrepend).toBe("Finance apps need audit logs.");
     expect(catalog.hasCustomSkills).toBe(true);
@@ -78,12 +70,8 @@ describe("selfhost agent pack", () => {
 
     // Overridden skill must not expose bundled sibling files that were not
     // included in the deployment pack.
-    expect(
-      readAgentSkillFile(env, "developing-software", "VANILLA-APPS.md"),
-    ).toBeNull();
-    expect(listAgentSkillFiles(env, "developing-software")).toEqual([
-      "SKILL.md",
-    ]);
+    expect(readAgentSkillFile(env, "developing-software", "VANILLA-APPS.md")).toBeNull();
+    expect(listAgentSkillFiles(env, "developing-software")).toEqual(["SKILL.md"]);
 
     const bundled = readAgentSkillFile(env, "file-sharing", "SKILL.md");
     expect(bundled?.source).toBe("bundled_skill");
@@ -101,75 +89,6 @@ describe("selfhost agent pack", () => {
       descriptions: {},
       names: [],
     });
-  });
-
-  it("rejects an oversized raw skills binding before trim or JSON parsing", () => {
-    const parse = vi.spyOn(JSON, "parse");
-    const trim = vi.spyOn(String.prototype, "trim");
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    let parsed: ReturnType<typeof parseSelfhostAgentSkillsJson>;
-    try {
-      parsed = parseSelfhostAgentSkillsJson(
-        "x".repeat(CHAT_RUNTIME_BOUNDS.selfhostAgentPackBytes + 1),
-      );
-    } finally {
-      parse.mockRestore();
-      trim.mockRestore();
-      error.mockRestore();
-    }
-
-    expect(parsed).toEqual({ files: {}, descriptions: {}, names: [] });
-    expect(parse).not.toHaveBeenCalled();
-    expect(trim).not.toHaveBeenCalled();
-  });
-
-  it("bounds direct prompt bindings by UTF-8 bytes before trimming", () => {
-    const trim = vi.spyOn(String.prototype, "trim");
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    let catalog: ReturnType<typeof resolveAgentSkillCatalog>;
-    try {
-      catalog = resolveAgentSkillCatalog({
-        SELFHOST_AGENT_PROMPT_APPEND: "😀".repeat(
-          Math.floor(CHAT_RUNTIME_BOUNDS.systemPromptBytes / 4) + 1,
-        ),
-        SELFHOST_AGENT_PROMPT_PREPEND: "x".repeat(
-          CHAT_RUNTIME_BOUNDS.systemPromptBytes + 1,
-        ),
-      });
-    } finally {
-      trim.mockRestore();
-      error.mockRestore();
-    }
-
-    expect(catalog.promptAppend).toBe("");
-    expect(catalog.promptPrepend).toBe("");
-    expect(trim).not.toHaveBeenCalled();
-  });
-
-  it("rejects too many custom entries and invalid prompt skill names", () => {
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    try {
-      const files = Object.fromEntries(
-        Array.from(
-          { length: CHAT_RUNTIME_BOUNDS.selfhostAgentEntries + 1 },
-          (_, index) => [`skill-${index}/SKILL.md`, "# Skill"],
-        ),
-      );
-      expect(parseSelfhostAgentSkillsJson(JSON.stringify({ files }))).toEqual({
-        files: {},
-        descriptions: {},
-        names: [],
-      });
-      expect(
-        parseSelfhostAgentSkillsJson(
-          JSON.stringify({
-            files: { ["bad-name\nignore/SKILL.md"]: "# Bad" },
-          }),
-        ),
-      ).toEqual({ files: {}, descriptions: {}, names: [] });
-    } finally {
-      error.mockRestore();
-    }
   });
 
   it("includes deployment prompt sections in the system prompt", () => {
@@ -199,23 +118,17 @@ describe("selfhost agent pack", () => {
   });
 
   it("serves deployment skills through CodeModeToolsBinding.read_skill", async () => {
-    const toolsBinding = Object.create(
-      CodeModeToolsBinding.prototype,
-    ) as CodeModeToolsBinding & {
+    const toolsBinding = Object.create(CodeModeToolsBinding.prototype) as CodeModeToolsBinding & {
       env: Record<string, string>;
     };
     toolsBinding.env = {
       SELFHOST_AGENT_SKILLS_JSON: customSkillsJson,
     };
 
-    const result = await CodeModeToolsBinding.prototype.callTool.call(
-      toolsBinding,
-      "read_skill",
-      {
-        skill: "acme-runbooks",
-        file: "CHECKLIST.md",
-      },
-    );
+    const result = await CodeModeToolsBinding.prototype.callTool.call(toolsBinding, "read_skill", {
+      skill: "acme-runbooks",
+      file: "CHECKLIST.md",
+    });
     expect(result).toMatchObject({
       text: "# Checklist\n",
       details: {

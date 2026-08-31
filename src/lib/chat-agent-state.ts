@@ -12,7 +12,7 @@
  * source of truth. Imported from both sides like runtime-message-state.
  */
 
-import type { ErrorBlock } from "../types";
+import type { ErrorBlock } from '../types';
 
 /**
  * The most recent terminal error surfaced through Agent state (one-shot by id).
@@ -21,10 +21,10 @@ import type { ErrorBlock } from "../types";
  * is shared via Pick, and the optional narrowed fields become required-but-
  * nullable, widened to what the DO can carry before validation (`billingSource`/
  * `provider` as raw strings, `status` possibly a string). The adapter narrows
- * them back into `ErrorBlock` at read time. The durable
+ * them back into `ErrorBlock` at read time (ui-message-adapter). The durable
  * `data-pi-error` part payload (`PiErrorData`) is an alias of this type.
  */
-export interface ChatAgentTerminalError extends Pick<ErrorBlock, "error"> {
+export interface ChatAgentTerminalError extends Pick<ErrorBlock, 'error'> {
   id: string;
   billingSource: string | null;
   provider: string | null;
@@ -36,13 +36,8 @@ export interface ChatAgentModelFallbackNotice {
   id: string;
   fromModel: string;
   toModel: string;
-  reason: "hosted_credits_exhausted" | "hosted_subscription_unavailable";
+  reason: 'hosted_credits_exhausted' | 'hosted_subscription_unavailable';
   createdAt: number;
-}
-
-export interface ChatAgentLegacyMigrationError {
-  id: string;
-  error: string;
 }
 
 export function shouldShowModelFallbackNotice(
@@ -71,6 +66,5 @@ export interface ChatAgentStatePayload<
   model: Model | null;
   modelUpdatedAt: number | null;
   modelFallbackNotice: ChatAgentModelFallbackNotice | null;
-  legacyMigrationError: ChatAgentLegacyMigrationError | null;
   lastError: ChatAgentTerminalError | null;
 }

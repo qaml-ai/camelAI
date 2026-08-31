@@ -15,7 +15,7 @@ export const CHAT_RUNTIME_CONTROL_ACTIONS = [
 export type ChatRuntimeControlAction =
   (typeof CHAT_RUNTIME_CONTROL_ACTIONS)[number];
 export interface ChatRuntimeCallbacks {
-  kick(scope?: TrustedChatRuntimeScope): void | Promise<void>;
+  kick(): void | Promise<void>;
   control(
     action: ChatRuntimeControlAction,
     payload: unknown,
@@ -352,6 +352,7 @@ export class ChatRuntimeController {
   private publishRun: Promise<void> | null = null;
   private publishDirty = false;
   private liveEpoch: LiveEpoch | null = null;
+  private postOpenKickScheduled = false;
   private reservedSseBytes = 0;
   private storeInstance: DurableChatTurnStore | null = null;
   private readonly storeFactory: () => DurableChatTurnStore;
@@ -500,10 +501,12 @@ export class ChatRuntimeController {
     if (!frame || writer.closed) return;
     writer.frame(frame);
   }
-  private scheduleKick(scope?: TrustedChatRuntimeScope): void {
+  private scheduleKick(once = false): void {
+    if (once && this.postOpenKickScheduled) return;
+    if (once) this.postOpenKickScheduled = true;
     this.ctx.waitUntil(
       Promise.resolve()
-        .then(() => this.callbacks.kick(scope))
+        .then(() => this.callbacks.kick())
         .catch((error) =>
           console.error("[ChatRuntimeController] kick failed", error),
         ),
@@ -607,7 +610,7 @@ export class ChatRuntimeController {
         writer.close();
       }),
     );
-    this.scheduleKick(scope);
+    this.scheduleKick(true);
     return new Response(stream, {
       headers: {
         "Content-Type": "text/event-stream",

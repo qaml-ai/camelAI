@@ -411,13 +411,7 @@ export class ChatThreadRuntimeDO extends DurableObject<ChatEnv> {
       () => this.store,
       (request) => this.trustedScope(request),
       {
-        kick: (scope) => {
-          if (scope) {
-            const error = this.bindContext(scope);
-            if (error) throw new Error(error);
-          }
-          return this.driver.kick(scope);
-        },
+        kick: () => this.driver.kick(),
         control: (action, payload) => this.control(action, payload),
         coarseState: () => this.coarseState(),
       },

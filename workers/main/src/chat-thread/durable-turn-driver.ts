@@ -2,7 +2,7 @@ import { CHAT_RUNTIME_BOUNDS } from "../../../../src/lib/chat-runtime-bounds";
 import { BoundedTurnError } from "./bounded-turn-runner";
 import { DurableChatTurnStore, type DurableChatTurn, type StoreResult } from "./durable-turn-store";
 import type { AutomationRunReport } from "./automation-turn-report";
-import type { LegacyMigrationScope, LegacySessionMigrator } from "./legacy-session-migration";
+import type { LegacySessionMigrator } from "./legacy-session-migration";
 import type { CheckpointProviderBatch, CheckpointToolResult } from "./turn-checkpoint";
 import type { ChatRuntimeContentBlock } from "./chat-runtime-content";
 import type { ChatRuntimeLiveUpdate } from "./chat-runtime-controller";
@@ -71,6 +71,7 @@ export class DurableTurnDriver {
   private ownedAttemptToken: string | null = null;
   private currentAbort: AbortController | null = null;
   private alarmRun: Promise<void> | null = null;
+  private coldWakeSignalled = false;
 
   constructor(private readonly options: DurableTurnDriverOptions) {
     if (CHAT_RUNTIME_BOUNDS.alarmTurnsPerInvocation !== 1) {
@@ -80,11 +81,20 @@ export class DurableTurnDriver {
     this.token = options.token ?? (() => crypto.randomUUID());
   }
 
+  /** Called only after an SSE heartbeat has been enqueued. */
+  afterTransportOpen(): void {
+    if (this.coldWakeSignalled) return;
+    this.coldWakeSignalled = true;
+    this.options.ctx.waitUntil(
+      this.kick().catch((error) =>
+        console.error("[DurableTurnDriver] cold-wake alarm failed", error),
+      ),
+    );
+  }
+
   /** An accelerator only: accepted work is owned by the durable alarm. */
-  async kick(scope?: LegacyMigrationScope): Promise<void> {
-    const now = this.now();
-    await this.setAlarm(now);
-    if (scope) this.options.migrator.requestAfterOpen(scope, now);
+  async kick(): Promise<void> {
+    await this.setAlarm(this.now());
   }
 
   alarm(): Promise<void> {
@@ -160,11 +170,11 @@ export class DurableTurnDriver {
       return;
     }
 
-    // Migration is alarm-owned and starts only after admission or an open request. Its
+    // Migration is alarm-owned and happens only after a durable admission. Its
     // marker is the claim fence: neither a constructor nor an SSE attach reads
     // legacy rows, and a queued turn cannot start while migration is pending.
     await this.setAlarm(now);
-    const migration = await this.options.migrator.runAfterTrigger(
+    const migration = await this.options.migrator.runAfterAdmission(
       now,
       this.token(),
     );

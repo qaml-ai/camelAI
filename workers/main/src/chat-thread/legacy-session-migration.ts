@@ -13,7 +13,6 @@ export interface LegacyMigrationStatus {
   error: string | null;
   changed: boolean;
 }
-export type LegacyMigrationScope = { threadId: string; workspaceId: string; orgId: string };
 
 interface MigrationRow {
   [key: string]: string | number | null;
@@ -721,36 +720,7 @@ export class LegacySessionMigrator {
     );
   }
 
-  requestAfterOpen(scope: LegacyMigrationScope, at: number): LegacyMigrationStatus {
-    const now = Math.max(0, Math.floor(at));
-    if (
-      [scope.threadId, scope.workspaceId, scope.orgId].some(
-        (value) => !value || value.length > CHAT_RUNTIME_BOUNDS.identifierChars,
-      ) || !tableExists(this.sql, "chat_runtime_v2")
-    ) return this.status();
-    this.ensureTable();
-    return this.storage.transactionSync(() => {
-      const existing = migrationRow(this.sql);
-      if (existing) return statusFromRow(existing);
-      const runtime = this.sql.exec<{ thread_id: string | null;
-        workspace_id: string | null; org_id: string | null }>(
-          `SELECT thread_id, workspace_id, org_id FROM chat_runtime_v2 WHERE singleton = 1`,
-        ).one();
-      if (runtime.thread_id &&
-        (runtime.thread_id !== scope.threadId || runtime.workspace_id !== scope.workspaceId ||
-          runtime.org_id !== scope.orgId)) return unseenStatus();
-      this.sql.exec(`UPDATE chat_runtime_v2 SET thread_id = ?, workspace_id = ?, org_id = ?
-        WHERE singleton = 1`, scope.threadId, scope.workspaceId, scope.orgId);
-      this.sql.exec(`INSERT INTO ${MIGRATION_TABLE}
-        (singleton, state, attempt_count, attempt_token, deadline_at,
-         imported_turns, imported_bytes, source, error, started_at, updated_at)
-        VALUES (1, 'pending', 0, NULL, ?, 0, 0, 'none', NULL, ?, ?)`,
-        now + CHAT_RUNTIME_BOUNDS.legacyMigrationDeadlineMs, now, now);
-      return statusFromRow(migrationRow(this.sql) as MigrationRow, true);
-    });
-  }
-
-  async runAfterTrigger(
+  async runAfterAdmission(
     at: number,
     attemptToken: string,
   ): Promise<LegacyMigrationStatus> {
@@ -766,16 +736,20 @@ export class LegacySessionMigrator {
       return statusFromRow(existing);
     }
     const hasAdmittedWork = this.hasAdmittedV2Turn(now);
-    const opened = existing?.state === "pending" && existing.source === "none";
-    if (existing?.state === "pending" && !hasAdmittedWork && !opened) {
-      return this.storage.transactionSync(() => this.failInTransaction(
-        now >= Number(existing.deadline_at)
-          ? "legacy_migration_deadline" : "legacy_migration_admission_missing", now));
+    if (existing?.state === "pending" && !hasAdmittedWork) {
+      return this.storage.transactionSync(() =>
+        this.failInTransaction(
+          now >= Number(existing.deadline_at)
+            ? "legacy_migration_deadline"
+            : "legacy_migration_admission_missing",
+          now,
+        ),
+      );
     }
-    if (!hasAdmittedWork && !opened) return unseenStatus();
+    if (!hasAdmittedWork) return unseenStatus();
     this.ensureTable();
     if (this.hasSettledV2History()) {
-      return existing && Number(existing.attempt_count) > 0
+      return existing
         ? this.storage.transactionSync(() =>
             this.failInTransaction("v2_runtime_changed_during_migration", now),
           )
@@ -862,9 +836,18 @@ export class LegacySessionMigrator {
     now: number,
     token: string,
   ): LegacyMigrationStatus {
-    const claimed = this.claimAttempt(now, token);
-    if (claimed.state !== "pending" || claimed.attemptToken !== token) return claimed;
     return this.storage.transactionSync(() => {
+      this.sql.exec(
+        `INSERT INTO ${MIGRATION_TABLE}
+          (singleton, state, attempt_count, attempt_token, deadline_at,
+           imported_turns, imported_bytes, source, error, started_at, updated_at)
+         VALUES (1, 'pending', 1, ?, ?, 0, 0, NULL, NULL, ?, ?)`,
+        token,
+        now + CHAT_RUNTIME_BOUNDS.legacyMigrationDeadlineMs,
+        now,
+        now,
+      );
+      this.appendMigrationEvent("BeginLegacyMigration", now);
       const completed = this.sql
         .exec<MigrationRow>(
           `UPDATE ${MIGRATION_TABLE}

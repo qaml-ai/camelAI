@@ -179,7 +179,7 @@ describe("single durable turn driver", () => {
       admit(store, "crashed", 0);
       admit(store, "next", 1);
       const migrator = new LegacySessionMigrator(instance.ctx.storage, () => 4);
-      await migrator.runAfterTrigger(2, "migration:crash");
+      await migrator.runAfterAdmission(2, "migration:crash");
       store.claim(2, "dead-owner");
       store.startNextInference("crashed", "dead-owner", 3);
       store.checkpointProviderBatch(
@@ -249,7 +249,7 @@ describe("single durable turn driver", () => {
       const store = new DurableChatTurnStore(instance.ctx.storage);
       admit(store, "one", 0);
       const migrator = new LegacySessionMigrator(instance.ctx.storage, () => 3);
-      await migrator.runAfterTrigger(1, "migration:safe-recovery");
+      await migrator.runAfterAdmission(1, "migration:safe-recovery");
       const claimed = store.claim(1, "dead-owner");
       store.startNextInference("one", "dead-owner", 2);
       const originalDeadline = claimed.ok ? claimed.turn.terminalDeadlineAt : 0;
@@ -459,7 +459,7 @@ describe("single durable turn driver", () => {
           automationRun: { workspaceId: "workspace:test", automationId: "prompt", runId },
         }, 10);
         const migrator = new LegacySessionMigrator(instance.ctx.storage, () => 11);
-        await migrator.runAfterTrigger(11, "migration-timeout");
+        await migrator.runAfterAdmission(11, "migration-timeout");
         store.claim(11, "owner-timeout");
         store.fail(runId, "owner-timeout", "turn failed", 12);
         const error = vi.spyOn(console, "error").mockImplementation(() => undefined);

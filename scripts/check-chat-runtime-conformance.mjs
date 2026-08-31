@@ -414,19 +414,13 @@ expect(
   "prune must retain idempotency tombstones",
 );
 
-// JIT migration: admission or durable post-open authority, one retry, one fixed
+// JIT migration: admitted-only, no transport dependency, one retry, one fixed
 // deadline, fresh fences, terminal marker, and claim blocking until terminal.
-const requestMigration = tlaOperator("RequestLegacyMigration");
-expect(
-  requestMigration,
-  /transport\s*=\s*"open"[\s\S]*firstByteSent[\s\S]*migrationRequested'\s*=\s*TRUE/,
-  "migration request must follow the first transport byte",
-);
 const beginMigration = tlaOperator("BeginLegacyMigration");
 expect(
   beginMigration,
-  /seen\s*#\s*\{\}\s*\\\/\s*migrationRequested/,
-  "legacy read needs admission or a durable post-open request",
+  /seen\s*#\s*\{\}/,
+  "legacy read must follow durable admission",
 );
 expect(
   beginMigration,
@@ -771,7 +765,7 @@ before(
 );
 reject(
   events,
-  /LegacySessionMigrator|runAfterTrigger/,
+  /LegacySessionMigrator|runAfterAdmission/,
   "transport attach must never start legacy migration",
 );
 const messages = bracedBody(
@@ -1157,8 +1151,8 @@ expect(
 );
 const runMigration = bracedBody(
   legacy,
-  "async runAfterTrigger(",
-  "LegacySessionMigrator.runAfterTrigger",
+  "async runAfterAdmission(",
+  "LegacySessionMigrator.runAfterAdmission",
 );
 expect(
   runMigration,
@@ -1167,9 +1161,9 @@ expect(
 );
 before(
   runMigration,
-  /if \(!hasAdmittedWork && !opened\)/,
+  /if \(!hasAdmittedWork\)/,
   /this\.scanLegacy\(/,
-  "legacy read must require admission or an authenticated open request",
+  "legacy read must require admitted V2 work",
 );
 before(
   runMigration,

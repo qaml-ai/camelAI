@@ -30,7 +30,7 @@ async function finishLegacyMigration(
   now: number,
 ): Promise<void> {
   const migrator = new LegacySessionMigrator(storage, () => now);
-  await migrator.runAfterTrigger(now, `migration:${now}`);
+  await migrator.runAfterAdmission(now, `migration:${now}`);
   expect(migrator.claimBlocked()).toBe(false);
   expect(store.nextAlarmAt(now)).not.toBeNull();
 }
@@ -558,7 +558,7 @@ describe("framework-free ChatThreadRuntimeDO", () => {
         const migration = await new LegacySessionMigrator(
           instance.ctx.storage,
           () => 10_001,
-        ).runAfterTrigger(10_000, "migration:failed");
+        ).runAfterAdmission(10_000, "migration:failed");
         expect(migration.state).toBe("failed");
 
         const runtime = new ChatThreadRuntimeDO(

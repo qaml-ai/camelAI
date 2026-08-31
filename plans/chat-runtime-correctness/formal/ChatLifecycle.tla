@@ -54,7 +54,7 @@ BatchOrders ==
 
 VARIABLES
   transport, transportRemaining, firstByteSent,
-  migrationState, migrationRemaining, migrationAttempts, migrationToken, migrationRequested,
+  migrationState, migrationRemaining, migrationAttempts, migrationToken,
   prearmed, seen, retainedPayload, queue, status, alarmArmed, turnRemaining,
   active, attemptCount, recoveryCount, activeToken,
   phase, providerCallsUsed, providerRemaining, checkpointBytes,
@@ -63,7 +63,7 @@ VARIABLES
 
 TransportVars == <<transport, transportRemaining, firstByteSent>>
 MigrationVars ==
-  <<migrationState, migrationRemaining, migrationAttempts, migrationToken, migrationRequested>>
+  <<migrationState, migrationRemaining, migrationAttempts, migrationToken>>
 PayloadQueueVars == <<seen, retainedPayload, queue, status, turnRemaining>>
 LedgerVars == <<PayloadQueueVars, alarmArmed>>
 OwnerVars == <<active, attemptCount, recoveryCount, activeToken>>
@@ -88,7 +88,6 @@ Init ==
   /\ transport = "absent" /\ transportRemaining = 0 /\ firstByteSent = FALSE
   /\ migrationState = "unseen" /\ migrationRemaining = 0
   /\ migrationAttempts = 0 /\ migrationToken = NoToken
-  /\ migrationRequested = FALSE
   /\ prearmed = NoMessage
   /\ seen = {} /\ retainedPayload = {} /\ queue = <<>>
   /\ status = [m \in MessageIds |-> "absent"]
@@ -127,23 +126,14 @@ CloseTransport ==
   /\ firstByteSent' = FALSE /\ UNCHANGED LifecycleVars
 
 (***************************************************************************
-One JIT legacy read starts after admission or a durable post-open request. Its
-retry shares one absolute budget. A terminal decision fences later reads.
+One JIT legacy read starts only after durable admission. Its retry consumes the
+same absolute budget. A terminal decision permanently fences later reads.
 ***************************************************************************)
 
-RequestLegacyMigration ==
-  /\ transport = "open" /\ firstByteSent /\ migrationState = "unseen"
-  /\ ~migrationRequested /\ migrationRequested' = TRUE /\ alarmArmed' = TRUE
-  /\ UNCHANGED <<TransportVars, migrationState, migrationRemaining,
-       migrationAttempts, migrationToken, prearmed, PayloadQueueVars,
-       OwnerVars, ExecutionVars, FenceVars>>
-
 BeginLegacyMigration ==
-  /\ (seen # {} \/ migrationRequested)
-  /\ migrationState = "unseen" /\ migrationAttempts = 0
+  /\ seen # {} /\ migrationState = "unseen" /\ migrationAttempts = 0
   /\ migrationState' = "pending"
   /\ migrationAttempts' = 1 /\ migrationToken' = MigrationToken(1)
-  /\ migrationRequested' = FALSE
   /\ migrationRemaining' = MigrationDeadline
   /\ alarmArmed' = TRUE
   /\ UNCHANGED
@@ -156,7 +146,7 @@ RetryLegacyMigration ==
   /\ migrationAttempts' = 2 /\ migrationToken' = MigrationToken(2)
   /\ UNCHANGED
        <<transport, transportRemaining, firstByteSent,
-         migrationState, migrationRemaining, migrationRequested, prearmed, LedgerVars,
+         migrationState, migrationRemaining, prearmed, LedgerVars,
          OwnerVars, ExecutionVars, FenceVars>>
 
 CompleteLegacyMigration ==
@@ -164,7 +154,7 @@ CompleteLegacyMigration ==
   /\ migrationState' = "complete" /\ migrationRemaining' = 0
   /\ migrationToken' = NoToken
   /\ UNCHANGED
-       <<transport, transportRemaining, firstByteSent, migrationAttempts, migrationRequested,
+       <<transport, transportRemaining, firstByteSent, migrationAttempts,
          prearmed, LedgerVars, OwnerVars, ExecutionVars, FenceVars>>
 
 FailLegacyMigration ==
@@ -172,7 +162,7 @@ FailLegacyMigration ==
   /\ migrationState' = "failed" /\ migrationRemaining' = 0
   /\ migrationToken' = NoToken
   /\ UNCHANGED
-       <<transport, transportRemaining, firstByteSent, migrationAttempts, migrationRequested,
+       <<transport, transportRemaining, firstByteSent, migrationAttempts,
          prearmed, LedgerVars, OwnerVars, ExecutionVars, FenceVars>>
 
 MigrationTimeoutFail ==
@@ -220,7 +210,7 @@ RejectQueueBound ==
 
 ConsumeSpuriousAlarm ==
   /\ alarmArmed /\ active = NoMessage /\ Len(queue) = 0
-  /\ prearmed = NoMessage /\ migrationState # "pending" /\ ~migrationRequested
+  /\ prearmed = NoMessage /\ migrationState # "pending"
   /\ alarmArmed' = FALSE
   /\ UNCHANGED
        <<TransportVars, MigrationVars, prearmed, PayloadQueueVars,
@@ -392,7 +382,7 @@ ExpireOperation ==
        /\ turnRemaining' = [turnRemaining EXCEPT ![m] = 0]
        /\ alarmArmed' =
             (Len(Tail(queue)) > 0 \/ prearmed # NoMessage \/
-             migrationState = "pending" \/ migrationRequested)
+             migrationState = "pending")
        /\ UNCHANGED <<OwnerVars, ExecutionVars, crashed, abortRequired>>
   /\ UNCHANGED
        <<TransportVars, MigrationVars, prearmed, seen, retainedPayload,
@@ -456,7 +446,7 @@ Tick ==
        THEN toolRemaining - 1 ELSE toolRemaining
   /\ UNCHANGED
        <<transport, firstByteSent, migrationState, migrationAttempts,
-         migrationToken, migrationRequested,
+         migrationToken,
          prearmed, seen, retainedPayload, queue, status, alarmArmed,
          OwnerVars, phase, providerCallsUsed, checkpointBytes, batchCalls,
          usedCalls, begunCalls, resultCalls, FenceVars>>
@@ -470,7 +460,7 @@ TimeoutFail ==
 
 Next ==
   \/ RequestTransport \/ FlushTransport \/ TimeoutTransport \/ CloseTransport
-  \/ RequestLegacyMigration \/ BeginLegacyMigration \/ RetryLegacyMigration
+  \/ BeginLegacyMigration \/ RetryLegacyMigration
   \/ CompleteLegacyMigration \/ FailLegacyMigration
   \/ (\E m \in MessageIds : ClientPost(m)) \/ AdmitPending
   \/ RejectDuplicate \/ RejectThreadFull \/ RejectQueueBound
@@ -490,8 +480,7 @@ Next ==
 
 Fairness ==
   /\ WF_vars(FlushTransport) /\ WF_vars(TimeoutTransport) /\ WF_vars(Tick)
-  /\ WF_vars(RequestLegacyMigration) /\ WF_vars(BeginLegacyMigration)
-  /\ WF_vars(MigrationTimeoutFail)
+  /\ WF_vars(BeginLegacyMigration) /\ WF_vars(MigrationTimeoutFail)
   /\ WF_vars(AdmitPending) /\ WF_vars(RejectDuplicate)
   /\ WF_vars(RejectThreadFull) /\ WF_vars(RejectQueueBound)
   /\ WF_vars(ConsumeSpuriousAlarm) /\ WF_vars(StartSelectedTurn)
@@ -511,7 +500,6 @@ Safety and liveness checked by TLC.
 TypeOK ==
   /\ transport \in TransportStates /\ transportRemaining \in 0..TransportDeadline
   /\ firstByteSent \in BOOLEAN /\ migrationState \in MigrationStates
-  /\ migrationRequested \in BOOLEAN
   /\ migrationRemaining \in 0..MigrationDeadline /\ migrationAttempts \in 0..2
   /\ migrationToken \in {NoToken, MigrationToken(1), MigrationToken(2)}
   /\ prearmed \in MessageIds \cup {NoMessage}
@@ -540,11 +528,10 @@ MigrationConsistency ==
   /\ (migrationState = "unseen") =>
        (migrationAttempts = 0 /\ migrationRemaining = 0 /\
         migrationToken = NoToken)
-  /\ migrationRequested => (migrationState = "unseen" /\ alarmArmed)
   /\ (migrationState = "pending") =>
        (migrationAttempts \in 1..2 /\
         migrationToken = MigrationToken(migrationAttempts) /\
-        ~migrationRequested /\ active = NoMessage /\ alarmArmed)
+        active = NoMessage /\ alarmArmed)
   /\ (migrationState \in {"complete", "failed"}) =>
        (migrationAttempts \in 1..2 /\ migrationRemaining = 0 /\
         migrationToken = NoToken /\

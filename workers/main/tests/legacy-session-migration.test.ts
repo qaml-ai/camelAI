@@ -68,7 +68,7 @@ function seedAiChat(
 }
 
 describe("bounded just-in-time legacy session migration", () => {
-  it("starts only after admission or a durable post-open request", async () => {
+  it("does nothing before a V2 turn is durably admitted", async () => {
     await runInDurableObject(stub("unseen"), async (instance: any) => {
       const store = new DurableChatTurnStore(instance.ctx.storage);
       seedPi(instance, [
@@ -84,7 +84,7 @@ describe("bounded just-in-time legacy session migration", () => {
         () => 100,
       );
 
-      expect(await migrator.runAfterTrigger(100, "attempt-1")).toMatchObject({
+      expect(await migrator.runAfterAdmission(100, "attempt-1")).toMatchObject({
         state: "unseen",
         attemptCount: 0,
       });
@@ -100,23 +100,6 @@ describe("bounded just-in-time legacy session migration", () => {
           .one().present,
       ).toBe(0);
       expect(store.latestSnapshot().messages).toEqual([]);
-
-      expect(migrator.requestAfterOpen({
-        threadId: "thread:test",
-        workspaceId: "workspace:test",
-        orgId: "org:test",
-      }, 100)).toMatchObject({ state: "pending", attemptCount: 0 });
-      expect(await migrator.runAfterTrigger(100, "attempt-2")).toMatchObject({
-        state: "complete",
-        importedTurns: 1,
-      });
-      expect(store.latestSnapshot().messages.map(({ role, content }) => ({
-        role,
-        content,
-      }))).toEqual([
-        { role: "user", content: "old" },
-        { role: "assistant", content: "answer" },
-      ]);
     });
   });
 
@@ -203,7 +186,7 @@ describe("bounded just-in-time legacy session migration", () => {
         () => 10_001,
       );
 
-      const result = await migrator.runAfterTrigger(10_000, "migration-1");
+      const result = await migrator.runAfterAdmission(10_000, "migration-1");
 
       expect(result).toMatchObject({
         state: "complete",
@@ -270,7 +253,7 @@ describe("bounded just-in-time legacy session migration", () => {
         "UPDATE pi_core_messages SET payload = 'not json' WHERE idx = 0",
       );
       expect(
-        await migrator.runAfterTrigger(11_000, "migration-should-not-run"),
+        await migrator.runAfterAdmission(11_000, "migration-should-not-run"),
       ).toMatchObject({
         state: "complete",
         attemptCount: 1,
@@ -308,7 +291,7 @@ describe("bounded just-in-time legacy session migration", () => {
         );
 
         expect(
-          await migrator.runAfterTrigger(10_000, "migration-1"),
+          await migrator.runAfterAdmission(10_000, "migration-1"),
         ).toMatchObject({ state: "complete", importedTurns: 1 });
         expect(store.getTurn("legacy:pi:0")).toBeNull();
         expect(store.getTurn("legacy:pi:2")).toMatchObject({
@@ -386,7 +369,7 @@ describe("bounded just-in-time legacy session migration", () => {
         );
 
         expect(
-          await migrator.runAfterTrigger(10_000, "migration-1"),
+          await migrator.runAfterAdmission(10_000, "migration-1"),
         ).toMatchObject({ state: "complete", importedTurns: 1 });
         expect(store.getTurn("legacy:pi:0")).toMatchObject({
           userContent:
@@ -431,7 +414,7 @@ describe("bounded just-in-time legacy session migration", () => {
           await new LegacySessionMigrator(
             instance.ctx.storage,
             () => 10_001,
-          ).runAfterTrigger(10_000, "migration-1"),
+          ).runAfterAdmission(10_000, "migration-1"),
         ).toMatchObject({ state: "complete", importedTurns: 2 });
         expect(store.getTurn("legacy:pi:0")?.userDisplay).toBe("model one");
         expect(store.getTurn("legacy:pi:2")?.userDisplay).toBe("model two");
@@ -484,7 +467,7 @@ describe("bounded just-in-time legacy session migration", () => {
       );
 
       expect(
-        await migrator.runAfterTrigger(10_000, "migration-1"),
+        await migrator.runAfterAdmission(10_000, "migration-1"),
       ).toMatchObject({ state: "complete", importedTurns: 1 });
       expect(store.getTurn("legacy:pi:0")).toBeNull();
       expect(store.getTurn("legacy:pi:2")).toMatchObject({
@@ -563,7 +546,7 @@ describe("bounded just-in-time legacy session migration", () => {
       );
 
       expect(
-        await migrator.runAfterTrigger(10_000, "migration-1"),
+        await migrator.runAfterAdmission(10_000, "migration-1"),
       ).toMatchObject({
         state: "complete",
         source: "ai_chat",
@@ -606,7 +589,7 @@ describe("bounded just-in-time legacy session migration", () => {
           await new LegacySessionMigrator(
             instance.ctx.storage,
             () => 10_001,
-          ).runAfterTrigger(10_000, "migration-1"),
+          ).runAfterAdmission(10_000, "migration-1"),
         ).toMatchObject({
           state: "complete",
           source: "none",
@@ -656,7 +639,7 @@ describe("bounded just-in-time legacy session migration", () => {
           await new LegacySessionMigrator(
             instance.ctx.storage,
             () => 10_001,
-          ).runAfterTrigger(10_000, "migration-1"),
+          ).runAfterAdmission(10_000, "migration-1"),
         ).toMatchObject({ importedTurns: 1, source: "ai_chat" });
         expect(store.getTurn("legacy:ai:orphan-followup")).toBeNull();
         expect(store.getTurn("legacy:ai:real-user")).toMatchObject({
@@ -710,7 +693,7 @@ describe("bounded just-in-time legacy session migration", () => {
           await new LegacySessionMigrator(
             instance.ctx.storage,
             () => 10_001,
-          ).runAfterTrigger(10_000, "migration-1"),
+          ).runAfterAdmission(10_000, "migration-1"),
         ).toMatchObject({
           state: "complete",
           source: "ai_chat",
@@ -815,7 +798,7 @@ describe("bounded just-in-time legacy session migration", () => {
         );
 
         expect(
-          await migrator.runAfterTrigger(10_000, "migration-1"),
+          await migrator.runAfterAdmission(10_000, "migration-1"),
         ).toMatchObject({
           state: "complete",
           source: "ai_chat",
@@ -895,7 +878,7 @@ describe("bounded just-in-time legacy session migration", () => {
         const result = await new LegacySessionMigrator(
           instance.ctx.storage,
           () => 10_001,
-        ).runAfterTrigger(10_000, "migration-1");
+        ).runAfterAdmission(10_000, "migration-1");
         expect(result).toMatchObject({ state: "complete", importedTurns: 2 });
         expect(store.getTurn("legacy:ai:old-user")?.assistantFinal).toBe(
           "old answer",
@@ -947,7 +930,7 @@ describe("bounded just-in-time legacy session migration", () => {
         () => 10_001,
       );
 
-      const result = await migrator.runAfterTrigger(10_000, "migration-1");
+      const result = await migrator.runAfterAdmission(10_000, "migration-1");
 
       expect(result).toMatchObject({
         state: "complete",
@@ -1028,7 +1011,7 @@ describe("bounded just-in-time legacy session migration", () => {
         const result = await new LegacySessionMigrator(
           instance.ctx.storage,
           () => 10_001,
-        ).runAfterTrigger(10_000, "migration-1");
+        ).runAfterAdmission(10_000, "migration-1");
         expect(result).toMatchObject({
           state: "complete",
           source: "pi_core",
@@ -1089,7 +1072,7 @@ describe("bounded just-in-time legacy session migration", () => {
           await new LegacySessionMigrator(
             instance.ctx.storage,
             () => 10_001,
-          ).runAfterTrigger(10_000, "migration-1"),
+          ).runAfterAdmission(10_000, "migration-1"),
         ).toMatchObject({
           state: "complete",
           source: "pi_core",
@@ -1180,7 +1163,7 @@ describe("bounded just-in-time legacy session migration", () => {
           await new LegacySessionMigrator(
             instance.ctx.storage,
             () => 10_001,
-          ).runAfterTrigger(10_000, "migration-1"),
+          ).runAfterAdmission(10_000, "migration-1"),
         ).toMatchObject({
           state: "complete",
           source: "pi_core",
@@ -1220,7 +1203,7 @@ describe("bounded just-in-time legacy session migration", () => {
 
         // The first 32-row metadata page is consumed synchronously; its bounded
         // yield lets this terminal marker supersede the in-flight attempt.
-        const migration = migrator.runAfterTrigger(10_000, "migration-1");
+        const migration = migrator.runAfterAdmission(10_000, "migration-1");
         expect(migrator.status()).toMatchObject({
           state: "pending",
           attemptToken: "migration-1",
@@ -1270,7 +1253,7 @@ describe("bounded just-in-time legacy session migration", () => {
       );
 
       expect(
-        await migrator.runAfterTrigger(10_000, "migration-1"),
+        await migrator.runAfterAdmission(10_000, "migration-1"),
       ).toMatchObject({
         state: "failed",
         attemptCount: 1,
@@ -1284,7 +1267,7 @@ describe("bounded just-in-time legacy session migration", () => {
         JSON.stringify({ role: "user", content: "now valid" }),
       );
       expect(
-        await migrator.runAfterTrigger(11_000, "migration-2"),
+        await migrator.runAfterAdmission(11_000, "migration-2"),
       ).toMatchObject({
         state: "failed",
         attemptCount: 1,
@@ -1334,7 +1317,7 @@ describe("bounded just-in-time legacy session migration", () => {
       );
 
       expect(
-        await migrator.runAfterTrigger(10_000, "migration-1"),
+        await migrator.runAfterAdmission(10_000, "migration-1"),
       ).toMatchObject({
         state: "failed",
         importedTurns: 0,
@@ -1379,7 +1362,7 @@ describe("bounded just-in-time legacy session migration", () => {
         return now;
       });
 
-      const first = await migrator.runAfterTrigger(10_000, "migration-1");
+      const first = await migrator.runAfterAdmission(10_000, "migration-1");
       expect(first).toMatchObject({
         state: "pending",
         attemptCount: 1,
@@ -1397,7 +1380,7 @@ describe("bounded just-in-time legacy session migration", () => {
 
       throwNextRead = true;
       now += 100;
-      const second = await migrator.runAfterTrigger(now, "migration-2");
+      const second = await migrator.runAfterAdmission(now, "migration-2");
       expect(second).toMatchObject({
         state: "failed",
         attemptCount: CHAT_RUNTIME_BOUNDS.legacyMigrationAttempts,
@@ -1406,7 +1389,7 @@ describe("bounded just-in-time legacy session migration", () => {
       });
       expect(migrator.claimBlocked()).toBe(false);
       expect(
-        await migrator.runAfterTrigger(now + 1, "migration-3"),
+        await migrator.runAfterAdmission(now + 1, "migration-3"),
       ).toMatchObject({
         state: "failed",
         attemptCount: CHAT_RUNTIME_BOUNDS.legacyMigrationAttempts,
@@ -1437,11 +1420,11 @@ describe("bounded just-in-time legacy session migration", () => {
           }
           return 10_001;
         });
-        const pending = await migrator.runAfterTrigger(10_000, "migration-1");
+        const pending = await migrator.runAfterAdmission(10_000, "migration-1");
         expect(pending).toMatchObject({ state: "pending", attemptCount: 1 });
 
         // Bad tokens report durable state but consume neither a retry nor time.
-        expect(await migrator.runAfterTrigger(10_010, "")).toMatchObject({
+        expect(await migrator.runAfterAdmission(10_010, "")).toMatchObject({
           state: "pending",
           attemptCount: 1,
           deadlineAt: pending.deadlineAt,
@@ -1451,7 +1434,7 @@ describe("bounded just-in-time legacy session migration", () => {
         );
 
         expect(
-          await migrator.runAfterTrigger(10_020, "migration-2"),
+          await migrator.runAfterAdmission(10_020, "migration-2"),
         ).toMatchObject({
           state: "failed",
           attemptCount: 1,
@@ -1484,11 +1467,11 @@ describe("bounded just-in-time legacy session migration", () => {
           }
           return now;
         });
-        const pending = await migrator.runAfterTrigger(10_000, "migration-1");
+        const pending = await migrator.runAfterAdmission(10_000, "migration-1");
         now = pending.deadlineAt as number;
 
         expect(
-          await migrator.runAfterTrigger(now, "migration-2"),
+          await migrator.runAfterAdmission(now, "migration-2"),
         ).toMatchObject({
           state: "failed",
           attemptCount: 1,
@@ -1533,7 +1516,7 @@ describe("bounded just-in-time legacy session migration", () => {
       );
 
       expect(
-        await migrator.runAfterTrigger(10_000, "migration-1"),
+        await migrator.runAfterAdmission(10_000, "migration-1"),
       ).toMatchObject({
         state: "complete",
         attemptCount: 1,

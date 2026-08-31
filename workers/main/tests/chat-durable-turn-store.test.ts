@@ -71,7 +71,7 @@ async function claimReady(
   token: string,
 ): Promise<StoreResult> {
   const migrator = new LegacySessionMigrator(instance.ctx.storage, () => now);
-  await migrator.runAfterTrigger(now, `migration:${token}`);
+  await migrator.runAfterAdmission(now, `migration:${token}`);
   return store.claim(now, token);
 }
 

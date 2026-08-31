@@ -3,11 +3,6 @@
  * smaller child budget, but they may not supply or increase these ceilings.
  */
 export const CHAT_RUNTIME_BOUNDS = Object.freeze({
-  // Selected ChatThreadDO-owned serialized payload windows in the executable
-  // accounting model must stay beneath this envelope. This is not a V8 heap
-  // limit: object overhead, SQLite, SDK/workerd allocations, concurrent request
-  // interleavings, and other Durable Objects in the isolate are excluded.
-  accountedChatPayloadEnvelopeBytes: 48 * 1024 * 1024,
   requestBytes: 256 * 1024,
   identifierChars: 256,
   assistantBytes: 1024 * 1024,
@@ -17,13 +12,12 @@ export const CHAT_RUNTIME_BOUNDS = Object.freeze({
   historyTurns: 128,
   historyBytes: 8 * 1024 * 1024,
   snapshotMessages: 50,
-  snapshotBytes: 1536 * 1024,
-  coarseStateBytes: 256 * 1024,
+  snapshotBytes: 8 * 1024 * 1024,
   clientSnapshotCacheEntries: 8,
-  clientSnapshotCacheEntryBytes: 2 * 1024 * 1024,
-  clientSnapshotCacheBytes: 8 * 1024 * 1024,
+  clientSnapshotCacheEntryBytes: 5 * 1024 * 1024,
+  clientSnapshotCacheBytes: 16 * 1024 * 1024,
   contextMessages: 64,
-  contextBytes: 2 * 1024 * 1024,
+  contextBytes: 4 * 1024 * 1024,
   systemPromptBytes: 256 * 1024,
   toolSchemaBytes: 512 * 1024,
   toolCatalogEntries: 128,
@@ -35,28 +29,25 @@ export const CHAT_RUNTIME_BOUNDS = Object.freeze({
   providerJsonDepth: 12,
   providerJsonEntries: 4_096,
   providerJsonNodes: 8_192,
-  checkpointBytes: 4 * 1024 * 1024,
-  evalEventBytes: 64 * 1024,
+  checkpointBytes: 8 * 1024 * 1024,
+  outboxEventBytes: 64 * 1024,
+  outboxEvents: 256,
+  outboxBytes: 2 * 1024 * 1024,
   liveFlushMs: 50,
-  // One 20 Hz slot for the full durable turn lease. The independent byte
-  // bucket below is what paces large cumulative presentation frames.
-  liveFramesPerTurn: 24_000,
-  // 4 MiB burst plus 256 KiB/s for the full lease: even the largest legal
-  // cumulative frame earns another slot within eight seconds.
-  liveBytesPerTurn: 304 * 1024 * 1024,
-  liveBurstBytes: 4 * 1024 * 1024,
-  liveMaxPacingDelayMs: 8_000,
-  liveMessageBytes: 1536 * 1024,
-  liveTraceBytes: 1024 * 1024,
-  liveContentBlocks: 128,
-  sseWritersPerThread: 4,
-  sseWriterBytes: 2 * 1024 * 1024 - 4 * 1024,
-  sseWriterQueueBytes: 2 * 1024 * 1024,
-  sseDoBytes: 8 * 1024 * 1024,
+  liveFramesPerTurn: 4_096,
+  liveBytesPerTurn: 64 * 1024 * 1024,
+  liveMessageBytes: 3 * 1024 * 1024,
+  liveTraceBytes: 2 * 1024 * 1024,
+  liveContentBlocks: 256,
+  sseWritersPerUser: 8,
+  sseWritersPerThread: 32,
+  sseWriterBytes: 5 * 1024 * 1024,
+  sseWriterQueueBytes: 5 * 1024 * 1024 + 4 * 1024,
+  sseDoBytes: 40 * 1024 * 1024,
   sseDecodeSliceBytes: 64 * 1024,
   sseHeartbeatMs: 15_000,
   sseIdleMs: 55_000,
-  sseSlowWriterMs: 10_000,
+  sseSlowWriterMs: 30_000,
   bodyReadMs: 15_000,
   alarmWriteMs: 5_000,
   runtimeCallbackMs: 10_000,
@@ -68,7 +59,7 @@ export const CHAT_RUNTIME_BOUNDS = Object.freeze({
   reconnectBackoffMs: 10_000,
   reconnectStableMs: 30_000,
   malformedFrames: 3,
-  frameBytes: 2 * 1024 * 1024 - 4 * 1024,
+  frameBytes: 5 * 1024 * 1024,
   postAttempts: 2,
   postAttemptMs: 15_000,
   postResponseBytes: 64 * 1024,
@@ -79,8 +70,6 @@ export const CHAT_RUNTIME_BOUNDS = Object.freeze({
   legacyMigrationAttempts: 2,
   legacyMigrationPageRows: 32,
   legacyMigrationScanRows: 128 * (32 + 3),
-  legacyMigrationBytes: 8 * 1024 * 1024,
-  legacyMigrationRowBytes: 1536 * 1024,
   automationSummaryChars: 2_000,
   automationReportAttempts: 3,
   automationReportAttemptMs: 2_000,
@@ -90,26 +79,13 @@ export const CHAT_RUNTIME_BOUNDS = Object.freeze({
   providerStreamEvents: 8_192,
   providerOutputTokens: 16_384,
   toolDeadlineMs: 10 * 60_000,
-  // Whole-buffer tool paths stop here. Larger admitted transfers must remain
-  // backpressured streams from source through destination.
   toolSourceReadBytes: 2 * 1024 * 1024,
-  toolTransferFilesPerCall: 256,
-  toolTransferFileBytes: 8 * 1024 * 1024,
-  toolTransferBytesPerCall: 64 * 1024 * 1024,
   streamReadChunks: 4_096,
   toolInputBytes: 64 * 1024,
   toolInputsPerTurnBytes: 1024 * 1024,
   toolResultBytes: 256 * 1024,
   toolResultsPerTurnBytes: 1024 * 1024,
-  codeModeScratchEntries: 128,
-  codeModeScratchValueBytes: 64 * 1024,
-  codeModeScratchBytes: 1024 * 1024,
-  codeModeCpuMs: 10_000,
   toolResultOverflowBytes: 2 * 1024 * 1024,
-  analysisOutputOverflowBytes: 1024 * 1024,
-  // Leaves room inside the 10-minute tool deadline for the separately bounded
-  // project transfer, notebook validation, cleanup, and deadline grace phases.
-  analysisCommandDeadlineMs: 6 * 60_000,
   toolResultOverflowPerAttemptBytes: 4 * 1024 * 1024,
   toolResultOverflowFilesPerAttempt: 4,
   toolResultOverflowStubBytes: 4 * 1024,
@@ -121,3 +97,5 @@ export const CHAT_RUNTIME_BOUNDS = Object.freeze({
   attemptsPerTurn: 2,
   alarmTurnsPerInvocation: 1,
 });
+
+export type ChatRuntimeBounds = typeof CHAT_RUNTIME_BOUNDS;

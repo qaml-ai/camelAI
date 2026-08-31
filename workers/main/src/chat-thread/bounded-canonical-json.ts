@@ -24,6 +24,7 @@ interface EncodeState {
   active: WeakSet<object>;
 }
 
+const encoder = new TextEncoder();
 const ZERO: JsonPiece = { text: "0", bytes: 1, complete: false };
 const BIGINT_TEXT_LIMIT = 10n ** 128n;
 
@@ -180,8 +181,7 @@ function arrayPiece(
     text += child.text;
     used += separator + child.bytes;
     processed += 1;
-    if (!descriptor || !("value" in descriptor) || !child.complete)
-      complete = false;
+    if (!descriptor || !("value" in descriptor) || !child.complete) complete = false;
   }
   if (processed < length) complete = false;
   return { text: `${text}]`, bytes: used + 1, complete };
@@ -252,8 +252,7 @@ function objectPiece(
     if (separator) text += ",";
     text += `${encodedKey.text}:${child.text}`;
     used += separator + encodedKey.bytes + 1 + child.bytes;
-    if (!descriptor || !("value" in descriptor) || !child.complete)
-      complete = false;
+    if (!descriptor || !("value" in descriptor) || !child.complete) complete = false;
   }
   return { text: `${text}}`, bytes: used + 1, complete };
 }
@@ -324,7 +323,7 @@ export function boundedCanonicalJsonResult(
     active: new WeakSet<object>(),
   };
   const result = valuePiece(value, budget, 0, state);
-  const fits = result.bytes <= budget && utf8ByteLength(result.text) <= budget;
+  const fits = result.bytes <= budget && encoder.encode(result.text).byteLength <= budget;
   return { json: fits ? result.text : "0", complete: fits && result.complete };
 }
 
@@ -335,4 +334,3 @@ export function boundedCanonicalJson(
 ): string {
   return boundedCanonicalJsonResult(value, maxBytes, limits).json;
 }
-import { utf8ByteLength } from "./utf8-byte-length";

@@ -93,9 +93,7 @@ describe("runProjectBuild", () => {
       }),
     });
     expect(sandbox.mkdir).toHaveBeenCalledWith("/workspace/demo-project", { recursive: true });
-    // Without a streamed read surface, the previous manifest is a cache miss;
-    // never fall back to a whole-buffer sandbox read merely to preserve cache.
-    expect(sandbox.exists).not.toHaveBeenCalled();
+    expect(sandbox.exists).toHaveBeenCalledWith("/workspace/demo-project.source-manifest.json");
     expect(sandbox.readFile).not.toHaveBeenCalledWith(
       "/workspace/demo-project.source-manifest.json",
       { encoding: "base64" },

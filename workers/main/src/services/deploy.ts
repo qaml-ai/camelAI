@@ -14,20 +14,11 @@ import {
   markUsageGuardEligible,
   type UsageGuardRegistryFields,
 } from '../usage-guard-state.js';
-import type { DirectDeployEffectScope } from '../direct-dispatch-deploy.js';
 
 // KV key prefix for script access info (namespaced by org-slug)
 const SCRIPT_PREFIX = 'script:';
 
-export async function handleDeploySideEffects(
-  env: Env,
-  info: DeploySideEffectsInfo,
-  scope?: DirectDeployEffectScope,
-): Promise<void> {
-  const read = <T>(subject: string, start: () => Promise<T>) =>
-    scope ? scope.read(subject, start) : start();
-  const write = <T>(subject: string, start: () => Promise<T>) =>
-    scope ? scope.write(subject, start) : start();
+export async function handleDeploySideEffects(env: Env, info: DeploySideEffectsInfo): Promise<void> {
   const { scriptName, dispatchScriptName, orgId, orgSlug, workspaceId, hostname, threadId, projectId, configPath, commitSha, artifactCacheKey, scriptVersion } = info;
   const orgStub = getOrgStub(env, orgId);
 
@@ -35,30 +26,21 @@ export async function handleDeploySideEffects(
   let createdBy = 'system:deploy';
   if (threadId) {
     try {
-      const thread = await read("reading the deploy thread owner", () =>
-        Promise.resolve(orgStub.getThread(threadId)),
-      );
+      const thread = await orgStub.getThread(threadId);
       if (thread?.created_by && thread.workspace_id === workspaceId) {
         createdBy = thread.created_by;
       }
-    } catch (error) {
-      if (scope && !scope.isActive) throw error;
-    }
+    } catch {}
   }
 
-  const script = await write("registering the deployed worker", () =>
-    orgStub.registerWorkerScript(scriptName, workspaceId, createdBy, configPath, projectId, commitSha, artifactCacheKey),
-  );
+  const script = await orgStub.registerWorkerScript(scriptName, workspaceId, createdBy, configPath, projectId, commitSha, artifactCacheKey);
 
   const primaryRegistryKey = `${SCRIPT_PREFIX}${dispatchScriptName}`;
   let existingRegistry: (UsageGuardRegistryFields & { org_id?: string; org_slug?: string; is_public?: boolean }) | null = null;
   try {
-    const stored = await read("reading the deploy registry", () =>
-      env.APP_KV.get(primaryRegistryKey),
-    );
+    const stored = await env.APP_KV.get(primaryRegistryKey);
     existingRegistry = stored ? JSON.parse(stored) : null;
   } catch (error) {
-    if (scope && !scope.isActive) throw error;
     console.warn('[deploy] failed to parse existing app registry state', {
       dispatchScriptName,
       error: String(error),
@@ -76,19 +58,17 @@ export async function handleDeploySideEffects(
     : {};
   if (scriptVersion && env.APP_DB) {
     const recovering = isUsageGuardRecovery(existingRegistry?.usage_guard_status);
-    const eligibility = await write("updating deploy usage-guard eligibility", () =>
-      markUsageGuardEligible({
-        db: scope ? scope.bindD1(env.APP_DB!) : env.APP_DB!,
-        appId: `${orgId}:${scriptName}`,
-        dispatchScriptName,
-        orgId,
-        workspaceId,
-        scriptName,
-        scriptVersion,
-        artifactCacheKey,
-        recovering,
-      }),
-    );
+    const eligibility = await markUsageGuardEligible({
+      db: env.APP_DB,
+      appId: `${orgId}:${scriptName}`,
+      dispatchScriptName,
+      orgId,
+      workspaceId,
+      scriptName,
+      scriptVersion,
+      artifactCacheKey,
+      recovering,
+    });
     usageGuardFields = {
       usage_guard_status: eligibility.status,
       usage_guard_eligible_version: scriptVersion,
@@ -100,23 +80,19 @@ export async function handleDeploySideEffects(
 
   // Store in KV with namespaced key: script:{script-name}--{org-slug}
   // This allows the dispatcher to look up access info by dispatchScriptName
-  await write("writing the deploy registry", () =>
-    env.APP_KV.put(
-      primaryRegistryKey,
-      JSON.stringify({ org_id: orgId, org_slug: orgSlug, is_public: script.is_public, ...usageGuardFields }),
-    ),
+  await env.APP_KV.put(
+    primaryRegistryKey,
+    JSON.stringify({ org_id: orgId, org_slug: orgSlug, is_public: script.is_public, ...usageGuardFields })
   );
 
   // Update preview status
   const envPrefix = resolveEnvPrefix(env.WORKER_BASE_URL, hostname);
-  const previewResult = await write("marking the deploy preview pending", () =>
-    orgStub.updateWorkerScriptPreview(scriptName, {
-      status: 'pending',
-      preview_key: null,
-      preview_error: null,
-      deploy_ts: script.updated_at,
-    }),
-  );
+  const previewResult = await orgStub.updateWorkerScriptPreview(scriptName, {
+    status: 'pending',
+    preview_key: null,
+    preview_error: null,
+    deploy_ts: script.updated_at,
+  });
 
   if (previewResult.stale) return;
 
@@ -138,18 +114,13 @@ export async function handleDeploySideEffects(
       contentType: 'json',
       messageId: `${scriptName}:${script.updated_at}`,
     } as unknown as QueueSendOptions;
-    await write("queueing the deploy screenshot", () =>
-      env.APP_SCREENSHOT_QUEUE!.send(jobBase, sendOptions),
-    );
+    await env.APP_SCREENSHOT_QUEUE.send(jobBase, sendOptions);
   } catch (err) {
-    if (scope && !scope.isActive) throw err;
-    await write("marking the deploy screenshot failed", () =>
-      orgStub.updateWorkerScriptPreview(scriptName, {
-        status: 'failed',
-        preview_key: null,
-        preview_error: String(err),
-        deploy_ts: script.updated_at,
-      }),
-    );
+    await orgStub.updateWorkerScriptPreview(scriptName, {
+      status: 'failed',
+      preview_key: null,
+      preview_error: String(err),
+      deploy_ts: script.updated_at,
+    });
   }
 }

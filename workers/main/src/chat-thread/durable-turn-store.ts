@@ -5,20 +5,14 @@ import {
   checkpointClosed,
   checkpointUncertain,
   emptyTurnCheckpoint,
-  normalizeTurnCheckpoint,
   parseTurnCheckpoint,
   serializeTurnCheckpoint,
   type CheckpointProviderBatch,
   type CheckpointToolResult,
   type TurnCheckpoint,
 } from "./turn-checkpoint";
-import {
-  checkpointRuntimeContent,
-  combineRuntimeContent,
-  parseRuntimeContent,
-  serializeRuntimeContent,
-  type ChatRuntimeContentBlock,
-} from "./chat-runtime-content";
+import { checkpointRuntimeContent, combineRuntimeContent, parseRuntimeContent,
+  serializeRuntimeContent, type ChatRuntimeContentBlock } from "./chat-runtime-content";
 import {
   automationReportResult,
   checkpointAutomationOutcome,
@@ -28,11 +22,6 @@ import {
   type AutomationRunReport,
   type DurableAutomationRun,
 } from "./automation-turn-report";
-import {
-  boundedJsonString,
-  jsonStringByteLength,
-  utf8ByteLength,
-} from "./utf8-byte-length";
 
 export interface AdmitChatTurn {
   id: string;
@@ -87,24 +76,30 @@ export interface ChatModelContextTurn {
   assistantFinal: string;
 }
 
-export const CHAT_RUNTIME_DURABLE_ACTIONS = [
-  "DurablyAdmit",
-  "StartSelectedTurn",
-  "StartNextInference",
-  "CheckpointProviderBatch",
-  "CheckpointProviderFinal",
-  "BeginEffect",
-  "RecordToolResult",
-  "RecoverFromCheckpoint",
-  "CompleteTurn",
-  "FailTurn",
-  "ExpireOperation",
-  "ReconcileCrashedTurn",
-  "BeginLegacyMigration",
-  "RetryLegacyMigration",
-  "CompleteLegacyMigration",
-  "FailLegacyMigration",
-] as const;
+export interface ChatOutboxEvent {
+  seq: number;
+  revision: number;
+  type:
+    | "DurablyAdmit"
+    | "StartSelectedTurn"
+    | "StartNextInference"
+    | "CheckpointProviderBatch"
+    | "CheckpointProviderFinal"
+    | "BeginEffect"
+    | "RecordToolResult"
+    | "RecoverFromCheckpoint"
+    | "CompleteTurn"
+    | "FailTurn"
+    | "ExpireOperation"
+    | "ReconcileCrashedTurn"
+    | "BeginLegacyMigration"
+    | "RetryLegacyMigration"
+    | "CompleteLegacyMigration"
+    | "FailLegacyMigration";
+  turnId: string;
+  status: RuntimeTurnStatus;
+  createdAt: number;
+}
 
 export type StoreRejection =
   | "invalid"
@@ -122,15 +117,20 @@ export type StoreRejection =
   | "uncertain";
 
 export type StoreResult =
-  | { ok: true; duplicate: boolean; turn: DurableChatTurn }
-  | { ok: false; reason: StoreRejection };
-
-export type CheckpointMutation =
-  | { type: "start_provider" }
-  | { type: "provider_batch"; batch: CheckpointProviderBatch }
-  | { type: "provider_final"; output: string }
-  | { type: "begin_effect"; callId: string }
-  | { type: "tool_result"; result: CheckpointToolResult };
+  | {
+      ok: true;
+      durable: true;
+      duplicate: boolean;
+      turn: DurableChatTurn;
+      revision: number;
+      shouldArmAlarm: boolean;
+    }
+  | {
+      ok: false;
+      reason: StoreRejection;
+      revision: number;
+      shouldArmAlarm: boolean;
+    };
 
 type TurnRow = {
   id: string;
@@ -161,198 +161,28 @@ type TurnRow = {
   updated_at: number;
 };
 
-type RuntimeRow = Record<
-  "thread_id" | "workspace_id" | "org_id",
-  string | null
-> & {
+type RuntimeRow = {
   revision: number;
   active_turn_id: string | null;
+  thread_id: string | null;
+  workspace_id: string | null;
+  org_id: string | null;
 };
 
-const sizeOf = utf8ByteLength;
-const ADMIT_KEYS = Object.freeze([
-  "id", "clientMessageId", "threadId", "workspaceId", "orgId", "userId",
-  "source", "userContent", "userDisplay", "automationRun",
-]);
-const AUTOMATION_RUN_KEYS = Object.freeze([
-  "workspaceId", "automationId", "runId", "requiresExplicitOutcome",
-]);
-const onlyKeys = (record: Record<string, unknown>, allowed: readonly string[]) => {
-  let count = 0;
-  for (const key in record) {
-    if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
-    if (++count > allowed.length || !allowed.includes(key)) return false;
-  }
-  return true;
-};
-const jsonStringsBytes = (...values: string[]) =>
-  values.reduce((sum, value) => sum + jsonStringByteLength(value), 0);
-const validAttemptToken = (value: string) =>
-  Boolean(value) && value.length <= CHAT_RUNTIME_BOUNDS.identifierChars;
-const payloadBytes = (content: string, display: string) =>
-  23 + jsonStringsBytes(content, display);
-function admitRequestBytes(
-  input: AdmitChatTurn,
-  run: AutomationRunInput | undefined,
-): number {
-  return (
-    112 +
-    jsonStringsBytes(input.id, input.clientMessageId, input.threadId) +
-    jsonStringsBytes(input.workspaceId, input.orgId, input.source) +
-    jsonStringsBytes(input.userContent, input.userDisplay) +
-    (input.userId === null ? 4 : jsonStringByteLength(input.userId)) +
-    (run
-      ? 58 +
-        jsonStringsBytes(run.workspaceId, run.automationId, run.runId) +
-        (run.requiresExplicitOutcome === undefined
-          ? 0
-          : 27 + (run.requiresExplicitOutcome ? 4 : 5))
-      : 0)
-  );
-}
-function normalizeAutomationRun(
-  value: unknown,
-): AutomationRunInput | null | undefined {
-  if (value === undefined) return undefined;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  if (
-    Object.getPrototypeOf(value) !== Object.prototype ||
-    !onlyKeys(record, AUTOMATION_RUN_KEYS) ||
-    typeof record.workspaceId !== "string" ||
-    typeof record.automationId !== "string" ||
-    typeof record.runId !== "string" ||
-    (record.requiresExplicitOutcome !== undefined &&
-      typeof record.requiresExplicitOutcome !== "boolean")
-  )
-    return null;
-  return {
-    workspaceId: record.workspaceId,
-    automationId: record.automationId,
-    runId: record.runId,
-    ...(record.requiresExplicitOutcome === undefined
-      ? {}
-      : { requiresExplicitOutcome: record.requiresExplicitOutcome }),
-  };
-}
+const sizeOf = (value: string) => new TextEncoder().encode(value).byteLength;
 const time = (n: number) =>
   Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
 const EMPTY_CHECKPOINT_JSON = serializeTurnCheckpoint(emptyTurnCheckpoint());
 
-function compactSnapshotGroup(
-  group: ChatSnapshotMessage[],
-  prefixMessages: number,
-  maximumBytes: number,
-): number | null {
-  const strings = group.map((message, index) => {
-    if (typeof message.content !== "string") return null;
-    group[index] = { ...message, content: "" };
-    return message.content;
-  });
-  const measure = () =>
-    group.reduce(
-      (sum, message, index) =>
-        sum +
-        sizeOf(JSON.stringify(message)) +
-        (prefixMessages + index > 0 ? 1 : 0),
-      0,
-    );
-  const fixedBytes = measure();
-  if (fixedBytes > maximumBytes) return null;
-  let remaining = maximumBytes - fixedBytes;
-  for (let index = strings.length - 1; index >= 0; index -= 1) {
-    const value = strings[index];
-    if (value === null) continue;
-    const content = boundedJsonString(value, remaining + 2);
-    const added = jsonStringByteLength(content) - 2;
-    group[index] = { ...group[index], content };
-    remaining -= added;
-  }
-  return measure();
-}
-
-function terminalRenderJson(
-  checkpointJson: string,
-  output: string,
-  completed: boolean,
-): string | null {
+function terminalRenderJson(checkpointJson: string, output: string, completed: boolean): string | null {
   try {
     const checkpoint = parseTurnCheckpoint(checkpointJson);
     if (checkpoint.batches.length === 0) return null;
     const trace = checkpointRuntimeContent(checkpoint);
-    const content = completed
-      ? trace
-      : combineRuntimeContent(trace, [{ type: "text", text: output }]);
+    const content = completed ? trace : combineRuntimeContent(trace, [{ type: "text", text: output }]);
     return content.length ? serializeRuntimeContent(content) : null;
   } catch {
     return null;
-  }
-}
-
-function applyCheckpointMutation(
-  checkpoint: TurnCheckpoint,
-  mutation: CheckpointMutation,
-): StoreRejection | null {
-  if (checkpoint.final !== null) return "stale";
-  const pending = checkpoint.batches
-    .at(-1)
-    ?.calls.find((call) => call.result === null);
-  switch (mutation.type) {
-    case "start_provider":
-      if (checkpoint.providerInFlight || !checkpointClosed(checkpoint))
-        return "stale";
-      if (checkpoint.providerCalls >= CHAT_RUNTIME_BOUNDS.providerCallsPerTurn)
-        return "provider_limit";
-      checkpoint.providerCalls += 1;
-      checkpoint.providerInFlight = true;
-      return null;
-    case "provider_batch": {
-      const { batch } = mutation;
-      if (
-        !checkpoint.providerInFlight ||
-        !checkpointClosed(checkpoint) ||
-        batch.calls.length === 0 ||
-        batch.calls.some((call) => call.effectStarted || call.result !== null)
-      )
-        return "stale";
-      const calls = checkpoint.batches.reduce(
-        (count, item) => count + item.calls.length,
-        batch.calls.length,
-      );
-      if (calls > CHAT_RUNTIME_BOUNDS.toolCallsPerTurn) return "tool_limit";
-      checkpoint.providerInFlight = false;
-      checkpoint.batches.push(batch);
-      return null;
-    }
-    case "provider_final":
-      if (!checkpoint.providerInFlight || !checkpointClosed(checkpoint))
-        return "stale";
-      checkpoint.providerInFlight = false;
-      checkpoint.final = mutation.output;
-      return null;
-    case "begin_effect": {
-      if (
-        checkpoint.providerInFlight ||
-        !pending ||
-        pending.id !== mutation.callId ||
-        pending.effectStarted
-      )
-        return "stale";
-      pending.effectStarted = true;
-      return null;
-    }
-    case "tool_result": {
-      if (
-        checkpoint.providerInFlight ||
-        !pending ||
-        pending.id !== mutation.result.callId ||
-        !pending.effectStarted ||
-        mutation.result.output.length === 0
-      )
-        return "stale";
-      pending.result = mutation.result;
-      return null;
-    }
   }
 }
 
@@ -409,14 +239,10 @@ export class DurableChatTurnStore {
         );
       }
       if (existingTable && !existingColumns.has("automation_json")) {
-        this.sql.exec(
-          "ALTER TABLE chat_turns_v2 ADD COLUMN automation_json TEXT",
-        );
+        this.sql.exec("ALTER TABLE chat_turns_v2 ADD COLUMN automation_json TEXT");
       }
       if (existingTable && !existingColumns.has("automation_report_at")) {
-        this.sql.exec(
-          "ALTER TABLE chat_turns_v2 ADD COLUMN automation_report_at INTEGER",
-        );
+        this.sql.exec("ALTER TABLE chat_turns_v2 ADD COLUMN automation_report_at INTEGER");
       }
       this.sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS chat_turns_v2_one_running
         ON chat_turns_v2 ((1)) WHERE status = 'running'`);
@@ -435,24 +261,30 @@ export class DurableChatTurnStore {
           (singleton, revision, active_turn_id, thread_id, workspace_id, org_id)
          VALUES (1, 0, NULL, NULL, NULL, NULL)`,
       );
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS chat_outbox_v2 (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, revision INTEGER NOT NULL, event_type TEXT NOT NULL,
+        turn_id TEXT NOT NULL, status TEXT NOT NULL,
+        payload_bytes INTEGER NOT NULL, created_at INTEGER NOT NULL
+      )`);
       this.sql.exec(
         `INSERT OR IGNORE INTO chat_attempt_tokens_v2 (token, turn_id, created_at)
          SELECT attempt_token, id, updated_at FROM chat_turns_v2
          WHERE attempt_token IS NOT NULL`,
       );
       if (existingTable && !hadCheckpoint) {
-        const interrupted = this.sql.exec<{ id: string }>(
+        // No legacy V2 running row carries enough information to distinguish
+        // an unstarted call from an uncertain effect. End it; never invent a
+        // recoverable empty checkpoint during an upgrade.
+        this.sql.exec(
           `UPDATE chat_turns_v2 SET status = 'interrupted', assistant_error = ?,
              lease_expires_at = NULL, checkpoint_json = ?, updated_at = updated_at
-           WHERE status = 'running' RETURNING id`,
+           WHERE status = 'running'`,
           "Turn interrupted during the bounded runtime upgrade; please continue.",
           EMPTY_CHECKPOINT_JSON,
-        ).toArray().length;
-        const cleared = this.sql.exec<{ singleton: number }>(
-          `UPDATE chat_runtime_v2 SET active_turn_id = NULL
-           WHERE singleton = 1 AND active_turn_id IS NOT NULL RETURNING singleton`,
-        ).toArray().length;
-        if (interrupted || cleared) this.bumpRevision();
+        );
+        this.sql.exec(
+          "UPDATE chat_runtime_v2 SET active_turn_id = NULL WHERE singleton = 1",
+        );
       }
     });
   }
@@ -466,10 +298,7 @@ export class DurableChatTurnStore {
       .one();
   }
 
-  private toTurn(
-    row: TurnRow,
-    checkpoint = parseTurnCheckpoint(row.checkpoint_json),
-  ): DurableChatTurn {
+  private toTurn(row: TurnRow): DurableChatTurn {
     return {
       id: row.id,
       clientMessageId: row.client_message_id,
@@ -492,7 +321,7 @@ export class DurableChatTurnStore {
         row.lease_expires_at === null ? null : Number(row.lease_expires_at),
       terminalDeadlineAt: Number(row.terminal_deadline_at),
       effectStarted: Boolean(row.effect_started),
-      checkpoint,
+      checkpoint: parseTurnCheckpoint(row.checkpoint_json),
       createdAt: Number(row.created_at),
       updatedAt: Number(row.updated_at),
     };
@@ -511,48 +340,78 @@ export class DurableChatTurnStore {
   }
 
   private rejected(reason: StoreRejection): StoreResult {
-    return { ok: false, reason };
+    const runtime = this.runtime();
+    return {
+      ok: false,
+      reason,
+      revision: Number(runtime.revision),
+      shouldArmAlarm: this.shouldArmAlarm(),
+    };
   }
 
-  private bumpRevision(): void {
+  private bumpRevision(): number {
     this.sql.exec(
       "UPDATE chat_runtime_v2 SET revision = revision + 1 WHERE singleton = 1",
     );
+    return Number(this.runtime().revision);
   }
 
-  commitCoarseState(mutate: () => void): void {
-    this.storage.transactionSync(() => {
-      mutate();
-      this.bumpRevision();
-    });
+  private appendEvent(
+    type: ChatOutboxEvent["type"],
+    turnId: string,
+    status: RuntimeTurnStatus,
+    revision: number,
+    now: number,
+  ): void {
+    const bytes = sizeOf(
+      JSON.stringify({ revision, type, turnId, status, createdAt: now }),
+    );
+    this.sql.exec(
+      `INSERT INTO chat_outbox_v2
+        (revision, event_type, turn_id, status, payload_bytes, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      revision,
+      type,
+      turnId,
+      status,
+      bytes,
+      now,
+    );
+
+    this.sql.exec(
+      `DELETE FROM chat_outbox_v2 WHERE seq NOT IN (
+        SELECT seq FROM (
+          SELECT seq, SUM(payload_bytes) OVER (
+            ORDER BY seq DESC ROWS UNBOUNDED PRECEDING
+          ) AS cumulative_bytes
+          FROM chat_outbox_v2 ORDER BY seq DESC LIMIT ?
+        ) WHERE cumulative_bytes <= ?
+      )`,
+      CHAT_RUNTIME_BOUNDS.outboxEvents,
+      CHAT_RUNTIME_BOUNDS.outboxBytes,
+    );
   }
 
+  /**
+   * Scrub old payloads but retain bounded idempotency tombstones. Exact
+   * admit-once semantics and finite storage are compatible because a thread
+   * has an explicit lifetime admission cap.
+   */
   private pruneHistory(): void {
     this.sql.exec(
       `UPDATE chat_turns_v2 SET retained = 0, user_id = NULL,
          source = 'tombstone', user_content = '', user_display = '',
          assistant_final = NULL, assistant_error = NULL,
-         assistant_render_json = NULL, automation_json = NULL,
-         payload_bytes = 0, checkpoint_json = ?
+         assistant_render_json = NULL, payload_bytes = 0
+         , checkpoint_json = ?
        WHERE retained = 1
          AND status IN ('completed', 'failed', 'interrupted')
          AND automation_report_at IS NULL AND id NOT IN (
          SELECT id FROM (
            SELECT id,
-             SUM(
-               length(CAST(id AS BLOB)) + length(CAST(client_message_id AS BLOB)) +
-               length(CAST(thread_id AS BLOB)) + length(CAST(workspace_id AS BLOB)) +
-               length(CAST(org_id AS BLOB)) + length(CAST(COALESCE(user_id, '') AS BLOB)) +
-               length(CAST(source AS BLOB)) + length(CAST(user_content AS BLOB)) +
-               length(CAST(user_display AS BLOB)) +
-               length(CAST(COALESCE(assistant_final, '') AS BLOB)) +
-               length(CAST(COALESCE(assistant_error, '') AS BLOB)) +
-               length(CAST(COALESCE(assistant_render_json, '') AS BLOB)) +
-               length(CAST(COALESCE(automation_json, '') AS BLOB)) +
-               length(CAST(status AS BLOB)) +
-               length(CAST(COALESCE(attempt_token, '') AS BLOB)) +
-               length(CAST(checkpoint_json AS BLOB))
-             ) OVER (
+             SUM(payload_bytes + length(CAST(COALESCE(
+               assistant_render_json, assistant_final, assistant_error, ''
+             ) AS BLOB))) OVER (
                ORDER BY created_at DESC, rowid DESC
                ROWS UNBOUNDED PRECEDING
              ) AS cumulative_bytes
@@ -570,25 +429,31 @@ export class DurableChatTurnStore {
     );
   }
 
-  private accepted(
-    turn: TurnRow,
-    duplicate = false,
-    checkpoint?: TurnCheckpoint,
-  ): StoreResult {
-    return { ok: true, duplicate, turn: this.toTurn(turn, checkpoint) };
+  private accepted(turn: TurnRow, duplicate = false): StoreResult {
+    const runtime = this.runtime();
+    return {
+      ok: true,
+      durable: true,
+      duplicate,
+      turn: this.toTurn(turn),
+      revision: Number(runtime.revision),
+      shouldArmAlarm: this.shouldArmAlarm(),
+    };
   }
 
-  checkpoint(
+  private mutateCheckpoint(
     id: string,
     attemptToken: string,
-    mutation: CheckpointMutation,
     now: number,
+    event:
+      | "StartNextInference"
+      | "CheckpointProviderBatch"
+      | "CheckpointProviderFinal"
+      | "BeginEffect"
+      | "RecordToolResult",
+    mutate: (checkpoint: TurnCheckpoint) => TurnCheckpoint | StoreRejection,
+    markEffect = false,
   ): StoreResult {
-    if (
-      mutation.type === "provider_final" &&
-      sizeOf(mutation.output) > CHAT_RUNTIME_BOUNDS.assistantBytes
-    )
-      return this.rejected("output_bytes");
     return this.storage.transactionSync(() => {
       const row = this.find(id);
       if (
@@ -608,6 +473,7 @@ export class DurableChatTurnStore {
           row,
           at,
           "Turn interrupted when a checkpoint crossed its deadline.",
+          "ExpireOperation",
         );
       }
       let checkpoint: TurnCheckpoint;
@@ -618,15 +484,15 @@ export class DurableChatTurnStore {
           row,
           at,
           "Turn interrupted because its durable checkpoint was invalid.",
+          "ReconcileCrashedTurn",
         );
       }
-      const rejection = applyCheckpointMutation(checkpoint, mutation);
-      if (rejection) return this.rejected(rejection);
-      let normalized: TurnCheckpoint;
+      const changed = mutate(checkpoint);
+      if (typeof changed === "string") return this.rejected(changed);
       let serialized: string;
       try {
-        normalized = normalizeTurnCheckpoint(checkpoint);
-        serialized = serializeTurnCheckpoint(normalized);
+        serialized = serializeTurnCheckpoint(changed);
+        parseTurnCheckpoint(serialized);
       } catch (error) {
         return this.rejected(
           error instanceof Error && error.message.includes("byte limit")
@@ -643,7 +509,7 @@ export class DurableChatTurnStore {
              AND lease_expires_at > ? AND terminal_deadline_at > ?
            RETURNING *`,
           serialized,
-          mutation.type === "begin_effect" ? 1 : 0,
+          markEffect ? 1 : 0,
           at,
           id,
           attemptToken,
@@ -652,38 +518,14 @@ export class DurableChatTurnStore {
         )
         .toArray()[0];
       if (!updated) return this.rejected("stale");
-      this.bumpRevision();
-      return this.accepted(updated, false, normalized);
+      const revision = this.bumpRevision();
+      this.appendEvent(event, id, "running", revision, at);
+      return this.accepted(updated);
     });
   }
 
   admit(input: AdmitChatTurn, now: number): StoreResult {
-    if (
-      !input ||
-      typeof input !== "object" ||
-      Array.isArray(input) ||
-      Object.getPrototypeOf(input) !== Object.prototype ||
-      !onlyKeys(input as unknown as Record<string, unknown>, ADMIT_KEYS)
-    )
-      return this.rejected("invalid");
-    const scheduled = normalizeAutomationRun(
-      (input as { automationRun?: unknown }).automationRun,
-    );
-    if (
-      [
-        input.id,
-        input.clientMessageId,
-        input.threadId,
-        input.workspaceId,
-        input.orgId,
-        input.source,
-        input.userContent,
-        input.userDisplay,
-      ].some((value) => typeof value !== "string") ||
-      (input.userId !== null && typeof input.userId !== "string") ||
-      scheduled === null
-    )
-      return this.rejected("invalid");
+    const scheduled = input.automationRun;
     const identifiers = [
       input.id,
       input.clientMessageId,
@@ -692,15 +534,12 @@ export class DurableChatTurnStore {
       input.orgId,
       input.source,
       ...(input.userId ? [input.userId] : []),
-      ...(scheduled
-        ? [scheduled.workspaceId, scheduled.automationId, scheduled.runId]
-        : []),
+      ...(scheduled ? [scheduled.workspaceId, scheduled.automationId, scheduled.runId] : []),
     ];
     if (
       identifiers.some(
         (value) => !value || value.length > CHAT_RUNTIME_BOUNDS.identifierChars,
-      ) ||
-      (scheduled &&
+      ) || (scheduled !== undefined &&
         (scheduled.workspaceId !== input.workspaceId ||
           scheduled.runId !== input.id ||
           (scheduled.requiresExplicitOutcome !== undefined &&
@@ -708,10 +547,6 @@ export class DurableChatTurnStore {
     ) {
       return this.rejected("invalid");
     }
-    const requestBytes = admitRequestBytes(input, scheduled);
-    if (requestBytes > CHAT_RUNTIME_BOUNDS.requestBytes)
-      return this.rejected("request_bytes");
-    const bytes = payloadBytes(input.userContent, input.userDisplay);
     return this.storage.transactionSync(() => {
       const runtime = this.runtime();
       if (
@@ -745,6 +580,16 @@ export class DurableChatTurnStore {
         return this.rejected("thread_full");
       }
 
+      const requestBytes = sizeOf(JSON.stringify(input));
+      if (requestBytes > CHAT_RUNTIME_BOUNDS.requestBytes) {
+        return this.rejected("request_bytes");
+      }
+      const payloadBytes = sizeOf(
+        JSON.stringify({
+          content: input.userContent,
+          display: input.userDisplay,
+        }),
+      );
       const queue = this.sql
         .exec<{ turns: number; bytes: number | null }>(
           `SELECT COUNT(*) AS turns, COALESCE(SUM(payload_bytes), 0) AS bytes
@@ -754,7 +599,10 @@ export class DurableChatTurnStore {
       if (Number(queue.turns) >= CHAT_RUNTIME_BOUNDS.queueTurns) {
         return this.rejected("queue_full");
       }
-      if (Number(queue.bytes ?? 0) + bytes > CHAT_RUNTIME_BOUNDS.queueBytes) {
+      if (
+        Number(queue.bytes ?? 0) + payloadBytes >
+        CHAT_RUNTIME_BOUNDS.queueBytes
+      ) {
         return this.rejected("queue_bytes");
       }
 
@@ -774,19 +622,25 @@ export class DurableChatTurnStore {
         input.source,
         input.userContent,
         input.userDisplay,
-        bytes,
-        scheduled ? JSON.stringify(scheduled) : null,
+        payloadBytes,
+        scheduled ? JSON.stringify({ ...scheduled, requiresExplicitOutcome: scheduled.requiresExplicitOutcome === true }) : null,
         at + CHAT_RUNTIME_BOUNDS.turnLeaseMs,
         at,
         at,
       );
-      this.bumpRevision();
+      const revision = this.bumpRevision();
+      this.appendEvent("DurablyAdmit", input.id, "queued", revision, at);
       return this.accepted(this.find(input.id) as TurnRow);
     });
   }
 
   claim(now: number, attemptToken: string): StoreResult {
-    if (!validAttemptToken(attemptToken)) return this.rejected("invalid");
+    if (
+      !attemptToken ||
+      attemptToken.length > CHAT_RUNTIME_BOUNDS.identifierChars
+    ) {
+      return this.rejected("invalid");
+    }
     return this.storage.transactionSync(() => {
       if (legacyMigrationBlocksClaim(this.sql)) return this.rejected("busy");
       if (this.runtime().active_turn_id) return this.rejected("busy");
@@ -811,6 +665,8 @@ export class DurableChatTurnStore {
            WHERE status = 'queued' ORDER BY created_at, rowid LIMIT 1`,
         )
         .toArray()[0];
+      // Never skip an expired FIFO head to run newer work. The alarm driver
+      // terminalizes that head first, one bounded transition per wake.
       if (!turn || Number(turn.terminal_deadline_at) <= at) {
         return this.rejected("idle");
       }
@@ -846,12 +702,174 @@ export class DurableChatTurnStore {
         `UPDATE chat_runtime_v2 SET active_turn_id = ? WHERE singleton = 1`,
         turn.id,
       );
-      this.bumpRevision();
+      const revision = this.bumpRevision();
+      this.appendEvent("StartSelectedTurn", turn.id, "running", revision, at);
       return this.accepted(claimed);
     });
   }
 
-  finish(
+  startNextInference(
+    id: string,
+    attemptToken: string,
+    now: number,
+  ): StoreResult {
+    return this.mutateCheckpoint(
+      id,
+      attemptToken,
+      now,
+      "StartNextInference",
+      (checkpoint) => {
+        if (
+          checkpoint.final !== null ||
+          checkpoint.providerInFlight ||
+          !checkpointClosed(checkpoint)
+        ) {
+          return "stale";
+        }
+        if (
+          checkpoint.providerCalls >= CHAT_RUNTIME_BOUNDS.providerCallsPerTurn
+        ) {
+          return "provider_limit";
+        }
+        checkpoint.providerCalls += 1;
+        checkpoint.providerInFlight = true;
+        return checkpoint;
+      },
+    );
+  }
+
+  checkpointProviderBatch(
+    id: string,
+    attemptToken: string,
+    batch: CheckpointProviderBatch,
+    now: number,
+  ): StoreResult {
+    return this.mutateCheckpoint(
+      id,
+      attemptToken,
+      now,
+      "CheckpointProviderBatch",
+      (checkpoint) => {
+        if (
+          !checkpoint.providerInFlight ||
+          checkpoint.final !== null ||
+          !checkpointClosed(checkpoint) ||
+          batch.calls.length === 0 ||
+          batch.calls.some((call) => call.effectStarted || call.result !== null)
+        ) {
+          return "stale";
+        }
+        const calls = checkpoint.batches.reduce(
+          (count, item) => count + item.calls.length,
+          batch.calls.length,
+        );
+        if (calls > CHAT_RUNTIME_BOUNDS.toolCallsPerTurn) return "tool_limit";
+        checkpoint.providerInFlight = false;
+        checkpoint.batches.push(batch);
+        return checkpoint;
+      },
+    );
+  }
+
+  checkpointProviderFinal(
+    id: string,
+    attemptToken: string,
+    output: string,
+    now: number,
+  ): StoreResult {
+    if (sizeOf(output) > CHAT_RUNTIME_BOUNDS.assistantBytes) {
+      return this.rejected("output_bytes");
+    }
+    return this.mutateCheckpoint(
+      id,
+      attemptToken,
+      now,
+      "CheckpointProviderFinal",
+      (checkpoint) => {
+        if (
+          !checkpoint.providerInFlight ||
+          checkpoint.final !== null ||
+          !checkpointClosed(checkpoint)
+        ) {
+          return "stale";
+        }
+        checkpoint.providerInFlight = false;
+        checkpoint.final = output;
+        return checkpoint;
+      },
+    );
+  }
+
+  markEffectStarted(
+    id: string,
+    attemptToken: string,
+    callId: string,
+    now: number,
+  ): StoreResult {
+    return this.mutateCheckpoint(
+      id,
+      attemptToken,
+      now,
+      "BeginEffect",
+      (checkpoint) => {
+        if (checkpoint.providerInFlight || checkpoint.final !== null) {
+          return "stale";
+        }
+        const batch = checkpoint.batches.at(-1);
+        const firstPending = batch?.calls.find((call) => call.result === null);
+        if (
+          !firstPending ||
+          firstPending.id !== callId ||
+          firstPending.effectStarted
+        ) {
+          return "stale";
+        }
+        firstPending.effectStarted = true;
+        return checkpoint;
+      },
+      true,
+    );
+  }
+
+  recordToolResult(
+    id: string,
+    attemptToken: string,
+    result: CheckpointToolResult,
+    now: number,
+  ): StoreResult {
+    return this.mutateCheckpoint(
+      id,
+      attemptToken,
+      now,
+      "RecordToolResult",
+      (checkpoint) => {
+        if (checkpoint.providerInFlight || checkpoint.final !== null) {
+          return "stale";
+        }
+        const call = checkpoint.batches
+          .at(-1)
+          ?.calls.find((candidate) => candidate.result === null);
+        if (
+          !call ||
+          call.id !== result.callId ||
+          !call.effectStarted ||
+          result.output.length === 0
+        ) {
+          return "stale";
+        }
+        call.result = result;
+        return checkpoint;
+      },
+    );
+  }
+
+  complete(id: string, attemptToken: string, assistantFinal: string, now: number): StoreResult {
+    return this.terminal(id, attemptToken, "completed", assistantFinal, now); }
+
+  fail(id: string, attemptToken: string, assistantError: string, now: number): StoreResult {
+    return this.terminal(id, attemptToken, "failed", assistantError, now); }
+
+  private terminal(
     id: string,
     attemptToken: string,
     status: "completed" | "failed",
@@ -880,6 +898,7 @@ export class DurableChatTurnStore {
           running,
           at,
           "Turn interrupted when a late result crossed its deadline.",
+          "ExpireOperation",
         );
       }
       if (status === "completed") {
@@ -897,7 +916,10 @@ export class DurableChatTurnStore {
           return this.rejected("stale");
         }
       }
-      return this.finishTurn(running, status, output, at);
+      return this.finishTurn(
+        running, status, output,
+        status === "completed" ? "CompleteTurn" : "FailTurn", at,
+      );
     });
   }
 
@@ -918,22 +940,30 @@ export class DurableChatTurnStore {
       if (!turn) return this.rejected("idle");
       if (turn.status === "queued") {
         return this.finishTurn(
-          turn,
-          "failed",
-          "Turn expired before execution could begin.",
-          at,
+          turn, "failed", "Turn expired before execution could begin.",
+          "ExpireOperation", at,
         );
       }
       return this.interruptRunning(
         turn,
         at,
         "Turn interrupted after its execution lease expired.",
+        "ExpireOperation",
       );
     });
   }
 
+  /**
+   * Give a cold isolate one fresh fenced owner without changing the original
+   * absolute deadline. An unrecorded effect or a second crash is terminal.
+   */
   recoverFromCheckpoint(now: number, freshToken: string): StoreResult {
-    if (!validAttemptToken(freshToken)) return this.rejected("invalid");
+    if (
+      !freshToken ||
+      freshToken.length > CHAT_RUNTIME_BOUNDS.identifierChars
+    ) {
+      return this.rejected("invalid");
+    }
     return this.storage.transactionSync(() => {
       const turn = this.activeTurnRow();
       if (!turn) return this.rejected("idle");
@@ -946,6 +976,7 @@ export class DurableChatTurnStore {
           turn,
           at,
           "Turn interrupted before checkpoint recovery could begin.",
+          "ExpireOperation",
         );
       }
       if (
@@ -970,6 +1001,7 @@ export class DurableChatTurnStore {
           turn,
           at,
           "Turn interrupted because its recovery checkpoint was invalid.",
+          "ReconcileCrashedTurn",
         );
       }
       if (
@@ -982,8 +1014,11 @@ export class DurableChatTurnStore {
           checkpointUncertain(checkpoint)
             ? "Turn interrupted after a crash with an uncertain external effect."
             : "Turn interrupted after its one checkpoint recovery was exhausted.",
+          "ReconcileCrashedTurn",
         );
       }
+      // A provider dispatch without a response checkpoint is safe to repeat
+      // once. Its consumed provider-call count remains consumed.
       checkpoint.providerInFlight = false;
       const serialized = serializeTurnCheckpoint(checkpoint);
       const lease = Math.min(
@@ -1016,11 +1051,22 @@ export class DurableChatTurnStore {
         turn.id,
         at,
       );
-      this.bumpRevision();
-      return this.accepted(recovered, false, checkpoint);
+      const revision = this.bumpRevision();
+      this.appendEvent(
+        "RecoverFromCheckpoint",
+        turn.id,
+        "running",
+        revision,
+        at,
+      );
+      return this.accepted(recovered);
     });
   }
 
+  /**
+   * Terminalize an attempt owned by a previous isolate. This never retries it;
+   * the token makes every late completion from the dead owner stale.
+   */
   reconcileCrashedTurn(
     now: number,
     ownedAttemptToken: string | null,
@@ -1037,6 +1083,7 @@ export class DurableChatTurnStore {
         turn.effect_started
           ? "Turn interrupted after a crash; an external effect may have completed."
           : "Turn interrupted after a crash before any external effect began.",
+        "ReconcileCrashedTurn",
       );
     });
   }
@@ -1058,40 +1105,22 @@ export class DurableChatTurnStore {
 
   getTurn(id: string): DurableChatTurn | null {
     const turn = this.find(id);
-    return turn ? this.toTurn(turn) : null;
-  }
+    return turn ? this.toTurn(turn) : null; }
 
   recordedAutomationOutcome(id: string) {
-    return (
-      checkpointAutomationOutcome(this.find(id)?.checkpoint_json ?? "") ?? null
-    );
-  }
+    return checkpointAutomationOutcome(this.find(id)?.checkpoint_json ?? "") ?? null; }
 
   claimAutomationReport(now: number): AutomationRunReport | null {
     return this.storage.transactionSync(() => {
       const at = time(now);
-      const row = this.sql
-        .exec<TurnRow>(
-          `SELECT * FROM chat_turns_v2
-        WHERE automation_report_at <= ? ORDER BY automation_report_at, rowid LIMIT 1`,
-          at,
-        )
-        .toArray()[0];
+      const row = this.sql.exec<TurnRow>(`SELECT * FROM chat_turns_v2
+        WHERE automation_report_at <= ? ORDER BY automation_report_at, rowid LIMIT 1`, at).toArray()[0];
       if (!row) return null;
       const run = parseAutomationRun(row.automation_json);
       const attempts = Number(run?.reportAttempts ?? 0);
       const deadline = Number(run?.reportDeadlineAt ?? 0);
-      if (
-        !run ||
-        at >= deadline ||
-        attempts >= CHAT_RUNTIME_BOUNDS.automationReportAttempts
-      ) {
-        this.sql.exec(
-          `UPDATE chat_turns_v2 SET automation_json = NULL,
-             automation_report_at = NULL WHERE id = ?`,
-          row.id,
-        );
-        this.pruneHistory();
+      if (!run || at >= deadline || attempts >= CHAT_RUNTIME_BOUNDS.automationReportAttempts) {
+        this.sql.exec("UPDATE chat_turns_v2 SET automation_report_at = NULL WHERE id = ?", row.id);
         return null;
       }
       const attempt = attempts + 1;
@@ -1099,9 +1128,7 @@ export class DurableChatTurnStore {
       this.sql.exec(
         `UPDATE chat_turns_v2 SET automation_json = ?, automation_report_at = ?
          WHERE id = ? AND automation_report_at IS NOT NULL`,
-        JSON.stringify(run),
-        Math.min(deadline, at + CHAT_RUNTIME_BOUNDS.automationReportRetryMs),
-        row.id,
+        JSON.stringify(run), Math.min(deadline, at + CHAT_RUNTIME_BOUNDS.automationReportRetryMs), row.id,
       );
       return {
         turnId: row.id,
@@ -1121,31 +1148,19 @@ export class DurableChatTurnStore {
       const row = this.find(turnId);
       const run = row ? parseAutomationRun(row.automation_json) : null;
       if (!run || run.reportAttempts !== attempt) return false;
-      const updated = this.sql
-        .exec<{ id: string }>(
-          `UPDATE chat_turns_v2 SET automation_json = NULL,
-             automation_report_at = NULL
-           WHERE id = ? AND automation_report_at IS NOT NULL RETURNING id`,
-          turnId,
-        )
-        .toArray()[0];
-      if (!updated) return false;
-      this.pruneHistory();
-      return true;
+      return Boolean(this.sql.exec<{ id: string }>(
+        `UPDATE chat_turns_v2 SET automation_report_at = NULL
+         WHERE id = ? AND automation_report_at IS NOT NULL RETURNING id`, turnId,
+      ).toArray()[0]);
     });
   }
 
   hasPendingTurn(): boolean {
-    return Boolean(
-      this.sql
-        .exec<{ found: number }>(
-          `SELECT EXISTS(SELECT 1 FROM
-      chat_turns_v2 WHERE status IN ('queued','running')) AS found`,
-        )
-        .one().found,
-    );
+    return Boolean(this.sql.exec<{ found: number }>(`SELECT EXISTS(SELECT 1 FROM
+      chat_turns_v2 WHERE status IN ('queued','running')) AS found`).one().found);
   }
 
+  /** Newest-first, model-only settled history; never substitutes UI display text. */
   *readModelContext(excludeTurnId: string): Iterable<ChatModelContextTurn> {
     const rows = this.sql.exec<{
       user_content: string;
@@ -1167,12 +1182,18 @@ export class DurableChatTurnStore {
   }
 
   scope(): { threadId: string; workspaceId: string; orgId: string } | null {
-    const { thread_id, workspace_id, org_id } = this.runtime();
-    return thread_id && workspace_id && org_id
-      ? { threadId: thread_id, workspaceId: workspace_id, orgId: org_id }
-      : null;
+    const runtime = this.runtime();
+    if (!runtime.thread_id || !runtime.workspace_id || !runtime.org_id) {
+      return null;
+    }
+    return {
+      threadId: runtime.thread_id,
+      workspaceId: runtime.workspace_id,
+      orgId: runtime.org_id,
+    };
   }
 
+  /** One bounded compatibility import; imported rows are ordinary settled turns. */
   replaceSettledHistory(
     scope: {
       threadId: string;
@@ -1182,8 +1203,9 @@ export class DurableChatTurnStore {
     },
     turns: readonly SettledChatTurn[],
   ): void {
+    const identifiers = [scope.threadId, scope.workspaceId, scope.orgId];
     if (
-      [scope.threadId, scope.workspaceId, scope.orgId].some(
+      identifiers.some(
         (value) => !value || value.length > CHAT_RUNTIME_BOUNDS.identifierChars,
       ) ||
       turns.length === 0 ||
@@ -1191,19 +1213,52 @@ export class DurableChatTurnStore {
     ) {
       throw new Error("Invalid settled history");
     }
+    let totalBytes = 0;
+    const normalized = turns.map((turn) => {
+      if (!turn.id || turn.id.length > CHAT_RUNTIME_BOUNDS.identifierChars) {
+        throw new Error("Invalid settled turn id");
+      }
+      const payloadBytes = sizeOf(
+        JSON.stringify({
+          content: turn.userContent,
+          display: turn.userDisplay,
+        }),
+      );
+      const historyBytes = sizeOf(
+        JSON.stringify({
+          content: turn.userContent,
+          display: turn.userDisplay,
+          assistant: turn.assistantFinal,
+        }),
+      );
+      if (
+        historyBytes >
+        CHAT_RUNTIME_BOUNDS.requestBytes + CHAT_RUNTIME_BOUNDS.assistantBytes
+      ) {
+        throw new Error("Settled turn is too large");
+      }
+      totalBytes += historyBytes;
+      return {
+        ...turn,
+        payloadBytes,
+        createdAt: time(turn.createdAt),
+        updatedAt: Math.max(time(turn.createdAt), time(turn.updatedAt)),
+      };
+    });
+    if (totalBytes > CHAT_RUNTIME_BOUNDS.historyBytes) {
+      throw new Error("Settled history is too large");
+    }
+
     this.storage.transactionSync(() => {
-      if (this.sql.exec("SELECT id FROM chat_turns_v2 LIMIT 1").toArray()[0]) {
+      if (
+        this.sql
+          .exec<{
+            count: number;
+          }>("SELECT COUNT(*) AS count FROM chat_turns_v2")
+          .one().count > 0
+      ) {
         throw new Error("Cannot import history into a nonempty runtime");
       }
-      let totalBytes = 0;
-      const fixedBytes = [
-        scope.threadId,
-        scope.workspaceId,
-        scope.orgId,
-        scope.userId ?? "",
-        "forkcompleted",
-        EMPTY_CHECKPOINT_JSON,
-      ].reduce((sum, value) => sum + sizeOf(value), 0);
       this.sql.exec(
         `UPDATE chat_runtime_v2 SET active_turn_id = NULL,
          thread_id = ?, workspace_id = ?, org_id = ? WHERE singleton = 1`,
@@ -1211,22 +1266,7 @@ export class DurableChatTurnStore {
         scope.workspaceId,
         scope.orgId,
       );
-      for (const turn of turns) {
-        if (!turn.id || turn.id.length > CHAT_RUNTIME_BOUNDS.identifierChars)
-          throw new Error("Invalid settled turn id");
-        const bodyBytes =
-          sizeOf(turn.userContent) +
-          sizeOf(turn.userDisplay) +
-          sizeOf(turn.assistantFinal ?? "");
-        if (
-          bodyBytes >
-          CHAT_RUNTIME_BOUNDS.requestBytes + CHAT_RUNTIME_BOUNDS.assistantBytes
-        )
-          throw new Error("Settled turn is too large");
-        totalBytes += bodyBytes + sizeOf(turn.id) * 2 + fixedBytes;
-        if (totalBytes > CHAT_RUNTIME_BOUNDS.historyBytes)
-          throw new Error("Settled history is too large");
-        const createdAt = time(turn.createdAt);
+      for (const turn of normalized) {
         this.sql.exec(
           `INSERT INTO chat_turns_v2
             (id, client_message_id, thread_id, workspace_id, org_id, user_id,
@@ -1242,10 +1282,10 @@ export class DurableChatTurnStore {
           turn.userContent,
           turn.userDisplay,
           turn.assistantFinal,
-          payloadBytes(turn.userContent, turn.userDisplay),
-          createdAt + CHAT_RUNTIME_BOUNDS.turnLeaseMs,
-          createdAt,
-          Math.max(createdAt, time(turn.updatedAt)),
+          turn.payloadBytes,
+          turn.createdAt + CHAT_RUNTIME_BOUNDS.turnLeaseMs,
+          turn.createdAt,
+          turn.updatedAt,
         );
       }
       this.bumpRevision();
@@ -1257,55 +1297,46 @@ export class DurableChatTurnStore {
     turn: TurnRow,
     at: number,
     error: string,
+    event: "ExpireOperation" | "ReconcileCrashedTurn",
   ): StoreResult {
-    return this.finishTurn(turn, "interrupted", error, at);
+    return this.finishTurn(turn, "interrupted", error, event, at);
   }
 
   private finishTurn(
     turn: TurnRow,
     status: "completed" | "failed" | "interrupted",
     output: string,
+    event: "CompleteTurn" | "FailTurn" | "ExpireOperation" | "ReconcileCrashedTurn",
     at: number,
   ): StoreResult {
     const pending = terminalAutomation(
-      parseAutomationRun(turn.automation_json),
-      turn.checkpoint_json,
-      at,
+      parseAutomationRun(turn.automation_json), turn.checkpoint_json, at,
     );
-    const terminal = this.sql
-      .exec<TurnRow>(
-        `UPDATE chat_turns_v2 SET status = ?, assistant_final = ?, assistant_error = ?,
+    const terminal = this.sql.exec<TurnRow>(
+      `UPDATE chat_turns_v2 SET status = ?, assistant_final = ?, assistant_error = ?,
        assistant_render_json = ?, automation_json = ?, automation_report_at = ?,
        lease_expires_at = NULL, checkpoint_json = ?, updated_at = ?
        WHERE id = ? AND status = ? AND attempt_token IS ? RETURNING *`,
-        status,
-        status === "completed" ? output : null,
-        status === "completed" ? null : output,
-        terminalRenderJson(
-          turn.checkpoint_json,
-          output,
-          status === "completed",
-        ),
-        pending ? JSON.stringify(pending) : null,
-        pending ? at : null,
-        EMPTY_CHECKPOINT_JSON,
-        at,
-        turn.id,
-        turn.status,
-        turn.attempt_token,
-      )
-      .toArray()[0];
+      status, status === "completed" ? output : null,
+      status === "completed" ? null : output,
+      terminalRenderJson(turn.checkpoint_json, output, status === "completed"),
+      pending ? JSON.stringify(pending) : null, pending ? at : null,
+      EMPTY_CHECKPOINT_JSON, at, turn.id, turn.status, turn.attempt_token,
+    ).toArray()[0];
     if (!terminal) return this.rejected("stale");
     this.sql.exec(
       `UPDATE chat_runtime_v2 SET active_turn_id = NULL
          WHERE singleton = 1 AND active_turn_id = ?`,
       turn.id,
     );
-    this.bumpRevision();
+    const revision = this.bumpRevision();
+    this.appendEvent(event, turn.id, status, revision, at);
     const result = this.accepted(terminal);
     this.pruneHistory();
     return result;
   }
+
+  shouldArmAlarm(): boolean { return this.nextAlarmAt(0) !== null; }
 
   nextAlarmAt(now: number): number | null {
     const row = this.sql
@@ -1332,74 +1363,58 @@ export class DurableChatTurnStore {
     revision: number;
     messages: ChatSnapshotMessage[];
     bytes: number;
+    shouldArmAlarm: boolean;
   } {
     const newest: ChatSnapshotMessage[] = [];
     let bytes = 2; // Canonical JSON array brackets.
     const rows = this.sql.exec<TurnRow>(
-      `SELECT id, user_display, assistant_final, assistant_error,
-              assistant_render_json, status, checkpoint_json,
-              created_at, updated_at
-         FROM chat_turns_v2
+      `SELECT * FROM chat_turns_v2
        WHERE retained = 1
        ORDER BY created_at DESC, rowid DESC LIMIT ?`,
       CHAT_RUNTIME_BOUNDS.snapshotMessages,
     );
     for (const row of rows) {
+      const turn = this.toTurn(row);
       const group: ChatSnapshotMessage[] = [
         {
-          id: `${row.id}:user`,
-          turnId: row.id,
+          id: `${turn.id}:user`,
+          turnId: turn.id,
           role: "user",
-          content: row.user_display,
-          status: row.status,
-          createdAt: Number(row.created_at),
+          content: turn.userDisplay,
+          status: turn.status,
+          createdAt: turn.createdAt,
         },
       ];
-      const storedRender = row.assistant_render_json
-        ? parseRuntimeContent(row.assistant_render_json)
+      const storedRender = turn.assistantRenderJson
+        ? parseRuntimeContent(turn.assistantRenderJson)
         : null;
       const activeRender =
-        row.status === "running"
-          ? checkpointRuntimeContent(parseTurnCheckpoint(row.checkpoint_json))
+        turn.status === "running"
+          ? checkpointRuntimeContent(turn.checkpoint)
           : [];
-      const assistant = storedRender?.length
-        ? storedRender
-        : activeRender.length
-          ? activeRender
-          : (row.assistant_final ?? row.assistant_error);
+      const assistant =
+        storedRender?.length
+          ? storedRender
+          : activeRender.length
+            ? activeRender
+            : (turn.assistantFinal ?? turn.assistantError);
       if (assistant !== null) {
         group.push({
-          id: `${row.id}:assistant`,
-          turnId: row.id,
+          id: `${turn.id}:assistant`,
+          turnId: turn.id,
           role: "assistant",
           content: assistant,
-          status: row.status,
-          createdAt: Number(row.updated_at),
+          status: turn.status,
+          createdAt: turn.updatedAt,
         });
       }
-      let groupBytes = group.reduce(
+      const groupBytes = group.reduce(
         (sum, message, index) =>
           sum +
           sizeOf(JSON.stringify(message)) +
           (newest.length + index > 0 ? 1 : 0),
         0,
       );
-      if (bytes + groupBytes > CHAT_RUNTIME_BOUNDS.snapshotBytes) {
-        const assistantMessage = group[1];
-        if (assistantMessage && Array.isArray(assistantMessage.content)) {
-          group[1] = {
-            ...assistantMessage,
-            content: row.assistant_final ?? row.assistant_error ?? [],
-          };
-        }
-        const compacted = compactSnapshotGroup(
-          group,
-          newest.length,
-          CHAT_RUNTIME_BOUNDS.snapshotBytes - bytes,
-        );
-        if (compacted === null) break;
-        groupBytes = compacted;
-      }
       if (
         newest.length + group.length > CHAT_RUNTIME_BOUNDS.snapshotMessages ||
         bytes + groupBytes > CHAT_RUNTIME_BOUNDS.snapshotBytes
@@ -1413,10 +1428,64 @@ export class DurableChatTurnStore {
       revision: Number(this.runtime().revision),
       messages: newest,
       bytes,
+      shouldArmAlarm: this.shouldArmAlarm(),
     };
   }
 
-  revision(): number {
-    return Number(this.runtime().revision);
+  readOutbox(afterSeq: number | null): {
+    reset: boolean;
+    cursor: number;
+    events: ChatOutboxEvent[];
+    revision: number;
+  } {
+    const range = this.sql
+      .exec<{
+        oldest: number | null;
+        latest: number | null;
+      }>("SELECT MIN(seq) AS oldest, MAX(seq) AS latest FROM chat_outbox_v2")
+      .one();
+    const oldest = range.oldest === null ? 0 : Number(range.oldest);
+    const latest = range.latest === null ? 0 : Number(range.latest);
+    const reset =
+      afterSeq === null || afterSeq < oldest - 1 || afterSeq > latest;
+    if (reset) {
+      return {
+        reset: true,
+        cursor: latest,
+        events: [],
+        revision: Number(this.runtime().revision),
+      };
+    }
+
+    const events = this.sql
+      .exec<{
+        seq: number;
+        revision: number;
+        event_type: ChatOutboxEvent["type"];
+        turn_id: string;
+        status: RuntimeTurnStatus;
+        created_at: number;
+      }>(
+        `SELECT seq, revision, event_type, turn_id, status, created_at
+         FROM chat_outbox_v2 WHERE seq > ? ORDER BY seq
+         LIMIT ?`,
+        afterSeq,
+        CHAT_RUNTIME_BOUNDS.outboxEvents,
+      )
+      .toArray()
+      .map((row) => ({
+        seq: Number(row.seq),
+        revision: Number(row.revision),
+        type: row.event_type,
+        turnId: row.turn_id,
+        status: row.status,
+        createdAt: Number(row.created_at),
+      }));
+    return {
+      reset: false,
+      cursor: events.at(-1)?.seq ?? afterSeq,
+      events,
+      revision: Number(this.runtime().revision),
+    };
   }
 }

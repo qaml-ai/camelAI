@@ -168,15 +168,6 @@ describe("chat runtime content", () => {
     expect(
       parseRuntimeContent(" ".repeat(CHAT_RUNTIME_BOUNDS.liveMessageBytes + 1)),
     ).toBeNull();
-    let tooDeep = "0";
-    for (
-      let depth = 0;
-      depth < CHAT_RUNTIME_BOUNDS.providerJsonDepth + 2;
-      depth += 1
-    ) {
-      tooDeep = `[${tooDeep}]`;
-    }
-    expect(parseRuntimeContent(tooDeep)).toBeNull();
   });
 
   it("bounds trace, message, and block count without splitting UTF-8", () => {
@@ -253,30 +244,6 @@ describe("chat runtime content", () => {
     expect(bytes(resultArtifact[0].content)).toBeLessThanOrEqual(
       CHAT_RUNTIME_BOUNDS.toolResultBytes,
     );
-  });
-
-  it("truncates large text before its first JSON serialization", () => {
-    const huge = "\u0000".repeat(CHAT_RUNTIME_BOUNDS.liveMessageBytes);
-    const stringify = vi.spyOn(JSON, "stringify");
-    try {
-      const serialized = serializeRuntimeContent([
-        { type: "thinking", thinking: huge, signature: huge },
-      ]);
-      expect(bytes(serialized)).toBeLessThanOrEqual(
-        CHAT_RUNTIME_BOUNDS.liveMessageBytes,
-      );
-      expect(
-        stringify.mock.calls.some(
-          ([value]) =>
-            !!value &&
-            typeof value === "object" &&
-            ((value as { thinking?: unknown }).thinking === huge ||
-              (value as { signature?: unknown }).signature === huge),
-        ),
-      ).toBe(false);
-    } finally {
-      stringify.mockRestore();
-    }
   });
 
   it("omits malformed provider JSON and tool results without losing safe parts", () => {

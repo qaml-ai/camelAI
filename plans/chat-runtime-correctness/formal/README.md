@@ -19,10 +19,7 @@ The model composes five finite state machines:
   one establishes one absolute migration deadline;
   the only retry uses a fresh token without renewing that deadline or any queued
   turn deadline/counter. Claim is disabled until the permanent terminal marker.
-  The first-byte path never begins or waits for migration. The implementation
-  also treats pre-existing settled or fork-sourced V2 history as authoritative
-  and completes its marker without merging legacy rows; that initial-history
-  selection is outside this lifecycle model.
+  The first-byte path never begins or waits for migration.
 - `ClientPost` pre-arms the alarm. `DurablyAdmit` is the server-side durable ACK
   decision: it records an id exactly once, appends a bounded FIFO queue, and
   starts one accepted-to-terminal deadline. A lifetime admission cap makes its
@@ -49,8 +46,7 @@ work, and then requires isolate abort for uncancellable local/RPC work.
 
 ## Durable action vocabulary
 
-The store's static exported vocabulary and formal model share these 16 durable
-action names exactly:
+The store/outbox and formal model share these 16 durable event names exactly:
 
 1. `DurablyAdmit`
 2. `BeginLegacyMigration`
@@ -72,8 +68,8 @@ action names exactly:
 `runtime-lifecycle.ts` intentionally remains a coarse, side-effect-free
 seven-action admission/ownership/terminal projection. It does not duplicate
 checkpoint JSON or legacy-import state. The conformance script compares that
-coarse set exactly, compares the complete static store vocabulary to the model,
-and checks semantic source structure rather than relying on vocabulary alone.
+coarse set exactly, compares the complete store/outbox set to the model, and
+checks semantic source structure rather than relying on vocabulary alone.
 
 ## Checked properties
 
@@ -210,30 +206,38 @@ the script's process and shutdown bounds are complementary.
 
 ### Verification record
 
-On 2026-08-30, the checked-in `SHA256SUMS` verified the current model and all
-five configs, and the TLA+ 1.7.4 jar verified against the pinned digest above.
-The four unsymmetrized focused configs then completed locally with
-`-lncheck final`; every configured invariant and temporal property was clean,
-the final state queue was zero, and TLC exited 0:
+With the pinned jar on 2026-08-27, all four unsymmetrized matrix configurations
+completed exhaustively on one AWS `r8id.24xlarge`, eight TLC workers per config,
+with every configured invariant and temporal property clean:
 
-| Config | Workers | Generated |  Distinct | Queue | Depth | Elapsed |
-| ------ | ------: | --------: | --------: | ----: | ----: | ------: |
-| A      |       2 |   295,927 |    53,111 |     0 |    23 |   1m40s |
-| B      |       6 | 8,363,179 | 1,184,087 |     0 |    32 |  25m08s |
-| C      |       2 |   351,817 |    65,210 |     0 |    26 |   1m10s |
-| D      |       6 | 8,330,079 | 1,179,935 |     0 |    32 |  24m53s |
+| Config | Generated |  Distinct | Queue | Depth |  Time |       Max RSS |
+| ------ | --------: | --------: | ----: | ----: | ----: | ------------: |
+| A      |   291,863 |    52,435 |     0 |    23 |   20s | 1,701,044 KiB |
+| B      | 8,350,307 | 1,182,355 |     0 |    33 | 7m59s | 4,546,972 KiB |
+| C      |   350,337 |    64,930 |     0 |    26 |   14s | 1,675,600 KiB |
+| D      | 8,322,711 | 1,178,875 |     0 |    33 | 7m48s | 4,583,208 KiB |
 
-A and C used the exact two-worker CI setting. B and D used six workers to
-reduce local wall time; worker count changes parallel graph exploration, not the
-configured state machine or checked properties. Earlier two-worker B/D sizing
-runs were stopped with nonzero frontiers and are not verification evidence.
+Before execution, the uploaded model and configs were checked against the
+checked-in `SHA256SUMS`, and the TLA+ tools jar was checked against the digest
+pinned above and in CI. The CI heap is consequently 4 GiB rather than the earlier
+3 GiB estimate; its 50-minute process deadline accounts for using two workers
+instead of eight while remaining an absolute bound.
 
-The larger `ChatLifecycle.cfg` instance was not rerun in this 2026-08-30 audit.
-Its 2026-08-27 AWS result predates the current model/config checksum set, so it
-must be treated as historical sizing information rather than verification of the
-current model. The focused A-D matrix above is the current exhaustive record.
+The supplementary larger combined instance also completed on the same AWS host
+with 80 TLC workers and every configured invariant and temporal property clean:
 
-The model is 639 lines, below the 641-line runtime-startup/retry model it
+|   Generated |   Distinct | Queue | Depth | TLC time | Wall time |         Max RSS |
+| ----------: | ---------: | ----: | ----: | -------: | --------: | --------------: |
+| 136,449,961 | 18,419,600 |     0 |    36 |   52m25s | 52m33.74s | 282,159,156 KiB |
+
+After the queue reached zero, final-only liveness checked all 28 temporal
+branches over the complete graph; TLC then exited 0. This combined instance adds
+cross-dimensional evidence but, as noted above, does not subsume focused config
+D's queue-before-lifetime-cap boundary. Earlier local sizing runs were stopped
+with nonempty frontiers and remain non-evidence; the completed AWS records above
+supersede them.
+
+The model is 626 lines, below the 641-line runtime-startup/retry model it
 replaced, while adding the bounded migration and checkpoint-recovery contract.
 
 ## Production bounds
@@ -241,51 +245,41 @@ replaced, while adding the bounded migration and checkpoint-recovery contract.
 Finite TLC values are exhaustive abstractions, not production settings. The
 production ceilings live in `src/lib/chat-runtime-bounds.ts`:
 
-| Resource                               |                   Production bound |
-| -------------------------------------- | ---------------------------------: |
-| Selected serialized payload accounting |                             48 MiB |
-| Lifetime admissions                    |                              4,096 |
-| Queue                                  |                    8 turns / 1 MiB |
-| Retained history                       |                  128 turns / 8 MiB |
-| Model context                          |                64 messages / 2 MiB |
-| Reconnect snapshot source              |            50 messages / 1,536 KiB |
-| SSE writers                            |                    4 per thread DO |
-| Escaped SSE data frame                 |                  2 MiB minus 4 KiB |
-| Undrained SSE writer queue             |                              2 MiB |
-| Aggregate undrained SSE per DO         |                              8 MiB |
-| Turn accepted-to-terminal              |                         20 minutes |
-| Migration                              |            30 seconds / 2 attempts |
-| Legacy scan                            |          32 rows/page / 4,480 rows |
-| Legacy row                             |                          1,536 KiB |
-| Legacy import                          |                  128 turns / 8 MiB |
-| Provider call                          |                          2 minutes |
-| Provider calls per turn                |                                 34 |
-| Provider stream events/call            |                              8,192 |
-| Tool call                              |                         10 minutes |
-| Tool calls per turn                    |                                 32 |
-| Nested calls inside one `js_exec`      |                                 31 |
-| `js_exec` wall / loaded-worker CPU     |            10 minutes / 10 seconds |
-| `js_exec` cleanup                      |                         10 seconds |
-| `js_exec` scratch                      | 128 entries / 64 KiB / 1 MiB total |
-| `js_exec` captured output              |                 200,000 characters |
-| Analysis command                       |                          6 minutes |
-| Analysis output overflow               |                              1 MiB |
-| Tool source text read                  |           2 MiB / 4,096 chunks max |
-| Inline image result                    |                 128 KiB base64 max |
-| `tools.move`                           |   256 files / 8 MiB / 64 MiB total |
-| Tool inputs/results per turn           |                      1 MiB / 1 MiB |
-| Tool overflow object                   |                              2 MiB |
-| Tool overflows per attempt             |                  4 objects / 4 MiB |
-| Tool overflows per turn                |                  8 objects / 8 MiB |
-| Overflow-reference stub                |                              4 KiB |
-| Provider state per turn                |                              2 MiB |
-| Checkpoint                             |                              4 MiB |
-| Live presentation per turn             |          2,048 frames / 32 MiB max |
-| Browser snapshot cache                 |    8 entries / 2 MiB / 8 MiB total |
-| Attempts                               |             1 initial + 1 recovery |
-| Turns per alarm invocation             |                                  1 |
+| Resource                       |          Production bound |
+| ------------------------------ | ------------------------: |
+| Lifetime admissions            |                     4,096 |
+| Queue                          |           8 turns / 1 MiB |
+| Retained history               |         128 turns / 8 MiB |
+| Model context                  |       64 messages / 4 MiB |
+| Reconnect snapshot source      |       50 messages / 8 MiB |
+| Escaped SSE data frame         |                     5 MiB |
+| Undrained SSE writer queue     |             5 MiB + 4 KiB |
+| Aggregate undrained SSE per DO |                    40 MiB |
+| Turn accepted-to-terminal      |                20 minutes |
+| Migration                      |   30 seconds / 2 attempts |
+| Legacy scan                    | 32 rows/page / 4,480 rows |
+| Legacy import                  |         128 turns / 8 MiB |
+| Provider call                  |                 2 minutes |
+| Provider calls per turn        |                        34 |
+| Provider stream events/call    |                     8,192 |
+| Tool call                      |                10 minutes |
+| Tool calls per turn            |                        32 |
+| Tool source text read          |  2 MiB / 4,096 chunks max |
+| Inline image result            |        128 KiB base64 max |
+| `tools.move`                   | 256 files / 8 MiB / 64 MiB total |
+| Tool inputs/results per turn   |            1 MiB / 1 MiB |
+| Tool overflow object           |                     2 MiB |
+| Tool overflows per attempt     |         4 objects / 4 MiB |
+| Tool overflows per turn        |         8 objects / 8 MiB |
+| Overflow-reference stub        |                     4 KiB |
+| Provider state per turn        |                     2 MiB |
+| Checkpoint                     |                     8 MiB |
+| Live presentation per turn     | 4,096 frames / 64 MiB max |
+| Browser snapshot cache         | 8 entries / 5 MiB / 16 MiB total |
+| Attempts                       |    1 initial + 1 recovery |
+| Turns per alarm invocation     |                         1 |
 
-Snapshot, context, prompt, tool-schema, and UTF-8 payload windows are
+Snapshot, outbox, context, prompt, tool-schema, and UTF-8 payload windows are
 enforced in their data-plane modules and adversarial tests, including
 pre-materialization stream/R2 checks, incremental line scanning, and recovered
 JSON depth/entry/node validation. Complete oversized tool results use bounded,
@@ -295,58 +289,5 @@ ceiling. The bounded externalization wait occurs after `BeginEffect` and before
 `RecordToolResult`: a crash there remains an uncertain effect and interrupts
 without replay, while a late object is never checkpointed and is best-effort
 deleted. The formal state abstracts that wait into the same latched interval and
-keeps only bounds that affect ownership, recovery, migration, or
-canonical-history safety.
-
-The code-mode nested-call ledger covers envelope tools, raw tools, secure
-`fetch`, and direct `env.AI`, `env.CAMELAI`, and `env.SCREENSHOT` methods
-together: 31 nested calls (the outer `js_exec` is the turn's 32nd tool call),
-1 MiB of admitted arguments, and 1 MiB of retained results per run, with a
-256 KiB per-result ceiling. Secure-fetch bodies are charged as their bounded
-stream chunks are retained. Direct runtime-binding results reject at that seam;
-ordinary tool results alone may use the separately bounded R2 overflow path.
-
-TLC exhaustively checked the configured finite A-D state graphs for the modeled
-lifecycle semantics: ownership, fencing, migration, recovery, terminality, and
-the stated safety/liveness properties under the documented weak-fairness
-assumptions. It does **not** prove a refinement from TypeScript, nor model or
-prove the 48 MiB selected-payload ledger.
-That ledger is an implementation accounting model for named, serialized
-ChatThreadDO payload windows. Deterministic phase arithmetic and adversarial
-tests use explicit duplicate-copy allowances at modeled seams; object overhead,
-SQLite, SDK/workerd allocations, source RPC materialization, unmodeled request
-interleavings, and unrelated Durable Objects are excluded. It is not a claim
-that total V8/workerd heap is at most 48 MiB.
-
-Analysis/container bounds are implementation-tested but are not variables in
-`ChatLifecycle.tla`: strict project traversal admits at most 8,192 entries,
-4,096 files, 224 KiB of paths, 25 MiB per file, and 256 MiB aggregate source or
-persist bytes; the manifest is capped at 512 KiB and never hashes an inadmissible
-file body. Lightweight request validation precedes admission and sandbox work.
-Within each independently isolated agent/app sandbox scope, one durable token
-lease owns the complete lifecycle under one absolute deadline; those two scopes
-may run concurrently. Write-ahead session/archive taints force confirmed reset
-and exact-key archive cleanup after uncertain work, and
-release/acknowledgement is owner-fenced. Commands, persistence, workdir cleanup,
-session deletion, and reset fallbacks each have finite waits. The ordinary
-command process group is reaped, but deliberate cross-session daemonization,
-transport allocation inside the SDK before our parser, total heap, cancellation
-of already-dispatched RPCs, a late unused session after non-cancelable acquisition,
-and an unreferenced acknowledged archive after outer-response loss remain
-outside both the model and the implementation claim.
-
-Workspace/R2, code-mode execution, analysis, build/bundle, and direct deploy
-are also outside `ChatLifecycle.tla`. Their count, byte, concurrency, and
-deadline ceilings are implementation contracts covered by source conformance
-checks and deterministic adversarial tests. In particular, workspace mutation
-is single-flight; reads retain bounded slots through cancellation; R2 pointer
-changes have durable write-ahead GC; sandbox listings are bounded at the
-producer; bundle streams share one absolute deadline and require confirmed
-destructive reset after abandonment; bundle reads are serial and return stable
-bounded asset values; and direct deploy uses single-lane asset work plus one
-attempt scope across HTTP/storage/registration awaits. A timed-out dispatched
-write is terminal/unknown, while confirmed publication followed by bookkeeping
-failure returns success with a warning rather than repeating publication. None
-of that establishes a total V8/workerd/SDK/R2/`FormData` heap
-bound. The finite 30-second workspace late-put grace also cannot prove cleanup
-against an arbitrarily delayed provider commit.
+keeps only bounds that affect ownership, recovery, migration, or canonical-history
+safety.

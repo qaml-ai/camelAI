@@ -84,7 +84,6 @@ export interface ChatRuntimeClientOptions<State = unknown> {
   maxFrameBytes?: number;
   maxSnapshotMessages?: number;
   onFrame?: (frame: ChatRuntimeFrame<State>) => void;
-  onLiveReset?: () => void;
   onStatus?: (status: ChatRuntimeConnectionStatus) => void;
   onError?: (error: Error) => void;
 }
@@ -516,8 +515,6 @@ export class ChatRuntimeClient<State = unknown> {
       return;
     }
     this.attempts += 1;
-    this.resetLiveTracking(this.durableActiveTurnId ?? null);
-    this.options.onLiveReset?.();
     this.setStatus("connecting");
     const startedAt = Date.now();
     const controller = new AbortController();

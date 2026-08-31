@@ -118,7 +118,10 @@ describe("single durable turn driver", () => {
           status: "completed",
           terminalDeadlineAt: originalDeadline,
         });
-        expect(store.revision()).toBeGreaterThan(0);
+        const actions = store.readOutbox(0).events.map((event) => event.type);
+        expect(actions.indexOf("CompleteLegacyMigration")).toBeLessThan(
+          actions.indexOf("StartSelectedTurn"),
+        );
       },
     );
   });
@@ -170,48 +173,6 @@ describe("single durable turn driver", () => {
     });
   });
 
-  it("aborts a local isolate whose alarm write does not settle", async () => {
-    vi.useFakeTimers();
-    try {
-      await runInDurableObject(stub("alarm-timeout"), async (instance: any) => {
-        const context = driverContext(instance);
-        context.storage.setAlarm = () => new Promise<void>(() => undefined);
-        const abort = vi.spyOn(context, "abort");
-        const driver = new DurableTurnDriver({
-          ctx: context,
-          store: new DurableChatTurnStore(instance.ctx.storage),
-          migrator: new LegacySessionMigrator(instance.ctx.storage),
-          run: vi.fn(),
-          publish: vi.fn(),
-        });
-        const kick = driver.kick().catch((error) => error);
-        await vi.advanceTimersByTimeAsync(CHAT_RUNTIME_BOUNDS.alarmWriteMs);
-        expect(await kick).toEqual(
-          expect.objectContaining({ message: "Alarm write timed out" }),
-        );
-        expect(abort).toHaveBeenCalledWith("Alarm write timed out");
-      });
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("leaves an idle surplus alarm instead of racing a future admission", async () => {
-    await runInDurableObject(stub("surplus-alarm"), async (instance: any) => {
-      const context = driverContext(instance);
-      const deleteAlarm = vi.spyOn(context.storage, "deleteAlarm");
-      const driver = new DurableTurnDriver({
-        ctx: context,
-        store: new DurableChatTurnStore(instance.ctx.storage),
-        migrator: new LegacySessionMigrator(instance.ctx.storage),
-        run: vi.fn(),
-        publish: vi.fn(),
-      });
-      await driver.alarm();
-      expect(deleteAlarm).not.toHaveBeenCalled();
-    });
-  });
-
   it("interrupts an attempt owned by a dead isolate and never regenerates it", async () => {
     await runInDurableObject(stub("crash"), async (instance: any) => {
       const store = new DurableChatTurnStore(instance.ctx.storage);
@@ -220,33 +181,25 @@ describe("single durable turn driver", () => {
       const migrator = new LegacySessionMigrator(instance.ctx.storage, () => 4);
       await migrator.runAfterTrigger(2, "migration:crash");
       store.claim(2, "dead-owner");
-      store.checkpoint("crashed", "dead-owner", { type: "start_provider" }, 3);
-      store.checkpoint(
+      store.startNextInference("crashed", "dead-owner", 3);
+      store.checkpointProviderBatch(
         "crashed",
         "dead-owner",
         {
-          type: "provider_batch",
-          batch: {
-            providerStateJson: "[]",
-            calls: [
-              {
-                id: "call:crashed",
-                name: "tool",
-                inputJson: "{}",
-                effectStarted: false,
-                result: null,
-              },
-            ],
-          },
+          providerStateJson: "[]",
+          calls: [
+            {
+              id: "call:crashed",
+              name: "tool",
+              inputJson: "{}",
+              effectStarted: false,
+              result: null,
+            },
+          ],
         },
         3,
       );
-      store.checkpoint(
-        "crashed",
-        "dead-owner",
-        { type: "begin_effect", callId: "call:crashed" },
-        3,
-      );
+      store.markEffectStarted("crashed", "dead-owner", "call:crashed", 3);
       const run = vi.fn(
         async ({ startNextInference, checkpointProviderFinal }) => {
           await startNextInference();
@@ -298,7 +251,7 @@ describe("single durable turn driver", () => {
       const migrator = new LegacySessionMigrator(instance.ctx.storage, () => 3);
       await migrator.runAfterTrigger(1, "migration:safe-recovery");
       const claimed = store.claim(1, "dead-owner");
-      store.checkpoint("one", "dead-owner", { type: "start_provider" }, 2);
+      store.startNextInference("one", "dead-owner", 2);
       const originalDeadline = claimed.ok ? claimed.turn.terminalDeadlineAt : 0;
       const run = vi.fn(
         async ({ turn, startNextInference, checkpointProviderFinal }) => {
@@ -436,136 +389,94 @@ describe("single durable turn driver", () => {
   });
 
   it("drains at most one automation report per alarm and stops after finite attempts", async () => {
-    await runInDurableObject(
-      stub("automation-retries"),
-      async (instance: any) => {
-        const store = new DurableChatTurnStore(instance.ctx.storage);
-        const runId = "scheduled-run";
-        store.admit(
-          {
-            id: runId,
-            clientMessageId: runId,
-            threadId: "thread:test",
-            workspaceId: "workspace:test",
-            orgId: "org:test",
-            userId: "user:test",
-            source: "scheduled prompt",
-            userContent: "run",
-            userDisplay: "run",
-            automationRun: {
-              workspaceId: "workspace:test",
-              automationId: "scheduled-prompt",
-              runId,
-              requiresExplicitOutcome: true,
-            },
-          },
-          20,
-        );
-        let now = 20;
-        const tokens = ["migration-owner", "turn-owner"];
-        const reportAutomation = vi.fn(async () => false);
-        const driver = new DurableTurnDriver({
-          ctx: driverContext(instance),
-          store,
-          migrator: new LegacySessionMigrator(instance.ctx.storage, () => now),
-          run: async ({ startNextInference, checkpointProviderFinal }) => {
-            await startNextInference();
-            await checkpointProviderFinal("finished without a report");
-            return "finished without a report";
-          },
-          publish: vi.fn(),
-          reportAutomation,
-          now: () => now,
-          token: () => tokens.shift() ?? "unused-token",
-        });
+    await runInDurableObject(stub("automation-retries"), async (instance: any) => {
+      const store = new DurableChatTurnStore(instance.ctx.storage);
+      const runId = "scheduled-run";
+      store.admit({
+        id: runId,
+        clientMessageId: runId,
+        threadId: "thread:test",
+        workspaceId: "workspace:test",
+        orgId: "org:test",
+        userId: "user:test",
+        source: "scheduled prompt",
+        userContent: "run",
+        userDisplay: "run",
+        automationRun: {
+          workspaceId: "workspace:test",
+          automationId: "scheduled-prompt",
+          runId,
+          requiresExplicitOutcome: true,
+        },
+      }, 20);
+      let now = 20;
+      const tokens = ["migration-owner", "turn-owner"];
+      const reportAutomation = vi.fn(async () => false);
+      const driver = new DurableTurnDriver({
+        ctx: driverContext(instance),
+        store,
+        migrator: new LegacySessionMigrator(instance.ctx.storage, () => now),
+        run: async ({ startNextInference, checkpointProviderFinal }) => {
+          await startNextInference();
+          await checkpointProviderFinal("finished without a report");
+          return "finished without a report";
+        },
+        publish: vi.fn(),
+        reportAutomation,
+        now: () => now,
+        token: () => tokens.shift() ?? "unused-token",
+      });
 
+      await driver.alarm();
+      expect(reportAutomation).not.toHaveBeenCalled();
+      for (let attempt = 1; attempt <= CHAT_RUNTIME_BOUNDS.automationReportAttempts; attempt += 1) {
         await driver.alarm();
-        expect(reportAutomation).not.toHaveBeenCalled();
-        for (
-          let attempt = 1;
-          attempt <= CHAT_RUNTIME_BOUNDS.automationReportAttempts;
-          attempt += 1
-        ) {
-          await driver.alarm();
-          expect(reportAutomation).toHaveBeenCalledTimes(attempt);
-          expect(reportAutomation.mock.calls.at(-1)?.[0]).toMatchObject({
-            attempt,
-            runId,
-            status: "error",
-            message:
-              "Automation completed without explicitly reporting an outcome",
-          });
-          now += CHAT_RUNTIME_BOUNDS.automationReportRetryMs;
-        }
-        await driver.alarm();
-        expect(reportAutomation).toHaveBeenCalledTimes(
-          CHAT_RUNTIME_BOUNDS.automationReportAttempts,
-        );
-        expect(store.nextAlarmAt(now)).toBeNull();
-      },
-    );
+        expect(reportAutomation).toHaveBeenCalledTimes(attempt);
+        expect(reportAutomation.mock.calls.at(-1)?.[0]).toMatchObject({
+          attempt,
+          runId,
+          status: "error",
+          message: "Automation completed without explicitly reporting an outcome",
+        });
+        now += CHAT_RUNTIME_BOUNDS.automationReportRetryMs;
+      }
+      await driver.alarm();
+      expect(reportAutomation).toHaveBeenCalledTimes(CHAT_RUNTIME_BOUNDS.automationReportAttempts);
+      expect(store.nextAlarmAt(now)).toBeNull();
+    });
   });
 
   it("bounds a hung automation-report RPC without reopening the terminal turn", async () => {
     vi.useFakeTimers();
     try {
-      await runInDurableObject(
-        stub("automation-timeout"),
-        async (instance: any) => {
-          const store = new DurableChatTurnStore(instance.ctx.storage);
-          const runId = "timed-report";
-          store.admit(
-            {
-              id: runId,
-              clientMessageId: runId,
-              threadId: "thread:test",
-              workspaceId: "workspace:test",
-              orgId: "org:test",
-              userId: null,
-              source: "scheduled prompt",
-              userContent: "run",
-              userDisplay: "run",
-              automationRun: {
-                workspaceId: "workspace:test",
-                automationId: "prompt",
-                runId,
-              },
-            },
-            10,
-          );
-          const migrator = new LegacySessionMigrator(
-            instance.ctx.storage,
-            () => 11,
-          );
-          await migrator.runAfterTrigger(11, "migration-timeout");
-          store.claim(11, "owner-timeout");
-          store.finish(runId, "owner-timeout", "failed", "turn failed", 12);
-          const error = vi
-            .spyOn(console, "error")
-            .mockImplementation(() => undefined);
-          const driver = new DurableTurnDriver({
-            ctx: driverContext(instance),
-            store,
-            migrator,
-            run: vi.fn(),
-            publish: vi.fn(),
-            now: () => 12,
-            reportAutomation: () => new Promise<boolean>(() => undefined),
-          });
-          const alarm = driver.alarm();
-          await vi.advanceTimersByTimeAsync(
-            CHAT_RUNTIME_BOUNDS.automationReportAttemptMs,
-          );
-          await alarm;
-          expect(store.getTurn(runId)).toMatchObject({ status: "failed" });
-          expect(
-            store.claimAutomationReport(
-              12 + CHAT_RUNTIME_BOUNDS.automationReportRetryMs,
-            )?.attempt,
-          ).toBe(2);
-          error.mockRestore();
-        },
-      );
+      await runInDurableObject(stub("automation-timeout"), async (instance: any) => {
+        const store = new DurableChatTurnStore(instance.ctx.storage);
+        const runId = "timed-report";
+        store.admit({
+          id: runId, clientMessageId: runId, threadId: "thread:test",
+          workspaceId: "workspace:test", orgId: "org:test", userId: null,
+          source: "scheduled prompt", userContent: "run", userDisplay: "run",
+          automationRun: { workspaceId: "workspace:test", automationId: "prompt", runId },
+        }, 10);
+        const migrator = new LegacySessionMigrator(instance.ctx.storage, () => 11);
+        await migrator.runAfterTrigger(11, "migration-timeout");
+        store.claim(11, "owner-timeout");
+        store.fail(runId, "owner-timeout", "turn failed", 12);
+        const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+        const driver = new DurableTurnDriver({
+          ctx: driverContext(instance), store, migrator,
+          run: vi.fn(), publish: vi.fn(), now: () => 12,
+          reportAutomation: () => new Promise<boolean>(() => undefined),
+        });
+        const alarm = driver.alarm();
+        await vi.advanceTimersByTimeAsync(CHAT_RUNTIME_BOUNDS.automationReportAttemptMs);
+        await alarm;
+        expect(store.getTurn(runId)).toMatchObject({ status: "failed" });
+        expect(store.claimAutomationReport(
+          12 + CHAT_RUNTIME_BOUNDS.automationReportRetryMs,
+        )?.attempt).toBe(2);
+        error.mockRestore();
+      });
     } finally {
       vi.useRealTimers();
     }

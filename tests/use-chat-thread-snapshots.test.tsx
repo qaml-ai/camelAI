@@ -54,18 +54,11 @@ describe("ChatThreadSnapshotsProvider", () => {
   it("enforces the aggregate byte bound independently of entry count", () => {
     const { result } = renderHook(() => useChatThreadSnapshots(), { wrapper });
     const content = "x".repeat(
-      CHAT_RUNTIME_BOUNDS.clientSnapshotCacheEntryBytes - 16 * 1024,
-    );
-    const entryCount =
-      Math.floor(
-        CHAT_RUNTIME_BOUNDS.clientSnapshotCacheBytes / content.length,
-      ) + 1;
-    expect(entryCount).toBeLessThan(
-      CHAT_RUNTIME_BOUNDS.clientSnapshotCacheEntries,
+      Math.floor(CHAT_RUNTIME_BOUNDS.clientSnapshotCacheBytes / 4),
     );
 
     act(() => {
-      for (let index = 0; index < entryCount; index += 1) {
+      for (let index = 0; index < 4; index += 1) {
         result.current.setSnapshot(`large-${index}`, {
           messages: [message(`large-message-${index}`, content)],
           todos: [],
@@ -74,9 +67,7 @@ describe("ChatThreadSnapshotsProvider", () => {
     });
 
     expect(result.current.getSnapshot("large-0")).toBeNull();
-    expect(
-      result.current.getSnapshot(`large-${entryCount - 1}`),
-    ).not.toBeNull();
+    expect(result.current.getSnapshot("large-3")).not.toBeNull();
   });
 
   it("keeps the settled snapshot instead of caching a live overlay", () => {
@@ -154,9 +145,9 @@ describe("ChatThreadSnapshotsProvider", () => {
     expect(() => {
       cached!.messages[0].content = "mutated cache";
     }).toThrow();
-    expect(
-      result.current.getSnapshot("thread-detached")?.messages[0].content,
-    ).toBe("original");
+    expect(result.current.getSnapshot("thread-detached")?.messages[0].content).toBe(
+      "original",
+    );
   });
 
   it("rejects accessor-backed snapshots without invoking their getters", () => {

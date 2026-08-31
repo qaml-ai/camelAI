@@ -18,10 +18,6 @@ interface OverflowProjection {
 }
 
 type PrivateCodeModeMethods = {
-  analysisRunCode(
-    this: unknown,
-    args: Record<string, unknown>,
-  ): Promise<unknown>;
   callToolWithArtifactCapture(
     this: unknown,
     name: string,
@@ -34,8 +30,7 @@ type PrivateCodeModeMethods = {
   ): Promise<Record<string, unknown>>;
 };
 
-const privateMethods =
-  CodeModeToolsBinding.prototype as unknown as PrivateCodeModeMethods;
+const privateMethods = CodeModeToolsBinding.prototype as unknown as PrivateCodeModeMethods;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const byteLength = (value: unknown) =>
@@ -46,9 +41,7 @@ function createBinding(
   props: Record<string, unknown> = {},
   bucketExtras: Record<string, unknown> = {},
 ): CodeModeToolsBinding {
-  const binding = Object.create(
-    CodeModeToolsBinding.prototype,
-  ) as CodeModeToolsBinding;
+  const binding = Object.create(CodeModeToolsBinding.prototype) as CodeModeToolsBinding;
   Object.assign(binding, {
     ctx: {
       props: {
@@ -79,89 +72,6 @@ describe("code-mode tool-result overflow", () => {
     ).toBe(8 * 1024 * 1024);
   });
 
-  it("reserves analysis archive capacity before concurrent dispatch and refunds only explicit non-use", async () => {
-    const binding = createBinding(vi.fn());
-    const captures: number[] = [];
-    const resolvers: Array<
-      (result: { ok: boolean; outputTruncated: false }) => void
-    > = [];
-    const runCode = vi.fn((request: { outputCaptureBytes?: number }) => {
-      captures.push(request.outputCaptureBytes ?? -1);
-      return new Promise<{ ok: boolean; outputTruncated: false }>((resolve) => {
-        resolvers.push(resolve);
-      });
-    });
-    Object.defineProperty(binding, "analysisService", {
-      configurable: true,
-      value: () => ({ runCode }),
-    });
-
-    const concurrent = Array.from(
-      { length: CHAT_RUNTIME_BOUNDS.toolResultOverflowFilesPerAttempt + 1 },
-      () => privateMethods.analysisRunCode.call(binding, { code: "print(1)" }),
-    );
-    expect(captures).toEqual([
-      ...Array(CHAT_RUNTIME_BOUNDS.toolResultOverflowFilesPerAttempt).fill(
-        CHAT_RUNTIME_BOUNDS.analysisOutputOverflowBytes,
-      ),
-      0,
-    ]);
-
-    for (const resolve of resolvers) {
-      resolve({ ok: true, outputTruncated: false });
-    }
-    await Promise.all(concurrent);
-
-    const final = privateMethods.analysisRunCode.call(binding, {
-      code: "print(2)",
-    });
-    expect(captures.at(-1)).toBe(
-      CHAT_RUNTIME_BOUNDS.analysisOutputOverflowBytes,
-    );
-    resolvers.at(-1)?.({ ok: true, outputTruncated: false });
-    await final;
-  });
-
-  it("retains analysis reservations on throws, uncertainty, truncation, and archives", async () => {
-    const binding = createBinding(vi.fn());
-    const captures: number[] = [];
-    let call = 0;
-    const runCode = vi.fn(async (request: { outputCaptureBytes?: number }) => {
-      captures.push(request.outputCaptureBytes ?? -1);
-      call += 1;
-      if (call === 1) throw new Error("uncertain dispatch");
-      if (call === 2) return { ok: false, error: "uncertain result" };
-      if (call === 3) return { ok: true, outputTruncated: true };
-      if (call === 4) {
-        return {
-          ok: true,
-          outputTruncated: false,
-          fullOutput: { path: "outputs/tmp/archive.log" },
-        };
-      }
-      return { ok: true, outputTruncated: false };
-    });
-    Object.defineProperty(binding, "analysisService", {
-      configurable: true,
-      value: () => ({ runCode }),
-    });
-
-    await expect(
-      privateMethods.analysisRunCode.call(binding, { code: "print(1)" }),
-    ).rejects.toThrow("uncertain dispatch");
-    await privateMethods.analysisRunCode.call(binding, { code: "print(2)" });
-    await privateMethods.analysisRunCode.call(binding, { code: "print(3)" });
-    await privateMethods.analysisRunCode.call(binding, { code: "print(4)" });
-    await privateMethods.analysisRunCode.call(binding, { code: "print(5)" });
-
-    expect(captures).toEqual([
-      ...Array(CHAT_RUNTIME_BOUNDS.toolResultOverflowFilesPerAttempt).fill(
-        CHAT_RUNTIME_BOUNDS.analysisOutputOverflowBytes,
-      ),
-      0,
-    ]);
-  });
-
   it("spills an exact oversized string before inline bounding destroys it", async () => {
     const put = vi.fn(async () => undefined);
     const binding = createBinding(put);
@@ -169,14 +79,12 @@ describe("code-mode tool-result overflow", () => {
       Math.ceil((CHAT_RUNTIME_BOUNDS.toolResultBytes + 1) / 13),
     );
 
-    const result = projection(
-      await privateMethods.callToolWithArtifactCapture.call(
-        binding,
-        "analysis_exec",
-        {},
-        () => raw,
-      ),
-    );
+    const result = projection(await privateMethods.callToolWithArtifactCapture.call(
+      binding,
+      "analysis_exec",
+      {},
+      () => raw,
+    ));
 
     expect(result.$overflow).toMatchObject({
       stored: true,
@@ -217,67 +125,6 @@ describe("code-mode tool-result overflow", () => {
     expect(options.customMetadata.storedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
-  it("snapshots a bounded preview before awaiting overflow storage", async () => {
-    let finishPut!: () => void;
-    const put = vi.fn(
-      () =>
-        new Promise<void>((resolve) => {
-          finishPut = resolve;
-        }),
-    );
-    const binding = createBinding(put);
-    const original = "original".repeat(
-      Math.ceil((CHAT_RUNTIME_BOUNDS.toolResultBytes + 1) / 8),
-    );
-    const raw = { payload: original };
-
-    const pending = binding.overflowToolResult("query", "preview", raw);
-    await vi.waitFor(() => expect(put).toHaveBeenCalledOnce());
-    raw.payload = "mutated after the bounded archive was captured";
-    finishPut();
-
-    const result = projection(await pending);
-    expect(result.$overflow).toMatchObject({ stored: true, complete: true });
-    expect(JSON.stringify(result.preview)).not.toContain("mutated after");
-    const [, body] = put.mock.calls[0] as [string, Uint8Array];
-    expect(JSON.parse(decoder.decode(body))).toEqual({ payload: original });
-  });
-
-  it("does not materialize a truncated inline copy while spilling", async () => {
-    const binding = createBinding(vi.fn());
-    const raw = {
-      payload: "x".repeat(CHAT_RUNTIME_BOUNDS.toolResultBytes * 2),
-    };
-    const overflow = vi.fn(
-      async (_toolName: string, _toolCallId: string, _value: unknown) => ({
-        $overflow: { stored: true, complete: true, path: "tmp/result.json" },
-      }),
-    );
-    Object.defineProperty(binding, "overflowToolResult", {
-      configurable: true,
-      value: overflow,
-    });
-    const parse = vi.spyOn(JSON, "parse");
-
-    try {
-      await expect(
-        privateMethods.callToolWithArtifactCapture.call(
-          binding,
-          "query",
-          {},
-          () => raw,
-        ),
-      ).resolves.toMatchObject({
-        $overflow: { stored: true, complete: true },
-      });
-      expect(parse).not.toHaveBeenCalled();
-      expect(overflow).toHaveBeenCalledOnce();
-      expect(overflow.mock.calls[0]?.[2]).toBe(raw);
-    } finally {
-      parse.mockRestore();
-    }
-  });
-
   it("stores plain data as complete canonical JSON", async () => {
     const put = vi.fn(async () => undefined);
     const binding = createBinding(put);
@@ -286,9 +133,7 @@ describe("code-mode tool-result overflow", () => {
       a: "x".repeat(CHAT_RUNTIME_BOUNDS.toolResultBytes),
     };
 
-    const result = projection(
-      await binding.overflowToolResult("query", "call/1", raw),
-    );
+    const result = projection(await binding.overflowToolResult("query", "call/1", raw));
 
     expect(result.$overflow).toMatchObject({
       stored: true,
@@ -309,13 +154,11 @@ describe("code-mode tool-result overflow", () => {
   it("returns preview-only projections for the source cap and hostile accessors", async () => {
     const put = vi.fn(async () => undefined);
     const binding = createBinding(put);
-    const capped = projection(
-      await binding.overflowToolResult(
-        "huge",
-        "cap",
-        "x".repeat(CHAT_RUNTIME_BOUNDS.toolResultOverflowBytes + 1),
-      ),
-    );
+    const capped = projection(await binding.overflowToolResult(
+      "huge",
+      "cap",
+      "x".repeat(CHAT_RUNTIME_BOUNDS.toolResultOverflowBytes + 1),
+    ));
     expect(capped.$overflow).toMatchObject({
       stored: false,
       complete: false,
@@ -368,12 +211,8 @@ describe("code-mode tool-result overflow", () => {
     });
     const binding = createBinding(put);
 
-    const first = projection(
-      await binding.overflowToolResult("query", "one", "full one"),
-    );
-    const second = projection(
-      await binding.overflowToolResult("query", "two", "full two"),
-    );
+    const first = projection(await binding.overflowToolResult("query", "one", "full one"));
+    const second = projection(await binding.overflowToolResult("query", "two", "full two"));
 
     expect(first.$overflow).toMatchObject({
       stored: false,
@@ -393,8 +232,7 @@ describe("code-mode tool-result overflow", () => {
     const binding = createBinding(put);
     const calls = Array.from(
       { length: CHAT_RUNTIME_BOUNDS.toolResultOverflowFilesPerAttempt + 1 },
-      (_, index) =>
-        binding.overflowToolResult("query", `file-${index}`, `value-${index}`),
+      (_, index) => binding.overflowToolResult("query", `file-${index}`, `value-${index}`),
     );
 
     const results = (await Promise.all(calls)).map(projection);
@@ -418,20 +256,19 @@ describe("code-mode tool-result overflow", () => {
     const exactCap = "z".repeat(CHAT_RUNTIME_BOUNDS.toolResultOverflowBytes);
     const fullFileCount = Math.floor(
       CHAT_RUNTIME_BOUNDS.toolResultOverflowPerAttemptBytes /
-        CHAT_RUNTIME_BOUNDS.toolResultOverflowBytes,
+      CHAT_RUNTIME_BOUNDS.toolResultOverflowBytes,
     );
     const calls = [
-      ...Array.from({ length: fullFileCount }, (_, index) =>
-        binding.overflowToolResult("query", `bytes-${index}`, exactCap),
+      ...Array.from(
+        { length: fullFileCount },
+        (_, index) => binding.overflowToolResult("query", `bytes-${index}`, exactCap),
       ),
       binding.overflowToolResult("query", "bytes-over", "x"),
     ];
 
     const results = (await Promise.all(calls)).map(projection);
 
-    expect(
-      results.slice(0, fullFileCount).every((item) => item.$overflow.stored),
-    ).toBe(true);
+    expect(results.slice(0, fullFileCount).every((item) => item.$overflow.stored)).toBe(true);
     expect(results.at(-1)?.$overflow).toMatchObject({
       stored: false,
       complete: false,
@@ -452,34 +289,25 @@ describe("code-mode tool-result overflow", () => {
       httpMetadata: { contentType: "text/plain; charset=utf-8" },
       customMetadata: { type: "tool-result-overflow" },
     };
-    const get = vi.fn(
-      async (
-        _key: string,
-        options: {
-          range: { offset: number; length: number };
-        },
-      ) => {
-        const { offset, length } = options.range;
-        const chunk = sourceBytes.slice(offset, offset + length);
-        return {
-          ...head,
-          body: new ReadableStream<Uint8Array>({
-            start(controller) {
-              controller.enqueue(chunk);
-              controller.close();
-            },
-          }),
-        };
-      },
-    );
-    const binding = createBinding(
-      vi.fn(),
-      {},
-      {
-        head: vi.fn(async () => head),
-        get,
-      },
-    );
+    const get = vi.fn(async (_key: string, options: {
+      range: { offset: number; length: number };
+    }) => {
+      const { offset, length } = options.range;
+      const chunk = sourceBytes.slice(offset, offset + length);
+      return {
+        ...head,
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(chunk);
+            controller.close();
+          },
+        }),
+      };
+    });
+    const binding = createBinding(vi.fn(), {}, {
+      head: vi.fn(async () => head),
+      get,
+    });
 
     const first = await privateMethods.readR2File.call(binding, {
       location: "r2",
@@ -490,9 +318,7 @@ describe("code-mode tool-result overflow", () => {
     expect(firstDetails.byteOffset).toBe(0);
     expect(firstDetails.nextByteOffset).toBe(maxWindow - 2);
     expect(first.text).not.toContain("�");
-    expect(first.text).toContain(
-      `Use byte_offset=${maxWindow - 2} to continue`,
-    );
+    expect(first.text).toContain(`Use byte_offset=${maxWindow - 2} to continue`);
 
     const second = await privateMethods.readR2File.call(binding, {
       location: "r2",
@@ -514,12 +340,9 @@ describe("code-mode tool-result overflow", () => {
 
   it("rethrows caller abort and deletes a put that completes late", async () => {
     let finishPut: (() => void) | undefined;
-    const put = vi.fn(
-      () =>
-        new Promise<void>((resolve) => {
-          finishPut = resolve;
-        }),
-    );
+    const put = vi.fn(() => new Promise<void>((resolve) => {
+      finishPut = resolve;
+    }));
     const remove = vi.fn(async () => undefined);
     const binding = createBinding(put, {}, { delete: remove });
     const controller = new AbortController();
@@ -543,9 +366,7 @@ describe("code-mode tool-result overflow", () => {
     const put = vi.fn(async () => undefined);
     const binding = createBinding(put);
     const small = { ok: true, rows: [1, 2, 3] };
-    const imageData = "A".repeat(
-      Math.floor(CHAT_RUNTIME_BOUNDS.toolResultBytes / 2),
-    );
+    const imageData = "A".repeat(Math.floor(CHAT_RUNTIME_BOUNDS.toolResultBytes / 2));
     const image = {
       content: [
         { type: "text", text: "Read image" },
@@ -577,13 +398,11 @@ describe("code-mode tool-result overflow", () => {
     const binding = createBinding(put) as CodeModeToolsBinding & {
       callTool: ReturnType<typeof vi.fn>;
     };
-    const overflow = projection(
-      await binding.overflowToolResult(
-        "WebSearch",
-        "web-call",
-        "full web result",
-      ),
-    );
+    const overflow = projection(await binding.overflowToolResult(
+      "WebSearch",
+      "web-call",
+      "full web result",
+    ));
     binding.callTool = vi.fn(async () => overflow);
 
     const envelope = await CodeModeToolsBinding.prototype.callToolEnvelope.call(

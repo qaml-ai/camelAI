@@ -1,11 +1,11 @@
 import { CHAT_RUNTIME_BOUNDS } from "../../../../src/lib/chat-runtime-bounds";
 import { boundedCanonicalJsonResult } from "./bounded-canonical-json";
-import { parseJsonBounded, runtimeJsonLimits } from "./bounded-json-parse";
 import type { DurableTurnRunContext } from "./durable-turn-driver";
 import type { DurableChatTurn } from "./durable-turn-store";
 import {
   checkpointClosed,
   checkpointUncertain,
+  parseTurnCheckpoint,
   serializeTurnCheckpoint,
   type CheckpointProviderBatch,
   type CheckpointToolCall,
@@ -59,9 +59,7 @@ export interface BoundedTurnAdapter {
   callTool(call: BoundedToolCall, signal: AbortSignal): Promise<unknown>;
   /** Best-effort externalization when the durable result budget is smaller. */
   overflowToolResult?(
-    call: BoundedToolCall,
-    value: unknown,
-    signal: AbortSignal,
+    call: BoundedToolCall, value: unknown, signal: AbortSignal
   ): Promise<unknown>;
 }
 
@@ -90,9 +88,9 @@ export class BoundedTurnError extends Error {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const byteLength = (value: string) => encoder.encode(value).byteLength;
-const TOOL_RESULT_STUB_PLACEHOLDER = JSON.stringify(
-  "0".repeat(CHAT_RUNTIME_BOUNDS.toolResultOverflowStubBytes - 2),
-);
+const TOOL_RESULT_STUB_PLACEHOLDER = JSON.stringify("0".repeat(
+  CHAT_RUNTIME_BOUNDS.toolResultOverflowStubBytes - 2,
+));
 
 function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error
@@ -228,10 +226,7 @@ function assertProviderStep(step: BoundedProviderStep): void {
     byteLength(step.providerStateJson) <= CHAT_RUNTIME_BOUNDS.providerStateBytes
   ) {
     try {
-      parseJsonBounded(
-        step.providerStateJson,
-        runtimeJsonLimits(CHAT_RUNTIME_BOUNDS.providerStateBytes),
-      );
+      JSON.parse(step.providerStateJson);
     } catch {
       throw new BoundedTurnError(
         "invalid_provider_step",
@@ -262,50 +257,22 @@ function assertProviderStep(step: BoundedProviderStep): void {
   throw new BoundedTurnError("invalid_provider_step", "Invalid provider step");
 }
 
-/**
- * Isolates adapter/measurement mutations without round-tripping the whole
- * checkpoint through JSON. Provider state and result bodies are immutable
- * strings, so copying the bounded arrays and records is sufficient and avoids
- * transient serialized + parsed copies of the checkpoint payload.
- */
-function cloneProviderBatches(
-  batches: readonly CheckpointProviderBatch[],
-): CheckpointProviderBatch[] {
-  return batches.map((batch) => ({
-    providerStateJson: batch.providerStateJson,
-    calls: batch.calls.map((call) => ({
-      id: call.id,
-      name: call.name,
-      inputJson: call.inputJson,
-      effectStarted: call.effectStarted,
-      result: call.result === null ? null : { ...call.result },
-    })),
-  }));
-}
-
 function cloneCheckpoint(checkpoint: TurnCheckpoint): TurnCheckpoint {
-  return { ...checkpoint, batches: cloneProviderBatches(checkpoint.batches) };
+  return parseTurnCheckpoint(serializeTurnCheckpoint(checkpoint));
 }
 
 function reservedCheckpoint(
   checkpoint: TurnCheckpoint,
   result?: CheckpointToolResult,
 ): TurnCheckpoint {
-  const reserved: TurnCheckpoint = {
-    ...checkpoint,
-    batches: cloneProviderBatches(checkpoint.batches),
-  };
+  const reserved = cloneCheckpoint(checkpoint);
   for (const batch of reserved.batches) {
     for (const call of batch.calls) {
       if (call.result === null) {
         call.result =
           result?.callId === call.id
             ? result
-            : {
-                callId: call.id,
-                status: "error",
-                output: TOOL_RESULT_STUB_PLACEHOLDER,
-              };
+            : { callId: call.id, status: "error", output: TOOL_RESULT_STUB_PLACEHOLDER };
       }
     }
   }
@@ -323,9 +290,7 @@ function assertClosable(checkpoint: TurnCheckpoint): void {
   }
 }
 
-type PreparedCheckpointToolResult =
-  | { complete: true; result: CheckpointToolResult }
-  | { complete: false };
+type PreparedCheckpointToolResult = { result: CheckpointToolResult; complete: boolean };
 
 function checkpointToolResult(
   checkpoint: TurnCheckpoint,
@@ -388,10 +353,6 @@ function checkpointToolResult(
       maxEntries: CHAT_RUNTIME_BOUNDS.providerJsonEntries,
       maxNodes: CHAT_RUNTIME_BOUNDS.providerJsonNodes,
     });
-    // The truncated value will be replaced with a small overflow reference.
-    // Do not retain it (or serialize a full reserved checkpoint around it)
-    // while potentially waiting on R2.
-    if (!encoded.complete) return { complete: false };
     const result = {
       callId,
       status,
@@ -399,7 +360,7 @@ function checkpointToolResult(
     } satisfies CheckpointToolResult;
     try {
       serializeTurnCheckpoint(reservedCheckpoint(checkpoint, result));
-      return { result, complete: true };
+      return { result, complete: encoded.complete };
     } catch {
       if (budget === 1) {
         throw new BoundedTurnError(
@@ -484,24 +445,22 @@ function providerBatch(
   const priorIds = new Set(
     checkpoint.batches.flatMap((batch) => batch.calls.map((call) => call.id)),
   );
-  const calls: CheckpointToolCall[] = serializedCalls.map(
-    ({ call, inputJson }) => {
-      if (priorIds.has(call.id)) {
-        throw new BoundedTurnError(
-          "invalid_provider_step",
-          "Provider reused a tool-call id",
-        );
-      }
-      priorIds.add(call.id);
-      return {
-        id: call.id,
-        name: call.name,
-        inputJson,
-        effectStarted: false,
-        result: null,
-      };
-    },
-  );
+  const calls: CheckpointToolCall[] = serializedCalls.map(({ call, inputJson }) => {
+    if (priorIds.has(call.id)) {
+      throw new BoundedTurnError(
+        "invalid_provider_step",
+        "Provider reused a tool-call id",
+      );
+    }
+    priorIds.add(call.id);
+    return {
+      id: call.id,
+      name: call.name,
+      inputJson,
+      effectStarted: false,
+      result: null,
+    };
+  });
   return { providerStateJson: step.providerStateJson, calls };
 }
 
@@ -511,8 +470,7 @@ function toolErrorValue(error: unknown): unknown {
 
 function unavailableOverflowValue(value: unknown): unknown {
   const preview = boundedCanonicalJsonResult(
-    value,
-    Math.floor(CHAT_RUNTIME_BOUNDS.toolResultOverflowStubBytes / 2),
+    value, Math.floor(CHAT_RUNTIME_BOUNDS.toolResultOverflowStubBytes / 2),
     {
       maxDepth: CHAT_RUNTIME_BOUNDS.providerJsonDepth,
       maxEntries: Math.floor(CHAT_RUNTIME_BOUNDS.providerJsonEntries / 2),
@@ -520,11 +478,8 @@ function unavailableOverflowValue(value: unknown): unknown {
     },
   );
   return {
-    $overflow: {
-      stored: false,
-      complete: false,
-      reason: "temporary overflow storage unavailable",
-    },
+    $overflow: { stored: false, complete: false,
+      reason: "temporary overflow storage unavailable" },
     hint: "Output was truncated inline and could not be stored temporarily.",
     preview: JSON.parse(preview.json),
   };
@@ -532,11 +487,7 @@ function unavailableOverflowValue(value: unknown): unknown {
 
 function minimalOverflowValue(): unknown {
   return {
-    $overflow: {
-      stored: false,
-      complete: false,
-      reason: "result budget exhausted",
-    },
+    $overflow: { stored: false, complete: false, reason: "result budget exhausted" },
     hint: "Output could not fit inline or in temporary overflow storage.",
     preview: null,
   };
@@ -619,8 +570,6 @@ export function createBoundedTurnRunner(
         if (!prepared.complete) {
           let overflow = unavailableOverflowValue(value);
           if (adapter.overflowToolResult) {
-            let overflowSource = value;
-            value = undefined;
             try {
               overflow = await withDeadline(
                 "tool_timeout",
@@ -628,20 +577,11 @@ export function createBoundedTurnRunner(
                 signal,
                 deadlineAt,
                 now,
-                (overflowSignal) => {
-                  const source = overflowSource;
-                  overflowSource = undefined;
-                  return adapter.overflowToolResult!(
-                    call,
-                    source,
-                    overflowSignal,
-                  );
-                },
+                (overflowSignal) =>
+                  adapter.overflowToolResult!(call, value, overflowSignal),
               );
             } catch {
               if (signal.aborted) throw abortError(signal);
-            } finally {
-              overflowSource = undefined;
             }
           }
           prepared = prepare(overflow);
@@ -655,10 +595,6 @@ export function createBoundedTurnRunner(
             );
           }
         }
-        // From here on the bounded JSON string is authoritative. Release the
-        // potentially much larger producer object before durable serialization
-        // and live-frame projection allocate their own bounded views.
-        value = undefined;
         const result = prepared.result;
         await recordToolResult(result);
         pending.result = result;
@@ -691,7 +627,7 @@ export function createBoundedTurnRunner(
           adapter.callProvider({
             turn,
             context,
-            toolBatches: cloneProviderBatches(checkpoint.batches),
+            toolBatches: cloneCheckpoint(checkpoint).batches,
             signal: providerSignal,
             onProgress: (content) =>
               publishLive(combineRuntimeContent(durableTrace, content)),

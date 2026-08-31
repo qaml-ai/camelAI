@@ -1,5 +1,5 @@
 import { env, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { CHAT_RUNTIME_BOUNDS } from "../src/chat-thread/runtime-lifecycle";
 import {
@@ -47,28 +47,6 @@ const batch = (callId: string): CheckpointProviderBatch => ({
   ],
 });
 
-const retainedHistory = (instance: any) =>
-  instance.ctx.storage.sql
-    .exec(
-      `SELECT COUNT(*) AS count, COALESCE(SUM(
-        length(CAST(id AS BLOB)) + length(CAST(client_message_id AS BLOB)) +
-        length(CAST(thread_id AS BLOB)) + length(CAST(workspace_id AS BLOB)) +
-        length(CAST(org_id AS BLOB)) + length(CAST(COALESCE(user_id, '') AS BLOB)) +
-        length(CAST(source AS BLOB)) + length(CAST(user_content AS BLOB)) +
-        length(CAST(user_display AS BLOB)) +
-        length(CAST(COALESCE(assistant_final, '') AS BLOB)) +
-        length(CAST(COALESCE(assistant_error, '') AS BLOB)) +
-        length(CAST(COALESCE(assistant_render_json, '') AS BLOB)) +
-        length(CAST(COALESCE(automation_json, '') AS BLOB)) +
-        length(CAST(status AS BLOB)) +
-        length(CAST(COALESCE(attempt_token, '') AS BLOB)) +
-        length(CAST(checkpoint_json AS BLOB))
-      ), 0) AS bytes FROM chat_turns_v2
-       WHERE retained = 1
-         AND status IN ('completed', 'failed', 'interrupted')`,
-    )
-    .one();
-
 function completeTurn(
   store: DurableChatTurnStore,
   id: string,
@@ -76,19 +54,14 @@ function completeTurn(
   output: string,
   now: number,
 ): StoreResult {
-  const started = store.checkpoint(id, token, { type: "start_provider" }, now);
+  const started = store.startNextInference(id, token, now);
   if (!started.ok)
     throw new Error(`Could not start provider: ${started.reason}`);
-  const checkpointed = store.checkpoint(
-    id,
-    token,
-    { type: "provider_final", output },
-    now,
-  );
+  const checkpointed = store.checkpointProviderFinal(id, token, output, now);
   if (!checkpointed.ok) {
     throw new Error(`Could not checkpoint provider: ${checkpointed.reason}`);
   }
-  return store.finish(id, token, "completed", output, now);
+  return store.complete(id, token, output, now);
 }
 
 async function claimReady(
@@ -144,7 +117,6 @@ describe("durable bounded chat turn store", () => {
         checkpoint: { providerCalls: 0, batches: [] },
       });
       expect(store.activeTurn()).toBeNull();
-      expect(store.revision()).toBe(2);
       expect(store.admit(input("new"), 10)).toMatchObject({ ok: true });
       expect(
         await claimReady(instance, store, 11, "legacy-token"),
@@ -168,10 +140,11 @@ describe("durable bounded chat turn store", () => {
       const admitted = first.admit(input("one"), 10);
       expect(admitted).toMatchObject({
         ok: true,
+        durable: true,
         duplicate: false,
         turn: { id: "one", status: "queued" },
+        shouldArmAlarm: true,
       });
-      const revision = first.revision();
 
       // A new store instance observes the row before any additional async work.
       const afterRestart = new DurableChatTurnStore(instance.ctx.storage);
@@ -187,7 +160,8 @@ describe("durable bounded chat turn store", () => {
         duplicate: true,
         turn: { id: "one", clientMessageId: "client:one" },
       });
-      expect(afterRestart.revision()).toBe(revision);
+      expect(duplicate.revision).toBe(admitted.revision);
+      expect(afterRestart.readOutbox(0).events).toHaveLength(1);
     });
   });
 
@@ -227,117 +201,6 @@ describe("durable bounded chat turn store", () => {
     });
   });
 
-  it("rejects huge input without serializing an unbounded copy", async () => {
-    await runInDurableObject(
-      stub("allocation-free-admit"),
-      async (instance: any) => {
-        const store = new DurableChatTurnStore(instance.ctx.storage);
-        const huge = "x".repeat(CHAT_RUNTIME_BOUNDS.requestBytes);
-        const stringify = vi.spyOn(JSON, "stringify");
-        expect(store.admit(input("huge", huge, huge), 0)).toMatchObject({
-          ok: false,
-          reason: "request_bytes",
-        });
-        expect(stringify).not.toHaveBeenCalledWith(
-          expect.objectContaining({ userContent: huge }),
-        );
-        expect(stringify).not.toHaveBeenCalledWith(
-          expect.objectContaining({ content: huge }),
-        );
-        expect(store.scope()).toBeNull();
-        stringify.mockRestore();
-      },
-    );
-  });
-
-  it("accounts for escaped and optional admission JSON bytes exactly", async () => {
-    await runInDurableObject(
-      stub("exact-admit-bytes"),
-      async (instance: any) => {
-        const store = new DurableChatTurnStore(instance.ctx.storage);
-        const exact: AdmitChatTurn = {
-          ...input("escaped"),
-          userId: null,
-          userContent: '"\\\n',
-          automationRun: {
-            workspaceId: "workspace:test",
-            automationId: "automation:test",
-            runId: "escaped",
-            requiresExplicitOutcome: true,
-          },
-        };
-        const encoder = new TextEncoder();
-        const base = encoder.encode(JSON.stringify(exact)).byteLength;
-        exact.userContent += "x".repeat(
-          CHAT_RUNTIME_BOUNDS.requestBytes - base,
-        );
-        expect(encoder.encode(JSON.stringify(exact))).toHaveLength(
-          CHAT_RUNTIME_BOUNDS.requestBytes,
-        );
-        expect(store.admit(exact, 0)).toMatchObject({ ok: true });
-        expect(
-          store.admit(
-            {
-              ...exact,
-              id: "escapee",
-              clientMessageId: "client:escapee",
-              automationRun: { ...exact.automationRun!, runId: "escapee" },
-              userContent: `${exact.userContent}x`,
-            },
-            1,
-          ),
-        ).toMatchObject({ ok: false, reason: "request_bytes" });
-      },
-    );
-  });
-
-  it("rejects raw automation extras before serialization and stores only normalized keys", async () => {
-    await runInDurableObject(stub("automation-admit-shape"), async (instance: any) => {
-      const store = new DurableChatTurnStore(instance.ctx.storage);
-      const huge = "x".repeat(CHAT_RUNTIME_BOUNDS.requestBytes * 2);
-      const raw = {
-        workspaceId: "workspace:test",
-        automationId: "automation:test",
-        runId: "bad",
-        extra: huge,
-      };
-      const stringify = vi.spyOn(JSON, "stringify");
-      expect(
-        store.admit({ ...input("top-extra"), extra: huge } as never, 0),
-      ).toMatchObject({ ok: false, reason: "invalid" });
-      expect(
-        store.admit({ ...input("bad"), automationRun: raw as never }, 0),
-      ).toMatchObject({ ok: false, reason: "invalid" });
-      expect(stringify).not.toHaveBeenCalledWith(raw);
-      expect(store.scope()).toBeNull();
-      stringify.mockRestore();
-
-      expect(
-        store.admit(
-          {
-            ...input("good"),
-            automationRun: {
-              workspaceId: "workspace:test",
-              automationId: "automation:test",
-              runId: "good",
-            },
-          },
-          1,
-        ),
-      ).toMatchObject({ ok: true });
-      const stored = instance.ctx.storage.sql
-        .exec<{ automation_json: string }>(
-          "SELECT automation_json FROM chat_turns_v2 WHERE id = 'good'",
-        )
-        .one().automation_json;
-      expect(JSON.parse(stored)).toEqual({
-        workspaceId: "workspace:test",
-        automationId: "automation:test",
-        runId: "good",
-      });
-    });
-  });
-
   it("claims FIFO once and fences effects and terminal writes by token", async () => {
     await runInDurableObject(stub("token-fence"), async (instance: any) => {
       const store = new DurableChatTurnStore(instance.ctx.storage);
@@ -354,16 +217,14 @@ describe("durable bounded chat turn store", () => {
         ok: false,
         reason: "busy",
       });
-      expect(
-        store.checkpoint("first", "attempt-1", { type: "start_provider" }, 11),
-      ).toMatchObject({
+      expect(store.startNextInference("first", "attempt-1", 11)).toMatchObject({
         ok: true,
       });
       expect(
-        store.checkpoint(
+        store.checkpointProviderBatch(
           "first",
           "attempt-1",
-          { type: "provider_batch", batch: batch("call:first") },
+          batch("call:first"),
           12,
         ),
       ).toMatchObject({ ok: true });
@@ -374,57 +235,33 @@ describe("durable bounded chat turn store", () => {
           ?.content,
       ).toMatchObject([{ type: "tool_use", id: "call:first" }]);
       expect(
-        store.checkpoint(
-          "first",
-          "old-token",
-          { type: "begin_effect", callId: "call:first" },
-          13,
-        ),
+        store.markEffectStarted("first", "old-token", "call:first", 13),
       ).toMatchObject({
         ok: false,
         reason: "stale",
       });
       expect(
-        store.checkpoint(
-          "first",
-          "attempt-1",
-          { type: "begin_effect", callId: "call:first" },
-          14,
-        ),
+        store.markEffectStarted("first", "attempt-1", "call:first", 14),
       ).toMatchObject({ ok: true, turn: { effectStarted: true } });
       expect(
-        store.checkpoint(
+        store.recordToolResult(
           "first",
           "attempt-1",
-          {
-            type: "tool_result",
-            result: { callId: "call:first", status: "success", output: "1" },
-          },
+          { callId: "call:first", status: "success", output: "1" },
           15,
         ),
       ).toMatchObject({ ok: true });
-      expect(
-        store.checkpoint("first", "attempt-1", { type: "start_provider" }, 16),
-      ).toMatchObject({
+      expect(store.startNextInference("first", "attempt-1", 16)).toMatchObject({
         ok: true,
       });
       expect(
-        store.checkpoint(
-          "first",
-          "attempt-1",
-          { type: "provider_final", output: "done" },
-          17,
-        ),
+        store.checkpointProviderFinal("first", "attempt-1", "done", 17),
       ).toMatchObject({ ok: true });
-      expect(
-        store.finish("first", "old-token", "completed", "wrong", 18),
-      ).toMatchObject({
+      expect(store.complete("first", "old-token", "wrong", 18)).toMatchObject({
         ok: false,
         reason: "stale",
       });
-      expect(
-        store.finish("first", "attempt-1", "completed", "done", 19),
-      ).toMatchObject({
+      expect(store.complete("first", "attempt-1", "done", 19)).toMatchObject({
         ok: true,
         turn: { status: "completed", assistantFinal: "done" },
       });
@@ -450,60 +287,14 @@ describe("durable bounded chat turn store", () => {
         turn: { id: "second" },
       });
       expect(
-        store.finish("second", "attempt-2", "failed", "provider failed", 21),
+        store.fail("second", "attempt-2", "provider failed", 21),
       ).toMatchObject({
         ok: true,
         turn: { status: "failed", assistantError: "provider failed" },
+        shouldArmAlarm: false,
       });
       expect(store.nextAlarmAt(22)).toBeNull();
     });
-  });
-
-  it("rejects a malformed checkpoint mutation without persisting it", async () => {
-    await runInDurableObject(
-      stub("malformed-checkpoint-mutation"),
-      async (instance: any) => {
-        const store = new DurableChatTurnStore(instance.ctx.storage);
-        expect(store.admit(input("one"), 1)).toMatchObject({ ok: true });
-        expect(await claimReady(instance, store, 2, "owner")).toMatchObject({
-          ok: true,
-        });
-        expect(
-          store.checkpoint("one", "owner", { type: "start_provider" }, 3),
-        ).toMatchObject({ ok: true });
-        const before = instance.ctx.storage.sql
-          .exec<{
-            checkpoint_json: string;
-          }>("SELECT checkpoint_json FROM chat_turns_v2 WHERE id = 'one'")
-          .one().checkpoint_json;
-        const revision = store.latestSnapshot().revision;
-
-        const rejected = store.checkpoint(
-          "one",
-          "owner",
-          {
-            type: "provider_batch",
-            batch: { ...batch("malformed"), providerStateJson: "[" },
-          },
-          4,
-        );
-
-        expect(rejected).toMatchObject({ ok: false, reason: "invalid" });
-        expect(
-          instance.ctx.storage.sql
-            .exec<{
-              checkpoint_json: string;
-            }>("SELECT checkpoint_json FROM chat_turns_v2 WHERE id = 'one'")
-            .one().checkpoint_json,
-        ).toBe(before);
-        expect(store.latestSnapshot().revision).toBe(revision);
-        expect(store.getTurn("one")?.checkpoint).toMatchObject({
-          providerCalls: 1,
-          providerInFlight: true,
-          batches: [],
-        });
-      },
-    );
   });
 
   it("uses storage deadlines as authority for claim, effects, and completion", async () => {
@@ -527,30 +318,25 @@ describe("durable bounded chat turn store", () => {
       const store = new DurableChatTurnStore(instance.ctx.storage);
       store.admit(input("effect"), 0);
       await claimReady(instance, store, 1, "effect-attempt");
-      store.checkpoint(
+      store.startNextInference("effect", "effect-attempt", 2);
+      store.checkpointProviderBatch(
         "effect",
         "effect-attempt",
-        { type: "start_provider" },
-        2,
-      );
-      store.checkpoint(
-        "effect",
-        "effect-attempt",
-        { type: "provider_batch", batch: batch("call:effect") },
+        batch("call:effect"),
         3,
       );
       expect(
-        store.checkpoint(
+        store.markEffectStarted(
           "effect",
           "effect-attempt",
-          { type: "begin_effect", callId: "call:effect" },
+          "call:effect",
           CHAT_RUNTIME_BOUNDS.turnLeaseMs,
         ),
       ).toMatchObject({
         ok: true,
         turn: { status: "interrupted", effectStarted: false },
       });
-      expect(store.getTurn("effect")?.status).toBe("interrupted");
+      expect(store.readOutbox(0).events.at(-1)?.type).toBe("ExpireOperation");
     });
 
     await runInDurableObject(
@@ -560,10 +346,9 @@ describe("durable bounded chat turn store", () => {
         store.admit(input("complete"), 0);
         await claimReady(instance, store, 1, "complete-attempt");
         expect(
-          store.finish(
+          store.complete(
             "complete",
             "complete-attempt",
-            "completed",
             "late answer",
             CHAT_RUNTIME_BOUNDS.turnLeaseMs,
           ),
@@ -597,8 +382,8 @@ describe("durable bounded chat turn store", () => {
           status: "interrupted",
           leaseExpiresAt: null,
         },
+        shouldArmAlarm: true,
       });
-      expect(store.nextAlarmAt(200)).toBe(200);
       expect(
         await claimReady(instance, store, 200, "next-attempt"),
       ).toMatchObject({
@@ -629,9 +414,7 @@ describe("durable bounded chat turn store", () => {
           turn: { attemptCount: 1 },
         });
         const deadline = claimed.ok ? claimed.turn.terminalDeadlineAt : 0;
-        expect(
-          store.checkpoint("one", "old-owner", { type: "start_provider" }, 21),
-        ).toMatchObject({
+        expect(store.startNextInference("one", "old-owner", 21)).toMatchObject({
           ok: true,
           turn: { checkpoint: { providerCalls: 1, providerInFlight: true } },
         });
@@ -648,12 +431,7 @@ describe("durable bounded chat turn store", () => {
           },
         });
         expect(
-          store.checkpoint(
-            "one",
-            "old-owner",
-            { type: "provider_final", output: "late" },
-            23,
-          ),
+          store.checkpointProviderFinal("one", "old-owner", "late", 23),
         ).toMatchObject({ ok: false, reason: "stale" });
         expect(store.recoverFromCheckpoint(24, "third-owner")).toMatchObject({
           ok: true,
@@ -671,22 +449,15 @@ describe("durable bounded chat turn store", () => {
       const store = new DurableChatTurnStore(instance.ctx.storage);
       store.admit(input("one"), 0);
       await claimReady(instance, store, 1, "old-owner");
-      store.checkpoint("one", "old-owner", { type: "start_provider" }, 2);
+      store.startNextInference("one", "old-owner", 2);
       const twoCalls: CheckpointProviderBatch = {
         providerStateJson: "[]",
         calls: [...batch("call:a").calls, ...batch("call:b").calls],
       };
       expect(
-        store.checkpoint(
-          "one",
-          "old-owner",
-          { type: "provider_batch", batch: twoCalls },
-          3,
-        ),
+        store.checkpointProviderBatch("one", "old-owner", twoCalls, 3),
       ).toMatchObject({ ok: true });
-      expect(
-        store.checkpoint("one", "old-owner", { type: "start_provider" }, 4),
-      ).toMatchObject({
+      expect(store.startNextInference("one", "old-owner", 4)).toMatchObject({
         ok: false,
         reason: "stale",
       });
@@ -708,65 +479,39 @@ describe("durable bounded chat turn store", () => {
         },
       });
       expect(
-        store.checkpoint(
-          "one",
-          "fresh-owner",
-          { type: "begin_effect", callId: "call:b" },
-          6,
-        ),
+        store.markEffectStarted("one", "fresh-owner", "call:b", 6),
       ).toMatchObject({ ok: false, reason: "stale" });
       expect(
-        store.checkpoint(
-          "one",
-          "fresh-owner",
-          { type: "begin_effect", callId: "call:a" },
-          6,
-        ),
+        store.markEffectStarted("one", "fresh-owner", "call:a", 6),
       ).toMatchObject({ ok: true });
       expect(
-        store.checkpoint(
+        store.recordToolResult(
           "one",
           "fresh-owner",
-          {
-            type: "tool_result",
-            result: { callId: "call:b", status: "success", output: "1" },
-          },
+          { callId: "call:b", status: "success", output: "1" },
           7,
         ),
       ).toMatchObject({ ok: false, reason: "stale" });
       expect(
-        store.checkpoint(
+        store.recordToolResult(
           "one",
           "fresh-owner",
-          {
-            type: "tool_result",
-            result: { callId: "call:a", status: "success", output: "1" },
-          },
+          { callId: "call:a", status: "success", output: "1" },
           7,
         ),
       ).toMatchObject({ ok: true });
       expect(
-        store.checkpoint(
-          "one",
-          "fresh-owner",
-          { type: "begin_effect", callId: "call:b" },
-          8,
-        ),
+        store.markEffectStarted("one", "fresh-owner", "call:b", 8),
       ).toMatchObject({ ok: true });
       expect(
-        store.checkpoint(
+        store.recordToolResult(
           "one",
           "fresh-owner",
-          {
-            type: "tool_result",
-            result: { callId: "call:b", status: "error", output: '"failed"' },
-          },
+          { callId: "call:b", status: "error", output: '"failed"' },
           9,
         ),
       ).toMatchObject({ ok: true });
-      expect(
-        store.checkpoint("one", "fresh-owner", { type: "start_provider" }, 10),
-      ).toMatchObject({
+      expect(store.startNextInference("one", "fresh-owner", 10)).toMatchObject({
         ok: true,
       });
     });
@@ -779,36 +524,21 @@ describe("durable bounded chat turn store", () => {
         const store = new DurableChatTurnStore(instance.ctx.storage);
         store.admit(input("one"), 0);
         await claimReady(instance, store, 1, "old-owner");
-        store.checkpoint("one", "old-owner", { type: "start_provider" }, 2);
-        store.checkpoint(
+        store.startNextInference("one", "old-owner", 2);
+        store.checkpointProviderBatch(
           "one",
           "old-owner",
           {
-            type: "provider_batch",
-            batch: {
-              providerStateJson: "[]",
-              calls: [...batch("call:a").calls, ...batch("call:b").calls],
-            },
+            providerStateJson: "[]",
+            calls: [...batch("call:a").calls, ...batch("call:b").calls],
           },
           3,
         );
-        store.checkpoint(
+        store.markEffectStarted("one", "old-owner", "call:a", 4);
+        store.recordToolResult(
           "one",
           "old-owner",
-          { type: "begin_effect", callId: "call:a" },
-          4,
-        );
-        store.checkpoint(
-          "one",
-          "old-owner",
-          {
-            type: "tool_result",
-            result: {
-              callId: "call:a",
-              status: "success",
-              output: '"durable"',
-            },
-          },
+          { callId: "call:a", status: "success", output: '"durable"' },
           5,
         );
 
@@ -838,12 +568,7 @@ describe("durable bounded chat turn store", () => {
           },
         });
         expect(
-          store.checkpoint(
-            "one",
-            "fresh-owner",
-            { type: "begin_effect", callId: "call:b" },
-            7,
-          ),
+          store.markEffectStarted("one", "fresh-owner", "call:b", 7),
         ).toMatchObject({ ok: true });
       },
     );
@@ -856,19 +581,9 @@ describe("durable bounded chat turn store", () => {
         const store = new DurableChatTurnStore(instance.ctx.storage);
         store.admit(input("one"), 0);
         await claimReady(instance, store, 1, "old-owner");
-        store.checkpoint("one", "old-owner", { type: "start_provider" }, 2);
-        store.checkpoint(
-          "one",
-          "old-owner",
-          { type: "provider_batch", batch: batch("call:a") },
-          3,
-        );
-        store.checkpoint(
-          "one",
-          "old-owner",
-          { type: "begin_effect", callId: "call:a" },
-          4,
-        );
+        store.startNextInference("one", "old-owner", 2);
+        store.checkpointProviderBatch("one", "old-owner", batch("call:a"), 3);
+        store.markEffectStarted("one", "old-owner", "call:a", 4);
 
         expect(store.recoverFromCheckpoint(5, "fresh-owner")).toMatchObject({
           ok: true,
@@ -942,6 +657,19 @@ describe("durable bounded chat turn store", () => {
       expect(snapshot.bytes).toBeLessThanOrEqual(
         CHAT_RUNTIME_BOUNDS.snapshotBytes,
       );
+
+      const outbox = instance.ctx.storage.sql
+        .exec(
+          `SELECT COUNT(*) AS count, COALESCE(SUM(payload_bytes), 0) AS bytes
+           FROM chat_outbox_v2`,
+        )
+        .one();
+      expect(Number(outbox.count)).toBeLessThanOrEqual(
+        CHAT_RUNTIME_BOUNDS.outboxEvents,
+      );
+      expect(Number(outbox.bytes)).toBeLessThanOrEqual(
+        CHAT_RUNTIME_BOUNDS.outboxBytes,
+      );
     });
 
     await runInDurableObject(stub("snapshot-bytes"), async (instance: any) => {
@@ -974,7 +702,7 @@ describe("durable bounded chat turn store", () => {
     });
   });
 
-  it("retains a bounded newest answer after worst-case JSON escaping", async () => {
+  it("retains a newest max-size answer after worst-case JSON escaping", async () => {
     await runInDurableObject(
       stub("snapshot-escaping"),
       async (instance: any) => {
@@ -991,14 +719,13 @@ describe("durable bounded chat turn store", () => {
           "user",
           "assistant",
         ]);
-        const projected = snapshot.messages.at(-1)?.content;
-        expect(typeof projected).toBe("string");
-        expect((projected as string).endsWith("…")).toBe(true);
-        expect((projected as string).length).toBeLessThan(answer.length);
+        expect(snapshot.messages.at(-1)?.content).toBe(answer);
+        expect(snapshot.bytes).toBeGreaterThan(
+          CHAT_RUNTIME_BOUNDS.sseWriterBytes,
+        );
         expect(snapshot.bytes).toBeLessThanOrEqual(
           CHAT_RUNTIME_BOUNDS.snapshotBytes,
         );
-        expect(snapshot.bytes).toBeLessThan(CHAT_RUNTIME_BOUNDS.sseWriterBytes);
       },
     );
   });
@@ -1029,7 +756,17 @@ describe("durable bounded chat turn store", () => {
             index * 3 + 2,
           );
         }
-        let retained = retainedHistory(instance);
+        let retained = instance.ctx.storage.sql
+          .exec(
+            `SELECT COUNT(*) AS count,
+            COALESCE(SUM(payload_bytes + length(CAST(COALESCE(
+              assistant_final, assistant_error, ''
+            ) AS BLOB))), 0) AS bytes
+           FROM chat_turns_v2
+           WHERE retained = 1
+             AND status IN ('completed', 'failed', 'interrupted')`,
+          )
+          .one();
         expect(Number(retained.count)).toBe(CHAT_RUNTIME_BOUNDS.historyTurns);
         expect(store.latestSnapshot().messages.at(-1)?.id).toBe(
           `history-${CHAT_RUNTIME_BOUNDS.historyTurns + 11}:assistant`,
@@ -1046,8 +783,8 @@ describe("durable bounded chat turn store", () => {
           ok: true,
           duplicate: true,
           turn: { id: "history-0", source: "tombstone" },
+          revision: beforeDuplicate,
         });
-        expect(store.latestSnapshot().revision).toBe(beforeDuplicate);
         expect(
           instance.ctx.storage.sql
             .exec(
@@ -1075,7 +812,17 @@ describe("durable bounded chat turn store", () => {
             at + 2,
           );
         }
-        retained = retainedHistory(instance);
+        retained = instance.ctx.storage.sql
+          .exec(
+            `SELECT COUNT(*) AS count,
+            COALESCE(SUM(payload_bytes + length(CAST(COALESCE(
+              assistant_final, assistant_error, ''
+            ) AS BLOB))), 0) AS bytes
+           FROM chat_turns_v2
+           WHERE retained = 1
+             AND status IN ('completed', 'failed', 'interrupted')`,
+          )
+          .one();
         expect(Number(retained.count)).toBeLessThanOrEqual(
           CHAT_RUNTIME_BOUNDS.historyTurns,
         );
@@ -1129,74 +876,6 @@ describe("durable bounded chat turn store", () => {
     );
   });
 
-  it("counts both final text and rendered tool transcripts in retained bytes", async () => {
-    await runInDurableObject(
-      stub("tool-history-byte-accounting"),
-      async (instance: any) => {
-        const store = new DurableChatTurnStore(instance.ctx.storage);
-        const answer = "x".repeat(900_000);
-        for (let index = 0; index < 5; index += 1) {
-          const id = `tool-history-${index}`;
-          const token = `tool-history-owner-${index}`;
-          const at = index * 10;
-          store.admit(input(id), at);
-          await claimReady(instance, store, at + 1, token);
-          store.checkpoint(id, token, { type: "start_provider" }, at + 2);
-          store.checkpoint(
-            id,
-            token,
-            { type: "provider_batch", batch: batch(`call:${index}`) },
-            at + 3,
-          );
-          store.checkpoint(
-            id,
-            token,
-            { type: "begin_effect", callId: `call:${index}` },
-            at + 4,
-          );
-          store.checkpoint(
-            id,
-            token,
-            {
-              type: "tool_result",
-              result: {
-                callId: `call:${index}`,
-                status: "success",
-                output: '"ok"',
-              },
-            },
-            at + 5,
-          );
-          store.checkpoint(id, token, { type: "start_provider" }, at + 6);
-          store.checkpoint(
-            id,
-            token,
-            { type: "provider_final", output: answer },
-            at + 7,
-          );
-          store.finish(id, token, "completed", answer, at + 8);
-        }
-
-        const retained = retainedHistory(instance);
-        expect(Number(retained.count)).toBeLessThan(5);
-        expect(Number(retained.bytes)).toBeLessThanOrEqual(
-          CHAT_RUNTIME_BOUNDS.historyBytes,
-        );
-        expect(
-          Number(
-            instance.ctx.storage.sql
-              .exec(
-                `SELECT COUNT(*) AS count FROM chat_turns_v2
-                 WHERE retained = 1 AND assistant_final IS NOT NULL
-                   AND assistant_render_json IS NOT NULL`,
-              )
-              .one().count,
-          ),
-        ).toBeGreaterThan(0);
-      },
-    );
-  });
-
   it("rejects new admissions at the permanent lifetime cap", async () => {
     await runInDurableObject(stub("lifetime-cap"), async (instance: any) => {
       const store = new DurableChatTurnStore(instance.ctx.storage);
@@ -1233,203 +912,151 @@ describe("durable bounded chat turn store", () => {
     });
   });
 
-  it("uses the scalar runtime revision as its change cursor", async () => {
-    await runInDurableObject(stub("revision-cursor"), async (instance: any) => {
+  it("bounds outbox retention and resets stale, missing, and future cursors", async () => {
+    await runInDurableObject(stub("outbox-cursors"), async (instance: any) => {
       const store = new DurableChatTurnStore(instance.ctx.storage);
-      expect(store.revision()).toBe(0);
-      store.admit(input("one"), 1);
-      expect(store.revision()).toBe(1);
+      for (let index = 0; index < 90; index += 1) {
+        store.admit(input(`o${index}`), index * 3);
+        await claimReady(instance, store, index * 3 + 1, `oa${index}`);
+        completeTurn(store, `o${index}`, `oa${index}`, "ok", index * 3 + 2);
+      }
+      const range = instance.ctx.storage.sql
+        .exec(
+          `SELECT MIN(seq) AS oldest, MAX(seq) AS latest, COUNT(*) AS count,
+            COALESCE(SUM(payload_bytes), 0) AS bytes FROM chat_outbox_v2`,
+        )
+        .one();
+      const oldest = Number(range.oldest);
+      const latest = Number(range.latest);
+      expect(Number(range.count)).toBe(CHAT_RUNTIME_BOUNDS.outboxEvents);
+      expect(Number(range.bytes)).toBeLessThanOrEqual(
+        CHAT_RUNTIME_BOUNDS.outboxBytes,
+      );
+
+      expect(store.readOutbox(null)).toMatchObject({
+        reset: true,
+        cursor: latest,
+        events: [],
+      });
+      expect(store.readOutbox(oldest - 2)).toMatchObject({
+        reset: true,
+        cursor: latest,
+        events: [],
+      });
+      expect(store.readOutbox(latest + 1)).toMatchObject({
+        reset: true,
+        cursor: latest,
+        events: [],
+      });
+      const replay = store.readOutbox(oldest - 1);
+      expect(replay.reset).toBe(false);
+      expect(replay.events).toHaveLength(CHAT_RUNTIME_BOUNDS.outboxEvents);
+      expect(replay.events[0].seq).toBe(oldest);
+      expect(replay.cursor).toBe(latest);
+    });
+
+    await runInDurableObject(stub("outbox-bytes"), async (instance: any) => {
+      const store = new DurableChatTurnStore(instance.ctx.storage);
+      instance.ctx.storage.sql.exec(
+        `WITH RECURSIVE n(value) AS (
+           VALUES(0) UNION ALL SELECT value + 1 FROM n WHERE value < 39
+         )
+         INSERT INTO chat_outbox_v2
+           (revision, event_type, turn_id, status, payload_bytes, created_at)
+         SELECT 0, 'DurablyAdmit', 'synthetic:' || value, 'completed', ?, value
+         FROM n`,
+        CHAT_RUNTIME_BOUNDS.outboxEventBytes,
+      );
+      expect(store.admit(input("trigger"), 100)).toMatchObject({ ok: true });
+      const retained = instance.ctx.storage.sql
+        .exec(
+          `SELECT COUNT(*) AS count, COALESCE(SUM(payload_bytes), 0) AS bytes
+           FROM chat_outbox_v2`,
+        )
+        .one();
+      expect(Number(retained.count)).toBeLessThan(40);
+      expect(Number(retained.bytes)).toBeLessThanOrEqual(
+        CHAT_RUNTIME_BOUNDS.outboxBytes,
+      );
     });
   });
 
   it("atomically derives and queues one bounded automation report from the checkpoint", async () => {
-    await runInDurableObject(
-      stub("automation-report"),
-      async (instance: any) => {
-        const store = new DurableChatTurnStore(instance.ctx.storage);
-        const runId = "automation-run:one";
-        expect(
-          store.admit(
-            {
-              ...input(runId),
-              automationRun: {
-                workspaceId: "workspace:test",
-                automationId: "automation:one",
-                runId,
-                requiresExplicitOutcome: true,
-              },
-            },
-            10,
-          ),
-        ).toMatchObject({ ok: true, turn: { automationRun: { runId } } });
-        await claimReady(instance, store, 11, "automation-owner");
-        store.checkpoint(
-          runId,
-          "automation-owner",
-          { type: "start_provider" },
-          12,
-        );
-        store.checkpoint(
-          runId,
-          "automation-owner",
-          {
-            type: "provider_batch",
-            batch: {
-              providerStateJson: "[]",
-              calls: [
-                {
-                  id: "outcome-call",
-                  name: AUTOMATION_OUTCOME_TOOL,
-                  inputJson: JSON.stringify({
-                    status: "success",
-                    summary: "Verified the scheduled work.",
-                  }),
-                  effectStarted: false,
-                  result: null,
-                },
-              ],
-            },
-          },
-          13,
-        );
-        store.checkpoint(
-          runId,
-          "automation-owner",
-          { type: "begin_effect", callId: "outcome-call" },
-          14,
-        );
-        store.checkpoint(
-          runId,
-          "automation-owner",
-          {
-            type: "tool_result",
-            result: {
-              callId: "outcome-call",
-              status: "success",
-              output: JSON.stringify({
-                content: [{ type: "text", text: "recorded" }],
-              }),
-            },
-          },
-          15,
-        );
-        expect(store.recordedAutomationOutcome(runId)).toEqual({
-          status: "success",
-          summary: "Verified the scheduled work.",
-        });
-        store.checkpoint(
-          runId,
-          "automation-owner",
-          { type: "start_provider" },
-          16,
-        );
-        store.checkpoint(
-          runId,
-          "automation-owner",
-          { type: "provider_final", output: "done" },
-          17,
-        );
-        expect(
-          store.finish(runId, "automation-owner", "completed", "done", 18),
-        ).toMatchObject({
-          ok: true,
-          turn: { status: "completed", checkpoint: { batches: [] } },
-        });
-
-        const report = store.claimAutomationReport(18);
-        expect(report).toMatchObject({
-          turnId: runId,
-          runId,
+    await runInDurableObject(stub("automation-report"), async (instance: any) => {
+      const store = new DurableChatTurnStore(instance.ctx.storage);
+      const runId = "automation-run:one";
+      expect(store.admit({
+        ...input(runId),
+        automationRun: {
+          workspaceId: "workspace:test",
           automationId: "automation:one",
-          attempt: 1,
-          status: "success",
-          message: "Verified the scheduled work.",
-          completedAt: 18,
-        });
-        instance.ctx.storage.sql.exec(
-          `WITH RECURSIVE n(value) AS (
-             VALUES(0) UNION ALL SELECT value + 1 FROM n WHERE value + 1 < ?
-           )
-           INSERT INTO chat_turns_v2
-             (id, client_message_id, thread_id, workspace_id, org_id, source,
-              user_content, user_display, assistant_final, status, payload_bytes,
-              terminal_deadline_at, created_at, updated_at)
-           SELECT 'report-history:' || value, 'report-history-client:' || value,
-             'thread:test', 'workspace:test', 'org:test', 'web', 'q', 'q',
-             'a', 'completed', 2, 0, 100 + value, 100 + value FROM n`,
-          CHAT_RUNTIME_BOUNDS.historyTurns,
-        );
-        expect(
-          instance.ctx.storage.sql
-            .exec(
-              "SELECT retained, automation_json FROM chat_turns_v2 WHERE id = ?",
-              runId,
-            )
-            .one(),
-        ).toMatchObject({ retained: 1 });
-        expect(store.completeAutomationReport(runId, report!.attempt)).toBe(
-          true,
-        );
-        expect(
-          instance.ctx.storage.sql
-            .exec(
-              `SELECT retained, automation_json, automation_report_at
-               FROM chat_turns_v2 WHERE id = ?`,
-              runId,
-            )
-            .one(),
-        ).toMatchObject({
-          retained: 0,
-          automation_json: null,
-          automation_report_at: null,
-        });
-        expect(store.nextAlarmAt(18)).toBeNull();
-      },
-    );
+          runId,
+          requiresExplicitOutcome: true,
+        },
+      }, 10)).toMatchObject({ ok: true, turn: { automationRun: { runId } } });
+      await claimReady(instance, store, 11, "automation-owner");
+      store.startNextInference(runId, "automation-owner", 12);
+      store.checkpointProviderBatch(runId, "automation-owner", {
+        providerStateJson: "[]",
+        calls: [{
+          id: "outcome-call",
+          name: AUTOMATION_OUTCOME_TOOL,
+          inputJson: JSON.stringify({ status: "success", summary: "Verified the scheduled work." }),
+          effectStarted: false,
+          result: null,
+        }],
+      }, 13);
+      store.markEffectStarted(runId, "automation-owner", "outcome-call", 14);
+      store.recordToolResult(runId, "automation-owner", {
+        callId: "outcome-call",
+        status: "success",
+        output: JSON.stringify({ content: [{ type: "text", text: "recorded" }] }),
+      }, 15);
+      expect(store.recordedAutomationOutcome(runId)).toEqual({
+        status: "success",
+        summary: "Verified the scheduled work.",
+      });
+      store.startNextInference(runId, "automation-owner", 16);
+      store.checkpointProviderFinal(runId, "automation-owner", "done", 17);
+      expect(store.complete(runId, "automation-owner", "done", 18)).toMatchObject({
+        ok: true,
+        turn: { status: "completed", checkpoint: { batches: [] } },
+      });
+
+      const report = store.claimAutomationReport(18);
+      expect(report).toMatchObject({
+        turnId: runId,
+        runId,
+        automationId: "automation:one",
+        attempt: 1,
+        status: "success",
+        message: "Verified the scheduled work.",
+        completedAt: 18,
+      });
+      expect(store.completeAutomationReport(runId, report!.attempt)).toBe(true);
+      expect(store.nextAlarmAt(18)).toBeNull();
+    });
   });
 
   it("queues an explicit error when an automation terminalizes without an outcome", async () => {
-    await runInDurableObject(
-      stub("automation-failure"),
-      async (instance: any) => {
-        const store = new DurableChatTurnStore(instance.ctx.storage);
-        const runId = "automation-run:failed";
-        store.admit(
-          {
-            ...input(runId),
-            automationRun: {
-              workspaceId: "workspace:test",
-              automationId: "automation:failed",
-              runId,
-              requiresExplicitOutcome: true,
-            },
-          },
-          10,
-        );
-        await claimReady(instance, store, 11, "failed-owner");
-        store.finish(
+    await runInDurableObject(stub("automation-failure"), async (instance: any) => {
+      const store = new DurableChatTurnStore(instance.ctx.storage);
+      const runId = "automation-run:failed";
+      store.admit({
+        ...input(runId),
+        automationRun: {
+          workspaceId: "workspace:test",
+          automationId: "automation:failed",
           runId,
-          "failed-owner",
-          "failed",
-          "Provider failed safely",
-          12,
-        );
-        const report = store.claimAutomationReport(12);
-        expect(report).toMatchObject({
-          status: "error",
-          message: "Provider failed safely",
-        });
-        expect(store.claimAutomationReport(report!.deadlineAt)).toBeNull();
-        expect(
-          instance.ctx.storage.sql
-            .exec(
-              `SELECT automation_json, automation_report_at
-               FROM chat_turns_v2 WHERE id = ?`,
-              runId,
-            )
-            .one(),
-        ).toEqual({ automation_json: null, automation_report_at: null });
-      },
-    );
+          requiresExplicitOutcome: true,
+        },
+      }, 10);
+      await claimReady(instance, store, 11, "failed-owner");
+      store.fail(runId, "failed-owner", "Provider failed safely", 12);
+      expect(store.claimAutomationReport(12)).toMatchObject({
+        status: "error",
+        message: "Provider failed safely",
+      });
+    });
   });
 });

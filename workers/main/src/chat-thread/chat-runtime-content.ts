@@ -1,13 +1,6 @@
 import { CHAT_RUNTIME_BOUNDS } from "../../../../src/lib/chat-runtime-bounds";
 import { boundedCanonicalJson } from "./bounded-canonical-json";
-import { parseJsonBounded, runtimeJsonLimits } from "./bounded-json-parse";
 import type { TurnCheckpoint } from "./turn-checkpoint";
-import {
-  boundedJsonString,
-  boundedUtf8String,
-  jsonStringByteLength,
-  utf8ByteLength,
-} from "./utf8-byte-length";
 
 export type ChatRuntimeContentBlock =
   | { type: "text"; text: string }
@@ -25,8 +18,23 @@ export type ChatRuntimeContentBlock =
       is_error: boolean;
     };
 
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 const MISSING = Symbol("missing data property");
-const byteLength = utf8ByteLength;
+const byteLength = (value: string): number => encoder.encode(value).byteLength;
+
+function boundedText(value: string, maximumBytes: number): string {
+  const encoded = encoder.encode(value);
+  if (encoded.byteLength <= maximumBytes) return value;
+  const suffix = "…";
+  let kept = decoder
+    .decode(encoded.slice(0, maximumBytes - byteLength(suffix)))
+    .replace(/\uFFFD+$/, "");
+  while (byteLength(kept) + byteLength(suffix) > maximumBytes) {
+    kept = kept.slice(0, -1);
+  }
+  return kept + suffix;
+}
 
 function dataField(value: unknown, key: string): unknown | typeof MISSING {
   if (!value || typeof value !== "object") return MISSING;
@@ -71,7 +79,7 @@ function parseJson(
 ): unknown | typeof MISSING {
   if (typeof raw !== "string" || byteLength(raw) > maximumBytes) return MISSING;
   try {
-    return parseJsonBounded(raw, runtimeJsonLimits(maximumBytes));
+    return JSON.parse(raw) as unknown;
   } catch {
     return MISSING;
   }
@@ -160,7 +168,7 @@ function sanitizeRuntimeBlock(
     return {
       type,
       tool_use_id: toolUseId,
-      content: boundedUtf8String(content, CHAT_RUNTIME_BOUNDS.toolResultBytes),
+      content: boundedText(content, CHAT_RUNTIME_BOUNDS.toolResultBytes),
       is_error: isError === true,
     };
   }
@@ -219,45 +227,51 @@ function compactBlock(
   block: ChatRuntimeContentBlock,
   maximumBytes: number,
 ): ChatRuntimeContentBlock | null {
-  if (block.type === "tool_use") {
-    const serialized = serializedBlock(block);
-    return serialized !== null && byteLength(serialized) <= maximumBytes
-      ? block
-      : null;
-  }
   let candidate = block;
-  if (block.type === "thinking" && block.signature !== undefined) {
-    const emptySigned = serializedBlock({
-      type: "thinking",
-      thinking: "",
-      signature: "",
-    });
-    const signedBytes =
-      (emptySigned === null ? maximumBytes + 1 : byteLength(emptySigned)) +
-      jsonStringByteLength(block.signature) -
-      2;
-    if (signedBytes > maximumBytes) {
-      candidate = { type: "thinking", thinking: block.thinking };
+  let serialized = serializedBlock(candidate);
+  if (serialized !== null && byteLength(serialized) <= maximumBytes) {
+    return candidate;
+  }
+  if (candidate.type === "thinking" && candidate.signature !== undefined) {
+    candidate = { type: "thinking", thinking: candidate.thinking };
+    serialized = serializedBlock(candidate);
+    if (serialized !== null && byteLength(serialized) <= maximumBytes) {
+      return candidate;
     }
   }
+  if (candidate.type === "tool_use") return null;
+
   const original =
     candidate.type === "text"
       ? candidate.text
       : candidate.type === "thinking"
         ? candidate.thinking
         : candidate.content;
-  const empty = serializedBlock(withMainText(candidate, ""));
-  if (empty === null) return null;
-  const stringBudget = maximumBytes - byteLength(empty) + 2;
-  if (stringBudget < 2) return null;
-  const compact = withMainText(
-    candidate,
-    boundedJsonString(original, stringBudget),
-  );
-  const serialized = serializedBlock(compact);
-  return serialized !== null && byteLength(serialized) <= maximumBytes
-    ? compact
-    : null;
+  let low = 0;
+  let high = original.length;
+  let selected: ChatRuntimeContentBlock | null = null;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    let end = middle;
+    if (
+      end > 0 &&
+      end < original.length &&
+      /[\uD800-\uDBFF]/.test(original[end - 1])
+    ) {
+      end -= 1;
+    }
+    const shortened =
+      end < original.length ? `${original.slice(0, end)}…` : original;
+    const next = withMainText(candidate, shortened);
+    const encoded = serializedBlock(next);
+    if (encoded !== null && byteLength(encoded) <= maximumBytes) {
+      selected = next;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return selected;
 }
 
 class ContentAccumulator {
@@ -465,7 +479,9 @@ export function combineRuntimeContent(
 }
 
 /** Serializes a self-contained terminal render artifact within the wire ceiling. */
-export function serializeRuntimeContent(blocks: readonly unknown[]): string {
+export function serializeRuntimeContent(
+  blocks: readonly ChatRuntimeContentBlock[],
+): string {
   const safe =
     boundedInput(
       blocks,

@@ -25,7 +25,6 @@ const deferred = <T>() => {
 class TestState {
   waits: Promise<unknown>[] = [];
   alarms: number[] = [];
-  aborts: string[] = [];
   storage = {
     setAlarm: async (at: number) => {
       this.alarms.push(at);
@@ -34,10 +33,6 @@ class TestState {
 
   waitUntil(task: Promise<unknown>): void {
     this.waits.push(task);
-  }
-
-  abort(reason: string): void {
-    this.aborts.push(reason);
   }
 
   async flush(): Promise<void> {
@@ -49,16 +44,20 @@ const emptySnapshot = () => ({
   revision: 0,
   messages: [],
   bytes: 0,
+  shouldArmAlarm: false,
 });
 
 function store(overrides: Record<string, unknown> = {}): DurableChatTurnStore {
   return {
-    revision: () => 0,
+    readOutbox: () => ({ reset: true, cursor: 0, events: [], revision: 0 }),
     latestSnapshot: emptySnapshot,
     admit: () => ({
       ok: true,
+      durable: true,
       duplicate: false,
       turn: { id: "message-1", status: "queued" },
+      revision: 1,
+      shouldArmAlarm: true,
     }),
     nextAlarmAt: (now: number) => now,
     ...overrides,
@@ -107,15 +106,15 @@ function liveUpdate(
     activeTurn: {
       id: "turn-1",
       status: "running",
-      acceptedAt: Date.now(),
-      startedAt: Date.now(),
+      acceptedAt: 10,
+      startedAt: 20,
     },
     message: {
       id: "turn-1:assistant",
       role: "assistant",
       content,
       status: "running",
-      createdAt: Date.now(),
+      createdAt: 20,
     },
   };
 }
@@ -184,16 +183,34 @@ describe("ChatRuntimeController events", () => {
     let stateCalls = 0;
     let cursor = 0;
     let messages: Array<Record<string, unknown>> = [];
-    const revision = () => cursor;
+    const readOutbox = (after: number | null) => ({
+      reset: after === null,
+      cursor,
+      events:
+        after !== null && after < cursor
+          ? [
+              {
+                seq: cursor,
+                revision: cursor,
+                type: "DurablyAdmit",
+                turnId: "turn",
+                status: "queued",
+                createdAt: cursor,
+              },
+            ]
+          : [],
+      revision: cursor,
+    });
     const state = new TestState();
     const runtime = controller(
       state,
       store({
-        revision,
+        readOutbox,
         latestSnapshot: () => ({
           revision: cursor,
           messages,
           bytes: 2,
+          shouldArmAlarm: false,
         }),
       }),
       callbacks({
@@ -239,13 +256,18 @@ describe("ChatRuntimeController events", () => {
 
   it("coalesces cumulative live updates without touching durable state or cursors", async () => {
     vi.useFakeTimers();
-    const revision = vi.fn(() => 7);
+    const readOutbox = vi.fn(() => ({
+      reset: true,
+      cursor: 7,
+      events: [],
+      revision: 7,
+    }));
     const latestSnapshot = vi.fn(emptySnapshot);
     const coarseState = vi.fn(() => ({ model: "test" }));
     const state = new TestState();
     const runtime = controller(
       state,
-      store({ revision, latestSnapshot }),
+      store({ readOutbox, latestSnapshot }),
       callbacks({ coarseState }),
     );
     const reader = (
@@ -255,7 +277,7 @@ describe("ChatRuntimeController events", () => {
     await reader.read();
     await reader.read();
     const durableCalls = {
-      cursor: revision.mock.calls.length,
+      outbox: readOutbox.mock.calls.length,
       snapshot: latestSnapshot.mock.calls.length,
       state: coarseState.mock.calls.length,
     };
@@ -285,7 +307,7 @@ describe("ChatRuntimeController events", () => {
       },
     });
     expect(first).not.toHaveProperty("cursor");
-    expect(revision).toHaveBeenCalledTimes(durableCalls.cursor);
+    expect(readOutbox).toHaveBeenCalledTimes(durableCalls.outbox);
     expect(latestSnapshot).toHaveBeenCalledTimes(durableCalls.snapshot);
     expect(coarseState).toHaveBeenCalledTimes(durableCalls.state);
 
@@ -346,83 +368,15 @@ describe("ChatRuntimeController events", () => {
     }
   });
 
-  it("paces maximal cumulative live frames through the full lease", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_000);
-    const runtime = controller(new TestState(), store());
-    const large = "x".repeat(CHAT_RUNTIME_BOUNDS.liveMessageBytes - 4_096);
-    const refillPerMs =
-      (CHAT_RUNTIME_BOUNDS.liveBytesPerTurn -
-        CHAT_RUNTIME_BOUNDS.liveBurstBytes) /
-      CHAT_RUNTIME_BOUNDS.turnLeaseMs;
-    expect(
-      Math.ceil(CHAT_RUNTIME_BOUNDS.sseWriterBytes / refillPerMs),
-    ).toBeLessThanOrEqual(CHAT_RUNTIME_BOUNDS.liveMaxPacingDelayMs);
-
-    for (let frame = 1; frame <= 2; frame += 1) {
-      runtime.publishLive(liveUpdate(large));
-      await vi.advanceTimersByTimeAsync(CHAT_RUNTIME_BOUNDS.liveFlushMs);
-      expect((runtime as any).liveEpoch.emitted).toBe(frame);
-    }
-    runtime.publishLive(liveUpdate(large));
-    await vi.advanceTimersByTimeAsync(CHAT_RUNTIME_BOUNDS.liveFlushMs);
-    expect((runtime as any).liveEpoch.emitted).toBe(2);
-    await vi.advanceTimersByTimeAsync(CHAT_RUNTIME_BOUNDS.liveMaxPacingDelayMs);
-    expect((runtime as any).liveEpoch).toMatchObject({ emitted: 3, dirty: false });
-    await vi.advanceTimersByTimeAsync(CHAT_RUNTIME_BOUNDS.turnLeaseMs);
-    runtime.publishLive(liveUpdate("after the durable lease"));
-    await vi.advanceTimersByTimeAsync(CHAT_RUNTIME_BOUNDS.liveFlushMs);
-    expect((runtime as any).liveEpoch).toMatchObject({
-      emitted: 3,
-      emittedBytes: CHAT_RUNTIME_BOUNDS.liveBytesPerTurn,
-    });
-  });
-
-  it("publishes a durable reset while a large live frame is paced", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_000);
-    let cursor = 0;
-    const state = new TestState();
-    const runtime = controller(
-      state,
-      store({
-        revision: () => cursor,
-        latestSnapshot: () => ({ revision: cursor, messages: [], bytes: 0 }),
-      }),
-    );
-    const reader = (
-      await runtime.fetch(new Request(url("/v2/events")))
-    ).body!.getReader();
-    await reader.read();
-    await reader.read();
-    await reader.read();
-    const large = "x".repeat(CHAT_RUNTIME_BOUNDS.liveMessageBytes - 4_096);
-    for (let frame = 0; frame < 3; frame += 1) {
-      runtime.publishLive(liveUpdate(large));
-      await vi.advanceTimersByTimeAsync(CHAT_RUNTIME_BOUNDS.liveFlushMs);
-      if (frame < 2) await reader.read();
-    }
-    expect((runtime as any).liveEpoch).toMatchObject({ emitted: 2, dirty: true });
-    cursor = 1;
-    await runtime.publish();
-    expect(data((await reader.read()).value!)).toMatchObject({
-      type: "reset",
-      cursor: 1,
-    });
-    await reader.cancel();
-  });
-
   it("stops best-effort live painting at the cumulative byte budget", async () => {
     vi.useFakeTimers();
     const runtime = controller(new TestState(), store());
 
     runtime.publishLive(liveUpdate("first"));
     await vi.advanceTimersByTimeAsync(CHAT_RUNTIME_BOUNDS.liveFlushMs);
-    const live = (
-      runtime as unknown as {
-        liveEpoch: { emitted: number; emittedBytes: number; dirty: boolean };
-      }
-    ).liveEpoch;
+    const live = (runtime as unknown as {
+      liveEpoch: { emitted: number; emittedBytes: number; dirty: boolean };
+    }).liveEpoch;
     expect(live.emitted).toBe(1);
     live.emittedBytes = CHAT_RUNTIME_BOUNDS.liveBytesPerTurn - 1;
 
@@ -461,50 +415,20 @@ describe("ChatRuntimeController events", () => {
       message: { content: "replacement" },
     });
 
-    const huge = "\u0000".repeat(CHAT_RUNTIME_BOUNDS.liveMessageBytes);
-    const oversized = liveUpdate(huge, "attempt-2");
-    const stringify = vi.spyOn(JSON, "stringify");
-    runtime.publishLive(oversized);
-    expect(
-      stringify.mock.calls.some(
-        ([value]) =>
-          value === oversized.message ||
-          (Boolean(value) &&
-            typeof value === "object" &&
-            (value as { content?: unknown }).content === huge),
+    runtime.publishLive(
+      liveUpdate(
+        "\u0000".repeat(CHAT_RUNTIME_BOUNDS.liveMessageBytes),
+        "attempt-2",
       ),
-    ).toBe(false);
-    stringify.mockRestore();
+    );
     await expect(reader.read()).rejects.toThrow("Chat SSE writer closed");
-  });
-
-  it("bounds array live content before serializing it", () => {
-    const runtime = controller(new TestState(), store());
-    const block = {
-      type: "text",
-      text: "x".repeat(CHAT_RUNTIME_BOUNDS.liveMessageBytes * 2),
-    };
-    const content = [block];
-    const update = liveUpdate(content);
-    const stringify = vi.spyOn(JSON, "stringify");
-    runtime.publishLive(update);
-    expect(
-      stringify.mock.calls.some(
-        ([value]) =>
-          value === content ||
-          value === block ||
-          (Boolean(value) &&
-            typeof value === "object" &&
-            (value as { content?: unknown }).content === content),
-      ),
-    ).toBe(false);
-    stringify.mockRestore();
   });
 
   it("enforces connection and serialized-byte caps with teardown", async () => {
     const state = new TestState();
     const runtime = controller(state, store());
     const limit = Math.min(
+      CHAT_RUNTIME_BOUNDS.sseWritersPerUser,
       CHAT_RUNTIME_BOUNDS.sseWritersPerThread,
       Math.floor(
         CHAT_RUNTIME_BOUNDS.sseDoBytes /
@@ -534,31 +458,53 @@ describe("ChatRuntimeController events", () => {
     );
     const response = await bytesRuntime.fetch(new Request(url("/v2/events")));
     const reader = response.body!.getReader();
-    // An impossible coarse-state frame closes the connection without
-    // acknowledging the cursor. Reconnect can therefore retry from the same
-    // durable revision instead of silently losing state.
-    expect(new TextDecoder().decode((await reader.read()).value)).toBe(
-      ":hb\n\n",
+    const chunks = await Promise.all([
+      reader.read(),
+      reader.read(),
+      reader.read(),
+    ]);
+    const body = chunks.reduce(
+      (text, chunk) => text + new TextDecoder().decode(chunk.value),
+      "",
     );
-    await expect(reader.read()).rejects.toThrow("Chat SSE writer closed");
-    const retry = await bytesRuntime.fetch(new Request(url("/v2/events")));
-    expect(retry.status).toBe(200);
-    await retry.body!.cancel();
+    expect(new TextEncoder().encode(body).byteLength).toBeLessThanOrEqual(
+      CHAT_RUNTIME_BOUNDS.sseWriterBytes,
+    );
+    expect(body).not.toContain(hugeState);
+    await reader.cancel();
     await bytesState.flush();
   });
 
   it("never enqueues beyond one writer or the aggregate SSE queue budget", async () => {
     let cursor = 0;
     const content = "x".repeat(CHAT_RUNTIME_BOUNDS.assistantBytes);
-    const revision = () => cursor;
+    const readOutbox = (after: number | null) => ({
+      reset: after === null,
+      cursor,
+      events:
+        after !== null && after < cursor
+          ? [
+              {
+                seq: cursor,
+                revision: cursor,
+                type: "CompleteTurn",
+                turnId: "turn",
+                status: "completed",
+                createdAt: cursor,
+              },
+            ]
+          : [],
+      revision: cursor,
+    });
     const state = new TestState();
     const runtime = controller(
       state,
       store({
-        revision,
+        readOutbox,
         latestSnapshot: () => ({
           revision: cursor,
           bytes: content.length,
+          shouldArmAlarm: false,
           messages: [
             {
               id: "turn:assistant",
@@ -596,6 +542,7 @@ describe("ChatRuntimeController events", () => {
           latestSnapshot: () => ({
             revision: 1,
             bytes: content.length,
+            shouldArmAlarm: false,
             messages: [
               {
                 id: "turn:user",
@@ -643,81 +590,41 @@ describe("ChatRuntimeController events", () => {
     }
   });
 
-  it("drops only the smallest oversized snapshot prefix with logarithmic encoding", () => {
-    const runtime = controller(new TestState(), store());
-    const content = "x".repeat(42_000);
-    const messages = Array.from({ length: 50 }, (_, index) => ({
-      id: `turn-${index}:assistant`,
-      turnId: `turn-${index}`,
-      role: "assistant" as const,
-      content,
-      status: "completed" as const,
-      createdAt: index,
-    }));
-    const stringify = vi.spyOn(JSON, "stringify");
-    const frame = (runtime as any).buildSnapshotFrame(
-      "snapshot",
-      1,
-      { revision: 1, messages, bytes: content.length * messages.length },
-      undefined,
-    ) as Uint8Array;
-    expect((data(frame) as any).messages).toHaveLength(49);
-    expect(stringify.mock.calls.length).toBeLessThanOrEqual(8);
-    stringify.mockRestore();
-  });
-
-  it("sizes each candidate snapshot string only once before truncation", () => {
-    const runtime = controller(new TestState(), store());
-    const original = String.prototype.charCodeAt;
-    let calls = 0;
-    String.prototype.charCodeAt = function (index: number) {
-      calls += 1;
-      return original.call(this, index);
-    };
-    try {
-      const messages = Array.from({ length: 50 }, (_, index) => ({
-        id: `shared:${index}`,
-        turnId: "shared",
-        role: "assistant" as const,
-        content: "é".repeat(index === 0 ? 200_000 : 20_000),
-        status: "completed" as const,
-        createdAt: index,
-      }));
-      expect(
-        (runtime as any).buildSnapshotFrame(
-          "snapshot",
-          1,
-          { revision: 1, messages, bytes: 2_360_000 },
-          undefined,
-        ),
-      ).toBeInstanceOf(Uint8Array);
-      expect(calls).toBeLessThan(1_600_000);
-    } finally {
-      String.prototype.charCodeAt = original;
-    }
-  });
-
   it("uses forwarded scope only as a check against trusted context", async () => {
     const state = new TestState();
-    const revision = vi.fn(() => 0);
-    const runtime = controller(state, store({ revision }));
+    const readOutbox = vi.fn(() => ({
+      reset: true,
+      cursor: 0,
+      events: [],
+      revision: 0,
+    }));
+    const runtime = controller(state, store({ readOutbox }));
     const denied = await runtime.fetch(
       new Request(url("/v2/events", "&workspaceId=attacker")),
     );
     expect(denied.status).toBe(403);
-    expect(revision).not.toHaveBeenCalled();
+    expect(readOutbox).not.toHaveBeenCalled();
   });
 
-  it("publishes revision-ordered resets and durably kicks every open", async () => {
-    let revision = 0;
+  it("publishes cursor-ordered resets and durably kicks every open", async () => {
+    const events: Array<Record<string, unknown>> = [];
     let messages: Array<Record<string, unknown>> = [];
-    const readRevision = vi.fn(() => revision);
+    const readOutbox = vi.fn((after: number | null) => ({
+      reset: after === null,
+      cursor: Number(events.at(-1)?.seq ?? after ?? 0),
+      events:
+        after === null
+          ? []
+          : events.filter((event) => Number(event.seq) > after),
+      revision: events.length,
+    }));
     const turnStore = store({
-      revision: readRevision,
+      readOutbox,
       latestSnapshot: () => ({
-        revision,
+        revision: events.length,
         messages,
         bytes: 0,
+        shouldArmAlarm: false,
       }),
     });
     const state = new TestState();
@@ -734,15 +641,20 @@ describe("ChatRuntimeController events", () => {
     }
     await state.flush();
     expect(kick).toHaveBeenCalledTimes(2);
-    expect(kick).toHaveBeenCalledWith(
-      expect.objectContaining({
-        threadId: "thread-1",
-        workspaceId: "workspace-1",
-        orgId: "org-1",
-      }),
-    );
+    expect(kick).toHaveBeenCalledWith(expect.objectContaining({
+      threadId: "thread-1",
+      workspaceId: "workspace-1",
+      orgId: "org-1",
+    }));
 
-    revision = 1;
+    events.push({
+      seq: 1,
+      revision: 1,
+      type: "DurablyAdmit",
+      turnId: "turn-1",
+      status: "queued",
+      createdAt: 10,
+    });
     messages = [
       {
         id: "turn-1:user",
@@ -770,9 +682,8 @@ describe("ChatRuntimeController events", () => {
       });
     }
 
-    const revisionReads = readRevision.mock.calls.length;
     await runtime.publish();
-    expect(readRevision).toHaveBeenCalledTimes(revisionReads + 1);
+    expect(readOutbox.mock.calls.slice(-2)).toEqual([[1], [1]]);
     for (const reader of readers) await reader.cancel();
   });
 
@@ -784,11 +695,28 @@ describe("ChatRuntimeController events", () => {
       blocked ? stateGate.promise : { model: "ready" },
     );
     const latestSnapshot = vi.fn(emptySnapshot);
-    const revision = vi.fn(() => cursor);
+    const readOutbox = vi.fn((after: number | null) => ({
+      reset: after === null,
+      cursor,
+      events:
+        after !== null && after < cursor
+          ? [
+              {
+                seq: cursor,
+                revision: cursor,
+                type: "DurablyAdmit",
+                turnId: "turn-1",
+                status: "queued",
+                createdAt: 1,
+              },
+            ]
+          : [],
+      revision: cursor,
+    }));
     const state = new TestState();
     const runtime = controller(
       state,
-      store({ revision, latestSnapshot }),
+      store({ readOutbox, latestSnapshot }),
       callbacks({ coarseState }),
     );
 
@@ -849,8 +777,11 @@ describe("ChatRuntimeController POSTs", () => {
       order.push("turn-durable");
       return {
         ok: true as const,
+        durable: true as const,
         duplicate: false,
         turn: { id: "message-1", status: "queued" },
+        revision: 1,
+        shouldArmAlarm: true,
       };
     });
     const runtime = controller(state, store({ admit }), callbacks({ kick }));
@@ -906,24 +837,6 @@ describe("ChatRuntimeController POSTs", () => {
     expect(kick).not.toHaveBeenCalled();
   });
 
-  it("aborts the isolate when alarm pre-arming does not settle", async () => {
-    vi.useFakeTimers();
-    const state = new TestState();
-    state.storage.setAlarm = vi.fn(() => new Promise<void>(() => undefined));
-    const admit = vi.fn();
-    const runtime = controller(state, store({ admit }));
-    const pending = runtime.fetch(
-      post("/v2/messages", {
-        clientMessageId: "safe-timeout-id",
-        content: "hello",
-      }),
-    );
-    await vi.advanceTimersByTimeAsync(CHAT_RUNTIME_BOUNDS.alarmWriteMs);
-    expect((await pending).status).toBe(503);
-    expect(state.aborts).toEqual(["Alarm pre-arm timed out"]);
-    expect(admit).not.toHaveBeenCalled();
-  });
-
   it("rejects oversized, malformed, and structurally invalid messages", async () => {
     const state = new TestState();
     const admit = vi.fn();
@@ -954,22 +867,6 @@ describe("ChatRuntimeController POSTs", () => {
     );
     expect((await runtime.fetch(streamed)).status).toBe(413);
     expect(admit).not.toHaveBeenCalled();
-  });
-
-  it("rejects deeply nested request JSON before JSON.parse", async () => {
-    const state = new TestState();
-    const runtime = controller(state, store({ admit: vi.fn() }));
-    const raw =
-      "[".repeat(CHAT_RUNTIME_BOUNDS.providerJsonDepth + 1) +
-      "0" +
-      "]".repeat(CHAT_RUNTIME_BOUNDS.providerJsonDepth + 1);
-    const parse = vi.spyOn(JSON, "parse");
-    try {
-      expect((await runtime.fetch(post("/v2/messages", raw))).status).toBe(400);
-      expect(parse).not.toHaveBeenCalled();
-    } finally {
-      parse.mockRestore();
-    }
   });
 
   it("allows only named controls and has no generic RPC surface", async () => {

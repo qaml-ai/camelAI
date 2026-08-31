@@ -87,10 +87,6 @@ export function useChatRuntime<State = unknown>({
       baseUrl:
         baseUrl ?? `/agents/chat-thread/${encodeURIComponent(threadId)}/v2`,
       onStatus: (next) => current && setConnectionStatus(next),
-      onLiveReset: () => {
-        pendingLive = null;
-        if (current) setLiveOverlay(null);
-      },
       onFrame: (frame: ChatRuntimeFrame<State>) => {
         if (!current) return;
         if (frame.type === "snapshot" || frame.type === "reset") {

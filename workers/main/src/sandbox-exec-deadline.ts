@@ -4,8 +4,8 @@
 // which is the PRIMARY enforcement and produces the better error (it knows the
 // exit code and the partial output). But nothing bounded the await on THIS
 // side: a wedged container, a hung capnweb call, or a shell that died under the
-// command leaves the caller waiting until the turn's outer tool deadline.
-// Production saw an `analysis_exec`
+// command leaves the caller waiting until the 20-minute
+// PI_TURN_TOOL_HARD_TIMEOUT backstop fires. Production saw an `analysis_exec`
 // declaring `timeoutMs: 120000` occupy a turn for 1,200,000ms.
 //
 // This module is the upper bound with grace: it never replaces the
@@ -89,13 +89,13 @@ export class SandboxDeadlineExceededError extends Error {
     const started = input.started !== false;
     super(
       `${input.operation} did not return within its ${Math.round(input.budgetMs / 1000)}s budget ` +
-        `(declared timeout ${input.declaredTimeoutMs == null ? "default" : `${input.declaredTimeoutMs}ms`}) ` +
-        (started
-          ? `and was abandoned. It may already have run to completion in the sandbox — file writes, ` +
-            `installs and database changes it started can still be landing — so do NOT simply repeat it ` +
-            `unless it is safe to run twice; check the resulting state first. `
-          : `and was NOT started: the budget for this tool call was already spent. Nothing ran. `) +
-        `Try a smaller scope, a shorter command, or a different approach — the turn is still active.`,
+      `(declared timeout ${input.declaredTimeoutMs == null ? "default" : `${input.declaredTimeoutMs}ms`}) ` +
+      (started
+        ? `and was abandoned. It may already have run to completion in the sandbox — file writes, ` +
+          `installs and database changes it started can still be landing — so do NOT simply repeat it ` +
+          `unless it is safe to run twice; check the resulting state first. `
+        : `and was NOT started: the budget for this tool call was already spent. Nothing ran. `) +
+      `Try a smaller scope, a shorter command, or a different approach — the turn is still active.`,
     );
     this.name = "SandboxDeadlineExceededError";
     this.operation = input.operation;
@@ -109,9 +109,7 @@ export class SandboxDeadlineExceededError extends Error {
 export function isSandboxDeadlineExceededError(error: unknown): boolean {
   if (error instanceof SandboxDeadlineExceededError) return true;
   // Survives an RPC hop, where only name/message are preserved.
-  return (
-    error instanceof Error && error.name === "SandboxDeadlineExceededError"
-  );
+  return error instanceof Error && error.name === "SandboxDeadlineExceededError";
 }
 
 /** Same clamp analysis-service applies before forwarding a timeout container-side. */
@@ -120,8 +118,7 @@ export function clampSandboxTimeoutMs(
   fallback: number,
   max: number,
 ): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0)
-    return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallback;
   return Math.min(Math.floor(value), max);
 }
 
@@ -205,16 +202,11 @@ export function createSandboxExecDeadline(
   const now = options.now ?? (() => Date.now());
   const timer = options.timer ?? createSandboxDeadlineTimer;
   const declaredTimeoutMs =
-    typeof options.declaredTimeoutMs === "number" &&
-    Number.isFinite(options.declaredTimeoutMs)
+    typeof options.declaredTimeoutMs === "number" && Number.isFinite(options.declaredTimeoutMs)
       ? options.declaredTimeoutMs
       : undefined;
   const budgetMs =
-    clampSandboxTimeoutMs(
-      declaredTimeoutMs,
-      options.defaultTimeoutMs,
-      options.maxTimeoutMs,
-    ) +
+    clampSandboxTimeoutMs(declaredTimeoutMs, options.defaultTimeoutMs, options.maxTimeoutMs) +
     (options.overheadMs ?? 0) +
     (options.graceMs ?? SANDBOX_EXEC_DEADLINE_GRACE_MS);
   let deadlineAtMs: number | null = null;
@@ -239,8 +231,7 @@ export function createSandboxExecDeadline(
       } finally {
         // Before the first `run` there is no clock to push; the budget starts
         // whole when the first command is actually dispatched.
-        if (deadlineAtMs !== null)
-          deadlineAtMs += Math.max(0, now() - startedAtMs);
+        if (deadlineAtMs !== null) deadlineAtMs += Math.max(0, now() - startedAtMs);
       }
     },
     async run<T>(fn: () => Promise<T>): Promise<T> {

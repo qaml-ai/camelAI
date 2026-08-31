@@ -15,10 +15,6 @@ import {
   transcribeAudioBytes,
   type AudioTranscriptionResult,
 } from "./audio-transcription.js";
-import { CHAT_RUNTIME_BOUNDS } from "../../../src/lib/chat-runtime-bounds.js";
-
-export const CAMELAI_MOUNTED_AUDIO_MAX_BYTES =
-  CHAT_RUNTIME_BOUNDS.toolSourceReadBytes;
 
 export type CamelAiServiceProps = AIVirtualBindingProps;
 export type TranscribeAudioInput =
@@ -103,21 +99,7 @@ export class CamelAiService extends WorkerEntrypoint<
     if (!object) {
       throw new Error(`Audio file not found: ${path}`);
     }
-    if (
-      !Number.isSafeInteger(object.size) ||
-      object.size < 0 ||
-      object.size > CAMELAI_MOUNTED_AUDIO_MAX_BYTES
-    ) {
-      await object.body?.cancel("Mounted audio exceeds the whole-buffer limit").catch(() => undefined);
-      throw new Error(
-        `Mounted audio exceeds the ${CAMELAI_MOUNTED_AUDIO_MAX_BYTES} byte whole-buffer limit`,
-      );
-    }
-    const bytes = await object.arrayBuffer();
-    if (bytes.byteLength !== object.size) {
-      throw new Error("Mounted audio size changed while it was read");
-    }
-    return bytes;
+    return object.arrayBuffer();
   }
 }
 

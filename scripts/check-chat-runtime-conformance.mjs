@@ -158,10 +158,6 @@ function quotedTypes(source) {
   );
 }
 
-function quotedUnion(source) {
-  return new Set([...source.matchAll(/\|\s*"([A-Za-z]+)"/g)].map((m) => m[1]));
-}
-
 function assertExact(actual, expected, label) {
   const missing = expected.filter((item) => !actual.has(item));
   const extra = [...actual].filter((item) => !expected.includes(item));
@@ -208,30 +204,26 @@ assertExact(
   "coarse reducer case set",
 );
 
-// The store/outbox is the complete implementation action authority.
-const outbox = between(
+// The store exports the complete formal vocabulary without persisting a
+// redundant event log beside the canonical turn/runtime rows.
+const durableVocabulary = between(
   store,
-  /export interface ChatOutboxEvent\s*\{/,
+  /export const CHAT_RUNTIME_DURABLE_ACTIONS\s*=\s*\[/,
   /export type StoreRejection\s*=/,
-  "ChatOutboxEvent",
+  "CHAT_RUNTIME_DURABLE_ACTIONS",
 );
-assertExact(quotedUnion(outbox), durableActions, "durable outbox action set");
+assertExact(
+  new Set(
+    [...durableVocabulary.matchAll(/"([A-Za-z]+)"/g)].map((match) => match[1]),
+  ),
+  durableActions,
+  "durable action vocabulary",
+);
 for (const action of durableActions) {
   if (!new RegExp(`^${action}(?:\\([^\\n]*\\))?\\s*==`, "m").test(model)) {
     fail(`TLA+ durable action ${action} is missing`);
   }
 }
-const migrationEventUnion = between(
-  legacy,
-  /private appendMigrationEvent\(/,
-  /now:\s*number/,
-  "legacy migration event union",
-);
-assertExact(
-  quotedUnion(migrationEventUnion),
-  migrationActions,
-  "legacy migration event set",
-);
 
 // The replacement model itself must remain smaller than the 641-line model it
 // superseded and must not regrow the deleted runtime-startup/retry axis.
@@ -603,6 +595,26 @@ expect(
   /contextMessages:\s*64\b/,
   "model-context message bound drifted",
 );
+expect(
+  bounds,
+  /accountedChatPayloadEnvelopeBytes:\s*48\s*\*\s*1024\s*\*\s*1024/,
+  "accounted chat payload envelope drifted",
+);
+expect(
+  bounds,
+  /contextBytes:\s*2\s*\*\s*1024\s*\*\s*1024/,
+  "model-context byte bound drifted",
+);
+expect(
+  bounds,
+  /snapshotBytes:\s*1536\s*\*\s*1024/,
+  "snapshot source byte bound drifted",
+);
+expect(
+  bounds,
+  /checkpointBytes:\s*4\s*\*\s*1024\s*\*\s*1024/,
+  "checkpoint byte bound drifted",
+);
 reject(
   bounds,
   /\bcontextTurns\s*:/,
@@ -610,23 +622,52 @@ reject(
 );
 expect(
   bounds,
-  /sseWriterBytes:\s*5\s*\*\s*1024\s*\*\s*1024/,
+  /sseWritersPerThread:\s*4\b/,
+  "per-thread SSE writer bound drifted",
+);
+expect(
+  bounds,
+  /sseWriterBytes:\s*2\s*\*\s*1024\s*\*\s*1024\s*-\s*4\s*\*\s*1024/,
   "SSE frame bound drifted",
 );
 expect(
   bounds,
-  /sseWriterQueueBytes:\s*5\s*\*\s*1024\s*\*\s*1024\s*\+\s*4\s*\*\s*1024/,
+  /sseWriterQueueBytes:\s*2\s*\*\s*1024\s*\*\s*1024/,
   "SSE writer queue bound drifted",
 );
 expect(
   bounds,
-  /sseDoBytes:\s*40\s*\*\s*1024\s*\*\s*1024/,
+  /sseDoBytes:\s*8\s*\*\s*1024\s*\*\s*1024/,
   "aggregate SSE bound drifted",
 );
 expect(
   bounds,
-  /frameBytes:\s*5\s*\*\s*1024\s*\*\s*1024/,
+  /frameBytes:\s*2\s*\*\s*1024\s*\*\s*1024\s*-\s*4\s*\*\s*1024/,
   "client frame bound drifted",
+);
+expect(
+  bounds,
+  /liveFramesPerTurn:\s*24_000\b/,
+  "live-frame count bound drifted",
+);
+expect(
+  bounds,
+  /liveBytesPerTurn:\s*304\s*\*\s*1024\s*\*\s*1024/,
+  "live-presentation byte bound drifted",
+);
+expect(bounds, /liveBurstBytes:\s*4\s*\*\s*1024\s*\*\s*1024/,
+  "live-presentation burst bound drifted");
+expect(bounds, /liveMaxPacingDelayMs:\s*8_000\b/,
+  "live-presentation pacing bound drifted");
+expect(
+  bounds,
+  /clientSnapshotCacheEntryBytes:\s*2\s*\*\s*1024\s*\*\s*1024/,
+  "snapshot-cache entry bound drifted",
+);
+expect(
+  bounds,
+  /clientSnapshotCacheBytes:\s*8\s*\*\s*1024\s*\*\s*1024/,
+  "snapshot-cache aggregate bound drifted",
 );
 expect(
   bounds,
@@ -659,6 +700,16 @@ expect(
   bounds,
   /legacyMigrationScanRows:\s*128\s*\*\s*\(32\s*\+\s*3\)/,
   "migration scan bound drifted",
+);
+expect(
+  bounds,
+  /legacyMigrationBytes:\s*8\s*\*\s*1024\s*\*\s*1024/,
+  "migration import byte bound drifted",
+);
+expect(
+  bounds,
+  /legacyMigrationRowBytes:\s*1536\s*\*\s*1024/,
+  "migration row byte bound drifted",
 );
 
 expect(
@@ -708,8 +759,8 @@ expect(
 
 const checkpointMutation = bracedBody(
   store,
-  "private mutateCheckpoint(",
-  "mutateCheckpoint",
+  "  checkpoint(",
+  "DurableChatTurnStore.checkpoint",
 );
 expect(
   checkpointMutation,
@@ -733,12 +784,12 @@ expect(
 );
 expect(
   store,
-  /firstPending\.effectStarted = true/,
+  /pending\.effectStarted = true/,
   "BeginEffect must persist a per-call latch",
 );
 expect(
   store,
-  /call\.result = result/,
+  /pending\.result = mutation\.result/,
   "RecordToolResult must persist one matching result",
 );
 expect(
@@ -785,10 +836,25 @@ before(
   /store\.admit\(/,
   "alarm must be durable before row admission",
 );
-expect(
+const encodeFrameFunction = bracedBody(
   controller,
-  /encoder\.encode\(`data: \$\{JSON\.stringify\(value\)\}\\n\\n`\)\.byteLength/,
-  "SSE cap must measure escaped wire bytes",
+  "function encodeFrame(",
+  "encodeFrame",
+);
+expect(
+  encodeFrameFunction,
+  /encoder\.encode\(`data: \$\{JSON\.stringify\(value\)\}\\n\\n`\)/,
+  "SSE encoder must materialize the escaped wire frame",
+);
+const frameBytesFunction = bracedBody(
+  controller,
+  "function frameBytes(",
+  "frameBytes",
+);
+expect(
+  frameBytesFunction,
+  /8\s*\+\s*utf8ByteLength\(JSON\.stringify\(value\)\)/,
+  "SSE cap must count the escaped UTF-8 wire frame",
 );
 expect(
   controller,
@@ -1096,18 +1162,18 @@ expect(
 before(
   execute,
   /await this\.setAlarm\(this\.now\(\)\)/,
-  /store\.complete\(/,
+  /store\.finish\(/,
   "next alarm must precede success commit",
 );
 before(
   execute,
   /this\.publish\(\)/,
-  /await this\.armNext\(terminal\)/,
+  /await this\.armNext\(\)/,
   "terminal publication must precede next ownership",
 );
 before(
   execute,
-  /await this\.armNext\(terminal\)/,
+  /await this\.armNext\(\)/,
   /this\.options\.ctx\.abort\(/,
   "terminal state and next alarm must precede isolate abort",
 );
@@ -1162,12 +1228,12 @@ const runMigration = bracedBody(
 );
 expect(
   runMigration,
-  /const hasAdmittedWork\s*=\s*this\.hasAdmittedV2Turn\(now\)/,
+  /const admitted\s*=\s*this\.hasAdmittedTurn\(now\)/,
   "legacy read must check for admitted V2 work",
 );
 before(
   runMigration,
-  /if \(!hasAdmittedWork && !opened\)/,
+  /if \(!existing && !admitted\)/,
   /this\.scanLegacy\(/,
   "legacy read must require admission or an authenticated open request",
 );
@@ -1209,7 +1275,7 @@ const scanLegacy = bracedBody(
 );
 expect(
   scanLegacy,
-  /this\.assertAttemptOwned\(attemptToken, deadlineAt\)/,
+  /this\.assertOwned\(token, deadlineAt\)/,
   "legacy source selection must be fenced by the current token and deadline",
 );
 const readLegacyRows = bracedBody(
@@ -1220,13 +1286,13 @@ const readLegacyRows = bracedBody(
 const legacyPageLoop = between(
   readLegacyRows,
   /while\s*\(/,
-  /return newest\.reverse\(\)/,
+  /return rows\.reverse\(\)/,
   "bounded legacy page loop",
 );
 before(
   legacyPageLoop,
-  /this\.assertAttemptOwned\(attemptToken, deadlineAt\)/,
-  /let metadata:/,
+  /this\.assertOwned\(token, deadlineAt\)/,
+  /const metadata\s*=/,
   "every legacy page read must begin behind an ownership fence",
 );
 expect(
@@ -1261,26 +1327,15 @@ expect(
   "legacy scan must use its total-row bound",
 );
 expect(legacy, /historyTurns/, "legacy import must use the shared turn bound");
-expect(legacy, /historyBytes/, "legacy import must use the shared byte bound");
 expect(
   legacy,
-  /function hasCompleteAiChatChronology\(/,
-  "legacy ordering needs an explicit completeness guard",
+  /legacyMigrationBytes/,
+  "legacy import must use its dedicated byte bound",
 );
 expect(
   legacy,
-  /key = 'metadata_v1' AND value = 1[\s\S]*cf_ai_chat_agent_messages_chronology/,
-  "chronology ordering must require both marker and index",
-);
-expect(
-  legacy,
-  /table === AI_CHAT_TABLE && hasCompleteAiChatChronology\(this\.sql\)/,
-  "ai-chat paging must consult the chronology completeness guard",
-);
-expect(
-  legacy,
-  /WHERE rowid < \? ORDER BY rowid DESC LIMIT \?/,
-  "incomplete chronology must fall back to indexed rowid paging",
+  /WHERE rowid < \?[\s\S]*ORDER BY rowid DESC LIMIT \?/,
+  "ai-chat migration must use indexed rowid paging",
 );
 reject(
   legacy,

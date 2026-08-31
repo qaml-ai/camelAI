@@ -244,14 +244,75 @@ describe("bounded turn runner", () => {
     ]);
   });
 
+  it("isolates provider replay from the mutable durable checkpoint", async () => {
+    let providerCalls = 0;
+    const painted: Parameters<DurableTurnRunContext["publishLive"]>[0][] = [];
+    const adapter = fakeAdapter({
+      callProvider: async ({ toolBatches }) => {
+        if (++providerCalls === 1) return toolBatch(["call-a"], "inspect");
+        const replay = toolBatches as CheckpointProviderBatch[];
+        replay[0].providerStateJson = "[]";
+        replay[0].calls[0].id = "mutated";
+        replay[0].calls[0].result!.callId = "mutated";
+        replay[0].calls[0].result!.output = JSON.stringify({
+          value: "mutated",
+        });
+        return { kind: "assistant", content: "done" };
+      },
+      callTool: async () => ({ value: "original" }),
+    });
+
+    await createBoundedTurnRunner(adapter)(
+      input({
+        publishLive: (content) => painted.push(content),
+      }),
+    );
+
+    const terminal = painted.at(-1) ?? [];
+    expect(terminal).toContainEqual({
+      type: "tool_use",
+      id: "call-a",
+      name: "inspect",
+      input: {},
+    });
+    const result = terminal.find((block) => block.type === "tool_result");
+    expect(result).toMatchObject({ tool_use_id: "call-a" });
+    expect(
+      result?.type === "tool_result" ? JSON.parse(result.content) : null,
+    ).toEqual({ value: "original" });
+  });
+
   it("checkpoints thrown tool values without invoking accessors or coercion", async () => {
     let reads = 0;
-    const hostile = Object.defineProperties({}, {
-      name: { get: () => { reads += 1; return "Hostile"; } },
-      message: { get: () => { reads += 1; return "secret"; } },
-      toString: { get: () => { reads += 1; return () => "secret"; } },
-      toJSON: { get: () => { reads += 1; return () => "secret"; } },
-    });
+    const hostile = Object.defineProperties(
+      {},
+      {
+        name: {
+          get: () => {
+            reads += 1;
+            return "Hostile";
+          },
+        },
+        message: {
+          get: () => {
+            reads += 1;
+            return "secret";
+          },
+        },
+        toString: {
+          get: () => {
+            reads += 1;
+            return () => "secret";
+          },
+        },
+        toJSON: {
+          get: () => {
+            reads += 1;
+            return () => "secret";
+          },
+        },
+      },
+    );
     let providerCalls = 0;
     const results: CheckpointToolResult[] = [];
     const adapter = fakeAdapter({
@@ -261,11 +322,17 @@ describe("bounded turn runner", () => {
           ? toolBatch(["call-error"])
           : { kind: "assistant", content: "continued" };
       },
-      callTool: async () => { throw hostile; },
+      callTool: async () => {
+        throw hostile;
+      },
     });
 
     await createBoundedTurnRunner(adapter)(
-      input({ recordToolResult: async (result) => { results.push(result); } }),
+      input({
+        recordToolResult: async (result) => {
+          results.push(result);
+        },
+      }),
     );
 
     expect(reads).toBe(0);
@@ -275,28 +342,44 @@ describe("bounded turn runner", () => {
       message: "[object thrown]",
       name: "Error",
     });
-    expect(new TextEncoder().encode(results[0].output).byteLength).toBeLessThanOrEqual(
-      CHAT_RUNTIME_BOUNDS.toolResultBytes,
-    );
+    expect(
+      new TextEncoder().encode(results[0].output).byteLength,
+    ).toBeLessThanOrEqual(CHAT_RUNTIME_BOUNDS.toolResultBytes);
   });
 
   it("rejects hostile tool inputs without materializing or invoking them", async () => {
     let reads = 0;
-    const hostile = Object.defineProperties({
-      huge: "x".repeat(CHAT_RUNTIME_BOUNDS.toolInputBytes * 4),
-    }, {
-      accessor: { enumerable: true, get: () => { reads += 1; return "secret"; } },
-      toJSON: { get: () => { reads += 1; return () => ({ secret: true }); } },
-    });
+    const hostile = Object.defineProperties(
+      {
+        huge: "x".repeat(CHAT_RUNTIME_BOUNDS.toolInputBytes * 4),
+      },
+      {
+        accessor: {
+          enumerable: true,
+          get: () => {
+            reads += 1;
+            return "secret";
+          },
+        },
+        toJSON: {
+          get: () => {
+            reads += 1;
+            return () => ({ secret: true });
+          },
+        },
+      },
+    );
 
     await expect(
-      createBoundedTurnRunner(fakeAdapter({
-        callProvider: async () => ({
-          kind: "tool_batch",
-          providerStateJson: "[]",
-          calls: [{ id: "hostile", name: "tool", input: hostile }],
+      createBoundedTurnRunner(
+        fakeAdapter({
+          callProvider: async () => ({
+            kind: "tool_batch",
+            providerStateJson: "[]",
+            calls: [{ id: "hostile", name: "tool", input: hostile }],
+          }),
         }),
-      }))(input()),
+      )(input()),
     ).rejects.toMatchObject({ code: "tool_input_bytes" });
     expect(reads).toBe(0);
   });
@@ -307,14 +390,43 @@ describe("bounded turn runner", () => {
     calls.length = CHAT_RUNTIME_BOUNDS.toolCallsPerTurn + 1;
     Object.defineProperty(calls, "0", { get: touched });
 
-    await expect(createBoundedTurnRunner(fakeAdapter({
-      callProvider: async () => ({
-        kind: "tool_batch",
-        providerStateJson: "[]",
-        calls,
-      }) as BoundedProviderStep,
-    }))(input())).rejects.toMatchObject({ code: "invalid_provider_step" });
+    await expect(
+      createBoundedTurnRunner(
+        fakeAdapter({
+          callProvider: async () =>
+            ({
+              kind: "tool_batch",
+              providerStateJson: "[]",
+              calls,
+            }) as BoundedProviderStep,
+        }),
+      )(input()),
+    ).rejects.toMatchObject({ code: "invalid_provider_step" });
     expect(touched).not.toHaveBeenCalled();
+  });
+
+  it("rejects allocation-amplifying provider JSON before JSON.parse", async () => {
+    const raw =
+      "[".repeat(CHAT_RUNTIME_BOUNDS.providerJsonDepth + 1) +
+      "0" +
+      "]".repeat(CHAT_RUNTIME_BOUNDS.providerJsonDepth + 1);
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      await expect(
+        createBoundedTurnRunner(
+          fakeAdapter({
+            callProvider: async () => ({
+              kind: "tool_batch",
+              providerStateJson: raw,
+              calls: [{ id: "safe", name: "tool", input: {} }],
+            }),
+          }),
+        )(input()),
+      ).rejects.toMatchObject({ code: "invalid_provider_step" });
+      expect(parse).not.toHaveBeenCalled();
+    } finally {
+      parse.mockRestore();
+    }
   });
 
   it("paints provider deltas and tool milestones only behind durable checkpoints", async () => {
@@ -362,11 +474,7 @@ describe("bounded turn runner", () => {
       "final-durable",
       "paint-final",
     ]);
-    expect(painted.at(-1)).toEqual([
-      "tool_use",
-      "tool_result",
-      "text",
-    ]);
+    expect(painted.at(-1)).toEqual(["tool_use", "tool_result", "text"]);
   });
 
   it("recovers an unstarted batch without repeating its provider response", async () => {
@@ -677,13 +785,14 @@ describe("bounded turn runner", () => {
       retained.some((result) => result.output.includes('"$overflow"')),
     ).toBe(true);
     expect(
-      replayed.at(-1)?.calls.some((call) =>
-        call.result?.output.includes('"$overflow"'),
-      ),
+      replayed
+        .at(-1)
+        ?.calls.some((call) => call.result?.output.includes('"$overflow"')),
     ).toBe(true);
     expect(
       retained.reduce(
-        (total, result) => total + new TextEncoder().encode(result.output).byteLength,
+        (total, result) =>
+          total + new TextEncoder().encode(result.output).byteLength,
         0,
       ),
     ).toBeLessThanOrEqual(CHAT_RUNTIME_BOUNDS.toolResultsPerTurnBytes);
@@ -698,7 +807,8 @@ describe("bounded turn runner", () => {
           ++providerCalls === 1
             ? toolBatch(["call-a"], "read")
             : { kind: "assistant", content: "done" },
-        callTool: async () => "x".repeat(CHAT_RUNTIME_BOUNDS.toolResultBytes * 2),
+        callTool: async () =>
+          "x".repeat(CHAT_RUNTIME_BOUNDS.toolResultBytes * 2),
         overflowToolResult: async () => {
           throw new Error("R2 unavailable");
         },
@@ -711,13 +821,17 @@ describe("bounded turn runner", () => {
       }),
     );
 
-    const output = JSON.parse(retained?.output ?? "null") as Record<string, unknown>;
+    const output = JSON.parse(retained?.output ?? "null") as Record<
+      string,
+      unknown
+    >;
     expect(output.$overflow).toMatchObject({
       stored: false,
       complete: false,
     });
-    expect(new TextEncoder().encode(retained?.output ?? "").byteLength)
-      .toBeLessThanOrEqual(CHAT_RUNTIME_BOUNDS.toolResultOverflowStubBytes);
+    expect(
+      new TextEncoder().encode(retained?.output ?? "").byteLength,
+    ).toBeLessThanOrEqual(CHAT_RUNTIME_BOUNDS.toolResultOverflowStubBytes);
   });
 
   it("checkpoints a fallback and fences a late overflow result", async () => {
@@ -733,7 +847,8 @@ describe("bounded turn runner", () => {
           ++providerCalls === 1
             ? toolBatch(["call-a"], "read")
             : { kind: "assistant", content: "done" },
-        callTool: async () => "x".repeat(CHAT_RUNTIME_BOUNDS.toolResultBytes * 2),
+        callTool: async () =>
+          "x".repeat(CHAT_RUNTIME_BOUNDS.toolResultBytes * 2),
         overflowToolResult: (_call, _value, signal) =>
           new Promise((resolve) => {
             overflowSignal = signal;
@@ -741,10 +856,17 @@ describe("bounded turn runner", () => {
           }),
       }),
       () => clock,
-    )(input({ deadlineAt: CHAT_RUNTIME_BOUNDS.turnLeaseMs, recordToolResult: recorded }));
+    )(
+      input({
+        deadlineAt: CHAT_RUNTIME_BOUNDS.turnLeaseMs,
+        recordToolResult: recorded,
+      }),
+    );
     await flush();
     clock = CHAT_RUNTIME_BOUNDS.toolResultOverflowDeadlineMs;
-    await vi.advanceTimersByTimeAsync(CHAT_RUNTIME_BOUNDS.toolResultOverflowDeadlineMs);
+    await vi.advanceTimersByTimeAsync(
+      CHAT_RUNTIME_BOUNDS.toolResultOverflowDeadlineMs,
+    );
 
     await expect(run).resolves.toBe("done");
     expect(overflowSignal?.aborted).toBe(true);
@@ -752,7 +874,9 @@ describe("bounded turn runner", () => {
     expect(JSON.parse(recorded.mock.calls[0][0].output)).toMatchObject({
       $overflow: { stored: false, complete: false },
     });
-    finish({ $overflow: { stored: true, complete: true, path: "tmp/late.json" } });
+    finish({
+      $overflow: { stored: true, complete: true, path: "tmp/late.json" },
+    });
     await flush();
     expect(recorded).toHaveBeenCalledOnce();
   });

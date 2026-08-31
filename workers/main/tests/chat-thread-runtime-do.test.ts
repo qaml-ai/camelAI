@@ -45,6 +45,24 @@ class ColdRuntime extends ChatThreadRuntimeDO {
   }
 }
 
+class StateRuntime extends ChatThreadRuntimeDO {
+  protected override createDriver(): DurableTurnDriver {
+    return { kick: vi.fn(), alarm: vi.fn() } as unknown as DurableTurnDriver;
+  }
+}
+
+async function readSseData(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): Promise<Record<string, unknown>> {
+  const chunk = await reader.read();
+  const line = new TextDecoder()
+    .decode(chunk.value)
+    .split("\n")
+    .find((value) => value.startsWith("data: "));
+  if (!line) throw new Error("Expected SSE data frame");
+  return JSON.parse(line.slice(6)) as Record<string, unknown>;
+}
+
 describe("framework-free ChatThreadRuntimeDO", () => {
   it("returns an SSE heartbeat even when cold storage startup fails", async () => {
     await runInDurableObject(threadStub("cold"), async (instance: any) => {
@@ -56,6 +74,48 @@ describe("framework-free ChatThreadRuntimeDO", () => {
       const first = await reader.read();
       expect(new TextDecoder().decode(first.value)).toBe(":hb\n\n");
       await reader.cancel();
+    });
+  });
+
+  it("publishes scalar state on a durable cursor and replays it after reconnect", async () => {
+    await runInDurableObject(threadStub("state-cursor"), async (instance: any) => {
+      const runtime = new StateRuntime(instance.ctx, env as unknown as ChatEnv);
+      await runtime.setTitle("seed cursor");
+      const response = await runtime.fetch(runtimeRequest());
+      const reader = response.body!.getReader();
+      expect(new TextDecoder().decode((await reader.read()).value)).toBe(
+        ":hb\n\n",
+      );
+      const hello = await readSseData(reader);
+      const initialCursor = hello.cursor as number;
+      await readSseData(reader);
+
+      await runtime.setModel("claude-sonnet-4-5");
+      const reset = await readSseData(reader);
+      expect(reset).toMatchObject({
+        type: "reset",
+        cursor: initialCursor + 1,
+        state: { model: "claude-sonnet-4-5" },
+      });
+      await reader.cancel();
+
+      const reconnect = await runtime.fetch(
+        new Request(`${runtimeRequest().url}&after=${initialCursor}`, {
+          headers: { "X-Chiridion-User-Id": "user-1" },
+        }),
+      );
+      const reconnectReader = reconnect.body!.getReader();
+      await reconnectReader.read();
+      expect(await readSseData(reconnectReader)).toMatchObject({
+        type: "hello",
+        cursor: initialCursor + 1,
+      });
+      expect(await readSseData(reconnectReader)).toMatchObject({
+        type: "reset",
+        cursor: initialCursor + 1,
+        state: { model: "claude-sonnet-4-5" },
+      });
+      await reconnectReader.cancel();
     });
   });
 
@@ -119,7 +179,7 @@ describe("framework-free ChatThreadRuntimeDO", () => {
         const toJSON = vi.fn(() => ({ leaked: true }));
         const getter = vi.fn(() => "leaked");
         const result: Record<string, unknown> = {
-          huge: "x".repeat(CHAT_RUNTIME_BOUNDS.outboxEventBytes * 4),
+          huge: "x".repeat(CHAT_RUNTIME_BOUNDS.evalEventBytes * 4),
           toJSON,
         };
         Object.defineProperty(result, "secret", {
@@ -200,7 +260,10 @@ describe("framework-free ChatThreadRuntimeDO", () => {
         instance.ctx,
         env as unknown as ChatEnv,
       );
+      const turnStore = new DurableChatTurnStore(instance.ctx.storage);
+      const initialRevision = turnStore.revision();
       await runtime.setTitle("x".repeat(CHAT_RUNTIME_BOUNDS.requestBytes * 2));
+      expect(turnStore.revision()).toBe(initialRevision + 1);
       expect(
         new TextEncoder().encode(
           instance.ctx.storage.kv.get<string>(CHAT_RUNTIME_KV_KEYS.title) ?? "",
@@ -216,6 +279,7 @@ describe("framework-free ChatThreadRuntimeDO", () => {
           }),
         ),
       );
+      expect(turnStore.revision()).toBe(initialRevision + 2);
       expect(runtime.getTodoState().length).toBeLessThanOrEqual(
         CHAT_RUNTIME_BOUNDS.snapshotMessages,
       );
@@ -231,9 +295,16 @@ describe("framework-free ChatThreadRuntimeDO", () => {
         ),
         null,
       );
+      expect(turnStore.revision()).toBe(initialRevision + 3);
       expect(runtime.getPreviewState().tabs.length).toBeLessThanOrEqual(
         CHAT_RUNTIME_BOUNDS.snapshotMessages,
       );
+      const state = (
+        runtime as unknown as { coarseState(): Record<string, unknown> }
+      ).coarseState();
+      expect(
+        new TextEncoder().encode(JSON.stringify(state)).byteLength,
+      ).toBeLessThanOrEqual(CHAT_RUNTIME_BOUNDS.coarseStateBytes);
 
       for (
         let index = 0;
@@ -379,20 +450,22 @@ describe("framework-free ChatThreadRuntimeDO", () => {
         await finishLegacyMigration(this.ctx.storage, this.store, Date.now());
         const claimed = this.store.claim(Date.now(), "eval-attempt");
         if (claimed.ok) {
-          this.store.startNextInference(
+          this.store.checkpoint(
             claimed.turn.id,
             "eval-attempt",
+            { type: "start_provider" },
             Date.now(),
           );
-          this.store.checkpointProviderFinal(
+          this.store.checkpoint(
             claimed.turn.id,
             "eval-attempt",
-            "bounded answer",
+            { type: "provider_final", output: "bounded answer" },
             Date.now(),
           );
-          this.store.complete(
+          this.store.finish(
             claimed.turn.id,
             "eval-attempt",
+            "completed",
             "bounded answer",
             Date.now(),
           );
@@ -505,11 +578,21 @@ describe("framework-free ChatThreadRuntimeDO", () => {
           );
           store.claim(index * 3 + 1, `attempt:${id}`);
           if (id === "failed")
-            store.fail(id, `attempt:${id}`, "provider failed", 2);
+            store.finish(id, `attempt:${id}`, "failed", "provider failed", 2);
           else {
-            store.startNextInference(id, `attempt:${id}`, 4);
-            store.checkpointProviderFinal(id, `attempt:${id}`, "done", 5);
-            store.complete(id, `attempt:${id}`, "done", 5);
+            store.checkpoint(
+              id,
+              `attempt:${id}`,
+              { type: "start_provider" },
+              4,
+            );
+            store.checkpoint(
+              id,
+              `attempt:${id}`,
+              { type: "provider_final", output: "done" },
+              5,
+            );
+            store.finish(id, `attempt:${id}`, "completed", "done", 5);
           }
         }
         const runtime = new ChatThreadRuntimeDO(
@@ -535,12 +618,6 @@ describe("framework-free ChatThreadRuntimeDO", () => {
       threadStub("migration-failure-state"),
       async (instance: any) => {
         const store = new DurableChatTurnStore(instance.ctx.storage);
-        instance.ctx.storage.sql.exec(`CREATE TABLE pi_core_messages (
-          idx INTEGER PRIMARY KEY, payload TEXT NOT NULL, created_at INTEGER NOT NULL
-        )`);
-        instance.ctx.storage.sql.exec(
-          "INSERT INTO pi_core_messages VALUES (0, 'not json', 1)",
-        );
         store.admit(
           {
             id: "queued",
@@ -557,7 +634,12 @@ describe("framework-free ChatThreadRuntimeDO", () => {
         );
         const migration = await new LegacySessionMigrator(
           instance.ctx.storage,
-          () => 10_001,
+          // The trigger creates a 30-second absolute deadline at 40,000. The
+          // scan observes that deadline as expired and must publish the coarse
+          // migration failure without turning the queued user turn into an
+          // agent error. Malformed legacy rows are intentionally bounded gaps,
+          // not whole-migration failures, and have their own tests.
+          () => 40_001,
         ).runAfterTrigger(10_000, "migration:failed");
         expect(migration.state).toBe("failed");
 

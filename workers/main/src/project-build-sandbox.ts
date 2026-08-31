@@ -1,4 +1,8 @@
-import { Sandbox, type ExecOptions, type ExecResult } from "@cloudflare/sandbox";
+import {
+  Sandbox,
+  type ExecOptions,
+  type ExecResult,
+} from "@cloudflare/sandbox";
 
 import {
   PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS,
@@ -40,7 +44,10 @@ export class ProjectBuildSandbox extends Sandbox<Env> {
    * call boots clean. The original error is always re-thrown — the readiness
    * gate and the build ladder keep deciding what to do about this call.
    */
-  override async exec(command: string, options?: ExecOptions): Promise<ExecResult> {
+  override async exec(
+    command: string,
+    options?: ExecOptions,
+  ): Promise<ExecResult> {
     return withZombieSelfHeal(
       this.zombieHealTarget,
       "ProjectBuildSandbox",
@@ -62,7 +69,10 @@ export class ProjectBuildSandbox extends Sandbox<Env> {
    * the gate implements, and keeps `probe_session_death` a real telemetry
    * trigger. Real build commands still heal on their first death.
    */
-  async probeShell(command: string, options?: ExecOptions): Promise<ExecResult> {
+  async probeShell(
+    command: string,
+    options?: ExecOptions,
+  ): Promise<ExecResult> {
     return super.exec(command, options);
   }
 
@@ -75,7 +85,20 @@ export class ProjectBuildSandbox extends Sandbox<Env> {
   async restartZombieContainer(
     request: SandboxZombieRestartRequest,
   ): Promise<SandboxZombieRestartOutcome> {
-    return healZombieSandboxContainer(this.zombieHealTarget, "ProjectBuildSandbox", request);
+    return healZombieSandboxContainer(
+      this.zombieHealTarget,
+      "ProjectBuildSandbox",
+      request,
+    );
+  }
+
+  /**
+   * Destructive ownership fence for an abandoned build-output stream. Bundle
+   * reads have no SDK abort surface; only a confirmed container destroy proves
+   * that a late stream cannot overlap the next deploy attempt.
+   */
+  async resetAfterBundleCollectionTimeout(): Promise<void> {
+    await this.destroy();
   }
 
   /**
@@ -110,7 +133,9 @@ export class ProjectBuildSandbox extends Sandbox<Env> {
   async noteBuildSessionActivity(
     windowMs: number = PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS,
   ): Promise<void> {
-    const stored = await this.ctx.storage.get<number>(PROJECT_BUILD_SESSION_ACTIVITY_KEY);
+    const stored = await this.ctx.storage.get<number>(
+      PROJECT_BUILD_SESSION_ACTIVITY_KEY,
+    );
     const deadline = nextBuildSessionDeadline(Date.now(), stored, windowMs);
     if (deadline === null) return;
     await this.ctx.storage.put(PROJECT_BUILD_SESSION_ACTIVITY_KEY, deadline);
@@ -127,7 +152,9 @@ export class ProjectBuildSandbox extends Sandbox<Env> {
    * the workspace goes quiet.
    */
   override async onActivityExpired(): Promise<void> {
-    const until = await this.ctx.storage.get<number>(PROJECT_BUILD_SESSION_ACTIVITY_KEY);
+    const until = await this.ctx.storage.get<number>(
+      PROJECT_BUILD_SESSION_ACTIVITY_KEY,
+    );
     if (shouldKeepBuildSandboxAwake(Date.now(), until)) {
       // Every deferral is one instance held against the binding's
       // `max_instances` cap; without this the warm fleet size is invisible.

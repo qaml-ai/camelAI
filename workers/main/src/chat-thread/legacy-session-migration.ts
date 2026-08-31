@@ -1,99 +1,48 @@
 import { CHAT_RUNTIME_BOUNDS } from "../../../../src/lib/chat-runtime-bounds";
 import { parseMessageAuthor } from "../../../../src/lib/message-author";
+import { preflightJson } from "./bounded-json-parse";
+import { utf8ByteLength } from "./utf8-byte-length";
 export type LegacyMigrationState = "unseen" | "pending" | "complete" | "failed";
-
+type LegacySource = "pi_core" | "ai_chat" | "none" | "v2" | null;
 export interface LegacyMigrationStatus {
-  state: LegacyMigrationState;
-  attemptCount: number;
-  attemptToken: string | null;
-  deadlineAt: number | null;
-  importedTurns: number;
-  importedBytes: number;
-  source: "pi_core" | "ai_chat" | "none" | "v2" | null;
-  error: string | null;
-  changed: boolean;
+  state: LegacyMigrationState; attemptCount: number; attemptToken: string | null;
+  deadlineAt: number | null; importedTurns: number; importedBytes: number;
+  source: LegacySource; error: string | null; changed: boolean;
 }
 export type LegacyMigrationScope = { threadId: string; workspaceId: string; orgId: string };
-
 interface MigrationRow {
   [key: string]: string | number | null;
-  state: Exclude<LegacyMigrationState, "unseen">;
-  attempt_count: number;
-  attempt_token: string | null;
-  deadline_at: number;
-  imported_turns: number;
-  imported_bytes: number;
-  source: LegacyMigrationStatus["source"];
-  error: string | null;
+  state: Exclude<LegacyMigrationState, "unseen">; attempt_count: number;
+  attempt_token: string | null; deadline_at: number; imported_turns: number;
+  imported_bytes: number; source: LegacySource; error: string | null;
 }
-type LegacyRow = {
-  key: number;
-  id: string;
-  payload: string;
-  createdAt: number;
-};
+type LegacyRow = { key: number; id: string; payload: Record<string, unknown> | null; createdAt: number };
 type LegacyRowMeta = {
-  key: number;
-  id: string | null;
-  bytes: number;
-  created_at: number | string;
-  cursor_key: string | number;
+  key: number; id: string | null; bytes: number;
+  created_at: number | string; cursor_key: number | string;
 };
-type DisplaySegment = {
-  fallback: string;
-  renderMessageId: string | null;
-  piCoreMessageKey: string;
+type LegacyTurn = {
+  id: string; userContent: string; userDisplay: string;
+  assistantFinal: string; createdAt: number; updatedAt: number;
 };
-interface LegacyTurn {
-  id: string;
-  userContent: string;
-  userDisplay: string;
-  assistantFinal: string;
-  createdAt: number;
-  updatedAt: number;
-  displaySegments?: DisplaySegment[];
-}
-type ScanResult = {
-  turns: LegacyTurn[];
-  bytes: number;
-  source: "pi_core" | "ai_chat" | "none";
+type ScanResult = { turns: LegacyTurn[]; bytes: number; source: Exclude<LegacySource, "v2" | null> };
+type ScanBudget = {
+  rows: number; bytes: number; tokens: number; nodes: number;
+  entries: number; strings: number; stringCodeUnits: number;
 };
+type PiTurn = {
+  id: string; userContent: string; userDisplay: string; createdAt: number;
+  updatedAt: number; assistantParts: string[];
+  pendingCalls: Map<string, string>; terminal: boolean;
+};
+type AiMessage = { role: "user" | "assistant"; id: string; text: string;
+  createdAt: number; completion: "explicit" | "boundary" | null;
+  followup: boolean; steerIds: string[] };
 type PiCompaction = { firstKeptIndex: number; summary: string | null };
-type ScanBudget = { rows: number; bytes: number };
-type ParsedUiMessage = {
-  role: "user" | "assistant";
-  id: string;
-  text: string;
-  complete: boolean;
-  explicitlyCompleted: boolean;
-  sentDuringStreaming: boolean;
-  createdAt: number;
-  piCoreMessageKey: string | null;
-  steerMessageIds: string[];
-};
-interface TurnBuilder {
-  id: string;
-  userSegments: string[];
-  userBytes: number;
-  displaySegments: DisplaySegment[];
-  createdAt: number;
-  updatedAt: number;
-  assistantParts: string[];
-  pendingCalls: Map<string, string>;
-  answeredCalls: Set<string>;
-  sawAssistant: boolean;
-  hasTerminalAssistant: boolean;
-  invalid: boolean;
-}
 class LegacyMigrationError extends Error {
-  constructor(readonly code: string) {
-    super(code);
-    this.name = "LegacyMigrationError";
-  }
+  constructor(readonly code: string) { super(code); this.name = "LegacyMigrationError"; }
 }
-
 class StaleLegacyMigrationAttempt extends Error {}
-
 const MIGRATION_TABLE = "chat_legacy_migration_v2";
 const PI_TABLE = "pi_core_messages";
 const PI_COMPACTION_TABLE = "pi_core_compaction";
@@ -101,40 +50,68 @@ const AI_CHAT_TABLE = "cf_ai_chat_agent_messages";
 const AI_CHAT_META_TABLE = "cf_ai_chat_render_history_meta";
 const EMPTY_CHECKPOINT_JSON =
   '{"version":1,"providerCalls":0,"providerInFlight":false,"batches":[],"final":null}';
-const encoder = new TextEncoder();
-const byteLength = (value: string) => encoder.encode(value).byteLength;
-const isPositiveNumber = (value: unknown): value is number =>
-  typeof value === "number" && Number.isFinite(value) && value > 0;
-const nonnegativeInteger = (value: unknown) =>
-  Math.max(0, Math.floor(Number(value) || 0));
 const FOLLOWUP_SEPARATOR = "\n\n[Follow-up]\n";
-const FOLLOWUP_SEPARATOR_BYTES = byteLength(FOLLOWUP_SEPARATOR);
+const byteLength = utf8ByteLength;
 const yieldToTransport = () =>
   new Promise<void>((resolve) => setTimeout(resolve, 0));
+const JSON_ROW_LIMITS = Object.freeze({
+  depth: 32, tokens: 65_536, nodes: 16_384, entries: 16_384, strings: 8_192,
+  stringCodeUnits: CHAT_RUNTIME_BOUNDS.legacyMigrationRowBytes,
+});
+const JSON_SCAN_LIMITS = Object.freeze({
+  tokens: 262_144, nodes: 65_536, entries: 65_536, strings: 32_768,
+  stringCodeUnits: CHAT_RUNTIME_BOUNDS.legacyMigrationBytes,
+});
+const recordOf = (value: unknown): Record<string, unknown> | null =>
+  value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+const boundedInteger = (value: unknown): number =>
+  Math.max(0, Math.floor(Number(value) || 0));
 const finiteTime = (value: unknown, fallback = 0): number => {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return Math.max(0, Math.floor(value));
-  }
+  if (typeof value === "number" && Number.isFinite(value)) return boundedInteger(value);
   if (typeof value === "string" && value) {
     const parsed = Date.parse(value.endsWith("Z") ? value : `${value}Z`);
-    if (Number.isFinite(parsed)) return Math.max(0, Math.floor(parsed));
+    if (Number.isFinite(parsed)) return boundedInteger(parsed);
   }
-  return Math.max(0, Math.floor(fallback));
+  return boundedInteger(fallback);
 };
-const recordOf = (value: unknown): Record<string, unknown> | null =>
-  value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-
-function renderMessageId(message: Record<string, unknown>): string | null {
-  const value =
-    recordOf(message.uiMetadata)?.renderMessageId ??
-    recordOf(message.metadata)?.renderMessageId;
-  if (typeof value !== "string") return null;
-  const normalized = value.trim();
-  return normalized && normalized.length <= CHAT_RUNTIME_BOUNDS.identifierChars
-    ? normalized
-    : null;
+function tableExists(sql: SqlStorage, name: string): boolean {
+  return Boolean(sql.exec<{ present: number }>(
+        `SELECT EXISTS(
+           SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?
+         ) AS present`,
+        name,
+      ).one().present);
+}
+function hasCompleteAiChatChronology(sql: SqlStorage): boolean {
+  if (!tableExists(sql, AI_CHAT_META_TABLE)) return false;
+  return Boolean(sql.exec<{ ready: number }>(
+        `SELECT EXISTS(SELECT 1 FROM ${AI_CHAT_META_TABLE}
+          WHERE key = 'metadata_v1' AND value = 1) AND EXISTS(
+          SELECT 1 FROM sqlite_master WHERE type = 'index'
+            AND name = 'cf_ai_chat_agent_messages_chronology') AS ready`,
+      ).one().ready);
+}
+function unseenStatus(): LegacyMigrationStatus {
+  return {
+    state: "unseen", attemptCount: 0, attemptToken: null, deadlineAt: null,
+    importedTurns: 0, importedBytes: 0, source: null, error: null, changed: false,
+  };
+}
+function statusFromRow(row: MigrationRow, changed = false): LegacyMigrationStatus {
+  return {
+    state: row.state, attemptCount: Number(row.attempt_count),
+    attemptToken: row.attempt_token, deadlineAt: Number(row.deadline_at),
+    importedTurns: Number(row.imported_turns), importedBytes: Number(row.imported_bytes),
+    source: row.source, error: row.error, changed,
+  };
+}
+function migrationRow(sql: SqlStorage): MigrationRow | null {
+  if (!tableExists(sql, MIGRATION_TABLE)) return null;
+  return sql.exec<MigrationRow>(
+        `SELECT state, attempt_count, attempt_token, deadline_at,
+                imported_turns, imported_bytes, source, error
+           FROM ${MIGRATION_TABLE} WHERE singleton = 1`,
+      ).toArray()[0] ?? null;
 }
 function isStreamingFollowup(message: Record<string, unknown>): boolean {
   return (
@@ -143,335 +120,204 @@ function isStreamingFollowup(message: Record<string, unknown>): boolean {
     recordOf(message.uiMetadata)?.sentDuringStreaming === true
   );
 }
-const combinedSegments = (segments: readonly string[]) =>
-  segments.join(FOLLOWUP_SEPARATOR);
-
-function appendFollowup(
-  segments: string[],
-  currentBytes: number,
-  content: string,
-): number {
-  const next = currentBytes + FOLLOWUP_SEPARATOR_BYTES + byteLength(content);
-  if (next > CHAT_RUNTIME_BOUNDS.requestBytes) {
-    throw new LegacyMigrationError("legacy_user_message_too_large");
-  }
-  segments.push(content);
-  return next;
-}
-
-function tableExists(sql: SqlStorage, name: string): boolean {
-  return Boolean(
-    sql
-      .exec<{ present: number }>(
-        `SELECT EXISTS(
-           SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?
-         ) AS present`,
-        name,
-      )
-      .one().present,
-  );
-}
-
-function hasCompleteAiChatChronology(sql: SqlStorage): boolean {
-  if (!tableExists(sql, AI_CHAT_META_TABLE)) return false;
-  return Boolean(
-    sql
-      .exec<{ ready: number }>(
-        `SELECT EXISTS(SELECT 1 FROM ${AI_CHAT_META_TABLE}
-          WHERE key = 'metadata_v1' AND value = 1) AND EXISTS(
-          SELECT 1 FROM sqlite_master WHERE type = 'index'
-            AND name = 'cf_ai_chat_agent_messages_chronology') AS ready`,
-      )
-      .one().ready,
-  );
-}
-
-function unseenStatus(): LegacyMigrationStatus {
-  return {
-    state: "unseen",
-    attemptCount: 0,
-    attemptToken: null,
-    deadlineAt: null,
-    importedTurns: 0,
-    importedBytes: 0,
-    source: null,
-    error: null,
-    changed: false,
-  };
-}
-
-function statusFromRow(
-  row: MigrationRow,
-  changed = false,
-): LegacyMigrationStatus {
-  return {
-    state: row.state,
-    attemptCount: Number(row.attempt_count),
-    attemptToken: row.attempt_token,
-    deadlineAt: Number(row.deadline_at),
-    importedTurns: Number(row.imported_turns),
-    importedBytes: Number(row.imported_bytes),
-    source: row.source,
-    error: row.error,
-    changed,
-  };
-}
-
-function migrationRow(sql: SqlStorage): MigrationRow | null {
-  if (!tableExists(sql, MIGRATION_TABLE)) return null;
-  return (
-    sql
-      .exec<MigrationRow>(
-        `SELECT state, attempt_count, attempt_token, deadline_at,
-              imported_turns, imported_bytes, source, error
-         FROM ${MIGRATION_TABLE} WHERE singleton = 1`,
-      )
-      .toArray()[0] ?? null
-  );
-}
-
 function textContent(value: unknown): string {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return "";
   const text: string[] = [];
-  for (const raw of value) {
-    const part = recordOf(raw);
-    if (!part) continue;
-    if (typeof part.text === "string") text.push(part.text);
-    else if (part.type === "image") text.push("[image]");
+  for (const item of value) {
+    const part = recordOf(item);
+    if (typeof part?.text === "string") text.push(part.text);
+    else if (part?.type === "image") text.push("[image]");
   }
   return text.join("\n");
 }
-
-function piToolCalls(content: unknown): Array<{ id: string; name: string }> {
+function parsePayload(
+  json: string,
+  budget: ScanBudget,
+): Record<string, unknown> | null {
+  const reserved = {
+    tokens: Math.min(JSON_ROW_LIMITS.tokens, budget.tokens),
+    nodes: Math.min(JSON_ROW_LIMITS.nodes, budget.nodes),
+    entries: Math.min(JSON_ROW_LIMITS.entries, budget.entries),
+    strings: Math.min(JSON_ROW_LIMITS.strings, budget.strings),
+    stringCodeUnits: Math.min(
+      JSON_ROW_LIMITS.stringCodeUnits,
+      budget.stringCodeUnits,
+    ),
+  };
+  try {
+    const stats = preflightJson(json, {
+      maxDepth: JSON_ROW_LIMITS.depth,
+      maxTokens: reserved.tokens,
+      maxNodes: reserved.nodes,
+      maxEntries: reserved.entries,
+      maxStrings: reserved.strings,
+      maxStringCodeUnits: reserved.stringCodeUnits,
+    });
+    budget.tokens -= stats.tokens;
+    budget.nodes -= stats.nodes;
+    budget.entries -= stats.entries;
+    budget.strings -= stats.strings;
+    budget.stringCodeUnits -= stats.stringCodeUnits;
+    return recordOf(JSON.parse(json) as unknown);
+  } catch {
+    // A failed lexical pass cannot charge any dimension more than the input
+    // length before stopping. Conservatively account for that work so short
+    // corrupt rows do not hide all older history.
+    budget.tokens -= Math.min(reserved.tokens, json.length);
+    budget.nodes -= Math.min(reserved.nodes, json.length);
+    budget.entries -= Math.min(reserved.entries, json.length);
+    budget.strings -= Math.min(reserved.strings, json.length);
+    budget.stringCodeUnits -= Math.min(reserved.stringCodeUnits, json.length);
+    return null;
+  }
+}
+function parseToolCalls(
+  content: unknown,
+): Array<{ id: string; name: string }> | null {
   if (!Array.isArray(content)) return [];
   const calls: Array<{ id: string; name: string }> = [];
-  for (const raw of content) {
-    const part = recordOf(raw);
+  const ids = new Set<string>();
+  for (const item of content) {
+    const part = recordOf(item);
     if (!part || (part.type !== "toolCall" && part.type !== "tool_use")) {
       continue;
     }
-    const id =
-      typeof part.id === "string"
-        ? part.id.trim()
-        : typeof part.toolCallId === "string"
-          ? part.toolCallId.trim()
-          : "";
-    const name =
-      typeof part.name === "string"
-        ? part.name.trim()
-        : typeof part.toolName === "string"
-          ? part.toolName.trim()
-          : "";
+    const id = String(part.id ?? part.toolCallId ?? "").trim();
+    const name = String(part.name ?? part.toolName ?? "").trim();
     if (
       !id ||
       !name ||
       id.length > CHAT_RUNTIME_BOUNDS.identifierChars ||
-      name.length > CHAT_RUNTIME_BOUNDS.identifierChars
+      name.length > CHAT_RUNTIME_BOUNDS.identifierChars ||
+      ids.has(id) ||
+      calls.length >= CHAT_RUNTIME_BOUNDS.toolCallsPerTurn
     ) {
-      throw new LegacyMigrationError("malformed_tool_call");
+      return null;
     }
+    ids.add(id);
     calls.push({ id, name });
   }
   return calls;
 }
-
-function newBuilder(
-  row: LegacyRow,
-  message: Record<string, unknown>,
-): TurnBuilder {
-  const userContent = textContent(message.content);
-  if (!userContent) throw new LegacyMigrationError("malformed_user_message");
-  if (byteLength(userContent) > CHAT_RUNTIME_BOUNDS.requestBytes) {
-    throw new LegacyMigrationError("legacy_user_message_too_large");
-  }
-  const timestamp = finiteTime(message.timestamp, row.createdAt);
-  return {
-    id: `legacy:pi:${row.key}`,
-    userSegments: [userContent],
-    userBytes: byteLength(userContent),
-    displaySegments: [
-      {
-        fallback: parseMessageAuthor(userContent).content,
-        renderMessageId: renderMessageId(message),
-        piCoreMessageKey: String(timestamp),
-      },
-    ],
-    createdAt: timestamp,
-    updatedAt: timestamp,
-    assistantParts: [],
-    pendingCalls: new Map(),
-    answeredCalls: new Set(),
-    sawAssistant: false,
-    hasTerminalAssistant: false,
-    invalid: false,
-  };
-}
-
-function settleBuilder(builder: TurnBuilder | null): LegacyTurn | null {
-  if (
-    !builder ||
-    builder.invalid ||
-    !builder.sawAssistant ||
-    !builder.hasTerminalAssistant ||
-    builder.pendingCalls.size !== 0
-  ) {
+function settlePi(builder: PiTurn | null): LegacyTurn | null {
+  if (!builder || !builder.terminal || builder.pendingCalls.size !== 0) {
     return null;
   }
   const assistantFinal = builder.assistantParts.filter(Boolean).join("\n\n");
-  if (!assistantFinal) return null;
-  if (byteLength(assistantFinal) > CHAT_RUNTIME_BOUNDS.assistantBytes) {
-    throw new LegacyMigrationError("legacy_assistant_message_too_large");
+  if (
+    !assistantFinal ||
+    byteLength(assistantFinal) > CHAT_RUNTIME_BOUNDS.assistantBytes
+  ) {
+    return null;
   }
   return {
     id: builder.id,
-    userContent: combinedSegments(builder.userSegments),
-    userDisplay: combinedSegments(
-      builder.displaySegments.map((segment) => segment.fallback),
-    ),
+    userContent: builder.userContent,
+    userDisplay: builder.userDisplay,
     assistantFinal,
     createdAt: builder.createdAt,
-    updatedAt: Math.max(builder.createdAt, builder.updatedAt),
-    displaySegments: builder.displaySegments,
+    updatedAt: builder.updatedAt,
   };
 }
-
 function parsePiTurns(
   rows: readonly LegacyRow[],
   checkDeadline: () => void,
 ): LegacyTurn[] {
   const turns: LegacyTurn[] = [];
-  let builder: TurnBuilder | null = null;
+  let builder: PiTurn | null = null;
+  const settle = () => {
+    const turn = settlePi(builder);
+    if (turn) turns.push(turn);
+    builder = null;
+  };
   for (const row of rows) {
     checkDeadline();
-    let message: Record<string, unknown>;
-    try {
-      message = recordOf(JSON.parse(row.payload)) ?? {};
-    } catch {
-      throw new LegacyMigrationError("malformed_pi_core_json");
+    const message = row.payload;
+    if (!message || !message.role) {
+      settle();
+      continue;
     }
-    if (!message.role || message.visibility === "hidden") continue;
+    if (message.visibility === "hidden") continue;
     if (message.role === "user") {
-      if (isStreamingFollowup(message)) {
-        // A bounded read can begin mid-turn; never promote its orphaned steer.
+      const followup = isStreamingFollowup(message);
+      if (!followup) settle();
+      const content = textContent(message.content);
+      if (!content || byteLength(content) > CHAT_RUNTIME_BOUNDS.requestBytes)
+        { if (followup) builder = null; continue; }
+      if (followup) {
         if (!builder) continue;
-        const followup = textContent(message.content);
-        if (!followup) {
-          builder.invalid = true;
-          continue;
-        }
-        const timestamp = finiteTime(message.timestamp, row.createdAt);
-        builder.userBytes = appendFollowup(
-          builder.userSegments,
-          builder.userBytes,
-          followup,
-        );
-        builder.displaySegments.push({
-          fallback: parseMessageAuthor(followup).content,
-          renderMessageId: renderMessageId(message),
-          piCoreMessageKey: String(timestamp),
-        });
-        builder.hasTerminalAssistant = false;
-        builder.updatedAt = Math.max(builder.updatedAt, timestamp);
+        const combined = `${builder.userContent}${FOLLOWUP_SEPARATOR}${content}`;
+        if (byteLength(combined) > CHAT_RUNTIME_BOUNDS.requestBytes)
+          { builder = null; continue; }
+        builder.userContent = combined;
+        builder.userDisplay += `${FOLLOWUP_SEPARATOR}${parseMessageAuthor(content).content}`;
+        builder.updatedAt = Math.max(builder.updatedAt, finiteTime(message.timestamp, row.createdAt));
+        builder.terminal = false;
         continue;
       }
-      const settled = settleBuilder(builder);
-      if (settled) turns.push(settled);
-      builder = newBuilder(row, message);
+      const createdAt = finiteTime(message.timestamp, row.createdAt);
+      builder = { id: `legacy:pi:${row.key}`, userContent: content,
+        userDisplay: parseMessageAuthor(content).content,
+        createdAt, updatedAt: createdAt, assistantParts: [],
+        pendingCalls: new Map(), terminal: false,
+      };
       continue;
     }
     if (!builder) continue;
-    const timestamp = finiteTime(message.timestamp, row.createdAt);
-    builder.updatedAt = Math.max(builder.updatedAt, timestamp);
+    builder.updatedAt = Math.max(
+      builder.updatedAt,
+      finiteTime(message.timestamp, row.createdAt),
+    );
     if (message.role === "assistant") {
-      if (message.stopReason === "aborted" || message.stopReason === "error") {
-        builder.sawAssistant = true;
-        builder.hasTerminalAssistant = false;
+      if (
+        message.stopReason === "aborted" ||
+        message.stopReason === "error" ||
+        builder.pendingCalls.size > 0
+      ) {
+        builder = null;
         continue;
       }
-      if (builder.pendingCalls.size > 0) {
-        builder.invalid = true;
-        continue;
-      }
-      let calls: Array<{ id: string; name: string }>;
-      try {
-        calls = piToolCalls(message.content);
-      } catch {
-        builder.invalid = true;
-        continue;
-      }
-      const ids = new Set<string>();
-      for (const call of calls) {
-        checkDeadline();
-        if (ids.has(call.id) || builder.answeredCalls.has(call.id)) {
-          builder.invalid = true;
-          break;
-        }
-        ids.add(call.id);
-        builder.pendingCalls.set(call.id, call.name);
-      }
+      const calls = parseToolCalls(message.content);
+      if (!calls) { builder = null; continue; }
+      for (const call of calls) builder.pendingCalls.set(call.id, call.name);
       const text = textContent(message.content);
       if (text) builder.assistantParts.push(text);
-      builder.sawAssistant = true;
-      builder.hasTerminalAssistant = calls.length === 0 && Boolean(text);
+      builder.terminal = calls.length === 0 && Boolean(text);
       continue;
     }
     if (message.role === "toolResult") {
-      const id =
-        typeof message.toolCallId === "string"
-          ? message.toolCallId.trim()
-          : typeof message.tool_use_id === "string"
-            ? message.tool_use_id.trim()
-            : "";
+      const id = String(message.toolCallId ?? message.tool_use_id ?? "").trim();
       const expectedName = builder.pendingCalls.get(id);
       const actualName =
         typeof message.toolName === "string" ? message.toolName.trim() : "";
-      if (
-        !id ||
-        !expectedName ||
-        builder.answeredCalls.has(id) ||
-        (actualName && actualName !== expectedName)
-      ) {
-        builder.invalid = true;
+      if (!id || !expectedName || (actualName && actualName !== expectedName)) {
+        builder = null;
         continue;
       }
       builder.pendingCalls.delete(id);
-      builder.answeredCalls.add(id);
-      builder.hasTerminalAssistant = false;
+      builder.terminal = false;
       continue;
     }
-    builder.invalid = true;
+    builder = null;
   }
-  const settled = settleBuilder(builder);
-  if (settled) turns.push(settled);
+  settle();
   return turns;
 }
-
-function parsedUiMessage(
+function parseAiMessage(
   row: LegacyRow,
   checkDeadline: () => void,
-): ParsedUiMessage | null {
-  let message: Record<string, unknown>;
-  try {
-    message = recordOf(JSON.parse(row.payload)) ?? {};
-  } catch {
-    throw new LegacyMigrationError("malformed_ai_chat_json");
+): AiMessage | null {
+  const message = row.payload;
+  if (!message || (message.role !== "user" && message.role !== "assistant")) {
+    return null;
   }
-  if (message.role !== "user" && message.role !== "assistant") return null;
-  if (!Array.isArray(message.parts)) {
-    throw new LegacyMigrationError("malformed_ai_chat_message");
-  }
-  const text: string[] = [];
-  const toolIds = new Set<string>();
-  const steerMessageIds: string[] = [];
-  let complete = true;
+  if (!Array.isArray(message.parts)) return null;
+  const text: string[] = [], toolIds = new Set<string>(), steerIds: string[] = [];
   for (const raw of message.parts) {
     checkDeadline();
     const part = recordOf(raw);
-    if (!part || typeof part.type !== "string") {
-      complete = false;
-      continue;
-    }
+    if (!part || typeof part.type !== "string") return null;
     if (part.type === "text") {
       if (typeof part.text === "string" && part.text) text.push(part.text);
       if (
@@ -479,202 +325,132 @@ function parsedUiMessage(
         part.state !== "done" &&
         part.state !== "output-available"
       ) {
-        complete = false;
+        return null;
       }
       continue;
     }
     if (part.type === "reasoning") {
-      if (part.state !== undefined && part.state !== "done") complete = false;
+      if (part.state !== undefined && part.state !== "done") return null;
       continue;
     }
     if (part.type.startsWith("tool-") || part.type === "dynamic-tool") {
       const id =
         typeof part.toolCallId === "string" ? part.toolCallId.trim() : "";
-      if (
-        !id ||
-        id.length > CHAT_RUNTIME_BOUNDS.identifierChars ||
-        toolIds.has(id) ||
-        (part.state !== "output-available" && part.state !== "output-error")
-      ) {
-        complete = false;
-      }
+      if (!id || id.length > CHAT_RUNTIME_BOUNDS.identifierChars ||
+        toolIds.has(id) || toolIds.size >= CHAT_RUNTIME_BOUNDS.toolCallsPerTurn ||
+        (part.state !== "output-available" && part.state !== "output-error")) return null;
       toolIds.add(id);
       continue;
     }
-    if (part.type === "data-pi-user-stop") {
-      complete = false;
-      continue;
-    }
-    if (part.type === "data-pi-turn-notice") {
-      const data = recordOf(part.data);
-      if (typeof data?.text === "string" && data.text) text.push(data.text);
-      continue;
-    }
-    if (part.type === "data-pi-error") {
-      complete = false;
-      continue;
-    }
     if (part.type === "data-pi-steer-marker") {
-      const value = recordOf(part.data)?.steerMessageId;
-      const id = typeof value === "string" ? value.trim() : "";
-      if (
-        !id ||
-        id.length > CHAT_RUNTIME_BOUNDS.identifierChars ||
-        steerMessageIds.includes(id)
-      ) {
-        complete = false;
-      } else {
-        steerMessageIds.push(id);
-      }
+      const id = String(recordOf(part.data)?.steerMessageId ?? "").trim();
+      if (!id || id.length > CHAT_RUNTIME_BOUNDS.identifierChars || steerIds.includes(id))
+        return null;
+      steerIds.push(id);
       continue;
     }
-    if (part.type === "step-start" || part.type.startsWith("data-pi-")) {
-      continue;
-    }
-    complete = false;
+    if (part.type !== "step-start") return null;
   }
-  const id =
-    typeof message.id === "string" && message.id.trim()
-      ? message.id.trim()
-      : row.id;
-  const metadata = recordOf(message.metadata);
-  const pi = recordOf(metadata?.pi);
-  const explicitlyCompleted = isPositiveNumber(pi?.completedAtMs);
+  const joined = text.join("\n");
+  const limit = message.role === "user" ? CHAT_RUNTIME_BOUNDS.requestBytes
+    : CHAT_RUNTIME_BOUNDS.assistantBytes;
+  if (!joined || byteLength(joined) > limit) return null;
+  const pi = recordOf(recordOf(message.metadata)?.pi);
+  const completion =
+    message.role === "user" ||
+    (typeof pi?.completedAtMs === "number" && pi.completedAtMs > 0)
+      ? "explicit"
+      : typeof pi?.createdAtMs === "number" && pi.createdAtMs > 0
+        ? "boundary"
+        : null;
+  const rawId = typeof message.id === "string" && message.id.trim()
+    ? message.id.trim() : row.id;
   return {
     role: message.role,
-    id,
-    text: text.join("\n"),
-    complete:
-      complete &&
-      (message.role === "user" ||
-        explicitlyCompleted ||
-        isPositiveNumber(pi?.createdAtMs)),
-    explicitlyCompleted: message.role === "user" || explicitlyCompleted,
-    sentDuringStreaming: isStreamingFollowup(message),
+    id: rawId,
+    text: joined,
     createdAt: finiteTime(pi?.createdAtMs ?? pi?.completedAtMs, row.createdAt),
-    piCoreMessageKey:
-      typeof metadata?.piCoreMessageKey === "string"
-        ? metadata.piCoreMessageKey
-        : null,
-    steerMessageIds,
+    completion,
+    followup: isStreamingFollowup(message),
+    steerIds,
   };
 }
-
-function parseAiChatTurns(
+function parseAiTurns(
   rows: readonly LegacyRow[],
   checkDeadline: () => void,
 ): LegacyTurn[] {
-  const messages: ParsedUiMessage[] = [];
-  for (const row of rows) {
-    checkDeadline();
-    const message = parsedUiMessage(row, checkDeadline);
-    if (message) messages.push(message);
-  }
-  const steering = new Map<string, ParsedUiMessage | null>();
-  const markedSteers = new Set<string>();
+  const messages = rows.map((row) => parseAiMessage(row, checkDeadline));
+  const followups = new Map<string, AiMessage | null>();
+  const marked = new Set<string>();
   for (const message of messages) {
-    if (message.role === "user" && message.sentDuringStreaming) {
-      steering.set(message.id, steering.has(message.id) ? null : message);
-    }
-    for (const id of message.steerMessageIds) markedSteers.add(id);
+    if (!message) continue;
+    if (message.role === "user" && message.followup)
+      followups.set(message.id, followups.has(message.id) ? null : message);
+    for (const id of message.steerIds) marked.add(id);
   }
   const turns: LegacyTurn[] = [];
-  let user: {
-    id: string;
-    segments: string[];
-    bytes: number;
-    createdAt: number;
-    complete: boolean;
-  } | null = null;
-  let assistantParts: string[] = [];
-  let assistantAt = 0;
-  let assistantComplete = false;
-  let assistantExplicitlyCompleted = false;
-  let sawAssistant = false;
-  const claimedSteers = new Set<string>();
-  const settle = (laterUserBoundary: boolean) => {
-    if (!user || !user.complete || !sawAssistant || !assistantComplete) return;
-    if (!assistantExplicitlyCompleted && !laterUserBoundary) return;
-    const userContent = combinedSegments(user.segments);
-    const assistantFinal = assistantParts.filter(Boolean).join("\n\n");
-    if (!assistantFinal) return;
-    if (byteLength(assistantFinal) > CHAT_RUNTIME_BOUNDS.assistantBytes) {
-      throw new LegacyMigrationError("legacy_assistant_message_too_large");
-    }
-    turns.push({
-      id: `legacy:ai:${user.id.slice(0, 220)}`,
-      userContent,
-      userDisplay: userContent,
-      assistantFinal,
-      createdAt: user.createdAt,
-      updatedAt: Math.max(user.createdAt, assistantAt),
-    });
+  let user: AiMessage | null = null;
+  let assistantParts: string[] = [], assistantBytes = 0, assistantAt = 0;
+  let completion: AiMessage["completion"] = null;
+  let assistantValid = true;
+  const append = (text: string) => {
+    if (!user) return false;
+    const combined = `${user.text}${FOLLOWUP_SEPARATOR}${text}`;
+    if (byteLength(combined) > CHAT_RUNTIME_BOUNDS.requestBytes) return false;
+    user = { ...user, text: combined }; completion = null; return true;
   };
+  const settle = (laterUser: boolean) => {
+    const assistantFinal = assistantParts.filter(Boolean).join("\n\n");
+    if (user && assistantFinal && (completion === "explicit" || (laterUser && completion === "boundary"))) {
+      turns.push({ id: `legacy:ai:${user.id.slice(0, CHAT_RUNTIME_BOUNDS.identifierChars - 10)}`,
+        userContent: user.text, userDisplay: user.text, assistantFinal,
+        createdAt: user.createdAt,
+        updatedAt: Math.max(user.createdAt, assistantAt),
+      });
+    }
+    user = null; assistantParts = []; assistantBytes = assistantAt = 0;
+    completion = null; assistantValid = true;
+  };
+  const claimed = new Set<string>();
   for (const message of messages) {
     checkDeadline();
+    if (!message) { settle(false); continue; }
     if (message.role === "user") {
-      if (markedSteers.has(message.id)) continue;
-      if (message.sentDuringStreaming) {
-        // Discard a leading follow-up when the bounded read omitted its base.
-        if (!user) continue;
-        user.bytes = appendFollowup(user.segments, user.bytes, message.text);
-        user.complete &&= message.complete;
-        assistantComplete = false;
-        assistantExplicitlyCompleted = false;
+      if (message.followup) {
+        if (!marked.has(message.id) && !append(message.text)) settle(false);
         continue;
       }
-      settle(true);
-      const userBytes = byteLength(message.text);
-      if (userBytes > CHAT_RUNTIME_BOUNDS.requestBytes) {
-        throw new LegacyMigrationError("legacy_user_message_too_large");
-      }
-      user = {
-        id: message.id,
-        segments: [message.text],
-        bytes: userBytes,
-        createdAt: message.createdAt,
-        complete: message.complete && Boolean(message.text),
-      };
-      assistantParts = [];
-      assistantAt = 0;
-      assistantComplete = false;
-      assistantExplicitlyCompleted = false;
-      sawAssistant = false;
-      continue;
+      settle(true); user = message; continue;
     }
     if (!user) continue;
-    let messageComplete = message.complete;
-    for (const id of message.steerMessageIds) {
-      const steer = steering.get(id);
-      if (!steer || !steer.complete || !steer.text || claimedSteers.has(id)) {
-        messageComplete = false;
-        continue;
-      }
-      user.bytes = appendFollowup(user.segments, user.bytes, steer.text);
-      assistantAt = Math.max(assistantAt, steer.createdAt);
-      claimedSteers.add(id);
+    let valid: boolean = assistantValid && Boolean(message.completion);
+    for (const id of message.steerIds) {
+      const steer = followups.get(id);
+      if (!steer || claimed.has(id) || !append(steer.text)) valid = false;
+      else claimed.add(id);
     }
-    assistantParts.push(message.text);
+    const nextBytes = assistantBytes + (assistantParts.length ? 2 : 0) +
+      byteLength(message.text);
+    if (nextBytes <= CHAT_RUNTIME_BOUNDS.assistantBytes) {
+      assistantParts.push(message.text);
+      assistantBytes = nextBytes;
+    } else valid = false;
+    assistantValid = valid;
     assistantAt = Math.max(assistantAt, message.createdAt);
-    assistantComplete = sawAssistant
-      ? assistantComplete && messageComplete
-      : messageComplete;
-    assistantExplicitlyCompleted = message.explicitlyCompleted;
-    sawAssistant = true;
+    completion = valid ? message.completion : null;
   }
   settle(false);
   return turns;
 }
-
-function boundedSelection(
+function selectNewest(
   turns: readonly LegacyTurn[],
   checkDeadline: () => void,
 ): Omit<ScanResult, "source"> {
-  const newest: LegacyTurn[] = [];
+  const selected: LegacyTurn[] = [];
   let bytes = 0;
   for (let index = turns.length - 1; index >= 0; index -= 1) {
     checkDeadline();
-    if (newest.length >= CHAT_RUNTIME_BOUNDS.historyTurns) break;
+    if (selected.length >= CHAT_RUNTIME_BOUNDS.historyTurns) break;
     const turn = turns[index];
     const turnBytes = byteLength(
       JSON.stringify({
@@ -683,109 +459,103 @@ function boundedSelection(
         assistant: turn.assistantFinal,
       }),
     );
-    if (turnBytes > CHAT_RUNTIME_BOUNDS.historyBytes) {
-      throw new LegacyMigrationError("legacy_turn_too_large");
-    }
-    if (bytes + turnBytes > CHAT_RUNTIME_BOUNDS.historyBytes) break;
-    newest.unshift(turn);
+    if (turnBytes > CHAT_RUNTIME_BOUNDS.legacyMigrationBytes) continue;
+    if (bytes + turnBytes > CHAT_RUNTIME_BOUNDS.legacyMigrationBytes) break;
+    selected.unshift(turn);
     bytes += turnBytes;
   }
-  return { turns: newest, bytes };
+  return { turns: selected, bytes };
 }
-
 export class LegacySessionMigrator {
   private readonly sql: SqlStorage;
-
   constructor(
     private readonly storage: DurableObjectStorage,
     private readonly now: () => number = Date.now,
   ) {
     this.sql = storage.sql;
   }
-
   status(): LegacyMigrationStatus {
     const row = migrationRow(this.sql);
     return row ? statusFromRow(row) : unseenStatus();
   }
-
-  claimBlocked(): boolean {
-    return legacyMigrationBlocksClaim(this.sql);
-  }
-
+  claimBlocked(): boolean { return legacyMigrationBlocksClaim(this.sql); }
   nextAlarmAt(now = this.now()): number | null {
     const status = this.status();
     if (status.state !== "pending" || status.deadlineAt === null) return null;
-    return Math.min(
-      status.deadlineAt,
-      Math.max(0, Math.floor(now)) + CHAT_RUNTIME_BOUNDS.legacyMigrationRetryMs,
-    );
+    return Math.min(status.deadlineAt,
+      boundedInteger(now) + CHAT_RUNTIME_BOUNDS.legacyMigrationRetryMs);
   }
-
   requestAfterOpen(scope: LegacyMigrationScope, at: number): LegacyMigrationStatus {
-    const now = Math.max(0, Math.floor(at));
-    if (
-      [scope.threadId, scope.workspaceId, scope.orgId].some(
-        (value) => !value || value.length > CHAT_RUNTIME_BOUNDS.identifierChars,
-      ) || !tableExists(this.sql, "chat_runtime_v2")
-    ) return this.status();
+    const ids = [scope.threadId, scope.workspaceId, scope.orgId];
+    if (ids.some((id) => !id || id.length > CHAT_RUNTIME_BOUNDS.identifierChars) ||
+      !tableExists(this.sql, "chat_runtime_v2")) return this.status();
     this.ensureTable();
+    const now = boundedInteger(at);
     return this.storage.transactionSync(() => {
       const existing = migrationRow(this.sql);
       if (existing) return statusFromRow(existing);
-      const runtime = this.sql.exec<{ thread_id: string | null;
-        workspace_id: string | null; org_id: string | null }>(
-          `SELECT thread_id, workspace_id, org_id FROM chat_runtime_v2 WHERE singleton = 1`,
-        ).one();
-      if (runtime.thread_id &&
-        (runtime.thread_id !== scope.threadId || runtime.workspace_id !== scope.workspaceId ||
-          runtime.org_id !== scope.orgId)) return unseenStatus();
-      this.sql.exec(`UPDATE chat_runtime_v2 SET thread_id = ?, workspace_id = ?, org_id = ?
-        WHERE singleton = 1`, scope.threadId, scope.workspaceId, scope.orgId);
-      this.sql.exec(`INSERT INTO ${MIGRATION_TABLE}
-        (singleton, state, attempt_count, attempt_token, deadline_at,
-         imported_turns, imported_bytes, source, error, started_at, updated_at)
-        VALUES (1, 'pending', 0, NULL, ?, 0, 0, 'none', NULL, ?, ?)`,
-        now + CHAT_RUNTIME_BOUNDS.legacyMigrationDeadlineMs, now, now);
+      const runtime = this.sql
+        .exec<{
+          thread_id: string | null;
+          workspace_id: string | null;
+          org_id: string | null;
+        }>(
+          `SELECT thread_id, workspace_id, org_id
+             FROM chat_runtime_v2 WHERE singleton = 1`,
+        )
+        .toArray()[0];
+      if (!runtime) return unseenStatus();
+      const stored = [runtime.thread_id, runtime.workspace_id, runtime.org_id];
+      if (stored.some((id, index) => id !== null && id !== ids[index])) {
+        return unseenStatus();
+      }
+      this.sql.exec(
+        `UPDATE chat_runtime_v2 SET thread_id = ?, workspace_id = ?, org_id = ?
+          WHERE singleton = 1`,
+        ...ids,
+      );
+      this.sql.exec(
+        `INSERT INTO ${MIGRATION_TABLE}
+          (singleton, state, attempt_count, attempt_token, deadline_at,
+           imported_turns, imported_bytes, source, error, started_at, updated_at)
+         VALUES (1, 'pending', 0, NULL, ?, 0, 0, 'none', NULL, ?, ?)`,
+        now + CHAT_RUNTIME_BOUNDS.legacyMigrationDeadlineMs,
+        now,
+        now,
+      );
+      this.bumpRevision();
       return statusFromRow(migrationRow(this.sql) as MigrationRow, true);
     });
   }
-
-  async runAfterTrigger(
-    at: number,
-    attemptToken: string,
-  ): Promise<LegacyMigrationStatus> {
-    const now = Math.max(0, Math.floor(at));
-    if (
-      !attemptToken ||
-      attemptToken.length > CHAT_RUNTIME_BOUNDS.identifierChars
-    ) {
+  async runAfterTrigger(at: number, attemptToken: string): Promise<LegacyMigrationStatus> {
+    const now = boundedInteger(at);
+    if (!attemptToken || attemptToken.length > CHAT_RUNTIME_BOUNDS.identifierChars)
       return this.status();
-    }
     const existing = migrationRow(this.sql);
     if (existing?.state === "complete" || existing?.state === "failed") {
       return statusFromRow(existing);
     }
-    const hasAdmittedWork = this.hasAdmittedV2Turn(now);
+    const admitted = this.hasAdmittedTurn(now);
     const opened = existing?.state === "pending" && existing.source === "none";
-    if (existing?.state === "pending" && !hasAdmittedWork && !opened) {
-      return this.storage.transactionSync(() => this.failInTransaction(
-        now >= Number(existing.deadline_at)
-          ? "legacy_migration_deadline" : "legacy_migration_admission_missing", now));
-    }
-    if (!hasAdmittedWork && !opened) return unseenStatus();
+    if (!existing && !admitted) return unseenStatus();
     this.ensureTable();
+    if (existing?.state === "pending" && !opened && !admitted) {
+      return this.storage.transactionSync(() =>
+        this.failInTransaction("legacy_migration_admission_missing"),
+      );
+    }
     if (this.hasSettledV2History()) {
-      return existing && Number(existing.attempt_count) > 0
-        ? this.storage.transactionSync(() =>
-            this.failInTransaction("v2_runtime_changed_during_migration", now),
-          )
-        : this.markExistingV2Complete(now, attemptToken);
+      if (existing && Number(existing.attempt_count) > 0) {
+        return this.storage.transactionSync(() =>
+          this.failInTransaction("v2_runtime_changed_during_migration"),
+        );
+      }
+      return this.completeExistingV2(now, attemptToken);
     }
     const claimed = this.claimAttempt(now, attemptToken);
     if (claimed.state !== "pending" || claimed.attemptToken !== attemptToken) {
       return claimed;
     }
-
     try {
       const selection = await this.scanLegacy(
         claimed.deadlineAt as number,
@@ -793,9 +563,7 @@ export class LegacySessionMigrator {
       );
       return this.commit(attemptToken, selection);
     } catch (error) {
-      if (error instanceof StaleLegacyMigrationAttempt) {
-        return this.status();
-      }
+      if (error instanceof StaleLegacyMigrationAttempt) return this.status();
       if (error instanceof LegacyMigrationError) {
         return this.recordAttemptError(
           attemptToken,
@@ -810,8 +578,7 @@ export class LegacySessionMigrator {
       );
     }
   }
-
-  private hasAdmittedV2Turn(now: number): boolean {
+  private hasAdmittedTurn(now: number): boolean {
     if (!tableExists(this.sql, "chat_turns_v2")) return false;
     return Boolean(
       this.sql
@@ -825,8 +592,8 @@ export class LegacySessionMigrator {
         .one().present,
     );
   }
-
   private hasSettledV2History(): boolean {
+    if (!tableExists(this.sql, "chat_turns_v2")) return false;
     return Boolean(
       this.sql
         .exec<{ present: number }>(
@@ -839,7 +606,6 @@ export class LegacySessionMigrator {
         .one().present,
     );
   }
-
   private ensureTable(): void {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS ${MIGRATION_TABLE} (
       singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -857,31 +623,6 @@ export class LegacySessionMigrator {
       updated_at INTEGER NOT NULL
     )`);
   }
-
-  private markExistingV2Complete(
-    now: number,
-    token: string,
-  ): LegacyMigrationStatus {
-    const claimed = this.claimAttempt(now, token);
-    if (claimed.state !== "pending" || claimed.attemptToken !== token) return claimed;
-    return this.storage.transactionSync(() => {
-      const completed = this.sql
-        .exec<MigrationRow>(
-          `UPDATE ${MIGRATION_TABLE}
-              SET state = 'complete', attempt_token = NULL, source = 'v2',
-                  updated_at = ?
-            WHERE singleton = 1 AND state = 'pending' AND attempt_token = ?
-          RETURNING state, attempt_count, attempt_token, deadline_at,
-                    imported_turns, imported_bytes, source, error`,
-          now,
-          token,
-        )
-        .one();
-      this.appendMigrationEvent("CompleteLegacyMigration", now);
-      return statusFromRow(completed, true);
-    });
-  }
-
   private claimAttempt(now: number, token: string): LegacyMigrationStatus {
     return this.storage.transactionSync(() => {
       this.sql.exec(
@@ -895,119 +636,99 @@ export class LegacySessionMigrator {
       );
       const row = migrationRow(this.sql) as MigrationRow;
       if (row.state !== "pending") return statusFromRow(row);
-      if (now >= Number(row.deadline_at)) {
-        return this.failInTransaction("legacy_migration_deadline", now);
-      }
-      if (
-        Number(row.attempt_count) >= CHAT_RUNTIME_BOUNDS.legacyMigrationAttempts
-      ) {
-        return this.failInTransaction(
-          "legacy_migration_attempts_exhausted",
-          now,
-        );
-      }
+      if (now >= Number(row.deadline_at))
+        return this.failInTransaction("legacy_migration_deadline");
+      if (Number(row.attempt_count) >= CHAT_RUNTIME_BOUNDS.legacyMigrationAttempts)
+        return this.failInTransaction("legacy_migration_attempts_exhausted");
       const claimed = this.sql
         .exec<MigrationRow>(
           `UPDATE ${MIGRATION_TABLE}
               SET attempt_count = attempt_count + 1, attempt_token = ?,
-                  error = NULL, updated_at = ?
+                  error = NULL
             WHERE singleton = 1 AND state = 'pending'
               AND attempt_count < ? AND deadline_at > ?
           RETURNING state, attempt_count, attempt_token, deadline_at,
                     imported_turns, imported_bytes, source, error`,
           token,
-          now,
           CHAT_RUNTIME_BOUNDS.legacyMigrationAttempts,
           now,
         )
         .toArray()[0];
-      if (claimed) {
-        this.appendMigrationEvent(
-          Number(row.attempt_count) === 0
-            ? "BeginLegacyMigration"
-            : "RetryLegacyMigration",
-          now,
-        );
-      }
-      return claimed
-        ? statusFromRow(claimed, true)
-        : statusFromRow(migrationRow(this.sql) as MigrationRow);
+      if (!claimed)
+        return statusFromRow(migrationRow(this.sql) as MigrationRow);
+      this.bumpRevision();
+      return statusFromRow(claimed, true);
     });
   }
-
-  private async scanLegacy(
-    deadlineAt: number,
-    attemptToken: string,
-  ): Promise<ScanResult> {
+  private completeExistingV2(now: number, token: string): LegacyMigrationStatus {
+    const claimed = this.claimAttempt(now, token);
+    if (claimed.state !== "pending" || claimed.attemptToken !== token) return claimed;
+    return this.storage.transactionSync(() => {
+      const completed = this.sql
+        .exec<MigrationRow>(
+          `UPDATE ${MIGRATION_TABLE}
+              SET state = 'complete', attempt_token = NULL, source = 'v2',
+                  error = NULL
+            WHERE singleton = 1 AND state = 'pending' AND attempt_token = ?
+          RETURNING state, attempt_count, attempt_token, deadline_at,
+                    imported_turns, imported_bytes, source, error`,
+          token,
+        )
+        .one();
+      this.bumpRevision();
+      return statusFromRow(completed, true);
+    });
+  }
+  private async scanLegacy(deadlineAt: number, token: string): Promise<ScanResult> {
     const budget: ScanBudget = {
       rows: CHAT_RUNTIME_BOUNDS.legacyMigrationScanRows,
-      bytes: CHAT_RUNTIME_BOUNDS.historyBytes,
+      bytes: CHAT_RUNTIME_BOUNDS.legacyMigrationBytes,
+      ...JSON_SCAN_LIMITS,
     };
-    this.assertAttemptOwned(attemptToken, deadlineAt);
+    this.assertOwned(token, deadlineAt);
     if (tableExists(this.sql, PI_TABLE)) {
-      const compaction = this.readPiCompaction(deadlineAt, attemptToken);
-      const rows = await this.readNewestRows(
-        PI_TABLE,
-        deadlineAt,
-        compaction.firstKeptIndex,
-        attemptToken,
-        budget,
-      );
-      const checkDeadline = () => this.assertWithinDeadline(deadlineAt);
-      const turns = boundedSelection(
-        parsePiTurns(rows, checkDeadline),
-        checkDeadline,
-      ).turns;
-      rows.length = 0;
-      if (turns.length > 0) {
-        await this.hydratePiUserDisplays(
-          turns,
-          deadlineAt,
-          attemptToken,
-          budget,
-        );
-        this.prependCompactionSummary(turns, compaction.summary, deadlineAt);
-        return {
-          ...boundedSelection(turns, checkDeadline),
-          source: "pi_core",
-        };
+      const compaction = this.readPiCompaction(deadlineAt, token, budget);
+      const rows = await this.readNewestRows(PI_TABLE, deadlineAt, token,
+        budget, compaction.firstKeptIndex);
+      const check = () => this.assertWithinDeadline(deadlineAt);
+      const turns = parsePiTurns(rows, check);
+      if (turns.length && compaction.summary) {
+        const newest = turns.length - 1;
+        const combined = `[Context Summary]\n\n${compaction.summary}\n\n${turns[newest].userContent}`;
+        if (byteLength(combined) > CHAT_RUNTIME_BOUNDS.requestBytes)
+          throw new LegacyMigrationError("legacy_summary_too_large");
+        turns[newest] = { ...turns[newest], userContent: combined };
       }
-      // A valid watermark makes rows behind it intentionally invisible. Never
-      // resurrect the mirrored pre-compaction transcript from ai-chat.
-      if (compaction.firstKeptIndex > 0) {
+      const selection = selectNewest(turns, check);
+      if (selection.turns.length) return { ...selection, source: "pi_core" };
+      if (compaction.firstKeptIndex > 0)
         return { turns: [], bytes: 0, source: "none" };
-      }
     }
-    this.assertAttemptOwned(attemptToken, deadlineAt);
+    this.assertOwned(token, deadlineAt);
     if (tableExists(this.sql, AI_CHAT_TABLE)) {
       const rows = await this.readNewestRows(
         AI_CHAT_TABLE,
         deadlineAt,
-        0,
-        attemptToken,
+        token,
         budget,
       );
-      const checkDeadline = () => this.assertWithinDeadline(deadlineAt);
-      const selection = boundedSelection(
-        parseAiChatTurns(rows, checkDeadline),
-        checkDeadline,
-      );
+      const check = () => this.assertWithinDeadline(deadlineAt);
+      const selection = selectNewest(parseAiTurns(rows, check), check);
       return {
         ...selection,
-        source: selection.turns.length > 0 ? "ai_chat" : "none",
+        source: selection.turns.length ? "ai_chat" : "none",
       };
     }
     return { turns: [], bytes: 0, source: "none" };
   }
-
   private async readNewestRows(
     table: typeof PI_TABLE | typeof AI_CHAT_TABLE,
     deadlineAt: number,
-    minimumPiIndex: number,
-    attemptToken: string,
+    token: string,
     budget: ScanBudget,
+    minimumPiIndex = 0,
   ): Promise<LegacyRow[]> {
-    const newest: LegacyRow[] = [];
+    const rows: LegacyRow[] = [];
     const usesChronology =
       table === AI_CHAT_TABLE && hasCompleteAiChatChronology(this.sql);
     let numericCursor = Number.MAX_SAFE_INTEGER;
@@ -1016,228 +737,167 @@ export class LegacySessionMigrator {
     while (
       budget.rows > 0 &&
       budget.bytes > 0 &&
+      budget.tokens > 0 &&
+      budget.nodes > 0 &&
+      budget.entries > 0 &&
+      budget.strings > 0 &&
+      budget.stringCodeUnits > 0 &&
       userRows <= CHAT_RUNTIME_BOUNDS.historyTurns
     ) {
-      this.assertAttemptOwned(attemptToken, deadlineAt);
-      const pageRows = Math.min(
+      this.assertOwned(token, deadlineAt);
+      const pageSize = Math.min(
         CHAT_RUNTIME_BOUNDS.legacyMigrationPageRows,
         budget.rows,
       );
-      let metadata: LegacyRowMeta[];
-      if (table === PI_TABLE) {
-        metadata = this.sql
-          .exec<LegacyRowMeta>(
-            `SELECT idx AS key, NULL AS id,
-                    length(CAST(payload AS BLOB)) AS bytes, created_at,
-                    idx AS cursor_key
-               FROM ${PI_TABLE}
-              WHERE idx >= ? AND idx < ?
-              ORDER BY idx DESC LIMIT ?`,
-            minimumPiIndex,
-            numericCursor,
-            pageRows,
-          )
-          .toArray();
-      } else if (usesChronology) {
-        metadata = this.sql
-          .exec<LegacyRowMeta>(
-            `SELECT rowid AS key, id,
-                    length(CAST(message AS BLOB)) AS bytes, created_at,
-                    chronology_key AS cursor_key
-               FROM ${AI_CHAT_TABLE}
-              WHERE chronology_key IS NOT NULL AND chronology_key < ?
-              ORDER BY chronology_key DESC LIMIT ?`,
-            chronologyCursor,
-            pageRows,
-          )
-          .toArray();
-      } else {
-        metadata = this.sql
-          .exec<LegacyRowMeta>(
-            `SELECT rowid AS key, id,
-                    length(CAST(message AS BLOB)) AS bytes, created_at,
-                    rowid AS cursor_key
-               FROM ${AI_CHAT_TABLE}
-              WHERE rowid < ? ORDER BY rowid DESC LIMIT ?`,
-            numericCursor,
-            pageRows,
-          )
-          .toArray();
-      }
-      if (metadata.length === 0) break;
+      const metadata = this.readMetadata(
+        table,
+        pageSize,
+        numericCursor,
+        chronologyCursor,
+        usesChronology,
+        minimumPiIndex,
+      );
+      if (!metadata.length) break;
       budget.rows -= metadata.length;
       for (const meta of metadata) {
         this.assertWithinDeadline(deadlineAt);
-        const rowBytes = Math.max(0, Math.floor(Number(meta.bytes) || 0));
-        if (rowBytes > CHAT_RUNTIME_BOUNDS.historyBytes) {
-          throw new LegacyMigrationError("legacy_row_too_large");
-        }
-        if (rowBytes > budget.bytes) {
-          return newest.reverse();
-        }
-        const body =
-          table === PI_TABLE
-            ? this.sql
-                .exec<{
-                  payload: string;
-                }>(
-                  `SELECT payload FROM ${PI_TABLE} WHERE idx = ? LIMIT 1`,
-                  meta.key,
-                )
-                .toArray()[0]?.payload
-            : this.sql
-                .exec<{ payload: string }>(
-                  `SELECT message AS payload FROM ${AI_CHAT_TABLE}
-                    WHERE id = ? LIMIT 1`,
-                  meta.id,
-                )
-                .toArray()[0]?.payload;
-        if (typeof body !== "string" || byteLength(body) !== rowBytes) {
-          throw new LegacyMigrationError("legacy_row_changed_during_read");
-        }
-        let role: unknown;
-        try {
-          role = recordOf(JSON.parse(body))?.role;
-        } catch {
-          throw new LegacyMigrationError(
-            table === PI_TABLE
-              ? "malformed_pi_core_json"
-              : "malformed_ai_chat_json",
-          );
-        }
-        newest.push({
+        if (usesChronology) chronologyCursor = String(meta.cursor_key);
+        else numericCursor = Math.min(numericCursor, Number(meta.cursor_key));
+        const boundary: LegacyRow = {
           key: Number(meta.key),
           id: meta.id ?? String(meta.key),
-          payload: body,
+          payload: null,
           createdAt: finiteTime(meta.created_at),
-        });
-        budget.bytes -= rowBytes;
-        if (role === "user") userRows += 1;
-        if (table === PI_TABLE) {
-          numericCursor = Math.min(numericCursor, Number(meta.cursor_key));
-        } else if (usesChronology) {
-          chronologyCursor = String(meta.cursor_key);
-        } else {
-          numericCursor = Math.min(numericCursor, Number(meta.key));
+        };
+        const expectedBytes = boundedInteger(meta.bytes);
+        if (
+          expectedBytes === 0 ||
+          expectedBytes > CHAT_RUNTIME_BOUNDS.legacyMigrationRowBytes
+        ) {
+          rows.push(boundary);
+          continue;
         }
+        if (expectedBytes > budget.bytes) {
+          budget.bytes = 0;
+          rows.push(boundary);
+          break;
+        }
+        const body = this.readPayload(table, meta);
+        if (typeof body !== "string") {
+          rows.push(boundary);
+          continue;
+        }
+        const actualBytes = byteLength(body);
+        if (actualBytes !== expectedBytes) {
+          throw new LegacyMigrationError("legacy_row_changed_during_read");
+        }
+        budget.bytes -= actualBytes;
+        const payload = parsePayload(body, budget);
+        rows.push({ ...boundary, payload });
+        if (payload?.role === "user") userRows += 1;
         if (userRows > CHAT_RUNTIME_BOUNDS.historyTurns) break;
       }
-      if (metadata.length < pageRows) break;
+      if (metadata.length < pageSize) break;
       await yieldToTransport();
     }
-    return newest.reverse();
+    return rows.reverse();
   }
-
-  private readPiCompaction(
-    deadlineAt: number,
-    attemptToken: string,
-  ): PiCompaction {
-    if (!tableExists(this.sql, PI_COMPACTION_TABLE)) {
-      return { firstKeptIndex: 0, summary: null };
+  private readMetadata(
+    table: typeof PI_TABLE | typeof AI_CHAT_TABLE,
+    limit: number,
+    numericCursor: number,
+    chronologyCursor: string,
+    usesChronology: boolean,
+    minimumPiIndex: number,
+  ): LegacyRowMeta[] {
+    if (table === PI_TABLE) {
+      return this.sql
+        .exec<LegacyRowMeta>(
+          `SELECT idx AS key, NULL AS id,
+                  length(CAST(payload AS BLOB)) AS bytes, created_at,
+                  idx AS cursor_key
+             FROM ${PI_TABLE} WHERE idx >= ? AND idx < ?
+            ORDER BY idx DESC LIMIT ?`,
+          minimumPiIndex,
+          numericCursor,
+          limit,
+        )
+        .toArray();
     }
-    this.assertAttemptOwned(attemptToken, deadlineAt);
-    const endIdx = nonnegativeInteger(
-      this.sql
-        .exec<{
-          end_idx: number;
-        }>(`SELECT COALESCE(MAX(idx) + 1, 0) AS end_idx FROM ${PI_TABLE}`)
-        .one().end_idx,
-    );
-    const metadata = this.sql
-      .exec<{ first_kept_index: number; bytes: number }>(
-        `SELECT first_kept_index,
-                length(CAST(summary AS BLOB)) AS bytes
-           FROM ${PI_COMPACTION_TABLE} WHERE id = 1`,
+    if (usesChronology) {
+      return this.sql
+        .exec<LegacyRowMeta>(
+          `SELECT rowid AS key, id,
+                  length(CAST(message AS BLOB)) AS bytes, created_at,
+                  chronology_key AS cursor_key
+             FROM ${AI_CHAT_TABLE}
+            WHERE chronology_key IS NOT NULL AND chronology_key < ?
+            ORDER BY chronology_key DESC LIMIT ?`,
+          chronologyCursor,
+          limit,
+        )
+        .toArray();
+    }
+    return this.sql
+      .exec<LegacyRowMeta>(
+        `SELECT rowid AS key, id,
+                length(CAST(message AS BLOB)) AS bytes, created_at,
+                rowid AS cursor_key
+           FROM ${AI_CHAT_TABLE} WHERE rowid < ?
+          ORDER BY rowid DESC LIMIT ?`,
+        numericCursor,
+        limit,
       )
-      .toArray()[0];
-    if (!metadata) return { firstKeptIndex: 0, summary: null };
-    const stored = nonnegativeInteger(metadata.first_kept_index);
-    if (stored === 0 || stored > endIdx) {
+      .toArray();
+  }
+  private readPiCompaction(
+    deadlineAt: number, token: string, budget: ScanBudget,
+  ): PiCompaction {
+    if (!tableExists(this.sql, PI_COMPACTION_TABLE))
       return { firstKeptIndex: 0, summary: null };
-    }
-    const bytes = Math.max(0, Math.floor(Number(metadata.bytes) || 0));
-    if (bytes > CHAT_RUNTIME_BOUNDS.requestBytes) {
+    this.assertOwned(token, deadlineAt);
+    const end = boundedInteger(this.sql.exec<{ end: number }>(
+      `SELECT COALESCE(MAX(idx) + 1, 0) AS end FROM ${PI_TABLE}`,
+    ).one().end);
+    const meta = this.sql.exec<{ first: number; bytes: number }>(
+      `SELECT first_kept_index AS first, length(CAST(summary AS BLOB)) AS bytes
+         FROM ${PI_COMPACTION_TABLE} WHERE id = 1`,
+    ).toArray()[0];
+    const first = boundedInteger(meta?.first);
+    if (!meta || first === 0 || first > end)
+      return { firstKeptIndex: 0, summary: null };
+    const bytes = boundedInteger(meta.bytes);
+    if (bytes > CHAT_RUNTIME_BOUNDS.requestBytes || bytes > budget.bytes)
       throw new LegacyMigrationError("legacy_summary_too_large");
-    }
-    const summary = this.sql
-      .exec<{
-        summary: string;
-      }>(`SELECT summary FROM ${PI_COMPACTION_TABLE} WHERE id = 1`)
-      .toArray()[0]?.summary;
-    if (typeof summary !== "string" || byteLength(summary) !== bytes) {
-      throw new LegacyMigrationError("legacy_row_changed_during_read");
-    }
-    return { firstKeptIndex: stored, summary: summary || null };
-  }
-
-  private async hydratePiUserDisplays(
-    turns: LegacyTurn[],
-    deadlineAt: number,
-    attemptToken: string,
-    budget: ScanBudget,
-  ): Promise<void> {
-    this.assertAttemptOwned(attemptToken, deadlineAt);
-    if (!tableExists(this.sql, AI_CHAT_TABLE)) return;
-    const byId = new Map<string, string>();
-    const byPiKey = new Map<string, string | null>();
-    for (const row of await this.readNewestRows(
-      AI_CHAT_TABLE,
-      deadlineAt,
-      0,
-      attemptToken,
-      budget,
-    )) {
-      this.assertWithinDeadline(deadlineAt);
-      const parsed = parsedUiMessage(row, () =>
-        this.assertWithinDeadline(deadlineAt),
-      );
-      if (parsed?.role !== "user" || !parsed.complete || !parsed.text) continue;
-      byId.set(row.id, parsed.text);
-      byId.set(parsed.id, parsed.text);
-      const key = parsed.piCoreMessageKey;
-      if (key) byPiKey.set(key, byPiKey.has(key) ? null : parsed.text);
-    }
-    const piKeyCounts = new Map<string, number>();
-    for (const turn of turns) {
-      for (const segment of turn.displaySegments ?? []) {
-        const key = segment.piCoreMessageKey;
-        piKeyCounts.set(key, (piKeyCounts.get(key) ?? 0) + 1);
-      }
-    }
-    for (const turn of turns) {
-      this.assertWithinDeadline(deadlineAt);
-      const segments = turn.displaySegments;
-      if (!segments) continue;
-      for (const segment of segments) {
-        this.assertWithinDeadline(deadlineAt);
-        const display = segment.renderMessageId
-          ? byId.get(segment.renderMessageId)
-          : piKeyCounts.get(segment.piCoreMessageKey) === 1
-            ? byPiKey.get(segment.piCoreMessageKey)
-            : null;
-        if (display) segment.fallback = display;
-      }
-      turn.userDisplay = combinedSegments(
-        segments.map((segment) => segment.fallback).filter(Boolean),
-      );
-    }
-  }
-
-  private prependCompactionSummary(
-    turns: LegacyTurn[],
-    summary: string | null,
-    deadlineAt: number,
-  ): void {
-    if (!turns.length || !summary) return;
     this.assertWithinDeadline(deadlineAt);
-    const target = turns.length - 1;
-    const combined = `[Context Summary]\n\n${summary}\n\n${turns[target].userContent}`;
-    if (byteLength(combined) > CHAT_RUNTIME_BOUNDS.requestBytes) {
-      throw new LegacyMigrationError("legacy_summary_too_large");
-    }
-    turns[target] = { ...turns[target], userContent: combined };
+    const summary = this.sql.exec<{ summary: string }>(
+      `SELECT summary FROM ${PI_COMPACTION_TABLE} WHERE id = 1`,
+    ).toArray()[0]?.summary;
+    if (typeof summary !== "string" || byteLength(summary) !== bytes)
+      throw new LegacyMigrationError("legacy_row_changed_during_read");
+    budget.bytes -= bytes;
+    return { firstKeptIndex: first, summary: summary || null };
   }
-
+  private readPayload(
+    table: typeof PI_TABLE | typeof AI_CHAT_TABLE,
+    meta: LegacyRowMeta,
+  ): string | undefined {
+    if (table === PI_TABLE) {
+      return this.sql
+        .exec<{
+          payload: string;
+        }>(`SELECT payload FROM ${PI_TABLE} WHERE idx = ? LIMIT 1`, meta.key)
+        .toArray()[0]?.payload;
+    }
+    return this.sql
+      .exec<{
+        payload: string;
+      }>(
+        `SELECT message AS payload FROM ${AI_CHAT_TABLE} WHERE id = ? LIMIT 1`,
+        meta.id,
+      )
+      .toArray()[0]?.payload;
+  }
   private commit(token: string, selection: ScanResult): LegacyMigrationStatus {
     return this.storage.transactionSync(() => {
       const now = this.now();
@@ -1248,30 +908,27 @@ export class LegacySessionMigrator {
         now >= Number(marker.deadline_at)
       ) {
         if (marker.state === "pending" && now >= Number(marker.deadline_at)) {
-          return this.failInTransaction("legacy_migration_deadline", now);
+          return this.failInTransaction("legacy_migration_deadline");
         }
         return statusFromRow(marker);
       }
       const current = this.sql
-        .exec<{ count: number; running: number; settled: number }>(
+        .exec<{ count: number; unsafe: number }>(
           `SELECT COUNT(*) AS count,
-                  COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running,
-                  COALESCE(SUM(CASE WHEN status IN ('completed','failed','interrupted')
-                                    THEN 1 ELSE 0 END), 0) AS settled
+                  COALESCE(SUM(CASE
+                    WHEN status IN ('running','completed','failed','interrupted')
+                    THEN 1 ELSE 0 END), 0) AS unsafe
              FROM chat_turns_v2`,
         )
         .one();
-      if (Number(current.running) !== 0 || Number(current.settled) !== 0) {
-        return this.failInTransaction(
-          "v2_runtime_changed_during_migration",
-          now,
-        );
+      if (Number(current.unsafe) !== 0) {
+        return this.failInTransaction("v2_runtime_changed_during_migration");
       }
       if (
         Number(current.count) + selection.turns.length >
         CHAT_RUNTIME_BOUNDS.admissionsPerThread
       ) {
-        return this.failInTransaction("legacy_migration_admission_limit", now);
+        return this.failInTransaction("legacy_migration_admission_limit");
       }
       const scope = this.sql
         .exec<{
@@ -1282,28 +939,25 @@ export class LegacySessionMigrator {
         }>(
           `SELECT runtime.thread_id, runtime.workspace_id, runtime.org_id,
                   (SELECT user_id FROM chat_turns_v2
-                    WHERE status = 'queued' ORDER BY created_at, rowid LIMIT 1) AS user_id
+                    WHERE status = 'queued' ORDER BY created_at, rowid LIMIT 1)
+                    AS user_id
              FROM chat_runtime_v2 runtime WHERE runtime.singleton = 1`,
         )
         .one();
       if (!scope.thread_id || !scope.workspace_id || !scope.org_id) {
-        return this.failInTransaction("legacy_migration_scope_missing", now);
+        return this.failInTransaction("legacy_migration_scope_missing");
       }
       for (const turn of selection.turns) {
         if (
           turn.id.length > CHAT_RUNTIME_BOUNDS.identifierChars ||
-          Number(
-            this.sql
-              .exec<{ present: number }>(
-                `SELECT EXISTS(
-                   SELECT 1 FROM chat_turns_v2
-                    WHERE id = ? OR client_message_id = ?
-                 ) AS present`,
-                turn.id,
-                turn.id,
-              )
-              .one().present,
-          ) !== 0
+          this.sql
+            .exec<{ present: number }>(
+              `SELECT COUNT(*) AS present FROM chat_turns_v2
+                WHERE id = ? OR client_message_id = ?`,
+              turn.id,
+              turn.id,
+            )
+            .one().present
         ) {
           throw new LegacyMigrationError("legacy_migration_id_collision");
         }
@@ -1342,87 +996,34 @@ export class LegacySessionMigrator {
           `UPDATE ${MIGRATION_TABLE}
               SET state = 'complete', attempt_token = NULL,
                   imported_turns = ?, imported_bytes = ?, source = ?,
-                  error = NULL, updated_at = ?
+                  error = NULL
             WHERE singleton = 1 AND state = 'pending' AND attempt_token = ?
           RETURNING state, attempt_count, attempt_token, deadline_at,
                     imported_turns, imported_bytes, source, error`,
           selection.turns.length,
           selection.bytes,
           selection.source,
-          now,
           token,
         )
         .toArray()[0];
       if (!completed)
         return statusFromRow(migrationRow(this.sql) as MigrationRow);
-      this.appendMigrationEvent("CompleteLegacyMigration", now);
+      this.bumpRevision();
       return statusFromRow(completed, true);
     });
   }
-
-  private appendMigrationEvent(
-    type:
-      | "BeginLegacyMigration"
-      | "RetryLegacyMigration"
-      | "CompleteLegacyMigration"
-      | "FailLegacyMigration",
-    now: number,
-  ): void {
-    this.sql.exec(
-      "UPDATE chat_runtime_v2 SET revision = revision + 1 WHERE singleton = 1",
-    );
-    const revision = Number(
-      this.sql
-        .exec<{
-          revision: number;
-        }>("SELECT revision FROM chat_runtime_v2 WHERE singleton = 1")
-        .one().revision,
-    );
-    const queued = this.sql
-      .exec<{ id: string }>(
-        `SELECT id FROM chat_turns_v2 WHERE status = 'queued'
-          ORDER BY created_at, rowid LIMIT 1`,
-      )
-      .toArray()[0];
-    const turnId = queued?.id ?? "legacy-migration";
-    const event = {
-      revision,
-      type,
-      turnId,
-      status: "queued",
-      createdAt: now,
-    };
-    this.sql.exec(
-      `INSERT INTO chat_outbox_v2
-        (revision, event_type, turn_id, status, payload_bytes, created_at)
-       VALUES (?, ?, ?, 'queued', ?, ?)`,
-      revision,
-      type,
-      turnId,
-      byteLength(JSON.stringify(event)),
-      now,
-    );
-    this.sql.exec(
-      `DELETE FROM chat_outbox_v2 WHERE seq NOT IN (
-        SELECT seq FROM (
-          SELECT seq, SUM(payload_bytes) OVER (
-            ORDER BY seq DESC ROWS UNBOUNDED PRECEDING
-          ) AS cumulative_bytes
-          FROM chat_outbox_v2 ORDER BY seq DESC LIMIT ?
-        ) WHERE cumulative_bytes <= ?
-      )`,
-      CHAT_RUNTIME_BOUNDS.outboxEvents,
-      CHAT_RUNTIME_BOUNDS.outboxBytes,
-    );
+  private bumpRevision(): void {
+    this.sql.exec(`UPDATE chat_runtime_v2 SET revision = revision + 1
+      WHERE singleton = 1`);
   }
-
   private recordAttemptError(
     token: string,
     error: string,
     retryable: boolean,
   ): LegacyMigrationStatus {
     return this.storage.transactionSync(() => {
-      const row = migrationRow(this.sql) as MigrationRow;
+      const row = migrationRow(this.sql);
+      if (!row) return unseenStatus();
       if (row.state !== "pending" || row.attempt_token !== token) {
         return statusFromRow(row);
       }
@@ -1432,55 +1033,52 @@ export class LegacySessionMigrator {
         now >= Number(row.deadline_at) ||
         Number(row.attempt_count) >= CHAT_RUNTIME_BOUNDS.legacyMigrationAttempts
       ) {
-        return this.failInTransaction(error, now);
+        return this.failInTransaction(error);
       }
       const pending = this.sql
         .exec<MigrationRow>(
-          `UPDATE ${MIGRATION_TABLE} SET error = ?, updated_at = ?
+          `UPDATE ${MIGRATION_TABLE} SET error = ?
             WHERE singleton = 1 AND state = 'pending' AND attempt_token = ?
           RETURNING state, attempt_count, attempt_token, deadline_at,
                     imported_turns, imported_bytes, source, error`,
           error,
-          now,
           token,
         )
         .one();
       return statusFromRow(pending, true);
     });
   }
-
-  private failInTransaction(error: string, now: number): LegacyMigrationStatus {
-    const boundedError = error.slice(0, CHAT_RUNTIME_BOUNDS.identifierChars);
+  private failInTransaction(error: string): LegacyMigrationStatus {
     const failed = this.sql
       .exec<MigrationRow>(
         `UPDATE ${MIGRATION_TABLE}
-            SET state = 'failed', attempt_token = NULL, error = ?, updated_at = ?
+            SET state = 'failed', attempt_token = NULL, error = ?
           WHERE singleton = 1 AND state = 'pending'
         RETURNING state, attempt_count, attempt_token, deadline_at,
                   imported_turns, imported_bytes, source, error`,
-        boundedError,
-        now,
+        error.slice(0, CHAT_RUNTIME_BOUNDS.identifierChars),
       )
       .toArray()[0];
-    if (failed) this.appendMigrationEvent("FailLegacyMigration", now);
-    return failed
-      ? statusFromRow(failed, true)
-      : statusFromRow(migrationRow(this.sql) as MigrationRow);
+    if (failed) {
+      this.bumpRevision();
+      return statusFromRow(failed, true);
+    }
+    const current = migrationRow(this.sql);
+    return current ? statusFromRow(current) : unseenStatus();
   }
-
   private assertWithinDeadline(deadlineAt: number): void {
-    if (this.now() >= deadlineAt)
+    if (this.now() >= deadlineAt) {
       throw new LegacyMigrationError("legacy_migration_deadline");
+    }
   }
-
-  private assertAttemptOwned(token: string, deadlineAt: number): void {
+  private assertOwned(token: string, deadlineAt: number): void {
     this.assertWithinDeadline(deadlineAt);
     const row = migrationRow(this.sql);
-    if (!row || row.state !== "pending" || row.attempt_token !== token)
+    if (!row || row.state !== "pending" || row.attempt_token !== token) {
       throw new StaleLegacyMigrationAttempt();
+    }
   }
 }
-
 export function legacyMigrationBlocksClaim(sql: SqlStorage): boolean {
   const marker = migrationRow(sql);
   if (marker) return marker.state === "pending";

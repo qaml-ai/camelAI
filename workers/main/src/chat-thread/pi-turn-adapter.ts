@@ -53,10 +53,10 @@ import type {
 import { CHAT_RUNTIME_MODEL_KEY } from "./runtime-metadata";
 import type { CheckpointProviderBatch } from "./turn-checkpoint";
 import type { ChatRuntimeContentBlock } from "./chat-runtime-content";
+import { utf8ByteLength } from "./utf8-byte-length";
 
 export { CHAT_RUNTIME_MODEL_KEY } from "./runtime-metadata";
 
-const encoder = new TextEncoder();
 const EMPTY_USAGE: Usage = {
   input: 0,
   output: 0,
@@ -178,7 +178,16 @@ class BoundedUtf8Builder {
           token = `\\u${code.toString(16).padStart(4, "0")}`;
         }
       }
-      visit(token, token.length > 1 ? token.length : code < 0x80 ? 1 : code < 0x800 ? 2 : 3);
+      visit(
+        token,
+        token.length > 1
+          ? token.length
+          : code < 0x80
+            ? 1
+            : code < 0x800
+              ? 2
+              : 3,
+      );
     }
   }
 
@@ -492,21 +501,20 @@ function providerProgressContent(
   message: AssistantMessage,
 ): ChatRuntimeContentBlock[] {
   const normalized = normalizedProviderContent(message);
-  return normalized.content.flatMap((part): ChatRuntimeContentBlock[] => {
-    if (part.type === "text") return [{ type: "text", text: part.text }];
+  const content: ChatRuntimeContentBlock[] = [];
+  for (const part of normalized.content) {
+    if (part.type === "text") content.push({ type: "text", text: part.text });
     if (part.type === "thinking") {
-      return [
-        {
-          type: "thinking",
-          thinking: part.thinking,
-          ...(part.thinkingSignature
-            ? { signature: part.thinkingSignature }
-            : {}),
-        },
-      ];
+      content.push({
+        type: "thinking",
+        thinking: part.thinking,
+        ...(part.thinkingSignature
+          ? { signature: part.thinkingSignature }
+          : {}),
+      });
     }
-    return [];
-  });
+  }
+  return content;
 }
 
 export async function consumePiProviderStream(
@@ -516,10 +524,10 @@ export async function consumePiProviderStream(
 ): Promise<AssistantMessage> {
   let response: AssistantMessage | null = null;
   let events = 0;
+  let nextProgressAt = Number.NEGATIVE_INFINITY;
   for await (const event of stream) {
-    if (signal.aborted) {
+    if (signal.aborted)
       throw signal.reason ?? new Error("Provider request aborted");
-    }
     events += 1;
     if (events > CHAT_RUNTIME_BOUNDS.providerStreamEvents) {
       throw new BoundedTurnError(
@@ -535,13 +543,12 @@ export async function consumePiProviderStream(
       event.type === "thinking_delta" ||
       event.type === "thinking_end"
     ) {
-      // Presentation is attempt-local and must never affect provider or
-      // checkpoint semantics. A malformed partial is simply not painted; the
-      // final response still passes the strict authoritative parser.
-      try {
-        onProgress(providerProgressContent(event.partial));
-      } catch {
-        // Ignore observational partials that are not yet valid/bounded.
+      const now = Date.now();
+      if (now >= nextProgressAt || event.type.endsWith("_end")) {
+        try {
+          onProgress(providerProgressContent(event.partial));
+        } catch {}
+        nextProgressAt = now + CHAT_RUNTIME_BOUNDS.liveFlushMs;
       }
     }
   }
@@ -570,12 +577,14 @@ function checkpointResultContent(
       byteCode: "invalid_provider_step",
       byteMessage: "Checkpointed tool result is too large",
     }).value;
-    if (!value || typeof value !== "object" || Array.isArray(value)) return fallback;
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      return fallback;
     const content = value.content;
     if (!Array.isArray(content) || content.length > 4) return fallback;
     const normalized: Extract<Message, { role: "toolResult" }>["content"] = [];
     for (const part of content) {
-      if (!part || typeof part !== "object" || Array.isArray(part)) return fallback;
+      if (!part || typeof part !== "object" || Array.isArray(part))
+        return fallback;
       if (part.type === "text" && typeof part.text === "string") {
         normalized.push({ type: "text", text: part.text });
       } else if (
@@ -583,9 +592,15 @@ function checkpointResultContent(
         typeof part.data === "string" &&
         part.data.length <= CHAT_RUNTIME_BOUNDS.toolResultBytes / 2 &&
         typeof part.mimeType === "string" &&
-        ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(part.mimeType)
+        ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(
+          part.mimeType,
+        )
       ) {
-        normalized.push({ type: "image", data: part.data, mimeType: part.mimeType });
+        normalized.push({
+          type: "image",
+          data: part.data,
+          mimeType: part.mimeType,
+        });
       } else return fallback;
     }
     return normalized.length ? normalized : fallback;
@@ -712,12 +727,22 @@ export const PI_JS_EXEC_TOOL_DEFINITION: BoundedToolDefinition = {
 };
 export const PI_AUTOMATION_OUTCOME_TOOL_DEFINITION: BoundedToolDefinition = {
   name: "report_automation_outcome",
-  description: "Required final status for this scheduled automation. Use success only when the requested objective completed and was verified.",
+  description:
+    "Required final status for this scheduled automation. Use success only when the requested objective completed and was verified.",
   parameters: {
-    type: "object", additionalProperties: false, required: ["status", "summary"],
+    type: "object",
+    additionalProperties: false,
+    required: ["status", "summary"],
     properties: {
-      status: { type: "string", enum: ["success", "failed", "partial", "needs_attention"] },
-      summary: { type: "string", minLength: 1, maxLength: CHAT_RUNTIME_BOUNDS.automationSummaryChars },
+      status: {
+        type: "string",
+        enum: ["success", "failed", "partial", "needs_attention"],
+      },
+      summary: {
+        type: "string",
+        minLength: 1,
+        maxLength: CHAT_RUNTIME_BOUNDS.automationSummaryChars,
+      },
     },
   },
 };
@@ -735,7 +760,8 @@ function boundedCatalogJson(value: unknown, maxBytes: number, message: string) {
       byteMessage: message,
     });
   } catch (error) {
-    if (error instanceof BoundedTurnError && error.message === message) return null;
+    if (error instanceof BoundedTurnError && error.message === message)
+      return null;
     throw error;
   }
 }
@@ -774,7 +800,14 @@ export function buildBoundedToolCatalog(
     const byteMessage = "Tool schema exceeds the catalog byte limit";
     // Prove metadata plus the smallest schema fits before touching a possibly
     // accessor-backed parameters field.
-    if (!boundedCatalogJson({ name, description, parameters: {} }, remaining, byteMessage)) break;
+    if (
+      !boundedCatalogJson(
+        { name, description, parameters: {} },
+        remaining,
+        byteMessage,
+      )
+    )
+      break;
     const parameters = dataField(definition, "parameters");
     const serialized = boundedCatalogJson(
       { name, description, parameters },
@@ -795,10 +828,10 @@ async function executeBoundedJsExec(input: {
   ctx: Pick<DurableObjectState, "exports">;
   env: Pick<ChatEnv, "CODE_MODE_LOADER">;
   turn: Pick<DurableChatTurn, "orgId" | "workspaceId" | "threadId" | "userId">;
-  callId: string;
+  tools: CodeModeToolsBinding;
   args: Record<string, unknown>;
 }): Promise<{ content: Array<{ type: "text"; text: string }> }> {
-  const { ctx, env, turn, callId, args } = input;
+  const { ctx, env, turn, tools, args } = input;
   const code = typeof args.code === "string" ? args.code : "";
   if (!code.trim()) throw new Error("code is required");
   const loader = env.CODE_MODE_LOADER as
@@ -829,17 +862,15 @@ async function executeBoundedJsExec(input: {
     workspaceId: turn.workspaceId,
     userId: turn.userId ?? undefined,
   };
-  const workerCode: WorkerLoaderWorkerCode = {
+  const workerCode: WorkerLoaderWorkerCode & { limits?: { cpuMs?: number } } = {
     compatibilityDate: CODE_MODE_COMPATIBILITY_DATE,
+    limits: { cpuMs: CHAT_RUNTIME_BOUNDS.codeModeCpuMs },
     mainModule: "index.js",
     modules: { "index.js": { js: codeModeWorkerModule(code) } },
     env: {
-      TOOLS: binding("CodeModeToolsBinding", {
-        ...scope,
-        threadId: turn.threadId,
-        parentToolUseId: callId,
-        allowWebTools: false,
-      }),
+      // Reuse the attempt binding: direct tools and nested js_exec therefore
+      // share one scratch/overflow ledger instead of each claiming a full cap.
+      TOOLS: tools,
       AI: binding("AIVirtualBinding", scope),
       CAMELAI: binding("CamelAiService", scope),
       SECURE_FETCH: binding("SecureFetchBinding", scope),
@@ -847,9 +878,10 @@ async function executeBoundedJsExec(input: {
       BROWSER: binding("AppBrowserBinding", scope),
     },
   };
-  const worker = typeof loader.load === "function"
-    ? loader.load(workerCode)
-    : loader.get(`pi-codemode-${crypto.randomUUID()}`, () => workerCode);
+  const worker =
+    typeof loader.load === "function"
+      ? loader.load(workerCode)
+      : loader.get(`pi-codemode-${crypto.randomUUID()}`, () => workerCode);
   const runner = worker.getEntrypoint("CodeModeRunner") as unknown as {
     run(
       timeout: number,
@@ -873,7 +905,12 @@ export function createPiTurnAdapter(input: {
   ctx: DurableObjectState;
   env: ChatEnv;
   store: DurableChatTurnStore;
-  automationOutcome?: { execute(args: Record<string, unknown>, signal: AbortSignal): Promise<unknown> };
+  automationOutcome?: {
+    execute(
+      args: Record<string, unknown>,
+      signal: AbortSignal,
+    ): Promise<unknown>;
+  };
 }): BoundedTurnAdapter {
   const { ctx, env, store } = input;
   const mapping = new PiModelMapping();
@@ -967,7 +1004,15 @@ export function createPiTurnAdapter(input: {
   };
 
   function* toolDefinitions(): Iterable<BoundedToolDefinition> {
-    const containerNames = ["read", "write", "edit", "delete", "ls", "grep", "find"] as const;
+    const containerNames = [
+      "read",
+      "write",
+      "edit",
+      "delete",
+      "ls",
+      "grep",
+      "find",
+    ] as const;
     let scanned = 0;
     for (const key of containerNames) {
       if (scanned >= CHAT_RUNTIME_BOUNDS.toolCatalogEntries) return;
@@ -981,7 +1026,10 @@ export function createPiTurnAdapter(input: {
     if (scanned++ < CHAT_RUNTIME_BOUNDS.toolCatalogEntries) {
       yield PI_JS_EXEC_TOOL_DEFINITION;
     }
-    if (input.automationOutcome && scanned++ < CHAT_RUNTIME_BOUNDS.toolCatalogEntries) {
+    if (
+      input.automationOutcome &&
+      scanned++ < CHAT_RUNTIME_BOUNDS.toolCatalogEntries
+    ) {
       yield PI_AUTOMATION_OUTCOME_TOOL_DEFINITION;
     }
     const length = dataField(
@@ -991,7 +1039,12 @@ export function createPiTurnAdapter(input: {
     if (!Number.isSafeInteger(length) || (length as number) < 0) {
       providerOutputError("Tool catalog has an invalid definition array");
     }
-    for (let index = 0; index < (length as number) && scanned < CHAT_RUNTIME_BOUNDS.toolCatalogEntries; index += 1) {
+    for (
+      let index = 0;
+      index < (length as number) &&
+      scanned < CHAT_RUNTIME_BOUNDS.toolCatalogEntries;
+      index += 1
+    ) {
       scanned += 1;
       const definition = dataField(
         CODE_MODE_PI_PASSTHROUGH_TOOL_DEFINITIONS,
@@ -1002,7 +1055,11 @@ export function createPiTurnAdapter(input: {
       }
       const hidden = dataField(definition, "hidden");
       const name = dataField(definition, "name");
-      if (typeof hidden !== "boolean" || typeof name !== "string" || name.length > CHAT_RUNTIME_BOUNDS.identifierChars) {
+      if (
+        typeof hidden !== "boolean" ||
+        typeof name !== "string" ||
+        name.length > CHAT_RUNTIME_BOUNDS.identifierChars
+      ) {
         providerOutputError("Tool catalog contains invalid metadata");
       }
       if (
@@ -1027,8 +1084,7 @@ export function createPiTurnAdapter(input: {
           { role: "user" as const, content: previous.userContent },
         ];
         const groupBytes = group.reduce(
-          (sum, message) =>
-            sum + encoder.encode(JSON.stringify(message)).byteLength + 1,
+          (sum, message) => sum + utf8ByteLength(JSON.stringify(message)) + 1,
           0,
         );
         if (
@@ -1041,13 +1097,7 @@ export function createPiTurnAdapter(input: {
         used += groupBytes;
       }
     },
-    async callProvider({
-      turn,
-      context,
-      toolBatches,
-      signal,
-      onProgress,
-    }) {
+    async callProvider({ turn, context, toolBatches, signal, onProgress }) {
       const state = stateFor(turn);
       const config = await resolveModel(turn);
       if (turn.userId) {
@@ -1073,15 +1123,19 @@ export function createPiTurnAdapter(input: {
         ),
       };
       const skills = resolveAgentSkillCatalog(env);
-      const suffix = input.automationOutcome ? `\n\n${AUTOMATION_OUTCOME_PROMPT}` : "";
-      const systemPrompt = createPiSystemPrompt(chat, {
-        skillNames: skills.skillNames,
-        skillDescriptions: skills.skillDescriptions,
-        promptPrepend: skills.promptPrepend,
-        promptAppend: skills.promptAppend,
-        deployedConnectionsBindingEnabled: connectionsBindingEnabled(env),
-        maxBytes: CHAT_RUNTIME_BOUNDS.systemPromptBytes - encoder.encode(suffix).byteLength,
-      }) + suffix;
+      const suffix = input.automationOutcome
+        ? `\n\n${AUTOMATION_OUTCOME_PROMPT}`
+        : "";
+      const systemPrompt =
+        createPiSystemPrompt(chat, {
+          skillNames: skills.skillNames,
+          skillDescriptions: skills.skillDescriptions,
+          promptPrepend: skills.promptPrepend,
+          promptAppend: skills.promptAppend,
+          deployedConnectionsBindingEnabled: connectionsBindingEnabled(env),
+          maxBytes:
+            CHAT_RUNTIME_BOUNDS.systemPromptBytes - utf8ByteLength(suffix),
+        }) + suffix;
       const { streamSimple } = await import("@earendil-works/pi-ai/compat");
       const startedAt = Date.now();
       const stream = streamSimple(
@@ -1164,15 +1218,25 @@ export function createPiTurnAdapter(input: {
           ? (call.input as Record<string, unknown>)
           : {};
       if (call.name === PI_AUTOMATION_OUTCOME_TOOL_DEFINITION.name) {
-        if (!input.automationOutcome) throw new Error("No scheduled automation run is active");
+        if (!input.automationOutcome)
+          throw new Error("No scheduled automation run is active");
         return input.automationOutcome.execute(raw, signal);
       }
       if (call.name === "js_exec") {
         if (state.jsExecUsed) {
-          throw new BoundedTurnError("tool_limit", "js_exec may run at most once per turn");
+          throw new BoundedTurnError(
+            "tool_limit",
+            "js_exec may run at most once per turn",
+          );
         }
         state.jsExecUsed = true;
-        return executeBoundedJsExec({ ctx, env, turn, callId: call.id, args: raw });
+        return executeBoundedJsExec({
+          ctx,
+          env,
+          turn,
+          tools: binding(turn),
+          args: raw,
+        });
       }
       return binding(turn).callTool(call.name, {
         ...raw,
@@ -1185,7 +1249,12 @@ export function createPiTurnAdapter(input: {
       if (!turn || turn.id !== active?.id) {
         throw new Error("Turn authority expired");
       }
-      return binding(turn).overflowToolResult(call.name, call.id, value, signal);
+      return binding(turn).overflowToolResult(
+        call.name,
+        call.id,
+        value,
+        signal,
+      );
     },
   };
 }

@@ -21,11 +21,19 @@ export function stripTypeScriptFromUserCode(userCode: string): string {
   if (!userCode.trim()) return userCode;
   try {
     const wrapped = `${TS_STRIP_PREFIX}${userCode}${TS_STRIP_SUFFIX}`;
-    const stripped = sucraseTransform(wrapped, { transforms: ["typescript"] }).code;
-    if (!stripped.startsWith(TS_STRIP_PREFIX) || !stripped.endsWith(TS_STRIP_SUFFIX)) {
+    const stripped = sucraseTransform(wrapped, {
+      transforms: ["typescript"],
+    }).code;
+    if (
+      !stripped.startsWith(TS_STRIP_PREFIX) ||
+      !stripped.endsWith(TS_STRIP_SUFFIX)
+    ) {
       return userCode;
     }
-    return stripped.slice(TS_STRIP_PREFIX.length, stripped.length - TS_STRIP_SUFFIX.length);
+    return stripped.slice(
+      TS_STRIP_PREFIX.length,
+      stripped.length - TS_STRIP_SUFFIX.length,
+    );
   } catch {
     return userCode;
   }
@@ -48,7 +56,9 @@ export function prepareCodeModeUserCode(userCode: string): string {
   if (
     !expression ||
     expression.endsWith("}") ||
-    /^(?:break|case|catch|class|const|continue|debugger|default|do|else|export|finally|for|function|if|import|let|return|switch|throw|try|var|while|with)\b/.test(expression)
+    /^(?:break|case|catch|class|const|continue|debugger|default|do|else|export|finally|for|function|if|import|let|return|switch|throw|try|var|while|with)\b/.test(
+      expression,
+    )
   ) {
     return userCode;
   }
@@ -59,7 +69,9 @@ export function prepareCodeModeUserCode(userCode: string): string {
 }
 
 export function codeModeWorkerModule(userCode: string): string {
-  const executableUserCode = prepareCodeModeUserCode(stripTypeScriptFromUserCode(userCode));
+  const executableUserCode = prepareCodeModeUserCode(
+    stripTypeScriptFromUserCode(userCode),
+  );
   const workerPrefixTemplate = String.raw`
 import { WorkerEntrypoint } from "cloudflare:workers";
 
@@ -68,20 +80,128 @@ const USER_CODE_END_LINE = __USER_CODE_END_LINE__;
 const DEFAULT_MAX_OUTPUT_CHARACTERS = __DEFAULT_MAX_OUTPUT_CHARACTERS__;
 const MAX_OUTPUT_CHARACTERS = __MAX_OUTPUT_CHARACTERS__;
 const MAX_NESTED_TOOL_CALLS = __MAX_NESTED_TOOL_CALLS__;
-const store = new Map();
+const MAX_NESTED_TOOL_ARGUMENT_BYTES = __MAX_NESTED_TOOL_ARGUMENT_BYTES__;
+const MAX_NESTED_TOOL_ARGUMENT_TOTAL_BYTES = __MAX_NESTED_TOOL_ARGUMENT_TOTAL_BYTES__;
+const MAX_NESTED_TOOL_RESULT_BYTES = __MAX_NESTED_TOOL_RESULT_BYTES__;
+const MAX_NESTED_TOOL_RESULT_TOTAL_BYTES = __MAX_NESTED_TOOL_RESULT_TOTAL_BYTES__;
+const MAX_NESTED_TOOL_ARGUMENT_DEPTH = __MAX_NESTED_TOOL_ARGUMENT_DEPTH__;
+const MAX_NESTED_TOOL_ARGUMENT_ENTRIES = __MAX_NESTED_TOOL_ARGUMENT_ENTRIES__;
+const MAX_NESTED_TOOL_ARGUMENT_NODES = __MAX_NESTED_TOOL_ARGUMENT_NODES__;
+const MAX_SCRATCH_ENTRIES = __MAX_SCRATCH_ENTRIES__;
+const MAX_SCRATCH_VALUE_BYTES = __MAX_SCRATCH_VALUE_BYTES__;
+const MAX_SCRATCH_TOTAL_BYTES = __MAX_SCRATCH_TOTAL_BYTES__;
+const MAX_IDENTIFIER_CHARACTERS = __MAX_IDENTIFIER_CHARACTERS__;
+const MAX_RUNTIME_CLEANUP_MS = __MAX_RUNTIME_CLEANUP_MS__;
+const NativeError = Error;
+const NativeHeaders = Headers;
+const NativePromise = Promise;
+const NativeReadableStream = ReadableStream;
+const NativeResponse = Response;
+const NativeUint8Array = Uint8Array;
+const NativeWeakSet = WeakSet;
+const nativeObjectPrototype = Object.prototype;
+const nativeObjectDefineProperty = Object.defineProperty.bind(Object);
+const nativeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor.bind(Object);
+const nativeGetPrototypeOf = Object.getPrototypeOf.bind(Object);
+const nativeHasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
+const nativeIsArray = Array.isArray.bind(Array);
+const nativeJsonParse = JSON.parse.bind(JSON);
+const nativeJsonStringify = JSON.stringify.bind(JSON);
+const nativeNumber = Number;
+const nativeNumberIsFinite = Number.isFinite.bind(Number);
+const nativeNumberIsSafeInteger = Number.isSafeInteger.bind(Number);
+const nativeString = String;
+const nativePromiseThen = Function.prototype.call.bind(NativePromise.prototype.then);
+const nativeHeadersAppend = Function.prototype.call.bind(NativeHeaders.prototype.append);
+const nativeHeadersForEach = Function.prototype.call.bind(NativeHeaders.prototype.forEach);
+const nativeHeadersGet = Function.prototype.call.bind(NativeHeaders.prototype.get);
+const nativeMapClear = Function.prototype.call.bind(Map.prototype.clear);
+const nativeMapDelete = Function.prototype.call.bind(Map.prototype.delete);
+const nativeMapForEach = Function.prototype.call.bind(Map.prototype.forEach);
+const nativeMapSet = Function.prototype.call.bind(Map.prototype.set);
+const nativeReadableStreamControllerClose = Function.prototype.call.bind(ReadableStreamDefaultController.prototype.close);
+const nativeReadableStreamControllerEnqueue = Function.prototype.call.bind(ReadableStreamDefaultController.prototype.enqueue);
+const nativeReadableStreamControllerError = Function.prototype.call.bind(ReadableStreamDefaultController.prototype.error);
+const nativeReadableStreamCancel = Function.prototype.call.bind(NativeReadableStream.prototype.cancel);
+const nativeReadableStreamGetReader = Function.prototype.call.bind(NativeReadableStream.prototype.getReader);
+const nativeReadableStreamReaderCancel = Function.prototype.call.bind(ReadableStreamDefaultReader.prototype.cancel);
+const nativeReadableStreamReaderRead = Function.prototype.call.bind(ReadableStreamDefaultReader.prototype.read);
+function captureNativeGetter(prototype, key) {
+  let current = prototype;
+  while (current) {
+    const descriptor = nativeGetOwnPropertyDescriptor(current, key);
+    if (descriptor && typeof descriptor.get === "function") {
+      return Function.prototype.call.bind(descriptor.get);
+    }
+    current = nativeGetPrototypeOf(current);
+  }
+  throw new NativeError("Missing required native getter: " + key);
+}
+const nativeResponseBody = captureNativeGetter(NativeResponse.prototype, "body");
+const nativeResponseHeaders = captureNativeGetter(NativeResponse.prototype, "headers");
+const nativeResponseStatus = captureNativeGetter(NativeResponse.prototype, "status");
+const nativeResponseStatusText = captureNativeGetter(NativeResponse.prototype, "statusText");
+const nativeTypedArrayByteLength = captureNativeGetter(NativeUint8Array.prototype, "byteLength");
+const nativeReadableStreamLocked = captureNativeGetter(NativeReadableStream.prototype, "locked");
+const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
+const nativeClearTimeout = globalThis.clearTimeout.bind(globalThis);
+
+function isNativeReadableStream(value) {
+  if (!value || typeof value !== "object") return false;
+  try {
+    nativeReadableStreamLocked(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function trustedPromiseRace(values) {
+  return new NativePromise((resolve, reject) => {
+    for (let index = 0; index < values.length; index += 1) {
+      try {
+        nativePromiseThen(values[index], resolve, reject);
+      } catch (error) {
+        reject(error);
+      }
+    }
+  });
+}
+
+function ignorePromiseRejection(value) {
+  try {
+    nativePromiseThen(value, undefined, () => undefined);
+  } catch {
+    // Best-effort observation must never replace the primary result.
+  }
+}
+
+function cancelReadableStream(stream, reason) {
+  try {
+    ignorePromiseRejection(nativeReadableStreamCancel(stream, reason));
+  } catch {
+    // Cancellation is best effort after the capability has been fenced.
+  }
+}
 
 function stringifyOutput(value) {
   if (typeof value === "string") return value;
+  if (value === null) return "null";
+  if (typeof value === "number" || typeof value === "boolean") {
+    return nativeJsonStringify(value);
+  }
+  if (typeof value === "undefined") return "undefined";
   try {
-    return JSON.stringify(value, null, 2) ?? String(value);
+    assertNestedToolArgumentsBounded({ value }, MAX_OUTPUT_CHARACTERS);
+    return nativeJsonStringify(value) ?? "[Output omitted: unsupported JSON value]";
   } catch {
-    return String(value);
+    return "[Output omitted: value exceeds bounded plain-JSON limits]";
   }
 }
 
 function stringifyConsoleArg(value) {
   if (typeof value === "string") return value;
-  if (value instanceof Error) return value.stack || value.message;
+  if (value instanceof NativeError) return value.stack || value.message;
   return stringifyOutput(value);
 }
 
@@ -128,19 +248,31 @@ function createOutputBuffer(requestedLimit) {
   let entries = 0;
   let kept = 0;
   let total = 0;
+  const addTotal = (amount) => {
+    total = Math.min(Number.MAX_SAFE_INTEGER, total + amount);
+  };
+  const append = (text) => {
+    addTotal(text.length);
+    if (kept >= limit) return;
+    const selected = text.slice(0, Math.max(0, limit - kept));
+    if (selected) chunks.push(selected);
+    kept += selected.length;
+  };
+  const beginEntry = () => {
+    if (entries++ === 0) return;
+    append("\n");
+  };
   return Object.freeze({
     push(value) {
-      const text = String(value ?? "");
-      const separator = entries++ > 0 ? 1 : 0;
-      total += separator + text.length;
-      if (kept >= limit) return;
-      if (separator) {
-        chunks.push("\n");
-        kept += 1;
+      beginEntry();
+      append(nativeString(value ?? ""));
+    },
+    pushValues(values, format) {
+      beginEntry();
+      for (let index = 0; index < values.length; index += 1) {
+        if (index > 0) append(" ");
+        append(format(values[index]));
       }
-      const selected = text.slice(0, Math.max(0, limit - kept));
-      if (selected) chunks.push(selected);
-      kept += selected.length;
     },
     empty: () => entries === 0,
     text() {
@@ -163,10 +295,219 @@ function createNestedToolBudget(requestedLimit) {
   };
 }
 
+/**
+ * Measure nested tool arguments without JSON.stringify/TextEncoder. The walk
+ * stops as soon as a central byte/shape limit is crossed, rejects accessors and
+ * cyclic/non-JSON objects, and therefore runs before service-binding structured
+ * clone can materialize another unbounded graph.
+ */
+function assertNestedToolArgumentsBounded(
+  root,
+  maximumBytes = MAX_NESTED_TOOL_ARGUMENT_BYTES,
+  subject = "Nested tool arguments",
+) {
+  if (!root || typeof root !== "object" || nativeIsArray(root)) {
+    throw new NativeError("Nested tool arguments must be an object");
+  }
+
+  let bytes = 0;
+  let entries = 0;
+  let iteratedKeys = 0;
+  let nodes = 0;
+  const active = new NativeWeakSet();
+  const overflow = () => new NativeError(subject + " exceed the " + maximumBytes + " byte limit");
+  const invalid = (reason) => new NativeError(subject + " must be bounded plain JSON: " + reason);
+  const spend = (amount) => {
+    if (amount > maximumBytes - bytes) throw overflow();
+    bytes += amount;
+  };
+  const countEntry = () => {
+    entries += 1;
+    if (entries > MAX_NESTED_TOOL_ARGUMENT_ENTRIES) {
+      throw invalid("too many entries");
+    }
+  };
+  const countString = (value) => {
+    spend(2); // JSON quotes.
+    for (let index = 0; index < value.length; index += 1) {
+      const code = value.charCodeAt(index);
+      if (code === 0x22 || code === 0x5c) {
+        spend(2);
+      } else if (code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d) {
+        spend(2);
+      } else if (code < 0x20) {
+        spend(6);
+      } else if (code < 0x80) {
+        spend(1);
+      } else if (code < 0x800) {
+        spend(2);
+      } else if (code >= 0xd800 && code <= 0xdbff) {
+        const next = value.charCodeAt(index + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          spend(4);
+          index += 1;
+        } else {
+          // Well-formed JSON.stringify escapes unpaired surrogates as \udxxx.
+          spend(6);
+        }
+      } else if (code >= 0xdc00 && code <= 0xdfff) {
+        spend(6);
+      } else {
+        spend(3);
+      }
+    }
+  };
+  const visit = (value, depth) => {
+    nodes += 1;
+    if (nodes > MAX_NESTED_TOOL_ARGUMENT_NODES) {
+      throw invalid("too many values");
+    }
+    if (value === null) {
+      spend(4);
+      return;
+    }
+    const kind = typeof value;
+    if (kind === "string") {
+      countString(value);
+      return;
+    }
+    if (kind === "boolean") {
+      spend(value ? 4 : 5);
+      return;
+    }
+    if (kind === "number") {
+      // 24 bytes covers every finite IEEE-754 number; non-finite JSON numbers
+      // become null. This conservative constant avoids allocating String(value).
+      spend(nativeNumberIsFinite(value) ? 24 : 4);
+      return;
+    }
+    if (kind === "undefined") {
+      // Structured clone preserves undefined even though JSON omits it. Count
+      // a null-sized value so optional fields stay compatible but still bounded.
+      spend(4);
+      return;
+    }
+    if (kind !== "object") {
+      throw invalid("unsupported " + kind + " value");
+    }
+    if (depth > MAX_NESTED_TOOL_ARGUMENT_DEPTH) {
+      throw invalid("maximum depth exceeded");
+    }
+    if (active.has(value)) throw invalid("cyclic value");
+    const prototype = nativeGetPrototypeOf(value);
+    if (!nativeIsArray(value) && prototype !== nativeObjectPrototype && prototype !== null) {
+      throw invalid("non-plain object");
+    }
+    if (
+      nativeGetOwnPropertyDescriptor(value, "toJSON") ||
+      (prototype && nativeGetOwnPropertyDescriptor(prototype, "toJSON"))
+    ) {
+      throw invalid("custom toJSON");
+    }
+    active.add(value);
+    try {
+      if (nativeIsArray(value)) {
+        if (value.length > MAX_NESTED_TOOL_ARGUMENT_ENTRIES - entries) {
+          throw invalid("too many entries");
+        }
+        spend(2);
+        for (let index = 0; index < value.length; index += 1) {
+          countEntry();
+          if (index > 0) spend(1);
+          const descriptor = nativeGetOwnPropertyDescriptor(value, nativeString(index));
+          if (!descriptor) {
+            spend(4);
+          } else if (!("value" in descriptor)) {
+            throw invalid("accessor property");
+          } else {
+            visit(descriptor.value, depth + 1);
+          }
+        }
+        for (const key in value) {
+          iteratedKeys += 1;
+          if (iteratedKeys > MAX_NESTED_TOOL_ARGUMENT_ENTRIES) {
+            throw invalid("too many traversed keys");
+          }
+          if (!nativeHasOwn(value, key)) continue;
+          const index = nativeNumber(key);
+          if (
+            nativeNumberIsSafeInteger(index) &&
+            index >= 0 &&
+            index < value.length &&
+            nativeString(index) === key
+          ) {
+            continue;
+          }
+          throw invalid("non-index array property");
+        }
+        return;
+      }
+
+      spend(2);
+      let included = 0;
+      for (const key in value) {
+        iteratedKeys += 1;
+        if (iteratedKeys > MAX_NESTED_TOOL_ARGUMENT_ENTRIES) {
+          throw invalid("too many traversed keys");
+        }
+        if (!nativeHasOwn(value, key)) continue;
+        const descriptor = nativeGetOwnPropertyDescriptor(value, key);
+        if (!descriptor || !descriptor.enumerable) continue;
+        countEntry();
+        if (!("value" in descriptor)) throw invalid("accessor property");
+        if (included > 0) spend(1);
+        countString(key);
+        spend(1);
+        visit(descriptor.value, depth + 1);
+        included += 1;
+      }
+    } finally {
+      active.delete(value);
+    }
+  };
+
+  visit(root, 0);
+  return bytes;
+}
+
+function createNestedToolResultBudget() {
+  let used = 0;
+  const spendBytes = (bytes) => {
+    if (
+      !nativeNumberIsSafeInteger(bytes) ||
+      bytes < 0 ||
+      bytes > MAX_NESTED_TOOL_RESULT_TOTAL_BYTES - used
+    ) {
+      throw new NativeError(
+        "Nested tool results exceed the " + MAX_NESTED_TOOL_RESULT_TOTAL_BYTES
+          + " byte per-run limit; the last operation may have completed, so do not retry it",
+      );
+    }
+    used += bytes;
+  };
+  const retain = (value) => {
+    let bytes;
+    try {
+      bytes = assertNestedToolArgumentsBounded(
+        { value }, MAX_NESTED_TOOL_RESULT_BYTES, "Nested tool results",
+      );
+    } catch (error) {
+      throw new NativeError(
+        (error && typeof error.message === "string" ? error.message : "Nested tool result is invalid")
+          + "; the operation may have completed, so do not retry it",
+      );
+    }
+    spendBytes(bytes);
+    return value;
+  };
+  retain.spendBytes = spendBytes;
+  return retain;
+}
+
 function createOutputConsole(output) {
   const originalConsole = globalThis.console || {};
   const capture = (...args) => {
-    output.push(args.map(stringifyConsoleArg).join(" "));
+    output.pushValues(args, stringifyConsoleArg);
   };
   return Object.freeze({
     ...originalConsole,
@@ -798,6 +1139,45 @@ const COMPLETION_EVIDENCE_TOOLS = new Set([
 ]);
 const NON_RETRYABLE_TOOL_ERROR = /(?:\\b401\\b|\\b402\\b|unauthori[sz]ed|forbidden|permission denied|credits? (?:are )?(?:used up|exhausted)|quota|billing|reserved for the Research agent|unknown (?:code mode )?tool|not configured)/i;
 
+function boundedToolFailureMessage(value) {
+  const message = typeof value === "string" && value ? value : "tool call failed";
+  return message.length <= MAX_IDENTIFIER_CHARACTERS
+    ? message
+    : message.slice(0, MAX_IDENTIFIER_CHARACTERS - 1) + "…";
+}
+
+function createNestedInvocationRetainer(retainNestedToolResult, assertRunActive) {
+  return async (invoke) => {
+    let result;
+    try {
+      result = await invoke();
+      try {
+        assertRunActive();
+        return retainNestedToolResult(result);
+      } catch (error) {
+        if (isNativeReadableStream(result)) {
+          const lateStream = result;
+          result = undefined;
+          cancelReadableStream(
+            lateStream,
+            "Streaming nested results are unavailable",
+          );
+        }
+        throw error;
+      }
+    } catch (error) {
+      const message = boundedToolFailureMessage(error && error.message);
+      const failure = new NativeError(message +
+        (NON_RETRYABLE_TOOL_ERROR.test(message) || /do not retry/i.test(message) ? "" : "; the operation may have completed, so do not retry it"));
+      failure.name = "NestedToolError";
+      failure.stack = "";
+      throw failure;
+    } finally {
+      result = undefined;
+    }
+  };
+}
+
 function stableToolArgs(value) {
   if (Array.isArray(value)) return value.map(stableToolArgs);
   if (!value || typeof value !== "object") return value;
@@ -859,7 +1239,7 @@ function withCompletionEvidence(name, envelope) {
   return completionEvidence ? { ...envelope, completionEvidence } : envelope;
 }
 
-function createEnvelopeToolCall(name, invokeEnvelope, failureBudget = new Map()) {
+function createEnvelopeToolCall(name, invokeEnvelope, failureBudget = new Map(), assertActive = () => {}) {
   return async (args = {}) => {
     const attemptKey = toolAttemptKey(name, args);
     const previous = failureBudget.get(attemptKey);
@@ -881,6 +1261,7 @@ function createEnvelopeToolCall(name, invokeEnvelope, failureBudget = new Map())
     let envelope;
     try {
       envelope = await invokeEnvelope(name, args);
+      assertActive();
       const outcomeFailed =
         OPERATIONAL_OUTCOME_TOOLS.has(name) &&
         envelope && envelope.ok === true &&
@@ -904,9 +1285,8 @@ function createEnvelopeToolCall(name, invokeEnvelope, failureBudget = new Map())
         };
       }
     } catch (error) {
-      const message = error && typeof error.message === "string" && error.message
-        ? error.message
-        : String(error);
+      assertActive();
+      const message = boundedToolFailureMessage(error && error.message);
       console.error("[code-mode] tools RPC failed", {
         toolName: name,
         origin: "transport",
@@ -916,14 +1296,13 @@ function createEnvelopeToolCall(name, invokeEnvelope, failureBudget = new Map())
     }
 
     if (!envelope || envelope.ok !== true) {
-      const message = envelope && envelope.error && typeof envelope.error.message === "string"
-        ? envelope.error.message
-        : "tool call failed";
+      const message = boundedToolFailureMessage(envelope && envelope.error && envelope.error.message);
       const limit = NON_RETRYABLE_TOOL_ERROR.test(message) ? 1 : 2;
       const count = previous && previous.message === message ? previous.count + 1 : 1;
       failureBudget.set(attemptKey, { count, limit, message });
       envelope = {
         ...envelope,
+        ...(envelope && envelope.error ? { error: { ...envelope.error, message } } : {}),
         recovery: {
           blocked: count >= limit,
           remainingEquivalentRetries: Math.max(0, limit - count),
@@ -968,13 +1347,25 @@ function createToolsFacade(entries, search) {
   });
 }
 
-function createScreenshotFacade(binding) {
+function createAiFacade(binding, callRuntimeBinding) {
   return Object.freeze({
-    capture: (...args) => binding.capture.call(binding, ...args),
+    run: (...args) => callRuntimeBinding(args, () => {
+      const input = args[1];
+      if (input && typeof input === "object" && input.stream === true) {
+        throw new NativeError("Streaming env.AI.run is not configured in js_exec; request a non-streaming result");
+      }
+      return binding.run.call(binding, ...args);
+    }),
   });
 }
 
-function createBrowserFacade(callTool) {
+function createScreenshotFacade(binding, callRuntimeBinding) {
+  return Object.freeze({
+    capture: (...args) => callRuntimeBinding(args, () => binding.capture.call(binding, ...args)),
+  });
+}
+
+function createBrowserFacade(callTool, cleanupTool) {
   const sessionMethods = [
     "goto",
     "click",
@@ -1021,7 +1412,7 @@ function createBrowserFacade(callTool) {
   const openSessions = new Map();
   const createSessionFacade = (handle) => {
     let closed = false;
-    openSessions.set(handle.sessionId, handle);
+    nativeMapSet(openSessions, handle.sessionId, handle);
     const call = async (method, args) => {
       if (method === "close" && closed) return undefined;
       if (closed) {
@@ -1037,7 +1428,7 @@ function createBrowserFacade(callTool) {
       } finally {
         if (method === "close") {
           closed = true;
-          openSessions.delete(handle.sessionId);
+          nativeMapDelete(openSessions, handle.sessionId);
         }
       }
     };
@@ -1078,26 +1469,56 @@ function createBrowserFacade(callTool) {
     },
   });
   const cleanup = async () => {
-    const handles = Array.from(openSessions.values());
-    openSessions.clear();
-    await Promise.all(handles.map((handle) =>
-      callTool("browser_action", {
-        sessionId: handle.sessionId,
-        scriptName: handle.scriptName,
-        method: "close",
-        args: [],
-      }).catch(() => undefined)
-    ));
+    const handles = [];
+    nativeMapForEach(openSessions, (handle) => {
+      if (handles.length < MAX_NESTED_TOOL_CALLS) {
+        handles[handles.length] = handle;
+      }
+    });
+    nativeMapClear(openSessions);
+    if (handles.length === 0) return;
+    const settled = new NativePromise((resolve) => {
+      let remaining = handles.length;
+      const markSettled = () => {
+        remaining -= 1;
+        if (remaining === 0) resolve();
+      };
+      for (let index = 0; index < handles.length; index += 1) {
+        const handle = handles[index];
+        try {
+          nativePromiseThen(cleanupTool({
+            sessionId: handle.sessionId,
+            scriptName: handle.scriptName,
+            method: "close",
+            args: [],
+          }), markSettled, markSettled);
+        } catch {
+          markSettled();
+        }
+      }
+    });
+    let timer;
+    try {
+      await trustedPromiseRace([
+        settled,
+        new NativePromise((resolve) => {
+          timer = nativeSetTimeout(resolve, MAX_RUNTIME_CLEANUP_MS);
+        }),
+      ]);
+    } finally {
+      if (timer) nativeClearTimeout(timer);
+      ignorePromiseRejection(settled);
+    }
   };
   return { facade, cleanup };
 }
 
-function createCamelAiFacade(binding) {
+function createCamelAiFacade(binding, callRuntimeBinding) {
   const helpEntry = RUNTIME_HELP_ENTRIES.find((entry) => entry.name === "env.CAMELAI");
   return Object.freeze({
     help: () => cloneHelpValue(helpEntry),
-    generateImage: (...args) => binding.generateImage.call(binding, ...args),
-    transcribeAudio: (...args) => binding.transcribeAudio.call(binding, ...args),
+    generateImage: (...args) => callRuntimeBinding(args, () => binding.generateImage.call(binding, ...args)),
+    transcribeAudio: (...args) => callRuntimeBinding(args, () => binding.transcribeAudio.call(binding, ...args)),
   });
 }
 
@@ -1144,36 +1565,36 @@ function createConnectionsFacade(binding) {
     if (!payload || typeof payload !== "object" || typeof payload.status !== "number") {
       return payload;
     }
-    const headers = new Headers(payload.headers || {});
+    const headers = new NativeHeaders(payload.headers || {});
     if (payload.truncated) headers.set("x-camelai-truncated", "true");
-    return new Response(payload.bodyText || "", {
+    return new NativeResponse(payload.bodyText || "", {
       status: payload.status,
       statusText: payload.statusText || "",
       headers,
     });
   }
 
-  async function serializeFetchInput(input) {
-    if (input instanceof Request) {
-      return {
-        input: input.url,
-        init: {
-          method: input.method,
-          headers: Object.fromEntries(input.headers.entries()),
-          body: input.method === "GET" || input.method === "HEAD" ? undefined : await input.text(),
-        },
-      };
+  function serializeFetchInput(input) {
+    if (typeof input !== "string") {
+      throw new Error(
+        "Connection fetch input must be a bounded URL string; normalize URL or Request objects first",
+      );
     }
-    return { input: String(input), init: {} };
+    assertNestedToolArgumentsBounded({ input });
+    return input;
   }
 
   function serializeFetchInit(init) {
-    if (!init || typeof init !== "object") return {};
-    const output = { ...init };
-    if (init.headers) {
-      output.headers = Object.fromEntries(new Headers(init.headers).entries());
+    if (init === undefined) return {};
+    if (!init || typeof init !== "object") {
+      throw new Error("Connection fetch init must be a bounded plain object");
     }
-    return output;
+    const prototype = nativeGetPrototypeOf(init);
+    if (prototype !== nativeObjectPrototype && prototype !== null) {
+      throw new Error("Connection fetch init must be a bounded plain object");
+    }
+    assertNestedToolArgumentsBounded(init);
+    return nativeJsonParse(nativeJsonStringify(init));
   }
 
   return new Proxy({}, {
@@ -1217,13 +1638,9 @@ function createConnectionsFacade(binding) {
 
             let input = args[0] ?? {};
             if (methodName === "fetch") {
-              const serialized = await serializeFetchInput(args[0] ?? "");
               input = {
-                ...serialized,
-                init: {
-                  ...serialized.init,
-                  ...serializeFetchInit(args[1]),
-                },
+                input: serializeFetchInput(args[0] ?? ""),
+                init: serializeFetchInit(args[1]),
               };
             }
             try {
@@ -1273,21 +1690,83 @@ async function runUserCode() {
   "use strict";
 `;
   const userCodeStartLine = workerPrefixTemplate.split("\n").length;
-  const userCodeEndLine = userCodeStartLine + Math.max(1, executableUserCode.split("\n").length) - 1;
+  const userCodeEndLine =
+    userCodeStartLine + Math.max(1, executableUserCode.split("\n").length) - 1;
   const workerPrefix = workerPrefixTemplate
     .replace("__USER_CODE_START_LINE__", String(userCodeStartLine))
     .replace("__USER_CODE_END_LINE__", String(userCodeEndLine))
-    .replace("__DEFAULT_MAX_OUTPUT_CHARACTERS__", String(CODE_MODE_DEFAULT_MAX_OUTPUT_CHARACTERS))
-    .replace("__MAX_OUTPUT_CHARACTERS__", String(CODE_MODE_MAX_OUTPUT_CHARACTERS))
-    .replace("__MAX_NESTED_TOOL_CALLS__", String(CODE_MODE_MAX_NESTED_TOOL_CALLS));
+    .replace(
+      "__DEFAULT_MAX_OUTPUT_CHARACTERS__",
+      String(CODE_MODE_DEFAULT_MAX_OUTPUT_CHARACTERS),
+    )
+    .replace(
+      "__MAX_OUTPUT_CHARACTERS__",
+      String(CODE_MODE_MAX_OUTPUT_CHARACTERS),
+    )
+    .replace(
+      "__MAX_NESTED_TOOL_CALLS__",
+      String(CODE_MODE_MAX_NESTED_TOOL_CALLS),
+    )
+    .replace(
+      "__MAX_NESTED_TOOL_ARGUMENT_BYTES__",
+      String(CHAT_RUNTIME_BOUNDS.toolInputBytes),
+    )
+    .replace(
+      "__MAX_NESTED_TOOL_ARGUMENT_TOTAL_BYTES__",
+      String(CHAT_RUNTIME_BOUNDS.toolInputsPerTurnBytes),
+    )
+    .replace(
+      "__MAX_NESTED_TOOL_RESULT_BYTES__",
+      String(CHAT_RUNTIME_BOUNDS.toolResultBytes),
+    )
+    .replace(
+      "__MAX_NESTED_TOOL_RESULT_TOTAL_BYTES__",
+      String(CHAT_RUNTIME_BOUNDS.toolResultsPerTurnBytes),
+    )
+    .replace(
+      "__MAX_NESTED_TOOL_ARGUMENT_DEPTH__",
+      String(CHAT_RUNTIME_BOUNDS.providerJsonDepth),
+    )
+    .replace(
+      "__MAX_NESTED_TOOL_ARGUMENT_ENTRIES__",
+      String(CHAT_RUNTIME_BOUNDS.providerJsonEntries),
+    )
+    .replace(
+      "__MAX_NESTED_TOOL_ARGUMENT_NODES__",
+      String(CHAT_RUNTIME_BOUNDS.providerJsonNodes),
+    )
+    .replace(
+      "__MAX_SCRATCH_ENTRIES__",
+      String(CHAT_RUNTIME_BOUNDS.codeModeScratchEntries),
+    )
+    .replace(
+      "__MAX_SCRATCH_VALUE_BYTES__",
+      String(CHAT_RUNTIME_BOUNDS.codeModeScratchValueBytes),
+    )
+    .replace(
+      "__MAX_SCRATCH_TOTAL_BYTES__",
+      String(CHAT_RUNTIME_BOUNDS.codeModeScratchBytes),
+    )
+    .replace(
+      "__MAX_IDENTIFIER_CHARACTERS__",
+      String(CHAT_RUNTIME_BOUNDS.identifierChars),
+    )
+    .replace(
+      "__MAX_RUNTIME_CLEANUP_MS__",
+      String(CHAT_RUNTIME_BOUNDS.runtimeCallbackMs),
+    );
   return `${workerPrefix}${executableUserCode}${String.raw`
 }
 
 function installRuntimeGlobals(values) {
   const previous = new Map();
   for (const [key, value] of Object.entries(values)) {
-    previous.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
-    Object.defineProperty(globalThis, key, {
+    nativeMapSet(
+      previous,
+      key,
+      nativeGetOwnPropertyDescriptor(globalThis, key),
+    );
+    nativeObjectDefineProperty(globalThis, key, {
       configurable: true,
       enumerable: false,
       writable: true,
@@ -1295,35 +1774,247 @@ function installRuntimeGlobals(values) {
     });
   }
   return () => {
-    for (const [key, descriptor] of previous.entries()) {
+    nativeMapForEach(previous, (descriptor, key) => {
       if (descriptor) {
-        Object.defineProperty(globalThis, key, descriptor);
+        nativeObjectDefineProperty(globalThis, key, descriptor);
       } else {
         delete globalThis[key];
       }
-    }
+    });
   };
 }
 
-function installSecureFetch(secureFetchBinding) {
+function installSecureFetch(
+  secureFetchBinding,
+  assertRunActive,
+  reserveFetch = (_input, _init, invoke) => invoke(),
+  retainBodyBytes = (_bytes) => {},
+) {
   if (!secureFetchBinding || typeof secureFetchBinding.fetch !== "function") {
     return () => {};
   }
-  const nativeFetch = globalThis.fetch.bind(globalThis);
-  globalThis.fetch = (input, init) => secureFetchBinding.fetch(input, init);
+  const previousFetch = nativeGetOwnPropertyDescriptor(globalThis, "fetch");
+  const openBodies = new Map();
+  const forgetBody = (body) => nativeMapDelete(openBodies, body);
+  const cancelBody = (body, cancel, reason) => {
+    forgetBody(body);
+    try {
+      ignorePromiseRejection(cancel(reason));
+    } catch {
+      // Cancellation is best effort after the capability has been fenced.
+    }
+  };
+  const boundedResponse = (response) => {
+    let sourceBody;
+    try {
+      sourceBody = nativeResponseBody(response);
+    } catch {
+      throw new NativeError("Secure fetch returned an invalid response");
+    }
+    if (sourceBody === null) return response;
+    const sourceHeaders = nativeResponseHeaders(response);
+    const declaredText = nativeHeadersGet(sourceHeaders, "content-length");
+    const declaredBytes = declaredText === null ? null : nativeNumber(declaredText);
+    if (
+      declaredBytes !== null &&
+      nativeNumberIsFinite(declaredBytes) &&
+      declaredBytes > MAX_NESTED_TOOL_RESULT_BYTES
+    ) {
+      cancelReadableStream(sourceBody, "secure fetch response exceeds its byte limit");
+      throw new NativeError(
+        "Secure fetch response exceeds the " + MAX_NESTED_TOOL_RESULT_BYTES + " byte limit",
+      );
+    }
+
+    const reader = nativeReadableStreamGetReader(sourceBody);
+    let retainedBytes = 0;
+    let finished = false;
+    let limitedBody;
+    const cancelSource = (reason) => {
+      if (finished) return new NativePromise((resolve) => resolve());
+      finished = true;
+      return nativeReadableStreamReaderCancel(reader, reason);
+    };
+    limitedBody = new NativeReadableStream({
+      async pull(controller) {
+        let item;
+        try {
+          item = await nativeReadableStreamReaderRead(reader);
+        } catch {
+          finished = true;
+          forgetBody(limitedBody);
+          nativeReadableStreamControllerError(
+            controller,
+            new NativeError("Secure fetch response stream failed"),
+          );
+          return;
+        }
+        if (item.done) {
+          finished = true;
+          forgetBody(limitedBody);
+          nativeReadableStreamControllerClose(controller);
+          return;
+        }
+        const chunk = item.value;
+        let chunkBytes;
+        try {
+          chunkBytes = nativeTypedArrayByteLength(chunk);
+        } catch {
+          cancelBody(limitedBody, cancelSource, "secure fetch returned a non-byte response chunk");
+          nativeReadableStreamControllerError(
+            controller,
+            new NativeError("Secure fetch returned a non-byte response chunk"),
+          );
+          return;
+        }
+        if (chunkBytes > MAX_NESTED_TOOL_RESULT_BYTES - retainedBytes) {
+          cancelBody(limitedBody, cancelSource, "secure fetch response exceeds its byte limit");
+          nativeReadableStreamControllerError(
+            controller,
+            new NativeError(
+              "Secure fetch response exceeds the " + MAX_NESTED_TOOL_RESULT_BYTES + " byte limit",
+            ),
+          );
+          return;
+        }
+        try {
+          retainBodyBytes(chunkBytes);
+        } catch (error) {
+          cancelBody(limitedBody, cancelSource, "secure fetch responses exceed the per-run byte limit");
+          nativeReadableStreamControllerError(controller, error);
+          return;
+        }
+        retainedBytes += chunkBytes;
+        nativeReadableStreamControllerEnqueue(controller, chunk);
+      },
+      cancel(reason) {
+        forgetBody(limitedBody);
+        return cancelSource(reason);
+      },
+    });
+    nativeMapSet(openBodies, limitedBody, cancelSource);
+
+    const headers = new NativeHeaders();
+    nativeHeadersForEach(sourceHeaders, (value, key) => {
+      nativeHeadersAppend(headers, key, value);
+    });
+    let wrapped;
+    try {
+      wrapped = new NativeResponse(limitedBody, {
+        status: nativeResponseStatus(response),
+        statusText: nativeResponseStatusText(response),
+        headers,
+      });
+    } catch (error) {
+      cancelBody(limitedBody, cancelSource, "secure fetch response wrapping failed");
+      throw error;
+    }
+    return wrapped;
+  };
+  nativeObjectDefineProperty(globalThis, "fetch", {
+    configurable: true,
+    enumerable: previousFetch ? previousFetch.enumerable : true,
+    writable: true,
+    value: async (input, init) => {
+      assertRunActive();
+      const response = await reserveFetch(
+        input,
+        init,
+        () => secureFetchBinding.fetch(input, init),
+      );
+      try {
+        assertRunActive();
+        return boundedResponse(response);
+      } catch (error) {
+        let body = null;
+        try {
+          body = nativeResponseBody(response);
+        } catch {
+          // An invalid binding result has no owned response body to cancel.
+        }
+        if (isNativeReadableStream(body)) {
+          cancelReadableStream(body, "js_exec completed before fetch");
+        }
+        throw error;
+      }
+    },
+  });
   return () => {
-    globalThis.fetch = nativeFetch;
+    nativeMapForEach(openBodies, (cancel, body) => {
+      cancelBody(body, cancel, "js_exec completed before fetch body was consumed");
+    });
+    nativeMapClear(openBodies);
+    if (previousFetch) {
+      nativeObjectDefineProperty(globalThis, "fetch", previousFetch);
+    } else {
+      delete globalThis.fetch;
+    }
   };
 }
 
 export class CodeModeRunner extends WorkerEntrypoint {
   async run(timeoutMs, maxTimeoutMs, maxOutputCharacters, maxNestedToolCalls) {
-    hardenTimingSurface();
     const output = createOutputBuffer(maxOutputCharacters);
     const nestedToolCall = createNestedToolBudget(maxNestedToolCalls);
-    globalThis.console = createOutputConsole(output);
-    const cleanupSecureFetch = installSecureFetch(this.env.SECURE_FETCH);
-    const registeredTools = Object.freeze((await this.env.TOOLS.listTools()).map((tool) => Object.freeze({
+    const retainNestedToolResult = createNestedToolResultBudget();
+    const scratch = new Map();
+    const scratchSizes = new Map();
+    let scratchBytes = 0;
+    let runActive = true;
+    const assertRunActive = () => {
+      if (!runActive) throw new Error("js_exec is no longer active");
+    };
+    let timeoutHandle;
+    const timeout = new NativePromise((_, reject) => {
+      timeoutHandle = nativeSetTimeout(() => {
+        runActive = false;
+        const error = new NativeError(
+          "JavaScript execution timed out after " + timeoutMs +
+          "ms. Do not retry this js_exec in the same turn. " +
+          "If a longer run is needed, start a new turn with a timeout up to " +
+          maxTimeoutMs + "ms."
+        );
+        error.name = "CodeModeTimeoutError";
+        reject(error);
+      }, timeoutMs);
+    });
+    const previousConsole = nativeGetOwnPropertyDescriptor(globalThis, "console");
+    let cleanupSecureFetch;
+    let cleanupRuntimeGlobals;
+    let browserRuntime;
+    try {
+      hardenTimingSurface();
+    let nestedToolArgumentBytes = 0;
+    const dispatchNestedTool = (args, invoke) => nestedToolCall(() => {
+      assertRunActive();
+      const argumentBytes = assertNestedToolArgumentsBounded(args);
+      if (argumentBytes > MAX_NESTED_TOOL_ARGUMENT_TOTAL_BYTES - nestedToolArgumentBytes) {
+        throw new Error(
+          "Nested tool arguments exceed the " + MAX_NESTED_TOOL_ARGUMENT_TOTAL_BYTES + " byte per-run limit",
+        );
+      }
+      nestedToolArgumentBytes += argumentBytes;
+      return invoke();
+    });
+    const retainNestedInvocation = createNestedInvocationRetainer(
+      retainNestedToolResult,
+      assertRunActive,
+    );
+    nativeObjectDefineProperty(globalThis, "console", {
+      configurable: true,
+      enumerable: previousConsole ? previousConsole.enumerable : false,
+      writable: true,
+      value: createOutputConsole(output),
+    });
+    cleanupSecureFetch = installSecureFetch(
+      this.env.SECURE_FETCH,
+      assertRunActive,
+      (input, init, invoke) => dispatchNestedTool({ input, init }, invoke),
+      retainNestedToolResult.spendBytes,
+    );
+    const listedTools = await trustedPromiseRace([timeout, this.env.TOOLS.listTools()]);
+    assertRunActive();
+    const registeredTools = Object.freeze(listedTools.map((tool) => Object.freeze({
       ...tool,
       parameters: tool.parameters,
       examples: Array.isArray(tool.examples) ? tool.examples : [],
@@ -1338,8 +2029,11 @@ export class CodeModeRunner extends WorkerEntrypoint {
       TOOL_DESCRIBE_DEFINITION,
       ...registeredTools.filter((tool) => !tool.hidden),
     ]);
-    const callTool = (name, args = {}) => nestedToolCall(() => this.env.TOOLS.callTool(name, args));
-    const invokeEnvelope = (name, args = {}) => nestedToolCall(() => this.env.TOOLS.callToolEnvelope(name, args));
+    const callTool = (name, args = {}) => dispatchNestedTool(args, () =>
+      retainNestedInvocation(() => this.env.TOOLS.callTool(name, args))
+    );
+    const invokeEnvelope = (name, args = {}) =>
+      retainNestedInvocation(() => this.env.TOOLS.callToolEnvelope(name, args));
     const help = createToolHelp(ALL_TOOLS);
     const search = createToolSearch(ALL_TOOLS);
     const describe = createToolDescribe(ALL_TOOLS);
@@ -1347,10 +2041,15 @@ export class CodeModeRunner extends WorkerEntrypoint {
       registeredTools.map((tool) => [tool.name, (args = {}) => callTool(tool.name, args)]),
     ));
     const failureBudget = new Map();
-    const toolEntries = registeredTools.map((tool) => [
-      tool.name,
-      createEnvelopeToolCall(tool.name, invokeEnvelope, failureBudget),
-    ]);
+    const toolEntries = registeredTools.map((tool) => {
+      const invoke = createEnvelopeToolCall(
+        tool.name,
+        invokeEnvelope,
+        failureBudget,
+        assertRunActive,
+      );
+      return [tool.name, (args = {}) => dispatchNestedTool(args, () => invoke(args))];
+    });
     const tools = createToolsFacade([
       ["help", help],
       ["search", search],
@@ -1360,28 +2059,59 @@ export class CodeModeRunner extends WorkerEntrypoint {
     const CONNECTIONS_BINDING = createToolBackedConnectionsBinding(callTool);
     const connections = createConnectionsFacade(CONNECTIONS_BINDING);
     const CONNECTIONS = connections;
-    const AI = this.env.AI;
-    const CAMELAI = createCamelAiFacade(this.env.CAMELAI);
-    const SCREENSHOT = createScreenshotFacade(this.env.SCREENSHOT);
-    const browserRuntime = createBrowserFacade(callTool);
+    const callRuntimeBinding = (args, invoke) => dispatchNestedTool({ args }, () =>
+      retainNestedInvocation(invoke)
+    );
+    const AI = createAiFacade(this.env.AI, callRuntimeBinding);
+    const CAMELAI = createCamelAiFacade(this.env.CAMELAI, callRuntimeBinding);
+    const SCREENSHOT = createScreenshotFacade(this.env.SCREENSHOT, callRuntimeBinding);
+    browserRuntime = createBrowserFacade(
+      callTool,
+      (args) => this.env.TOOLS.callTool("browser_action", args),
+    );
     const BROWSER = browserRuntime.facade;
     const WORKSPACE = createWorkspaceFacade(callTool);
     const PROJECTS = createProjectsFacade(rawTools);
     const env = Object.freeze({ CONNECTIONS, AI, CAMELAI, SCREENSHOT, BROWSER, WORKSPACE, PROJECTS });
     const context = Object.freeze({ cloudflare: Object.freeze({ env, connections, projects: env.PROJECTS }) });
     const text = (value) => {
+      assertRunActive();
       output.push(stringifyOutput(value));
     };
     const load = (key) => {
-      if (typeof key !== "string" || !key) throw new Error("load key must be a non-empty string");
-      return store.get(key);
+      assertRunActive();
+      if (typeof key !== "string" || !key || key.length > MAX_IDENTIFIER_CHARACTERS) {
+        throw new Error("load key must be a bounded non-empty string");
+      }
+      const serialized = scratch.get(key);
+      return serialized === undefined ? undefined : nativeJsonParse(serialized);
     };
     const save = (key, value) => {
-      if (typeof key !== "string" || !key) throw new Error("store key must be a non-empty string");
-      store.set(key, value);
+      assertRunActive();
+      if (typeof key !== "string" || !key || key.length > MAX_IDENTIFIER_CHARACTERS) {
+        throw new Error("store key must be a bounded non-empty string");
+      }
+      if (!scratch.has(key) && scratch.size >= MAX_SCRATCH_ENTRIES) {
+        throw new Error("store entry limit reached (" + MAX_SCRATCH_ENTRIES + ")");
+      }
+      const valueBytes = assertNestedToolArgumentsBounded(
+        { value },
+        MAX_SCRATCH_VALUE_BYTES,
+      );
+      const serialized = nativeJsonStringify(value);
+      const previousBytes = scratchSizes.get(key) || 0;
+      const retainedBytes = valueBytes + key.length * 2;
+      if (retainedBytes > MAX_SCRATCH_TOTAL_BYTES - (scratchBytes - previousBytes)) {
+        throw new Error("store exceeds the " + MAX_SCRATCH_TOTAL_BYTES + " byte per-run limit");
+      }
+      // Retain immutable JSON text, not a caller-owned object that can grow
+      // after admission or be mutated through a later load.
+      scratch.set(key, serialized);
+      scratchSizes.set(key, retainedBytes);
+      scratchBytes += retainedBytes - previousBytes;
     };
 
-    const cleanupRuntimeGlobals = installRuntimeGlobals({
+    cleanupRuntimeGlobals = installRuntimeGlobals({
       tools,
       CONNECTIONS,
       connections,
@@ -1394,23 +2124,11 @@ export class CodeModeRunner extends WorkerEntrypoint {
       save,
       load,
     });
-    let timeoutHandle;
-    try {
-      const result = await Promise.race([
-        runUserCode(),
-        new Promise((_, reject) => {
-          timeoutHandle = setTimeout(() => {
-            const error = new Error(
-              "JavaScript execution timed out after " + timeoutMs +
-              "ms. Do not retry this js_exec in the same turn. " +
-              "If a longer run is needed, start a new turn with a timeout up to " +
-              maxTimeoutMs + "ms."
-            );
-            error.name = "CodeModeTimeoutError";
-            reject(error);
-          }, timeoutMs);
-        }),
-      ]);
+      // Arm the trusted wall timer before user code can replace shared globals
+      // or mutate intrinsics and synchronously return a pending promise.
+      const userResult = runUserCode();
+      const result = await trustedPromiseRace([timeout, userResult]);
+      runActive = false;
       if (result !== undefined) output.push(stringifyOutput(result));
       if (output.empty()) {
         // A silent blank reads as a rendering failure and sends agents down
@@ -1426,15 +2144,44 @@ export class CodeModeRunner extends WorkerEntrypoint {
       }
       return { text: output.text() };
     } catch (error) {
+      runActive = false;
       if (error && error.name === "CodeModeTimeoutError") throw error;
       const formatted = formatRuntimeError(error);
       output.push((output.empty() ? "" : "\n") + "JavaScript execution failed: " + formatted);
       throw new Error(output.text());
     } finally {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-      await browserRuntime.cleanup();
-      cleanupSecureFetch();
-      cleanupRuntimeGlobals();
+      if (timeoutHandle) nativeClearTimeout(timeoutHandle);
+      try {
+        try {
+          await browserRuntime?.cleanup();
+        } catch {
+          // Cleanup must not replace the primary result or error.
+        }
+      } finally {
+        runActive = false;
+        nativeMapClear(scratch);
+        nativeMapClear(scratchSizes);
+        try {
+          cleanupSecureFetch?.();
+        } catch {
+          // Cleanup failure must not skip restoration of the other globals.
+        }
+        try {
+          cleanupRuntimeGlobals?.();
+        } catch {
+          // User code can make a global non-configurable; this worker run is
+          // already fenced, and cleanup must not replace the primary outcome.
+        }
+        try {
+          if (previousConsole) {
+            nativeObjectDefineProperty(globalThis, "console", previousConsole);
+          } else {
+            delete globalThis.console;
+          }
+        } catch {
+          // Restoration failure cannot replace the primary result or error.
+        }
+      }
     }
   }
 }

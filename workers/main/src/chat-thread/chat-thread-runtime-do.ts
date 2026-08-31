@@ -119,14 +119,17 @@ function cloneJson<T>(
 }
 
 /** Keeps the newest JSON-safe entries within both the shared count and byte caps. */
-function boundedList<T>(input: readonly T[]): T[] {
+function boundedList<T>(
+  input: readonly T[],
+  limit = CHAT_RUNTIME_BOUNDS.snapshotBytes,
+): T[] {
   const result: T[] = [];
   let used = 2;
   for (const value of input.slice(-CHAT_RUNTIME_BOUNDS.snapshotMessages)) {
-    const copy = cloneJson(value);
+    const copy = cloneJson(value, limit);
     if (copy === null) continue;
     const size = bytes(JSON.stringify(copy)) + (result.length ? 1 : 0);
-    if (used + size > CHAT_RUNTIME_BOUNDS.snapshotBytes) continue;
+    if (used + size > limit) continue;
     result.push(copy);
     used += size;
   }
@@ -460,7 +463,7 @@ export class ChatThreadRuntimeDO extends DurableObject<ChatEnv> {
       CHAT_RUNTIME_KV_KEYS.evalRun,
     );
     if (run?.turnId !== turnId) return;
-    const copy = cloneJson(event, CHAT_RUNTIME_BOUNDS.outboxEventBytes);
+    const copy = cloneJson(event, CHAT_RUNTIME_BOUNDS.evalEventBytes);
     if (!copy) return;
     const events =
       this.ctx.storage.kv.get<Array<Record<string, unknown>>>(
@@ -484,7 +487,7 @@ export class ChatThreadRuntimeDO extends DurableObject<ChatEnv> {
           CHAT_RUNTIME_KV_KEYS.evalRun,
         );
         if (!turnId || run?.turnId !== turnId) return;
-        const childBytes = Math.floor(CHAT_RUNTIME_BOUNDS.outboxEventBytes / 3);
+        const childBytes = Math.floor(CHAT_RUNTIME_BOUNDS.evalEventBytes / 3);
         this.appendEvalEvent(turnId, {
           type: "runtime_event",
           event: {
@@ -654,9 +657,18 @@ export class ChatThreadRuntimeDO extends DurableObject<ChatEnv> {
     const context = this.context()!;
     const message = typeof body.message === "string" ? body.message.trim() : "";
     if (!message) return { status: "error", error: "Missing message" };
-    const clientMessageId = body.clientMessageId?.trim() ||
-      body.automationRun?.runId?.trim() || crypto.randomUUID();
-    const source = body.messageSource?.trim() || "web";
+    const clientMessageId =
+      (typeof body.clientMessageId === "string"
+        ? body.clientMessageId.trim()
+        : "") ||
+      (typeof body.automationRun?.runId === "string"
+        ? body.automationRun.runId.trim()
+        : "") ||
+      crypto.randomUUID();
+    const source =
+      (typeof body.messageSource === "string"
+        ? body.messageSource.trim()
+        : "") || "web";
     if (!validId(clientMessageId) || !validId(source)) {
       return { status: "error", error: "Invalid message id or source" };
     }
@@ -667,6 +679,7 @@ export class ChatThreadRuntimeDO extends DurableObject<ChatEnv> {
         CHAT_RUNTIME_BOUNDS.alarmWriteMs,
       );
     } catch {
+      this.ctx.abort("Compatibility admission alarm pre-arm timed out");
       return { status: "error", error: "Could not schedule turn" };
     }
     const result = this.store.admit(
@@ -676,7 +689,10 @@ export class ChatThreadRuntimeDO extends DurableObject<ChatEnv> {
         threadId: context.threadId,
         workspaceId: context.workspaceId,
         orgId: context.orgId,
-        userId: body.userId?.trim() || context.userId,
+        userId:
+          typeof body.userId === "string"
+            ? body.userId.trim() || context.userId
+            : context.userId,
         source,
         userContent: message,
         userDisplay: message,
@@ -775,67 +791,42 @@ export class ChatThreadRuntimeDO extends DurableObject<ChatEnv> {
   }
 
   private previewState(): PreviewState {
-    let tabs = boundedList(
-      this.ctx.storage.kv.get<PreviewTarget[]>(
-        CHAT_RUNTIME_KV_KEYS.previewTabs,
-      ) ?? [],
-    ).flatMap((target) => {
+    let tabs = boundedList(this.ctx.storage.kv.get<PreviewTarget[]>(CHAT_RUNTIME_KV_KEYS.previewTabs) ?? []).flatMap((target) => {
       const normalized = normalizePreviewTarget(target);
       return normalized ? [normalized] : [];
     });
     if (!tabs.length) {
-      const legacy = normalizePreviewTarget(
-        this.ctx.storage.kv.get<PreviewTarget>(
-          CHAT_RUNTIME_KV_KEYS.previewTarget,
-        ),
-      );
+      const legacy = normalizePreviewTarget(this.ctx.storage.kv.get<PreviewTarget>(CHAT_RUNTIME_KV_KEYS.previewTarget));
       if (legacy) tabs = [legacy];
     }
-    const active = this.ctx.storage.kv.get<string | null>(
-      CHAT_RUNTIME_KV_KEYS.previewActiveTabId,
-    );
+    const active = this.ctx.storage.kv.get<string | null>(CHAT_RUNTIME_KV_KEYS.previewActiveTabId);
     const activeTabId =
-      typeof active === "string" &&
-      tabs.some((tab) => getPreviewTabId(tab) === active)
+      typeof active === "string" && tabs.some((tab) => getPreviewTabId(tab) === active)
         ? active
-        : tabs[0]
-          ? getPreviewTabId(tabs[0])
-          : null;
-    const storedVersion = this.ctx.storage.kv.get<number>(
-      CHAT_RUNTIME_KV_KEYS.previewVersion,
-    );
+        : tabs[0] ? getPreviewTabId(tabs[0]) : null;
+    const storedVersion = this.ctx.storage.kv.get<number>(CHAT_RUNTIME_KV_KEYS.previewVersion);
     return {
       tabs,
       activeTabId,
       target: tabs.find((tab) => getPreviewTabId(tab) === activeTabId) ?? null,
-      version: Number.isFinite(storedVersion)
-        ? Math.max(0, Math.floor(storedVersion!))
-        : 0,
+      version: Number.isFinite(storedVersion) ? Math.max(0, Math.floor(storedVersion!)) : 0,
     };
   }
 
   private putPreview(state: Omit<PreviewState, "version">): void {
     const current = this.previewState();
-    const tabs = boundedList(state.tabs);
+    const tabs = boundedList(state.tabs, CHAT_RUNTIME_BOUNDS.coarseStateBytes / 8);
     const activeTabId =
-      state.activeTabId &&
-      tabs.some((tab) => getPreviewTabId(tab) === state.activeTabId)
+      state.activeTabId && tabs.some((tab) => getPreviewTabId(tab) === state.activeTabId)
         ? state.activeTabId
-        : tabs[0]
-          ? getPreviewTabId(tabs[0])
-          : null;
-    const target =
-      tabs.find((tab) => getPreviewTabId(tab) === activeTabId) ?? null;
-    this.ctx.storage.kv.put(CHAT_RUNTIME_KV_KEYS.previewTabs, tabs);
-    this.ctx.storage.kv.put(
-      CHAT_RUNTIME_KV_KEYS.previewActiveTabId,
-      activeTabId,
-    );
-    this.ctx.storage.kv.put(CHAT_RUNTIME_KV_KEYS.previewTarget, target);
-    this.ctx.storage.kv.put(
-      CHAT_RUNTIME_KV_KEYS.previewVersion,
-      current.version + 1,
-    );
+        : tabs[0] ? getPreviewTabId(tabs[0]) : null;
+    const target = tabs.find((tab) => getPreviewTabId(tab) === activeTabId) ?? null;
+    this.store.commitCoarseState(() => {
+      this.ctx.storage.kv.put(CHAT_RUNTIME_KV_KEYS.previewTabs, tabs);
+      this.ctx.storage.kv.put(CHAT_RUNTIME_KV_KEYS.previewActiveTabId, activeTabId);
+      this.ctx.storage.kv.put(CHAT_RUNTIME_KV_KEYS.previewTarget, target);
+      this.ctx.storage.kv.put(CHAT_RUNTIME_KV_KEYS.previewVersion, current.version + 1);
+    });
     this.publish();
   }
 
@@ -844,25 +835,16 @@ export class ChatThreadRuntimeDO extends DurableObject<ChatEnv> {
   }
 
   getPreviewState(): PreviewState {
-    return (
-      cloneJson(this.previewState()) ?? {
-        target: null,
-        tabs: [],
-        activeTabId: null,
-        version: 0,
-      }
-    );
+    return cloneJson(this.previewState()) ?? {
+      target: null, tabs: [], activeTabId: null, version: 0,
+    };
   }
 
   async setPreviewTarget(target: PreviewTarget | null): Promise<void> {
     const normalized = normalizePreviewTarget(target);
     if (target && !normalized) throw new Error("Invalid preview target");
     const context = this.context();
-    if (
-      normalized?.kind === "file" &&
-      context &&
-      normalized.workspaceId !== context.workspaceId
-    ) {
+    if (normalized?.kind === "file" && context && normalized.workspaceId !== context.workspaceId) {
       throw new Error("Invalid preview target workspace");
     }
     this.putPreview({
@@ -872,20 +854,13 @@ export class ChatThreadRuntimeDO extends DurableObject<ChatEnv> {
     });
   }
 
-  async setPreviewTabsState(
-    tabs: PreviewTarget[],
-    activeTabId: string | null,
-  ): Promise<void> {
+  async setPreviewTabsState(tabs: PreviewTarget[], activeTabId: string | null): Promise<void> {
     const context = this.context();
     const deduped = new Map<string, PreviewTarget>();
     for (const value of boundedList(Array.isArray(tabs) ? tabs : [])) {
       const target = normalizePreviewTarget(value);
       if (!target) continue;
-      if (
-        target.kind === "file" &&
-        context &&
-        target.workspaceId !== context.workspaceId
-      ) {
+      if (target.kind === "file" && context && target.workspaceId !== context.workspaceId) {
         throw new Error("Invalid preview target workspace");
       }
       deduped.set(getPreviewTabId(target), target);
@@ -894,8 +869,7 @@ export class ChatThreadRuntimeDO extends DurableObject<ChatEnv> {
     this.putPreview({
       tabs: resolved,
       activeTabId,
-      target:
-        resolved.find((tab) => getPreviewTabId(tab) === activeTabId) ?? null,
+      target: resolved.find((tab) => getPreviewTabId(tab) === activeTabId) ?? null,
     });
   }
 
@@ -903,27 +877,22 @@ export class ChatThreadRuntimeDO extends DurableObject<ChatEnv> {
     await this.setPreviewTarget(null);
   }
 
-  async setPreviewAppVisibility(
-    scriptName: string,
-    isPublic: boolean,
-  ): Promise<void> {
+  async setPreviewAppVisibility(scriptName: string, isPublic: boolean): Promise<void> {
     const state = this.previewState();
     const tabs = state.tabs.map((tab) =>
       tab.kind === "app" && tab.scriptName === scriptName
         ? { ...tab, isPublic }
         : tab,
     );
-    this.putPreview({
-      tabs,
-      activeTabId: state.activeTabId,
-      target: state.target,
-    });
+    this.putPreview({ tabs, activeTabId: state.activeTabId, target: state.target });
   }
 
   async setTitle(title: string, _updatedAt?: number): Promise<void> {
-    const value = boundText(title.trim());
+    const value = boundText(title.trim(), CHAT_RUNTIME_BOUNDS.coarseStateBytes / 8);
     if (value) {
-      this.ctx.storage.kv.put(CHAT_RUNTIME_KV_KEYS.title, value);
+      this.store.commitCoarseState(() =>
+        this.ctx.storage.kv.put(CHAT_RUNTIME_KV_KEYS.title, value),
+      );
       this.publish();
     }
   }
@@ -931,22 +900,22 @@ export class ChatThreadRuntimeDO extends DurableObject<ChatEnv> {
   async setModel(model: LlmModel, _updatedAt?: number): Promise<void> {
     const value = String(model).trim();
     if (!validId(value)) throw new Error("Invalid model");
-    this.ctx.storage.kv.put(CHAT_RUNTIME_KV_KEYS.model, value as LlmModel);
+    this.store.commitCoarseState(() =>
+      this.ctx.storage.kv.put(CHAT_RUNTIME_KV_KEYS.model, value as LlmModel),
+    );
     this.publish();
   }
 
   async setTodoState(todos: unknown[]): Promise<void> {
-    this.ctx.storage.kv.put(
-      CHAT_RUNTIME_KV_KEYS.todos,
-      boundedList(Array.isArray(todos) ? todos : []),
+    const bounded = boundedList(Array.isArray(todos) ? todos : [], (CHAT_RUNTIME_BOUNDS.coarseStateBytes * 3) / 8);
+    this.store.commitCoarseState(() =>
+      this.ctx.storage.kv.put(CHAT_RUNTIME_KV_KEYS.todos, bounded),
     );
     this.publish();
   }
 
   getTodoState(): unknown[] {
-    return boundedList(
-      this.ctx.storage.kv.get<unknown[]>(CHAT_RUNTIME_KV_KEYS.todos) ?? [],
-    );
+    return boundedList(this.ctx.storage.kv.get<unknown[]>(CHAT_RUNTIME_KV_KEYS.todos) ?? []);
   }
 
   async appendChannelHistoryEvent(
@@ -1475,25 +1444,26 @@ export class ChatThreadRuntimeDO extends DurableObject<ChatEnv> {
 
   private coarseState(): Record<string, unknown> {
     const preview = this.previewState();
+    const previewTabs = boundedList(preview.tabs, CHAT_RUNTIME_BOUNDS.coarseStateBytes / 8);
+    const previewActiveTabId =
+      preview.activeTabId && previewTabs.some((tab) => getPreviewTabId(tab) === preview.activeTabId)
+        ? preview.activeTabId
+        : previewTabs[0] ? getPreviewTabId(previewTabs[0]) : null;
     const migration = this.migrator.status();
     return {
-      previewTarget: preview.target,
-      previewTabs: preview.tabs,
-      previewActiveTabId: preview.activeTabId,
+      previewTarget: previewTabs.find((tab) => getPreviewTabId(tab) === previewActiveTabId) ?? null,
+      previewTabs, previewActiveTabId,
       previewVersion: preview.version,
-      currentTodos: this.getTodoState(),
-      title:
-        this.ctx.storage.kv.get<string>(CHAT_RUNTIME_KV_KEYS.title) ?? null,
-      model:
-        this.ctx.storage.kv.get<LlmModel>(CHAT_RUNTIME_KV_KEYS.model) ?? null,
-      legacyMigrationError:
-        migration.state === "failed"
-          ? {
-              id: `legacy-migration:${migration.deadlineAt ?? 0}`,
-              error:
-                "Recent chat history could not be restored. This message will continue without older context.",
-            }
-          : null,
+      currentTodos: boundedList(this.getTodoState(), (CHAT_RUNTIME_BOUNDS.coarseStateBytes * 3) / 8),
+      title: boundText(
+        this.ctx.storage.kv.get<string>(CHAT_RUNTIME_KV_KEYS.title) ?? "",
+        CHAT_RUNTIME_BOUNDS.coarseStateBytes / 8,
+      ) || null,
+      model: this.ctx.storage.kv.get<LlmModel>(CHAT_RUNTIME_KV_KEYS.model) ?? null,
+      legacyMigrationError: migration.state === "failed" ? {
+        id: `legacy-migration:${migration.deadlineAt ?? 0}`,
+        error: "Recent chat history could not be restored. This message will continue without older context.",
+      } : null,
     };
   }
 }

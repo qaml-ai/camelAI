@@ -107,6 +107,55 @@ describe("Pi checkpoint protocol adapter", () => {
     await expect(result).resolves.toBe(final);
   });
 
+  it("bounds presentation work for a maximum-size burst of cumulative deltas", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const text = "x".repeat(64 * 1024);
+    const partial = (value: string): AssistantMessage => ({
+      ...response,
+      content: [{ type: "text", text: value }],
+      stopReason: "stop",
+    });
+    const final = partial(text);
+    const stream = {
+      async *[Symbol.asyncIterator]() {
+        for (
+          let index = 0;
+          index < CHAT_RUNTIME_BOUNDS.providerStreamEvents;
+          index += 1
+        ) {
+          yield {
+            type: "text_delta",
+            contentIndex: 0,
+            delta: "x",
+            partial: partial(
+              text.slice(
+                0,
+                Math.ceil(
+                  ((index + 1) * text.length) /
+                    CHAT_RUNTIME_BOUNDS.providerStreamEvents,
+                ),
+              ),
+            ),
+          };
+        }
+      },
+      result: vi.fn(() => final),
+    } as unknown as Parameters<typeof consumePiProviderStream>[0];
+    const progress = vi.fn();
+
+    try {
+      await expect(
+        consumePiProviderStream(stream, new AbortController().signal, progress),
+      ).resolves.toBe(final);
+      expect(progress).toHaveBeenCalledTimes(1);
+      expect(progress.mock.calls[0]?.[0]).toEqual([
+        { type: "text", text: text.slice(0, 8) },
+      ]);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it("rejects a provider stream that exceeds its finite event budget", async () => {
     const stream = {
       async *[Symbol.asyncIterator]() {
@@ -506,14 +555,19 @@ describe("Pi checkpoint protocol adapter", () => {
 
 describe("Pi attempt setup bounds", () => {
   it("keeps the scheduled outcome tool fixed and bounded", () => {
-    expect(buildBoundedToolCatalog([PI_AUTOMATION_OUTCOME_TOOL_DEFINITION]))
-      .toEqual([expect.objectContaining({
+    expect(
+      buildBoundedToolCatalog([PI_AUTOMATION_OUTCOME_TOOL_DEFINITION]),
+    ).toEqual([
+      expect.objectContaining({
         name: "report_automation_outcome",
-        parameters: expect.objectContaining({ required: ["status", "summary"] }),
-      })]);
+        parameters: expect.objectContaining({
+          required: ["status", "summary"],
+        }),
+      }),
+    ]);
   });
 
-  it("advertises bounded js_exec and scopes inner tools to its provider call", async () => {
+  it("advertises bounded js_exec and shares its attempt-level tool ledger", async () => {
     const catalog = buildBoundedToolCatalog([PI_JS_EXEC_TOOL_DEFINITION]);
     expect(catalog).toContainEqual(
       expect.objectContaining({
@@ -553,16 +607,19 @@ describe("Pi attempt setup bounds", () => {
       env: { CODE_MODE_LOADER: { load } } as never,
       store: { activeTurn: () => turn } as never,
     });
-    const result = await adapter.callTool({
-      id: "provider-js-call",
-      name: "js_exec",
-      input: {
-        description: "return output",
-        code: "'ok'",
-        timeoutMs: Number.MAX_SAFE_INTEGER,
-        maxOutputCharacters: Number.MAX_SAFE_INTEGER,
+    const result = (await adapter.callTool(
+      {
+        id: "provider-js-call",
+        name: "js_exec",
+        input: {
+          description: "return output",
+          code: "'ok'",
+          timeoutMs: Number.MAX_SAFE_INTEGER,
+          maxOutputCharacters: Number.MAX_SAFE_INTEGER,
+        },
       },
-    }, new AbortController().signal) as {
+      new AbortController().signal,
+    )) as {
       content: Array<{ type: "text"; text: string }>;
     };
 
@@ -572,21 +629,26 @@ describe("Pi attempt setup bounds", () => {
       CODE_MODE_MAX_OUTPUT_CHARACTERS,
       CODE_MODE_MAX_NESTED_TOOL_CALLS,
     );
-    expect(factories.CodeModeToolsBinding).toHaveBeenCalledWith({
-      props: expect.objectContaining({
-        parentToolUseId: "provider-js-call",
-        allowWebTools: false,
-      }),
-    });
+    expect(factories.CodeModeToolsBinding).toHaveBeenCalledOnce();
+    const tools = factories.CodeModeToolsBinding.mock.results[0]?.value;
+    expect(
+      (load.mock.calls[0]?.[0] as { env?: { TOOLS?: unknown } }).env?.TOOLS,
+    ).toBe(tools);
+    expect(
+      (load.mock.calls[0]?.[0] as { limits?: { cpuMs?: number } }).limits,
+    ).toEqual({ cpuMs: CHAT_RUNTIME_BOUNDS.codeModeCpuMs });
     expect(result.content[0].text).toContain(
       `[Truncated: ${CODE_MODE_MAX_OUTPUT_CHARACTERS} of ${CODE_MODE_MAX_OUTPUT_CHARACTERS + 1} characters]`,
     );
     expect(() =>
-      adapter.callTool({
-        id: "second-js-call",
-        name: "js_exec",
-        input: { description: "again", code: "'again'" },
-      }, new AbortController().signal),
+      adapter.callTool(
+        {
+          id: "second-js-call",
+          name: "js_exec",
+          input: { description: "again", code: "'again'" },
+        },
+        new AbortController().signal,
+      ),
     ).toThrow("js_exec may run at most once per turn");
     expect(load).toHaveBeenCalledOnce();
   });

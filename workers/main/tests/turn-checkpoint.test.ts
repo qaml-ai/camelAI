@@ -22,11 +22,7 @@ const jsonChunks = (totalBytes: number, maximumBytes: number): string[] => {
 const providerJsonWithBytes = (size: number): string =>
   `[${jsonWithBytes(size - 2)}]`;
 
-const completedCall = (
-  id: string,
-  inputJson = "{}",
-  output = "0",
-) => ({
+const completedCall = (id: string, inputJson = "{}", output = "0") => ({
   id,
   name: "bounded_tool",
   inputJson,
@@ -50,6 +46,17 @@ const checkpointJson = (batches: ReturnType<typeof batch>[]): string =>
   });
 
 describe("turn checkpoint recovery bounds", () => {
+  it("admits the maximum closed checkpoint shape through preflight", () => {
+    const batches = Array.from(
+      { length: CHAT_RUNTIME_BOUNDS.toolCallsPerTurn },
+      (_, index) => batch(`call-${index}`, "[]"),
+    );
+
+    expect(parseTurnCheckpoint(checkpointJson(batches)).batches).toHaveLength(
+      CHAT_RUNTIME_BOUNDS.toolCallsPerTurn,
+    );
+  });
+
   it("rejects 33 calls in one batch before accepting the batch", () => {
     const calls = Array.from(
       { length: CHAT_RUNTIME_BOUNDS.toolCallsPerTurn + 1 },
@@ -73,12 +80,7 @@ describe("turn checkpoint recovery bounds", () => {
       exact.length,
     );
     expect(() =>
-      parseTurnCheckpoint(
-        checkpointJson([
-          ...exact,
-          batch("call-over", "[]"),
-        ]),
-      ),
+      parseTurnCheckpoint(checkpointJson([...exact, batch("call-over", "[]")])),
     ).toThrow("Checkpoint provider state exceeds aggregate byte limit");
   });
 
@@ -105,6 +107,41 @@ describe("turn checkpoint recovery bounds", () => {
     }
   });
 
+  it("preflights the outer checkpoint before allocating nested JSON", () => {
+    let tooDeep = "0";
+    for (let depth = 0; depth < 9; depth += 1) tooDeep = `[${tooDeep}]`;
+    const raw = checkpointJson([]).replace(/}$/, `,"ignored":${tooDeep}}`);
+
+    expect(() => parseTurnCheckpoint(raw)).toThrow("Checkpoint is not JSON");
+  });
+
+  it("enforces tool JSON depth and entry ceilings independently", () => {
+    let tooDeep = "0";
+    for (
+      let depth = 0;
+      depth <= CHAT_RUNTIME_BOUNDS.providerJsonDepth;
+      depth += 1
+    ) {
+      tooDeep = `[${tooDeep}]`;
+    }
+    const tooBroad = JSON.stringify(
+      Array.from(
+        { length: CHAT_RUNTIME_BOUNDS.providerJsonEntries + 1 },
+        () => 0,
+      ),
+    );
+
+    for (const input of [tooDeep, tooBroad]) {
+      expect(() =>
+        parseTurnCheckpoint(
+          checkpointJson([
+            batch("batch", "[]", [completedCall("call", input)]),
+          ]),
+        ),
+      ).toThrow("Invalid checkpoint tool call");
+    }
+  });
+
   it("enforces the aggregate tool-input byte limit", () => {
     const callsAtLimit = jsonChunks(
       CHAT_RUNTIME_BOUNDS.toolInputsPerTurnBytes,
@@ -112,9 +149,8 @@ describe("turn checkpoint recovery bounds", () => {
     ).map((input, index) => completedCall(`call-${index}`, input));
 
     expect(
-      parseTurnCheckpoint(
-        checkpointJson([batch("batch", "[]", callsAtLimit)]),
-      ).batches[0].calls,
+      parseTurnCheckpoint(checkpointJson([batch("batch", "[]", callsAtLimit)]))
+        .batches[0].calls,
     ).toHaveLength(callsAtLimit.length);
     expect(() =>
       parseTurnCheckpoint(
@@ -135,9 +171,8 @@ describe("turn checkpoint recovery bounds", () => {
     ).map((output, index) => completedCall(`call-${index}`, "{}", output));
 
     expect(
-      parseTurnCheckpoint(
-        checkpointJson([batch("batch", "[]", callsAtLimit)]),
-      ).batches[0].calls,
+      parseTurnCheckpoint(checkpointJson([batch("batch", "[]", callsAtLimit)]))
+        .batches[0].calls,
     ).toHaveLength(callsAtLimit.length);
     expect(() =>
       parseTurnCheckpoint(

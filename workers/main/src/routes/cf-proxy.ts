@@ -8,6 +8,7 @@ import { handleDeploySideEffects } from '../services/deploy.js';
 
 export async function handleCfProxy({ req, env }: RouteContext): Promise<Response> {
   return proxyCloudflareApi(req, env, {
-    onDeploySideEffects: (info) => handleDeploySideEffects(env, info),
+    onDeploySideEffects: (info, scope) =>
+      handleDeploySideEffects(env, info, scope),
   }).catch((e) => cfApiError(10004, `Proxy failed: ${e}`, 502));
 }

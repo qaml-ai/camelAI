@@ -1,5 +1,10 @@
 import { CHAT_RUNTIME_BOUNDS } from "../../../../src/lib/chat-runtime-bounds";
 import { boundedCanonicalJsonResult } from "./bounded-canonical-json";
+import {
+  parseJsonBounded,
+  type JsonPreflightLimits,
+} from "./bounded-json-parse";
+import { jsonStringByteLength, utf8ByteLength } from "./utf8-byte-length";
 
 export type CheckpointToolResultStatus = "success" | "error";
 
@@ -33,18 +38,43 @@ export interface TurnCheckpoint {
   final: string | null;
 }
 
-const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
-const bytes = (value: string) => encoder.encode(value).byteLength;
+const bytes = utf8ByteLength;
 const object = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
 const boundedId = (value: unknown): value is string =>
   typeof value === "string" &&
   value.length > 0 &&
   value.length <= CHAT_RUNTIME_BOUNDS.identifierChars;
-const validJson = (value: string): boolean => {
+const checkpointJsonLimits: JsonPreflightLimits = {
+  maxDepth: 8,
+  maxTokens: 2_048,
+  maxNodes: 1_024,
+  maxEntries: 1_024,
+  maxStrings: 768,
+  maxStringCodeUnits: CHAT_RUNTIME_BOUNDS.checkpointBytes,
+};
+const embeddedJsonLimits = (
+  maxStringCodeUnits: number,
+): JsonPreflightLimits => ({
+  maxDepth: CHAT_RUNTIME_BOUNDS.providerJsonDepth,
+  maxTokens:
+    4 *
+      (CHAT_RUNTIME_BOUNDS.providerJsonNodes +
+        CHAT_RUNTIME_BOUNDS.providerJsonEntries) +
+    16,
+  maxNodes:
+    CHAT_RUNTIME_BOUNDS.providerJsonNodes +
+    CHAT_RUNTIME_BOUNDS.providerJsonEntries,
+  maxEntries: CHAT_RUNTIME_BOUNDS.providerJsonEntries,
+  maxStrings:
+    CHAT_RUNTIME_BOUNDS.providerJsonNodes +
+    CHAT_RUNTIME_BOUNDS.providerJsonEntries,
+  maxStringCodeUnits,
+});
+const validJson = (value: string, maximumBytes: number): boolean => {
   try {
-    JSON.parse(value);
+    parseJsonBounded(value, embeddedJsonLimits(maximumBytes));
     return true;
   } catch {
     return false;
@@ -52,15 +82,22 @@ const validJson = (value: string): boolean => {
 };
 const validProviderState = (value: string): boolean => {
   try {
-    const parsed: unknown = JSON.parse(value);
+    const parsed = parseJsonBounded(
+      value,
+      embeddedJsonLimits(CHAT_RUNTIME_BOUNDS.providerStateBytes),
+    );
     return (
       Array.isArray(parsed) &&
       parsed.length <= CHAT_RUNTIME_BOUNDS.providerContentParts &&
-      boundedCanonicalJsonResult(parsed, CHAT_RUNTIME_BOUNDS.providerStateBytes, {
-        maxDepth: CHAT_RUNTIME_BOUNDS.providerJsonDepth,
-        maxEntries: CHAT_RUNTIME_BOUNDS.providerJsonEntries,
-        maxNodes: CHAT_RUNTIME_BOUNDS.providerJsonNodes,
-      }).complete
+      boundedCanonicalJsonResult(
+        parsed,
+        CHAT_RUNTIME_BOUNDS.providerStateBytes,
+        {
+          maxDepth: CHAT_RUNTIME_BOUNDS.providerJsonDepth,
+          maxEntries: CHAT_RUNTIME_BOUNDS.providerJsonEntries,
+          maxNodes: CHAT_RUNTIME_BOUNDS.providerJsonNodes,
+        },
+      ).complete
     );
   } catch {
     return false;
@@ -68,7 +105,7 @@ const validProviderState = (value: string): boolean => {
 };
 
 function compactFinal(value: string): string | null {
-  const encoded = encoder.encode(value);
+  const encoded = new TextEncoder().encode(value);
   if (decoder.decode(encoded) !== value) return null;
   let binary = "";
   for (let offset = 0; offset < encoded.length; offset += 32_768) {
@@ -110,34 +147,40 @@ export function checkpointUncertain(checkpoint: TurnCheckpoint): boolean {
 }
 
 export function serializeTurnCheckpoint(checkpoint: TurnCheckpoint): string {
-  let serialized = JSON.stringify(checkpoint);
-  if (checkpoint.final !== null) {
+  let serializable:
+    | TurnCheckpoint
+    | (Omit<TurnCheckpoint, "final"> & {
+        final: null;
+        finalUtf8Base64: string;
+      }) = checkpoint;
+  if (
+    checkpoint.final !== null &&
+    4 * Math.ceil(bytes(checkpoint.final) / 3) + 32 <
+      jsonStringByteLength(checkpoint.final)
+  ) {
     const encoded = compactFinal(checkpoint.final);
     if (encoded !== null) {
-      const compact = JSON.stringify({
+      serializable = {
         ...checkpoint,
         final: null,
         finalUtf8Base64: encoded,
-      });
-      if (bytes(compact) < bytes(serialized)) serialized = compact;
+      };
     }
   }
+  const serialized = JSON.stringify(serializable);
   if (bytes(serialized) > CHAT_RUNTIME_BOUNDS.checkpointBytes) {
     throw new Error("Checkpoint exceeds byte limit");
   }
   return serialized;
 }
 
-export function parseTurnCheckpoint(raw: string): TurnCheckpoint {
-  if (bytes(raw) > CHAT_RUNTIME_BOUNDS.checkpointBytes) {
-    throw new Error("Checkpoint exceeds byte limit");
-  }
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    throw new Error("Checkpoint is not JSON");
-  }
+/**
+ * Validate and copy a checkpoint already held in memory.
+ *
+ * This is deliberately separate from parsing so a mutation can be checked
+ * before persistence without materializing and reparsing a second JSON copy.
+ */
+export function normalizeTurnCheckpoint(value: unknown): TurnCheckpoint {
   if (!object(value)) throw new Error("Invalid checkpoint shape");
   const encodedFinal = value.finalUtf8Base64;
   if (
@@ -151,7 +194,10 @@ export function parseTurnCheckpoint(raw: string): TurnCheckpoint {
     value.batches.length > CHAT_RUNTIME_BOUNDS.toolCallsPerTurn ||
     (value.final !== null && typeof value.final !== "string") ||
     (encodedFinal !== undefined &&
-      (value.final !== null || typeof encodedFinal !== "string"))
+      (value.final !== null ||
+        typeof encodedFinal !== "string" ||
+        encodedFinal.length >
+          4 * Math.ceil(CHAT_RUNTIME_BOUNDS.assistantBytes / 3) + 4))
   ) {
     throw new Error("Invalid checkpoint shape");
   }
@@ -188,8 +234,7 @@ export function parseTurnCheckpoint(raw: string): TurnCheckpoint {
         !object(candidate) ||
         typeof candidate.providerStateJson !== "string" ||
         providerStateLength === null ||
-        providerStateLength >
-          CHAT_RUNTIME_BOUNDS.providerStateBytes ||
+        providerStateLength > CHAT_RUNTIME_BOUNDS.providerStateBytes ||
         !validProviderState(candidate.providerStateJson) ||
         !Array.isArray(candidate.calls) ||
         candidate.calls.length === 0 ||
@@ -199,9 +244,7 @@ export function parseTurnCheckpoint(raw: string): TurnCheckpoint {
         throw new Error("Invalid provider batch");
       }
       providerStateBytes += providerStateLength;
-      if (
-        providerStateBytes > CHAT_RUNTIME_BOUNDS.providerStatePerTurnBytes
-      ) {
+      if (providerStateBytes > CHAT_RUNTIME_BOUNDS.providerStatePerTurnBytes) {
         throw new Error(
           "Checkpoint provider state exceeds aggregate byte limit",
         );
@@ -221,15 +264,13 @@ export function parseTurnCheckpoint(raw: string): TurnCheckpoint {
         const inputBytes = bytes(item.inputJson);
         if (
           inputBytes > CHAT_RUNTIME_BOUNDS.toolInputBytes ||
-          !validJson(item.inputJson)
+          !validJson(item.inputJson, CHAT_RUNTIME_BOUNDS.toolInputBytes)
         ) {
           throw new Error("Invalid checkpoint tool call");
         }
         toolInputBytes += inputBytes;
         if (toolInputBytes > CHAT_RUNTIME_BOUNDS.toolInputsPerTurnBytes) {
-          throw new Error(
-            "Checkpoint tool inputs exceed aggregate byte limit",
-          );
+          throw new Error("Checkpoint tool inputs exceed aggregate byte limit");
         }
         ids.add(item.id);
         let result: CheckpointToolResult | null = null;
@@ -246,7 +287,7 @@ export function parseTurnCheckpoint(raw: string): TurnCheckpoint {
           const resultBytes = bytes(item.result.output);
           if (
             resultBytes > CHAT_RUNTIME_BOUNDS.toolResultBytes ||
-            !validJson(item.result.output)
+            !validJson(item.result.output, CHAT_RUNTIME_BOUNDS.toolResultBytes)
           ) {
             throw new Error("Invalid checkpoint tool result");
           }
@@ -302,4 +343,17 @@ export function parseTurnCheckpoint(raw: string): TurnCheckpoint {
     batches,
     final,
   };
+}
+
+export function parseTurnCheckpoint(raw: string): TurnCheckpoint {
+  if (bytes(raw) > CHAT_RUNTIME_BOUNDS.checkpointBytes) {
+    throw new Error("Checkpoint exceeds byte limit");
+  }
+  let value: unknown;
+  try {
+    value = parseJsonBounded(raw, checkpointJsonLimits);
+  } catch {
+    throw new Error("Checkpoint is not JSON");
+  }
+  return normalizeTurnCheckpoint(value);
 }

@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { InvalidMountConfigError, S3FSMountError } from '@cloudflare/sandbox';
 import {
+  ANALYSIS_CONTAINER_RESET_TIMEOUT_MS,
+  ANALYSIS_EXECUTION_LEASE_MS,
   AnalysisSandbox,
   createSingleFlight,
   isMountAlreadyPresent,
@@ -61,7 +63,6 @@ describe('sandboxR2MountOptions', () => {
     });
   });
 });
-
 describe('AnalysisSandbox.resetSession', () => {
   it('clears the SDK session cache (memory + storage) so the next call re-handshakes', async () => {
     // The SDK only clears `defaultSession` on a container STOP, so a shell that
@@ -91,6 +92,208 @@ describe('AnalysisSandbox.resetSession', () => {
 
     await expect(AnalysisSandbox.prototype.resetSession.call(sandbox)).resolves.toBeUndefined();
     expect(sandbox.defaultSession).toBeNull();
+  });
+});
+
+function executionLeaseSandbox() {
+  const values = new Map<string, unknown>();
+  const kv = {
+    get: vi.fn((key: string) => values.get(key)),
+    put: vi.fn((key: string, value: unknown) => values.set(key, value)),
+    delete: vi.fn((key: string) => values.delete(key)),
+  };
+  const sandbox = Object.create(AnalysisSandbox.prototype) as any;
+  sandbox.ctx = { storage: { kv } };
+  sandbox.destroyAndForgetContainerGeneration = vi.fn(async () => undefined);
+  return { sandbox, values };
+}
+
+describe('AnalysisSandbox execution admission', () => {
+  it('is durable, fail-fast, and token-fences an old release after stale recovery', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    try {
+      const { sandbox, values } = executionLeaseSandbox();
+      await expect(
+        AnalysisSandbox.prototype.acquireExecutionLease.call(sandbox, {
+          token: 'owner-a',
+          operation: 'run_code',
+        }),
+      ).resolves.toMatchObject({ acquired: true });
+
+      // A fresh DO instance reading the same durable KV still sees the owner.
+      const afterEviction = executionLeaseSandbox().sandbox;
+      afterEviction.ctx.storage.kv = sandbox.ctx.storage.kv;
+      await expect(
+        AnalysisSandbox.prototype.acquireExecutionLease.call(afterEviction, {
+          token: 'owner-b',
+          operation: 'exec',
+        }),
+      ).resolves.toMatchObject({ acquired: false, reason: 'busy' });
+
+      vi.setSystemTime(1_000 + ANALYSIS_EXECUTION_LEASE_MS);
+      await expect(
+        AnalysisSandbox.prototype.acquireExecutionLease.call(sandbox, {
+          token: 'owner-b',
+          operation: 'exec',
+        }),
+      ).resolves.toMatchObject({ acquired: true });
+      expect(sandbox.destroyAndForgetContainerGeneration).toHaveBeenCalledOnce();
+
+      // owner-a's late finally cannot clear owner-b.
+      await expect(
+        AnalysisSandbox.prototype.releaseExecutionLease.call(sandbox, 'owner-a'),
+      ).resolves.toBe(false);
+      expect(values.size).toBe(1);
+      await expect(
+        AnalysisSandbox.prototype.acquireExecutionLease.call(sandbox, {
+          token: 'owner-c',
+          operation: 'run_notebook',
+        }),
+      ).resolves.toMatchObject({ acquired: false, reason: 'busy' });
+      await expect(
+        AnalysisSandbox.prototype.releaseExecutionLease.call(sandbox, 'owner-b'),
+      ).resolves.toBe(true);
+      expect(values.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds stale reset and keeps admission closed when reset is unconfirmed', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(5_000);
+    try {
+      const { sandbox } = executionLeaseSandbox();
+      await AnalysisSandbox.prototype.acquireExecutionLease.call(sandbox, {
+        token: 'owner-a',
+        operation: 'run_code',
+      });
+      sandbox.destroyAndForgetContainerGeneration = vi.fn(
+        () => new Promise<never>(() => {}),
+      );
+      vi.setSystemTime(5_000 + ANALYSIS_EXECUTION_LEASE_MS);
+
+      const replacement = AnalysisSandbox.prototype.acquireExecutionLease.call(
+        sandbox,
+        { token: 'owner-b', operation: 'exec' },
+      );
+      await vi.advanceTimersByTimeAsync(ANALYSIS_CONTAINER_RESET_TIMEOUT_MS);
+      await expect(replacement).resolves.toMatchObject({
+        acquired: false,
+        reason: 'stale_reset_unconfirmed',
+      });
+      await expect(
+        AnalysisSandbox.prototype.acquireExecutionLease.call(sandbox, {
+          token: 'owner-c',
+          operation: 'exec',
+        }),
+      ).resolves.toMatchObject({ acquired: false, reason: 'busy' });
+      expect(sandbox.destroyAndForgetContainerGeneration).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('recovers a durable archive taint with reset then exact R2 deletion before admission', async () => {
+    const { sandbox, values } = executionLeaseSandbox();
+    const events: string[] = [];
+    values.set('analysis:execution-archive-taint:v1', {
+      token: 'archive-owner',
+      kind: 'archive',
+      resource: 'org/ws/user-outputs/tmp/orphan.log',
+      createdAt: Date.now(),
+    });
+    sandbox.destroyAndForgetContainerGeneration = vi.fn(async () => {
+      events.push('reset');
+    });
+    sandbox.env = {
+      R2_OUTPUTS_BUCKET: {
+        delete: vi.fn(async (key: string) => {
+          events.push(`delete:${key}`);
+        }),
+      },
+    };
+
+    await expect(
+      AnalysisSandbox.prototype.acquireExecutionLease.call(sandbox, {
+        token: 'replacement',
+        operation: 'run_code',
+      }),
+    ).resolves.toMatchObject({ acquired: true });
+    expect(events).toEqual([
+      'reset',
+      'delete:org/ws/user-outputs/tmp/orphan.log',
+    ]);
+    expect(values.has('analysis:execution-archive-taint:v1')).toBe(false);
+    expect(values.get('analysis:execution-lease:v1')).toMatchObject({
+      token: 'replacement',
+      state: 'active',
+    });
+  });
+
+  it('keeps archive taint and admission closed when exact R2 deletion fails', async () => {
+    const { sandbox, values } = executionLeaseSandbox();
+    const taint = {
+      token: 'archive-owner',
+      kind: 'archive',
+      resource: 'org/ws/user-outputs/tmp/orphan.log',
+      createdAt: Date.now(),
+    };
+    values.set('analysis:execution-archive-taint:v1', taint);
+    sandbox.env = {
+      R2_OUTPUTS_BUCKET: {
+        delete: vi.fn(async () => {
+          throw new Error('R2 unavailable');
+        }),
+      },
+    };
+
+    await expect(
+      AnalysisSandbox.prototype.acquireExecutionLease.call(sandbox, {
+        token: 'replacement',
+        operation: 'run_code',
+      }),
+    ).resolves.toMatchObject({
+      acquired: false,
+      reason: 'stale_reset_unconfirmed',
+    });
+    expect(sandbox.destroyAndForgetContainerGeneration).toHaveBeenCalledOnce();
+    expect(values.get('analysis:execution-archive-taint:v1')).toEqual(taint);
+    expect(values.get('analysis:execution-lease:v1')).toMatchObject({
+      state: 'recovering',
+    });
+  });
+
+  it('fails closed without deleting R2 when a stale archive marker has an untrusted key', async () => {
+    const { sandbox, values } = executionLeaseSandbox();
+    const taint = {
+      token: 'archive-owner',
+      kind: 'archive',
+      resource: 'other-prefix/private-object',
+      createdAt: Date.now(),
+    };
+    values.set('analysis:execution-archive-taint:v1', taint);
+    const deleteObject = vi.fn(async () => undefined);
+    sandbox.env = {
+      R2_OUTPUTS_BUCKET: { delete: deleteObject },
+    };
+
+    await expect(
+      AnalysisSandbox.prototype.acquireExecutionLease.call(sandbox, {
+        token: 'replacement',
+        operation: 'run_code',
+      }),
+    ).resolves.toMatchObject({
+      acquired: false,
+      reason: 'stale_reset_unconfirmed',
+    });
+    expect(sandbox.destroyAndForgetContainerGeneration).toHaveBeenCalledOnce();
+    expect(deleteObject).not.toHaveBeenCalled();
+    expect(values.get('analysis:execution-archive-taint:v1')).toEqual(taint);
+    expect(values.get('analysis:execution-lease:v1')).toMatchObject({
+      state: 'recovering',
+    });
   });
 });
 
@@ -149,6 +352,41 @@ describe('mount bookkeeping across a container stop', () => {
     expect(sandbox.mountedPaths.size).toBe(0);
     expect(sandbox.mountGates.size).toBe(0);
     expect(superOnStop).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('AnalysisSandbox destructive generation reset', () => {
+  it('forgets cleanup-destroyed mounts and remounts on the next run', async () => {
+    const sandbox = Object.create(AnalysisSandbox.prototype) as any;
+    sandbox.env = { CF_ACCOUNT_ID: 'cloudflare-account' };
+    sandbox.containerGeneration = 1;
+    sandbox.mountedContainerGeneration = 1;
+    sandbox.mountedPaths = new Set(['/uploads']);
+    sandbox.mountGates = new Map([['/uploads', createSingleFlight()]]);
+    sandbox.sessionDeaths = new SandboxSessionDeathTracker();
+    sandbox.defaultSession = 'sandbox-ws-1';
+    sandbox.defaultSessionInit = { sessionId: 'sandbox-ws-1' };
+    sandbox.ctx = { storage: { delete: vi.fn(async () => undefined) } };
+    sandbox.destroy = vi.fn(async () => undefined);
+
+    await AnalysisSandbox.prototype.destroyAndForgetContainerGeneration.call(sandbox);
+
+    expect(sandbox.destroy).toHaveBeenCalledOnce();
+    expect(sandbox.mountedPaths.size).toBe(0);
+    expect(sandbox.mountGates.size).toBe(0);
+    expect(sandbox.defaultSession).toBeNull();
+
+    sandbox.mountBucket = vi.fn(async () => undefined);
+    sandbox.unmountBucket = vi.fn(async () => undefined);
+    sandbox.exec = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }));
+    await AnalysisSandbox.prototype.ensureMounted.call(
+      sandbox,
+      'R2_BUCKET',
+      'org1/workspace1/uploads',
+      '/uploads',
+      { readOnly: true },
+    );
+    expect(sandbox.mountBucket).toHaveBeenCalledOnce();
   });
 });
 

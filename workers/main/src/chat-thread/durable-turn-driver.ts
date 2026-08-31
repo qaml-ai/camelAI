@@ -1,12 +1,24 @@
 import { CHAT_RUNTIME_BOUNDS } from "../../../../src/lib/chat-runtime-bounds";
 import { BoundedTurnError } from "./bounded-turn-runner";
-import { DurableChatTurnStore, type DurableChatTurn, type StoreResult } from "./durable-turn-store";
+import {
+  DurableChatTurnStore,
+  type DurableChatTurn,
+  type StoreResult,
+} from "./durable-turn-store";
 import type { AutomationRunReport } from "./automation-turn-report";
-import type { LegacyMigrationScope, LegacySessionMigrator } from "./legacy-session-migration";
-import type { CheckpointProviderBatch, CheckpointToolResult } from "./turn-checkpoint";
+import type {
+  LegacyMigrationScope,
+  LegacySessionMigrator,
+} from "./legacy-session-migration";
+import type {
+  CheckpointProviderBatch,
+  CheckpointToolResult,
+} from "./turn-checkpoint";
 import type { ChatRuntimeContentBlock } from "./chat-runtime-content";
 import type { ChatRuntimeLiveUpdate } from "./chat-runtime-controller";
 import { boundedErrorText } from "./bounded-error-text";
+
+const ALARM_TIMEOUT = "Alarm write timed out";
 
 export interface DurableTurnRunContext {
   turn: DurableChatTurn;
@@ -28,7 +40,10 @@ export interface DurableTurnDriverOptions {
   publish(): void | Promise<void>;
   publishLive?(update: ChatRuntimeLiveUpdate): void;
   clearLive?(turnId?: string, epoch?: string): void;
-  reportAutomation?(report: AutomationRunReport, signal: AbortSignal): Promise<boolean>;
+  reportAutomation?(
+    report: AutomationRunReport,
+    signal: AbortSignal,
+  ): Promise<boolean>;
   now?: () => number;
   token?: () => string;
 }
@@ -104,7 +119,7 @@ export class DurableTurnDriver {
     this.ownedAttemptToken = null;
     this.publish();
     try {
-      await this.armNext(result);
+      await this.armNext();
       return true;
     } finally {
       // An adapter may ignore AbortSignal after dispatching an RPC. Once stop
@@ -119,7 +134,7 @@ export class DurableTurnDriver {
     if (expired.ok) {
       this.ownedAttemptToken = null;
       this.publish();
-      await this.armNext(expired);
+      await this.armNext();
       return;
     }
     if (await this.reportAutomation(now)) return;
@@ -155,10 +170,7 @@ export class DurableTurnDriver {
 
     const storeAlarmAt = this.options.store.nextAlarmAt(now);
     const migrationAlarmAt = this.options.migrator.nextAlarmAt(now);
-    if (storeAlarmAt === null && migrationAlarmAt === null) {
-      await this.deleteAlarm();
-      return;
-    }
+    if (storeAlarmAt === null && migrationAlarmAt === null) return;
 
     // Migration is alarm-owned and starts only after admission or an open request. Its
     // marker is the claim fence: neither a constructor nor an SSE attach reads
@@ -180,10 +192,7 @@ export class DurableTurnDriver {
       );
       return;
     }
-    if (this.options.store.nextAlarmAt(this.now()) === null) {
-      await this.deleteAlarm();
-      return;
-    }
+    if (this.options.store.nextAlarmAt(this.now()) === null) return;
 
     const token = this.token();
     // Leave an immediate wake durable before the attempt gains authority. If
@@ -212,7 +221,6 @@ export class DurableTurnDriver {
     const abort = new AbortController();
     const liveEpoch = crypto.randomUUID();
     this.currentAbort = abort;
-    let terminal: StoreResult;
     let abortInstance = false;
     try {
       const output = await withDeadline(
@@ -223,45 +231,46 @@ export class DurableTurnDriver {
             deadlineAt,
             startNextInference: () =>
               this.runningCheckpoint(
-                this.options.store.startNextInference(
+                this.options.store.checkpoint(
                   turn.id,
                   token,
+                  { type: "start_provider" },
                   this.now(),
                 ),
               ),
             checkpointProviderBatch: (batch) =>
               this.runningCheckpoint(
-                this.options.store.checkpointProviderBatch(
+                this.options.store.checkpoint(
                   turn.id,
                   token,
-                  batch,
+                  { type: "provider_batch", batch },
                   this.now(),
                 ),
               ),
             checkpointProviderFinal: (output) =>
               this.runningCheckpoint(
-                this.options.store.checkpointProviderFinal(
+                this.options.store.checkpoint(
                   turn.id,
                   token,
-                  output,
+                  { type: "provider_final", output },
                   this.now(),
                 ),
               ),
             beginEffect: (callId) =>
               this.runningCheckpoint(
-                this.options.store.markEffectStarted(
+                this.options.store.checkpoint(
                   turn.id,
                   token,
-                  callId,
+                  { type: "begin_effect", callId },
                   this.now(),
                 ),
               ),
             recordToolResult: (result) =>
               this.runningCheckpoint(
-                this.options.store.recordToolResult(
+                this.options.store.checkpoint(
                   turn.id,
                   token,
-                  result,
+                  { type: "tool_result", result },
                   this.now(),
                 ),
               ),
@@ -277,7 +286,12 @@ export class DurableTurnDriver {
                 this.options.publishLive?.({
                   turnId: turn.id,
                   epoch: liveEpoch,
-                  activeTurn: { id: turn.id, status: "running", acceptedAt: turn.createdAt, startedAt: turn.updatedAt },
+                  activeTurn: {
+                    id: turn.id,
+                    status: "running",
+                    acceptedAt: turn.createdAt,
+                    startedAt: turn.updatedAt,
+                  },
                   message: {
                     id: `${turn.id}:assistant`,
                     role: "assistant",
@@ -298,9 +312,10 @@ export class DurableTurnDriver {
       );
       // Keep the next alarm durable across the terminal commit.
       await this.setAlarm(this.now());
-      terminal = this.options.store.complete(
+      this.options.store.finish(
         turn.id,
         token,
+        "completed",
         boundedErrorText(output),
         this.now(),
       );
@@ -310,15 +325,17 @@ export class DurableTurnDriver {
         (error instanceof BoundedTurnError &&
           (error.code === "tool_timeout" || error.code === "provider_timeout"));
       await this.setAlarm(this.now());
-      terminal =
-        error instanceof TurnDeadlineError
-          ? this.options.store.expire(deadlineAt)
-          : this.options.store.fail(
-              turn.id,
-              token,
-              boundedErrorText(error),
-              this.now(),
-            );
+      if (error instanceof TurnDeadlineError) {
+        this.options.store.expire(deadlineAt);
+      } else {
+        this.options.store.finish(
+          turn.id,
+          token,
+          "failed",
+          boundedErrorText(error),
+          this.now(),
+        );
+      }
     } finally {
       this.options.clearLive?.(turn.id, liveEpoch);
       if (this.currentAbort === abort) this.currentAbort = null;
@@ -326,7 +343,7 @@ export class DurableTurnDriver {
     }
     this.publish();
     try {
-      await this.armNext(terminal);
+      await this.armNext();
     } finally {
       if (abortInstance) {
         // CodeModeToolsBinding cannot cancel every RPC it has already started.
@@ -367,12 +384,21 @@ export class DurableTurnDriver {
     const abort = new AbortController();
     try {
       const sent = await withDeadline(
-        Promise.resolve().then(() => this.options.reportAutomation?.(report, abort.signal) ?? false),
+        Promise.resolve().then(
+          () => this.options.reportAutomation?.(report, abort.signal) ?? false,
+        ),
         abort,
-        Math.min(report.deadlineAt, now + CHAT_RUNTIME_BOUNDS.automationReportAttemptMs),
+        Math.min(
+          report.deadlineAt,
+          now + CHAT_RUNTIME_BOUNDS.automationReportAttemptMs,
+        ),
         this.now,
       );
-      if (sent) this.options.store.completeAutomationReport(report.turnId, report.attempt);
+      if (sent)
+        this.options.store.completeAutomationReport(
+          report.turnId,
+          report.attempt,
+        );
     } catch (error) {
       console.error("[DurableTurnDriver] automation report failed", error);
     }
@@ -380,7 +406,7 @@ export class DurableTurnDriver {
     return true;
   }
 
-  private async armNext(_result?: StoreResult): Promise<void> {
+  private async armNext(): Promise<void> {
     const now = this.now();
     const storeAt = this.options.store.nextAlarmAt(now);
     const migrationAt = this.options.migrator.nextAlarmAt(now);
@@ -390,37 +416,31 @@ export class DurableTurnDriver {
         : migrationAt === null
           ? storeAt
           : Math.min(storeAt, migrationAt);
-    if (at === null) await this.deleteAlarm();
-    else await this.setAlarm(at);
-  }
-
-  private async deleteAlarm(): Promise<void> {
-    await this.alarmStorageCall(
-      this.options.ctx.storage.deleteAlarm(),
-      "Alarm delete timed out",
-    );
+    if (at !== null) await this.setAlarm(at);
   }
 
   private async setAlarm(at: number): Promise<void> {
-    await this.alarmStorageCall(
-      this.options.ctx.storage.setAlarm(at),
-      "Alarm write timed out",
-    );
+    await this.alarmStorageCall(this.options.ctx.storage.setAlarm(at));
   }
 
-  private async alarmStorageCall(
-    task: Promise<void>,
-    message: string,
-  ): Promise<void> {
+  private async alarmStorageCall(task: Promise<void>): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      task,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(message)),
-          CHAT_RUNTIME_BOUNDS.alarmWriteMs,
-        );
-      }),
-    ]).finally(() => clearTimeout(timer));
+    let timedOut = false;
+    try {
+      await Promise.race([
+        task,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error(ALARM_TIMEOUT));
+          }, CHAT_RUNTIME_BOUNDS.alarmWriteMs);
+        }),
+      ]);
+    } catch (error) {
+      if (timedOut) this.options.ctx.abort(ALARM_TIMEOUT);
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }

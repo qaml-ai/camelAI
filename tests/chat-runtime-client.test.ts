@@ -229,6 +229,24 @@ describe("ChatRuntimeClient", () => {
     transport.lastStream.end();
     await vi.advanceTimersByTimeAsync(250);
     expect(transport.gets[1]).toContain("after=7");
+    transport.lastStream.frame({
+      type: "reset",
+      cursor: 7,
+      messages: [],
+      activeTurn,
+    });
+    transport.lastStream.frame(live("attempt-b", 0, "seeded again"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(frames.at(-1)).toMatchObject({
+      type: "live",
+      epoch: "attempt-b",
+      seq: 0,
+      message: {
+        content: expect.arrayContaining([
+          { type: "text", text: "seeded again" },
+        ]),
+      },
+    });
   });
 
   it("rejects unsupported or over-bound live content", async () => {

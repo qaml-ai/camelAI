@@ -1,18 +1,39 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 
 import { assertConnectionsBindingEnabled } from "../../../src/lib/connections-binding";
+import { CHAT_RUNTIME_BOUNDS } from "../../../src/lib/chat-runtime-bounds";
 import { getWorkspaceR2Prefix } from "../../../src/lib/workspace-r2-paths";
-import { ANALYSIS_CONNECTIONS_HOST, type AnalysisConnectionsParams } from "./analysis-sandbox.js";
-import { listConnections, type ConnectionsRuntimeEnv } from "./connections-runtime.js";
-import { annotateWarehouseConnections, withWarehouseParams, type WarehouseConnection } from "./warehouse-service.js";
+import {
+  ANALYSIS_CONTAINER_RESET_TIMEOUT_MS,
+  ANALYSIS_CONNECTIONS_HOST,
+  ANALYSIS_EXECUTION_LEASE_MS,
+  type AnalysisConnectionsParams,
+  type AnalysisExecutionLeaseResult,
+} from "./analysis-sandbox.js";
+import { boundedCanonicalJsonResult } from "./chat-thread/bounded-canonical-json.js";
+import { utf8ByteLength } from "./chat-thread/utf8-byte-length.js";
+import {
+  listConnections,
+  type ConnectionsRuntimeEnv,
+} from "./connections-runtime.js";
+import {
+  annotateWarehouseConnections,
+  type WarehouseConnection,
+} from "./warehouse-service.js";
 import { warehouseWorkspacePrefix } from "./warehouse-export.js";
-import { recordObservabilityEvent, type ObservabilityEnv } from "./observability.js";
+import {
+  recordObservabilityEvent,
+  type ObservabilityEnv,
+} from "./observability.js";
 import {
   isSandboxSessionDeathError,
   isSandboxSessionDeathResult,
   sandboxSessionExitCode,
 } from "./sandbox-session-death.js";
-import { ProjectFilesystemClient, type WorkspaceFileStoreLike } from "./workspace-filesystem-do.js";
+import {
+  ProjectFilesystemClient,
+  type WorkspaceFileStoreLike,
+} from "./workspace-filesystem-do.js";
 
 /**
  * Unified analysis compute service — the successor to (and absorption of)
@@ -89,22 +110,425 @@ export const ANALYSIS_PYTHONPATH = "/opt/camelai-python";
  * legitimate run short or fail to bound the one this file forwards.
  */
 export const ANALYSIS_DEFAULT_NOTEBOOK_TIMEOUT_MS = 300_000;
-export const ANALYSIS_MAX_NOTEBOOK_TIMEOUT_MS = 900_000;
+export const ANALYSIS_MAX_NOTEBOOK_TIMEOUT_MS =
+  CHAT_RUNTIME_BOUNDS.analysisCommandDeadlineMs;
 // Long connection exports have a five-minute server budget. Leave enough room
 // for the request plus local DuckDB materialization in run_code/analysis_exec.
 export const ANALYSIS_DEFAULT_EXEC_TIMEOUT_MS = 360_000;
 export const ANALYSIS_DEFAULT_DEP_TIMEOUT_MS = 300_000;
 /** Fixed budget for the post-execution notebook validator leg. */
 export const ANALYSIS_NOTEBOOK_VALIDATE_TIMEOUT_MS = 60_000;
+/** Hard producer-side ceilings for post-run project manifests. */
+export const ANALYSIS_MANIFEST_MAX_FILES = 4_096;
+export const ANALYSIS_MANIFEST_MAX_ENTRIES = 8_192;
+export const ANALYSIS_MANIFEST_MAX_PATH_BYTES = 224 * 1024;
+export const ANALYSIS_MANIFEST_MAX_BYTES = 512 * 1024;
+export const ANALYSIS_MAX_SOURCE_FILE_BYTES = ANALYSIS_MAX_PERSIST_BYTES;
+export const ANALYSIS_MAX_SOURCE_BYTES = 256 * 1024 * 1024;
+/** Aggregate bytes a single run may stream back into project storage. */
+export const ANALYSIS_MAX_PERSIST_TOTAL_BYTES = 256 * 1024 * 1024;
+/** Absolute wall-clock budget for the whole post-command persist phase. */
+export const ANALYSIS_PERSIST_TIMEOUT_MS = 120_000;
+/** Container-reset confirmation when per-run directory cleanup fails. */
+export const ANALYSIS_CLEANUP_RESET_TIMEOUT_MS =
+  ANALYSIS_CONTAINER_RESET_TIMEOUT_MS;
+const ANALYSIS_ARCHIVE_HANDOFF_TIMEOUT_MS = 5_000;
+const ANALYSIS_OPERATION_FINALIZE_TIMEOUT_MS =
+  ANALYSIS_CLEANUP_RESET_TIMEOUT_MS + ANALYSIS_ARCHIVE_HANDOFF_TIMEOUT_MS;
+/**
+ * One service-side lifecycle budget is command + bounded I/O (+ validator for
+ * notebooks). It is deliberately shorter than the tool boundary's 15s grace,
+ * so callers are still present while this service confirms cancellation/reset.
+ */
+export const ANALYSIS_OPERATION_IO_TIMEOUT_MS = ANALYSIS_PERSIST_TIMEOUT_MS;
+/** Pure admission RPCs should never consume the operation's execution budget. */
+const ANALYSIS_ADMISSION_RPC_TIMEOUT_MS =
+  ANALYSIS_CLEANUP_RESET_TIMEOUT_MS + 1_000;
+/** At most two bounded requests wait behind the active workspace/scope run. */
+export const ANALYSIS_EXECUTION_QUEUE_MAX_WAITERS = 2;
+/** Queueing is backpressure, not another unbounded analysis lifecycle. */
+export const ANALYSIS_EXECUTION_QUEUE_WAIT_MS = 30_000;
+const ANALYSIS_EXECUTION_QUEUE_POLL_MS = 1_000;
+/** Admission ceilings applied before command/env/params copies are built. */
+export const ANALYSIS_MAX_COMMAND_BYTES = CHAT_RUNTIME_BOUNDS.toolInputBytes;
+export const ANALYSIS_MAX_CODE_BYTES = CHAT_RUNTIME_BOUNDS.toolSourceReadBytes;
+export const ANALYSIS_MAX_PARAMS_BYTES = CHAT_RUNTIME_BOUNDS.toolInputBytes;
+export const ANALYSIS_MAX_ENV_BYTES = 32 * 1024;
+export const ANALYSIS_MAX_REQUEST_PATH_BYTES = 4 * 1024;
+export const ANALYSIS_MAX_DEPENDENCY_SPECS = 64;
+export const ANALYSIS_MAX_DEPENDENCY_SPEC_BYTES = 214;
+export const ANALYSIS_MAX_DEPENDENCY_BYTES = 8 * 1024;
 
 const DEFAULT_NOTEBOOK_TIMEOUT_MS = ANALYSIS_DEFAULT_NOTEBOOK_TIMEOUT_MS;
 const MAX_NOTEBOOK_TIMEOUT_MS = ANALYSIS_MAX_NOTEBOOK_TIMEOUT_MS;
 const DEFAULT_EXEC_TIMEOUT_MS = ANALYSIS_DEFAULT_EXEC_TIMEOUT_MS;
 const DEFAULT_DEP_TIMEOUT_MS = ANALYSIS_DEFAULT_DEP_TIMEOUT_MS;
 
-async function r2PrefixHasObjects(bucket: R2Bucket, prefix: string): Promise<boolean> {
+export class AnalysisExecutionBusyError extends Error {
+  override name = "AnalysisExecutionBusyError";
+
+  constructor(
+    operation: string,
+    scope: "agent" | "app",
+    readonly retryAfterMs: number,
+    reason: "busy" | "stale_reset_unconfirmed",
+  ) {
+    super(
+      reason === "stale_reset_unconfirmed"
+        ? `Analysis ${scope} environment could not confirm stale-owner cleanup for ${operation}; retry later`
+        : `Analysis ${scope} environment is busy with another operation; retry ${operation} later`,
+    );
+  }
+}
+
+export class AnalysisOperationDeadlineError extends Error {
+  override name = "AnalysisOperationDeadlineError";
+
+  constructor(
+    readonly operation: string,
+    readonly budgetMs: number,
+    options?: ErrorOptions,
+  ) {
+    super(
+      `Analysis ${operation} exceeded its ${Math.round(budgetMs / 1000)}s absolute lifecycle budget`,
+      options,
+    );
+  }
+}
+
+interface AnalysisOperationBudget {
+  readonly operation: string;
+  readonly ownerToken: string;
+  readonly budgetMs: number;
+  readonly deadlineAt: number;
+  /** The final reset window is reserved; ordinary phases stop at this instant. */
+  readonly workDeadlineAt: number;
+  readonly signal: AbortSignal;
+  /** RPCs whose local deadline fired before their server outcome was known. */
+  readonly pending: Set<Promise<unknown>>;
+  /** Successful overflow writes awaiting service-level reference handoff. */
+  readonly archives: Map<string, string>;
+  abort(reason: unknown): void;
+  reset?: Promise<void>;
+}
+
+interface AnalysisExecutionQueueWaiter {
+  settled: boolean;
+  timer?: ReturnType<typeof setTimeout>;
+  resolve(release: () => void): void;
+  reject(error: AnalysisExecutionBusyError): void;
+}
+
+interface AnalysisExecutionQueueState {
+  active: boolean;
+  waiters: AnalysisExecutionQueueWaiter[];
+}
+
+function analysisOperationBudgetMs(
+  commandTimeoutMs: number,
+  secondaryTimeoutMs = 0,
+): number {
+  return Math.min(
+    ANALYSIS_EXECUTION_LEASE_MS,
+    commandTimeoutMs + secondaryTimeoutMs + ANALYSIS_OPERATION_IO_TIMEOUT_MS,
+  );
+}
+
+function analysisOperationDeadlineError(
+  budget: AnalysisOperationBudget,
+  cause?: unknown,
+): AnalysisOperationDeadlineError {
+  return new AnalysisOperationDeadlineError(
+    budget.operation,
+    budget.budgetMs,
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+function assertAnalysisOperationActive(
+  budget: AnalysisOperationBudget | undefined,
+): void {
+  if (!budget) return;
+  if (budget.signal.aborted || Date.now() >= budget.workDeadlineAt) {
+    const reason = budget.signal.reason;
+    const error =
+      reason instanceof AnalysisOperationDeadlineError
+        ? reason
+        : analysisOperationDeadlineError(budget, reason);
+    budget.abort(error);
+    throw error;
+  }
+}
+
+async function awaitAnalysisOperation<T>(
+  pending: Promise<T>,
+  budget: AnalysisOperationBudget | undefined,
+): Promise<T> {
+  assertAnalysisOperationActive(budget);
+  const value = await pending;
+  assertAnalysisOperationActive(budget);
+  return value;
+}
+
+function remainingAnalysisWorkMs(
+  budget: AnalysisOperationBudget | undefined,
+  requestedMs: number,
+): number {
+  if (!budget) return requestedMs;
+  assertAnalysisOperationActive(budget);
+  const remaining = Math.floor(budget.workDeadlineAt - Date.now());
+  if (remaining < 1_000) {
+    const error = analysisOperationDeadlineError(budget);
+    budget.abort(error);
+    throw error;
+  }
+  return Math.max(1, Math.min(requestedMs, remaining));
+}
+
+async function withAnalysisAdmissionRpcDeadline<T>(
+  pending: Promise<T>,
+  operation: "acquire" | "release" | "authorization",
+  timeoutMs = ANALYSIS_ADMISSION_RPC_TIMEOUT_MS,
+): Promise<T> {
+  pending.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Analysis ${operation} RPC deadline exceeded`)),
+      Math.max(1, Math.min(ANALYSIS_ADMISSION_RPC_TIMEOUT_MS, timeoutMs)),
+    );
+  });
+  try {
+    return await Promise.race([pending, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function acquireAnalysisExecutionLeaseWithBoundedWait(
+  sandbox: AnalysisSandboxStub,
+  request: { token: string; operation: string },
+  queueDeadlineAt: number,
+): Promise<AnalysisExecutionLeaseResult> {
+  for (;;) {
+    const remainingMs = Math.max(1, Math.floor(queueDeadlineAt - Date.now()));
+    const admission = await withAnalysisAdmissionRpcDeadline(
+      sandbox.acquireExecutionLease(request),
+      "acquire",
+      remainingMs,
+    );
+    if (
+      admission.acquired ||
+      admission.reason !== "busy" ||
+      Date.now() >= queueDeadlineAt
+    ) {
+      return admission;
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(
+        resolve,
+        Math.max(
+          1,
+          Math.min(
+            ANALYSIS_EXECUTION_QUEUE_POLL_MS,
+            queueDeadlineAt - Date.now(),
+          ),
+        ),
+      );
+    });
+  }
+}
+
+function clampAnalysisOutputCaptureBytes(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(
+        0,
+        Math.min(
+          CHAT_RUNTIME_BOUNDS.analysisOutputOverflowBytes,
+          Math.floor(value),
+        ),
+      )
+    : 0;
+}
+
+function encodeBoundedAnalysisObject(
+  value: unknown,
+  maximumBytes: number,
+  label: string,
+): string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const encoded = boundedCanonicalJsonResult(value, maximumBytes, {
+    maxDepth: CHAT_RUNTIME_BOUNDS.providerJsonDepth,
+    maxEntries: CHAT_RUNTIME_BOUNDS.providerJsonEntries,
+    maxNodes: CHAT_RUNTIME_BOUNDS.providerJsonNodes,
+  });
+  if (!encoded.complete || !encoded.json.startsWith("{")) {
+    throw new Error(`${label} exceeds its bounded JSON limit`);
+  }
+  return encoded.json;
+}
+
+function boundedAnalysisEnvironment(
+  value: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (value === undefined) return undefined;
+  const parsed = JSON.parse(
+    encodeBoundedAnalysisObject(value, ANALYSIS_MAX_ENV_BYTES, "environment"),
+  ) as Record<string, unknown>;
+  for (const [key, entry] of Object.entries(parsed)) {
+    if (
+      typeof entry !== "string" ||
+      key.includes("\0") ||
+      key.includes("=") ||
+      entry.includes("\0")
+    ) {
+      throw new Error("environment must contain valid string entries");
+    }
+  }
+  return parsed as Record<string, string>;
+}
+
+function withBoundedAnalysisParams(
+  code: string,
+  params: Record<string, unknown> | undefined,
+): string {
+  if (params === undefined) return code;
+  const encoded = encodeBoundedAnalysisObject(
+    params,
+    ANALYSIS_MAX_PARAMS_BYTES,
+    "params",
+  );
+  if (encoded === "{}") return code;
+  const literal = JSON.stringify(encoded);
+  return `import json as _wh_json\nparams = _wh_json.loads(${literal})\ndel _wh_json\n${code}`;
+}
+
+type AnalysisInputValidation<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: string };
+
+function validateAnalysisNotebookPath(
+  path: unknown,
+): AnalysisInputValidation<string> {
+  if (
+    typeof path !== "string" ||
+    path.includes("\0") ||
+    utf8ByteLength(path) > ANALYSIS_MAX_REQUEST_PATH_BYTES
+  ) {
+    return { ok: false, error: "path exceeds the analysis path byte limit" };
+  }
+  const notebookRel = normalizeAnalysisRelPath(path);
+  return notebookRel && notebookRel.endsWith(".ipynb")
+    ? { ok: true, value: notebookRel }
+    : {
+        ok: false,
+        error: "path must be a .ipynb file inside the project",
+      };
+}
+
+interface ValidatedAnalysisExecRequest {
+  command: string;
+  cwd?: string;
+  env?: Record<string, string>;
+  timeoutMs?: number;
+}
+
+function validateAnalysisExecRequest(request: {
+  command?: unknown;
+  cwd?: unknown;
+  env?: unknown;
+  timeoutMs?: number;
+}): AnalysisInputValidation<ValidatedAnalysisExecRequest> {
+  if (typeof request.command !== "string" || !/\S/.test(request.command)) {
+    return { ok: false, error: "command is required" };
+  }
+  if (request.command.includes("\0")) {
+    return { ok: false, error: "command contains a NUL byte" };
+  }
+  if (utf8ByteLength(request.command) > ANALYSIS_MAX_COMMAND_BYTES) {
+    return {
+      ok: false,
+      error: `command exceeds the ${ANALYSIS_MAX_COMMAND_BYTES} byte limit`,
+    };
+  }
+  if (
+    request.cwd !== undefined &&
+    (typeof request.cwd !== "string" ||
+      request.cwd.includes("\0") ||
+      utf8ByteLength(request.cwd) > ANALYSIS_MAX_REQUEST_PATH_BYTES)
+  ) {
+    return {
+      ok: false,
+      error: "cwd exceeds the analysis path byte limit",
+    };
+  }
+  try {
+    return {
+      ok: true,
+      value: {
+        command: request.command,
+        ...(request.cwd === undefined ? {} : { cwd: request.cwd }),
+        ...(request.env === undefined
+          ? {}
+          : {
+              env: boundedAnalysisEnvironment(
+                request.env as Record<string, string>,
+              ),
+            }),
+        ...(request.timeoutMs === undefined
+          ? {}
+          : { timeoutMs: request.timeoutMs }),
+      },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error ? error.message : "invalid analysis environment",
+    };
+  }
+}
+
+function validateAnalysisCodeRequest(request: {
+  code?: unknown;
+  params?: unknown;
+}): AnalysisInputValidation<string> {
+  if (typeof request.code !== "string" || !/\S/.test(request.code)) {
+    return { ok: false, error: "code is required" };
+  }
+  if (utf8ByteLength(request.code) > ANALYSIS_MAX_CODE_BYTES) {
+    return {
+      ok: false,
+      error: `code exceeds the ${ANALYSIS_MAX_CODE_BYTES} byte limit`,
+    };
+  }
+  try {
+    return {
+      ok: true,
+      value: withBoundedAnalysisParams(
+        request.code,
+        request.params as Record<string, unknown> | undefined,
+      ),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "invalid analysis params",
+    };
+  }
+}
+
+async function r2PrefixHasObjects(
+  bucket: R2Bucket,
+  prefix: string,
+): Promise<boolean> {
   const normalizedPrefix = prefix.replace(/\/+$/, "");
-  const listed = await bucket.list({ prefix: `${normalizedPrefix}/`, limit: 1 });
+  const listed = await bucket.list({
+    prefix: `${normalizedPrefix}/`,
+    limit: 1,
+  });
   return listed.objects.length > 0;
 }
 
@@ -115,8 +539,48 @@ async function r2PrefixHasObjects(bucket: R2Bucket, prefix: string): Promise<boo
 export interface AnalysisSandboxLike {
   exec(
     command: string,
-    options?: { cwd?: string; env?: Record<string, string | undefined>; timeout?: number },
-  ): Promise<{ success?: boolean; stdout?: string; stderr?: string; exitCode?: number }>;
+    options?: {
+      cwd?: string;
+      env?: Record<string, string | undefined>;
+      timeout?: number;
+    },
+  ): Promise<{
+    success?: boolean;
+    stdout?: string;
+    stderr?: string;
+    exitCode?: number;
+  }>;
+  execBounded(
+    command: string,
+    options:
+      | {
+          cwd?: string;
+          env?: Record<string, string | undefined>;
+          timeout?: number;
+          signal?: AbortSignal;
+        }
+      | undefined,
+    limits: {
+      stdoutBytes: number;
+      stderrBytes: number;
+      overflowPath?: string;
+      overflowObjectKey?: string;
+      executionOwnerToken?: string;
+      overflowBytes?: number;
+    },
+  ): Promise<{
+    success?: boolean;
+    stdout?: string;
+    stderr?: string;
+    exitCode?: number;
+    stdoutBytes: number;
+    stderrBytes: number;
+    outputTruncated: boolean;
+    overflowStored: boolean;
+    overflowComplete: boolean;
+    overflowBytes: number;
+    overflowTaintToken?: string;
+  }>;
   mkdir(path: string, options?: { recursive?: boolean }): Promise<unknown>;
   writeFile(
     path: string,
@@ -131,10 +595,27 @@ export interface AnalysisSandboxLike {
     size?: number;
     mimeType?: string;
   }>;
+  /** Disposable-container fallback, including generation-specific cache reset. */
+  destroyAndForgetContainerGeneration?(): Promise<void>;
 }
 
 /** The full DO-RPC stub surface the service drives (custom AnalysisSandbox methods). */
 export type AnalysisSandboxStub = AnalysisSandboxLike & {
+  acquireExecutionLease(request: {
+    token: string;
+    operation: string;
+  }): Promise<AnalysisExecutionLeaseResult>;
+  releaseExecutionLease(token: string): Promise<boolean>;
+  acknowledgeBoundedExecArchive?(request: {
+    ownerToken: string;
+    taintToken: string;
+    objectKey: string;
+  }): Promise<boolean>;
+  discardBoundedExecArchive?(request: {
+    ownerToken: string;
+    taintToken: string;
+    objectKey: string;
+  }): Promise<boolean>;
   /**
    * Optional: drop the container session handle so the next command
    * re-handshakes one (see AnalysisSandbox.resetSession). Absent on older
@@ -155,6 +636,13 @@ export type AnalysisSandboxStub = AnalysisSandboxLike & {
 // Result shapes
 // ---------------------------------------------------------------------------
 
+export interface AnalysisFullOutput {
+  path: string;
+  hint: string;
+  bytes: number;
+  complete: boolean;
+}
+
 export interface AnalysisNotebookResult {
   ok: boolean;
   executed: boolean;
@@ -166,7 +654,10 @@ export interface AnalysisNotebookResult {
   removedFiles: string[];
   skippedOversize: string[];
   durationMs: number;
+  /** Producer acknowledgement used to settle reserved output-archive capacity. */
+  outputTruncated: boolean;
   error?: string;
+  fullOutput?: AnalysisFullOutput;
 }
 
 export interface AnalysisExecResult {
@@ -178,7 +669,10 @@ export interface AnalysisExecResult {
   removedFiles: string[];
   skippedOversize: string[];
   durationMs: number;
+  /** Producer acknowledgement used to settle reserved output-archive capacity. */
+  outputTruncated: boolean;
   error?: string;
+  fullOutput?: AnalysisFullOutput;
 }
 
 export interface AnalysisDependencyResult {
@@ -191,6 +685,7 @@ export interface AnalysisDependencyResult {
   lockPersisted: boolean;
   durationMs: number;
   error?: string;
+  fullOutput?: AnalysisFullOutput;
 }
 
 export interface AnalysisRunCodeResult {
@@ -198,6 +693,9 @@ export interface AnalysisRunCodeResult {
   stdout?: string;
   stderr?: string;
   error?: string;
+  fullOutput?: AnalysisFullOutput;
+  /** Omitted when execution failed before its output state became certain. */
+  outputTruncated?: boolean;
   /**
    * Internal recovery marker: the sandbox SESSION died (not the user program).
    * Set only where the environment error was caught, never from program output.
@@ -248,21 +746,49 @@ export function normalizeAnalysisRelPath(path: string): string {
     .join("/");
 }
 
-/**
- * Parse the `sha256sum` output of the container's post-run tree into a
- * path → hash map. sha256sum prints `<64hex>  <path>` (two spaces, path may start
- * `./`). Ignored paths are dropped so they never count as changes.
- */
+/** Parse a complete, producer-counted post-run manifest or fail closed. */
 export function parseSha256Manifest(stdout: string): Map<string, string> {
+  if (utf8ByteLength(stdout) > ANALYSIS_MANIFEST_MAX_BYTES) {
+    throw new Error("analysis manifest exceeds its byte limit");
+  }
+  const lines = stdout.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  const footer = lines.pop();
+  const footerMatch = /^CAMELAI_MANIFEST_V1 ([0-9]+)$/.exec(footer ?? "");
+  if (!footerMatch)
+    throw new Error("analysis manifest is missing its completion footer");
+  const expectedFiles = Number(footerMatch[1]);
+  if (
+    !Number.isSafeInteger(expectedFiles) ||
+    expectedFiles > ANALYSIS_MANIFEST_MAX_FILES
+  ) {
+    throw new Error("analysis manifest footer exceeds its file limit");
+  }
   const manifest = new Map<string, string>();
-  for (const rawLine of stdout.split("\n")) {
-    const line = rawLine.trimEnd();
-    if (!line) continue;
-    const match = /^([0-9a-f]{64})\s+(.+)$/i.exec(line);
-    if (!match) continue;
-    const rel = normalizeAnalysisRelPath(match[2]);
-    if (!rel || shouldIgnoreAnalysisPath(rel)) continue;
+  let pathBytes = 0;
+  for (const line of lines) {
+    const match = /^([0-9a-f]{64})  \.\/(.+)$/i.exec(line);
+    if (!match) throw new Error("analysis manifest contains a malformed row");
+    const rawPath = match[2];
+    const rel = normalizeAnalysisRelPath(rawPath);
+    if (
+      !rel ||
+      rel !== rawPath ||
+      rawPath.includes("\\") ||
+      shouldIgnoreAnalysisPath(rel)
+    ) {
+      throw new Error("analysis manifest contains an unsupported path");
+    }
+    if (manifest.has(rel))
+      throw new Error("analysis manifest contains a duplicate path");
+    pathBytes += utf8ByteLength(rel);
+    if (pathBytes > ANALYSIS_MANIFEST_MAX_PATH_BYTES) {
+      throw new Error("analysis manifest exceeds its path-byte limit");
+    }
     manifest.set(rel, match[1].toLowerCase());
+  }
+  if (manifest.size !== expectedFiles) {
+    throw new Error("analysis manifest footer does not match its rows");
   }
   return manifest;
 }
@@ -288,16 +814,12 @@ export function diffManifests(
 }
 
 /**
- * Inline caps for notebook run outputs, applied at the TOOL layer (see
- * clampAnalysisRunOutputs in code-mode-tools.ts), keeping the TAIL: nbconvert
- * writes the failing cell's source and the Python traceback at the END of
- * stderr, after progress noise, while the model-side tool-result cap truncates
- * head-first over the whole JSON result. The service itself returns FULL
- * stdout/stderr so the tool layer can spill the untruncated log to R2 as the
- * escape hatch before clamping.
+ * Producer-side byte caps for notebook output returned to the model. The
+ * service owns the only bounded overflow archive; downstream code never makes
+ * a second full-output copy merely to clamp it again.
  */
-export const ANALYSIS_NOTEBOOK_STDOUT_MAX_CHARS = 8_000;
-export const ANALYSIS_NOTEBOOK_STDERR_MAX_CHARS = 20_000;
+export const ANALYSIS_NOTEBOOK_STDOUT_BYTES = 8_000;
+export const ANALYSIS_NOTEBOOK_STDERR_BYTES = 20_000;
 
 /** Clamp text to its last `maxChars` characters, marking what was dropped. */
 export function clampOutputTail(text: string, maxChars: number): string {
@@ -395,10 +917,15 @@ const NOTEBOOK_TOOLCHAIN_WITH = ["jupyter", "nbconvert", "ipykernel"]
  * `python /usr/local/bin/execute-notebook` so it always runs under the active
  * env's interpreter.
  */
-export function notebookExecuteCommand(notebookRelPath: string, hasPyproject: boolean): string {
+export function notebookExecuteCommand(
+  notebookRelPath: string,
+  hasPyproject: boolean,
+): string {
   const quoted = shellQuote(notebookRelPath);
   const execute = `python /usr/local/bin/execute-notebook ${quoted}`;
-  return hasPyproject ? `uv run --project . ${NOTEBOOK_TOOLCHAIN_WITH} ${execute}` : execute;
+  return hasPyproject
+    ? `uv run --project . ${NOTEBOOK_TOOLCHAIN_WITH} ${execute}`
+    : execute;
 }
 
 /** validate-notebook is a baked system CLI, independent of the project venv. */
@@ -407,34 +934,88 @@ export function validateNotebookCommand(notebookRelPath: string): string {
 }
 
 /**
- * The command that fingerprints the container's post-run tree with sha256sum.
- * Prunes heavy/derived dirs so the hash pass is fast and never descends `.venv`.
- *
- * The file list is staged through a temp file instead of a pipe so that a
- * mid-stream `find` failure surfaces as a non-zero exit in ANY POSIX shell (no
- * bash-only `pipefail` dependency): a partial manifest must never masquerade as
- * a complete one — persistChangedFiles refuses to diff against a failed
- * manifest, because a truncated listing would make untouched files look removed
- * and delete them from the project store.
+ * Fingerprints the post-run tree while enforcing the file, visited-entry, path,
+ * and output ceilings before the manifest crosses the container boundary. A
+ * partial manifest exits non-zero and is never diffed: treating one as complete
+ * could make untouched project files look deleted.
  */
 export function treeManifestCommand(): string {
-  const pruneNames = [
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".ipynb_checkpoints",
-    ".cache",
-    ".uv-cache",
-    "node_modules",
-    ".git",
-    ".pytest_cache",
-    ".mypy_cache",
-  ];
-  const prune = pruneNames.map((name) => `-name ${shellQuote(name)}`).join(" -o ");
-  return (
-    `__mf=$(mktemp) && find . \\( ${prune} \\) -prune -o -type f -print0 > "$__mf" ` +
-    `&& xargs -0 -r sha256sum < "$__mf"; __rc=$?; [ -n "$__mf" ] && rm -f "$__mf"; test "$__rc" -eq 0`
-  );
+  const script = String.raw`
+import hashlib
+import os
+import sys
+
+pruned = {
+    ".venv", "venv", "__pycache__", ".ipynb_checkpoints", ".cache",
+    ".uv-cache", "node_modules", ".git", ".pytest_cache", ".mypy_cache",
+}
+file_count = entry_count = path_bytes = eligible_bytes = 0
+
+def fail(message):
+    sys.stderr.write(message + "\n")
+    raise SystemExit(73)
+
+pending = ["."]
+while pending:
+    current = pending.pop()
+    try:
+        with os.scandir(current) as entries:
+            for entry in entries:
+                entry_count += 1
+                if entry_count > ${ANALYSIS_MANIFEST_MAX_ENTRIES}:
+                    fail("analysis manifest exceeds visited-entry limit")
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name not in pruned:
+                        pending.append(entry.path)
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                relative = os.path.relpath(entry.path, ".").replace(os.sep, "/")
+                if any(character in relative for character in ("\0", "\n", "\r", "\\")):
+                    fail("analysis manifest contains an unsupported path")
+                try:
+                    encoded_path = relative.encode("utf-8", "strict")
+                except UnicodeError:
+                    fail("analysis manifest contains a non-UTF-8 path")
+                file_count += 1
+                path_bytes += len(encoded_path)
+                if file_count > ${ANALYSIS_MANIFEST_MAX_FILES}:
+                    fail("analysis manifest exceeds file limit")
+                if path_bytes > ${ANALYSIS_MANIFEST_MAX_PATH_BYTES}:
+                    fail("analysis manifest exceeds path-byte limit")
+                try:
+                    size = entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    fail("analysis manifest could not stat the complete project tree")
+                if size < 0:
+                    fail("analysis manifest contains an invalid file size")
+                if size > ${ANALYSIS_MAX_PERSIST_BYTES}:
+                    # Oversize files are reported as changed without reading
+                    # their bodies. persistChangedFiles will surface them in
+                    # skippedOversize instead of copying them into project R2.
+                    marker = hashlib.sha256(("oversize:" + str(size)).encode()).hexdigest()
+                    print(marker + "  ./" + relative)
+                    continue
+                eligible_bytes += size
+                if eligible_bytes > ${ANALYSIS_MAX_PERSIST_TOTAL_BYTES}:
+                    fail("analysis manifest exceeds aggregate eligible-byte limit")
+                digest = hashlib.sha256()
+                with open(entry.path, "rb") as source:
+                    remaining = size
+                    while remaining:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            fail("analysis manifest file changed while hashing")
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                    if source.read(1):
+                        fail("analysis manifest file changed while hashing")
+                print(digest.hexdigest() + "  ./" + relative)
+    except OSError:
+        fail("analysis manifest could not read the complete project tree")
+print("CAMELAI_MANIFEST_V1 " + str(file_count))
+`;
+  return `python3 -I -c ${shellQuote(script)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -462,8 +1043,14 @@ interface AnalysisRunDeps {
   files: WorkspaceFileStoreLike;
   projectId: string;
   newRunId: () => string;
+  /** Reserved by the chat attempt before dispatch; zero means inline-only. */
+  outputCaptureBytes?: number;
+  /** Trusted R2 prefix paired with /outputs for archive cleanup after reset. */
+  outputObjectPrefix?: string;
   /** Set by withSessionRecovery; absent in direct unit calls. */
   dispatch?: AnalysisCommandDispatch;
+  /** One absolute service-side lifecycle budget; direct helper tests may omit. */
+  budget?: AnalysisOperationBudget;
 }
 
 /**
@@ -488,12 +1075,154 @@ function analysisRunScratchDir(runId: string): string {
   return `${ANALYSIS_SCRATCH_ROOT}/${sanitizeSegment(runId)}`;
 }
 
-/** Best-effort removal of a run's workdir; never masks the run result. */
-async function cleanupWorkdir(sandbox: AnalysisSandboxLike, workdir: string): Promise<void> {
+/**
+ * Remove every per-run directory or reset the disposable container. Returning
+ * success while neither happened would let warm-container disk grow without a
+ * lifetime bound, so an unconfirmed reset is an explicit run failure.
+ */
+async function cleanupWorkdirs(
+  sandbox: AnalysisSandboxLike,
+  workdirs: readonly string[],
+  budget?: AnalysisOperationBudget,
+): Promise<void> {
+  if (!workdirs.length) return;
+  // The admission wrapper owns the one destructive reset after its deadline.
+  // A late continuation must stop here instead of racing a second cleanup.
+  if (budget?.signal.aborted) return;
+  let cleanupError: unknown;
   try {
-    await sandbox.exec(`rm -rf ${shellQuote(workdir)}`, { cwd: "/" });
-  } catch {
-    /* workdir cleanup is best-effort */
+    const timeout = remainingAnalysisWorkMs(budget, 30_000);
+    const result = await sandbox.execBounded(
+      `rm -rf -- ${workdirs.map(shellQuote).join(" ")}`,
+      { cwd: "/", timeout, ...(budget ? { signal: budget.signal } : {}) },
+      {
+        stdoutBytes: 1024,
+        stderrBytes: 4096,
+        ...(budget ? { executionOwnerToken: budget.ownerToken } : {}),
+      },
+    );
+    assertAnalysisOperationActive(budget);
+    const exitCode =
+      result && typeof result.exitCode === "number"
+        ? result.exitCode
+        : result?.success === false
+          ? 1
+          : 0;
+    if (exitCode === 0) return;
+    cleanupError = new Error(`analysis directory cleanup exited ${exitCode}`);
+  } catch (error) {
+    cleanupError = error;
+  }
+
+  await resetAnalysisContainer(sandbox, cleanupError, budget);
+}
+
+async function resetAnalysisContainer(
+  sandbox: AnalysisSandboxLike,
+  cause: unknown,
+  budget?: AnalysisOperationBudget,
+): Promise<void> {
+  if (budget?.reset) return budget.reset;
+  if (typeof sandbox.destroyAndForgetContainerGeneration !== "function") {
+    const error = new Error("Analysis container reset is unavailable", {
+      cause,
+    });
+    budget?.abort(error);
+    throw error;
+  }
+  const runReset = async () => {
+    const remaining = budget
+      ? Math.floor(budget.deadlineAt - Date.now())
+      : ANALYSIS_CLEANUP_RESET_TIMEOUT_MS;
+    if (remaining <= 0) {
+      throw new Error("Analysis container reset was unconfirmed", { cause });
+    }
+    const reset = Promise.resolve()
+      .then(() => sandbox.destroyAndForgetContainerGeneration!())
+      .then(
+        () => true,
+        () => false,
+      );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<false>((resolve) => {
+      timer = setTimeout(
+        () => resolve(false),
+        Math.max(1, Math.min(ANALYSIS_CLEANUP_RESET_TIMEOUT_MS, remaining)),
+      );
+    });
+    const resetConfirmed = await Promise.race([reset, deadline]);
+    if (timer) clearTimeout(timer);
+    if (!resetConfirmed) {
+      throw new Error("Analysis container reset was unconfirmed", { cause });
+    }
+  };
+  const reset = runReset().catch((error) => {
+    budget?.abort(error);
+    throw error;
+  });
+  if (budget) budget.reset = reset;
+  return reset;
+}
+
+async function settleAnalysisArchives(
+  sandbox: AnalysisSandboxStub,
+  budget: AnalysisOperationBudget,
+  action: "acknowledge" | "discard",
+): Promise<void> {
+  for (const [taintToken, objectKey] of budget.archives) {
+    assertAnalysisOperationActive(budget);
+    const method =
+      action === "acknowledge"
+        ? sandbox.acknowledgeBoundedExecArchive
+        : sandbox.discardBoundedExecArchive;
+    if (typeof method !== "function") {
+      const error = new Error(
+        `Analysis archive ${action} capability is unavailable`,
+      );
+      budget.abort(error);
+      throw error;
+    }
+    const confirmed = await awaitAnalysisOperation(
+      method.call(sandbox, {
+        ownerToken: budget.ownerToken,
+        taintToken,
+        objectKey,
+      }),
+      budget,
+    );
+    if (!confirmed) {
+      const error = new Error(`Analysis archive ${action} was unconfirmed`);
+      budget.abort(error);
+      throw error;
+    }
+    budget.archives.delete(taintToken);
+  }
+}
+
+/** Final-window cleanup after the ordinary work budget has already aborted. */
+async function discardAnalysisArchivesAfterAbort(
+  sandbox: AnalysisSandboxStub,
+  budget: AnalysisOperationBudget,
+): Promise<void> {
+  for (const [taintToken, objectKey] of budget.archives) {
+    const remaining = Math.floor(budget.deadlineAt - Date.now());
+    if (
+      remaining <= 0 ||
+      typeof sandbox.discardBoundedExecArchive !== "function"
+    ) {
+      throw new Error("Analysis archive discard was unconfirmed");
+    }
+    const confirmed = await withAnalysisAdmissionRpcDeadline(
+      sandbox.discardBoundedExecArchive({
+        ownerToken: budget.ownerToken,
+        taintToken,
+        objectKey,
+      }),
+      "release",
+      Math.min(remaining, ANALYSIS_ARCHIVE_HANDOFF_TIMEOUT_MS),
+    );
+    if (!confirmed) throw new Error("Analysis archive discard was unconfirmed");
+    budget.archives.delete(taintToken);
   }
 }
 
@@ -506,24 +1235,29 @@ interface AnalysisRunOutcome {
 }
 
 /**
- * Remove a run's scratch/work dirs — unless the shell died under it.
- *
- * A session death means either the SDK will hand the next call a fresh session
- * or (past the zombie threshold) the container has just been destroyed. In both
- * cases the workdir is a per-run path that dies with the container, so the
- * `rm -rf` cleans nothing — and against a destroyed container it is an
- * unconditional 30-120s cold boot, paid inside the caller's exec budget, ahead
- * of the session recovery that actually needs that time.
+ * Remove a run's scratch/work dirs. A dead shell cannot prove that its
+ * container or run directories disappeared, so production stubs reset the
+ * disposable container; minimal legacy/test fakes without destroy retain the
+ * historical skip behavior.
  */
 async function cleanupRunDirs(
   sandbox: AnalysisSandboxLike,
   outcome: AnalysisRunOutcome,
+  budget: AnalysisOperationBudget | undefined,
   ...workdirs: string[]
 ): Promise<void> {
-  if (outcome.sessionDied) return;
-  for (const workdir of workdirs) {
-    await cleanupWorkdir(sandbox, workdir);
+  if (budget?.signal.aborted) return;
+  if (outcome.sessionDied) {
+    if (typeof sandbox.destroyAndForgetContainerGeneration === "function") {
+      await resetAnalysisContainer(
+        sandbox,
+        new Error("analysis session died before directory cleanup"),
+        budget,
+      );
+    }
+    return;
   }
+  await cleanupWorkdirs(sandbox, workdirs, budget);
 }
 
 /** Execute + validate a notebook, persisting the changed set back. */
@@ -532,61 +1266,211 @@ function markCommandDispatched(dispatch?: AnalysisCommandDispatch): void {
   if (dispatch) dispatch.started = true;
 }
 
+const ANALYSIS_COMMAND_STDOUT_BYTES = 96 * 1024;
+const ANALYSIS_COMMAND_STDERR_BYTES = 96 * 1024;
+
+async function boundedAnalysisExec(
+  sandbox: AnalysisSandboxLike,
+  command: string,
+  options: {
+    cwd?: string;
+    env?: Record<string, string | undefined>;
+    timeout?: number;
+    signal?: AbortSignal;
+  },
+  label: string,
+  limits: {
+    stdoutBytes?: number;
+    stderrBytes?: number;
+    overflowBytes?: number;
+    overflowObjectPrefix?: string;
+  } = {},
+  budget?: AnalysisOperationBudget,
+): Promise<{
+  success?: boolean;
+  stdout?: string;
+  stderr?: string;
+  exitCode?: number;
+  fullOutput?: AnalysisFullOutput;
+  outputTruncated?: boolean;
+}> {
+  const filename = `${Date.now()}-${label.replace(/[^a-z0-9-]/gi, "-")}-${crypto.randomUUID().slice(0, 8)}.log`;
+  const relativePath = `outputs/tmp/${filename}`;
+  const overflowObjectKey = limits.overflowObjectPrefix
+    ? `${limits.overflowObjectPrefix.replace(/\/+$/, "")}/tmp/${filename}`
+    : undefined;
+  const overflowBytes = Number.isFinite(limits.overflowBytes)
+    ? Math.max(
+        0,
+        Math.min(
+          CHAT_RUNTIME_BOUNDS.analysisOutputOverflowBytes,
+          Math.floor(limits.overflowBytes ?? 0),
+        ),
+      )
+    : 0;
+  const requestedTimeout = Number.isFinite(options.timeout)
+    ? Math.max(1, Math.floor(options.timeout ?? 1))
+    : DEFAULT_EXEC_TIMEOUT_MS;
+  const timeout = remainingAnalysisWorkMs(budget, requestedTimeout);
+  const result = await sandbox.execBounded(
+    command,
+    {
+      ...options,
+      timeout,
+      ...(budget ? { signal: budget.signal } : {}),
+    },
+    {
+      stdoutBytes: limits.stdoutBytes ?? ANALYSIS_COMMAND_STDOUT_BYTES,
+      stderrBytes: limits.stderrBytes ?? ANALYSIS_COMMAND_STDERR_BYTES,
+      ...(budget ? { executionOwnerToken: budget.ownerToken } : {}),
+      ...(overflowBytes > 0
+        ? {
+            overflowPath: `/${relativePath}`,
+            ...(overflowObjectKey ? { overflowObjectKey } : {}),
+            overflowBytes,
+          }
+        : {}),
+    },
+  );
+  if (
+    budget &&
+    overflowObjectKey &&
+    result.overflowStored &&
+    result.overflowTaintToken
+  ) {
+    budget.archives.set(result.overflowTaintToken, overflowObjectKey);
+  } else if (budget && overflowObjectKey && result.overflowStored) {
+    const error = new Error(
+      "Bounded analysis archive was not durably staged for acknowledgement",
+    );
+    budget.abort(error);
+    throw error;
+  }
+  assertAnalysisOperationActive(budget);
+  return {
+    ...result,
+    ...(result.outputTruncated && result.overflowStored
+      ? {
+          fullOutput: {
+            path: relativePath,
+            bytes: result.overflowBytes,
+            complete: result.overflowComplete,
+            hint: result.overflowComplete
+              ? `stdout/stderr were truncated inline. Complete output: read({ location: "r2", path: "${relativePath}" })`
+              : `stdout/stderr exceeded the bounded archive. Read its bounded head/tail at read({ location: "r2", path: "${relativePath}" }).`,
+          },
+        }
+      : {}),
+  };
+}
+
 export async function runAnalysisNotebook(
   request: { path: string; timeoutMs?: number },
   deps: AnalysisRunDeps,
+  prevalidatedNotebookRel?: string,
 ): Promise<AnalysisNotebookResult> {
   const startedAt = Date.now();
-  const notebookRel = normalizeAnalysisRelPath(request.path);
-  if (!notebookRel || !notebookRel.endsWith(".ipynb")) {
-    return emptyNotebookResult(startedAt, "path must be a .ipynb file inside the project");
-  }
-  const timeoutMs = clampTimeout(request.timeoutMs, DEFAULT_NOTEBOOK_TIMEOUT_MS, MAX_NOTEBOOK_TIMEOUT_MS);
+  const validation = prevalidatedNotebookRel
+    ? ({ ok: true, value: prevalidatedNotebookRel } as const)
+    : validateAnalysisNotebookPath(request.path);
+  if (!validation.ok) return emptyNotebookResult(startedAt, validation.error);
+  const notebookRel = validation.value;
+  const timeoutMs = clampTimeout(
+    request.timeoutMs,
+    DEFAULT_NOTEBOOK_TIMEOUT_MS,
+    MAX_NOTEBOOK_TIMEOUT_MS,
+  );
 
   const runId = deps.newRunId();
   const workdir = analysisRunWorkdir(deps.projectId, runId);
   const scratchDir = analysisRunScratchDir(runId);
   const outcome: AnalysisRunOutcome = { sessionDied: false };
   try {
-    const before = await materializeProject(deps.sandbox, workdir, deps.files);
+    const before = await materializeProject(
+      deps.sandbox,
+      workdir,
+      deps.files,
+      deps.budget,
+    );
     if (!before.some((f) => f.path === notebookRel)) {
-      return emptyNotebookResult(startedAt, `notebook ${notebookRel} not found in project`);
+      return emptyNotebookResult(
+        startedAt,
+        `notebook ${notebookRel} not found in project`,
+      );
     }
     const hasPyproject = before.some((f) => f.path === "pyproject.toml");
-    const beforeManifest = await snapshotProjectManifest(deps.sandbox, workdir);
-    await deps.sandbox.mkdir(scratchDir, { recursive: true });
+    const beforeManifest = await snapshotProjectManifest(
+      deps.sandbox,
+      workdir,
+      deps.budget,
+    );
+    await awaitAnalysisOperation(
+      deps.sandbox.mkdir(scratchDir, { recursive: true }),
+      deps.budget,
+    );
 
     markCommandDispatched(deps.dispatch);
     const nb = normalizeExec(
-      await deps.sandbox.exec(notebookExecuteCommand(notebookRel, hasPyproject), {
-        cwd: workdir,
-        timeout: timeoutMs,
-        env: { ...analysisRunEnv({ projectId: deps.projectId }), SCRATCH: scratchDir },
-      }),
+      await boundedAnalysisExec(
+        deps.sandbox,
+        notebookExecuteCommand(notebookRel, hasPyproject),
+        {
+          cwd: workdir,
+          timeout: timeoutMs,
+          env: {
+            ...analysisRunEnv({ projectId: deps.projectId }),
+            SCRATCH: scratchDir,
+          },
+        },
+        "run-notebook",
+        {
+          stdoutBytes: ANALYSIS_NOTEBOOK_STDOUT_BYTES,
+          stderrBytes: ANALYSIS_NOTEBOOK_STDERR_BYTES,
+          overflowBytes: deps.outputCaptureBytes,
+          overflowObjectPrefix: deps.outputObjectPrefix,
+        },
+        deps.budget,
+      ),
     );
 
     // Always run the validator (nbconvert can "succeed" while embedding error
     // outputs the report would surface); its stdout is the structured issue list.
     const val = normalizeExec(
-      await deps.sandbox.exec(validateNotebookCommand(notebookRel), {
-        cwd: workdir,
-        timeout: ANALYSIS_NOTEBOOK_VALIDATE_TIMEOUT_MS,
-      }),
+      await boundedAnalysisExec(
+        deps.sandbox,
+        validateNotebookCommand(notebookRel),
+        {
+          cwd: workdir,
+          timeout: ANALYSIS_NOTEBOOK_VALIDATE_TIMEOUT_MS,
+        },
+        "validate-notebook",
+        {},
+        deps.budget,
+      ),
     );
     const validation = parseValidateNotebookOutput(val.stdout, val.exitCode);
 
-    const persisted = await persistChangedFiles(deps.sandbox, workdir, deps.files, beforeManifest);
+    const persisted = await persistChangedFiles(
+      deps.sandbox,
+      workdir,
+      deps.files,
+      beforeManifest,
+      undefined,
+      deps.budget,
+    );
     const executed = nb.exitCode === 0;
     const ok = executed && validation.clean;
     return {
       ok,
       executed,
       validation,
-      // Full outputs — the tool layer spills them to R2 and clamps for the
-      // model (see ANALYSIS_NOTEBOOK_STDOUT_MAX_CHARS).
+      // Inline output is bounded at the producer. A separately reserved,
+      // bounded archive is included only when /outputs is durably mounted.
       stdout: nb.stdout,
       stderr: nb.stderr,
       exitCode: nb.exitCode,
+      outputTruncated: nb.outputTruncated,
+      ...(nb.fullOutput ? { fullOutput: nb.fullOutput } : {}),
       ...persisted,
       durationMs: Date.now() - startedAt,
       ...(ok ? {} : { error: notebookErrorMessage(nb, validation) }),
@@ -595,39 +1479,93 @@ export async function runAnalysisNotebook(
     outcome.sessionDied = isSandboxSessionDeathError(error);
     throw error;
   } finally {
-    await cleanupRunDirs(deps.sandbox, outcome, workdir, scratchDir);
+    await cleanupRunDirs(
+      deps.sandbox,
+      outcome,
+      deps.budget,
+      workdir,
+      scratchDir,
+    );
   }
 }
 
 /** Ad-hoc shell in a project working dir (or a scratch dir when no project). */
 export async function runAnalysisExec(
-  request: { command: string; cwd?: string; env?: Record<string, string>; timeoutMs?: number },
+  request: {
+    command: string;
+    cwd?: string;
+    env?: Record<string, string>;
+    timeoutMs?: number;
+  },
   deps: AnalysisRunDeps & { hasProject: boolean; scratchId: string },
+  prevalidatedRequest?: ValidatedAnalysisExecRequest,
 ): Promise<AnalysisExecResult> {
   const startedAt = Date.now();
-  if (!request.command || !request.command.trim()) {
-    return { ok: false, stdout: "", stderr: "command is required", exitCode: 1, changedFiles: [], removedFiles: [], skippedOversize: [], durationMs: 0, error: "command is required" };
-  }
-  const timeoutMs = clampTimeout(request.timeoutMs, DEFAULT_EXEC_TIMEOUT_MS, MAX_NOTEBOOK_TIMEOUT_MS);
+  const validation = prevalidatedRequest
+    ? ({ ok: true, value: prevalidatedRequest } as const)
+    : validateAnalysisExecRequest(request);
+  if (!validation.ok) return emptyExecResult(startedAt, validation.error);
+  const validatedRequest = validation.value;
+  const requestEnvironment = validatedRequest.env;
+  const timeoutMs = clampTimeout(
+    validatedRequest.timeoutMs,
+    DEFAULT_EXEC_TIMEOUT_MS,
+    MAX_NOTEBOOK_TIMEOUT_MS,
+  );
 
   const outcome: AnalysisRunOutcome = { sessionDied: false };
   if (!deps.hasProject) {
     const scratch = `${ANALYSIS_SCRATCH_ROOT}/${sanitizeSegment(deps.scratchId)}`;
     try {
-      await deps.sandbox.mkdir(scratch, { recursive: true });
-      const cwd = request.cwd ? joinWithin(scratch, request.cwd) : scratch;
+      await awaitAnalysisOperation(
+        deps.sandbox.mkdir(scratch, { recursive: true }),
+        deps.budget,
+      );
+      const cwd = validatedRequest.cwd
+        ? joinWithin(scratch, validatedRequest.cwd)
+        : scratch;
       markCommandDispatched(deps.dispatch);
       const res = normalizeExec(
-        await deps.sandbox.exec(request.command, { cwd, timeout: timeoutMs, env: { ...analysisRunEnv(), SCRATCH: scratch, ...request.env } }),
+        await boundedAnalysisExec(
+          deps.sandbox,
+          validatedRequest.command,
+          {
+            cwd,
+            timeout: timeoutMs,
+            env: {
+              ...analysisRunEnv(),
+              SCRATCH: scratch,
+              ...requestEnvironment,
+            },
+          },
+          "analysis-exec",
+          {
+            overflowBytes: deps.outputCaptureBytes,
+            overflowObjectPrefix: deps.outputObjectPrefix,
+          },
+          deps.budget,
+        ),
       );
-      return { ok: res.exitCode === 0, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode, changedFiles: [], removedFiles: [], skippedOversize: [], durationMs: Date.now() - startedAt, ...(res.exitCode === 0 ? {} : { error: execError(res) }) };
+      return {
+        ok: res.exitCode === 0,
+        stdout: res.stdout,
+        stderr: res.stderr,
+        exitCode: res.exitCode,
+        changedFiles: [],
+        removedFiles: [],
+        skippedOversize: [],
+        durationMs: Date.now() - startedAt,
+        outputTruncated: res.outputTruncated,
+        ...(res.fullOutput ? { fullOutput: res.fullOutput } : {}),
+        ...(res.exitCode === 0 ? {} : { error: execError(res) }),
+      };
     } catch (error) {
       outcome.sessionDied = isSandboxSessionDeathError(error);
       throw error;
     } finally {
       // Scratch is per-call; without cleanup a warm container accumulates
       // abandoned scratch trees until its disk fills.
-      await cleanupRunDirs(deps.sandbox, outcome, scratch);
+      await cleanupRunDirs(deps.sandbox, outcome, deps.budget, scratch);
     }
   }
 
@@ -635,15 +1573,49 @@ export async function runAnalysisExec(
   const workdir = analysisRunWorkdir(deps.projectId, runId);
   const scratchDir = analysisRunScratchDir(runId);
   try {
-    await materializeProject(deps.sandbox, workdir, deps.files);
-    const beforeManifest = await snapshotProjectManifest(deps.sandbox, workdir);
-    await deps.sandbox.mkdir(scratchDir, { recursive: true });
-    const cwd = request.cwd ? joinWithin(workdir, request.cwd) : workdir;
+    await materializeProject(deps.sandbox, workdir, deps.files, deps.budget);
+    const beforeManifest = await snapshotProjectManifest(
+      deps.sandbox,
+      workdir,
+      deps.budget,
+    );
+    await awaitAnalysisOperation(
+      deps.sandbox.mkdir(scratchDir, { recursive: true }),
+      deps.budget,
+    );
+    const cwd = validatedRequest.cwd
+      ? joinWithin(workdir, validatedRequest.cwd)
+      : workdir;
     markCommandDispatched(deps.dispatch);
     const res = normalizeExec(
-      await deps.sandbox.exec(request.command, { cwd, timeout: timeoutMs, env: { ...analysisRunEnv({ projectId: deps.projectId }), SCRATCH: scratchDir, ...request.env } }),
+      await boundedAnalysisExec(
+        deps.sandbox,
+        validatedRequest.command,
+        {
+          cwd,
+          timeout: timeoutMs,
+          env: {
+            ...analysisRunEnv({ projectId: deps.projectId }),
+            SCRATCH: scratchDir,
+            ...requestEnvironment,
+          },
+        },
+        "analysis-exec",
+        {
+          overflowBytes: deps.outputCaptureBytes,
+          overflowObjectPrefix: deps.outputObjectPrefix,
+        },
+        deps.budget,
+      ),
     );
-    const persisted = await persistChangedFiles(deps.sandbox, workdir, deps.files, beforeManifest);
+    const persisted = await persistChangedFiles(
+      deps.sandbox,
+      workdir,
+      deps.files,
+      beforeManifest,
+      undefined,
+      deps.budget,
+    );
     return {
       ok: res.exitCode === 0,
       stdout: res.stdout,
@@ -651,13 +1623,21 @@ export async function runAnalysisExec(
       exitCode: res.exitCode,
       ...persisted,
       durationMs: Date.now() - startedAt,
+      outputTruncated: res.outputTruncated,
+      ...(res.fullOutput ? { fullOutput: res.fullOutput } : {}),
       ...(res.exitCode === 0 ? {} : { error: execError(res) }),
     };
   } catch (error) {
     outcome.sessionDied = isSandboxSessionDeathError(error);
     throw error;
   } finally {
-    await cleanupRunDirs(deps.sandbox, outcome, workdir, scratchDir);
+    await cleanupRunDirs(
+      deps.sandbox,
+      outcome,
+      deps.budget,
+      workdir,
+      scratchDir,
+    );
   }
 }
 
@@ -665,13 +1645,20 @@ export async function runAnalysisExec(
 export async function runAnalysisAddDependency(
   request: { packages: string[]; dev?: boolean },
   deps: AnalysisRunDeps,
+  prevalidatedPackages?: string[],
 ): Promise<AnalysisDependencyResult> {
   const startedAt = Date.now();
-  const packages = normalizeDependencySpecs(request.packages);
+  const packages =
+    prevalidatedPackages ?? normalizeDependencySpecs(request.packages);
   const workdir = analysisRunWorkdir(deps.projectId, deps.newRunId());
   const outcome: AnalysisRunOutcome = { sessionDied: false };
   try {
-    const before = await materializeProject(deps.sandbox, workdir, deps.files);
+    const before = await materializeProject(
+      deps.sandbox,
+      workdir,
+      deps.files,
+      deps.budget,
+    );
     const hasPyproject = before.some((f) => f.path === "pyproject.toml");
 
     // `uv add` requires a project; init one if the analysis project has no
@@ -687,27 +1674,60 @@ export async function runAnalysisAddDependency(
     const command = `${initCmd}uv add ${request.dev ? "--dev " : ""}${packages.map(shellQuote).join(" ")}`;
     markCommandDispatched(deps.dispatch);
     const res = normalizeExec(
-      await deps.sandbox.exec(command, { cwd: workdir, timeout: DEFAULT_DEP_TIMEOUT_MS, env: analysisRunEnv({ projectId: deps.projectId }) }),
+      await boundedAnalysisExec(
+        deps.sandbox,
+        command,
+        {
+          cwd: workdir,
+          timeout: DEFAULT_DEP_TIMEOUT_MS,
+          env: analysisRunEnv({ projectId: deps.projectId }),
+        },
+        "add-dependency",
+        {},
+        deps.budget,
+      ),
     );
 
-    const pyprojectPersisted = res.exitCode === 0 ? await persistSingleFile(deps.sandbox, workdir, deps.files, "pyproject.toml") : false;
-    const lockPersisted = res.exitCode === 0 ? await persistSingleFile(deps.sandbox, workdir, deps.files, "uv.lock") : false;
+    const persisted =
+      res.exitCode === 0
+        ? await withAnalysisPersistBudget(
+            async (budget) => ({
+              pyproject: await persistSingleFile(
+                deps.sandbox,
+                workdir,
+                deps.files,
+                "pyproject.toml",
+                budget,
+              ),
+              lock: await persistSingleFile(
+                deps.sandbox,
+                workdir,
+                deps.files,
+                "uv.lock",
+                budget,
+              ),
+            }),
+            undefined,
+            deps.budget,
+          )
+        : { pyproject: false, lock: false };
     return {
       ok: res.exitCode === 0,
       packages,
       stdout: res.stdout,
       stderr: res.stderr,
       exitCode: res.exitCode,
-      pyprojectPersisted,
-      lockPersisted,
+      pyprojectPersisted: persisted.pyproject,
+      lockPersisted: persisted.lock,
       durationMs: Date.now() - startedAt,
+      ...(res.fullOutput ? { fullOutput: res.fullOutput } : {}),
       ...(res.exitCode === 0 ? {} : { error: execError(res) }),
     };
   } catch (error) {
     outcome.sessionDied = isSandboxSessionDeathError(error);
     throw error;
   } finally {
-    await cleanupRunDirs(deps.sandbox, outcome, workdir);
+    await cleanupRunDirs(deps.sandbox, outcome, deps.budget, workdir);
   }
 }
 
@@ -721,30 +1741,75 @@ export async function runAnalysisCode(
     sandbox: AnalysisSandboxLike;
     scratchId: string;
     connections?: boolean;
+    outputCaptureBytes?: number;
+    outputObjectPrefix?: string;
     dispatch?: AnalysisCommandDispatch;
+    budget?: AnalysisOperationBudget;
   },
+  prevalidatedCode?: string,
 ): Promise<AnalysisRunCodeResult> {
-  if (!request.code || !request.code.trim()) {
-    return { ok: false, error: "code is required" };
+  const validation = prevalidatedCode
+    ? ({ ok: true, value: prevalidatedCode } as const)
+    : validateAnalysisCodeRequest(request);
+  if (!validation.ok) {
+    return { ok: false, error: validation.error, outputTruncated: false };
   }
+  const code = validation.value;
   const scratch = `${ANALYSIS_SCRATCH_ROOT}/${sanitizeSegment(deps.scratchId)}`;
   const scriptPath = `${scratch}/main.py`;
   const outcome: AnalysisRunOutcome = { sessionDied: false };
   try {
-    await deps.sandbox.mkdir(scratch, { recursive: true });
-    const code = withWarehouseParams(request.code, request.params);
-    await deps.sandbox.writeFile(scriptPath, base64FromString(code), { encoding: "base64" });
+    await awaitAnalysisOperation(
+      deps.sandbox.mkdir(scratch, { recursive: true }),
+      deps.budget,
+    );
+    await awaitAnalysisOperation(
+      deps.sandbox.writeFile(scriptPath, base64FromString(code), {
+        encoding: "base64",
+      }),
+      deps.budget,
+    );
     markCommandDispatched(deps.dispatch);
     const res = normalizeExec(
-      await deps.sandbox.exec(`python ${shellQuote(scriptPath)}`, { cwd: scratch, timeout: DEFAULT_EXEC_TIMEOUT_MS, env: { ...analysisRunEnv({ connections: deps.connections }), SCRATCH: scratch } }),
+      await boundedAnalysisExec(
+        deps.sandbox,
+        `python ${shellQuote(scriptPath)}`,
+        {
+          cwd: scratch,
+          timeout: DEFAULT_EXEC_TIMEOUT_MS,
+          env: {
+            ...analysisRunEnv({ connections: deps.connections }),
+            SCRATCH: scratch,
+          },
+        },
+        "run-code",
+        {
+          overflowBytes: deps.outputCaptureBytes,
+          overflowObjectPrefix: deps.outputObjectPrefix,
+        },
+        deps.budget,
+      ),
     );
     if (res.exitCode !== 0) {
       // Deliberately NOT flagged as a session death, whatever the text says:
       // `execError` is the user program's own stderr, and a script that merely
       // PRINTS "SessionTerminatedError" must not trigger a silent re-run.
-      return { ok: false, stdout: res.stdout, stderr: res.stderr, error: execError(res) };
+      return {
+        ok: false,
+        stdout: res.stdout,
+        stderr: res.stderr,
+        error: execError(res),
+        outputTruncated: res.outputTruncated,
+        ...(res.fullOutput ? { fullOutput: res.fullOutput } : {}),
+      };
     }
-    return { ok: true, stdout: res.stdout, stderr: res.stderr };
+    return {
+      ok: true,
+      stdout: res.stdout,
+      stderr: res.stderr,
+      outputTruncated: res.outputTruncated,
+      ...(res.fullOutput ? { fullOutput: res.fullOutput } : {}),
+    };
   } catch (error) {
     outcome.sessionDied = isSandboxSessionDeathError(error);
     return {
@@ -758,7 +1823,7 @@ export async function runAnalysisCode(
   } finally {
     // Scratch is per-call; without cleanup a warm container accumulates
     // abandoned scratch trees until its disk fills.
-    await cleanupRunDirs(deps.sandbox, outcome, scratch);
+    await cleanupRunDirs(deps.sandbox, outcome, deps.budget, scratch);
   }
 }
 
@@ -770,56 +1835,131 @@ async function materializeProject(
   sandbox: AnalysisSandboxLike,
   workdir: string,
   files: WorkspaceFileStoreLike,
+  budget?: AnalysisOperationBudget,
 ): Promise<AnalysisSourceFile[]> {
-  const sourceFiles = await collectProjectSourceFiles(files);
-  await sandbox.mkdir(workdir, { recursive: true });
-  // Wipe non-derived files (keep .venv / caches for warm reuse) then write the
-  // current source tree. A future optimization diffs against a stamp; v1 is a
-  // correct full-source rewrite — cheap for notebooks + small data.
-  await sandbox.exec(
-    `find . -mindepth 1 \\( -name .venv -o -name venv -o -name .uv-cache -o -name __pycache__ -o -name node_modules -o -name .git \\) -prune -o -type f -print0 | xargs -0 -r rm -f`,
-    { cwd: workdir },
+  const sourceFiles = await collectProjectSourceFiles(files, budget);
+  await awaitAnalysisOperation(
+    sandbox.mkdir(workdir, { recursive: true }),
+    budget,
   );
+  // Every run gets a UUID-unique workdir, so there is no previous source tree
+  // to wipe and no reason to run another output-producing shell command here.
   for (const file of sourceFiles) {
+    assertAnalysisOperationActive(budget);
     const targetPath = `${workdir}/${file.path}`;
     const parent = dirname(targetPath);
-    if (parent && parent !== workdir) await sandbox.mkdir(parent, { recursive: true });
-    const read = await files.readFileStream(`/${file.path}`);
+    if (parent && parent !== workdir)
+      await awaitAnalysisOperation(
+        sandbox.mkdir(parent, { recursive: true }),
+        budget,
+      );
+    const read = await awaitAnalysisOperation(
+      files.readFileStream(`/${file.path}`),
+      budget,
+    );
     if (!read.success || !read.stream) {
-      throw new Error(read.error || `Failed to stream /${file.path} from the project store`);
+      throw new Error(
+        read.error || `Failed to stream /${file.path} from the project store`,
+      );
     }
-    if (typeof read.size === "number" && read.size !== file.size) {
+    if (!Number.isSafeInteger(read.size) || read.size !== file.size) {
       await read.stream.cancel().catch(() => {});
       throw new Error(
         `Project file /${file.path} changed size during analysis materialization ` +
-        `(${file.size} -> ${read.size} bytes)`,
+          `(${file.size} -> ${String(read.size)} bytes)`,
       );
     }
+    const exactStream = exactByteLengthStream(
+      read.stream,
+      file.size,
+      `/${file.path}`,
+    );
+    const boundedStream = budget
+      ? abortableAnalysisPersistStream(exactStream, budget.signal)
+      : exactStream;
     try {
       // ReadableStream ownership transfers through RPC: project R2 ->
       // WorkspaceFilesystemDO -> AnalysisService -> AnalysisSandbox. No file
       // bytes or base64 copy are retained in a Worker/DO isolate.
-      await sandbox.writeFile(targetPath, read.stream);
+      await awaitAnalysisOperation(
+        sandbox.writeFile(targetPath, boundedStream),
+        budget,
+      );
     } catch (error) {
-      await read.stream.cancel().catch(() => {});
+      await boundedStream.cancel().catch(() => {});
       throw error;
     }
   }
   return sourceFiles;
 }
 
+function exactByteLengthStream(
+  source: ReadableStream<Uint8Array>,
+  expectedBytes: number,
+  label: string,
+): ReadableStream<Uint8Array> {
+  let receivedBytes = 0;
+  return source.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        if (!(chunk instanceof Uint8Array)) {
+          throw new Error(`Project file ${label} returned a non-byte stream`);
+        }
+        if (chunk.byteLength > expectedBytes - receivedBytes) {
+          throw new Error(
+            `Project file ${label} exceeded its listed byte size while streaming`,
+          );
+        }
+        receivedBytes += chunk.byteLength;
+        controller.enqueue(chunk);
+      },
+      flush() {
+        if (receivedBytes !== expectedBytes) {
+          throw new Error(
+            `Project file ${label} ended after ${receivedBytes} of ${expectedBytes} listed bytes`,
+          );
+        }
+      },
+    }),
+  );
+}
+
 async function snapshotProjectManifest(
   sandbox: AnalysisSandboxLike,
   workdir: string,
+  budget?: AnalysisOperationBudget,
 ): Promise<Map<string, string>> {
-  const manifest = normalizeExec(await sandbox.exec(treeManifestCommand(), { cwd: workdir }));
+  const manifest = normalizeExec(
+    await boundedAnalysisExec(
+      sandbox,
+      treeManifestCommand(),
+      { cwd: workdir, timeout: ANALYSIS_NOTEBOOK_VALIDATE_TIMEOUT_MS },
+      "tree-manifest",
+      {
+        stdoutBytes: ANALYSIS_MANIFEST_MAX_BYTES,
+        stderrBytes: 8 * 1024,
+      },
+      budget,
+    ),
+  );
   if (manifest.exitCode !== 0) {
     throw new Error(
       `analysis persist aborted: tree manifest failed with exit code ${manifest.exitCode}` +
         (manifest.stderr ? `: ${manifest.stderr.slice(0, 500)}` : ""),
     );
   }
-  return parseSha256Manifest(manifest.stdout);
+  if (manifest.outputTruncated) {
+    throw new Error(
+      `analysis persist aborted: tree manifest exceeds ${ANALYSIS_MANIFEST_MAX_BYTES} bytes`,
+    );
+  }
+  const parsed = parseSha256Manifest(manifest.stdout);
+  if (parsed.size > ANALYSIS_MANIFEST_MAX_FILES) {
+    throw new Error(
+      `analysis persist aborted: tree manifest exceeds ${ANALYSIS_MANIFEST_MAX_FILES} files`,
+    );
+  }
+  return parsed;
 }
 
 interface StreamedSandboxFile {
@@ -828,44 +1968,187 @@ interface StreamedSandboxFile {
   mimeType?: string;
 }
 
+interface AnalysisPersistBudget {
+  deadlineAt: number;
+  signal: AbortSignal;
+  reservedBytes: number;
+}
+
+function analysisPersistDeadlineError(): Error {
+  return new Error("analysis persist deadline exceeded");
+}
+
+function assertAnalysisPersistActive(budget: AnalysisPersistBudget): void {
+  if (budget.signal.aborted || Date.now() >= budget.deadlineAt) {
+    throw analysisPersistDeadlineError();
+  }
+}
+
+async function withAnalysisPersistBudget<T>(
+  run: (budget: AnalysisPersistBudget) => Promise<T>,
+  timeoutMs = ANALYSIS_PERSIST_TIMEOUT_MS,
+  operationBudget?: AnalysisOperationBudget,
+): Promise<T> {
+  const requestedDurationMs = Number.isFinite(timeoutMs)
+    ? Math.max(1, Math.min(ANALYSIS_PERSIST_TIMEOUT_MS, Math.floor(timeoutMs)))
+    : ANALYSIS_PERSIST_TIMEOUT_MS;
+  const durationMs = operationBudget
+    ? remainingAnalysisWorkMs(operationBudget, requestedDurationMs)
+    : requestedDurationMs;
+  const controller = new AbortController();
+  const budget: AnalysisPersistBudget = {
+    deadlineAt: Date.now() + durationMs,
+    signal: controller.signal,
+    reservedBytes: 0,
+  };
+  const operation = Promise.resolve().then(() => run(budget));
+  // The persist timer may return a bounded error before a remote adoption or
+  // deletion reports its outcome. Keep that continuation visible to the outer
+  // admission owner so it cannot release the workspace lease meanwhile.
+  operationBudget?.pending.add(operation);
+  void operation.then(
+    () => operationBudget?.pending.delete(operation),
+    () => operationBudget?.pending.delete(operation),
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const parentAbort = () =>
+    controller.abort(
+      operationBudget?.signal.reason ?? analysisPersistDeadlineError(),
+    );
+  if (operationBudget?.signal.aborted) parentAbort();
+  else
+    operationBudget?.signal.addEventListener("abort", parentAbort, {
+      once: true,
+    });
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = analysisPersistDeadlineError();
+      controller.abort(error);
+      operationBudget?.abort(error);
+      reject(error);
+    }, durationMs);
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } catch (error) {
+    if (!controller.signal.aborted) controller.abort(error);
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    operationBudget?.signal.removeEventListener("abort", parentAbort);
+  }
+}
+
 async function openSandboxFileStream(
   sandbox: AnalysisSandboxLike,
   path: string,
+  budget: AnalysisPersistBudget,
 ): Promise<StreamedSandboxFile> {
+  assertAnalysisPersistActive(budget);
   const read = await sandbox.readFile(path, { encoding: "none" });
   if (typeof read.content === "string") {
     throw new Error(`Sandbox did not return a binary stream for ${path}`);
   }
-  if (!Number.isFinite(read.size) || (read.size as number) < 0) {
+  if (!Number.isSafeInteger(read.size) || (read.size as number) < 0) {
     await read.content.cancel().catch(() => {});
     throw new Error(`Sandbox did not report a valid byte size for ${path}`);
   }
+  if (budget.signal.aborted || Date.now() >= budget.deadlineAt) {
+    await read.content.cancel().catch(() => {});
+    throw analysisPersistDeadlineError();
+  }
   return {
     stream: read.content,
-    size: Math.floor(read.size as number),
+    size: read.size as number,
     mimeType: read.mimeType,
   };
+}
+
+function abortableAnalysisPersistStream(
+  source: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
+  let finished = false;
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const abort = () => {
+    if (finished) return;
+    finished = true;
+    const reason = signal.reason ?? analysisPersistDeadlineError();
+    void reader.cancel(reason).catch(() => {});
+    controller?.error(reason);
+  };
+  return new ReadableStream<Uint8Array>({
+    start(nextController) {
+      controller = nextController;
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+    },
+    async pull(nextController) {
+      try {
+        const next = await reader.read();
+        if (finished) return;
+        if (next.done) {
+          finished = true;
+          signal.removeEventListener("abort", abort);
+          nextController.close();
+          return;
+        }
+        nextController.enqueue(next.value);
+      } catch (error) {
+        if (finished) return;
+        finished = true;
+        signal.removeEventListener("abort", abort);
+        nextController.error(error);
+      }
+    },
+    async cancel(reason) {
+      if (finished) return;
+      finished = true;
+      signal.removeEventListener("abort", abort);
+      await reader.cancel(reason);
+    },
+  });
 }
 
 async function persistOpenedSandboxFile(
   files: WorkspaceFileStoreLike,
   rel: string,
   opened: StreamedSandboxFile,
+  budget: AnalysisPersistBudget,
 ): Promise<"persisted" | "oversize"> {
+  assertAnalysisPersistActive(budget);
   if (opened.size > ANALYSIS_MAX_PERSIST_BYTES) {
     await opened.stream.cancel().catch(() => {});
     return "oversize";
   }
+  if (opened.size > ANALYSIS_MAX_PERSIST_TOTAL_BYTES - budget.reservedBytes) {
+    await opened.stream.cancel().catch(() => {});
+    throw new Error(
+      `analysis persist exceeds the ${ANALYSIS_MAX_PERSIST_TOTAL_BYTES} aggregate-byte limit`,
+    );
+  }
   if (!files.adoptR2File) {
     await opened.stream.cancel().catch(() => {});
-    throw new Error("Project file store does not support streaming R2 adoption");
+    throw new Error(
+      "Project file store does not support streaming R2 adoption",
+    );
   }
+  // Reserve before crossing the RPC boundary. A failed or uncertain adoption
+  // never refunds capacity, so concurrent/late completion cannot exceed the
+  // per-run contract.
+  budget.reservedBytes += opened.size;
+  const abortableStream = abortableAnalysisPersistStream(
+    opened.stream,
+    budget.signal,
+  );
   const result = await files.adoptR2File(
     `/${rel}`,
-    opened.stream,
+    abortableStream,
     opened.size,
     opened.mimeType,
   );
+  assertAnalysisPersistActive(budget);
   if (!result.success) {
     throw new Error(result.error || `Failed to persist ${rel}`);
   }
@@ -877,34 +2160,65 @@ async function persistChangedFiles(
   workdir: string,
   files: WorkspaceFileStoreLike,
   beforeManifest: Map<string, string>,
-): Promise<{ changedFiles: string[]; removedFiles: string[]; skippedOversize: string[] }> {
-  // NEVER diff against a failed/partial manifest: an incomplete listing makes
-  // untouched files look removed and the loop below would delete them from the
-  // project store. Fail the run loudly instead.
-  const afterManifest = await snapshotProjectManifest(sandbox, workdir);
-  const { changed, removed } = diffManifests(beforeManifest, afterManifest);
+  timeoutMs = ANALYSIS_PERSIST_TIMEOUT_MS,
+  operationBudget?: AnalysisOperationBudget,
+): Promise<{
+  changedFiles: string[];
+  removedFiles: string[];
+  skippedOversize: string[];
+}> {
+  return withAnalysisPersistBudget(
+    async (budget) => {
+      // NEVER diff against a failed/partial manifest: an incomplete listing makes
+      // untouched files look removed and the loop below would delete them from the
+      // project store. Fail the run loudly instead.
+      const afterManifest = await snapshotProjectManifest(
+        sandbox,
+        workdir,
+        operationBudget,
+      );
+      assertAnalysisPersistActive(budget);
+      const { changed, removed } = diffManifests(beforeManifest, afterManifest);
 
-  const changedFiles: string[] = [];
-  const skippedOversize: string[] = [];
-  for (const rel of changed) {
-    const opened = await openSandboxFileStream(sandbox, `${workdir}/${rel}`);
-    const persisted = await persistOpenedSandboxFile(files, rel, opened);
-    if (persisted === "oversize") {
-      skippedOversize.push(rel);
-      continue;
-    }
-    changedFiles.push(rel);
-  }
-  const removedFiles: string[] = [];
-  for (const rel of removed) {
-    // force covers already-gone files; any remaining failure is a genuine
-    // storage error — fail loudly like the write path, or the project store
-    // silently keeps files the run deleted.
-    const result = await files.deleteFile(`/${rel}`, { force: true });
-    if (!result.success) throw new Error(result.error || `Failed to remove ${rel} from the project`);
-    removedFiles.push(rel);
-  }
-  return { changedFiles, removedFiles, skippedOversize };
+      const changedFiles: string[] = [];
+      const skippedOversize: string[] = [];
+      for (const rel of changed) {
+        const opened = await openSandboxFileStream(
+          sandbox,
+          `${workdir}/${rel}`,
+          budget,
+        );
+        const persisted = await persistOpenedSandboxFile(
+          files,
+          rel,
+          opened,
+          budget,
+        );
+        if (persisted === "oversize") {
+          skippedOversize.push(rel);
+          continue;
+        }
+        changedFiles.push(rel);
+      }
+      const removedFiles: string[] = [];
+      for (const rel of removed) {
+        assertAnalysisPersistActive(budget);
+        // force covers already-gone files; any remaining failure is a genuine
+        // storage error — fail loudly like the write path, or the project store
+        // silently keeps files the run deleted.
+        const result = await files.deleteFile(`/${rel}`, { force: true });
+        assertAnalysisPersistActive(budget);
+        if (!result.success)
+          throw new Error(
+            result.error || `Failed to remove ${rel} from the project`,
+          );
+        removedFiles.push(rel);
+      }
+      return { changedFiles, removedFiles, skippedOversize };
+    },
+    timeoutMs,
+    operationBudget,
+  );
 }
 
 async function persistSingleFile(
@@ -912,30 +2226,97 @@ async function persistSingleFile(
   workdir: string,
   files: WorkspaceFileStoreLike,
   rel: string,
+  budget: AnalysisPersistBudget,
 ): Promise<boolean> {
   let opened: StreamedSandboxFile;
   try {
-    opened = await openSandboxFileStream(sandbox, `${workdir}/${rel}`);
+    opened = await openSandboxFileStream(sandbox, `${workdir}/${rel}`, budget);
   } catch {
+    assertAnalysisPersistActive(budget);
     return false;
   }
-  return (await persistOpenedSandboxFile(files, rel, opened)) === "persisted";
+  return (
+    (await persistOpenedSandboxFile(files, rel, opened, budget)) === "persisted"
+  );
 }
 
-async function collectProjectSourceFiles(files: WorkspaceFileStoreLike): Promise<AnalysisSourceFile[]> {
-  const listing = await files.listFiles("/", { recursive: true, includeHidden: true, limit: 50_000 });
-  if (!listing.success) throw new Error(listing.error || "Failed to list project files");
+async function collectProjectSourceFiles(
+  files: WorkspaceFileStoreLike,
+  budget?: AnalysisOperationBudget,
+): Promise<AnalysisSourceFile[]> {
+  const listing = await awaitAnalysisOperation(
+    files.listFiles("/", {
+      recursive: true,
+      includeHidden: true,
+      limit: ANALYSIS_MANIFEST_MAX_ENTRIES + 1,
+      bounds: {
+        maxEntries: ANALYSIS_MANIFEST_MAX_ENTRIES,
+        maxFiles: ANALYSIS_MANIFEST_MAX_FILES,
+        maxPathBytes: ANALYSIS_MANIFEST_MAX_PATH_BYTES,
+        maxFileBytes: ANALYSIS_MAX_SOURCE_FILE_BYTES,
+        maxTotalBytes: ANALYSIS_MAX_SOURCE_BYTES,
+      },
+    }),
+    budget,
+  );
+  if (!listing.success)
+    throw new Error(listing.error || "Failed to list project files");
+  if (listing.files.length > ANALYSIS_MANIFEST_MAX_ENTRIES) {
+    throw new Error("Project exceeds the analysis source entry limit");
+  }
   const out: AnalysisSourceFile[] = [];
+  const seen = new Set<string>();
+  let pathBytes = 0;
+  let totalBytes = 0;
   for (const entry of listing.files) {
+    assertAnalysisOperationActive(budget);
     if (entry.type !== "file") continue;
+    const listedPath = entry.absolutePath.replace(/^\/+/, "");
     const rel = normalizeAnalysisRelPath(entry.absolutePath);
     if (!rel || shouldIgnoreAnalysisPath(rel)) continue;
-    if (!Number.isFinite(entry.size) || entry.size < 0) {
-      throw new Error(`Project file ${entry.absolutePath} has an invalid byte size`);
+    if (
+      rel !== listedPath ||
+      listedPath.includes("\\") ||
+      listedPath.includes("\0") ||
+      listedPath.includes("\n") ||
+      listedPath.includes("\r")
+    ) {
+      throw new Error(
+        `Project file ${entry.absolutePath} has an unsupported path`,
+      );
+    }
+    if (seen.has(rel))
+      throw new Error(
+        `Project contains duplicate file path ${entry.absolutePath}`,
+      );
+    seen.add(rel);
+    if (!Number.isSafeInteger(entry.size) || entry.size < 0) {
+      throw new Error(
+        `Project file ${entry.absolutePath} has an invalid byte size`,
+      );
+    }
+    const size = entry.size;
+    if (size > ANALYSIS_MAX_SOURCE_FILE_BYTES) {
+      throw new Error(
+        `Project file ${entry.absolutePath} exceeds the analysis source byte limit`,
+      );
+    }
+    if (out.length >= ANALYSIS_MANIFEST_MAX_FILES) {
+      throw new Error("Project exceeds the analysis source file limit");
+    }
+    pathBytes += utf8ByteLength(rel);
+    totalBytes += size;
+    if (pathBytes > ANALYSIS_MANIFEST_MAX_PATH_BYTES) {
+      throw new Error("Project exceeds the analysis source path-byte limit");
+    }
+    if (totalBytes > ANALYSIS_MAX_SOURCE_BYTES) {
+      throw new Error(
+        "Project exceeds the aggregate analysis source byte limit",
+      );
     }
     out.push({
       path: rel,
-      size: Math.floor(entry.size),
+      size,
     });
   }
   return out.sort((a, b) => a.path.localeCompare(b.path));
@@ -945,7 +2326,9 @@ async function collectProjectSourceFiles(files: WorkspaceFileStoreLike): Promise
 // Small utils
 // ---------------------------------------------------------------------------
 
-function analysisRunEnv(options: { projectId?: string; connections?: boolean } = {}): Record<string, string> {
+function analysisRunEnv(
+  options: { projectId?: string; connections?: boolean } = {},
+): Record<string, string> {
   return {
     CI: "1",
     PYTHONUNBUFFERED: "1",
@@ -957,21 +2340,37 @@ function analysisRunEnv(options: { projectId?: string; connections?: boolean } =
     // workspace/org scope the service attached DO-side (see analysis-sandbox.ts).
     // Omitted for app-scoped runs, whose container never registers the
     // interception (see runCodeForApps).
-    ...(options.connections === false ? {} : { CAMELAI_CONNECTIONS_RPC_URL: `http://${ANALYSIS_CONNECTIONS_HOST}/` }),
+    ...(options.connections === false
+      ? {}
+      : {
+          CAMELAI_CONNECTIONS_RPC_URL: `http://${ANALYSIS_CONNECTIONS_HOST}/`,
+        }),
     // Project runs use per-invocation workdirs (analysisRunWorkdir), so point uv
     // at a container-lifetime venv shared per project — env warmth survives run
     // isolation, and the venv never sits inside a persisted tree. uv locks the
     // environment during sync, so concurrent runs on one project are safe.
-    ...(options.projectId ? { UV_PROJECT_ENVIRONMENT: `/venvs/project-${sanitizeSegment(options.projectId)}` } : {}),
+    ...(options.projectId
+      ? {
+          UV_PROJECT_ENVIRONMENT: `/venvs/project-${sanitizeSegment(options.projectId)}`,
+        }
+      : {}),
   };
 }
 
-function clampTimeout(value: number | undefined, fallback: number, max: number): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallback;
+function clampTimeout(
+  value: number | undefined,
+  fallback: number,
+  max: number,
+): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0)
+    return fallback;
   return Math.min(Math.floor(value), max);
 }
 
-function emptyNotebookResult(startedAt: number, error: string): AnalysisNotebookResult {
+function emptyNotebookResult(
+  startedAt: number,
+  error: string,
+): AnalysisNotebookResult {
   return {
     ok: false,
     executed: false,
@@ -983,50 +2382,113 @@ function emptyNotebookResult(startedAt: number, error: string): AnalysisNotebook
     removedFiles: [],
     skippedOversize: [],
     durationMs: Date.now() - startedAt,
+    outputTruncated: false,
     error,
   };
 }
 
-function notebookErrorMessage(nb: { stderr: string; stdout: string; exitCode: number }, validation: { issues: string[] }): string {
+function emptyExecResult(startedAt: number, error: string): AnalysisExecResult {
+  return {
+    ok: false,
+    stdout: "",
+    stderr: error,
+    exitCode: 1,
+    changedFiles: [],
+    removedFiles: [],
+    skippedOversize: [],
+    durationMs: Date.now() - startedAt,
+    outputTruncated: false,
+    error,
+  };
+}
+
+function notebookErrorMessage(
+  nb: { stderr: string; stdout: string; exitCode: number },
+  validation: { issues: string[] },
+): string {
   if (nb.exitCode !== 0) {
     // Lead with the Python traceback when we can find one — it names the
     // failing cell and exception, which is what the caller needs to fix.
     const traceback = extractNotebookTraceback(nb.stderr);
     if (traceback) return traceback;
-    return clampOutputTail(nb.stderr || nb.stdout, ANALYSIS_NOTEBOOK_STDERR_MAX_CHARS)
-      || `notebook execution failed with exit code ${nb.exitCode}`;
+    return (
+      clampOutputTail(nb.stderr || nb.stdout, ANALYSIS_NOTEBOOK_STDERR_BYTES) ||
+      `notebook execution failed with exit code ${nb.exitCode}`
+    );
   }
-  if (validation.issues.length) return `notebook validation failed:\n${validation.issues.join("\n")}`;
+  if (validation.issues.length)
+    return `notebook validation failed:\n${validation.issues.join("\n")}`;
   return "notebook run failed";
 }
 
-function execError(res: { stderr: string; stdout: string; exitCode: number }): string {
-  return res.stderr || res.stdout || `command failed with exit code ${res.exitCode}`;
+function execError(res: {
+  stderr: string;
+  stdout: string;
+  exitCode: number;
+}): string {
+  return (
+    res.stderr || res.stdout || `command failed with exit code ${res.exitCode}`
+  );
 }
 
-function normalizeExec(result: { success?: boolean; stdout?: string; stderr?: string; exitCode?: number }): {
+function normalizeExec(result: {
+  success?: boolean;
+  stdout?: string;
+  stderr?: string;
+  exitCode?: number;
+  fullOutput?: AnalysisFullOutput;
+  outputTruncated?: boolean;
+}): {
   stdout: string;
   stderr: string;
   exitCode: number;
+  fullOutput?: AnalysisFullOutput;
+  outputTruncated: boolean;
 } {
-  const exitCode = typeof result.exitCode === "number" ? result.exitCode : result.success === false ? 1 : 0;
+  const exitCode =
+    typeof result.exitCode === "number"
+      ? result.exitCode
+      : result.success === false
+        ? 1
+        : 0;
   return {
     stdout: typeof result.stdout === "string" ? result.stdout : "",
     stderr: typeof result.stderr === "string" ? result.stderr : "",
     exitCode,
+    outputTruncated: result.outputTruncated === true,
+    ...(result.fullOutput ? { fullOutput: result.fullOutput } : {}),
   };
 }
 
 function normalizeDependencySpecs(value: unknown): string[] {
-  const list = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
+  const list = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? [value]
+      : [];
+  if (list.length > ANALYSIS_MAX_DEPENDENCY_SPECS) {
+    throw new Error(
+      `at most ${ANALYSIS_MAX_DEPENDENCY_SPECS} packages are allowed`,
+    );
+  }
   const out: string[] = [];
+  let totalBytes = 0;
   for (const raw of list) {
-    if (typeof raw !== "string") throw new Error("each package must be a string");
+    if (typeof raw !== "string")
+      throw new Error("each package must be a string");
     const spec = raw.trim();
     if (!spec) continue;
-    if (spec.length > 214) throw new Error("package spec is too long");
+    const specBytes = utf8ByteLength(spec);
+    if (specBytes > ANALYSIS_MAX_DEPENDENCY_SPEC_BYTES) {
+      throw new Error("package spec is too long");
+    }
+    totalBytes += specBytes;
+    if (totalBytes > ANALYSIS_MAX_DEPENDENCY_BYTES) {
+      throw new Error("package specs exceed their aggregate byte limit");
+    }
     // oxlint-disable-next-line no-control-regex -- Package specs must reject ASCII control characters.
-    if (/\s|[\u0000-\u001f\u007f]/.test(spec)) throw new Error("package must be a single spec (no spaces)");
+    if (/\s|[\u0000-\u001f\u007f]/.test(spec))
+      throw new Error("package must be a single spec (no spaces)");
     if (spec.startsWith("-")) throw new Error("package must not be a CLI flag");
     if (spec.includes("://") || /(^|@)(?:file|git|https?):/i.test(spec)) {
       throw new Error("package must be a PyPI package spec");
@@ -1044,7 +2506,12 @@ function joinWithin(base: string, sub: string): string {
 }
 
 function sanitizeSegment(value: string): string {
-  const cleaned = value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
+  const cleaned = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
   if (!cleaned) throw new Error("invalid identifier");
   return cleaned;
 }
@@ -1122,7 +2589,9 @@ interface AnalysisEnv extends ObservabilityEnv {
   R2_BUCKET?: R2Bucket;
   /** Same bucket as R2_BUCKET; separate binding so /outputs can mount alongside /uploads. */
   R2_OUTPUTS_BUCKET?: R2Bucket;
-  WORKSPACE_FS?: DurableObjectNamespace<import("./workspace-filesystem-do.js").WorkspaceFilesystemDO>;
+  WORKSPACE_FS?: DurableObjectNamespace<
+    import("./workspace-filesystem-do.js").WorkspaceFilesystemDO
+  >;
 }
 
 interface AnalysisServiceProps {
@@ -1130,61 +2599,515 @@ interface AnalysisServiceProps {
   orgId: string;
 }
 
-export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServiceProps> {
+export class AnalysisService extends WorkerEntrypoint<
+  AnalysisEnv,
+  AnalysisServiceProps
+> {
   private readonly sandboxes = new Map<string, AnalysisSandboxStub>();
+  private executionQueues?: Record<
+    "agent" | "app",
+    AnalysisExecutionQueueState
+  >;
 
   /** Test seam (agent-scoped container). */
   setSandbox(sandbox: AnalysisSandboxStub): void {
     this.sandboxes.set("agent", sandbox);
   }
 
-  async runNotebook(request: { projectId: string; path: string; timeoutMs?: number }): Promise<AnalysisNotebookResult> {
-    const files = await this.projectFiles(request.projectId);
-    return this.withSessionRecovery("run_notebook", async (sandbox, dispatch) => {
-      await this.prepareWorkspaceAccess(sandbox);
-      return runAnalysisNotebook(
-        { path: request.path, timeoutMs: request.timeoutMs },
-        { sandbox, files, projectId: request.projectId, newRunId: () => crypto.randomUUID(), dispatch },
+  private executionQueue(scope: "agent" | "app"): AnalysisExecutionQueueState {
+    const queues = (this.executionQueues ??= {
+      agent: { active: false, waiters: [] },
+      app: { active: false, waiters: [] },
+    });
+    return queues[scope];
+  }
+
+  private executionQueueRelease(scope: "agent" | "app"): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const queue = this.executionQueue(scope);
+      for (;;) {
+        const waiter = queue.waiters.shift();
+        if (!waiter) {
+          queue.active = false;
+          return;
+        }
+        if (waiter.settled) continue;
+        waiter.settled = true;
+        if (waiter.timer) clearTimeout(waiter.timer);
+        waiter.resolve(this.executionQueueRelease(scope));
+        return;
+      }
+    };
+  }
+
+  private async enterExecutionQueue(
+    operation: string,
+    scope: "agent" | "app",
+    queueDeadlineAt: number,
+  ): Promise<() => void> {
+    const queue = this.executionQueue(scope);
+    if (!queue.active) {
+      queue.active = true;
+      return this.executionQueueRelease(scope);
+    }
+    const remainingMs = Math.max(0, Math.floor(queueDeadlineAt - Date.now()));
+    if (
+      remainingMs < 1 ||
+      queue.waiters.length >= ANALYSIS_EXECUTION_QUEUE_MAX_WAITERS
+    ) {
+      throw new AnalysisExecutionBusyError(
+        operation,
+        scope,
+        Math.max(1, remainingMs),
+        "busy",
       );
+    }
+    return new Promise<() => void>((resolve, reject) => {
+      const waiter: AnalysisExecutionQueueWaiter = {
+        settled: false,
+        resolve,
+        reject,
+      };
+      waiter.timer = setTimeout(() => {
+        if (waiter.settled) return;
+        waiter.settled = true;
+        const index = queue.waiters.indexOf(waiter);
+        if (index >= 0) queue.waiters.splice(index, 1);
+        reject(
+          new AnalysisExecutionBusyError(
+            operation,
+            scope,
+            ANALYSIS_EXECUTION_QUEUE_POLL_MS,
+            "busy",
+          ),
+        );
+      }, remainingMs);
+      queue.waiters.push(waiter);
     });
   }
 
-  async exec(request: { projectId?: string; command: string; cwd?: string; env?: Record<string, string>; timeoutMs?: number }): Promise<AnalysisExecResult> {
-    const hasProject = Boolean(request.projectId);
-    const files = hasProject ? await this.projectFiles(request.projectId as string) : ({} as WorkspaceFileStoreLike);
-    return this.withSessionRecovery("exec", async (sandbox, dispatch) => {
-      await this.prepareWorkspaceAccess(sandbox);
-      return runAnalysisExec(
-        { command: request.command, cwd: request.cwd, env: request.env, timeoutMs: request.timeoutMs },
-        {
-          sandbox,
-          files,
-          dispatch,
-          projectId: request.projectId ?? "scratch",
-          newRunId: () => crypto.randomUUID(),
-          hasProject,
-          scratchId: crypto.randomUUID(),
+  /**
+   * One active operation plus two bounded waiters per workspace-scoped service.
+   * Waiters retain only already-admission-bounded request state and never begin
+   * file listing, materialization, or output capture before they own the slot.
+   * The durable sandbox lease remains the cross-instance authority; its ordinary
+   * busy result is polled only inside the same absolute queue deadline.
+   * Agent and deployed-app containers have intentionally separate security
+   * scopes, so each independently enforces one active operation plus its own
+   * bounded waiter lane.
+   */
+  private async withExecutionAdmission<T>(
+    operation: string,
+    scope: "agent" | "app",
+    budgetMs: number,
+    run: (budget: AnalysisOperationBudget) => Promise<T>,
+  ): Promise<T> {
+    const startedAt = Date.now();
+    const boundedBudgetMs = Math.max(
+      ANALYSIS_OPERATION_FINALIZE_TIMEOUT_MS + 1,
+      Math.min(ANALYSIS_EXECUTION_LEASE_MS, Math.floor(budgetMs)),
+    );
+    const lifecycleDeadlineAt = startedAt + boundedBudgetMs;
+    const queueDeadlineAt = Math.min(
+      lifecycleDeadlineAt - ANALYSIS_OPERATION_FINALIZE_TIMEOUT_MS,
+      startedAt + ANALYSIS_EXECUTION_QUEUE_WAIT_MS,
+    );
+    const releaseQueueSlot = await this.enterExecutionQueue(
+      operation,
+      scope,
+      queueDeadlineAt,
+    );
+    try {
+      const sandbox = await this.resolveSandbox(scope);
+      const token = crypto.randomUUID();
+      const admission = await acquireAnalysisExecutionLeaseWithBoundedWait(
+        sandbox,
+        { token, operation },
+        queueDeadlineAt,
+      );
+      if (!admission.acquired) {
+        throw new AnalysisExecutionBusyError(
+          operation,
+          scope,
+          admission.retryAfterMs,
+          admission.reason,
+        );
+      }
+
+      const deadlineAt = Math.min(admission.deadlineAt, lifecycleDeadlineAt);
+      const controller = new AbortController();
+      const budget: AnalysisOperationBudget = {
+        operation,
+        ownerToken: token,
+        budgetMs: Math.max(1, deadlineAt - startedAt),
+        deadlineAt,
+        workDeadlineAt: Math.max(
+          startedAt,
+          deadlineAt - ANALYSIS_OPERATION_FINALIZE_TIMEOUT_MS,
+        ),
+        signal: controller.signal,
+        pending: new Set(),
+        archives: new Map(),
+        abort(reason) {
+          if (!controller.signal.aborted) controller.abort(reason);
         },
-      );
-    });
+      };
+
+      const release = async () => {
+        const remaining = Math.floor(budget.deadlineAt - Date.now());
+        if (remaining <= 0) {
+          console.warn(
+            "[AnalysisService] analysis execution lease retained at lifecycle deadline",
+            { operation, scope, workspaceId: this.ctx.props.workspaceId },
+          );
+          return;
+        }
+        try {
+          const released = await withAnalysisAdmissionRpcDeadline(
+            sandbox.releaseExecutionLease(token),
+            "release",
+            remaining,
+          );
+          if (!released) {
+            console.warn(
+              "[AnalysisService] analysis execution lease release was fenced",
+              { operation, scope, workspaceId: this.ctx.props.workspaceId },
+            );
+          }
+        } catch (error) {
+          // The durable absolute expiry remains fail-closed if the transport dies.
+          console.warn(
+            "[AnalysisService] analysis execution lease release was unconfirmed",
+            {
+              operation,
+              scope,
+              workspaceId: this.ctx.props.workspaceId,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
+        }
+      };
+
+      let releaseNow = true;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let removeAbortListener = () => {};
+      try {
+        assertAnalysisOperationActive(budget);
+        let settled = false;
+        const operationOutcome = Promise.resolve()
+          .then(async () => {
+            try {
+              const value = await run(budget);
+              await settleAnalysisArchives(sandbox, budget, "acknowledge");
+              return value;
+            } catch (error) {
+              if (budget.archives.size > 0 && !budget.signal.aborted) {
+                try {
+                  await settleAnalysisArchives(sandbox, budget, "discard");
+                } catch (cleanupError) {
+                  throw new Error(
+                    "Analysis failed and its output archive cleanup was unconfirmed",
+                    { cause: cleanupError },
+                  );
+                }
+              }
+              throw error;
+            }
+          })
+          .then(
+            (value) => {
+              settled = true;
+              return { kind: "value" as const, value };
+            },
+            (error) => {
+              settled = true;
+              return { kind: "error" as const, error };
+            },
+          );
+        const aborted = new Promise<{ kind: "aborted" }>((resolve) => {
+          const onAbort = () => resolve({ kind: "aborted" });
+          controller.signal.addEventListener("abort", onAbort, { once: true });
+          removeAbortListener = () =>
+            controller.signal.removeEventListener("abort", onAbort);
+        });
+        timer = setTimeout(
+          () => {
+            budget.abort(analysisOperationDeadlineError(budget));
+          },
+          Math.max(0, budget.workDeadlineAt - Date.now()),
+        );
+
+        const outcome = await Promise.race([operationOutcome, aborted]);
+        if (outcome.kind === "value" && !budget.signal.aborted) {
+          return outcome.value;
+        }
+        if (outcome.kind === "error" && !budget.signal.aborted) {
+          throw outcome.error;
+        }
+
+        const deadlineError = analysisOperationDeadlineError(
+          budget,
+          budget.signal.reason,
+        );
+        budget.abort(deadlineError);
+        if (budget.archives.size > 0) {
+          try {
+            await discardAnalysisArchivesAfterAbort(sandbox, budget);
+          } catch {
+            // Retain both archive marker and durable lease. Stale-owner recovery
+            // must reset then delete the exact R2 key before another admission.
+            releaseNow = false;
+          }
+        }
+        try {
+          await resetAnalysisContainer(sandbox, deadlineError, budget);
+        } catch (resetError) {
+          // Cancellation is unconfirmed: retain the durable lease. Its stale-owner
+          // path requires another confirmed reset before any later admission.
+          releaseNow = false;
+          throw analysisOperationDeadlineError(budget, resetError);
+        }
+
+        const drains = [
+          ...(!settled ? [operationOutcome] : []),
+          ...budget.pending,
+        ];
+        if (drains.length > 0) {
+          // Do not permit overlap with an abandoned continuation. The durable
+          // lease remains owned until every locally-visible remote mutation
+          // reaches a terminal outcome; if one never does, lease expiry still
+          // requires destructive stale-owner recovery.
+          releaseNow = false;
+          void Promise.allSettled(drains)
+            .then(release)
+            .catch(() => undefined);
+        }
+        throw deadlineError;
+      } finally {
+        if (timer) clearTimeout(timer);
+        removeAbortListener();
+        if (releaseNow) await release();
+      }
+    } finally {
+      releaseQueueSlot();
+    }
   }
 
-  async addDependency(request: { projectId: string; packages: string[]; dev?: boolean }): Promise<AnalysisDependencyResult> {
+  async runNotebook(request: {
+    projectId: string;
+    path: string;
+    timeoutMs?: number;
+    outputCaptureBytes?: number;
+  }): Promise<AnalysisNotebookResult> {
+    const startedAt = Date.now();
+    const validatedPath = validateAnalysisNotebookPath(request.path);
+    if (!validatedPath.ok) {
+      return emptyNotebookResult(startedAt, validatedPath.error);
+    }
+    // Authorize the project before revealing workspace execution-busy state.
+    // This is a scalar registry lookup, not source materialization.
     const files = await this.projectFiles(request.projectId);
-    // `uv add` is idempotent (re-adding a pinned package converges on the same
-    // pyproject/uv.lock), so this one operation may retry after dispatch.
-    return this.withSessionRecovery("add_dependency", (sandbox, dispatch) =>
-      runAnalysisAddDependency(
-        { packages: request.packages, dev: request.dev },
-        { sandbox, files, projectId: request.projectId, newRunId: () => crypto.randomUUID(), dispatch },
-      ), "agent", { retryAfterDispatch: true });
+    const commandTimeoutMs = clampTimeout(
+      request.timeoutMs,
+      DEFAULT_NOTEBOOK_TIMEOUT_MS,
+      MAX_NOTEBOOK_TIMEOUT_MS,
+    );
+    return this.withExecutionAdmission(
+      "run_notebook",
+      "agent",
+      analysisOperationBudgetMs(
+        commandTimeoutMs,
+        ANALYSIS_NOTEBOOK_VALIDATE_TIMEOUT_MS,
+      ),
+      async (budget) => {
+        return this.withSessionRecovery(
+          "run_notebook",
+          async (sandbox, dispatch) => {
+            const outputsMounted = await this.prepareWorkspaceAccess(
+              sandbox,
+              budget,
+            );
+            return runAnalysisNotebook(
+              { path: request.path, timeoutMs: request.timeoutMs },
+              {
+                sandbox,
+                files,
+                projectId: request.projectId,
+                newRunId: () => crypto.randomUUID(),
+                outputCaptureBytes: outputsMounted
+                  ? clampAnalysisOutputCaptureBytes(request.outputCaptureBytes)
+                  : 0,
+                outputObjectPrefix: outputsMounted
+                  ? `${getWorkspaceR2Prefix(this.ctx.props.orgId, this.ctx.props.workspaceId)}/user-outputs`
+                  : undefined,
+                dispatch,
+                budget,
+              },
+              validatedPath.value,
+            );
+          },
+          "agent",
+          {},
+          budget,
+        );
+      },
+    );
   }
 
-  async runCode(request: { code: string; params?: Record<string, unknown> }): Promise<AnalysisRunCodeResult> {
-    return this.withSessionRecovery("run_code", async (sandbox, dispatch) => {
-      await this.prepareWorkspaceAccess(sandbox);
-      return runAnalysisCode(request, { sandbox, scratchId: crypto.randomUUID(), dispatch });
-    });
+  async exec(request: {
+    projectId?: string;
+    command: string;
+    cwd?: string;
+    env?: Record<string, string>;
+    timeoutMs?: number;
+    outputCaptureBytes?: number;
+  }): Promise<AnalysisExecResult> {
+    const startedAt = Date.now();
+    const validatedRequest = validateAnalysisExecRequest(request);
+    if (!validatedRequest.ok) {
+      return emptyExecResult(startedAt, validatedRequest.error);
+    }
+    const hasProject = Boolean(request.projectId);
+    const files = hasProject
+      ? await this.projectFiles(request.projectId as string)
+      : ({} as WorkspaceFileStoreLike);
+    const commandTimeoutMs = clampTimeout(
+      request.timeoutMs,
+      DEFAULT_EXEC_TIMEOUT_MS,
+      MAX_NOTEBOOK_TIMEOUT_MS,
+    );
+    return this.withExecutionAdmission(
+      "exec",
+      "agent",
+      analysisOperationBudgetMs(commandTimeoutMs),
+      async (budget) => {
+        return this.withSessionRecovery(
+          "exec",
+          async (sandbox, dispatch) => {
+            const outputsMounted = await this.prepareWorkspaceAccess(
+              sandbox,
+              budget,
+            );
+            return runAnalysisExec(
+              {
+                command: request.command,
+                cwd: request.cwd,
+                env: request.env,
+                timeoutMs: request.timeoutMs,
+              },
+              {
+                sandbox,
+                files,
+                dispatch,
+                projectId: request.projectId ?? "scratch",
+                newRunId: () => crypto.randomUUID(),
+                hasProject,
+                scratchId: crypto.randomUUID(),
+                outputCaptureBytes: outputsMounted
+                  ? clampAnalysisOutputCaptureBytes(request.outputCaptureBytes)
+                  : 0,
+                outputObjectPrefix: outputsMounted
+                  ? `${getWorkspaceR2Prefix(this.ctx.props.orgId, this.ctx.props.workspaceId)}/user-outputs`
+                  : undefined,
+                budget,
+              },
+              validatedRequest.value,
+            );
+          },
+          "agent",
+          {},
+          budget,
+        );
+      },
+    );
+  }
+
+  async addDependency(request: {
+    projectId: string;
+    packages: string[];
+    dev?: boolean;
+  }): Promise<AnalysisDependencyResult> {
+    if (request.dev !== undefined && typeof request.dev !== "boolean") {
+      throw new Error("dev must be a boolean");
+    }
+    const packages = normalizeDependencySpecs(request.packages);
+    const files = await this.projectFiles(request.projectId);
+    return this.withExecutionAdmission(
+      "add_dependency",
+      "agent",
+      analysisOperationBudgetMs(DEFAULT_DEP_TIMEOUT_MS),
+      async (budget) => {
+        // `uv add` is idempotent (re-adding a pinned package converges on the same
+        // pyproject/uv.lock), so this one operation may retry after dispatch.
+        return this.withSessionRecovery(
+          "add_dependency",
+          (sandbox, dispatch) =>
+            runAnalysisAddDependency(
+              { packages, dev: request.dev },
+              {
+                sandbox,
+                files,
+                projectId: request.projectId,
+                newRunId: () => crypto.randomUUID(),
+                dispatch,
+                budget,
+              },
+              packages,
+            ),
+          "agent",
+          { retryAfterDispatch: true },
+          budget,
+        );
+      },
+    );
+  }
+
+  async runCode(request: {
+    code: string;
+    params?: Record<string, unknown>;
+    outputCaptureBytes?: number;
+  }): Promise<AnalysisRunCodeResult> {
+    const validation = validateAnalysisCodeRequest(request);
+    if (!validation.ok) {
+      return { ok: false, error: validation.error, outputTruncated: false };
+    }
+    return this.withExecutionAdmission(
+      "run_code",
+      "agent",
+      analysisOperationBudgetMs(DEFAULT_EXEC_TIMEOUT_MS),
+      (budget) =>
+        this.withSessionRecovery(
+          "run_code",
+          async (sandbox, dispatch) => {
+            const outputsMounted = await this.prepareWorkspaceAccess(
+              sandbox,
+              budget,
+            );
+            return runAnalysisCode(
+              request,
+              {
+                sandbox,
+                scratchId: crypto.randomUUID(),
+                outputCaptureBytes: outputsMounted
+                  ? clampAnalysisOutputCaptureBytes(request.outputCaptureBytes)
+                  : 0,
+                outputObjectPrefix: outputsMounted
+                  ? `${getWorkspaceR2Prefix(this.ctx.props.orgId, this.ctx.props.workspaceId)}/user-outputs`
+                  : undefined,
+                dispatch,
+                budget,
+              },
+              validation.value,
+            );
+          },
+          "agent",
+          {},
+          budget,
+        ),
+    );
   }
 
   /**
@@ -1198,26 +3121,64 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
    * CAMELAI_CONNECTIONS_RPC_URL is injected (the interception is never
    * registered on this container, so the host is unreachable regardless).
    */
-  async runCodeForApps(request: { code: string; params?: Record<string, unknown> }): Promise<AnalysisRunCodeResult> {
-    return this.withSessionRecovery("run_code_for_apps", async (sandbox, dispatch) => {
-      // Seal egress before every app run: app code has no PyPI use case, so the
-      // class-level allowlist would only be an exfiltration channel for mounted
-      // export data (the override is in-memory DO state, hence per-run). The
-      // seal is re-applied on a recovery retry because a restarted container
-      // starts from the class-level allowlist again.
-      await sandbox.sealAppEgress();
-      if (this.env.WAREHOUSE_EXPORT_BUCKET) {
-        await sandbox.ensureMounted(ANALYSIS_EXPORT_BUCKET_BINDING, warehouseWorkspacePrefix(this.ctx.props.workspaceId));
-      }
-      return runAnalysisCode(request, { sandbox, scratchId: crypto.randomUUID(), connections: false, dispatch });
-    }, "app");
+  async runCodeForApps(request: {
+    code: string;
+    params?: Record<string, unknown>;
+  }): Promise<AnalysisRunCodeResult> {
+    const validation = validateAnalysisCodeRequest(request);
+    if (!validation.ok) {
+      return { ok: false, error: validation.error, outputTruncated: false };
+    }
+    return this.withExecutionAdmission(
+      "run_code_for_apps",
+      "app",
+      analysisOperationBudgetMs(DEFAULT_EXEC_TIMEOUT_MS),
+      (budget) =>
+        this.withSessionRecovery(
+          "run_code_for_apps",
+          async (sandbox, dispatch) => {
+            // Seal egress before every app run: app code has no PyPI use case, so the
+            // class-level allowlist would only be an exfiltration channel for mounted
+            // export data (the override is in-memory DO state, hence per-run). The
+            // seal is re-applied on a recovery retry because a restarted container
+            // starts from the class-level allowlist again.
+            await awaitAnalysisOperation(sandbox.sealAppEgress(), budget);
+            if (this.env.WAREHOUSE_EXPORT_BUCKET) {
+              await awaitAnalysisOperation(
+                sandbox.ensureMounted(
+                  ANALYSIS_EXPORT_BUCKET_BINDING,
+                  warehouseWorkspacePrefix(this.ctx.props.workspaceId),
+                ),
+                budget,
+              );
+            }
+            return runAnalysisCode(
+              request,
+              {
+                sandbox,
+                scratchId: crypto.randomUUID(),
+                connections: false,
+                dispatch,
+                budget,
+              },
+              validation.value,
+            );
+          },
+          "app",
+          {},
+          budget,
+        ),
+    );
   }
 
   async listConnections(): Promise<WarehouseConnection[]> {
-    const summaries = await listConnections(this.env as unknown as ConnectionsRuntimeEnv, {
-      orgId: this.ctx.props.orgId,
-      workspaceId: this.ctx.props.workspaceId,
-    });
+    const summaries = await listConnections(
+      this.env as unknown as ConnectionsRuntimeEnv,
+      {
+        orgId: this.ctx.props.orgId,
+        workspaceId: this.ctx.props.workspaceId,
+      },
+    );
     return annotateWarehouseConnections(summaries);
   }
 
@@ -1248,15 +3209,19 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
    * through AnalysisAppService) keeps getting a value, with the raw SDK text
    * swapped for the user-facing message; one that throws keeps throwing.
    *
-   * The retry inherits the caller's wall-clock budget: the client-side deadline
-   * (sandbox-exec-deadline.ts) and the abort race (pi-tools) both wrap this RPC
-   * from outside, so a retry cannot extend the tool call past either.
+   * The retry inherits this service's absolute lifecycle budget. Preparation,
+   * both attempts, persistence, cleanup, and confirmed destructive recovery all
+   * share one deadline; the caller-side grace remains only a transport backstop.
    */
   private async withSessionRecovery<T>(
     operation: string,
-    run: (sandbox: AnalysisSandboxStub, dispatch: AnalysisCommandDispatch) => Promise<T>,
+    run: (
+      sandbox: AnalysisSandboxStub,
+      dispatch: AnalysisCommandDispatch,
+    ) => Promise<T>,
     scope: "agent" | "app" = "agent",
     options: { retryAfterDispatch?: boolean } = {},
+    budget?: AnalysisOperationBudget,
   ): Promise<T> {
     const attempt = async (): Promise<
       | { kind: "value"; value: T }
@@ -1265,10 +3230,14 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
       const dispatch: AnalysisCommandDispatch = { started: false };
       // Safe to retry only while the command has not left us — unless the
       // caller declared this operation idempotent.
-      const retryable = () => options.retryAfterDispatch === true || !dispatch.started;
+      const retryable = () =>
+        options.retryAfterDispatch === true || !dispatch.started;
       try {
+        assertAnalysisOperationActive(budget);
         const value = await run(await this.resolveSandbox(scope), dispatch);
-        if (!isSandboxSessionDeathResult(value)) return { kind: "value", value };
+        assertAnalysisOperationActive(budget);
+        if (!isSandboxSessionDeathResult(value))
+          return { kind: "value", value };
         return {
           kind: "death",
           error: new Error(String((value as { error?: unknown }).error)),
@@ -1295,7 +3264,9 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
       return this.sessionDeathOutcome(first.result, first.error);
     }
     this.recordSessionTerminated(operation, first.error, true);
-    await this.recreateSandboxSession(scope);
+    assertAnalysisOperationActive(budget);
+    await this.recreateSandboxSession(scope, budget);
+    assertAnalysisOperationActive(budget);
 
     const retry = await attempt();
     if (retry.kind === "value") return annotateSessionRecovered(retry.value);
@@ -1306,7 +3277,9 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
   /** Same failure shape the operation uses, with the SDK text swapped out. */
   private sessionDeathOutcome<T>(result: T | null, error: Error): T {
     if (result !== null) {
-      const { sessionDeath: _dropped, ...rest } = result as T & { sessionDeath?: true };
+      const { sessionDeath: _dropped, ...rest } = result as T & {
+        sessionDeath?: true;
+      };
       return { ...(rest as T), error: ANALYSIS_SESSION_RESTARTED_MESSAGE };
     }
     throw new Error(ANALYSIS_SESSION_RESTARTED_MESSAGE, { cause: error });
@@ -1319,16 +3292,29 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
    * fails, the retry still works — the SDK recreates a terminated session
    * transparently on the next call — so this never fails the operation.
    */
-  private async recreateSandboxSession(scope: "agent" | "app"): Promise<void> {
+  private async recreateSandboxSession(
+    scope: "agent" | "app",
+    budget?: AnalysisOperationBudget,
+  ): Promise<void> {
     try {
       const sandbox = await this.resolveSandbox(scope);
-      await sandbox.resetSession?.();
+      if (sandbox.resetSession) {
+        await awaitAnalysisOperation(sandbox.resetSession(), budget);
+      }
     } catch (error) {
-      console.warn("[AnalysisService] failed to reset the sandbox session", error);
+      assertAnalysisOperationActive(budget);
+      console.warn(
+        "[AnalysisService] failed to reset the sandbox session",
+        error,
+      );
     }
   }
 
-  private recordSessionTerminated(operation: string, error: unknown, retried: boolean): void {
+  private recordSessionTerminated(
+    operation: string,
+    error: unknown,
+    retried: boolean,
+  ): void {
     console.warn("[AnalysisService] analysis session died under a command", {
       operation,
       retried,
@@ -1355,17 +3341,39 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
    * interception with this workspace/org scope attached DO-side. All three are
    * idempotent-cheap on a warm container.
    */
-  private async prepareWorkspaceAccess(sandbox: AnalysisSandboxStub): Promise<void> {
+  private async prepareWorkspaceAccess(
+    sandbox: AnalysisSandboxStub,
+    budget?: AnalysisOperationBudget,
+  ): Promise<boolean> {
+    let outputsMounted = false;
     if (this.env.WAREHOUSE_EXPORT_BUCKET) {
-      await sandbox.ensureMounted(ANALYSIS_EXPORT_BUCKET_BINDING, warehouseWorkspacePrefix(this.ctx.props.workspaceId));
+      await awaitAnalysisOperation(
+        sandbox.ensureMounted(
+          ANALYSIS_EXPORT_BUCKET_BINDING,
+          warehouseWorkspacePrefix(this.ctx.props.workspaceId),
+        ),
+        budget,
+      );
     }
     if (this.env.R2_BUCKET && this.ctx.props.orgId) {
       // Mounted at the stable /uploads alias — the agent's `uploads/<name>`
       // reference with a leading slash — because the raw org/workspace R2
       // prefix is neither shown to the agent nor derivable in the container.
       const uploadsPrefix = `${getWorkspaceR2Prefix(this.ctx.props.orgId, this.ctx.props.workspaceId)}/user-uploads`;
-      if (await r2PrefixHasObjects(this.env.R2_BUCKET, uploadsPrefix)) {
-        await sandbox.ensureMounted(ANALYSIS_UPLOADS_BUCKET_BINDING, uploadsPrefix, ANALYSIS_UPLOADS_MOUNT_PATH);
+      if (
+        await awaitAnalysisOperation(
+          r2PrefixHasObjects(this.env.R2_BUCKET, uploadsPrefix),
+          budget,
+        )
+      ) {
+        await awaitAnalysisOperation(
+          sandbox.ensureMounted(
+            ANALYSIS_UPLOADS_BUCKET_BINDING,
+            uploadsPrefix,
+            ANALYSIS_UPLOADS_MOUNT_PATH,
+          ),
+          budget,
+        );
       }
       // Writable, and deliberately NOT gated on the prefix already having
       // objects the way uploads is: outputs starts empty by definition, and the
@@ -1378,13 +3386,18 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
       const outputsPrefix = `${getWorkspaceR2Prefix(this.ctx.props.orgId, this.ctx.props.workspaceId)}/user-outputs`;
       if (this.env.R2_OUTPUTS_BUCKET) {
         try {
-          await sandbox.ensureMounted(
-            ANALYSIS_OUTPUTS_BUCKET_BINDING,
-            outputsPrefix,
-            ANALYSIS_OUTPUTS_MOUNT_PATH,
-            { readOnly: false },
+          await awaitAnalysisOperation(
+            sandbox.ensureMounted(
+              ANALYSIS_OUTPUTS_BUCKET_BINDING,
+              outputsPrefix,
+              ANALYSIS_OUTPUTS_MOUNT_PATH,
+              { readOnly: false },
+            ),
+            budget,
           );
+          outputsMounted = true;
         } catch (error) {
+          assertAnalysisOperationActive(budget);
           console.error("[AnalysisService] outputs mount failed", error);
         }
       } else {
@@ -1394,11 +3407,15 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
       }
     }
     if (this.ctx.props.orgId && this.ctx.props.workspaceId) {
-      await sandbox.ensureConnectionsRpc({
-        orgId: this.ctx.props.orgId,
-        workspaceId: this.ctx.props.workspaceId,
-      });
+      await awaitAnalysisOperation(
+        sandbox.ensureConnectionsRpc({
+          orgId: this.ctx.props.orgId,
+          workspaceId: this.ctx.props.workspaceId,
+        }),
+        budget,
+      );
     }
+    return outputsMounted;
   }
 
   /**
@@ -1410,11 +3427,23 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
    * project registry is the authority (same check the connections RPC route
    * uses); fail closed on any miss.
    */
-  private async projectFiles(projectId: string): Promise<WorkspaceFileStoreLike> {
-    if (!this.ctx.props.workspaceId) throw new Error("Analysis service requires workspace scope");
-    if (!this.env.WORKSPACE_FS) throw new Error("WORKSPACE_FS binding is not configured");
-    const registry = this.env.WORKSPACE_FS.get(this.env.WORKSPACE_FS.idFromName(this.ctx.props.workspaceId));
-    const project = await registry.getProject(projectId);
+  private async projectFiles(
+    projectId: string,
+  ): Promise<WorkspaceFileStoreLike> {
+    if (!this.ctx.props.workspaceId)
+      throw new Error("Analysis service requires workspace scope");
+    if (!this.env.WORKSPACE_FS)
+      throw new Error("WORKSPACE_FS binding is not configured");
+    const registry = this.env.WORKSPACE_FS.get(
+      this.env.WORKSPACE_FS.idFromName(this.ctx.props.workspaceId),
+    );
+    // This authorization lookup intentionally precedes execution admission so
+    // guessed cross-workspace ids cannot probe busy state. It has its own small
+    // RPC bound and performs no source listing/materialization or mutation.
+    const project = await withAnalysisAdmissionRpcDeadline(
+      registry.getProject(projectId),
+      "authorization",
+    );
     if (!project) {
       throw new Error(`Project ${projectId} not found in this workspace`);
     }
@@ -1427,14 +3456,20 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
    * separate container for deployed-app runCode, so app code never shares the
    * container-level mounts/interception the agent's runs establish.
    */
-  private async resolveSandbox(scope: "agent" | "app" = "agent"): Promise<AnalysisSandboxStub> {
+  private async resolveSandbox(
+    scope: "agent" | "app" = "agent",
+  ): Promise<AnalysisSandboxStub> {
     const cached = this.sandboxes.get(scope);
     if (cached) return cached;
-    if (!this.env.ANALYSIS_SANDBOX) throw new Error("ANALYSIS_SANDBOX container binding is not configured");
+    if (!this.env.ANALYSIS_SANDBOX)
+      throw new Error("ANALYSIS_SANDBOX container binding is not configured");
     const { getSandbox } = await import("@cloudflare/sandbox");
     // One warm container per workspace and scope; per-call isolation is via
     // working dirs.
-    const sandboxId = scope === "app" ? `app-${this.ctx.props.workspaceId}` : this.ctx.props.workspaceId;
+    const sandboxId =
+      scope === "app"
+        ? `app-${this.ctx.props.workspaceId}`
+        : this.ctx.props.workspaceId;
     const sandbox = getSandbox(
       this.env.ANALYSIS_SANDBOX as Parameters<typeof getSandbox>[0],
       sandboxId,
@@ -1455,22 +3490,34 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
  * full AnalysisService stays reachable only via ctx.exports with
  * platform-attached props — never bindable by user workers).
  */
-export class AnalysisAppService extends WorkerEntrypoint<AnalysisEnv, AnalysisServiceProps> {
-  async runCode(request: { code: string; params?: Record<string, unknown> }): Promise<AnalysisRunCodeResult> {
+export class AnalysisAppService extends WorkerEntrypoint<
+  AnalysisEnv,
+  AnalysisServiceProps
+> {
+  async runCode(request: {
+    code: string;
+    params?: Record<string, unknown>;
+  }): Promise<AnalysisRunCodeResult> {
     return this.full().runCodeForApps(request);
   }
 
   async listConnections(): Promise<WarehouseConnection[]> {
     // Honor CONNECTIONS_BINDING_ENABLED so deployed apps cannot read the
     // connection catalog through ANALYSIS when the CONNECTIONS broker is off.
-    assertConnectionsBindingEnabled(this.env as { CONNECTIONS_BINDING_ENABLED?: string });
+    assertConnectionsBindingEnabled(
+      this.env as { CONNECTIONS_BINDING_ENABLED?: string },
+    );
     return this.full().listConnections();
   }
 
   private full(): Pick<AnalysisService, "runCodeForApps" | "listConnections"> {
-    return (this.ctx.exports as unknown as {
-      AnalysisService: (options: { props: AnalysisServiceProps }) => AnalysisService;
-    }).AnalysisService({
+    return (
+      this.ctx.exports as unknown as {
+        AnalysisService: (options: {
+          props: AnalysisServiceProps;
+        }) => AnalysisService;
+      }
+    ).AnalysisService({
       props: {
         orgId: this.ctx.props.orgId,
         workspaceId: this.ctx.props.workspaceId,

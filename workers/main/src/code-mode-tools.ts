@@ -12,18 +12,36 @@ import { Type, type TSchema } from "typebox";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { WorkspaceDO } from "./workspace";
 import type { WorkspaceCronDO } from "./workspace-cron";
-import { ProjectFilesystemClient, WorkspaceFilesystemClient, normalizeWorkspacePath as normalizeDurableWorkspacePath, type WorkspaceFileStoreLike, type WorkspaceProject, type WorkspaceProjectCloneSummary, projectNameKey } from "./workspace-filesystem-do";
+import {
+  ProjectFilesystemClient,
+  WorkspaceFilesystemClient,
+  normalizeWorkspacePath as normalizeDurableWorkspacePath,
+  type WorkspaceFileStoreLike,
+  type WorkspaceProject,
+  type WorkspaceProjectCloneSummary,
+  projectNameKey,
+} from "./workspace-filesystem-do";
 import { getPreferredAppUrl } from "../../../src/lib/app-url";
 import {
   deleteDeployedAppRuntime,
   getDispatchScriptName,
 } from "../../../src/lib/deployed-app-delete.server";
-import { findConnectionMethodEntry, getConnection, invokeConnectionMethod, listConnectionMethods, listConnections, listConnectionTools, testConnectionMethodEntry, verifyConnection } from "./connections-runtime";
-import { confirmDestructiveAction, DESTRUCTIVE_CONFIRM_LABEL } from "./confirmed-destructive-action";
-import { collectProjectDeletionTargets } from "./project-deletion";
 import {
-  connectionsBindingEnabled,
-} from "../../../src/lib/connections-binding";
+  findConnectionMethodEntry,
+  getConnection,
+  invokeConnectionMethod,
+  listConnectionMethods,
+  listConnections,
+  listConnectionTools,
+  testConnectionMethodEntry,
+  verifyConnection,
+} from "./connections-runtime";
+import {
+  confirmDestructiveAction,
+  DESTRUCTIVE_CONFIRM_LABEL,
+} from "./confirmed-destructive-action";
+import { collectProjectDeletionTargets } from "./project-deletion";
+import { connectionsBindingEnabled } from "../../../src/lib/connections-binding";
 import { DEPLOYED_CONNECTIONS_BINDING_DISABLED_PROMPT } from "./pi-system-prompt";
 import {
   listAgentSkillFiles,
@@ -31,7 +49,10 @@ import {
   resolveAgentSkillCatalog,
   type AgentSkillReadResult,
 } from "./selfhost-agent-pack";
-import { PiContainerTools, PI_CONTAINER_TOOL_DEFINITIONS } from "./pi-container-tools";
+import {
+  PiContainerTools,
+  PI_CONTAINER_TOOL_DEFINITIONS,
+} from "./pi-container-tools";
 import { selectTextLineWindow, truncateTextHead } from "./bounded-text-lines";
 import { parseFilePreviewPath } from "./preview-paths";
 import type { ConnectionSetupResponse } from "./chat-thread-browser-prompts";
@@ -44,17 +65,36 @@ import {
 import type { HostedCapability } from "../../../src/lib/capability-allowances";
 import { buildWorkspaceScopedR2Key } from "../../../src/lib/workspace-r2-paths";
 import { retryR2Read } from "../../../src/lib/r2-read-retry";
-import { buildWorkspaceEmailAddress, getWorkspaceEmailDomain } from "../../../src/lib/workspace-email";
+import {
+  buildWorkspaceEmailAddress,
+  getWorkspaceEmailDomain,
+} from "../../../src/lib/workspace-email";
 import { isSelfhostRuntime } from "../../../src/lib/selfhost-runtime";
 import { SELFHOST_OUTBOUND_EMAIL_DISABLED_MESSAGE } from "../../../src/lib/selfhost-capabilities";
 import { CodeModeCustomDomains } from "./code-mode-custom-domains";
-import { detectImageMimeType as detectSharedImageMimeType, getSupportedImageMimeTypeFromContentType, inlineImageMaxBase64Chars, prepareInlineImageFromStream, readImageSniffBytesAndReplayStream, type PreparedInlineImage, readStreamBytes } from "./image-tool-content";
+import {
+  detectImageMimeType as detectSharedImageMimeType,
+  getSupportedImageMimeTypeFromContentType,
+  inlineImageMaxBase64Chars,
+  prepareInlineImageFromStream,
+  readImageSniffBytesAndReplayStream,
+  type PreparedInlineImage,
+  readStreamBytes,
+} from "./image-tool-content";
 import { CodeModeScheduledPrompts } from "./code-mode-scheduled-prompts";
 import { CodeModeDeterministicAutomations } from "./code-mode-deterministic-automations";
 import { CodeModeIntegrations } from "./code-mode-integrations";
 import { PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS } from "./container-sizing";
 import { recordErrorEvent, recordObservabilityEvent } from "./observability";
-import { buildLogTail, cleanBuildLog, DEFAULT_BUILD_TIMEOUT_MS, projectBuildSandboxKey, runProjectAddDependency, runProjectBuild, type ProjectBuildResult } from "./project-build-service";
+import {
+  buildLogTail,
+  cleanBuildLog,
+  DEFAULT_BUILD_TIMEOUT_MS,
+  projectBuildSandboxKey,
+  runProjectAddDependency,
+  runProjectBuild,
+  type ProjectBuildResult,
+} from "./project-build-service";
 import {
   createProjectBuildReadinessGate,
   ensureBuildSandboxReady,
@@ -63,18 +103,23 @@ import {
   type ProjectBuildReadinessGate,
   type ProjectBuildReadinessResult,
 } from "./project-build-readiness";
-import { collectWorkerBundleFromSandbox, findUnexportedDurableObjectClasses, type ProjectBuildSandboxLike } from "./project-worker-bundle";
-import { buildNotebookWorkerBundle, resolveNotebookDeployPath } from "./notebook-worker-bundle";
+import {
+  collectWorkerBundleFromSandbox,
+  findUnexportedDurableObjectClasses,
+  PROJECT_BUILD_BUNDLE_COLLECTION_RESERVE_MS,
+  type ProjectBuildSandboxLike,
+} from "./project-worker-bundle";
+import {
+  buildNotebookWorkerBundle,
+  resolveNotebookDeployPath,
+} from "./notebook-worker-bundle";
 import {
   ANALYSIS_DEFAULT_DEP_TIMEOUT_MS,
   ANALYSIS_DEFAULT_EXEC_TIMEOUT_MS,
   ANALYSIS_DEFAULT_NOTEBOOK_TIMEOUT_MS,
   ANALYSIS_MAX_NOTEBOOK_TIMEOUT_MS,
-  ANALYSIS_NOTEBOOK_STDERR_MAX_CHARS,
-  ANALYSIS_NOTEBOOK_STDOUT_MAX_CHARS,
   ANALYSIS_NOTEBOOK_VALIDATE_TIMEOUT_MS,
   ANALYSIS_SESSION_RESTARTED_MESSAGE,
-  clampOutputTail,
   isSandboxSessionDeathError,
 } from "./analysis-service";
 import {
@@ -83,16 +128,43 @@ import {
   type SandboxDeadlineExceededEvent,
   type SandboxExecDeadline,
 } from "./sandbox-exec-deadline";
-import { defaultProjectScaffoldFiles, normalizeProjectScaffoldTemplate, type ProjectScaffoldResult } from "./project-scaffold";
-import { addShadcnComponentsToProject, normalizeShadcnComponentList, SUPPORTED_SHADCN_BLOCKS, SUPPORTED_SHADCN_COMPONENTS } from "./shadcn-components";
-import { connectAppBrowserSession, launchAppBrowserSession } from "./app-browser-binding";
-import { deployWorkerModulesDirect, rollbackWorkerDeployFromArtifactCache, type DirectDispatchDeployResult } from "./direct-dispatch-deploy";
+import {
+  defaultProjectScaffoldFiles,
+  normalizeProjectScaffoldTemplate,
+  type ProjectScaffoldResult,
+} from "./project-scaffold";
+import {
+  addShadcnComponentsToProject,
+  normalizeShadcnComponentList,
+  SUPPORTED_SHADCN_BLOCKS,
+  SUPPORTED_SHADCN_COMPONENTS,
+} from "./shadcn-components";
+import {
+  connectAppBrowserSession,
+  launchAppBrowserSession,
+} from "./app-browser-binding";
+import {
+  DIRECT_DEPLOY_CALLER_RESERVE_MS,
+  deployWorkerModulesDirect,
+  rollbackWorkerDeployFromArtifactCache,
+  type DirectDispatchDeployResult,
+} from "./direct-dispatch-deploy";
 import { handleDeploySideEffects } from "./services/deploy";
 import { CHAT_RUNTIME_BOUNDS } from "../../../src/lib/chat-runtime-bounds";
 import { boundedCanonicalJsonResult } from "./chat-thread/bounded-canonical-json";
-import { boundedErrorValue } from "./chat-thread/bounded-error-text";
+import {
+  boundedErrorValue,
+  boundedUtf8Text,
+} from "./chat-thread/bounded-error-text";
+import { utf8ByteLength } from "./chat-thread/utf8-byte-length";
 import { sha256Hex } from "./sha256";
-import { editAutomationVirtualFile, listAutomationVirtualFiles, normalizeAutomationVirtualPath, readAutomationVirtualFile, writeAutomationVirtualFile } from "./deterministic-automation-virtual-files";
+import {
+  editAutomationVirtualFile,
+  listAutomationVirtualFiles,
+  normalizeAutomationVirtualPath,
+  readAutomationVirtualFile,
+  writeAutomationVirtualFile,
+} from "./deterministic-automation-virtual-files";
 import { applyTextEdits, normalizeTextEditArguments } from "./text-edit";
 import type { DynamicIntegrationSchema } from "../../../src/lib/integration-registry";
 import type { ChatThreadDO } from "./chat-thread-do";
@@ -138,14 +210,11 @@ function measureResultChars(value: unknown): number {
 
 /** Bounds a tool value before artifact, telemetry, RPC, or prompt copies exist. */
 export function boundCodeModeToolResult(value: unknown): unknown {
-  return boundedCodeModeToolResultProjection(value).value;
+  return JSON.parse(encodeCodeModeToolResult(value).json) as unknown;
 }
 
-function boundedCodeModeToolResultProjection(value: unknown): {
-  value: unknown;
-  complete: boolean;
-} {
-  const encoded = boundedCanonicalJsonResult(
+function encodeCodeModeToolResult(value: unknown) {
+  return boundedCanonicalJsonResult(
     value,
     CHAT_RUNTIME_BOUNDS.toolResultBytes,
     {
@@ -154,10 +223,25 @@ function boundedCodeModeToolResultProjection(value: unknown): {
       maxNodes: CHAT_RUNTIME_BOUNDS.providerJsonNodes,
     },
   );
-  return {
-    value: JSON.parse(encoded.json) as unknown,
-    complete: encoded.complete,
-  };
+}
+
+type CompleteCodeModeToolResult =
+  | { complete: true; value: unknown }
+  | { complete: false };
+
+/**
+ * Materializes an inline value only when it is complete. An oversized result
+ * is about to be spilled, so parsing its truncated 256 KiB projection would
+ * retain a second object graph for the entire R2 write for no user-visible
+ * benefit.
+ */
+function completeCodeModeToolResult(
+  value: unknown,
+): CompleteCodeModeToolResult {
+  const encoded = encodeCodeModeToolResult(value);
+  return encoded.complete
+    ? { complete: true, value: JSON.parse(encoded.json) as unknown }
+    : { complete: false };
 }
 
 type ToolResultOverflowFormat = "text" | "json";
@@ -189,7 +273,10 @@ function codeModeOverflowByteLength(value: string): number {
  * Stops as soon as the overflow cap is crossed, so a huge string cannot create
  * a second huge copy merely to decide that it is ineligible for storage.
  */
-function boundedCodeModeStringBytes(value: string, maxBytes: number): number | null {
+function boundedCodeModeStringBytes(
+  value: string,
+  maxBytes: number,
+): number | null {
   let bytes = 0;
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
@@ -324,19 +411,24 @@ function simplifyAgentWebToolResult(name: string, value: unknown): unknown {
   const overflow = Object.getOwnPropertyDescriptor(record, "$overflow");
   if (overflow && "value" in overflow && overflow.value) return value;
   const results = Array.isArray(record.results)
-    ? record.results.filter((result): result is Record<string, unknown> => (
-      Boolean(result) && typeof result === "object" && !Array.isArray(result)
-    ))
+    ? record.results.filter(
+        (result): result is Record<string, unknown> =>
+          Boolean(result) &&
+          typeof result === "object" &&
+          !Array.isArray(result),
+      )
     : [];
   if (name === "WebSearch") {
-    return results.map((result) => {
-      const compact: Record<string, string> = {};
-      for (const key of ["title", "url", "snippet"] as const) {
-        const field = result[key];
-        if (typeof field === "string" && field.trim()) compact[key] = field;
-      }
-      return compact;
-    }).filter((result) => Object.keys(result).length > 0);
+    return results
+      .map((result) => {
+        const compact: Record<string, string> = {};
+        for (const key of ["title", "url", "snippet"] as const) {
+          const field = result[key];
+          if (typeof field === "string" && field.trim()) compact[key] = field;
+        }
+        return compact;
+      })
+      .filter((result) => Object.keys(result).length > 0);
   }
   const first = results[0];
   if (!first) return "";
@@ -421,21 +513,38 @@ interface CodeModeMoveFile {
   contentType?: string;
 }
 
+type CodeModeMovePayload =
+  | {
+      kind: "bytes";
+      body: Uint8Array;
+      bytes: number;
+      contentType?: string;
+    }
+  | {
+      kind: "stream";
+      body: ReadableStream<Uint8Array>;
+      bytes: number;
+      contentType?: string;
+    };
+
 export const CODE_MODE_COMPATIBILITY_DATE = "2026-05-11";
 export const CODE_MODE_MAX_TIMEOUT_MS = 600_000;
 export const CODE_MODE_DEFAULT_TIMEOUT_MS = CODE_MODE_MAX_TIMEOUT_MS;
 export const CODE_MODE_DEFAULT_MAX_OUTPUT_CHARACTERS = 60_000;
 export const CODE_MODE_MAX_OUTPUT_CHARACTERS = 200_000;
-export const CODE_MODE_MOVE_MAX_FILES = 256;
-export const CODE_MODE_MOVE_MAX_FILE_BYTES = 8 * 1024 * 1024;
-export const CODE_MODE_MOVE_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+export const CODE_MODE_MOVE_MAX_FILES =
+  CHAT_RUNTIME_BOUNDS.toolTransferFilesPerCall;
+export const CODE_MODE_MOVE_MAX_FILE_BYTES =
+  CHAT_RUNTIME_BOUNDS.toolTransferFileBytes;
+export const CODE_MODE_MOVE_MAX_TOTAL_BYTES =
+  CHAT_RUNTIME_BOUNDS.toolTransferBytesPerCall;
 const CODE_MODE_R2_READ_MAX_LINES = 2_000;
 const CODE_MODE_R2_READ_MAX_BYTES = 50 * 1024;
 // R2 read results carry text twice (`text` plus a content block). At 16 KiB,
 // even worst-case JSON escaping of control bytes stays below toolResultBytes.
 const CODE_MODE_R2_BYTE_WINDOW_MAX_BYTES = 16 * 1024;
 const CODE_MODE_R2_READ_NOTICE_RESERVED_BYTES = 1024;
-const CODE_MODE_R2_MAX_WRITE_BYTES = 10 * 1024 * 1024;
+const CODE_MODE_R2_MAX_WRITE_BYTES = CHAT_RUNTIME_BOUNDS.toolSourceReadBytes;
 const ARCHIVE_TOOL_COMMAND = "python /usr/local/bin/camelai-archive";
 
 /**
@@ -443,11 +552,41 @@ const ARCHIVE_TOOL_COMMAND = "python /usr/local/bin/camelai-archive";
  * produces a file that downloads but will not open.
  */
 const CODE_MODE_BINARY_EXTENSIONS = new Set([
-  "xlsx", "xls", "xlsm", "docx", "doc", "pptx", "ppt", "pdf",
-  "zip", "gz", "tar", "7z", "rar",
-  "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff",
-  "mp3", "mp4", "wav", "mov", "avi", "webm",
-  "parquet", "db", "sqlite", "wasm", "woff", "woff2", "ttf", "otf",
+  "xlsx",
+  "xls",
+  "xlsm",
+  "docx",
+  "doc",
+  "pptx",
+  "ppt",
+  "pdf",
+  "zip",
+  "gz",
+  "tar",
+  "7z",
+  "rar",
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "ico",
+  "tiff",
+  "mp3",
+  "mp4",
+  "wav",
+  "mov",
+  "avi",
+  "webm",
+  "parquet",
+  "db",
+  "sqlite",
+  "wasm",
+  "woff",
+  "woff2",
+  "ttf",
+  "otf",
 ]);
 
 /** Long, unbroken, base64-alphabet text — what an encoded binary looks like. */
@@ -469,17 +608,21 @@ function looksLikeBase64Payload(content: string): boolean {
  *
  * Fail loudly and point at the mount that actually carries bytes.
  */
-export function assertNotBase64IntoBinaryFile(path: string, content: string): void {
+export function assertNotBase64IntoBinaryFile(
+  path: string,
+  content: string,
+): void {
   const extension = path.split(".").pop()?.toLowerCase() ?? "";
   if (!CODE_MODE_BINARY_EXTENSIONS.has(extension)) return;
   if (!looksLikeBase64Payload(content)) return;
   throw new Error(
     `Refusing to write base64 text to ${path}: the write tool stores content verbatim, so this would produce a corrupt .${extension} that will not open. ` +
-    `Generate the file in the analysis sandbox and save it straight to the writable /outputs mount instead — e.g. run_code with wb.save('/outputs/${path.split("/").pop()}') — ` +
-    `which writes real bytes to the same outputs/ object the user downloads.`,
+      `Generate the file in the analysis sandbox and save it straight to the writable /outputs mount instead — e.g. run_code with wb.save('/outputs/${path.split("/").pop()}') — ` +
+      `which writes real bytes to the same outputs/ object the user downloads.`,
   );
 }
-const CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES = CHAT_RUNTIME_BOUNDS.toolSourceReadBytes;
+const CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES =
+  CHAT_RUNTIME_BOUNDS.toolSourceReadBytes;
 
 function codeModeMoveFileSize(file: CodeModeMoveFile): number {
   if (
@@ -487,7 +630,9 @@ function codeModeMoveFileSize(file: CodeModeMoveFile): number {
     !Number.isSafeInteger(file.size) ||
     file.size < 0
   ) {
-    throw new Error(`Cannot move '${file.path}': source size is unavailable or invalid`);
+    throw new Error(
+      `Cannot move '${file.path}': source size is unavailable or invalid`,
+    );
   }
   if (file.size > CODE_MODE_MOVE_MAX_FILE_BYTES) {
     throw new Error(
@@ -532,46 +677,27 @@ const JS_EXEC_EXCLUDED_TOOL_NAMES = new Set([
   "workspace_info",
 ]);
 
-export function clampCodeModeInteger(value: unknown, fallback: number, min: number, max: number): number {
-  const parsed = typeof value === "number" ? Math.trunc(value) : Number.parseInt(String(value ?? ""), 10);
+export function clampCodeModeInteger(
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const parsed =
+    typeof value === "number"
+      ? Math.trunc(value)
+      : Number.parseInt(String(value ?? ""), 10);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.min(max, Math.max(min, parsed));
 }
 
-export function truncateCodeModeText(value: unknown, maxCharacters: number): string {
+export function truncateCodeModeText(
+  value: unknown,
+  maxCharacters: number,
+): string {
   const text = String(value ?? "");
   if (text.length <= maxCharacters) return text;
   return `${text.slice(0, maxCharacters)}\n\n[Truncated: ${maxCharacters} of ${text.length} characters]`;
-}
-
-/**
- * Clamp an analysis run result's stdout/stderr for the model, keeping the TAIL
- * (nbconvert puts the failing cell + Python traceback at the END of stderr,
- * while the model-side tool-result cap truncates head-first over the whole
- * JSON). When anything was clamped, `fullLog` carries the untruncated combined
- * output for the caller to spill to R2 — the escape-hatch log the agent can
- * read back in full. Pure; exported for tests.
- */
-export function clampAnalysisRunOutputs(result: Record<string, unknown>): {
-  result: Record<string, unknown>;
-  fullLog: string | null;
-} {
-  const stdout = typeof result.stdout === "string" ? result.stdout : "";
-  const stderr = typeof result.stderr === "string" ? result.stderr : "";
-  if (stdout.length <= ANALYSIS_NOTEBOOK_STDOUT_MAX_CHARS && stderr.length <= ANALYSIS_NOTEBOOK_STDERR_MAX_CHARS) {
-    return { result, fullLog: null };
-  }
-  const fullLog =
-    `=== stdout (${stdout.length} chars) ===\n${stdout}\n\n` +
-    `=== stderr (${stderr.length} chars) ===\n${stderr}\n`;
-  return {
-    result: {
-      ...result,
-      stdout: clampOutputTail(stdout, ANALYSIS_NOTEBOOK_STDOUT_MAX_CHARS),
-      stderr: clampOutputTail(stderr, ANALYSIS_NOTEBOOK_STDERR_MAX_CHARS),
-    },
-    fullLog,
-  };
 }
 
 function basenameForMove(path: string): string {
@@ -586,7 +712,11 @@ function joinRelativeMovePath(root: string, child: string): string {
   return `${cleanRoot}/${cleanChild}`;
 }
 
-function joinMoveDestinationPath(location: CodeModeFileLocation, root: string, child: string): string {
+function joinMoveDestinationPath(
+  location: CodeModeFileLocation,
+  root: string,
+  child: string,
+): string {
   const cleanChild = child.replace(/^\/+/, "");
   if (location === "r2") {
     const cleanRoot = root.replace(/^\/+|\/+$/g, "");
@@ -598,12 +728,18 @@ function joinMoveDestinationPath(location: CodeModeFileLocation, root: string, c
 }
 
 function bytesToBase64ForMove(bytes: Uint8Array): string {
-  let binary = "";
-  const chunkSize = 0x8000;
+  // Keep each temporary binary string small. Building one binary string for
+  // the whole file briefly retained the bytes, a same-sized binary copy, and
+  // the 4/3-inflated base64 result at once.
+  let encoded = "";
+  const chunkSize = 0x6000; // Divisible by three: interior chunks need no padding.
   for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    const binary = String.fromCharCode(
+      ...bytes.subarray(i, Math.min(bytes.length, i + chunkSize)),
+    );
+    encoded += btoa(binary);
   }
-  return btoa(binary);
+  return encoded;
 }
 
 // Warn (not block) when a notebook is deployed without any cell outputs — the
@@ -611,24 +747,136 @@ function bytesToBase64ForMove(bytes: Uint8Array): string {
 // failures return true so the deploy proceeds without a misleading warning.
 function notebookHasCellOutputs(notebookBytes: Uint8Array): boolean {
   try {
-    const parsed = JSON.parse(new TextDecoder().decode(notebookBytes)) as { cells?: unknown };
+    const parsed = JSON.parse(new TextDecoder().decode(notebookBytes)) as {
+      cells?: unknown;
+    };
     const cells = Array.isArray(parsed?.cells) ? parsed.cells : null;
     if (!cells) return true;
     return cells.some((cell) => {
       if (!cell || typeof cell !== "object") return false;
       const record = cell as { cell_type?: unknown; outputs?: unknown };
-      return record.cell_type === "code" && Array.isArray(record.outputs) && record.outputs.length > 0;
+      return (
+        record.cell_type === "code" &&
+        Array.isArray(record.outputs) &&
+        record.outputs.length > 0
+      );
     });
   } catch {
     return true;
   }
 }
 
-function base64ToBytesForMove(value: string): Uint8Array {
-  const binary = atob(value.replace(/\s/g, ""));
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
+function base64DecodedLength(value: string): number {
+  let characters = 0;
+  let last = "";
+  let secondLast = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (/\s/.test(character)) continue;
+    characters += 1;
+    secondLast = last;
+    last = character;
+  }
+  if (characters % 4 === 1) throw new Error("Invalid base64 move source");
+  const padding = last === "=" ? (secondLast === "=" ? 2 : 1) : 0;
+  return Math.floor((characters * 3) / 4) - padding;
+}
+
+function base64ToBytesForMove(value: string, maximumBytes: number): Uint8Array {
+  const decodedLength = base64DecodedLength(value);
+  if (decodedLength > maximumBytes) {
+    throw new Error(
+      `Move source exceeds the ${maximumBytes} byte whole-buffer limit`,
+    );
+  }
+  const compact = /\s/.test(value) ? value.replace(/\s/g, "") : value;
+  const bytes = new Uint8Array(decodedLength);
+  const chunkCharacters = 0x8000; // Divisible by four.
+  let written = 0;
+  for (let offset = 0; offset < compact.length; offset += chunkCharacters) {
+    const binary = atob(compact.slice(offset, offset + chunkCharacters));
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[written++] = binary.charCodeAt(index);
+    }
+  }
+  if (written !== decodedLength) throw new Error("Invalid base64 move source");
+  return bytes;
+}
+
+function bytesToMoveStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  let sent = false;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (!sent) {
+        sent = true;
+        controller.enqueue(bytes);
+      }
+      controller.close();
+    },
+  });
+}
+
+function exactMoveStream(
+  source: ReadableStream<Uint8Array>,
+  expectedBytes: number,
+  path: string,
+): ReadableStream<Uint8Array> {
+  let receivedBytes = 0;
+  return source.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        if (
+          !(chunk instanceof Uint8Array) ||
+          chunk.byteLength > expectedBytes - receivedBytes
+        ) {
+          throw new Error(
+            `Move source '${path}' exceeded its listed byte size while streaming`,
+          );
+        }
+        receivedBytes += chunk.byteLength;
+        controller.enqueue(chunk);
+      },
+      flush() {
+        if (receivedBytes !== expectedBytes) {
+          throw new Error(
+            `Move source '${path}' ended after ${receivedBytes} of ${expectedBytes} listed bytes`,
+          );
+        }
+      },
+    }),
+  );
+}
+
+async function bufferedMovePayload(
+  payload: CodeModeMovePayload,
+): Promise<Uint8Array> {
+  if (payload.kind === "bytes") {
+    if (
+      payload.bytes !== payload.body.byteLength ||
+      payload.bytes > CHAT_RUNTIME_BOUNDS.toolSourceReadBytes
+    ) {
+      throw new Error(
+        `Move source exceeds the ${CHAT_RUNTIME_BOUNDS.toolSourceReadBytes} byte whole-buffer limit`,
+      );
+    }
+    return payload.body;
+  }
+  if (payload.bytes > CHAT_RUNTIME_BOUNDS.toolSourceReadBytes) {
+    await payload.body
+      .cancel("move destination requires a bounded whole-buffer payload")
+      .catch(() => undefined);
+    throw new Error(
+      `Move source exceeds the ${CHAT_RUNTIME_BOUNDS.toolSourceReadBytes} byte whole-buffer limit`,
+    );
+  }
+  const bytes = await readStreamBytes(
+    payload.body,
+    CHAT_RUNTIME_BOUNDS.toolSourceReadBytes,
+  );
+  if (bytes.byteLength !== payload.bytes) {
+    throw new Error(
+      `Move source size changed from ${payload.bytes} to ${bytes.byteLength} bytes`,
+    );
   }
   return bytes;
 }
@@ -660,15 +908,15 @@ function normalizeTodoText(value: unknown): string {
     return String(value).trim();
   }
   if (Array.isArray(value)) {
-    return value
-      .map(normalizeTodoText)
-      .filter(Boolean)
-      .join("");
+    return value.map(normalizeTodoText).filter(Boolean).join("");
   }
   return "";
 }
 
-function normalizeTodoItem(value: unknown, index: number): NormalizedTodoItem | null {
+function normalizeTodoItem(
+  value: unknown,
+  index: number,
+): NormalizedTodoItem | null {
   if (
     typeof value === "string" ||
     typeof value === "number" ||
@@ -744,7 +992,10 @@ function codeModePassthroughTool(
   parameters: TSchema = EMPTY_PARAMETERS,
   options: Omit<CodeModeToolOptions, "piPassthrough"> = {},
 ): CodeModeToolRegistration {
-  return codeModeTool(name, description, parameters, { ...options, piPassthrough: true });
+  return codeModeTool(name, description, parameters, {
+    ...options,
+    piPassthrough: true,
+  });
 }
 
 function codeModeDefinition(
@@ -772,23 +1023,28 @@ const CODE_MODE_CONTAINER_TOOL_NAMES = [
   "delete",
 ] as const;
 
-const CODE_MODE_R2_READ_PARAMETERS = Type.Object({
-  ...PI_CONTAINER_TOOL_DEFINITIONS.read.parameters.properties,
-  byte_offset: Type.Optional(Type.Number({
-    description:
-      "0-indexed byte offset for a bounded R2 text window. Use details.nextByteOffset to page large single-line objects without splitting UTF-8. Only valid with location='r2'.",
-  })),
-}, { additionalProperties: false });
+const CODE_MODE_R2_READ_PARAMETERS = Type.Object(
+  {
+    ...PI_CONTAINER_TOOL_DEFINITIONS.read.parameters.properties,
+    byte_offset: Type.Optional(
+      Type.Number({
+        description:
+          "0-indexed byte offset for a bounded R2 text window. Use details.nextByteOffset to page large single-line objects without splitting UTF-8. Only valid with location='r2'.",
+      }),
+    ),
+  },
+  { additionalProperties: false },
+);
 
 const CODE_MODE_CONTAINER_TOOL_DEFINITIONS = CODE_MODE_CONTAINER_TOOL_NAMES.map(
   (name) => {
     const definition = PI_CONTAINER_TOOL_DEFINITIONS[name];
-    const parameters = name === "read"
-      ? CODE_MODE_R2_READ_PARAMETERS
-      : definition.parameters;
-    const description = name === "read"
-      ? `${definition.description} For large single-line R2 text, pass byte_offset=0 and continue with details.nextByteOffset.`
-      : definition.description;
+    const parameters =
+      name === "read" ? CODE_MODE_R2_READ_PARAMETERS : definition.parameters;
+    const description =
+      name === "read"
+        ? `${definition.description} For large single-line R2 text, pass byte_offset=0 and continue with details.nextByteOffset.`
+        : definition.description;
     return codeModeTool(definition.name, description, parameters, {
       category: "workspace",
       sideEffect: ["write", "edit"].includes(definition.name),
@@ -796,24 +1052,32 @@ const CODE_MODE_CONTAINER_TOOL_DEFINITIONS = CODE_MODE_CONTAINER_TOOL_NAMES.map(
   },
 );
 
-const MOVE_ENDPOINT_PARAMETERS = Type.Object({
-  location: Type.Union([
-    Type.Literal("workspace"),
-    Type.Literal("project"),
-    Type.Literal("r2"),
-  ], {
-    description: "Required filesystem location: workspace, project, or r2.",
-  }),
-  path: Type.String({
-    description: "Path at that location. R2 paths must be uploads/<path>, outputs/<path>, or tmp/<path> with no leading slash.",
-  }),
-  project: Type.Optional(Type.String({
-    description: "Required when location is project; unique workspace project name.",
-  })),
-  content_type: Type.Optional(Type.String({
-    description: "Destination R2 content type override.",
-  })),
-}, { additionalProperties: false });
+const MOVE_ENDPOINT_PARAMETERS = Type.Object(
+  {
+    location: Type.Union(
+      [Type.Literal("workspace"), Type.Literal("project"), Type.Literal("r2")],
+      {
+        description: "Required filesystem location: workspace, project, or r2.",
+      },
+    ),
+    path: Type.String({
+      description:
+        "Path at that location. R2 paths must be uploads/<path>, outputs/<path>, or tmp/<path> with no leading slash.",
+    }),
+    project: Type.Optional(
+      Type.String({
+        description:
+          "Required when location is project; unique workspace project name.",
+      }),
+    ),
+    content_type: Type.Optional(
+      Type.String({
+        description: "Destination R2 content type override.",
+      }),
+    ),
+  },
+  { additionalProperties: false },
+);
 
 const ASK_USER_QUESTION_TOOL = codeModePassthroughTool(
   "AskUserQuestion",
@@ -825,13 +1089,17 @@ const ASK_USER_QUESTION_TOOL = codeModePassthroughTool(
     category: "user_interaction",
   },
 );
-const CHANNEL_ATTACHMENT_PARAMETERS = Type.Optional(Type.Array(Type.Object({
-  path: Type.String(),
-  filename: Type.Optional(Type.String()),
-  content_type: Type.Optional(Type.String()),
-  caption: Type.Optional(Type.String()),
-  send_as: Type.Optional(Type.String()),
-})));
+const CHANNEL_ATTACHMENT_PARAMETERS = Type.Optional(
+  Type.Array(
+    Type.Object({
+      path: Type.String(),
+      filename: Type.Optional(Type.String()),
+      content_type: Type.Optional(Type.String()),
+      caption: Type.Optional(Type.String()),
+      send_as: Type.Optional(Type.String()),
+    }),
+  ),
+);
 const SEND_EMAIL_TOOL = codeModeTool(
   "send_email",
   "Send an email from the current workspace. This tool is available only inside js_exec as tools.send_email(...) or deterministic workflows as this.env.TOOLS.send_email(...); it is not a top-level tool. Use this only when channel instructions require an external reply or the user explicitly asks to send an email. Normal assistant replies stay in chat and must not be emailed. Arguments: { to, subject, text?, html?, reply_to?, attachments? }.",
@@ -927,7 +1195,9 @@ const WEB_SEARCH_TOOL = codeModePassthroughTool(
   }),
   {
     category: "web",
-    examples: [`await tools.WebSearch({ query: "Cloudflare Workers Durable Objects", numResults: 5 })`],
+    examples: [
+      `await tools.WebSearch({ query: "Cloudflare Workers Durable Objects", numResults: 5 })`,
+    ],
   },
 );
 const WEB_FETCH_TOOL = codeModePassthroughTool(
@@ -941,7 +1211,9 @@ const WEB_FETCH_TOOL = codeModePassthroughTool(
   }),
   {
     category: "web",
-    examples: [`await tools.WebFetch({ url: "https://developers.cloudflare.com/workers/", maxCharacters: 12000 })`],
+    examples: [
+      `await tools.WebFetch({ url: "https://developers.cloudflare.com/workers/", maxCharacters: 12000 })`,
+    ],
   },
 );
 const AGENT_TOOL = codeModeTool(
@@ -977,26 +1249,38 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   codeModeTool(
     "move",
     "Transfer files between any two explicit locations: workspace, project, or r2. Copies by default and overwrites the destination. Use deleteSource: true only when you intentionally want a destructive move after a successful copy. Arguments: { source: { location, path, project? }, destination: { location, path, project?, content_type? }, deleteSource? }.",
-    Type.Object({
-      source: MOVE_ENDPOINT_PARAMETERS,
-      destination: MOVE_ENDPOINT_PARAMETERS,
-      deleteSource: Type.Optional(Type.Boolean({
-        description: "Delete the source after all destination writes succeed. Defaults to false.",
-      })),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        source: MOVE_ENDPOINT_PARAMETERS,
+        destination: MOVE_ENDPOINT_PARAMETERS,
+        deleteSource: Type.Optional(
+          Type.Boolean({
+            description:
+              "Delete the source after all destination writes succeed. Defaults to false.",
+          }),
+        ),
+      },
+      { additionalProperties: false },
+    ),
     { category: "workspace", sideEffect: true },
   ),
   codeModePassthroughTool(
     "read_skill",
     "Read a bundled agent skill or one of its Markdown reference files. Use this instead of the generic read tool for skills; it never reads from project storage and needs no location, project, or absolute path. Omit file to read SKILL.md. Arguments: { skill, file? }.",
-    Type.Object({
-      skill: Type.String({
-        description: "Bundled skill name, for example 'developing-software'.",
-      }),
-      file: Type.Optional(Type.String({
-        description: "Markdown file within the skill, for example 'VANILLA-APPS.md' or 'references/example.md'. Defaults to SKILL.md.",
-      })),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        skill: Type.String({
+          description: "Bundled skill name, for example 'developing-software'.",
+        }),
+        file: Type.Optional(
+          Type.String({
+            description:
+              "Markdown file within the skill, for example 'VANILLA-APPS.md' or 'references/example.md'. Defaults to SKILL.md.",
+          }),
+        ),
+      },
+      { additionalProperties: false },
+    ),
   ),
   codeModePassthroughTool(
     "list_projects",
@@ -1005,28 +1289,40 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   codeModePassthroughTool(
     "create_project",
     "REQUIRED PRECONDITION: before calling create_project for the first time in a task, read the developing-software skill by calling read_skill with skill='developing-software', then read the entire result. Skip that read only if it already succeeded during the current task. Do not treat this as optional guidance. This tool creates a new DO-backed project and seeds a scaffold. The skill explains template selection, how to reshape each starter, and the build/deploy workflow. Project names must be unique within the workspace. New projects require a concise description. The default template is 'crud': a deployable React Router app with a SQLite Durable Object and working list/create/update/delete flow. Other templates: 'vanilla' for dependency-light client-only HTML/CSS/JavaScript experiences and simple browser games, 'ai-chat' for a virtual-AI-powered assistant, 'integration-dashboard' for workspace connection catalogs, 'data-dashboard' for interactive charts/tables, and 'data-analysis' for a notebook report. Arguments: { name, description, template? }.",
-    Type.Object({
-      name: Type.String(),
-      description: Type.String(),
-      template: Type.Optional(Type.Union([
-        Type.Literal("crud"),
-        Type.Literal("vanilla"),
-        Type.Literal("ai-chat"),
-        Type.Literal("integration-dashboard"),
-        Type.Literal("data-dashboard"),
-        Type.Literal("data-analysis"),
-      ], {
-        description: "Optional scaffold template. Defaults to crud. Choose vanilla for client-only plain HTML/CSS/JavaScript or a simple browser game; use data-analysis only for notebook-first reports.",
-      })),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        name: Type.String(),
+        description: Type.String(),
+        template: Type.Optional(
+          Type.Union(
+            [
+              Type.Literal("crud"),
+              Type.Literal("vanilla"),
+              Type.Literal("ai-chat"),
+              Type.Literal("integration-dashboard"),
+              Type.Literal("data-dashboard"),
+              Type.Literal("data-analysis"),
+            ],
+            {
+              description:
+                "Optional scaffold template. Defaults to crud. Choose vanilla for client-only plain HTML/CSS/JavaScript or a simple browser game; use data-analysis only for notebook-first reports.",
+            },
+          ),
+        ),
+      },
+      { additionalProperties: false },
+    ),
   ),
   codeModePassthroughTool(
     "set_project_description",
     "Set the description for an existing project by its unique workspace project name. Use this when the project's purpose changes or needs clarification. Arguments: { project, description }.",
-    Type.Object({
-      project: Type.String(),
-      description: Type.String(),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        project: Type.String(),
+        description: Type.String(),
+      },
+      { additionalProperties: false },
+    ),
     {
       sideEffect: true,
     },
@@ -1034,87 +1330,125 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   codeModeTool(
     "add_dependency",
     "Add one npm registry dependency to a DO-backed project with the platform dependency pipeline. This runs a fixed bun add command and persists package.json plus bun.lock back to project storage. Arguments: { project, dependency, dev? }.",
-    Type.Object({
-      project: Type.String(),
-      dependency: Type.String(),
-      dev: Type.Optional(Type.Boolean()),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        project: Type.String(),
+        dependency: Type.String(),
+        dev: Type.Optional(Type.Boolean()),
+      },
+      { additionalProperties: false },
+    ),
     { category: "workspace", sideEffect: true },
   ),
   codeModeTool(
     "add_shadcn_component",
     `Add bundled shadcn/ui components or full blocks (login pages, sidebar layouts, dashboards) to a DO-backed React Router project without npm registry access. Registry dependencies are resolved transitively and any npm packages a component needs are added to package.json automatically (installed on the next build). Prefer this over hand-writing standard UI components. Block pages land under /app/blocks/<name>/page.tsx and must be registered as a route in app/routes.ts. Supported components: ${SUPPORTED_SHADCN_COMPONENTS.join(", ")}. Supported blocks: ${SUPPORTED_SHADCN_BLOCKS.join(", ")}. Arguments: { project, component? or components?, force? }.`,
-    Type.Object({
-      project: Type.String(),
-      component: Type.Optional(Type.String()),
-      components: Type.Optional(Type.Array(Type.String())),
-      force: Type.Optional(Type.Boolean({ description: "Overwrite existing component files. Defaults to false." })),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        project: Type.String(),
+        component: Type.Optional(Type.String()),
+        components: Type.Optional(Type.Array(Type.String())),
+        force: Type.Optional(
+          Type.Boolean({
+            description:
+              "Overwrite existing component files. Defaults to false.",
+          }),
+        ),
+      },
+      { additionalProperties: false },
+    ),
     { category: "workspace", sideEffect: true },
   ),
   codeModeTool(
     "revert_project",
     "Restore a DO-backed project's source files to a previous source snapshot. Use snapshot_id from list_commits.commits[]; list_deploy_versions is for deployed artifact rollback, not source snapshots. Restoring source does not publish the live app unless deploy=true or you subsequently call deploy_project. Arguments: { project, snapshot_id, deploy?, script_name? }.",
-    Type.Object({
-      project: Type.String(),
-      snapshot_id: Type.String(),
-      deploy: Type.Optional(Type.Boolean()),
-      script_name: Type.Optional(Type.String()),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        project: Type.String(),
+        snapshot_id: Type.String(),
+        deploy: Type.Optional(Type.Boolean()),
+        script_name: Type.Optional(Type.String()),
+      },
+      { additionalProperties: false },
+    ),
     { category: "workspace", sideEffect: true },
   ),
   codeModeTool(
     "list_commits",
     "List source snapshots for a DO-backed project, newest first. These snapshot ids are the current platform source-version keys and can be passed to revert_project. Arguments: { project, limit? }.",
-    Type.Object({
-      project: Type.String(),
-      limit: Type.Optional(Type.Number()),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        project: Type.String(),
+        limit: Type.Optional(Type.Number()),
+      },
+      { additionalProperties: false },
+    ),
     { category: "workspace" },
   ),
   codeModePassthroughTool(
     "deploy_project",
     "Build, deploy, return the live URL, and open a DO-backed project in preview through the platform direct deploy path. A successful call proves publication, not feature correctness or live-data quality. Pass dry_run=true to validate without publishing or changing preview. A validation, build, or deploy failure is returned with diagnostics. Data-analysis notebook publication is an external side effect and requires publish_intent='user_requested'; creating or previewing a report alone does not authorize publication. Run run_notebook first so outputs are fresh. Arguments: { project, script_name?, path?, timeoutMs?, dry_run?, publish_intent? }.",
-    Type.Object({
-      project: Type.String(),
-      script_name: Type.Optional(Type.String()),
-      path: Type.Optional(Type.String({
-        description: "Notebook path inside the project to publish (data-analysis projects only). Defaults to analysis.ipynb or the project's single notebook.",
-      })),
-      timeoutMs: Type.Optional(Type.Number()),
-      dry_run: Type.Optional(Type.Boolean({
-        description: "Validate/build without deploying or changing the active preview. Defaults to false.",
-      })),
-      publish_intent: Type.Optional(Type.Literal("user_requested", {
-        description: "Required to publish a data-analysis notebook; confirms the user explicitly asked to publish, deploy, or create a shareable app.",
-      })),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        project: Type.String(),
+        script_name: Type.Optional(Type.String()),
+        path: Type.Optional(
+          Type.String({
+            description:
+              "Notebook path inside the project to publish (data-analysis projects only). Defaults to analysis.ipynb or the project's single notebook.",
+          }),
+        ),
+        timeoutMs: Type.Optional(Type.Number()),
+        dry_run: Type.Optional(
+          Type.Boolean({
+            description:
+              "Validate/build without deploying or changing the active preview. Defaults to false.",
+          }),
+        ),
+        publish_intent: Type.Optional(
+          Type.Literal("user_requested", {
+            description:
+              "Required to publish a data-analysis notebook; confirms the user explicitly asked to publish, deploy, or create a shareable app.",
+          }),
+        ),
+      },
+      { additionalProperties: false },
+    ),
     { category: "workspace", sideEffect: true },
   ),
   codeModeTool(
     "rollback_deploy",
     "Rollback a deployed app by re-uploading a cached deploy artifact without rebuilding. Use artifact_cache_key to target a specific cached artifact; otherwise the app's latest registered artifact is used. Arguments: { script_name, artifact_cache_key? }.",
-    Type.Object({
-      script_name: Type.String(),
-      artifact_cache_key: Type.Optional(Type.String()),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        script_name: Type.String(),
+        artifact_cache_key: Type.Optional(Type.String()),
+      },
+      { additionalProperties: false },
+    ),
     { category: "apps", sideEffect: true },
   ),
   codeModeTool(
     "list_deploy_versions",
     "List cached deploy versions for an app, newest first. Use artifact_cache_key values with rollback_deploy to restore a version without rebuilding. Arguments: { script_name, limit? }.",
-    Type.Object({
-      script_name: Type.String(),
-      limit: Type.Optional(Type.Number()),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        script_name: Type.String(),
+        limit: Type.Optional(Type.Number()),
+      },
+      { additionalProperties: false },
+    ),
     { category: "apps" },
   ),
   codeModePassthroughTool(
     "delete_app",
     "Delete a deployed app after the user confirms in chat. This removes the live deployment but keeps its source project. Use this as a top-level tool, not from js_exec. Arguments: { script_name }.",
-    Type.Object({
-      script_name: Type.String(),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        script_name: Type.String(),
+      },
+      { additionalProperties: false },
+    ),
     {
       category: "apps",
       sideEffect: true,
@@ -1123,9 +1457,12 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   codeModePassthroughTool(
     "delete_project",
     "Delete a project after the user confirms in chat. Any deployed apps linked to the project are always deleted first so no live app is orphaned. Use this as a top-level tool, not from js_exec. Accepts the unique workspace project name. Deleting a source project also deletes its clone projects and their linked apps. Arguments: { project }.",
-    Type.Object({
-      project: Type.String(),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        project: Type.String(),
+      },
+      { additionalProperties: false },
+    ),
     {
       sideEffect: true,
     },
@@ -1140,15 +1477,18 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
     "Update the visible task list in the chat UI. Arguments: { todos: [{ content, status, activeForm? }] }. Status is pending, in_progress, or completed.",
     Type.Object({
       todos: Type.Array(
-        Type.Object({
-          content: Type.Optional(Type.String()),
-          step: Type.Optional(Type.String()),
-          title: Type.Optional(Type.String()),
-          task: Type.Optional(Type.String()),
-          status: Type.Optional(Type.String()),
-          activeForm: Type.Optional(Type.String()),
-          active_form: Type.Optional(Type.String()),
-        }, { additionalProperties: true }),
+        Type.Object(
+          {
+            content: Type.Optional(Type.String()),
+            step: Type.Optional(Type.String()),
+            title: Type.Optional(Type.String()),
+            task: Type.Optional(Type.String()),
+            status: Type.Optional(Type.String()),
+            activeForm: Type.Optional(Type.String()),
+            active_form: Type.Optional(Type.String()),
+          },
+          { additionalProperties: true },
+        ),
       ),
     }),
     {
@@ -1172,11 +1512,13 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
       app_name: Type.Optional(Type.String()),
       path: Type.Optional(Type.String()),
       content_type: Type.Optional(Type.String()),
-      location: Type.Optional(Type.Union([
-        Type.Literal("workspace"),
-        Type.Literal("project"),
-        Type.Literal("r2"),
-      ])),
+      location: Type.Optional(
+        Type.Union([
+          Type.Literal("workspace"),
+          Type.Literal("project"),
+          Type.Literal("r2"),
+        ]),
+      ),
       project: Type.Optional(Type.String()),
     }),
     {
@@ -1187,12 +1529,21 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   codeModePassthroughTool(
     "list_apps",
     "List previously deployed apps for discovery or inspection. deploy_project already returns the new app URL and confirms successful publishing, so list_apps is not needed merely to verify a successful deploy. Optional filters keep output small: name matches app/custom-domain names, project matches project_id or app name, limit caps results, and sort defaults to updated_desc. Arguments: { name?, project?, limit?, sort? }.",
-    Type.Object({
-      name: Type.Optional(Type.String()),
-      project: Type.Optional(Type.String()),
-      limit: Type.Optional(Type.Number()),
-      sort: Type.Optional(Type.Union([Type.Literal("updated_desc"), Type.Literal("updated_asc"), Type.Literal("name_asc")])),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        name: Type.Optional(Type.String()),
+        project: Type.Optional(Type.String()),
+        limit: Type.Optional(Type.Number()),
+        sort: Type.Optional(
+          Type.Union([
+            Type.Literal("updated_desc"),
+            Type.Literal("updated_asc"),
+            Type.Literal("name_asc"),
+          ]),
+        ),
+      },
+      { additionalProperties: false },
+    ),
     {
       category: "apps",
     },
@@ -1238,7 +1589,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   ),
   codeModePassthroughTool(
     "run_notebook",
-    "Execute a Jupyter notebook (.ipynb) in a DO-backed project, persist the executed notebook + any changed files, and open a clean successful run in preview automatically. This is the PRIMARY data-analysis path — one call runs `jupyter nbconvert --execute --inplace`, validates the result, and previews it, so you don't drive nbconvert/validate or call set_preview by hand. The default Python data stack (pandas, numpy, polars, duckdb, pyarrow, altair, plotly, matplotlib, seaborn, scipy, scikit-learn, statsmodels, openpyxl, pdfplumber, jupyter) is PREINSTALLED — no setup needed; use add_python_dependency for anything else. Read big inputs from the read-only mounts — uploaded files at /uploads/<name> (the R2 uploads/<name> reference with a leading slash) and connection exports at '/' + r2_key — keep large intermediates in the per-run $SCRATCH directory (created for you, cleaned up after the run), and put notebooks + small results in the project. To hand the user a generated FILE (.xlsx, .csv, .pdf, .zip, an image), write it to the writable /outputs mount: `wb.save('/outputs/costs.xlsx')` makes it the R2 outputs/costs.xlsx reference, downloadable at /api/workspaces/<workspaceId>/outputs/costs.xlsx and previewable with set_preview({ location: 'r2', path: 'outputs/costs.xlsx' }). Never base64 a binary through the text-only write tool, and never deploy an app just to serve a file. deploy_project publishes the executed notebook as a static report app, returns the live URL, and opens that app in preview automatically when the user wants a shareable link. Returns { ok, executed, validation: { clean, issues }, preview?, message?, stdout, stderr, exitCode, changedFiles, removedFiles, skippedOversize, durationMs }. If ok is false, the current preview is unchanged; fix the failing cells and re-run — never suppress errors: error carries the Python traceback, and when stdout/stderr are truncated inline, fullOutput.path is an R2 log with the complete output (read({ location: 'r2', path: fullOutput.path })). Arguments: { project, path, timeoutMs? }.",
+    "Execute a Jupyter notebook (.ipynb) in a DO-backed project, persist the executed notebook + any changed files, and open a clean successful run in preview automatically. This is the PRIMARY data-analysis path — one call runs `jupyter nbconvert --execute --inplace`, validates the result, and previews it, so you don't drive nbconvert/validate or call set_preview by hand. The default Python data stack (pandas, numpy, polars, duckdb, pyarrow, altair, plotly, matplotlib, seaborn, scipy, scikit-learn, statsmodels, openpyxl, pdfplumber, jupyter) is PREINSTALLED — no setup needed; use add_python_dependency for anything else. Read big inputs from the read-only mounts — uploaded files at /uploads/<name> (the R2 uploads/<name> reference with a leading slash) and connection exports at '/' + r2_key — keep large intermediates in the per-run $SCRATCH directory (created for you, cleaned up after the run), and put notebooks + small results in the project. To hand the user a generated FILE (.xlsx, .csv, .pdf, .zip, an image), write it to the writable /outputs mount: `wb.save('/outputs/costs.xlsx')` makes it the R2 outputs/costs.xlsx reference, downloadable at /api/workspaces/<workspaceId>/outputs/costs.xlsx and previewable with set_preview({ location: 'r2', path: 'outputs/costs.xlsx' }). Never base64 a binary through the text-only write tool, and never deploy an app just to serve a file. deploy_project publishes the executed notebook as a static report app, returns the live URL, and opens that app in preview automatically when the user wants a shareable link. Returns { ok, executed, validation: { clean, issues }, preview?, message?, stdout, stderr, exitCode, changedFiles, removedFiles, skippedOversize, durationMs }. If ok is false, the current preview is unchanged; fix the failing cells and re-run — never suppress errors: error carries the Python traceback. When stdout/stderr are truncated inline, fullOutput.path contains a bounded R2 head/tail archive; fullOutput.complete says whether it contains every byte. Arguments: { project, path, timeoutMs? }.",
     Type.Object({
       project: Type.String(),
       path: Type.String(),
@@ -1278,12 +1629,30 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   codeModePassthroughTool(
     "inspect_archive",
     "Safely inspect an uploaded ZIP before extracting it. Pass the uploads/<name>.zip path. With no entry, returns a paginated manifest, size totals, safety issues, and whether the archive is extractable. Pass entry to read one UTF-8 text member (such as a script or Dockerfile) without extracting it. Always inspect an archive and any executable/configuration entries before calling extract_archive. Arguments: { path, entry?, offset?, limit? }.",
-    Type.Object({
-      path: Type.String({ description: "Read-only R2 upload path, starting with uploads/." }),
-      entry: Type.Optional(Type.String({ description: "Exact archive member path to read as UTF-8 text." })),
-      offset: Type.Optional(Type.Number({ description: "Zero-based manifest offset. Defaults to 0." })),
-      limit: Type.Optional(Type.Number({ description: "Manifest entries to return. Defaults to 200; maximum 500." })),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        path: Type.String({
+          description: "Read-only R2 upload path, starting with uploads/.",
+        }),
+        entry: Type.Optional(
+          Type.String({
+            description: "Exact archive member path to read as UTF-8 text.",
+          }),
+        ),
+        offset: Type.Optional(
+          Type.Number({
+            description: "Zero-based manifest offset. Defaults to 0.",
+          }),
+        ),
+        limit: Type.Optional(
+          Type.Number({
+            description:
+              "Manifest entries to return. Defaults to 200; maximum 500.",
+          }),
+        ),
+      },
+      { additionalProperties: false },
+    ),
     {
       category: "analysis",
     },
@@ -1291,11 +1660,23 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   codeModePassthroughTool(
     "extract_archive",
     "Safely extract an uploaded ZIP into an existing DO-backed project after inspect_archive. The archive is fully validated and staged before project files are changed. Extraction rejects absolute/traversal paths, symlinks, special or encrypted entries, duplicate/conflicting paths, unsupported compression, more than 2,000 entries, files over 25 MiB, or more than 250 MiB expanded. Existing files at matching paths are replaced. Arguments: { path, project, destination? }.",
-    Type.Object({
-      path: Type.String({ description: "Read-only R2 upload path, starting with uploads/." }),
-      project: Type.String({ description: "Existing destination project name." }),
-      destination: Type.Optional(Type.String({ description: "Relative directory inside the project. Defaults to the project root." })),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        path: Type.String({
+          description: "Read-only R2 upload path, starting with uploads/.",
+        }),
+        project: Type.String({
+          description: "Existing destination project name.",
+        }),
+        destination: Type.Optional(
+          Type.String({
+            description:
+              "Relative directory inside the project. Defaults to the project root.",
+          }),
+        ),
+      },
+      { additionalProperties: false },
+    ),
     {
       category: "analysis",
       sideEffect: true,
@@ -1345,9 +1726,14 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
       hidden: true,
     },
   ),
-  codeModePassthroughTool("list_scheduled_prompts", "List scheduled prompts for the current workspace.", EMPTY_PARAMETERS, {
-    category: "schedules",
-  }),
+  codeModePassthroughTool(
+    "list_scheduled_prompts",
+    "List scheduled prompts for the current workspace.",
+    EMPTY_PARAMETERS,
+    {
+      category: "schedules",
+    },
+  ),
   codeModePassthroughTool(
     "create_scheduled_prompt",
     "Create a scheduled prompt. Arguments: { name, prompt, cron_expression, enabled? }.",
@@ -1405,7 +1791,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   ),
   codeModePassthroughTool(
     "validate_workflow",
-    "Validate workflow source without saving it: checks that it exports `class AutomationWorkflow extends WorkflowEntrypoint` and compiles. IMPORTANT: a workflow runs as a single module with ONLY the injected bindings (env.TOOLS, env.CONNECTIONS, env.AI, …) — the only import you may use is `import { WorkflowEntrypoint } from \"cloudflare:workers\"`. npm packages, URL/CDN imports (e.g. esm.sh), and relative/multi-file modules are NOT available and fail at runtime, so never import them. Arguments: { source }.",
+    'Validate workflow source without saving it: checks that it exports `class AutomationWorkflow extends WorkflowEntrypoint` and compiles. IMPORTANT: a workflow runs as a single module with ONLY the injected bindings (env.TOOLS, env.CONNECTIONS, env.AI, …) — the only import you may use is `import { WorkflowEntrypoint } from "cloudflare:workers"`. npm packages, URL/CDN imports (e.g. esm.sh), and relative/multi-file modules are NOT available and fail at runtime, so never import them. Arguments: { source }.',
     Type.Object({ source: Type.String() }),
     {
       category: "workflows",
@@ -1413,7 +1799,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   ),
   codeModePassthroughTool(
     "create_workflow",
-    "Create a workflow. The source runs as a single module with ONLY the injected bindings — the one allowed import is `import { WorkflowEntrypoint } from \"cloudflare:workers\"`; do NOT import npm packages, URLs/CDNs (e.g. esm.sh), or relative modules (they fail at runtime). Use env.TOOLS / env.CONNECTIONS / env.AI for everything else. Arguments: { name, source, cron_expression, description, enabled? }.",
+    'Create a workflow. The source runs as a single module with ONLY the injected bindings — the one allowed import is `import { WorkflowEntrypoint } from "cloudflare:workers"`; do NOT import npm packages, URLs/CDNs (e.g. esm.sh), or relative modules (they fail at runtime). Use env.TOOLS / env.CONNECTIONS / env.AI for everything else. Arguments: { name, source, cron_expression, description, enabled? }.',
     Type.Object({
       name: Type.String(),
       source: Type.String(),
@@ -1463,7 +1849,10 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   codeModePassthroughTool(
     "get_workflow_run",
     "Inspect a workflow's recent runs — use after run_workflow_now (or to debug a failed scheduled run) instead of blindly waiting. Returns { latest, runs: [{ instance_id, status, trigger, started_at, completed_at, duration_ms, error }] }. status is `started` (still running), `success`, or `error` (with the message in `error`); each completed run reports duration_ms (sample recent runs for a rough ETA). Poll a few times if the latest run is still `started`. Arguments: { workflow_id, limit? }.",
-    Type.Object({ workflow_id: Type.String(), limit: Type.Optional(Type.Number()) }),
+    Type.Object({
+      workflow_id: Type.String(),
+      limit: Type.Optional(Type.Number()),
+    }),
     {
       category: "workflows",
     },
@@ -1474,7 +1863,9 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
     Type.Object({ category: Type.Optional(Type.String()) }),
     {
       category: "integrations",
-      examples: [`await tools.list_integrations({ category: "communication" })`],
+      examples: [
+        `await tools.list_integrations({ category: "communication" })`,
+      ],
     },
   ),
   codeModePassthroughTool(
@@ -1492,7 +1883,9 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
       integration_type: Type.String(),
       name: Type.String(),
       config: Type.Optional(Type.Object({}, { additionalProperties: true })),
-      credentials: Type.Optional(Type.Object({}, { additionalProperties: true })),
+      credentials: Type.Optional(
+        Type.Object({}, { additionalProperties: true }),
+      ),
     }),
     {
       category: "integrations",
@@ -1509,11 +1902,15 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
       suggested_name: Type.Optional(Type.String()),
       message: Type.Optional(Type.String()),
       config: Type.Optional(Type.Object({}, { additionalProperties: true })),
-      credentials: Type.Optional(Type.Object({}, { additionalProperties: true })),
+      credentials: Type.Optional(
+        Type.Object({}, { additionalProperties: true }),
+      ),
       display_name: Type.Optional(Type.String()),
       description: Type.Optional(Type.String()),
       instructions: Type.Optional(Type.String()),
-      fields: Type.Optional(Type.Array(Type.Object({}, { additionalProperties: true }))),
+      fields: Type.Optional(
+        Type.Array(Type.Object({}, { additionalProperties: true })),
+      ),
     }),
     {
       category: "integrations",
@@ -1523,17 +1920,25 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   codeModePassthroughTool(
     "delete_connection",
     "Delete a workspace connection after the user confirms in chat. Use this as a top-level tool, not from js_exec. Accepts a connection id, alias, type, or name. Arguments: { connection }.",
-    Type.Object({
-      connection: Type.String(),
-    }, { additionalProperties: false }),
+    Type.Object(
+      {
+        connection: Type.String(),
+      },
+      { additionalProperties: false },
+    ),
     {
       category: "integrations",
       sideEffect: true,
     },
   ),
-  codeModePassthroughTool("get_custom_domain", "Get custom domain diagnostics for deployed apps.", EMPTY_PARAMETERS, {
-    category: "domains",
-  }),
+  codeModePassthroughTool(
+    "get_custom_domain",
+    "Get custom domain diagnostics for deployed apps.",
+    EMPTY_PARAMETERS,
+    {
+      category: "domains",
+    },
+  ),
   codeModePassthroughTool(
     "set_custom_domain",
     "Set an exact custom hostname for an app. Arguments: { app_name, hostname }.",
@@ -1633,26 +2038,46 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   ),
 ];
 
-export const CODE_MODE_TOOL_DEFINITIONS: CodeModeToolDefinition[] = CODE_MODE_TOOL_REGISTRY
-  .map(codeModeDefinition);
+export const CODE_MODE_TOOL_DEFINITIONS: CodeModeToolDefinition[] =
+  CODE_MODE_TOOL_REGISTRY.map(codeModeDefinition);
 export const CODE_MODE_PI_PASSTHROUGH_TOOL_DEFINITIONS: CodeModeToolDefinition[] =
-  CODE_MODE_TOOL_REGISTRY
-    .filter((registration) => registration.piPassthrough)
-    .map(codeModeDefinition);
+  CODE_MODE_TOOL_REGISTRY.filter(
+    (registration) => registration.piPassthrough,
+  ).map(codeModeDefinition);
 
-const FILE_TOOL_NAMES = new Set(["read", "write", "edit", "ls", "delete", "grep", "find"]);
+const FILE_TOOL_NAMES = new Set([
+  "read",
+  "write",
+  "edit",
+  "ls",
+  "delete",
+  "grep",
+  "find",
+]);
 const AGENT_WEB_TOOL_NAMES = new Set(["WebSearch", "WebFetch"]);
 
-function requireFileLocation(toolName: string, args: Record<string, unknown>): CodeModeFileLocation {
+function requireFileLocation(
+  toolName: string,
+  args: Record<string, unknown>,
+): CodeModeFileLocation {
   const location = args.location;
   if (location !== "workspace" && location !== "project" && location !== "r2") {
-    throw new Error(`${toolName} requires an explicit location: "workspace", "project", or "r2"`);
+    throw new Error(
+      `${toolName} requires an explicit location: "workspace", "project", or "r2"`,
+    );
   }
-  if (location === "project" && (typeof args.project !== "string" || args.project.trim().length === 0)) {
-    throw new Error(`${toolName} with location "${location}" requires a project name`);
+  if (
+    location === "project" &&
+    (typeof args.project !== "string" || args.project.trim().length === 0)
+  ) {
+    throw new Error(
+      `${toolName} with location "${location}" requires a project name`,
+    );
   }
   if ((toolName === "grep" || toolName === "find") && location === "r2") {
-    throw new Error(`${toolName} does not support location "r2"; use ls/read for R2 objects`);
+    throw new Error(
+      `${toolName} does not support location "r2"; use ls/read for R2 objects`,
+    );
   }
   return location;
 }
@@ -1682,8 +2107,7 @@ function withDeployedConnectionsSkillOverride(
   // data-analysis also teach deployed-app CONNECTIONS. Deterministic
   // automations keep their CONNECTIONS docs — those are workflow bindings, not
   // the deployed-app broker this flag disables.
-  const banner =
-    `> **Deployment override:** ${DEPLOYED_CONNECTIONS_BINDING_DISABLED_PROMPT}\n\n`;
+  const banner = `> **Deployment override:** ${DEPLOYED_CONNECTIONS_BINDING_DISABLED_PROMPT}\n\n`;
   const text = `${banner}${skill.text}`;
   return {
     ...skill,
@@ -1712,7 +2136,9 @@ function skillTargetFromArgs(
 ): { skill: string; file: string } {
   const skill = typeof args.skill === "string" ? args.skill.trim() : "";
   if (!skill || !/^[a-z0-9][a-z0-9._-]*$/i.test(skill)) {
-    throw new Error(`read_skill requires one of these skill names: ${availableSkillNames.join(", ")}`);
+    throw new Error(
+      `read_skill requires one of these skill names: ${availableSkillNames.join(", ")}`,
+    );
   }
 
   if (args.file != null && typeof args.file !== "string") {
@@ -1742,6 +2168,16 @@ function normalizeDeployScriptName(value: unknown): string {
   return normalized;
 }
 
+function directDeployDeadlineAt(deadline: SandboxExecDeadline): number {
+  const remainingMs = deadline.remainingMs - DIRECT_DEPLOY_CALLER_RESERVE_MS;
+  if (remainingMs < 1_000) {
+    throw new Error(
+      "Deploy deadline has too little time remaining to start publication; no Cloudflare deploy request was started",
+    );
+  }
+  return Date.now() + remainingMs;
+}
+
 /**
  * Distinct tool failures one binding instance records as
  * `code_mode_project_tool_call_failed`. A js_exec script is model-written and
@@ -1752,11 +2188,12 @@ function normalizeDeployScriptName(value: unknown): string {
 export const CODE_MODE_TOOL_FAILURE_EVENT_BUDGET = 20;
 
 /**
- * Bound on a value-failure message.
+ * Bound on a failure message retained for diagnostics.
  *
- * It is both the AE blob and the dedupe key, so an unbounded message would let
- * distinct platform text burn the per-instance budget one row at a time. Long
- * enough to identify a failure, short enough that the key stays a key.
+ * It is both the AE blob and the dedupe key for value and thrown failures, so an
+ * unbounded message would let distinct platform text consume several MiB in a
+ * single binding instance. Long enough to identify a failure, short enough that
+ * the key stays a key.
  */
 export const CODE_MODE_VALUE_FAILURE_MESSAGE_MAX = 200;
 
@@ -1796,19 +2233,24 @@ export function toolValueFailureMessage(data: unknown): string | null {
   return "tool reported an unsuccessful outcome";
 }
 
-/** Error shape for a failure that was a VALUE: named, stackless, low-cardinality. */
-function stacklessValueFailure(message: string): Error {
+/** Named, stackless diagnostic shape that cannot retain an original thrown Error. */
+function stacklessToolFailure(
+  message: string,
+  surfaced: "throw" | "value",
+): Error {
   const error = new Error(message);
-  error.name = "ToolValueFailure";
+  error.name = surfaced === "value" ? "ToolValueFailure" : "ToolFailure";
   error.stack = "";
   return error;
 }
 
 /** A result carrying a command's own exit status/output rather than a tool error. */
 function isShellOutcomeResult(record: Record<string, unknown>): boolean {
-  return typeof record.exitCode === "number" ||
+  return (
+    typeof record.exitCode === "number" ||
     typeof record.stdout === "string" ||
-    typeof record.stderr === "string";
+    typeof record.stderr === "string"
+  );
 }
 
 /**
@@ -1817,7 +2259,8 @@ function isShellOutcomeResult(record: Record<string, unknown>): boolean {
  * session window keeps a single build from outliving the window that is meant
  * to cover the gap BETWEEN builds (and from pinning a standard-3 indefinitely).
  */
-export const PROJECT_BUILD_MAX_TIMEOUT_MS = PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS;
+export const PROJECT_BUILD_MAX_TIMEOUT_MS =
+  PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS;
 
 function clampProjectBuildTimeoutMs(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
@@ -1830,7 +2273,7 @@ function clampProjectBuildTimeoutMs(value: unknown): number | undefined {
 //
 // Container-side `timeout` stays the primary enforcement (better error, knows
 // the exit code); these bound OUR await so a container that never answers can
-// no longer occupy the turn until the 20-minute tool backstop. Defaults and
+// no longer occupy the turn until its outer tool deadline. Defaults and
 // maxes are the SAME constants the services forward container-side — a second
 // set of numbers here would either strangle legitimate work or fail to bound
 // the run it is supposed to bound.
@@ -1843,41 +2286,11 @@ function clampProjectBuildTimeoutMs(value: unknown): number | undefined {
 // large project — a regression the deadline exists to avoid causing.
 
 /**
- * BASE materialize-in + persist-out allowance for the project-tree analysis legs.
- *
- * It is a floor, not the whole story: unlike the build path (which reads with
- * SOURCE_READ_CONCURRENCY 16, skips unchanged files via a manifest and ships a
- * lane-parallel archive), the analysis legs wipe and rewrite the whole tree
- * every run with one sequential mkdir + readFileStream + writeFile round trip
- * PER FILE, then hash and persist the changed set back. That is proportional to
- * the project, not to the declared command timeout — so a fixed 120s let the
- * deadline fire AFTER a successful command on a big tree and invite the agent
- * to re-run a non-idempotent one. `analysisProjectIoOverheadMs` scales it.
+ * Fixed materialize/persist allowance. AnalysisService independently enforces
+ * source, manifest, persist, and phase ceilings; this caller does not perform a
+ * redundant TOCTOU traversal merely to predict their duration.
  */
 export const ANALYSIS_PROJECT_IO_OVERHEAD_MS = 120_000;
-/** Per-file allowance: one mkdir + readFileStream + writeFile, two DO hops each. */
-export const ANALYSIS_PROJECT_IO_PER_FILE_MS = 120;
-/** Per-MiB allowance: R2 → WorkspaceFilesystemDO → AnalysisService → container. */
-export const ANALYSIS_PROJECT_IO_PER_MIB_MS = 400;
-/**
- * Ceiling on the scaled allowance. Without it a pathological tree would push
- * the exec budget toward (and past) the 20-minute tool backstop, which must
- * stay the outermost bound.
- */
-export const ANALYSIS_PROJECT_IO_MAX_OVERHEAD_MS = 600_000;
-/** Files listed when sizing the overhead; matches collectProjectSourceFiles. */
-const ANALYSIS_PROJECT_IO_LISTING_LIMIT = 50_000;
-
-/** Size the materialize/persist allowance to the tree that will actually move. */
-export function analysisProjectIoOverheadMs(
-  listing: { fileCount: number; totalBytes: number },
-): number {
-  const scaled =
-    ANALYSIS_PROJECT_IO_OVERHEAD_MS +
-    Math.max(0, listing.fileCount) * ANALYSIS_PROJECT_IO_PER_FILE_MS +
-    (Math.max(0, listing.totalBytes) / (1024 * 1024)) * ANALYSIS_PROJECT_IO_PER_MIB_MS;
-  return Math.min(ANALYSIS_PROJECT_IO_MAX_OVERHEAD_MS, Math.round(scaled));
-}
 /** Source collect + materialize + lockfile/bundle persist around a build. */
 export const PROJECT_BUILD_IO_OVERHEAD_MS = 120_000;
 
@@ -1889,11 +2302,47 @@ interface SandboxExecLimits {
 
 /** The AnalysisService surface this binding drives (and wraps with deadlines). */
 interface AnalysisServiceLike {
-  runCode(request: { code: string; params?: Record<string, unknown> }): Promise<{ ok: boolean; stdout?: string; stderr?: string; error?: string }>;
-  runNotebook(request: { projectId: string; path: string; timeoutMs?: number }): Promise<unknown>;
-  exec(request: { projectId?: string; command: string; cwd?: string; env?: Record<string, string>; timeoutMs?: number }): Promise<unknown>;
-  addDependency(request: { projectId: string; packages: string[]; dev?: boolean }): Promise<unknown>;
-  listConnections(): Promise<Array<{ id: string; name: string; type: string; displayName: string; exportable: boolean; exportFormat: 'parquet' | 'ndjson' | null }>>;
+  runCode(request: {
+    code: string;
+    params?: Record<string, unknown>;
+    outputCaptureBytes?: number;
+  }): Promise<{
+    ok: boolean;
+    stdout?: string;
+    stderr?: string;
+    error?: string;
+    outputTruncated?: boolean;
+    fullOutput?: unknown;
+  }>;
+  runNotebook(request: {
+    projectId: string;
+    path: string;
+    timeoutMs?: number;
+    outputCaptureBytes?: number;
+  }): Promise<unknown>;
+  exec(request: {
+    projectId?: string;
+    command: string;
+    cwd?: string;
+    env?: Record<string, string>;
+    timeoutMs?: number;
+    outputCaptureBytes?: number;
+  }): Promise<unknown>;
+  addDependency(request: {
+    projectId: string;
+    packages: string[];
+    dev?: boolean;
+  }): Promise<unknown>;
+  listConnections(): Promise<
+    Array<{
+      id: string;
+      name: string;
+      type: string;
+      displayName: string;
+      exportable: boolean;
+      exportFormat: "parquet" | "ndjson" | null;
+    }>
+  >;
 }
 
 const ANALYSIS_EXEC_LIMITS: SandboxExecLimits = {
@@ -1906,7 +2355,8 @@ const ANALYSIS_NOTEBOOK_LIMITS: SandboxExecLimits = {
   defaultTimeoutMs: ANALYSIS_DEFAULT_NOTEBOOK_TIMEOUT_MS,
   maxTimeoutMs: ANALYSIS_MAX_NOTEBOOK_TIMEOUT_MS,
   // The notebook run is followed by a fixed-budget validator command.
-  overheadMs: ANALYSIS_PROJECT_IO_OVERHEAD_MS + ANALYSIS_NOTEBOOK_VALIDATE_TIMEOUT_MS,
+  overheadMs:
+    ANALYSIS_PROJECT_IO_OVERHEAD_MS + ANALYSIS_NOTEBOOK_VALIDATE_TIMEOUT_MS,
 };
 
 const ANALYSIS_DEPENDENCY_LIMITS: SandboxExecLimits = {
@@ -1925,8 +2375,12 @@ const PROJECT_BUILD_EXEC_LIMITS: SandboxExecLimits = {
   overheadMs: PROJECT_BUILD_IO_OVERHEAD_MS,
 };
 
-function summarizeProjectBuildResult(build: ProjectBuildResult): Record<string, unknown> {
-  const excerpt = build.success ? null : buildLogTail(buildFailureRawOutput(build));
+function summarizeProjectBuildResult(
+  build: ProjectBuildResult,
+): Record<string, unknown> {
+  const excerpt = build.success
+    ? null
+    : buildLogTail(buildFailureRawOutput(build));
   const errorMessage = build.success ? null : buildErrorMessage(build);
   return {
     success: build.success,
@@ -1939,16 +2393,24 @@ function summarizeProjectBuildResult(build: ProjectBuildResult): Record<string, 
     timings: build.timings,
     lockfilePersisted: build.lockfilePersisted,
     ...(build.buildLogPath ? { buildLogPath: build.buildLogPath } : {}),
-    ...(typeof build.buildLogPersisted === "boolean" ? { buildLogPersisted: build.buildLogPersisted } : {}),
-    ...(typeof build.buildLogBytes === "number" ? { buildLogBytes: build.buildLogBytes } : {}),
-    ...(errorMessage ? { errorMessage, errorSummary: summarizeBuildFailure(build) } : {}),
+    ...(typeof build.buildLogPersisted === "boolean"
+      ? { buildLogPersisted: build.buildLogPersisted }
+      : {}),
+    ...(typeof build.buildLogBytes === "number"
+      ? { buildLogBytes: build.buildLogBytes }
+      : {}),
+    ...(errorMessage
+      ? { errorMessage, errorSummary: summarizeBuildFailure(build) }
+      : {}),
     // Complete log when modest-sized; otherwise a capped tail. Full latest build
     // output is persisted at buildLogPath when buildLogPersisted is true.
     ...(excerpt ? { logExcerpt: excerpt } : {}),
   };
 }
 
-function summarizeDirectDeployResult(deploy: DirectDispatchDeployResult): Record<string, unknown> {
+function summarizeDirectDeployResult(
+  deploy: DirectDispatchDeployResult,
+): Record<string, unknown> {
   return {
     success: deploy.success,
     scriptName: deploy.scriptName,
@@ -1957,16 +2419,20 @@ function summarizeDirectDeployResult(deploy: DirectDispatchDeployResult): Record
     ...(deploy.timings ? { timings: deploy.timings } : {}),
     ...(deploy.success ? {} : { errorSummary: summarizeDeployFailure(deploy) }),
     ...(deploy.warnings?.length ? { warnings: deploy.warnings } : {}),
-    ...(deploy.skippedAssets?.length ? { skippedAssets: deploy.skippedAssets } : {}),
+    ...(deploy.skippedAssets?.length
+      ? { skippedAssets: deploy.skippedAssets }
+      : {}),
   };
 }
 
 function buildFailureRawOutput(build: ProjectBuildResult): string {
   // stdout first, stderr last — consumers keep a tail of this text, and stderr
   // (where compilers put errors) must never be truncated away by stdout noise.
-  return build.error ||
+  return (
+    build.error ||
     [build.stdout, build.stderr].filter(Boolean).join("\n") ||
-    `Build failed with exit code ${build.exitCode}`;
+    `Build failed with exit code ${build.exitCode}`
+  );
 }
 
 // The summary anchors on the failure marker that vite/rolldown/bun print right
@@ -1979,20 +2445,32 @@ const BUN_SCRIPT_WRAPPER_LINE = /^error: script ".*" exited with code \d+/i;
 // material, but frame lines are still scanned for the file:line reference.
 const CODE_FRAME_LINE = /^\s*(?:[╭│╰├└┌─]|\d+\s*[│|])/;
 const STACK_FRAME_LINE = /^\s*(?:at |[}{]+\s*$)/;
-const BUILD_FAILURE_MARKER = /(?:Build|Transform) failed with \d+ errors?|✗ Build failed|error during build:/i;
+const BUILD_FAILURE_MARKER =
+  /(?:Build|Transform) failed with \d+ errors?|✗ Build failed|error during build:/i;
 // File reference with optional bundler query suffix (stripped) and position.
-const BUILD_FILE_REFERENCE = /([^\s"'`()[\]]+\.(?:tsx?|jsx?|mjs|cjs|css|json))(\?[^\s:'"`)\]]*)?(:\d+(?::\d+)?)?/;
+const BUILD_FILE_REFERENCE =
+  /([^\s"'`()[\]]+\.(?:tsx?|jsx?|mjs|cjs|css|json))(\?[^\s:'"`)\]]*)?(:\d+(?::\d+)?)?/;
 
 function isBuildSummaryNoise(line: string): boolean {
   const trimmed = line.trim();
-  return !trimmed ||
+  return (
+    !trimmed ||
     BUN_SCRIPT_WRAPPER_LINE.test(trimmed) ||
     CODE_FRAME_LINE.test(line) ||
-    STACK_FRAME_LINE.test(line);
+    STACK_FRAME_LINE.test(line)
+  );
 }
 
-function buildFileReferenceNear(build: ProjectBuildResult, lines: string[], fromIndex: number): string | null {
-  for (let index = fromIndex; index < Math.min(lines.length, fromIndex + 8); index += 1) {
+function buildFileReferenceNear(
+  build: ProjectBuildResult,
+  lines: string[],
+  fromIndex: number,
+): string | null {
+  for (
+    let index = fromIndex;
+    index < Math.min(lines.length, fromIndex + 8);
+    index += 1
+  ) {
     const match = lines[index]?.match(BUILD_FILE_REFERENCE);
     if (match && !match[1]!.includes("node_modules")) {
       return `${relativizeBuildPath(build, match[1]!)}${match[3] ?? ""}`;
@@ -2007,22 +2485,29 @@ function relativizeBuildPath(build: ProjectBuildResult, value: string): string {
   return value.startsWith(prefix) ? value.slice(prefix.length) : value;
 }
 
-function relativizeBuildPaths(build: ProjectBuildResult, value: string): string {
-  const workdir = build.workdir.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&").replace(/\\\/+$/g, "");
+function relativizeBuildPaths(
+  build: ProjectBuildResult,
+  value: string,
+): string {
+  const workdir = build.workdir
+    .replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")
+    .replace(/\\\/+$/g, "");
   return value.replace(new RegExp(`${workdir}/`, "g"), "");
 }
 
 function summarizeBuildFailure(build: ProjectBuildResult): string {
   const message = buildErrorMessage(build);
   if (!message) return `Build failed with exit code ${build.exitCode}`;
-  if (message.length <= 300 && !message.includes("\n")) return limitSummary(message);
+  if (message.length <= 300 && !message.includes("\n"))
+    return limitSummary(message);
   return limitSummary(`${message} (${buildFailureOutputReference(build)})`);
 }
 
 function buildErrorMessage(build: ProjectBuildResult): string {
   const output = cleanBuildLog(buildFailureRawOutput(build));
   if (!output) return `Build failed with exit code ${build.exitCode}`;
-  if (output.length <= 300 && !output.includes("\n")) return relativizeBuildPaths(build, output);
+  if (output.length <= 300 && !output.includes("\n"))
+    return relativizeBuildPaths(build, output);
 
   const lines = output.split("\n");
   let summaryStart = -1;
@@ -2034,7 +2519,11 @@ function buildErrorMessage(build: ProjectBuildResult): string {
   if (markerIndex >= 0) {
     // The diagnostic block immediately follows the marker; collect its first
     // one or two informative lines (a bare "[plugin x]" tag plus its message).
-    for (let index = markerIndex + 1; index < lines.length && picked.length < 2; index += 1) {
+    for (
+      let index = markerIndex + 1;
+      index < lines.length && picked.length < 2;
+      index += 1
+    ) {
       const line = lines[index]!;
       if (!line.trim()) {
         if (picked.length) break;
@@ -2048,7 +2537,9 @@ function buildErrorMessage(build: ProjectBuildResult): string {
   if (!picked.length) {
     // No marker (e.g. tsc): the first error-looking line precedes any stack
     // trace or printed error-object tail.
-    summaryStart = lines.findIndex((line) => /error|failed/i.test(line) && !isBuildSummaryNoise(line));
+    summaryStart = lines.findIndex(
+      (line) => /error|failed/i.test(line) && !isBuildSummaryNoise(line),
+    );
     if (summaryStart >= 0) picked.push(lines[summaryStart]!.trim());
   }
   if (picked.length) {
@@ -2068,26 +2559,43 @@ function buildFailureOutputReference(build: ProjectBuildResult): string {
     : "see logExcerpt for diagnostic output";
 }
 
-function pickBuildFailureFields(build: Record<string, unknown>): Record<string, unknown> {
+function pickBuildFailureFields(
+  build: Record<string, unknown>,
+): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  for (const key of ["errorMessage", "buildLogPath", "buildLogPersisted", "buildLogBytes", "logExcerpt"]) {
+  for (const key of [
+    "errorMessage",
+    "buildLogPath",
+    "buildLogPersisted",
+    "buildLogBytes",
+    "logExcerpt",
+  ]) {
     if (key in build) out[key] = build[key];
   }
   return out;
 }
 
 function summarizeDeployFailure(deploy: DirectDispatchDeployResult): string {
-  return conciseErrorSummary(deploy.error || `Deploy failed with status ${deploy.status}`);
+  return conciseErrorSummary(
+    deploy.error || `Deploy failed with status ${deploy.status}`,
+  );
 }
 
 function conciseErrorSummary(value: string): string {
   const fromJson = conciseJsonErrorSummary(value);
   if (fromJson) return limitSummary(fromJson);
-  const dynamicRequire = value.match(/Dynamic require of ["'][^"']+["'] is not supported/i)?.[0];
+  const dynamicRequire = value.match(
+    /Dynamic require of ["'][^"']+["'] is not supported/i,
+  )?.[0];
   if (dynamicRequire) return dynamicRequire;
-  const uncaught = value.match(/Uncaught (?:Error|Exception|TypeError|ReferenceError|SyntaxError):?[^\n\r]*/i)?.[0];
+  const uncaught = value.match(
+    /Uncaught (?:Error|Exception|TypeError|ReferenceError|SyntaxError):?[^\n\r]*/i,
+  )?.[0];
   if (uncaught) return limitSummary(uncaught);
-  const firstMeaningfulLine = value.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  const firstMeaningfulLine = value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
   return limitSummary(firstMeaningfulLine || "Unknown error");
 }
 
@@ -2149,7 +2657,9 @@ function projectForAgent(project: WorkspaceProject): Record<string, unknown> {
   };
 }
 
-function projectCloneForAgent(project: WorkspaceProjectCloneSummary): Record<string, unknown> {
+function projectCloneForAgent(
+  project: WorkspaceProjectCloneSummary,
+): Record<string, unknown> {
   return {
     name: project.name,
     description: project.description,
@@ -2169,13 +2679,21 @@ type WorkerScriptListRow = WorkerScript & {
 
 function appFilterText(script: WorkerScriptListRow): string {
   return [script.script_name, script.custom_domain_hostname, script.project_id]
-    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .filter(
+      (value): value is string => typeof value === "string" && value.length > 0,
+    )
     .join(" ")
     .toLowerCase();
 }
 
-export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeToolsProps> {
-  private static readonly TOOL_CALL_HANDLERS: Record<string, CodeModeToolCallHandler> = {
+export class CodeModeToolsBinding extends WorkerEntrypoint<
+  ChatEnv,
+  CodeModeToolsProps
+> {
+  private static readonly TOOL_CALL_HANDLERS: Record<
+    string,
+    CodeModeToolCallHandler
+  > = {
     AskUserQuestion: (binding, args) => binding.askUserQuestion(args),
     TodoWrite: (binding, args) => binding.updateTodos(args),
     set_preview: (binding, args) => binding.setPreview(args),
@@ -2188,28 +2706,41 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     inspect_archive: (binding, args) => binding.inspectArchive(args),
     extract_archive: (binding, args) => binding.extractArchive(args),
     run_code: (binding, args) => binding.analysisRunCode(args),
-    add_python_dependency: (binding, args) => binding.analysisAddDependency(args),
+    add_python_dependency: (binding, args) =>
+      binding.analysisAddDependency(args),
     add_shadcn_component: (binding, args) => binding.addShadcnComponent(args),
     analysis_list_connections: (binding) => binding.analysisListConnections(),
     warehouse_run_code: (binding, args) => binding.analysisRunCode(args),
     warehouse_list_connections: (binding) => binding.analysisListConnections(),
     list_scheduled_prompts: (binding) => binding.listScheduledPrompts(),
-    create_scheduled_prompt: (binding, args) => binding.createScheduledPrompt(args),
-    update_scheduled_prompt: (binding, args) => binding.updateScheduledPrompt(args),
-    delete_scheduled_prompt: (binding, args) => binding.deleteScheduledPrompt(args),
-    run_scheduled_prompt_now: (binding, args) => binding.runScheduledPromptNow(args),
+    create_scheduled_prompt: (binding, args) =>
+      binding.createScheduledPrompt(args),
+    update_scheduled_prompt: (binding, args) =>
+      binding.updateScheduledPrompt(args),
+    delete_scheduled_prompt: (binding, args) =>
+      binding.deleteScheduledPrompt(args),
+    run_scheduled_prompt_now: (binding, args) =>
+      binding.runScheduledPromptNow(args),
     list_workflows: (binding) => binding.listDeterministicAutomations(),
-    validate_workflow: (binding, args) => binding.validateDeterministicAutomation(args),
-    create_workflow: (binding, args) => binding.createDeterministicAutomation(args),
-    update_workflow: (binding, args) => binding.updateDeterministicAutomation(args),
-    delete_workflow: (binding, args) => binding.deleteDeterministicAutomation(args),
-    run_workflow_now: (binding, args) => binding.runDeterministicAutomationNow(args),
-    get_workflow_run: (binding, args) => binding.getDeterministicAutomationRuns(args),
+    validate_workflow: (binding, args) =>
+      binding.validateDeterministicAutomation(args),
+    create_workflow: (binding, args) =>
+      binding.createDeterministicAutomation(args),
+    update_workflow: (binding, args) =>
+      binding.updateDeterministicAutomation(args),
+    delete_workflow: (binding, args) =>
+      binding.deleteDeterministicAutomation(args),
+    run_workflow_now: (binding, args) =>
+      binding.runDeterministicAutomationNow(args),
+    get_workflow_run: (binding, args) =>
+      binding.getDeterministicAutomationRuns(args),
     workspace_info: (binding) => binding.getWorkspaceRuntimeInfo(),
     list_integrations: (binding, args) => binding.listIntegrations(args),
-    list_integration_types: (binding, args) => binding.listIntegrationTypes(args),
+    list_integration_types: (binding, args) =>
+      binding.listIntegrationTypes(args),
     create_integration: (binding, args) => binding.createIntegration(args),
-    prompt_connection_setup: (binding, args) => binding.promptConnectionSetup(args),
+    prompt_connection_setup: (binding, args) =>
+      binding.promptConnectionSetup(args),
     delete_connection: (binding, args) => binding.deleteConnection(args),
     delete_app: (binding, args) => binding.deleteApp(args),
     delete_project: (binding, args) => binding.deleteProject(args),
@@ -2220,34 +2751,56 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     get_custom_domain: (binding) => binding.getCustomDomain(),
     set_custom_domain: (binding, args) => binding.setCustomDomain(args),
     remove_custom_domain: (binding, args) => binding.removeCustomDomain(args),
-    retry_custom_domain_hostnames: (binding) => binding.retryCustomDomainHostnames(),
+    retry_custom_domain_hostnames: (binding) =>
+      binding.retryCustomDomainHostnames(),
     WebSearch: (binding, args) => binding.webSearch(args),
     WebFetch: (binding, args) => binding.webFetch(args),
     Agent: (binding, args, name) => binding.runSubagentTool(name, args),
     Explore: (binding, args, name) => binding.runSubagentTool(name, args),
-    connections_list: (binding) => listConnections(binding.env, binding.connectionsContext),
+    connections_list: (binding) =>
+      listConnections(binding.env, binding.connectionsContext),
     connections_get: (binding, args) => {
-      const connection = typeof args.connection === "string" ? args.connection : "";
+      const connection =
+        typeof args.connection === "string" ? args.connection : "";
       if (!connection) throw new Error("connection is required");
       return getConnection(binding.env, binding.connectionsContext, connection);
     },
     connections_tools: (binding, args) => {
-      const connection = typeof args.connection === "string" ? args.connection : "";
+      const connection =
+        typeof args.connection === "string" ? args.connection : "";
       if (!connection) throw new Error("connection is required");
-      return listConnectionTools(binding.env, binding.connectionsContext, connection);
+      return listConnectionTools(
+        binding.env,
+        binding.connectionsContext,
+        connection,
+      );
     },
-    connections_methods: (binding) => listConnectionMethods(binding.env, binding.connectionsContext),
+    connections_methods: (binding) =>
+      listConnectionMethods(binding.env, binding.connectionsContext),
     connections_find: (binding, args) =>
-      findConnectionMethodEntry(binding.env, binding.connectionsContext, binding.connectionQuery(args)),
+      findConnectionMethodEntry(
+        binding.env,
+        binding.connectionsContext,
+        binding.connectionQuery(args),
+      ),
     connections_test: (binding, args) =>
-      testConnectionMethodEntry(binding.env, binding.connectionsContext, binding.connectionQuery(args)),
+      testConnectionMethodEntry(
+        binding.env,
+        binding.connectionsContext,
+        binding.connectionQuery(args),
+      ),
     connections_verify: (binding, args) =>
-      verifyConnection(binding.env, binding.connectionsContext, binding.connectionQuery(args)),
-    connections_invoke: (binding, args) => invokeConnectionMethod(binding.env, binding.connectionsContext, {
-      connection: typeof args.connection === "string" ? args.connection : "",
-      method: typeof args.method === "string" ? args.method : undefined,
-      input: args.input,
-    }),
+      verifyConnection(
+        binding.env,
+        binding.connectionsContext,
+        binding.connectionQuery(args),
+      ),
+    connections_invoke: (binding, args) =>
+      invokeConnectionMethod(binding.env, binding.connectionsContext, {
+        connection: typeof args.connection === "string" ? args.connection : "",
+        method: typeof args.method === "string" ? args.method : undefined,
+        input: args.input,
+      }),
   };
 
   private discordSendInvocationCount = 0;
@@ -2262,12 +2815,68 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   /**
    * Per-binding overflow reservations. These are lazy because focused tests
    * construct the binding with Object.create() and skip field initializers.
-   * Reservations are never refunded: after an uncertain/failed put, retrying
-   * the same capacity could exceed the bounded per-attempt contract.
+   * Ordinary overflow reservations are never refunded: after an uncertain or
+   * failed put, retrying the same capacity could exceed the bounded contract.
+   * Analysis reservations are refunded only after the producer explicitly
+   * proves that it neither truncated nor archived output.
    */
   private toolResultOverflowReservedBytes?: number;
   private toolResultOverflowReservedFiles?: number;
   private toolResultOverflowStorageFailed?: boolean;
+
+  /**
+   * Reserve source-produced analysis output before crossing an async boundary.
+   * Parallel js_exec calls therefore share the same per-attempt file/byte
+   * ledger as ordinary tool-result overflow instead of each writing its own
+   * maximum-sized artifact.
+   */
+  private reserveAnalysisOutputCaptureBytes(): number {
+    if (this.toolResultOverflowStorageFailed === true) return 0;
+    const files = this.toolResultOverflowReservedFiles ?? 0;
+    const bytes = this.toolResultOverflowReservedBytes ?? 0;
+    if (files >= CHAT_RUNTIME_BOUNDS.toolResultOverflowFilesPerAttempt)
+      return 0;
+    const remaining =
+      CHAT_RUNTIME_BOUNDS.toolResultOverflowPerAttemptBytes - bytes;
+    const reserved = Math.min(
+      CHAT_RUNTIME_BOUNDS.analysisOutputOverflowBytes,
+      remaining,
+    );
+    if (reserved < 256 * 1024) return 0;
+    this.toolResultOverflowReservedFiles = files + 1;
+    this.toolResultOverflowReservedBytes = bytes + reserved;
+    return reserved;
+  }
+
+  /**
+   * Hold archive capacity before dispatch. A throw, missing acknowledgement,
+   * truncation, or archive keeps the reservation; only an explicit unused
+   * acknowledgement makes that capacity safe to reuse.
+   */
+  private async withAnalysisOutputCaptureReservation<T>(
+    run: (outputCaptureBytes: number) => Promise<T>,
+  ): Promise<T> {
+    const outputCaptureBytes = this.reserveAnalysisOutputCaptureBytes();
+    const result = await run(outputCaptureBytes);
+    if (
+      outputCaptureBytes > 0 &&
+      result !== null &&
+      typeof result === "object" &&
+      !Array.isArray(result) &&
+      (result as Record<string, unknown>).outputTruncated === false &&
+      (result as Record<string, unknown>).fullOutput === undefined
+    ) {
+      this.toolResultOverflowReservedFiles = Math.max(
+        0,
+        (this.toolResultOverflowReservedFiles ?? 0) - 1,
+      );
+      this.toolResultOverflowReservedBytes = Math.max(
+        0,
+        (this.toolResultOverflowReservedBytes ?? 0) - outputCaptureBytes,
+      );
+    }
+    return result;
+  }
 
   private get workspaceFs(): WorkspaceFilesystemClient {
     const { workspaceId } = this.ctx.props;
@@ -2289,7 +2898,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return new PiContainerTools(this.workspaceFs, { images: this.env.IMAGES });
   }
 
-  private async projectFileStore(args: Record<string, unknown>): Promise<ProjectFilesystemClient> {
+  private async projectFileStore(
+    args: Record<string, unknown>,
+  ): Promise<ProjectFilesystemClient> {
     const name = typeof args.project === "string" ? args.project.trim() : "";
     if (!name) throw new Error("project is required for location='project'");
     const project = await this.workspaceFs.getProjectByName(name);
@@ -2297,20 +2908,30 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return new ProjectFilesystemClient(this.env, project.id);
   }
 
-  private async projectContainerTools(args: Record<string, unknown>): Promise<PiContainerTools> {
-    return new PiContainerTools(await this.projectFileStore(args), { images: this.env.IMAGES });
+  private async projectContainerTools(
+    args: Record<string, unknown>,
+  ): Promise<PiContainerTools> {
+    return new PiContainerTools(await this.projectFileStore(args), {
+      images: this.env.IMAGES,
+    });
   }
 
   private projectBuildSandbox(): ProjectBuildSandboxLike {
     const { orgId } = this.ctx.props;
     if (!orgId) throw new Error("Project builds require org scope");
     if (!this.env.PROJECT_BUILD_SANDBOX) {
-      throw new Error("PROJECT_BUILD_SANDBOX container binding is not configured");
+      throw new Error(
+        "PROJECT_BUILD_SANDBOX container binding is not configured",
+      );
     }
-    return getSandbox(this.env.PROJECT_BUILD_SANDBOX, projectBuildSandboxKey(orgId), {
-      normalizeId: true,
-      transport: "rpc",
-    }) as unknown as ProjectBuildSandboxLike;
+    return getSandbox(
+      this.env.PROJECT_BUILD_SANDBOX,
+      projectBuildSandboxKey(orgId),
+      {
+        normalizeId: true,
+        transport: "rpc",
+      },
+    ) as unknown as ProjectBuildSandboxLike;
   }
 
   /**
@@ -2324,7 +2945,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     operation: "add_dependency" | "deploy_project",
   ): ProjectBuildReadinessGate {
     return createProjectBuildReadinessGate((sandbox, budgetMs) =>
-      this.awaitProjectBuildSandboxReady(sandbox, operation, budgetMs));
+      this.awaitProjectBuildSandboxReady(sandbox, operation, budgetMs),
+    );
   }
 
   private async awaitProjectBuildSandboxReady(
@@ -2343,7 +2965,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           orgId: this.ctx?.props?.orgId,
         });
       },
-      onEvent: (event) => this.recordProjectBuildReadinessEvent(operation, event),
+      onEvent: (event) =>
+        this.recordProjectBuildReadinessEvent(operation, event),
     });
     if (readiness.coldStart) {
       console.warn("[project-build] build container cold start", {
@@ -2386,20 +3009,24 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     // boot — it gets its own event so cold-start dashboards stay boot-shaped.
     // Same for a zombie: the wait is real, but the cause is a dead shell layer,
     // and the DO's own build_sandbox_zombie_restart records what was done.
-    const eventName = event.type === "cold_start"
-      ? "build_sandbox_cold_start"
-      : event.type === "zombie_detected"
-        ? "build_sandbox_zombie_detected"
-        : event.type === "startup_failed"
-          ? "build_sandbox_startup_failed"
-          : "build_sandbox_ready_timeout";
-    const status = event.type === "cold_start"
-      ? "ready"
-      : event.type === "zombie_detected"
-        ? (event.restarted ? "restarted" : "restart_suppressed")
-        : event.type === "startup_failed"
-          ? "startup_failed"
-          : "timeout";
+    const eventName =
+      event.type === "cold_start"
+        ? "build_sandbox_cold_start"
+        : event.type === "zombie_detected"
+          ? "build_sandbox_zombie_detected"
+          : event.type === "startup_failed"
+            ? "build_sandbox_startup_failed"
+            : "build_sandbox_ready_timeout";
+    const status =
+      event.type === "cold_start"
+        ? "ready"
+        : event.type === "zombie_detected"
+          ? event.restarted
+            ? "restarted"
+            : "restart_suppressed"
+          : event.type === "startup_failed"
+            ? "startup_failed"
+            : "timeout";
     recordObservabilityEvent(this.env, {
       event: eventName,
       severity: event.type === "cold_start" ? "info" : "error",
@@ -2416,7 +3043,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     });
   }
 
-  private async resolveProjectForAction(args: Record<string, unknown>): Promise<WorkspaceProject> {
+  private async resolveProjectForAction(
+    args: Record<string, unknown>,
+  ): Promise<WorkspaceProject> {
     const name = typeof args.project === "string" ? args.project.trim() : "";
     if (!name) throw new Error("project is required");
     const project = await this.workspaceFs.getProjectByName(name);
@@ -2424,7 +3053,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return project;
   }
 
-  private async resolveDoBackedProjectForAction(args: Record<string, unknown>, _action: string): Promise<WorkspaceProject> {
+  private async resolveDoBackedProjectForAction(
+    args: Record<string, unknown>,
+    _action: string,
+  ): Promise<WorkspaceProject> {
     return this.resolveProjectForAction(args);
   }
 
@@ -2433,7 +3065,11 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     options: { template?: unknown; force?: boolean } = {},
   ): Promise<ProjectScaffoldResult> {
     const template = normalizeProjectScaffoldTemplate(options.template);
-    const files = defaultProjectScaffoldFiles(project.name, template, normalizeDeployScriptName(project.name));
+    const files = defaultProjectScaffoldFiles(
+      project.name,
+      template,
+      normalizeDeployScriptName(project.name),
+    );
     const fileStore = new ProjectFilesystemClient(this.env, project.id);
     const filesWritten: string[] = [];
     const filesSkipped: string[] = [];
@@ -2446,13 +3082,18 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         }
       }
       const result = await fileStore.writeFile(file.path, file.content);
-      if (!result.success) throw new Error(result.error || `Failed to write scaffold file ${file.path}`);
+      if (!result.success)
+        throw new Error(
+          result.error || `Failed to write scaffold file ${file.path}`,
+        );
       filesWritten.push(file.path);
     }
     return { template, filesWritten, filesSkipped };
   }
 
-  private async createProject(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async createProject(
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     // Validate before creating: js_exec calls skip schema validation, and an
     // invalid template must not leave behind an empty registered project.
     const template = normalizeProjectScaffoldTemplate(args.template);
@@ -2489,23 +3130,29 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (!this.env.WORKSPACE_CRON) {
       throw new Error("Scheduled prompt tools are not configured");
     }
-    return this.env.WORKSPACE_CRON.get(this.env.WORKSPACE_CRON.idFromName(workspaceId));
+    return this.env.WORKSPACE_CRON.get(
+      this.env.WORKSPACE_CRON.idFromName(workspaceId),
+    );
   }
 
   private async getOrgSlug(): Promise<string | null> {
     const info = await this.orgStub.getInfo();
-    return typeof info?.slug === "string" && info.slug.trim() ? info.slug.trim() : null;
+    return typeof info?.slug === "string" && info.slug.trim()
+      ? info.slug.trim()
+      : null;
   }
 
   private async getWorkspaceRuntimeInfo(): Promise<Record<string, unknown>> {
     const workspaceInfo = await this.workspaceStub.getInfo();
     const emailDomain = getWorkspaceEmailDomain(this.env);
-    const emailHandle = typeof workspaceInfo?.email_handle === "string"
-      ? workspaceInfo.email_handle.trim()
-      : "";
-    const emailAddress = emailDomain && emailHandle
-      ? buildWorkspaceEmailAddress(emailHandle, emailDomain)
-      : null;
+    const emailHandle =
+      typeof workspaceInfo?.email_handle === "string"
+        ? workspaceInfo.email_handle.trim()
+        : "";
+    const emailAddress =
+      emailDomain && emailHandle
+        ? buildWorkspaceEmailAddress(emailHandle, emailDomain)
+        : null;
     return {
       id: workspaceInfo?.id ?? this.ctx.props.workspaceId,
       name: workspaceInfo?.name ?? null,
@@ -2540,9 +3187,14 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     }
   }
 
-  private normalizeR2RelativePath(path: string, allowDirectory: boolean): string {
+  private normalizeR2RelativePath(
+    path: string,
+    allowDirectory: boolean,
+  ): string {
     if (path.startsWith("/")) {
-      throw new Error("R2 paths must be relative: use uploads/<path>, outputs/<path>, or tmp/<path>");
+      throw new Error(
+        "R2 paths must be relative: use uploads/<path>, outputs/<path>, or tmp/<path>",
+      );
     }
     const relativePath = allowDirectory ? path.replace(/\/+$/, "") : path;
     if (relativePath.length > 1024) {
@@ -2550,13 +3202,20 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     }
     if (!relativePath) return "";
     const segments = relativePath.split("/");
-    if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    if (
+      segments.some(
+        (segment) => segment === "" || segment === "." || segment === "..",
+      )
+    ) {
       throw new Error("R2 paths must not contain empty, '.', or '..' segments");
     }
     return relativePath;
   }
 
-  private r2PathFromRelative(mount: CodeModeR2Mount, relativePath: string): string {
+  private r2PathFromRelative(
+    mount: CodeModeR2Mount,
+    relativePath: string,
+  ): string {
     return relativePath ? `${mount}/${relativePath}` : mount;
   }
 
@@ -2564,16 +3223,26 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     raw: Record<string, unknown>,
     options: { allowDirectory?: boolean; requireWritable?: boolean } = {},
   ): CodeModeR2Path {
-    const rawPath = typeof raw.path === "string" ? raw.path.trim().replace(/\\/g, "/") : "";
+    const rawPath =
+      typeof raw.path === "string" ? raw.path.trim().replace(/\\/g, "/") : "";
     if (!rawPath) throw new Error("R2 path is required");
-    const normalizedPath = this.normalizeR2RelativePath(rawPath, options.allowDirectory ?? false);
+    const normalizedPath = this.normalizeR2RelativePath(
+      rawPath,
+      options.allowDirectory ?? false,
+    );
     const [mountPart, ...rest] = normalizedPath.split("/");
-    if (mountPart !== "uploads" && mountPart !== "outputs" && mountPart !== "tmp") {
+    if (
+      mountPart !== "uploads" &&
+      mountPart !== "outputs" &&
+      mountPart !== "tmp"
+    ) {
       throw new Error("R2 path must start with uploads/, outputs/, or tmp/");
     }
     const relativePath = rest.join("/");
-    if (!options.allowDirectory && !relativePath) throw new Error("R2 object path is required");
-    if (options.requireWritable && mountPart === "uploads") throw new Error("uploads/ is read-only");
+    if (!options.allowDirectory && !relativePath)
+      throw new Error("R2 object path is required");
+    if (options.requireWritable && mountPart === "uploads")
+      throw new Error("uploads/ is read-only");
     return {
       mount: mountPart,
       key: `${this.r2MountBaseKey(mountPart)}${relativePath}`,
@@ -2587,7 +3256,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return `/api/workspaces/${this.ctx.props.workspaceId}/${target.mount}/${target.relativePath}`;
   }
 
-  private formatR2ObjectMetadata(obj: R2Object, target: CodeModeR2Path): Record<string, unknown> {
+  private formatR2ObjectMetadata(
+    obj: R2Object,
+    target: CodeModeR2Path,
+  ): Record<string, unknown> {
     return {
       location: "r2",
       path: target.path,
@@ -2595,7 +3267,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       publicUrl: this.r2PublicUrl(target),
       size: obj.size,
       etag: obj.etag,
-      uploaded: obj.uploaded instanceof Date ? obj.uploaded.toISOString() : String(obj.uploaded),
+      uploaded:
+        obj.uploaded instanceof Date
+          ? obj.uploaded.toISOString()
+          : String(obj.uploaded),
       contentType: obj.httpMetadata?.contentType ?? null,
       customMetadata: obj.customMetadata ?? {},
     };
@@ -2617,7 +3292,11 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     maxLines: number;
     maxBytes: number;
   } {
-    const truncated = truncateTextHead(content, CODE_MODE_R2_READ_MAX_LINES, maxBytes);
+    const truncated = truncateTextHead(
+      content,
+      CODE_MODE_R2_READ_MAX_LINES,
+      maxBytes,
+    );
     return {
       ...truncated,
       ...(truncated.firstLineExceedsLimit
@@ -2639,11 +3318,16 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (inlineImage?.optimizedForInlineView) {
       text += `\n[Image optimized for inline model context and may be scaled/compressed from the source.]`;
     }
-    const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [
-      { type: "text", text },
-    ];
+    const content: Array<
+      | { type: "text"; text: string }
+      | { type: "image"; data: string; mimeType: string }
+    > = [{ type: "text", text }];
     if (inlineImage) {
-      content.push({ type: "image", data: inlineImage.data, mimeType: inlineImage.mimeType });
+      content.push({
+        type: "image",
+        data: inlineImage.data,
+        mimeType: inlineImage.mimeType,
+      });
     } else {
       text += `\n[Image omitted: could not be resized below the inline image size limit of ${inlineImageMaxBase64Chars()} base64 chars.]`;
       content[0] = { type: "text", text };
@@ -2685,8 +3369,13 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (!Number.isSafeInteger(requestedOffset) || requestedOffset < 0) {
       throw new Error("byte_offset must be a non-negative safe integer");
     }
-    if (requestedOffset > head.size || (requestedOffset === head.size && head.size > 0)) {
-      throw new Error(`Byte offset ${requestedOffset} is beyond end of R2 object`);
+    if (
+      requestedOffset > head.size ||
+      (requestedOffset === head.size && head.size > 0)
+    ) {
+      throw new Error(
+        `Byte offset ${requestedOffset} is beyond end of R2 object`,
+      );
     }
 
     const maxContentBytes = Math.min(
@@ -2708,9 +3397,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       if (object.body) {
         bytes = new Uint8Array(await readStreamBytes(object.body, fetchLength));
       } else {
-        bytes = typeof object.arrayBuffer === "function"
-          ? new Uint8Array(await object.arrayBuffer())
-          : new TextEncoder().encode(await object.text());
+        bytes =
+          typeof object.arrayBuffer === "function"
+            ? new Uint8Array(await object.arrayBuffer())
+            : new TextEncoder().encode(await object.text());
         if (bytes.byteLength > fetchLength) {
           throw new Error("R2 range read returned more bytes than requested");
         }
@@ -2735,9 +3425,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     } catch {
       throw new Error("R2 byte window is not valid UTF-8 text");
     }
-    const nextByteOffset = actualOffset + windowBytes.byteLength < head.size
-      ? actualOffset + windowBytes.byteLength
-      : null;
+    const nextByteOffset =
+      actualOffset + windowBytes.byteLength < head.size
+        ? actualOffset + windowBytes.byteLength
+        : null;
     let text = content;
     if (nextByteOffset !== null) {
       const endDisplay = Math.max(actualOffset, nextByteOffset - 1);
@@ -2764,7 +3455,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
   }
 
-  private async readR2File(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async readR2File(
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     const target = this.resolveCodeModeR2Path(args);
     const head = await this.env.R2_BUCKET.head(target.key);
     if (!head) {
@@ -2775,7 +3468,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     );
     if (args.byte_offset !== undefined) {
       if (args.offset !== undefined || args.limit !== undefined) {
-        throw new Error("byte_offset cannot be combined with line offset or limit");
+        throw new Error(
+          "byte_offset cannot be combined with line offset or limit",
+        );
       }
       if (contentTypeImageMimeType) {
         throw new Error("byte_offset is only supported for R2 text objects");
@@ -2789,10 +3484,21 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       }
       return this.readR2ByteWindow(target, head, args.byte_offset);
     }
-    const offset = clampCodeModeInteger(args.offset, 1, 1, Number.MAX_SAFE_INTEGER);
-    const limit = typeof args.limit === "number"
-      ? clampCodeModeInteger(args.limit, CODE_MODE_R2_READ_MAX_LINES, 1, CODE_MODE_R2_READ_MAX_LINES)
-      : undefined;
+    const offset = clampCodeModeInteger(
+      args.offset,
+      1,
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const limit =
+      typeof args.limit === "number"
+        ? clampCodeModeInteger(
+            args.limit,
+            CODE_MODE_R2_READ_MAX_LINES,
+            1,
+            CODE_MODE_R2_READ_MAX_LINES,
+          )
+        : undefined;
     const object = await this.env.R2_BUCKET.get(target.key);
     if (!object) {
       throw new Error(`R2 object not found: ${target.path}`);
@@ -2801,25 +3507,37 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (object.body) {
       const sniffed = await readImageSniffBytesAndReplayStream(object.body);
       const imageDetection = detectSharedImageMimeType(sniffed.prefix);
-      const imageMimeType = imageDetection.kind === "supported"
-        ? imageDetection.mimeType
-        : imageDetection.kind === "unknown"
-          ? contentTypeImageMimeType
-          : null;
+      const imageMimeType =
+        imageDetection.kind === "supported"
+          ? imageDetection.mimeType
+          : imageDetection.kind === "unknown"
+            ? contentTypeImageMimeType
+            : null;
       if (imageMimeType) {
         const images = this.env.IMAGES;
-        if (!images) throw new Error("IMAGES binding is required for image reads");
-        const inlineImage = await prepareInlineImageFromStream(sniffed.stream, imageMimeType, images, {
-          createRetryStream: async () => {
-            const retryObject = await this.env.R2_BUCKET.get(target.key);
-            if (!retryObject?.body) throw new Error(`R2 image object is not streamable: ${target.path}`);
-            return retryObject.body;
+        if (!images)
+          throw new Error("IMAGES binding is required for image reads");
+        const inlineImage = await prepareInlineImageFromStream(
+          sniffed.stream,
+          imageMimeType,
+          images,
+          {
+            createRetryStream: async () => {
+              const retryObject = await this.env.R2_BUCKET.get(target.key);
+              if (!retryObject?.body)
+                throw new Error(
+                  `R2 image object is not streamable: ${target.path}`,
+                );
+              return retryObject.body;
+            },
           },
-        });
+        );
         return this.r2ImageReadResult(head, target, imageMimeType, inlineImage);
       }
       if (head.size > CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES) {
-        await sniffed.stream.cancel("R2 object exceeds text read limit").catch(() => undefined);
+        await sniffed.stream
+          .cancel("R2 object exceeds text read limit")
+          .catch(() => undefined);
         throw new Error(
           `R2 object is too large for text read (${head.size} bytes; max ${CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES} bytes)`,
         );
@@ -2829,25 +3547,31 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES,
       );
     } else {
-      const materializedSize = typeof object.size === "number" ? object.size : head.size;
+      const materializedSize =
+        typeof object.size === "number" ? object.size : head.size;
       if (!Number.isSafeInteger(materializedSize) || materializedSize < 0) {
-        throw new Error("R2 object has an invalid size; refusing to materialize it");
+        throw new Error(
+          "R2 object has an invalid size; refusing to materialize it",
+        );
       }
       if (materializedSize > CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES) {
         throw new Error(
           `R2 object is too large for text read (${materializedSize} bytes; max ${CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES} bytes)`,
         );
       }
-      bytes = typeof object.arrayBuffer === "function"
-        ? new Uint8Array(await object.arrayBuffer())
-        : new TextEncoder().encode(await object.text());
+      bytes =
+        typeof object.arrayBuffer === "function"
+          ? new Uint8Array(await object.arrayBuffer())
+          : new TextEncoder().encode(await object.text());
       const imageDetection = detectSharedImageMimeType(bytes);
-      const imageMimeType = imageDetection.kind === "supported"
-        ? imageDetection.mimeType
-        : imageDetection.kind === "unknown"
-          ? contentTypeImageMimeType
-          : null;
-      if (imageMimeType) throw new Error(`R2 image object is not streamable: ${target.path}`);
+      const imageMimeType =
+        imageDetection.kind === "supported"
+          ? imageDetection.mimeType
+          : imageDetection.kind === "unknown"
+            ? contentTypeImageMimeType
+            : null;
+      if (imageMimeType)
+        throw new Error(`R2 image object is not streamable: ${target.path}`);
     }
     if (head.size > CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES) {
       throw new Error(
@@ -2858,20 +3582,21 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const startLine = offset - 1;
     const window = selectTextLineWindow(fullText, startLine, limit);
     if (!window) throw new Error(`Offset ${offset} is beyond end of R2 object`);
-    const maxBytes = CODE_MODE_R2_READ_MAX_BYTES - CODE_MODE_R2_READ_NOTICE_RESERVED_BYTES;
+    const maxBytes =
+      CODE_MODE_R2_READ_MAX_BYTES - CODE_MODE_R2_READ_NOTICE_RESERVED_BYTES;
     const truncation = this.truncateR2ReadHead(window.content, maxBytes);
     const startLineDisplay = startLine + 1;
     let text: string;
     let nextOffset: number | null = null;
     if (truncation.firstLineExceedsLimit) {
-      text =
-        `[Line ${startLineDisplay} is ${truncation.firstLineBytes} bytes, exceeds ${maxBytes} byte read budget. R2 path: ${target.path}]`;
+      text = `[Line ${startLineDisplay} is ${truncation.firstLineBytes} bytes, exceeds ${maxBytes} byte read budget. R2 path: ${target.path}]`;
     } else if (truncation.truncated) {
       const endLineDisplay = startLine + truncation.outputLines;
       nextOffset = endLineDisplay + 1;
-      const limitLabel = truncation.truncatedBy === "bytes"
-        ? ` (${maxBytes} byte read budget)`
-        : "";
+      const limitLabel =
+        truncation.truncatedBy === "bytes"
+          ? ` (${maxBytes} byte read budget)`
+          : "";
       text = truncation.content;
       text +=
         `${text ? "\n\n" : ""}` +
@@ -2903,16 +3628,21 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   ): Promise<Record<string, unknown>> {
     const target = this.resolveCodeModeR2Path(args, { requireWritable: true });
     const content = typeof args.content === "string" ? args.content : "";
-    const contentBytes = new TextEncoder().encode(content).byteLength;
+    const contentBytes = utf8ByteLength(content);
     if (contentBytes > CODE_MODE_R2_MAX_WRITE_BYTES) {
-      throw new Error(`R2 write content exceeds ${CODE_MODE_R2_MAX_WRITE_BYTES} bytes`);
+      throw new Error(
+        `R2 write content exceeds ${CODE_MODE_R2_MAX_WRITE_BYTES} bytes`,
+      );
     }
     assertNotBase64IntoBinaryFile(target.path, content);
-    const contentType = typeof args.content_type === "string" && args.content_type.trim()
-      ? args.content_type.trim()
-      : "text/plain; charset=utf-8";
+    const contentType =
+      typeof args.content_type === "string" && args.content_type.trim()
+        ? args.content_type.trim()
+        : "text/plain; charset=utf-8";
     const object = await this.env.R2_BUCKET.put(target.key, content, {
-      ...(options.expectedEtag ? { onlyIf: { etagMatches: options.expectedEtag } } : {}),
+      ...(options.expectedEtag
+        ? { onlyIf: { etagMatches: options.expectedEtag } }
+        : {}),
       httpMetadata: { contentType },
       customMetadata: {
         type: "code-mode-r2-file",
@@ -2922,27 +3652,33 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       },
     });
     if (!object && options.expectedEtag) {
-      throw new Error(`Edit conflict for ${target.path}: the R2 object changed while the edit was running. Read it again and retry.`);
+      throw new Error(
+        `Edit conflict for ${target.path}: the R2 object changed while the edit was running. Read it again and retry.`,
+      );
     }
     const text = `Wrote ${contentBytes} bytes to ${target.path}`;
     return {
       text,
       content: [{ type: "text", text }],
       details: {
-        ...(object ? this.formatR2ObjectMetadata(object, target) : {
-          location: "r2",
-          path: target.path,
-          namespace: target.mount,
-          publicUrl: this.r2PublicUrl(target),
-          size: contentBytes,
-          contentType,
-        }),
+        ...(object
+          ? this.formatR2ObjectMetadata(object, target)
+          : {
+              location: "r2",
+              path: target.path,
+              namespace: target.mount,
+              publicUrl: this.r2PublicUrl(target),
+              size: contentBytes,
+              contentType,
+            }),
         bytesWritten: contentBytes,
       },
     };
   }
 
-  private async editR2File(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async editR2File(
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     const target = this.resolveCodeModeR2Path(args, { requireWritable: true });
     const edits = normalizeTextEditArguments(args);
 
@@ -2957,19 +3693,25 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (!object) throw new Error(`R2 object not found: ${target.path}`);
     const originalContent = await object.text();
     const applied = applyTextEdits(originalContent, edits, target.path);
-    const written = await this.writeR2File({
-      ...args,
-      path: target.path,
-      content: applied.after,
-      content_type: head.httpMetadata?.contentType ?? "text/plain; charset=utf-8",
-    }, { expectedEtag: object.etag });
+    const written = await this.writeR2File(
+      {
+        ...args,
+        path: target.path,
+        content: applied.after,
+        content_type:
+          head.httpMetadata?.contentType ?? "text/plain; charset=utf-8",
+      },
+      { expectedEtag: object.etag },
+    );
     const text = `Successfully replaced ${edits.length} block(s) in ${target.path}.`;
     return {
       ...written,
       text,
       content: [{ type: "text", text }],
       details: {
-        ...((written.details && typeof written.details === "object") ? written.details : {}),
+        ...(written.details && typeof written.details === "object"
+          ? written.details
+          : {}),
         diff: applied.diff,
         patch: applied.patch,
         firstChangedLine: applied.firstChangedLine,
@@ -2979,12 +3721,15 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
   }
 
-  private async listR2Files(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async listR2Files(
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     const target = this.resolveCodeModeR2Path(args, { allowDirectory: true });
     const limit = clampCodeModeInteger(args.limit, 100, 1, 1000);
-    const cursor = typeof args.cursor === "string" && args.cursor.trim()
-      ? args.cursor.trim()
-      : undefined;
+    const cursor =
+      typeof args.cursor === "string" && args.cursor.trim()
+        ? args.cursor.trim()
+        : undefined;
     const directoryRelativePath = target.relativePath
       ? `${target.relativePath}/`
       : "";
@@ -3015,7 +3760,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     });
     const lines = [
       ...prefixes.map((prefix) => `dir  ${prefix.path}/`),
-      ...objects.map((object) => `${String(object.size).padStart(8, " ")} ${object.path}`),
+      ...objects.map(
+        (object) => `${String(object.size).padStart(8, " ")} ${object.path}`,
+      ),
     ];
     const text = lines.length > 0 ? lines.join("\n") : "(empty)";
     return {
@@ -3033,7 +3780,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
   }
 
-  private async deleteR2File(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async deleteR2File(
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     const target = this.resolveCodeModeR2Path(args, { requireWritable: true });
     await this.env.R2_BUCKET.delete(target.key);
     const text = `Deleted ${target.path}`;
@@ -3050,41 +3799,66 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
   }
 
-  private normalizeMoveEndpoint(value: unknown, label: "source" | "destination"): CodeModeMoveEndpoint {
+  private normalizeMoveEndpoint(
+    value: unknown,
+    label: "source" | "destination",
+  ): CodeModeMoveEndpoint {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       throw new Error(`${label} must be an object`);
     }
     const raw = value as Record<string, unknown>;
     const location = raw.location;
-    if (location !== "workspace" && location !== "project" && location !== "r2") {
-      throw new Error(`${label}.location must be "workspace", "project", or "r2"`);
+    if (
+      location !== "workspace" &&
+      location !== "project" &&
+      location !== "r2"
+    ) {
+      throw new Error(
+        `${label}.location must be "workspace", "project", or "r2"`,
+      );
     }
-    const path = typeof raw.path === "string" ? raw.path.trim().replace(/\\/g, "/") : "";
+    const path =
+      typeof raw.path === "string" ? raw.path.trim().replace(/\\/g, "/") : "";
     if (!path) throw new Error(`${label}.path is required`);
-    const project = typeof raw.project === "string" && raw.project.trim()
-      ? raw.project.trim()
-      : undefined;
+    const project =
+      typeof raw.project === "string" && raw.project.trim()
+        ? raw.project.trim()
+        : undefined;
     if (location === "project" && !project) {
-      throw new Error(`${label}.project is required when ${label}.location is "${location}"`);
+      throw new Error(
+        `${label}.project is required when ${label}.location is "${location}"`,
+      );
     }
-    const contentType = typeof raw.content_type === "string" && raw.content_type.trim()
-      ? raw.content_type.trim()
-      : undefined;
+    const contentType =
+      typeof raw.content_type === "string" && raw.content_type.trim()
+        ? raw.content_type.trim()
+        : undefined;
     return { location, path, project, contentType };
   }
 
-  private async collectMoveSourceFiles(source: CodeModeMoveEndpoint): Promise<{ files: CodeModeMoveFile[]; sourceIsDirectory: boolean }> {
-    if (source.location === "workspace") return this.collectWorkspaceMoveFiles(source);
-    if (source.location === "project") return this.collectProjectMoveFiles(source);
+  private async collectMoveSourceFiles(
+    source: CodeModeMoveEndpoint,
+  ): Promise<{ files: CodeModeMoveFile[]; sourceIsDirectory: boolean }> {
+    if (source.location === "workspace")
+      return this.collectWorkspaceMoveFiles(source);
+    if (source.location === "project")
+      return this.collectProjectMoveFiles(source);
     return this.collectR2MoveFiles(source);
   }
 
-  private async collectWorkspaceMoveFiles(source: CodeModeMoveEndpoint): Promise<{ files: CodeModeMoveFile[]; sourceIsDirectory: boolean }> {
+  private async collectWorkspaceMoveFiles(
+    source: CodeModeMoveEndpoint,
+  ): Promise<{ files: CodeModeMoveFile[]; sourceIsDirectory: boolean }> {
     return this.collectFileStoreMoveFiles(this.workspaceFs, source);
   }
 
-  private async collectProjectMoveFiles(source: CodeModeMoveEndpoint): Promise<{ files: CodeModeMoveFile[]; sourceIsDirectory: boolean }> {
-    return this.collectFileStoreMoveFiles(await this.projectFileStore(source as unknown as Record<string, unknown>), source);
+  private async collectProjectMoveFiles(
+    source: CodeModeMoveEndpoint,
+  ): Promise<{ files: CodeModeMoveFile[]; sourceIsDirectory: boolean }> {
+    return this.collectFileStoreMoveFiles(
+      await this.projectFileStore(source as unknown as Record<string, unknown>),
+      source,
+    );
   }
 
   private async collectFileStoreMoveFiles(
@@ -3096,17 +3870,26 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (!exists.exists) throw new Error(`Path not found: ${path}`);
     if (exists.isFile) {
       return {
-        files: [{ path, relativePath: basenameForMove(path), size: exists.size, contentType: exists.mimeType }],
+        files: [
+          {
+            path,
+            relativePath: basenameForMove(path),
+            size: exists.size,
+            contentType: exists.mimeType,
+          },
+        ],
         sourceIsDirectory: false,
       };
     }
-    if (!exists.isDirectory) throw new Error(`Path is not a file or directory: ${path}`);
+    if (!exists.isDirectory)
+      throw new Error(`Path is not a file or directory: ${path}`);
     const listing = await fileStore.listFiles(path, {
       recursive: true,
       includeHidden: true,
       limit: CODE_MODE_MOVE_MAX_FILES + 1,
     });
-    if (!listing.success) throw new Error(listing.error || `Failed to list ${path}`);
+    if (!listing.success)
+      throw new Error(listing.error || `Failed to list ${path}`);
     if (listing.files.length > CODE_MODE_MOVE_MAX_FILES) {
       throw new Error(
         `Move source has more than ${CODE_MODE_MOVE_MAX_FILES} entries; cannot prove its file-count bound`,
@@ -3125,25 +3908,34 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return { files, sourceIsDirectory: true };
   }
 
-  private async collectR2MoveFiles(source: CodeModeMoveEndpoint): Promise<{ files: CodeModeMoveFile[]; sourceIsDirectory: boolean }> {
-    const target = this.resolveCodeModeR2Path(source as unknown as Record<string, unknown>, { allowDirectory: true });
+  private async collectR2MoveFiles(
+    source: CodeModeMoveEndpoint,
+  ): Promise<{ files: CodeModeMoveFile[]; sourceIsDirectory: boolean }> {
+    const target = this.resolveCodeModeR2Path(
+      source as unknown as Record<string, unknown>,
+      { allowDirectory: true },
+    );
     if (target.relativePath) {
       const head = await this.env.R2_BUCKET.head(target.key);
       if (head) {
         return {
-          files: [{
-            path: target.path,
-            relativePath: basenameForMove(target.path),
-            size: head.size,
-            contentType: head.httpMetadata?.contentType,
-          }],
+          files: [
+            {
+              path: target.path,
+              relativePath: basenameForMove(target.path),
+              size: head.size,
+              contentType: head.httpMetadata?.contentType,
+            },
+          ],
           sourceIsDirectory: false,
         };
       }
     }
 
     const baseKey = this.r2MountBaseKey(target.mount);
-    const directoryRelativePath = target.relativePath ? `${target.relativePath}/` : "";
+    const directoryRelativePath = target.relativePath
+      ? `${target.relativePath}/`
+      : "";
     const prefix = `${baseKey}${directoryRelativePath}`;
     const rootName = basenameForMove(target.path);
     const files: CodeModeMoveFile[] = [];
@@ -3152,7 +3944,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     do {
       const remainingFileSlots = CODE_MODE_MOVE_MAX_FILES + 1 - files.length;
       if (remainingFileSlots <= 0) {
-        throw new Error(`Move source has more than ${CODE_MODE_MOVE_MAX_FILES} files`);
+        throw new Error(
+          `Move source has more than ${CODE_MODE_MOVE_MAX_FILES} files`,
+        );
       }
       const listed = await this.env.R2_BUCKET.list({
         prefix,
@@ -3166,15 +3960,20 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           : object.key.slice(baseKey.length);
         if (!objectRelativePath) continue;
         const file = {
-          path: this.r2PathFromRelative(target.mount, target.relativePath
-            ? `${target.relativePath}/${objectRelativePath}`
-            : objectRelativePath),
+          path: this.r2PathFromRelative(
+            target.mount,
+            target.relativePath
+              ? `${target.relativePath}/${objectRelativePath}`
+              : objectRelativePath,
+          ),
           relativePath: joinRelativeMovePath(rootName, objectRelativePath),
           size: object.size,
           contentType: object.httpMetadata?.contentType,
         } satisfies CodeModeMoveFile;
         if (files.length >= CODE_MODE_MOVE_MAX_FILES) {
-          throw new Error(`Move source has more than ${CODE_MODE_MOVE_MAX_FILES} files`);
+          throw new Error(
+            `Move source has more than ${CODE_MODE_MOVE_MAX_FILES} files`,
+          );
         }
         const fileSize = codeModeMoveFileSize(file);
         if (fileSize > CODE_MODE_MOVE_MAX_TOTAL_BYTES - listedBytes) {
@@ -3188,57 +3987,88 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       cursor = listed.truncated ? listed.cursor : undefined;
     } while (cursor);
 
-    if (files.length === 0) throw new Error(`R2 path not found: ${target.path}`);
+    if (files.length === 0)
+      throw new Error(`R2 path not found: ${target.path}`);
     files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
     return { files, sourceIsDirectory: true };
   }
 
-  private async readMoveSourceFile(source: CodeModeMoveEndpoint, file: CodeModeMoveFile): Promise<{ bytes: Uint8Array; contentType?: string }> {
-    if (source.location === "workspace") {
-      const read = await this.workspaceFs.readFile(file.path);
-      if (!read.success || typeof read.content !== "string") {
-        throw new Error(read.error || `Failed to read ${file.path}`);
+  private async readMoveSourceFile(
+    source: CodeModeMoveEndpoint,
+    file: CodeModeMoveFile,
+    preferStream: boolean,
+  ): Promise<CodeModeMovePayload> {
+    const expectedSize = codeModeMoveFileSize(file);
+    if (
+      !preferStream &&
+      expectedSize > CHAT_RUNTIME_BOUNDS.toolSourceReadBytes
+    ) {
+      throw new Error(
+        `Move source exceeds the ${CHAT_RUNTIME_BOUNDS.toolSourceReadBytes} byte whole-buffer limit`,
+      );
+    }
+
+    if (source.location === "workspace" || source.location === "project") {
+      const fileStore =
+        source.location === "workspace"
+          ? this.workspaceFs
+          : await this.projectFileStore(
+              source as unknown as Record<string, unknown>,
+            );
+      const read = await fileStore.readFileStream(file.path);
+      if (!read.success || !read.stream) {
+        throw new Error(read.error || `Failed to stream ${file.path}`);
+      }
+      if (read.size !== expectedSize) {
+        await read.stream
+          .cancel("move source changed after listing")
+          .catch(() => undefined);
+        throw new Error(
+          `Cannot move '${file.path}': source size changed from ${expectedSize} to ${String(read.size)} bytes`,
+        );
       }
       return {
-        bytes: read.encoding === "base64"
-          ? base64ToBytesForMove(read.content)
-          : new TextEncoder().encode(read.content),
+        kind: "stream",
+        body: exactMoveStream(read.stream, expectedSize, file.path),
+        bytes: expectedSize,
         contentType: read.mimeType ?? file.contentType,
       };
     }
-    if (source.location === "project") {
-      const fileStore = await this.projectFileStore(source as unknown as Record<string, unknown>);
-      const read = await fileStore.readFile(file.path);
-      if (!read.success || typeof read.content !== "string") {
-        throw new Error(read.error || `Failed to read ${file.path}`);
-      }
-      return {
-        bytes: read.encoding === "base64"
-          ? base64ToBytesForMove(read.content)
-          : new TextEncoder().encode(read.content),
-        contentType: read.mimeType ?? file.contentType,
-      };
-    }
+
     const target = this.resolveCodeModeR2Path({ ...source, path: file.path });
     const object = await this.env.R2_BUCKET.get(target.key);
     if (!object) throw new Error(`R2 object not found: ${target.path}`);
-    const expectedSize = codeModeMoveFileSize(file);
     if (object.size !== expectedSize) {
-      await object.body?.cancel("move source changed after listing").catch(() => undefined);
+      await object.body
+        ?.cancel("move source changed after listing")
+        .catch(() => undefined);
       throw new Error(
         `Cannot move '${file.path}': source size changed from ${expectedSize} to ${object.size} bytes`,
       );
     }
-    const bytes = object.body
-      ? await readStreamBytes(object.body, CODE_MODE_MOVE_MAX_FILE_BYTES)
-      : new Uint8Array(await object.arrayBuffer());
+    if (object.body) {
+      return {
+        kind: "stream",
+        body: exactMoveStream(object.body, expectedSize, file.path),
+        bytes: expectedSize,
+        contentType: object.httpMetadata?.contentType ?? file.contentType,
+      };
+    }
+    if (expectedSize > CHAT_RUNTIME_BOUNDS.toolSourceReadBytes) {
+      throw new Error(
+        `Move source exceeds the ${CHAT_RUNTIME_BOUNDS.toolSourceReadBytes} byte whole-buffer limit`,
+      );
+    }
+    const bytes = new Uint8Array(await object.arrayBuffer());
     if (bytes.byteLength !== expectedSize) {
       throw new Error(
         `Cannot move '${file.path}': read ${bytes.byteLength} bytes; expected ${expectedSize}`,
       );
     }
     return {
-      bytes,
+      kind: "bytes",
+      body: bytes,
+      bytes: bytes.byteLength,
       contentType: object.httpMetadata?.contentType ?? file.contentType,
     };
   }
@@ -3246,25 +4076,65 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   private async writeMoveDestinationFile(
     destination: CodeModeMoveEndpoint,
     path: string,
-    bytes: Uint8Array,
-    contentType?: string,
+    payload: CodeModeMovePayload,
   ): Promise<{ path: string; bytes: number }> {
     if (destination.location === "workspace") {
       const normalizedPath = normalizeDurableWorkspacePath(path);
-      const result = await this.workspaceFs.writeBinaryFile(normalizedPath, bytesToBase64ForMove(bytes));
-      if (!result.success) throw new Error(result.error || `Failed to write ${normalizedPath}`);
+      const bytes = await bufferedMovePayload(payload);
+      const result = await this.workspaceFs.writeBinaryFile(
+        normalizedPath,
+        bytesToBase64ForMove(bytes),
+      );
+      if (!result.success)
+        throw new Error(result.error || `Failed to write ${normalizedPath}`);
       return { path: normalizedPath, bytes: bytes.byteLength };
     }
     if (destination.location === "project") {
       const normalizedPath = normalizeDurableWorkspacePath(path);
-      const fileStore = await this.projectFileStore(destination as unknown as Record<string, unknown>);
-      const result = await fileStore.writeBinaryFile(normalizedPath, bytesToBase64ForMove(bytes));
-      if (!result.success) throw new Error(result.error || `Failed to write ${normalizedPath}`);
+      const fileStore = await this.projectFileStore(
+        destination as unknown as Record<string, unknown>,
+      );
+      if (fileStore.adoptR2File) {
+        const stream =
+          payload.kind === "stream"
+            ? payload.body
+            : bytesToMoveStream(payload.body);
+        const result = await fileStore.adoptR2File(
+          normalizedPath,
+          stream,
+          payload.bytes,
+          destination.contentType ?? payload.contentType,
+        );
+        if (!result.success) {
+          throw new Error(result.error || `Failed to write ${normalizedPath}`);
+        }
+        if (result.size !== undefined && result.size !== payload.bytes) {
+          throw new Error(
+            `Move destination wrote ${result.size} bytes; expected ${payload.bytes}`,
+          );
+        }
+        return { path: normalizedPath, bytes: payload.bytes };
+      }
+      const bytes = await bufferedMovePayload(payload);
+      const result = await fileStore.writeBinaryFile(
+        normalizedPath,
+        bytesToBase64ForMove(bytes),
+      );
+      if (!result.success)
+        throw new Error(result.error || `Failed to write ${normalizedPath}`);
       return { path: normalizedPath, bytes: bytes.byteLength };
     }
-    const target = this.resolveCodeModeR2Path({ ...destination, path }, { requireWritable: true });
-    await this.env.R2_BUCKET.put(target.key, bytes, {
-      httpMetadata: { contentType: destination.contentType ?? contentType ?? "application/octet-stream" },
+    const target = this.resolveCodeModeR2Path(
+      { ...destination, path },
+      { requireWritable: true },
+    );
+    await this.env.R2_BUCKET.put(target.key, payload.body, {
+      httpMetadata: {
+        contentType:
+          destination.contentType ??
+          payload.contentType ??
+          "application/octet-stream",
+      },
       customMetadata: {
         type: "code-mode-move-file",
         orgId: this.ctx.props.orgId,
@@ -3272,40 +4142,69 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         threadId: this.ctx.props.threadId ?? "",
       },
     });
-    return { path: target.path, bytes: bytes.byteLength };
+    return { path: target.path, bytes: payload.bytes };
   }
 
-  private async deleteMoveSource(source: CodeModeMoveEndpoint, files: CodeModeMoveFile[]): Promise<void> {
+  private async deleteMoveSource(
+    source: CodeModeMoveEndpoint,
+    files: CodeModeMoveFile[],
+  ): Promise<void> {
     if (source.location === "workspace") {
-      const result = await this.workspaceFs.deleteFile(source.path, { recursive: true });
-      if (!result.success) throw new Error(result.error || `Failed to delete ${source.path}`);
+      const result = await this.workspaceFs.deleteFile(source.path, {
+        recursive: true,
+      });
+      if (!result.success)
+        throw new Error(result.error || `Failed to delete ${source.path}`);
       return;
     }
     if (source.location === "project") {
-      const fileStore = await this.projectFileStore(source as unknown as Record<string, unknown>);
-      const result = await fileStore.deleteFile(source.path, { recursive: true });
-      if (!result.success) throw new Error(result.error || `Failed to delete ${source.path}`);
+      const fileStore = await this.projectFileStore(
+        source as unknown as Record<string, unknown>,
+      );
+      const result = await fileStore.deleteFile(source.path, {
+        recursive: true,
+      });
+      if (!result.success)
+        throw new Error(result.error || `Failed to delete ${source.path}`);
       return;
     }
-    const target = this.resolveCodeModeR2Path(source as unknown as Record<string, unknown>, { allowDirectory: true });
+    const target = this.resolveCodeModeR2Path(
+      source as unknown as Record<string, unknown>,
+      { allowDirectory: true },
+    );
     if (target.mount === "uploads") throw new Error("uploads/ is read-only");
     for (const file of files) {
-      const fileTarget = this.resolveCodeModeR2Path({ ...source, path: file.path }, { requireWritable: true });
+      const fileTarget = this.resolveCodeModeR2Path(
+        { ...source, path: file.path },
+        { requireWritable: true },
+      );
       await this.env.R2_BUCKET.delete(fileTarget.key);
     }
   }
 
-  private async comparableMovePath(endpoint: CodeModeMoveEndpoint): Promise<string> {
+  private async comparableMovePath(
+    endpoint: CodeModeMoveEndpoint,
+  ): Promise<string> {
     if (endpoint.location === "workspace") {
-      return normalizeDurableWorkspacePath(endpoint.path).replace(/\/+$/g, "") || "/";
+      return (
+        normalizeDurableWorkspacePath(endpoint.path).replace(/\/+$/g, "") || "/"
+      );
     }
     if (endpoint.location === "project") {
-      return normalizeDurableWorkspacePath(endpoint.path).replace(/\/+$/g, "") || "/";
+      return (
+        normalizeDurableWorkspacePath(endpoint.path).replace(/\/+$/g, "") || "/"
+      );
     }
-    return this.resolveCodeModeR2Path(endpoint as unknown as Record<string, unknown>, { allowDirectory: true }).path.replace(/\/+$/g, "");
+    return this.resolveCodeModeR2Path(
+      endpoint as unknown as Record<string, unknown>,
+      { allowDirectory: true },
+    ).path.replace(/\/+$/g, "");
   }
 
-  private isMovePathEqualOrDescendant(sourcePath: string, destinationPath: string): boolean {
+  private isMovePathEqualOrDescendant(
+    sourcePath: string,
+    destinationPath: string,
+  ): boolean {
     if (destinationPath === sourcePath) return true;
     const prefix = sourcePath.endsWith("/") ? sourcePath : `${sourcePath}/`;
     return destinationPath.startsWith(prefix);
@@ -3317,7 +4216,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     sourceIsDirectory: boolean,
   ): Promise<void> {
     if (source.location !== destination.location) return;
-    if (source.location === "project" && source.project !== destination.project) return;
+    if (source.location === "project" && source.project !== destination.project)
+      return;
 
     const sourcePath = await this.comparableMovePath(source);
     const destinationPath = await this.comparableMovePath(destination);
@@ -3325,27 +4225,47 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       ? this.isMovePathEqualOrDescendant(sourcePath, destinationPath)
       : sourcePath === destinationPath;
     if (overlaps) {
-      throw new Error("move with deleteSource cannot use an equal or descendant destination in the same location");
+      throw new Error(
+        "move with deleteSource cannot use an equal or descendant destination in the same location",
+      );
     }
   }
 
-  private async moveFile(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async moveFile(
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     const source = this.normalizeMoveEndpoint(args.source, "source");
-    const destination = this.normalizeMoveEndpoint(args.destination, "destination");
-    const deleteSource = args.deleteSource === true || args.delete_source === true;
+    const destination = this.normalizeMoveEndpoint(
+      args.destination,
+      "destination",
+    );
+    const deleteSource =
+      args.deleteSource === true || args.delete_source === true;
     if (deleteSource && source.location === "r2") {
-      const sourceTarget = this.resolveCodeModeR2Path(source as unknown as Record<string, unknown>, { allowDirectory: true });
-      if (sourceTarget.mount === "uploads") throw new Error("uploads/ is read-only");
+      const sourceTarget = this.resolveCodeModeR2Path(
+        source as unknown as Record<string, unknown>,
+        { allowDirectory: true },
+      );
+      if (sourceTarget.mount === "uploads")
+        throw new Error("uploads/ is read-only");
     }
     if (destination.location === "r2") {
-      this.resolveCodeModeR2Path(destination as unknown as Record<string, unknown>, { allowDirectory: true, requireWritable: true });
+      this.resolveCodeModeR2Path(
+        destination as unknown as Record<string, unknown>,
+        { allowDirectory: true, requireWritable: true },
+      );
     }
 
-    const { files, sourceIsDirectory } = await this.collectMoveSourceFiles(source);
+    const { files, sourceIsDirectory } =
+      await this.collectMoveSourceFiles(source);
     if (files.length === 0) throw new Error(`No files found at ${source.path}`);
     assertCodeModeMoveBounds(files);
     if (deleteSource) {
-      await this.assertSafeMoveDeleteDestination(source, destination, sourceIsDirectory);
+      await this.assertSafeMoveDeleteDestination(
+        source,
+        destination,
+        sourceIsDirectory,
+      );
     }
 
     const copied: Array<{ from: string; to: string; bytes: number }> = [];
@@ -3353,10 +4273,35 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const useDestinationAsRoot = sourceIsDirectory || files.length > 1;
     for (const file of files) {
       const destinationPath = useDestinationAsRoot
-        ? joinMoveDestinationPath(destination.location, destination.path, file.relativePath)
+        ? joinMoveDestinationPath(
+            destination.location,
+            destination.path,
+            file.relativePath,
+          )
         : destination.path;
-      const read = await this.readMoveSourceFile(source, file);
-      const written = await this.writeMoveDestinationFile(destination, destinationPath, read.bytes, read.contentType);
+      const sourceAndDestinationAreEqual =
+        source.location === destination.location &&
+        (source.location !== "project" ||
+          source.project === destination.project) &&
+        (await this.comparableMovePath({ ...source, path: file.path })) ===
+          (await this.comparableMovePath({
+            ...destination,
+            path: destinationPath,
+          }));
+      if (sourceAndDestinationAreEqual) {
+        const bytes = codeModeMoveFileSize(file);
+        totalBytes += bytes;
+        copied.push({ from: file.path, to: destinationPath, bytes });
+        continue;
+      }
+      const preferStream =
+        destination.location === "r2" || destination.location === "project";
+      const payload = await this.readMoveSourceFile(source, file, preferStream);
+      const written = await this.writeMoveDestinationFile(
+        destination,
+        destinationPath,
+        payload,
+      );
       totalBytes += written.bytes;
       copied.push({ from: file.path, to: written.path, bytes: written.bytes });
     }
@@ -3369,8 +4314,16 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       text,
       content: [{ type: "text", text }],
       details: {
-        source: { location: source.location, path: source.path, project: source.project ?? null },
-        destination: { location: destination.location, path: destination.path, project: destination.project ?? null },
+        source: {
+          location: source.location,
+          path: source.path,
+          project: source.project ?? null,
+        },
+        destination: {
+          location: destination.location,
+          path: destination.path,
+          project: destination.project ?? null,
+        },
         deleteSource,
         files: copied,
         count: copied.length,
@@ -3381,7 +4334,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
 
   private async getAppUrl(script: WorkerScript): Promise<string> {
     let appHostname = "camelai.dev";
-    const workerBaseUrl = (this.env as { WORKER_BASE_URL?: string }).WORKER_BASE_URL;
+    const workerBaseUrl = (this.env as { WORKER_BASE_URL?: string })
+      .WORKER_BASE_URL;
     if (workerBaseUrl) {
       try {
         appHostname = new URL(workerBaseUrl).host;
@@ -3402,14 +4356,18 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   async listTools(): Promise<CodeModeToolDefinition[]> {
-    return CODE_MODE_TOOL_DEFINITIONS
-      .filter((definition) => !JS_EXEC_EXCLUDED_TOOL_NAMES.has(definition.name))
-      .filter((definition) => (
-        definition.name !== "send_email" || !isSelfhostRuntime(this.env)
-      ))
-      .filter((definition) => (
-        this.ctx?.props?.allowWebTools !== false || !AGENT_WEB_TOOL_NAMES.has(definition.name)
-      ));
+    return CODE_MODE_TOOL_DEFINITIONS.filter(
+      (definition) => !JS_EXEC_EXCLUDED_TOOL_NAMES.has(definition.name),
+    )
+      .filter(
+        (definition) =>
+          definition.name !== "send_email" || !isSelfhostRuntime(this.env),
+      )
+      .filter(
+        (definition) =>
+          this.ctx?.props?.allowWebTools !== false ||
+          !AGENT_WEB_TOOL_NAMES.has(definition.name),
+      );
   }
 
   /**
@@ -3424,13 +4382,18 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     signal?: AbortSignal,
   ): Promise<unknown> {
     const format = codeModeOverflowFormat(value);
+    let previewSource = value;
     const previewOnly = (reason: string, hint: string): unknown =>
-      codeModeOverflowProjection(value, {
-        stored: false,
-        format,
-        complete: false,
-        reason,
-      }, hint);
+      codeModeOverflowProjection(
+        previewSource,
+        {
+          stored: false,
+          format,
+          complete: false,
+          reason,
+        },
+        hint,
+      );
 
     try {
       if (signal?.aborted) throw codeModeOverflowAbortError(signal);
@@ -3459,9 +4422,22 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         );
       }
 
+      // Snapshot only the tiny user-facing preview before the first async
+      // storage step. The bounded serialized bytes are authoritative from this
+      // point on; retaining the producer object through hashing/R2 could hold a
+      // much larger graph, and recomputing the preview later could observe a
+      // caller mutation that no longer matched the archived bytes.
+      previewSource = codeModeOverflowPreview(
+        value,
+        Math.max(1, CHAT_RUNTIME_BOUNDS.toolResultOverflowStubBytes - 1_024),
+      );
+      value = undefined;
+
       const reservedFiles = this.toolResultOverflowReservedFiles ?? 0;
       const reservedBytes = this.toolResultOverflowReservedBytes ?? 0;
-      if (reservedFiles >= CHAT_RUNTIME_BOUNDS.toolResultOverflowFilesPerAttempt) {
+      if (
+        reservedFiles >= CHAT_RUNTIME_BOUNDS.toolResultOverflowFilesPerAttempt
+      ) {
         return previewOnly(
           "file_limit",
           "The per-attempt overflow file limit is exhausted; only a bounded preview is available.",
@@ -3505,7 +4481,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         const store = (async () => {
           const sha256 = await sha256Hex(serialized.bytes);
           if (signal?.aborted) throw codeModeOverflowAbortError(signal);
-          if (timedOut) throw new Error("Tool-result overflow storage deadline exceeded");
+          if (timedOut)
+            throw new Error("Tool-result overflow storage deadline exceeded");
           await this.env.R2_BUCKET.put(key, serialized.bytes, {
             httpMetadata: { contentType: serialized.contentType },
             customMetadata: {
@@ -3522,7 +4499,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
             try {
               await this.env.R2_BUCKET.delete(key);
             } catch {
-              console.error("[CodeModeTools] failed to clean up late tool-result overflow");
+              console.error(
+                "[CodeModeTools] failed to clean up late tool-result overflow",
+              );
             }
             if (signal?.aborted) throw codeModeOverflowAbortError(signal);
             throw new Error("Tool-result overflow storage deadline exceeded");
@@ -3542,7 +4521,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           ? new Promise<never>((_resolve, reject) => {
               const onAbort = () => reject(codeModeOverflowAbortError(signal));
               signal.addEventListener("abort", onAbort, { once: true });
-              removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+              removeAbortListener = () =>
+                signal.removeEventListener("abort", onAbort);
             })
           : null;
         const sha256 = await Promise.race(
@@ -3550,23 +4530,30 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         );
         if (timeout !== undefined) clearTimeout(timeout);
         removeAbortListener?.();
-        return codeModeOverflowProjection(value, {
-          stored: true,
-          path,
-          format: serialized.format,
-          bytes: serialized.bytes.byteLength,
-          sha256,
-          complete: true,
-        }, `Tool result exceeded the inline limit. Read the full result in bounded windows with read({ location: "r2", path: "${path}", byte_offset: 0 }) and continue with details.nextByteOffset.`);
+        return codeModeOverflowProjection(
+          previewSource,
+          {
+            stored: true,
+            path,
+            format: serialized.format,
+            bytes: serialized.bytes.byteLength,
+            sha256,
+            complete: true,
+          },
+          `Tool result exceeded the inline limit. Read the full result in bounded windows with read({ location: "r2", path: "${path}", byte_offset: 0 }) and continue with details.nextByteOffset.`,
+        );
       } catch {
         if (timeout !== undefined) clearTimeout(timeout);
         removeAbortListener?.();
         if (signal?.aborted) throw codeModeOverflowAbortError(signal);
         this.toolResultOverflowStorageFailed = true;
-        console.error("[CodeModeTools] failed to store tool-result overflow in R2", {
-          toolName: safeToolName,
-          reason: timedOut ? "storage_deadline" : "storage_failure",
-        });
+        console.error(
+          "[CodeModeTools] failed to store tool-result overflow in R2",
+          {
+            toolName: safeToolName,
+            reason: timedOut ? "storage_deadline" : "storage_failure",
+          },
+        );
         return previewOnly(
           timedOut ? "storage_deadline" : "storage_failure",
           timedOut
@@ -3612,13 +4599,14 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       // toolValueFailureMessage).
       const valueFailure = toolValueFailureMessage(data);
       if (valueFailure !== null) {
-        this.recordCodeModeToolFailure(name, valueFailure, undefined, "value");
+        this.recordCodeModeToolFailure(name, valueFailure, "value");
       }
       return { ok: true, data };
     } catch (error) {
-      const message = error instanceof Error && error.message ? error.message : String(error);
+      const message =
+        error instanceof Error && error.message ? error.message : String(error);
       this.recordCodeModeToolCall(name, startedAtMs, false, message, undefined);
-      this.recordCodeModeToolFailure(name, message, error, "throw");
+      this.recordCodeModeToolFailure(name, message, "throw");
       return { ok: false, error: { tool: name, message, origin: "tool" } };
     }
   }
@@ -3641,11 +4629,13 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   private recordCodeModeToolFailure(
     name: string,
     message: string,
-    error: unknown,
     surfaced: "throw" | "value",
   ): void {
+    const boundedMessage =
+      boundedUtf8Text(message, CODE_MODE_VALUE_FAILURE_MESSAGE_MAX) ||
+      "tool call failed";
     const recorded = (this.recordedToolFailures ??= new Set<string>());
-    const key = `${surfaced}:${name}:${message}`;
+    const key = `${surfaced}:${name}:${boundedMessage}`;
     if (recorded.has(key)) return;
     if (recorded.size >= CODE_MODE_TOOL_FAILURE_EVENT_BUDGET) return;
     recorded.add(key);
@@ -3656,7 +4646,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       surfaced,
       workspaceId: props?.workspaceId,
       threadId: props?.threadId,
-      error: message,
+      error: boundedMessage,
     });
     recordErrorEvent(this.env, {
       event: "code_mode_project_tool_call_failed",
@@ -3669,9 +4659,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       threadId: props?.threadId,
       orgId: props?.orgId,
       userId: props?.userId,
-      // A value failure never had a stack; fabricating one from here would fill
-      // the 4096-char errorStack blob with this method's own frames.
-      error: error ?? stacklessValueFailure(message),
+      // Never pass the original exception to diagnostics: even a bounded
+      // message can arrive on an Error with a multi-MiB stack or cause chain.
+      error: stacklessToolFailure(boundedMessage, surfaced),
     });
   }
 
@@ -3684,49 +4674,60 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     result: unknown,
   ): void {
     const props = this.ctx?.props;
-    sendToolCallRecords(this.env, [{
-      ingested_at_ms: Date.now(),
-      ts_ms: startedAtMs,
-      thread_id: props?.threadId ?? "",
-      org_id: props?.orgId ?? "",
-      workspace_id: props?.workspaceId ?? "",
-      user_id: props?.userId ?? "",
-      turn_id: "",
-      tool_call_id: crypto.randomUUID(),
-      parent_tool_call_id: props?.parentToolUseId ?? "",
-      tool_name: toolName,
-      surface: "code_mode",
-      model: "",
-      provider: "",
-      duration_ms: Math.max(0, Date.now() - startedAtMs),
-      ok,
-      error_message: ok ? "" : boundLakeErrorMessage(errorMessage),
-      blocks_on_human: toolBlocksOnHuman(toolName),
-      result_chars: measureResultChars(result),
-    }]);
+    sendToolCallRecords(this.env, [
+      {
+        ingested_at_ms: Date.now(),
+        ts_ms: startedAtMs,
+        thread_id: props?.threadId ?? "",
+        org_id: props?.orgId ?? "",
+        workspace_id: props?.workspaceId ?? "",
+        user_id: props?.userId ?? "",
+        turn_id: "",
+        tool_call_id: crypto.randomUUID(),
+        parent_tool_call_id: props?.parentToolUseId ?? "",
+        tool_name: toolName,
+        surface: "code_mode",
+        model: "",
+        provider: "",
+        duration_ms: Math.max(0, Date.now() - startedAtMs),
+        ok,
+        error_message: ok ? "" : boundLakeErrorMessage(errorMessage),
+        blocks_on_human: toolBlocksOnHuman(toolName),
+        result_chars: measureResultChars(result),
+      },
+    ]);
   }
 
   async callTool(name: string, rawArgs: unknown = {}): Promise<unknown> {
     if (name === "send_email" && isSelfhostRuntime(this.env)) {
       throw new Error(SELFHOST_OUTBOUND_EMAIL_DISABLED_MESSAGE);
     }
-    if (this.ctx?.props?.allowWebTools === false && AGENT_WEB_TOOL_NAMES.has(name)) {
-      throw new Error(`${name} is reserved for the Research agent; delegate web lookup to Research instead`);
+    if (
+      this.ctx?.props?.allowWebTools === false &&
+      AGENT_WEB_TOOL_NAMES.has(name)
+    ) {
+      throw new Error(
+        `${name} is reserved for the Research agent; delegate web lookup to Research instead`,
+      );
     }
-    if (rawArgs != null && (typeof rawArgs !== "object" || Array.isArray(rawArgs))) {
+    if (
+      rawArgs != null &&
+      (typeof rawArgs !== "object" || Array.isArray(rawArgs))
+    ) {
       throw new Error("tool arguments must be an object");
     }
-    const args = rawArgs == null ? {} : rawArgs as Record<string, unknown>;
+    const args = rawArgs == null ? {} : (rawArgs as Record<string, unknown>);
     const handler = CodeModeToolsBinding.TOOL_CALL_HANDLERS[name];
     if (handler) {
-      return this.callToolWithArtifactCapture(name, args, () => handler(this, args, name));
+      return this.callToolWithArtifactCapture(name, args, () =>
+        handler(this, args, name),
+      );
     }
 
     return this.callToolWithArtifactCapture(name, args, async () => {
       if (FILE_TOOL_NAMES.has(name)) requireFileLocation(name, args);
       switch (name) {
-        case "read_skill":
-        {
+        case "read_skill": {
           const catalog = resolveAgentSkillCatalog(this.env);
           const target = skillTargetFromArgs(args, catalog.skillNames);
           const skill = readAgentSkillFile(this.env, target.skill, target.file);
@@ -3739,7 +4740,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
             }
             throw new Error(
               `Skill file not found: ${target.skill}/${target.file}. ` +
-              `Available files: ${availableFiles.join(", ")}.`,
+                `Available files: ${availableFiles.join(", ")}.`,
             );
           }
           return skillReadResponse(
@@ -3749,84 +4750,113 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
 
         case "read":
           if (hasR2Target(args)) return this.readR2File(args);
-          if (hasProjectTarget(args)) return (await this.projectContainerTools(args)).callTool("read", args);
-        {
-          const path = typeof args.path === "string" ? args.path : "";
-          if (normalizeAutomationVirtualPath(path) !== null) {
-            const automationFile = await readAutomationVirtualFile({
-              cronStub: this.cronStub,
-              workspaceId: this.ctx.props.workspaceId,
-              path,
-            });
-            if (automationFile) return automationFile;
+          if (hasProjectTarget(args))
+            return (await this.projectContainerTools(args)).callTool(
+              "read",
+              args,
+            );
+          {
+            const path = typeof args.path === "string" ? args.path : "";
+            if (normalizeAutomationVirtualPath(path) !== null) {
+              const automationFile = await readAutomationVirtualFile({
+                cronStub: this.cronStub,
+                workspaceId: this.ctx.props.workspaceId,
+                path,
+              });
+              if (automationFile) return automationFile;
+            }
           }
-        }
-        return this.piContainerTools.callTool("read", args);
+          return this.piContainerTools.callTool("read", args);
 
         case "write":
           if (hasR2Target(args)) return this.writeR2File(args);
-          if (hasProjectTarget(args)) return (await this.projectContainerTools(args)).callTool("write", args);
-        {
-          const path = typeof args.path === "string" ? args.path : "";
-          const content = typeof args.content === "string" ? args.content : "";
-          if (normalizeAutomationVirtualPath(path) !== null) {
-            const automationFile = await writeAutomationVirtualFile({
-              cronStub: this.cronStub,
-              workspaceId: this.ctx.props.workspaceId,
-              path,
-              content,
-            });
-            if (automationFile) return automationFile;
+          if (hasProjectTarget(args))
+            return (await this.projectContainerTools(args)).callTool(
+              "write",
+              args,
+            );
+          {
+            const path = typeof args.path === "string" ? args.path : "";
+            const content =
+              typeof args.content === "string" ? args.content : "";
+            if (normalizeAutomationVirtualPath(path) !== null) {
+              const automationFile = await writeAutomationVirtualFile({
+                cronStub: this.cronStub,
+                workspaceId: this.ctx.props.workspaceId,
+                path,
+                content,
+              });
+              if (automationFile) return automationFile;
+            }
           }
-        }
-        return this.piContainerTools.callTool("write", args);
+          return this.piContainerTools.callTool("write", args);
 
         case "ls":
           if (hasR2Target(args)) return this.listR2Files(args);
-          if (hasProjectTarget(args)) return (await this.projectContainerTools(args)).callTool("ls", args);
-        {
-          if (typeof args.path === "string") {
-            if (normalizeAutomationVirtualPath(args.path) !== null) {
-              const automationListing = await listAutomationVirtualFiles({
-                cronStub: this.cronStub,
-                workspaceId: this.ctx.props.workspaceId,
-                path: args.path,
-              });
-              if (automationListing) return automationListing;
+          if (hasProjectTarget(args))
+            return (await this.projectContainerTools(args)).callTool(
+              "ls",
+              args,
+            );
+          {
+            if (typeof args.path === "string") {
+              if (normalizeAutomationVirtualPath(args.path) !== null) {
+                const automationListing = await listAutomationVirtualFiles({
+                  cronStub: this.cronStub,
+                  workspaceId: this.ctx.props.workspaceId,
+                  path: args.path,
+                });
+                if (automationListing) return automationListing;
+              }
             }
           }
-        }
-        return this.piContainerTools.callTool("ls", args);
+          return this.piContainerTools.callTool("ls", args);
 
         case "edit":
           if (hasR2Target(args)) return this.editR2File(args);
-          if (hasProjectTarget(args)) return (await this.projectContainerTools(args)).callTool("edit", args);
-        {
-          const path = typeof args.path === "string" ? args.path : "";
-          const edits = normalizeTextEditArguments(args);
-          if (normalizeAutomationVirtualPath(path) !== null) {
-            const automationFile = await editAutomationVirtualFile({
-              cronStub: this.cronStub,
-              workspaceId: this.ctx.props.workspaceId,
-              path,
-              edits,
-            });
-            if (automationFile) return automationFile;
+          if (hasProjectTarget(args))
+            return (await this.projectContainerTools(args)).callTool(
+              "edit",
+              args,
+            );
+          {
+            const path = typeof args.path === "string" ? args.path : "";
+            const edits = normalizeTextEditArguments(args);
+            if (normalizeAutomationVirtualPath(path) !== null) {
+              const automationFile = await editAutomationVirtualFile({
+                cronStub: this.cronStub,
+                workspaceId: this.ctx.props.workspaceId,
+                path,
+                edits,
+              });
+              if (automationFile) return automationFile;
+            }
           }
-        }
-        return this.piContainerTools.callTool("edit", args);
+          return this.piContainerTools.callTool("edit", args);
 
         case "delete":
           if (hasR2Target(args)) return this.deleteR2File(args);
-          if (hasProjectTarget(args)) return (await this.projectContainerTools(args)).callTool("delete", args);
+          if (hasProjectTarget(args))
+            return (await this.projectContainerTools(args)).callTool(
+              "delete",
+              args,
+            );
           return this.piContainerTools.callTool("delete", args);
 
         case "grep":
-          if (hasProjectTarget(args)) return (await this.projectContainerTools(args)).callTool("grep", args);
+          if (hasProjectTarget(args))
+            return (await this.projectContainerTools(args)).callTool(
+              "grep",
+              args,
+            );
           return this.piContainerTools.callTool("grep", args);
 
         case "find":
-          if (hasProjectTarget(args)) return (await this.projectContainerTools(args)).callTool("find", args);
+          if (hasProjectTarget(args))
+            return (await this.projectContainerTools(args)).callTool(
+              "find",
+              args,
+            );
           return this.piContainerTools.callTool("find", args);
 
         case "move":
@@ -3841,9 +4871,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           // to trip workerd's unhandled-rejection detector.
           return await this.createProject(args);
 
-
         case "set_project_description":
-          return projectForAgent(await this.workspaceFs.setProjectDescription(args));
+          return projectForAgent(
+            await this.workspaceFs.setProjectDescription(args),
+          );
 
         case "add_dependency":
           return this.addDependency(args);
@@ -3887,18 +4918,30 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     execute: () => Promise<unknown> | unknown,
   ): Promise<unknown> {
     try {
-      const rawResult = await execute();
-      const inline = boundedCodeModeToolResultProjection(rawResult);
-      const result = inline.complete
-        ? inline.value
-        : await this.overflowToolResult(
-            name,
-            this.ctx?.props?.parentToolUseId?.trim() || crypto.randomUUID(),
-            rawResult,
-          );
-      return result;
+      let rawResult: unknown = await execute();
+      const inline = completeCodeModeToolResult(rawResult);
+      if (inline.complete) {
+        rawResult = undefined;
+        return inline.value;
+      }
+      let overflowSource = rawResult;
+      rawResult = undefined;
+      try {
+        const pending = this.overflowToolResult(
+          name,
+          this.ctx?.props?.parentToolUseId?.trim() || crypto.randomUUID(),
+          overflowSource,
+        );
+        overflowSource = undefined;
+        return await pending;
+      } finally {
+        overflowSource = undefined;
+      }
     } catch (error) {
-      const bounded = boundedErrorValue(error, CHAT_RUNTIME_BOUNDS.toolResultBytes);
+      const bounded = boundedErrorValue(
+        error,
+        CHAT_RUNTIME_BOUNDS.toolResultBytes,
+      );
       const boundedError = new Error(bounded.message);
       boundedError.name = bounded.name;
       throw boundedError;
@@ -3908,19 +4951,33 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   private askUserQuestion(args: Record<string, unknown>): Promise<unknown> {
     return this.chatThreadStub.askUserQuestion({
       questions: Array.isArray(args.questions) ? args.questions : [args],
-      toolUseId: typeof args.toolUseId === "string" ? args.toolUseId : undefined,
+      toolUseId:
+        typeof args.toolUseId === "string" ? args.toolUseId : undefined,
     });
   }
 
-  private runSubagentTool(name: string, args: Record<string, unknown>): Promise<AgentToolResult<unknown>> {
-    return (this.chatThreadStub as unknown as {
-      runCodeModeSubagent(toolName: "Agent" | "Explore", params: unknown): Promise<AgentToolResult<unknown>>;
-    }).runCodeModeSubagent(name as "Agent" | "Explore", args);
+  private runSubagentTool(
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<AgentToolResult<unknown>> {
+    return (
+      this.chatThreadStub as unknown as {
+        runCodeModeSubagent(
+          toolName: "Agent" | "Explore",
+          params: unknown,
+        ): Promise<AgentToolResult<unknown>>;
+      }
+    ).runCodeModeSubagent(name as "Agent" | "Explore", args);
   }
 
-  private connectionQuery(args: Record<string, unknown>): string | Record<string, string> {
-    return typeof args.query === "string" || (args.query && typeof args.query === "object" && !Array.isArray(args.query))
-      ? args.query as string | Record<string, string>
+  private connectionQuery(
+    args: Record<string, unknown>,
+  ): string | Record<string, string> {
+    return typeof args.query === "string" ||
+      (args.query &&
+        typeof args.query === "object" &&
+        !Array.isArray(args.query))
+      ? (args.query as string | Record<string, string>)
       : "";
   }
 
@@ -3937,21 +4994,34 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async setPreview(args: Record<string, unknown>): Promise<unknown> {
-    const scriptNameArg = typeof args.script_name === "string" ? args.script_name.trim() : "";
-    const appNameArg = typeof args.app_name === "string" ? args.app_name.trim() : "";
+    const scriptNameArg =
+      typeof args.script_name === "string" ? args.script_name.trim() : "";
+    const appNameArg =
+      typeof args.app_name === "string" ? args.app_name.trim() : "";
     if (scriptNameArg && appNameArg && scriptNameArg !== appNameArg) {
-      throw new Error("set_preview accepts only one app target; use script_name or app_name, not both");
+      throw new Error(
+        "set_preview accepts only one app target; use script_name or app_name, not both",
+      );
     }
     const scriptName = scriptNameArg || appNameArg;
     const filePath = typeof args.path === "string" ? args.path.trim() : "";
-    const targetKinds = [scriptName ? "app" : "", filePath ? "file" : ""].filter(Boolean);
+    const targetKinds = [
+      scriptName ? "app" : "",
+      filePath ? "file" : "",
+    ].filter(Boolean);
     if (targetKinds.length === 0) {
       throw new Error("set_preview requires app_name/script_name or path");
     }
     if (targetKinds.length > 1) {
-      throw new Error("set_preview accepts exactly one target: app_name/script_name or path");
+      throw new Error(
+        "set_preview accepts exactly one target: app_name/script_name or path",
+      );
     }
-    if (args.location !== "project" && typeof args.project === "string" && args.project.trim()) {
+    if (
+      args.location !== "project" &&
+      typeof args.project === "string" &&
+      args.project.trim()
+    ) {
       throw new Error("project is only valid with location: 'project'");
     }
     if (filePath && typeof args.is_public === "boolean") {
@@ -3967,21 +5037,40 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       const target: PreviewTarget = {
         kind: "app",
         scriptName,
-        isPublic: typeof args.is_public === "boolean"
-          ? args.is_public
-          : script.is_public,
+        isPublic:
+          typeof args.is_public === "boolean"
+            ? args.is_public
+            : script.is_public,
       };
       await this.chatThreadStub.setPreviewTarget(target);
-      return { success: true, target, app: { name: scriptName, url: await this.getAppUrl(script), is_public: target.isPublic } };
+      return {
+        success: true,
+        target,
+        app: {
+          name: scriptName,
+          url: await this.getAppUrl(script),
+          is_public: target.isPublic,
+        },
+      };
     }
-    const location = typeof args.location === "string" ? args.location.trim() : "";
-    if (location && location !== "workspace" && location !== "project" && location !== "r2") {
-      throw new Error('set_preview location must be "workspace", "project", or "r2"');
+    const location =
+      typeof args.location === "string" ? args.location.trim() : "";
+    if (
+      location &&
+      location !== "workspace" &&
+      location !== "project" &&
+      location !== "r2"
+    ) {
+      throw new Error(
+        'set_preview location must be "workspace", "project", or "r2"',
+      );
     }
     let parsedPath = parseFilePreviewPath(filePath);
     let source: Extract<PreviewTarget, { kind: "file" }>["source"];
     if (location === "workspace" || location === "project") {
-      parsedPath = parseFilePreviewPath(filePath.startsWith("/") ? filePath : `/${filePath}`);
+      parsedPath = parseFilePreviewPath(
+        filePath.startsWith("/") ? filePath : `/${filePath}`,
+      );
       if (!parsedPath || parsedPath.source !== "workspace") {
         throw new Error("Invalid preview file path");
       }
@@ -4007,7 +5096,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           ? args.project.trim()
           : undefined,
       filename: parsedPath.filename,
-      contentType: typeof args.content_type === "string" ? args.content_type.trim() : undefined,
+      contentType:
+        typeof args.content_type === "string"
+          ? args.content_type.trim()
+          : undefined,
     };
     if (target.source === "project" && !target.project) {
       throw new Error(`project is required when previewing a project file`);
@@ -4017,7 +5109,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return { success: true, target };
   }
 
-  private async assertPreviewFileReadable(target: Extract<PreviewTarget, { kind: "file" }>): Promise<void> {
+  private async assertPreviewFileReadable(
+    target: Extract<PreviewTarget, { kind: "file" }>,
+  ): Promise<void> {
     switch (target.source) {
       case "workspace": {
         const exists = await this.workspaceFs.exists(target.path);
@@ -4025,7 +5119,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           throw new Error(`Preview file not found: ${target.path}`);
         }
         if (exists.isDirectory) {
-          throw new Error(`Preview path is a directory, not a file: ${target.path}`);
+          throw new Error(
+            `Preview path is a directory, not a file: ${target.path}`,
+          );
         }
         return;
       }
@@ -4033,13 +5129,17 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         if (!target.project) {
           throw new Error("project is required when previewing a project file");
         }
-        const fileStore = await this.projectFileStore({ project: target.project });
+        const fileStore = await this.projectFileStore({
+          project: target.project,
+        });
         const exists = await fileStore.exists(target.path);
         if (!exists.exists) {
           throw new Error(`Preview file not found: ${target.path}`);
         }
         if (exists.isDirectory) {
-          throw new Error(`Preview path is a directory, not a file: ${target.path}`);
+          throw new Error(
+            `Preview path is a directory, not a file: ${target.path}`,
+          );
         }
         return;
       }
@@ -4049,13 +5149,18 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         if (!orgId || !workspaceId) {
           throw new Error("Code mode tool binding is missing R2 scope");
         }
-        const bucketDir = target.source === "upload" ? "user-uploads" : "user-outputs";
+        const bucketDir =
+          target.source === "upload" ? "user-uploads" : "user-outputs";
         const relativePath = target.path.replace(/^\/+/, "");
         // Retry briefly so a preview set the moment before the producer
         // finishes writing to R2 validates instead of failing the race.
         const object = await retryR2Read(() =>
           this.env.R2_BUCKET.head(
-            buildWorkspaceScopedR2Key(orgId, workspaceId, `${bucketDir}/${relativePath}`),
+            buildWorkspaceScopedR2Key(
+              orgId,
+              workspaceId,
+              `${bucketDir}/${relativePath}`,
+            ),
           ),
         );
         if (!object) {
@@ -4068,25 +5173,39 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async listApps(args: Record<string, unknown> = {}): Promise<unknown> {
-    const nameFilter = typeof args.name === "string" ? args.name.trim().toLowerCase() : "";
-    const projectFilter = typeof args.project === "string" ? args.project.trim().toLowerCase() : "";
-    const sort = args.sort === "updated_asc" || args.sort === "name_asc" ? args.sort : "updated_desc";
-    const limit = typeof args.limit === "number" && Number.isFinite(args.limit)
-      ? Math.max(0, Math.min(100, Math.floor(args.limit)))
-      : undefined;
-    let scripts: WorkerScriptListRow[] = [...await this.orgStub.listWorkerScriptsByWorkspace(this.ctx.props.workspaceId)];
+    const nameFilter =
+      typeof args.name === "string" ? args.name.trim().toLowerCase() : "";
+    const projectFilter =
+      typeof args.project === "string" ? args.project.trim().toLowerCase() : "";
+    const sort =
+      args.sort === "updated_asc" || args.sort === "name_asc"
+        ? args.sort
+        : "updated_desc";
+    const limit =
+      typeof args.limit === "number" && Number.isFinite(args.limit)
+        ? Math.max(0, Math.min(100, Math.floor(args.limit)))
+        : undefined;
+    let scripts: WorkerScriptListRow[] = [
+      ...(await this.orgStub.listWorkerScriptsByWorkspace(
+        this.ctx.props.workspaceId,
+      )),
+    ];
     if (nameFilter) {
-      scripts = scripts.filter((script) => appFilterText(script).includes(nameFilter));
+      scripts = scripts.filter((script) =>
+        appFilterText(script).includes(nameFilter),
+      );
     }
     if (projectFilter) {
-      scripts = scripts.filter((script) =>
-        (script.project_id ?? "").toLowerCase().includes(projectFilter) ||
-        script.script_name.toLowerCase().includes(projectFilter)
+      scripts = scripts.filter(
+        (script) =>
+          (script.project_id ?? "").toLowerCase().includes(projectFilter) ||
+          script.script_name.toLowerCase().includes(projectFilter),
       );
     }
     scripts = scripts.sort((a, b) => {
       if (sort === "updated_asc") return a.updated_at - b.updated_at;
-      if (sort === "name_asc") return a.script_name.localeCompare(b.script_name);
+      if (sort === "name_asc")
+        return a.script_name.localeCompare(b.script_name);
       return b.updated_at - a.updated_at;
     });
     const total = scripts.length;
@@ -4100,37 +5219,51 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         ...(limit !== undefined ? { limit } : {}),
         sort,
       },
-      apps: await Promise.all(scripts.map(async (script) => ({
-        name: script.script_name,
-        url: await this.getAppUrl(script),
-        is_public: script.is_public,
-        created_by: script.created_by,
-        created_at: new Date(script.created_at).toISOString(),
-        updated_at: new Date(script.updated_at).toISOString(),
-        preview_status: script.preview_status,
-        project_id: script.project_id,
-        commit_sha: script.commit_sha,
-        artifact_cache_key: script.artifact_cache_key,
-      }))),
+      apps: await Promise.all(
+        scripts.map(async (script) => ({
+          name: script.script_name,
+          url: await this.getAppUrl(script),
+          is_public: script.is_public,
+          created_by: script.created_by,
+          created_at: new Date(script.created_at).toISOString(),
+          updated_at: new Date(script.updated_at).toISOString(),
+          preview_status: script.preview_status,
+          project_id: script.project_id,
+          commit_sha: script.commit_sha,
+          artifact_cache_key: script.artifact_cache_key,
+        })),
+      ),
     };
   }
 
-  private async setAppVisibility(args: Record<string, unknown>): Promise<unknown> {
-    const scriptName = typeof args.script_name === "string" ? args.script_name.trim() : "";
+  private async setAppVisibility(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    const scriptName =
+      typeof args.script_name === "string" ? args.script_name.trim() : "";
     if (!scriptName) throw new Error("script_name is required");
-    if (typeof args.is_public !== "boolean") throw new Error("is_public must be a boolean");
+    if (typeof args.is_public !== "boolean")
+      throw new Error("is_public must be a boolean");
     const script = await this.orgStub.getWorkerScript(scriptName);
-    if (!script) return { success: false, error: `App '${scriptName}' not found` };
+    if (!script)
+      return { success: false, error: `App '${scriptName}' not found` };
     if (script.workspace_id !== this.ctx.props.workspaceId) {
-      return { success: false, error: `App '${scriptName}' belongs to a different workspace` };
+      return {
+        success: false,
+        error: `App '${scriptName}' belongs to a different workspace`,
+      };
     }
     const updated = await this.orgStub.setWorkerScriptPublic(
       scriptName,
       args.is_public,
       this.ctx.props.userId || "system",
     );
-    if (!updated) return { success: false, error: `Failed to update app '${scriptName}'` };
-    await this.chatThreadStub.setPreviewAppVisibility(scriptName, updated.is_public);
+    if (!updated)
+      return { success: false, error: `Failed to update app '${scriptName}'` };
+    await this.chatThreadStub.setPreviewAppVisibility(
+      scriptName,
+      updated.is_public,
+    );
     return {
       success: true,
       app: {
@@ -4144,35 +5277,50 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async getLatestLogs(args: Record<string, unknown>): Promise<unknown> {
-    const scriptName = typeof args.script_name === "string" ? args.script_name.trim() : "";
+    const scriptName =
+      typeof args.script_name === "string" ? args.script_name.trim() : "";
     if (!scriptName) throw new Error("script_name is required");
-    if (!this.env.WORKER_LOGS) throw new Error("Worker logs are not configured");
+    if (!this.env.WORKER_LOGS)
+      throw new Error("Worker logs are not configured");
     const script = await this.orgStub.getWorkerScript(scriptName);
-    if (!script) return { success: false, error: `App '${scriptName}' not found` };
+    if (!script)
+      return { success: false, error: `App '${scriptName}' not found` };
     if (script.workspace_id !== this.ctx.props.workspaceId) {
-      return { success: false, error: `App '${scriptName}' belongs to a different workspace` };
+      return {
+        success: false,
+        error: `App '${scriptName}' belongs to a different workspace`,
+      };
     }
     const limit = clampCodeModeInteger(args.limit, 100, 1, 500);
-    const since = typeof args.since_ms === "number" && Number.isFinite(args.since_ms)
-      ? Math.max(0, Math.floor(args.since_ms))
-      : undefined;
+    const since =
+      typeof args.since_ms === "number" && Number.isFinite(args.since_ms)
+        ? Math.max(0, Math.floor(args.since_ms))
+        : undefined;
     const orgSlug = await this.getOrgSlug();
     const storageKey = orgSlug ? `${scriptName}--${orgSlug}` : scriptName;
-    const logsStub = this.env.WORKER_LOGS.get(this.env.WORKER_LOGS.idFromName(storageKey));
+    const logsStub = this.env.WORKER_LOGS.get(
+      this.env.WORKER_LOGS.idFromName(storageKey),
+    );
     const [logs, stats] = await Promise.all([
       logsStub.getLogs({ limit, since }),
       logsStub.getStats(),
     ]);
     return {
       success: true,
-      script: { name: scriptName, storage_key: storageKey, dispatch_name: storageKey },
+      script: {
+        name: scriptName,
+        storage_key: storageKey,
+        dispatch_name: storageKey,
+      },
       count: logs.length,
       limit,
       since_ms: since ?? null,
       stats: {
         total_log_count: stats.logCount,
         last_log_at_ms: stats.lastLogAt,
-        last_log_at: stats.lastLogAt ? new Date(stats.lastLogAt).toISOString() : null,
+        last_log_at: stats.lastLogAt
+          ? new Date(stats.lastLogAt).toISOString()
+          : null,
       },
       logs: logs.map((entry) => ({
         id: entry.id,
@@ -4186,20 +5334,27 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
   }
 
-  private async takeScreenshot(args: Record<string, unknown>): Promise<unknown> {
-    const scriptName = typeof args.script_name === "string" ? args.script_name.trim() : "";
+  private async takeScreenshot(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    const scriptName =
+      typeof args.script_name === "string" ? args.script_name.trim() : "";
     if (!scriptName) throw new Error("script_name is required");
-    const screenshotBinding = (this.ctx.exports as unknown as {
-      AppScreenshotBinding: (options: { props: Pick<CodeModeToolsProps, "orgId" | "workspaceId"> }) => {
-        capture(input: {
-          scriptName: string;
-          path?: string;
-          width?: number;
-          height?: number;
-          waitMs?: number;
-        }): Promise<{ imageDataUrl: string; width: number; height: number }>;
-      };
-    }).AppScreenshotBinding({
+    const screenshotBinding = (
+      this.ctx.exports as unknown as {
+        AppScreenshotBinding: (options: {
+          props: Pick<CodeModeToolsProps, "orgId" | "workspaceId">;
+        }) => {
+          capture(input: {
+            scriptName: string;
+            path?: string;
+            width?: number;
+            height?: number;
+            waitMs?: number;
+          }): Promise<{ imageDataUrl: string; width: number; height: number }>;
+        };
+      }
+    ).AppScreenshotBinding({
       props: {
         orgId: this.ctx.props.orgId,
         workspaceId: this.ctx.props.workspaceId,
@@ -4218,7 +5373,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       width: result.width,
       height: result.height,
       imageDataUrlBytes: result.imageDataUrl.length,
-      message: "Screenshot captured. Re-run with include_image_data_url=true only if the inline base64 image is needed.",
+      message:
+        "Screenshot captured. Re-run with include_image_data_url=true only if the inline base64 image is needed.",
     };
   }
 
@@ -4227,9 +5383,13 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
    * still exercises the deadline + error mapping that `analysisService()` adds.
    */
   private analysisServiceBinding(): AnalysisServiceLike {
-    return (this.ctx.exports as unknown as {
-      AnalysisService: (options: { props: Pick<CodeModeToolsProps, "orgId" | "workspaceId"> }) => AnalysisServiceLike;
-    }).AnalysisService({
+    return (
+      this.ctx.exports as unknown as {
+        AnalysisService: (options: {
+          props: Pick<CodeModeToolsProps, "orgId" | "workspaceId">;
+        }) => AnalysisServiceLike;
+      }
+    ).AnalysisService({
       props: {
         orgId: this.ctx.props.orgId,
         workspaceId: this.ctx.props.workspaceId,
@@ -4241,79 +5401,56 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
    * AnalysisService with the tool-boundary guarantees attached to every
    * exec-class call:
    *   - a client-side deadline derived from the declared timeout (Fix A), so a
-   *     wedged container cannot hold the turn to the 20-minute backstop;
+   *     wedged container cannot hold the turn to its outer tool deadline;
    *   - session-death translation, so an SDK error name never reaches a user
    *     even on a path AnalysisService's own recovery did not throw from.
    * Wrapping here rather than at each call site means a new analysis tool is
    * bounded by construction.
    */
-  private analysisService(projectIoOverheadMs?: number): AnalysisServiceLike {
+  private analysisService(): AnalysisServiceLike {
     const service = this.analysisServiceBinding();
-    // Project legs move the whole tree in and out around the command; the
-    // caller sizes that allowance to the tree when it knows which project.
-    const ioMs = projectIoOverheadMs ?? ANALYSIS_PROJECT_IO_OVERHEAD_MS;
-    const execLimits: SandboxExecLimits = { ...ANALYSIS_EXEC_LIMITS, overheadMs: ioMs };
+    const ioMs = ANALYSIS_PROJECT_IO_OVERHEAD_MS;
+    const execLimits: SandboxExecLimits = {
+      ...ANALYSIS_EXEC_LIMITS,
+      overheadMs: ioMs,
+    };
     const notebookLimits: SandboxExecLimits = {
       ...ANALYSIS_NOTEBOOK_LIMITS,
       overheadMs: ioMs + ANALYSIS_NOTEBOOK_VALIDATE_TIMEOUT_MS,
     };
-    const dependencyLimits: SandboxExecLimits = { ...ANALYSIS_DEPENDENCY_LIMITS, overheadMs: ioMs };
+    const dependencyLimits: SandboxExecLimits = {
+      ...ANALYSIS_DEPENDENCY_LIMITS,
+      overheadMs: ioMs,
+    };
     return {
-      runCode: (request) => this.runSandboxExecOperation(
-        "run_code",
-        undefined,
-        execLimits,
-        () => service.runCode(request),
-      ),
-      runNotebook: (request) => this.runSandboxExecOperation(
-        "run_notebook",
-        request.timeoutMs,
-        notebookLimits,
-        () => service.runNotebook(request),
-      ),
-      exec: (request) => this.runSandboxExecOperation(
-        "analysis_exec",
-        request.timeoutMs,
-        execLimits,
-        () => service.exec(request),
-      ),
-      addDependency: (request) => this.runSandboxExecOperation(
-        "add_python_dependency",
-        undefined,
-        dependencyLimits,
-        () => service.addDependency(request),
-      ),
+      runCode: (request) =>
+        this.runSandboxExecOperation("run_code", undefined, execLimits, () =>
+          service.runCode(request),
+        ),
+      runNotebook: (request) =>
+        this.runSandboxExecOperation(
+          "run_notebook",
+          request.timeoutMs,
+          notebookLimits,
+          () => service.runNotebook(request),
+        ),
+      exec: (request) =>
+        this.runSandboxExecOperation(
+          "analysis_exec",
+          request.timeoutMs,
+          execLimits,
+          () => service.exec(request),
+        ),
+      addDependency: (request) =>
+        this.runSandboxExecOperation(
+          "add_python_dependency",
+          undefined,
+          dependencyLimits,
+          () => service.addDependency(request),
+        ),
       // Catalog read, not an exec: no container command, no deadline.
       listConnections: () => service.listConnections(),
     };
-  }
-
-  /**
-   * Measure the project tree so the exec deadline covers the IO it will really
-   * do. One extra listing RPC against a path that is about to make one per
-   * FILE; a failure here degrades to the base allowance rather than failing the
-   * tool.
-   */
-  private async projectIoOverheadMs(projectId: string | undefined): Promise<number> {
-    if (!projectId) return ANALYSIS_PROJECT_IO_OVERHEAD_MS;
-    try {
-      const listing = await new ProjectFilesystemClient(this.env, projectId).listFiles("/", {
-        recursive: true,
-        includeHidden: true,
-        limit: ANALYSIS_PROJECT_IO_LISTING_LIMIT,
-      });
-      let fileCount = 0;
-      let totalBytes = 0;
-      for (const entry of listing.files ?? []) {
-        if (entry.type !== "file") continue;
-        fileCount += 1;
-        if (Number.isFinite(entry.size)) totalBytes += entry.size;
-      }
-      return analysisProjectIoOverheadMs({ fileCount, totalBytes });
-    } catch (error) {
-      console.warn("[code-mode] could not size the project IO allowance; using the base value", error);
-      return ANALYSIS_PROJECT_IO_OVERHEAD_MS;
-    }
   }
 
   /** One deadline-bounded sandbox call, with the tool-boundary error mapping. */
@@ -4324,7 +5461,11 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     run: () => Promise<T>,
   ): Promise<T> {
     try {
-      return await this.sandboxExecDeadline(operation, declaredTimeoutMs, limits).run(run);
+      return await this.sandboxExecDeadline(
+        operation,
+        declaredTimeoutMs,
+        limits,
+      ).run(run);
     } catch (error) {
       // The environment died under the command and even AnalysisService's
       // one-shot recovery could not get it back: the user gets the plain-English
@@ -4352,15 +5493,20 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     });
   }
 
-  private recordSandboxExecDeadlineEvent(event: SandboxDeadlineExceededEvent): void {
+  private recordSandboxExecDeadlineEvent(
+    event: SandboxDeadlineExceededEvent,
+  ): void {
     const props = this.ctx?.props;
-    console.error("[code-mode] sandbox operation exceeded its client deadline", {
-      operation: event.operation,
-      declaredTimeoutMs: event.declaredTimeoutMs,
-      budgetMs: event.budgetMs,
-      waitedMs: event.waitedMs,
-      workspaceId: props?.workspaceId,
-    });
+    console.error(
+      "[code-mode] sandbox operation exceeded its client deadline",
+      {
+        operation: event.operation,
+        declaredTimeoutMs: event.declaredTimeoutMs,
+        budgetMs: event.budgetMs,
+        waitedMs: event.waitedMs,
+        workspaceId: props?.workspaceId,
+      },
+    );
     recordObservabilityEvent(this.env, {
       event: "sandbox_exec_deadline_exceeded",
       severity: "error",
@@ -4378,31 +5524,48 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     });
   }
 
-  private async analysisRunCode(args: Record<string, unknown>): Promise<unknown> {
+  private async analysisRunCode(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     const code = typeof args.code === "string" ? args.code : "";
     if (!code.trim()) throw new Error("code is required");
     // Forward the params dict (the tool advertises it) so AnalysisService can
     // inject it as a Python `params` dict; otherwise params['...'] is a NameError.
     const params =
-      args.params && typeof args.params === "object" && !Array.isArray(args.params)
+      args.params &&
+      typeof args.params === "object" &&
+      !Array.isArray(args.params)
         ? (args.params as Record<string, unknown>)
         : undefined;
-    return this.analysisService().runCode({ code, params });
+    return this.withAnalysisOutputCaptureReservation((outputCaptureBytes) =>
+      this.analysisService().runCode({ code, params, outputCaptureBytes }),
+    );
   }
 
-  private async analysisRunNotebook(args: Record<string, unknown>): Promise<unknown> {
-    const project = await this.resolveDoBackedProjectForAction(args, "run_notebook");
+  private async analysisRunNotebook(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    const project = await this.resolveDoBackedProjectForAction(
+      args,
+      "run_notebook",
+    );
     const path = typeof args.path === "string" ? args.path.trim() : "";
     if (!path) throw new Error("path is required (the .ipynb to execute)");
-    const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : undefined;
-    const raw = await this.analysisService(await this.projectIoOverheadMs(project.id))
-      .runNotebook({ projectId: project.id, path, timeoutMs });
-    const { result, fullLog } = clampAnalysisRunOutputs(raw as Record<string, unknown>);
-    const fullOutput = fullLog ? await this.storeAnalysisRunLog("run-notebook", fullLog) : undefined;
+    const timeoutMs =
+      typeof args.timeoutMs === "number" ? args.timeoutMs : undefined;
+    const raw = await this.withAnalysisOutputCaptureReservation(
+      (outputCaptureBytes) =>
+        this.analysisService().runNotebook({
+          projectId: project.id,
+          path,
+          timeoutMs,
+          outputCaptureBytes,
+        }),
+    );
+    const result = raw as Record<string, unknown>;
     if (result.ok !== true) {
       return {
         ...result,
-        ...(fullOutput ? { fullOutput } : {}),
         project: project.name,
       };
     }
@@ -4418,54 +5581,47 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       ...result,
       preview,
       message,
-      ...(fullOutput ? { fullOutput } : {}),
       project: project.name,
     };
   }
 
-  /**
-   * Spill an analysis run's untruncated output to the thread's R2 tmp/ mount —
-   * the same escape-hatch namespace the read tool advertises — so clamped
-   * stdout/stderr never strands information the agent might need. Best-effort:
-   * a storage failure degrades to clamped-only output, never fails the run.
-   */
-  private async storeAnalysisRunLog(
-    label: string,
-    text: string,
-  ): Promise<{ path: string; hint: string } | undefined> {
-    try {
-      const filename = `${Date.now()}-${label}-${crypto.randomUUID().slice(0, 8)}.log`;
-      const key = `${this.r2MountBaseKey("tmp")}${filename}`;
-      await this.env.R2_BUCKET.put(key, text, {
-        httpMetadata: { contentType: "text/plain; charset=utf-8" },
-      });
-      const path = `tmp/${filename}`;
-      return {
-        path,
-        hint: `stdout/stderr were truncated inline. Full output: read({ location: "r2", path: "${path}" })`,
-      };
-    } catch (error) {
-      console.error("[CodeModeTools] failed to store analysis run log in R2", error);
-      return undefined;
-    }
-  }
-
-  private async analysisExecCommand(args: Record<string, unknown>): Promise<unknown> {
+  private async analysisExecCommand(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     const command = typeof args.command === "string" ? args.command : "";
     if (!command.trim()) throw new Error("command is required");
     let projectId: string | undefined;
     let projectName: string | undefined;
     if (typeof args.project === "string" && args.project.trim()) {
-      const project = await this.resolveDoBackedProjectForAction(args, "analysis_exec");
+      const project = await this.resolveDoBackedProjectForAction(
+        args,
+        "analysis_exec",
+      );
       projectId = project.id;
       projectName = project.name;
     }
     const cwd = typeof args.cwd === "string" ? args.cwd : undefined;
-    const env = args.env && typeof args.env === "object" && !Array.isArray(args.env) ? (args.env as Record<string, string>) : undefined;
-    const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : undefined;
-    const result = await this.analysisService(await this.projectIoOverheadMs(projectId))
-      .exec({ projectId, command, cwd, env, timeoutMs });
-    return { ...(result as Record<string, unknown>), ...(projectName ? { project: projectName } : {}) };
+    const env =
+      args.env && typeof args.env === "object" && !Array.isArray(args.env)
+        ? (args.env as Record<string, string>)
+        : undefined;
+    const timeoutMs =
+      typeof args.timeoutMs === "number" ? args.timeoutMs : undefined;
+    const result = await this.withAnalysisOutputCaptureReservation(
+      (outputCaptureBytes) =>
+        this.analysisService().exec({
+          projectId,
+          command,
+          cwd,
+          env,
+          timeoutMs,
+          outputCaptureBytes,
+        }),
+    );
+    return {
+      ...(result as Record<string, unknown>),
+      ...(projectName ? { project: projectName } : {}),
+    };
   }
 
   private archiveUploadTarget(args: Record<string, unknown>): CodeModeR2Path {
@@ -4481,10 +5637,12 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     target: CodeModeR2Path,
     projectName?: string,
   ): Record<string, unknown> {
-    const execution = raw && typeof raw === "object" && !Array.isArray(raw)
-      ? raw as Record<string, unknown>
-      : {};
-    const stdout = typeof execution.stdout === "string" ? execution.stdout.trim() : "";
+    const execution =
+      raw && typeof raw === "object" && !Array.isArray(raw)
+        ? (raw as Record<string, unknown>)
+        : {};
+    const stdout =
+      typeof execution.stdout === "string" ? execution.stdout.trim() : "";
     let archive: Record<string, unknown> | null = null;
     if (stdout) {
       try {
@@ -4497,7 +5655,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       }
     }
     if (!archive) {
-      const stderr = typeof execution.stderr === "string" ? execution.stderr.trim() : "";
+      const stderr =
+        typeof execution.stderr === "string" ? execution.stderr.trim() : "";
       throw new Error(stderr || "archive helper returned an invalid response");
     }
     return {
@@ -4511,7 +5670,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
   }
 
-  private async inspectArchive(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async inspectArchive(
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     const target = this.archiveUploadTarget(args);
     const entry = typeof args.entry === "string" ? args.entry.trim() : "";
     const action = entry ? "read" : "list";
@@ -4521,20 +5682,34 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         CAMELAI_ARCHIVE_ACTION: action,
         CAMELAI_ARCHIVE_PATH: `/uploads/${target.relativePath}`,
         ...(entry ? { CAMELAI_ARCHIVE_ENTRY: entry } : {}),
-        ...(!entry ? {
-          CAMELAI_ARCHIVE_OFFSET: String(clampCodeModeInteger(args.offset, 0, 0, Number.MAX_SAFE_INTEGER)),
-          CAMELAI_ARCHIVE_LIMIT: String(clampCodeModeInteger(args.limit, 200, 1, 500)),
-        } : {}),
+        ...(!entry
+          ? {
+              CAMELAI_ARCHIVE_OFFSET: String(
+                clampCodeModeInteger(
+                  args.offset,
+                  0,
+                  0,
+                  Number.MAX_SAFE_INTEGER,
+                ),
+              ),
+              CAMELAI_ARCHIVE_LIMIT: String(
+                clampCodeModeInteger(args.limit, 200, 1, 500),
+              ),
+            }
+          : {}),
       },
     });
     return this.archiveCommandResult(result, target);
   }
 
   private normalizeArchiveDestination(value: unknown): string {
-    const raw = typeof value === "string" ? value.trim().replace(/\\/g, "/") : ".";
+    const raw =
+      typeof value === "string" ? value.trim().replace(/\\/g, "/") : ".";
     if (!raw || raw === ".") return ".";
     if (raw.startsWith("/") || /^[A-Za-z]:/.test(raw)) {
-      throw new Error("archive destination must be relative to the project root");
+      throw new Error(
+        "archive destination must be relative to the project root",
+      );
     }
     const parts = raw.replace(/\/+$/, "").split("/");
     if (parts.some((part) => part === "..")) {
@@ -4547,11 +5722,16 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return normalized || ".";
   }
 
-  private async extractArchive(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async extractArchive(
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     const target = this.archiveUploadTarget(args);
-    const project = await this.resolveDoBackedProjectForAction(args, "extract_archive");
+    const project = await this.resolveDoBackedProjectForAction(
+      args,
+      "extract_archive",
+    );
     const destination = this.normalizeArchiveDestination(args.destination);
-    const result = await this.analysisService(await this.projectIoOverheadMs(project.id)).exec({
+    const result = await this.analysisService().exec({
       projectId: project.id,
       command: ARCHIVE_TOOL_COMMAND,
       env: {
@@ -4563,16 +5743,27 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return this.archiveCommandResult(result, target, project.name);
   }
 
-  private async analysisAddDependency(args: Record<string, unknown>): Promise<unknown> {
-    const project = await this.resolveDoBackedProjectForAction(args, "add_python_dependency");
+  private async analysisAddDependency(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    const project = await this.resolveDoBackedProjectForAction(
+      args,
+      "add_python_dependency",
+    );
     const packages = Array.isArray(args.packages)
-      ? (args.packages as unknown[]).filter((p): p is string => typeof p === "string")
+      ? (args.packages as unknown[]).filter(
+          (p): p is string => typeof p === "string",
+        )
       : typeof args.package === "string"
         ? [args.package]
         : [];
-    if (!packages.length) throw new Error("packages is required (one or more PyPI specs)");
-    const result = await this.analysisService(await this.projectIoOverheadMs(project.id))
-      .addDependency({ projectId: project.id, packages, dev: args.dev === true });
+    if (!packages.length)
+      throw new Error("packages is required (one or more PyPI specs)");
+    const result = await this.analysisService().addDependency({
+      projectId: project.id,
+      packages,
+      dev: args.dev === true,
+    });
     return { ...(result as Record<string, unknown>), project: project.name };
   }
 
@@ -4601,19 +5792,27 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return this.scheduledPrompts.list();
   }
 
-  private async createScheduledPrompt(args: Record<string, unknown>): Promise<unknown> {
+  private async createScheduledPrompt(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.scheduledPrompts.create(args);
   }
 
-  private async updateScheduledPrompt(args: Record<string, unknown>): Promise<unknown> {
+  private async updateScheduledPrompt(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.scheduledPrompts.update(args);
   }
 
-  private async deleteScheduledPrompt(args: Record<string, unknown>): Promise<unknown> {
+  private async deleteScheduledPrompt(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.scheduledPrompts.delete(args);
   }
 
-  private async runScheduledPromptNow(args: Record<string, unknown>): Promise<unknown> {
+  private async runScheduledPromptNow(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.scheduledPrompts.runNow(args);
   }
 
@@ -4621,27 +5820,39 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return this.deterministicAutomations.list();
   }
 
-  private async validateDeterministicAutomation(args: Record<string, unknown>): Promise<unknown> {
+  private async validateDeterministicAutomation(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.deterministicAutomations.validate(args);
   }
 
-  private async createDeterministicAutomation(args: Record<string, unknown>): Promise<unknown> {
+  private async createDeterministicAutomation(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.deterministicAutomations.create(args);
   }
 
-  private async updateDeterministicAutomation(args: Record<string, unknown>): Promise<unknown> {
+  private async updateDeterministicAutomation(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.deterministicAutomations.update(args);
   }
 
-  private async deleteDeterministicAutomation(args: Record<string, unknown>): Promise<unknown> {
+  private async deleteDeterministicAutomation(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.deterministicAutomations.delete(args);
   }
 
-  private async runDeterministicAutomationNow(args: Record<string, unknown>): Promise<unknown> {
+  private async runDeterministicAutomationNow(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.deterministicAutomations.runNow(args);
   }
 
-  private async getDeterministicAutomationRuns(args: Record<string, unknown>): Promise<unknown> {
+  private async getDeterministicAutomationRuns(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.deterministicAutomations.getRuns(args);
   }
 
@@ -4652,45 +5863,61 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       workspaceId: this.ctx.props.workspaceId,
       userId: this.ctx.props.userId,
       promptConnectionSetup: (input) =>
-        (this.chatThreadStub as unknown as {
-          promptConnectionSetup(input: {
-            integrationId?: string;
-            integrationType: string;
-            suggestedName?: string;
-            message?: string;
-            instructions?: string;
-            initialConfig?: Record<string, unknown>;
-            initialCredentials?: Record<string, unknown>;
-            dynamicSchema?: DynamicIntegrationSchema;
-          }): Promise<ConnectionSetupResponse>;
-        }).promptConnectionSetup(input),
+        (
+          this.chatThreadStub as unknown as {
+            promptConnectionSetup(input: {
+              integrationId?: string;
+              integrationType: string;
+              suggestedName?: string;
+              message?: string;
+              instructions?: string;
+              initialConfig?: Record<string, unknown>;
+              initialCredentials?: Record<string, unknown>;
+              dynamicSchema?: DynamicIntegrationSchema;
+            }): Promise<ConnectionSetupResponse>;
+          }
+        ).promptConnectionSetup(input),
     });
   }
 
-  private async listIntegrations(args: Record<string, unknown>): Promise<unknown> {
+  private async listIntegrations(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.integrations.list(args);
   }
 
-  private listIntegrationTypes(args: Record<string, unknown>): Promise<unknown> {
+  private listIntegrationTypes(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.integrations.listTypes(args);
   }
 
-  private async createIntegration(args: Record<string, unknown>): Promise<unknown> {
+  private async createIntegration(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.integrations.create(args);
   }
 
-  private async promptConnectionSetup(args: Record<string, unknown>): Promise<unknown> {
+  private async promptConnectionSetup(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.integrations.promptConnectionSetup(args);
   }
 
-  private async deleteConnection(args: Record<string, unknown>): Promise<unknown> {
-    const connection = typeof args.connection === "string" ? args.connection.trim() : "";
+  private async deleteConnection(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    const connection =
+      typeof args.connection === "string" ? args.connection.trim() : "";
     if (!connection) throw new Error("connection is required");
 
-    const entry = await findConnectionMethodEntry(this.env, this.connectionsContext, connection);
+    const entry = await findConnectionMethodEntry(
+      this.env,
+      this.connectionsContext,
+      connection,
+    );
     const summary = entry.connection;
-    const question =
-      `Delete connection "${summary.name}" (${summary.type})? This removes its stored configuration and cannot be undone.`;
+    const question = `Delete connection "${summary.name}" (${summary.type})? This removes its stored configuration and cannot be undone.`;
     const confirmation = await confirmDestructiveAction(
       (questionArgs) => this.askUserQuestion(questionArgs),
       {
@@ -4730,41 +5957,65 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
 
   private async addDependency(args: Record<string, unknown>): Promise<unknown> {
     const gate = this.projectBuildReadinessGate("add_dependency");
-    const deadline = this.sandboxExecDeadline("add_dependency", undefined, PROJECT_BUILD_EXEC_LIMITS);
-    return gate.annotate(await withProjectBuildServiceErrorMapping("add_dependency", async () => {
-      const project = await this.resolveDoBackedProjectForAction(args, "add_dependency");
-      const dependency = typeof args.dependency === "string" ? args.dependency : "";
-      const sandbox = this.projectBuildSandbox();
-      // Cold-boot waiting is charged to the GATE's own 240s budget, not to the
-      // install's: a container that has to wake first must not hand the install
-      // a truncated (or empty) slice of the exec budget.
-      await deadline.excluding(() => gate.ensureReady(sandbox));
-      try {
-        const result = await deadline.run(() => runProjectAddDependency({
-          projectId: project.id,
-          dependency,
-          dev: args.dev === true,
-          files: new ProjectFilesystemClient(this.env, project.id),
-          sandbox,
-        }));
-        return {
-          ...result,
-          project: project.name,
-          backend: "do-r2",
-        };
-      } finally {
-        // Warm window is anchored to the END of the install, not its start.
-        await this.noteProjectBuildSessionActivity(sandbox, "add_dependency");
-      }
-    }, {
-      onTransient: () => gate.invalidate(),
-      unavailableMessage: () => gate.unavailableMessage(),
-      deadline,
-    }));
+    const deadline = this.sandboxExecDeadline(
+      "add_dependency",
+      undefined,
+      PROJECT_BUILD_EXEC_LIMITS,
+    );
+    return gate.annotate(
+      await withProjectBuildServiceErrorMapping(
+        "add_dependency",
+        async () => {
+          const project = await this.resolveDoBackedProjectForAction(
+            args,
+            "add_dependency",
+          );
+          const dependency =
+            typeof args.dependency === "string" ? args.dependency : "";
+          const sandbox = this.projectBuildSandbox();
+          // Cold-boot waiting is charged to the GATE's own 240s budget, not to the
+          // install's: a container that has to wake first must not hand the install
+          // a truncated (or empty) slice of the exec budget.
+          await deadline.excluding(() => gate.ensureReady(sandbox));
+          try {
+            const result = await deadline.run(() =>
+              runProjectAddDependency({
+                projectId: project.id,
+                dependency,
+                dev: args.dev === true,
+                files: new ProjectFilesystemClient(this.env, project.id),
+                sandbox,
+              }),
+            );
+            return {
+              ...result,
+              project: project.name,
+              backend: "do-r2",
+            };
+          } finally {
+            // Warm window is anchored to the END of the install, not its start.
+            await this.noteProjectBuildSessionActivity(
+              sandbox,
+              "add_dependency",
+            );
+          }
+        },
+        {
+          onTransient: () => gate.invalidate(),
+          unavailableMessage: () => gate.unavailableMessage(),
+          deadline,
+        },
+      ),
+    );
   }
 
-  private async addShadcnComponent(args: Record<string, unknown>): Promise<unknown> {
-    const project = await this.resolveDoBackedProjectForAction(args, "add_shadcn_component");
+  private async addShadcnComponent(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    const project = await this.resolveDoBackedProjectForAction(
+      args,
+      "add_shadcn_component",
+    );
     const components = normalizeShadcnComponentList(args);
     const result = await addShadcnComponentsToProject(
       new ProjectFilesystemClient(this.env, project.id),
@@ -4785,11 +6036,12 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     height?: number;
   } {
     return {
-      scriptName: typeof args.scriptName === "string"
-        ? args.scriptName
-        : typeof args.script_name === "string"
-          ? args.script_name
-          : "",
+      scriptName:
+        typeof args.scriptName === "string"
+          ? args.scriptName
+          : typeof args.script_name === "string"
+            ? args.script_name
+            : "",
       path: typeof args.path === "string" ? args.path : undefined,
       width: typeof args.width === "number" ? args.width : undefined,
       height: typeof args.height === "number" ? args.height : undefined,
@@ -4825,14 +6077,20 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async browserLaunch(args: Record<string, unknown>): Promise<unknown> {
-    const session = await launchAppBrowserSession(this.env, {
-      orgId: this.ctx.props.orgId,
-      workspaceId: this.ctx.props.workspaceId,
-    }, this.browserLaunchInput(args));
+    const session = await launchAppBrowserSession(
+      this.env,
+      {
+        orgId: this.ctx.props.orgId,
+        workspaceId: this.ctx.props.workspaceId,
+      },
+      this.browserLaunchInput(args),
+    );
     try {
       const sessionId = session.sessionId();
       if (!sessionId) {
-        throw new Error("Browser session did not expose a reconnectable sessionId");
+        throw new Error(
+          "Browser session did not expose a reconnectable sessionId",
+        );
       }
       return {
         sessionId,
@@ -4844,23 +6102,36 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async browserAction(args: Record<string, unknown>): Promise<unknown> {
-    const sessionId = typeof args.sessionId === "string" ? args.sessionId.trim() : "";
+    const sessionId =
+      typeof args.sessionId === "string" ? args.sessionId.trim() : "";
     if (!sessionId) throw new Error("sessionId is required");
-    const scriptName = typeof args.scriptName === "string"
-      ? args.scriptName
-      : typeof args.script_name === "string"
-        ? args.script_name
-        : "";
+    const scriptName =
+      typeof args.scriptName === "string"
+        ? args.scriptName
+        : typeof args.script_name === "string"
+          ? args.script_name
+          : "";
     const method = typeof args.method === "string" ? args.method.trim() : "";
     if (!this.browserMethodAllowlist().has(method)) {
-      throw new Error(`Unsupported browser session method: ${method || "(empty)"}`);
+      throw new Error(
+        `Unsupported browser session method: ${method || "(empty)"}`,
+      );
     }
-    const session = await connectAppBrowserSession(this.env, {
-      orgId: this.ctx.props.orgId,
-      workspaceId: this.ctx.props.workspaceId,
-    }, { sessionId, scriptName });
+    const session = await connectAppBrowserSession(
+      this.env,
+      {
+        orgId: this.ctx.props.orgId,
+        workspaceId: this.ctx.props.workspaceId,
+      },
+      { sessionId, scriptName },
+    );
     try {
-      const callable = (session as unknown as Record<string, (...methodArgs: unknown[]) => Promise<unknown>>)[method];
+      const callable = (
+        session as unknown as Record<
+          string,
+          (...methodArgs: unknown[]) => Promise<unknown>
+        >
+      )[method];
       if (typeof callable !== "function") {
         throw new Error(`Browser session method is not callable: ${method}`);
       }
@@ -4876,8 +6147,12 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async revertProject(args: Record<string, unknown>): Promise<unknown> {
-    const project = await this.resolveDoBackedProjectForAction(args, "revert_project");
-    const snapshotId = typeof args.snapshot_id === "string" ? args.snapshot_id.trim() : "";
+    const project = await this.resolveDoBackedProjectForAction(
+      args,
+      "revert_project",
+    );
+    const snapshotId =
+      typeof args.snapshot_id === "string" ? args.snapshot_id.trim() : "";
     if (!snapshotId) throw new Error("snapshot_id is required");
     const files = new ProjectFilesystemClient(this.env, project.id);
     const snapshot = await files.restoreSourceSnapshot(snapshotId);
@@ -4889,23 +6164,37 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
     if (args.deploy === true) {
       const deployArgs: Record<string, unknown> = { project: project.name };
-      if (typeof args.script_name === "string" && args.script_name.trim()) deployArgs.script_name = args.script_name.trim();
+      if (typeof args.script_name === "string" && args.script_name.trim())
+        deployArgs.script_name = args.script_name.trim();
       const deploy = await this.deployProject(deployArgs);
-      return { success: true, project: project.name, backend: "do-r2", restored, deploy };
+      return {
+        success: true,
+        project: project.name,
+        backend: "do-r2",
+        restored,
+        deploy,
+      };
     }
     return {
       success: true,
       project: project.name,
       backend: "do-r2",
       restored,
-      message: "Source restored. The deployed app is unchanged until you call deploy_project (or pass deploy=true).",
+      message:
+        "Source restored. The deployed app is unchanged until you call deploy_project (or pass deploy=true).",
     };
   }
 
   private async listCommits(args: Record<string, unknown>): Promise<unknown> {
-    const project = await this.resolveDoBackedProjectForAction(args, "list_commits");
+    const project = await this.resolveDoBackedProjectForAction(
+      args,
+      "list_commits",
+    );
     const limit = typeof args.limit === "number" ? args.limit : 20;
-    const snapshots = await new ProjectFilesystemClient(this.env, project.id).listSourceSnapshots(limit);
+    const snapshots = await new ProjectFilesystemClient(
+      this.env,
+      project.id,
+    ).listSourceSnapshots(limit);
     return {
       project: project.name,
       backend: "do-r2",
@@ -4931,99 +6220,357 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       clampProjectBuildTimeoutMs(args.timeoutMs),
       PROJECT_BUILD_EXEC_LIMITS,
     );
-    return gate.annotate(await withProjectBuildServiceErrorMapping("deploy_project", async () => {
-      const project = await this.resolveDoBackedProjectForAction(args, "deploy_project");
-      const notebookProjectFiles = new ProjectFilesystemClient(this.env, project.id);
-      const notebookPath = await resolveNotebookDeployPath(
-        notebookProjectFiles,
-        typeof args.path === "string" && args.path.trim() ? args.path.trim() : null,
-      );
-      if (notebookPath) {
-        if (args.dry_run !== true && args.publish_intent !== "user_requested") {
-          throw new Error(
-            "Publishing a data-analysis notebook requires publish_intent='user_requested'. " +
-            "Creating or previewing an analysis does not authorize deployment; ask the user to publish or use run_notebook for chat preview.",
+    return gate.annotate(
+      await withProjectBuildServiceErrorMapping(
+        "deploy_project",
+        async () => {
+          const project = await this.resolveDoBackedProjectForAction(
+            args,
+            "deploy_project",
           );
-        }
-        return await this.deployNotebookProject(project, notebookProjectFiles, notebookPath, args);
-      }
-      const sandbox = this.projectBuildSandbox();
-      // Cold-boot waiting is charged to the GATE's own 240s budget, not to the
-      // build's: a container that has to wake first (or reboot between ladder
-      // attempts) must not hand the build a truncated slice of the exec budget.
-      await deadline.excluding(() => gate.ensureReady(sandbox));
-      const timeoutMs = clampProjectBuildTimeoutMs(args.timeoutMs);
-      let build: ProjectBuildResult;
-      try {
-        build = await deadline.run(() => runProjectBuild({
-          projectId: project.id,
-          files: new ProjectFilesystemClient(this.env, project.id),
-          sandbox,
-          timeoutMs,
-        }));
-      } finally {
-        // Warm window is anchored to the END of the build, not its start, so a
-        // long build still leaves a full window for the next deploy.
-        await this.noteProjectBuildSessionActivity(sandbox, "deploy_project");
-      }
-      if (!build.success) {
-        const summarizedBuild = summarizeProjectBuildResult(build);
-        return {
-          success: false,
-          stage: "build",
-          project: project.name,
-          errorSummary: summarizeBuildFailure(build),
-          ...pickBuildFailureFields(summarizedBuild),
-          build: summarizedBuild,
-          ...(args.dry_run === true ? { dryRun: true } : {}),
-        };
-      }
-      if (args.dry_run === true) {
-        return {
-          ...summarizeProjectBuildResult(build),
-          ...(build.stdout ? { stdout: buildLogTail(build.stdout) } : {}),
-          success: true,
-          dryRun: true,
-          stage: "build",
-          project: project.name,
-          backend: "do-r2",
-          message: "Build validation passed; nothing was deployed and preview was unchanged.",
-        };
-      }
-      const projectFiles = new ProjectFilesystemClient(this.env, project.id);
-      const snapshot = await projectFiles.createSourceSnapshot({ message: `Deploy ${project.name}` });
-      const bundle = await collectWorkerBundleFromSandbox(sandbox, build.workdir);
-      // Catch a Durable Object binding whose class the entry module doesn't
-      // export before the upload, where CF would reject it with an opaque
-      // migration error, and name the class so the agent can fix it directly.
-      const unexportedDoClasses = findUnexportedDurableObjectClasses(bundle);
-      if (unexportedDoClasses.length > 0) {
-        const classList = unexportedDoClasses.map((name) => `"${name}"`).join(", ");
-        const plural = unexportedDoClasses.length > 1;
-        return {
-          success: false,
-          stage: "validate",
-          project: project.name,
-          errorSummary:
-            `Durable Object ${plural ? "classes" : "class"} ${classList} ${plural ? "are" : "is"} declared in ` +
-            `wrangler.jsonc but not exported from the worker entry (${bundle.metadata.main_module}). ` +
-            `Add \`export class ${unexportedDoClasses[0]} …\` (or \`export { ${unexportedDoClasses[0]} }\`) ` +
-            `to the module set as \`main\`, matching the binding's class_name exactly.`,
-          build: summarizeProjectBuildResult(build),
-        };
-      }
-      const orgSlug = await this.getOrgSlug();
-      if (!orgSlug) throw new Error("Current org has no slug; cannot deploy project");
-      // Script-name precedence: explicit arg > wrangler config name > project
-      // name. VM-era deploys were driven by the config name, so honoring it
-      // keeps a migrated project's app identity and URL instead of forking a
-      // duplicate app under the durable project name.
-      const scriptName = normalizeDeployScriptName(
-        typeof args.script_name === "string" && args.script_name.trim()
-          ? args.script_name
-          : bundle.configName || project.name,
+          const notebookProjectFiles = new ProjectFilesystemClient(
+            this.env,
+            project.id,
+          );
+          const notebookPath = await resolveNotebookDeployPath(
+            notebookProjectFiles,
+            typeof args.path === "string" && args.path.trim()
+              ? args.path.trim()
+              : null,
+          );
+          if (notebookPath) {
+            if (
+              args.dry_run !== true &&
+              args.publish_intent !== "user_requested"
+            ) {
+              throw new Error(
+                "Publishing a data-analysis notebook requires publish_intent='user_requested'. " +
+                  "Creating or previewing an analysis does not authorize deployment; ask the user to publish or use run_notebook for chat preview.",
+              );
+            }
+            return await deadline.run(() =>
+              this.deployNotebookProject(
+                project,
+                notebookProjectFiles,
+                notebookPath,
+                args,
+                deadline,
+              ),
+            );
+          }
+          const sandbox = this.projectBuildSandbox();
+          // Cold-boot waiting is charged to the GATE's own 240s budget, not to the
+          // build's: a container that has to wake first (or reboot between ladder
+          // attempts) must not hand the build a truncated slice of the exec budget.
+          await deadline.excluding(() => gate.ensureReady(sandbox));
+          const timeoutMs = clampProjectBuildTimeoutMs(args.timeoutMs);
+          let build: ProjectBuildResult;
+          try {
+            build = await deadline.run(() =>
+              runProjectBuild({
+                projectId: project.id,
+                files: new ProjectFilesystemClient(this.env, project.id),
+                sandbox,
+                timeoutMs,
+              }),
+            );
+          } finally {
+            // Warm window is anchored to the END of the build, not its start, so a
+            // long build still leaves a full window for the next deploy.
+            await this.noteProjectBuildSessionActivity(
+              sandbox,
+              "deploy_project",
+            );
+          }
+          if (!build.success) {
+            const summarizedBuild = summarizeProjectBuildResult(build);
+            return {
+              success: false,
+              stage: "build",
+              project: project.name,
+              errorSummary: summarizeBuildFailure(build),
+              ...pickBuildFailureFields(summarizedBuild),
+              build: summarizedBuild,
+              ...(args.dry_run === true ? { dryRun: true } : {}),
+            };
+          }
+          if (args.dry_run === true) {
+            return {
+              ...summarizeProjectBuildResult(build),
+              ...(build.stdout ? { stdout: buildLogTail(build.stdout) } : {}),
+              success: true,
+              dryRun: true,
+              stage: "build",
+              project: project.name,
+              backend: "do-r2",
+              message:
+                "Build validation passed; nothing was deployed and preview was unchanged.",
+            };
+          }
+          const projectFiles = new ProjectFilesystemClient(
+            this.env,
+            project.id,
+          );
+          const snapshot = await deadline.run(() =>
+            projectFiles.createSourceSnapshot({
+              message: `Deploy ${project.name}`,
+            }),
+          );
+          const collectionBudgetMs =
+            deadline.remainingMs - PROJECT_BUILD_BUNDLE_COLLECTION_RESERVE_MS;
+          if (collectionBudgetMs < 1_000) {
+            throw new Error(
+              "Deploy deadline has too little time remaining to start bounded bundle collection; no build-output read was started",
+            );
+          }
+          const bundle = await deadline.run(() =>
+            collectWorkerBundleFromSandbox(
+              sandbox,
+              build.workdir,
+              "build/server/wrangler.json",
+              {
+                // Reserve cleanup time inside the tool's one absolute budget:
+                // a timed-out SDK stream must confirm destructive reset before
+                // the outer deadline is allowed to abandon this operation.
+                timeoutMs: collectionBudgetMs,
+                onTimeout: async () => {
+                  if (
+                    typeof sandbox.resetAfterBundleCollectionTimeout !==
+                    "function"
+                  ) {
+                    throw new Error(
+                      "Build sandbox cannot confirm stream cleanup",
+                    );
+                  }
+                  await sandbox.resetAfterBundleCollectionTimeout();
+                  gate.invalidate();
+                },
+              },
+            ),
+          );
+          // Catch a Durable Object binding whose class the entry module doesn't
+          // export before the upload, where CF would reject it with an opaque
+          // migration error, and name the class so the agent can fix it directly.
+          const unexportedDoClasses =
+            findUnexportedDurableObjectClasses(bundle);
+          if (unexportedDoClasses.length > 0) {
+            const classList = unexportedDoClasses
+              .map((name) => `"${name}"`)
+              .join(", ");
+            const plural = unexportedDoClasses.length > 1;
+            return {
+              success: false,
+              stage: "validate",
+              project: project.name,
+              errorSummary:
+                `Durable Object ${plural ? "classes" : "class"} ${classList} ${plural ? "are" : "is"} declared in ` +
+                `wrangler.jsonc but not exported from the worker entry (${bundle.metadata.main_module}). ` +
+                `Add \`export class ${unexportedDoClasses[0]} …\` (or \`export { ${unexportedDoClasses[0]} }\`) ` +
+                `to the module set as \`main\`, matching the binding's class_name exactly.`,
+              build: summarizeProjectBuildResult(build),
+            };
+          }
+          const orgSlug = await deadline.run(() => this.getOrgSlug());
+          if (!orgSlug)
+            throw new Error("Current org has no slug; cannot deploy project");
+          // Script-name precedence: explicit arg > wrangler config name > project
+          // name. VM-era deploys were driven by the config name, so honoring it
+          // keeps a migrated project's app identity and URL instead of forking a
+          // duplicate app under the durable project name.
+          const scriptName = normalizeDeployScriptName(
+            typeof args.script_name === "string" && args.script_name.trim()
+              ? args.script_name
+              : bundle.configName || project.name,
+          );
+          const directDeadlineAt = directDeployDeadlineAt(deadline);
+          const deploy = await deadline.run(() =>
+            deployWorkerModulesDirect(
+              this.env,
+              {
+                scriptName,
+                hostname: this.deployHostname(),
+                identity: {
+                  orgId: this.ctx.props.orgId,
+                  orgSlug,
+                  workspaceId: this.ctx.props.workspaceId,
+                  userId: this.ctx.props.userId,
+                  threadId: this.ctx.props.threadId,
+                  projectId: project.id,
+                },
+                metadata: bundle.metadata,
+                modules: bundle.modules,
+                assets: bundle.assets,
+                commitSha: snapshot.id,
+              },
+              {
+                deadlineAt: directDeadlineAt,
+                onDeploySideEffects: (info, scope) =>
+                  handleDeploySideEffects(this.env as never, info, scope),
+              },
+            ),
+          );
+          if (!deploy.success) {
+            return {
+              success: false,
+              stage: "deploy",
+              project: project.name,
+              scriptName: deploy.scriptName,
+              dispatchScriptName: deploy.dispatchScriptName,
+              status: deploy.status,
+              errorSummary: summarizeDeployFailure(deploy),
+              build: summarizeProjectBuildResult(build),
+              deploy: summarizeDirectDeployResult(deploy),
+            };
+          }
+          const appUrl = await deadline.run(() =>
+            this.appUrlForScriptName(scriptName),
+          );
+          const warnings = [
+            ...(deploy.warnings ?? []),
+            ...this.localDeployReachabilityWarnings(),
+          ];
+          const preview = await deadline.run(() =>
+            this.setPreview({ app_name: scriptName }),
+          );
+          const message = `Deployed and previewed at ${appUrl}`;
+          console.log(message);
+          return {
+            success: true,
+            project: project.name,
+            scriptName: deploy.scriptName,
+            dispatchScriptName: deploy.dispatchScriptName,
+            status: deploy.status,
+            url: appUrl,
+            appUrl,
+            preview,
+            message,
+            buildSuccess: true,
+            sourceSnapshot: {
+              id: snapshot.id,
+              fileCount: snapshot.fileCount,
+              totalBytes: snapshot.totalBytes,
+            },
+            // Deliberately compact on success: full timings/log detail is noise the
+            // model has to carry (and re-render); failures keep the rich shapes.
+            build: {
+              success: true,
+              durationMs: build.durationMs,
+              fileCount: build.fileCount,
+              sourceBytes: build.sourceBytes,
+            },
+            deploy: {
+              success: true,
+              scriptName: deploy.scriptName,
+              dispatchScriptName: deploy.dispatchScriptName,
+              status: deploy.status,
+              ...(deploy.skippedAssets?.length
+                ? { skippedAssets: deploy.skippedAssets }
+                : {}),
+            },
+            ...(warnings.length > 0 ? { warnings } : {}),
+          };
+        },
+        {
+          onTransient: () => gate.invalidate(),
+          unavailableMessage: () => gate.unavailableMessage(),
+          deadline,
+        },
+      ),
+    );
+  }
+
+  // Publish an executed notebook as a static app: the pre-built renderer SPA
+  // (main app ASSETS, /notebook-renderer/) plus the .ipynb, uploaded through the
+  // same direct-dispatch deploy + app registration path as built projects.
+  private async deployNotebookProject(
+    project: WorkspaceProject,
+    projectFiles: ProjectFilesystemClient,
+    notebookPath: string,
+    args: Record<string, unknown>,
+    deadline: SandboxExecDeadline,
+  ): Promise<unknown> {
+    const rendererAssets = this.env.ASSETS;
+    if (!rendererAssets) {
+      throw new Error(
+        "Notebook publishing is unavailable: the ASSETS binding is not configured on this worker",
       );
-      const deploy = await deployWorkerModulesDirect(this.env, {
+    }
+    const notebookMetadata = await projectFiles.exists(notebookPath);
+    if (
+      !notebookMetadata.exists ||
+      !notebookMetadata.isFile ||
+      typeof notebookMetadata.size !== "number" ||
+      !Number.isSafeInteger(notebookMetadata.size) ||
+      notebookMetadata.size < 0
+    ) {
+      throw new Error(
+        `Cannot determine a safe notebook size for ${notebookPath}`,
+      );
+    }
+    if (notebookMetadata.size > CHAT_RUNTIME_BOUNDS.toolSourceReadBytes) {
+      throw new Error(
+        `Notebook exceeds the ${CHAT_RUNTIME_BOUNDS.toolSourceReadBytes} byte whole-buffer limit`,
+      );
+    }
+    const read = await projectFiles.readFile(notebookPath);
+    if (!read.success || typeof read.content !== "string") {
+      throw new Error(read.error || `Failed to read notebook ${notebookPath}`);
+    }
+    let notebookBytes: Uint8Array;
+    if (read.encoding === "base64") {
+      notebookBytes = base64ToBytesForMove(
+        read.content,
+        CHAT_RUNTIME_BOUNDS.toolSourceReadBytes,
+      );
+    } else {
+      const contentBytes = utf8ByteLength(read.content);
+      if (contentBytes > CHAT_RUNTIME_BOUNDS.toolSourceReadBytes) {
+        throw new Error(
+          `Notebook exceeds the ${CHAT_RUNTIME_BOUNDS.toolSourceReadBytes} byte whole-buffer limit`,
+        );
+      }
+      notebookBytes = codeModeOverflowEncoder.encode(read.content);
+    }
+    const warnings: string[] = [];
+    if (!notebookHasCellOutputs(notebookBytes)) {
+      warnings.push(
+        `${notebookPath} has no cell outputs — run run_notebook before deploying so the published report includes charts and tables.`,
+      );
+    }
+    const filename =
+      notebookPath.split("/").filter(Boolean).pop() || "notebook.ipynb";
+    const bundle = await buildNotebookWorkerBundle({
+      rendererAssets,
+      filename,
+      notebook: notebookBytes,
+    });
+    if (args.dry_run === true) {
+      return {
+        success: true,
+        dryRun: true,
+        stage: "validate",
+        mode: "notebook",
+        project: project.name,
+        notebook: notebookPath,
+        message:
+          "Notebook publish validation passed; nothing was deployed and preview was unchanged.",
+        ...(warnings.length > 0 ? { warnings } : {}),
+      };
+    }
+    const snapshot = await projectFiles.createSourceSnapshot({
+      message: `Deploy ${project.name}`,
+    });
+    const orgSlug = await this.getOrgSlug();
+    if (!orgSlug)
+      throw new Error("Current org has no slug; cannot deploy project");
+    const scriptName = normalizeDeployScriptName(
+      typeof args.script_name === "string" && args.script_name.trim()
+        ? args.script_name
+        : project.name,
+    );
+    const deploy = await deployWorkerModulesDirect(
+      this.env,
+      {
         scriptName,
         hostname: this.deployHostname(),
         identity: {
@@ -5038,131 +6585,13 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         modules: bundle.modules,
         assets: bundle.assets,
         commitSha: snapshot.id,
-      }, {
-        onDeploySideEffects: (info) => handleDeploySideEffects(this.env as never, info),
-      });
-      if (!deploy.success) {
-        return {
-          success: false,
-          stage: "deploy",
-          project: project.name,
-          scriptName: deploy.scriptName,
-          dispatchScriptName: deploy.dispatchScriptName,
-          status: deploy.status,
-          errorSummary: summarizeDeployFailure(deploy),
-          build: summarizeProjectBuildResult(build),
-          deploy: summarizeDirectDeployResult(deploy),
-        };
-      }
-      const appUrl = await this.appUrlForScriptName(scriptName);
-      const warnings = [...(deploy.warnings ?? []), ...this.localDeployReachabilityWarnings()];
-      const preview = await this.setPreview({ app_name: scriptName });
-      const message = `Deployed and previewed at ${appUrl}`;
-      console.log(message);
-      return {
-        success: true,
-        project: project.name,
-        scriptName: deploy.scriptName,
-        dispatchScriptName: deploy.dispatchScriptName,
-        status: deploy.status,
-        url: appUrl,
-        appUrl,
-        preview,
-        message,
-        buildSuccess: true,
-        sourceSnapshot: {
-          id: snapshot.id,
-          fileCount: snapshot.fileCount,
-          totalBytes: snapshot.totalBytes,
-        },
-        // Deliberately compact on success: full timings/log detail is noise the
-        // model has to carry (and re-render); failures keep the rich shapes.
-        build: {
-          success: true,
-          durationMs: build.durationMs,
-          fileCount: build.fileCount,
-          sourceBytes: build.sourceBytes,
-        },
-        deploy: {
-          success: true,
-          scriptName: deploy.scriptName,
-          dispatchScriptName: deploy.dispatchScriptName,
-          status: deploy.status,
-          ...(deploy.skippedAssets?.length ? { skippedAssets: deploy.skippedAssets } : {}),
-        },
-        ...(warnings.length > 0 ? { warnings } : {}),
-      };
-    }, {
-      onTransient: () => gate.invalidate(),
-      unavailableMessage: () => gate.unavailableMessage(),
-      deadline,
-    }));
-  }
-
-  // Publish an executed notebook as a static app: the pre-built renderer SPA
-  // (main app ASSETS, /notebook-renderer/) plus the .ipynb, uploaded through the
-  // same direct-dispatch deploy + app registration path as built projects.
-  private async deployNotebookProject(
-    project: WorkspaceProject,
-    projectFiles: ProjectFilesystemClient,
-    notebookPath: string,
-    args: Record<string, unknown>,
-  ): Promise<unknown> {
-    const rendererAssets = this.env.ASSETS;
-    if (!rendererAssets) {
-      throw new Error("Notebook publishing is unavailable: the ASSETS binding is not configured on this worker");
-    }
-    const read = await projectFiles.readFile(notebookPath);
-    if (!read.success || typeof read.content !== "string") {
-      throw new Error(read.error || `Failed to read notebook ${notebookPath}`);
-    }
-    const notebookBytes = read.encoding === "base64"
-      ? base64ToBytesForMove(read.content)
-      : new TextEncoder().encode(read.content);
-    const warnings: string[] = [];
-    if (!notebookHasCellOutputs(notebookBytes)) {
-      warnings.push(
-        `${notebookPath} has no cell outputs — run run_notebook before deploying so the published report includes charts and tables.`,
-      );
-    }
-    const filename = notebookPath.split("/").filter(Boolean).pop() || "notebook.ipynb";
-    const bundle = await buildNotebookWorkerBundle({ rendererAssets, filename, notebook: notebookBytes });
-    if (args.dry_run === true) {
-      return {
-        success: true,
-        dryRun: true,
-        stage: "validate",
-        mode: "notebook",
-        project: project.name,
-        notebook: notebookPath,
-        message: "Notebook publish validation passed; nothing was deployed and preview was unchanged.",
-        ...(warnings.length > 0 ? { warnings } : {}),
-      };
-    }
-    const snapshot = await projectFiles.createSourceSnapshot({ message: `Deploy ${project.name}` });
-    const orgSlug = await this.getOrgSlug();
-    if (!orgSlug) throw new Error("Current org has no slug; cannot deploy project");
-    const scriptName = normalizeDeployScriptName(
-      typeof args.script_name === "string" && args.script_name.trim() ? args.script_name : project.name,
-    );
-    const deploy = await deployWorkerModulesDirect(this.env, {
-      scriptName,
-      hostname: this.deployHostname(),
-      identity: {
-        orgId: this.ctx.props.orgId,
-        orgSlug,
-        workspaceId: this.ctx.props.workspaceId,
-        userId: this.ctx.props.userId,
-        threadId: this.ctx.props.threadId,
-        projectId: project.id,
       },
-      metadata: bundle.metadata,
-      modules: bundle.modules,
-      assets: bundle.assets,
-      commitSha: snapshot.id,
-    }, {
-      onDeploySideEffects: (info) => handleDeploySideEffects(this.env as never, info),
-    });
+      {
+        deadlineAt: directDeployDeadlineAt(deadline),
+        onDeploySideEffects: (info, scope) =>
+          handleDeploySideEffects(this.env as never, info, scope),
+      },
+    );
     if (!deploy.success) {
       return {
         success: false,
@@ -5178,7 +6607,11 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       };
     }
     const appUrl = await this.appUrlForScriptName(scriptName);
-    const allWarnings = [...warnings, ...(deploy.warnings ?? []), ...this.localDeployReachabilityWarnings()];
+    const allWarnings = [
+      ...warnings,
+      ...(deploy.warnings ?? []),
+      ...this.localDeployReachabilityWarnings(),
+    ];
     const preview = await this.setPreview({ app_name: scriptName });
     const message = `Deployed and previewed at ${appUrl}`;
     console.log(message);
@@ -5205,7 +6638,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private localDeployReachabilityWarnings(): string[] {
-    const workerBaseUrl = (this.env as { WORKER_BASE_URL?: string }).WORKER_BASE_URL;
+    const workerBaseUrl = (this.env as { WORKER_BASE_URL?: string })
+      .WORKER_BASE_URL;
     if (!workerBaseUrl) return [];
     let hostname = "";
     try {
@@ -5213,7 +6647,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     } catch {
       return [];
     }
-    const isLocalMainWorker = hostname === "localhost" ||
+    const isLocalMainWorker =
+      hostname === "localhost" ||
       hostname === "127.0.0.1" ||
       hostname === "::1";
     if (!isLocalMainWorker) return [];
@@ -5225,44 +6660,67 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
 
   private isRemoteDispatcherHostConfigured(): boolean {
     const dispatchNamespace = this.env.CF_DISPATCH_NAMESPACE?.trim();
-    if (!dispatchNamespace || !dispatchNamespace.startsWith("chiridion-platform") || dispatchNamespace === "chiridion-platform-local") return false;
-    const domains = [this.env.LOCAL_APP_VANITY_DOMAIN, this.env.LOCAL_APP_IFRAME_DOMAIN]
-      .map((value) => typeof value === "string" ? value.trim().toLowerCase() : "")
+    if (
+      !dispatchNamespace ||
+      !dispatchNamespace.startsWith("chiridion-platform") ||
+      dispatchNamespace === "chiridion-platform-local"
+    )
+      return false;
+    const domains = [
+      this.env.LOCAL_APP_VANITY_DOMAIN,
+      this.env.LOCAL_APP_IFRAME_DOMAIN,
+    ]
+      .map((value) =>
+        typeof value === "string" ? value.trim().toLowerCase() : "",
+      )
       .filter(Boolean);
-    return domains.some((domain) =>
-      domain === "camelai.app" ||
-      domain.endsWith(".camelai.app") ||
-      domain === "apps.camelai.dev" ||
-      domain.endsWith(".camelai.dev"),
+    return domains.some(
+      (domain) =>
+        domain === "camelai.app" ||
+        domain.endsWith(".camelai.app") ||
+        domain === "apps.camelai.dev" ||
+        domain.endsWith(".camelai.dev"),
     );
   }
 
-  private async rollbackDeploy(args: Record<string, unknown>): Promise<unknown> {
-    const scriptName = typeof args.script_name === "string" ? args.script_name.trim() : "";
+  private async rollbackDeploy(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    const scriptName =
+      typeof args.script_name === "string" ? args.script_name.trim() : "";
     if (!scriptName) throw new Error("script_name is required");
     const script = await this.orgStub.getWorkerScript(scriptName);
     if (!script) throw new Error(`App '${scriptName}' not found`);
     if (script.workspace_id !== this.ctx.props.workspaceId) {
       throw new Error(`App '${scriptName}' belongs to a different workspace`);
     }
-    const artifactCacheKey = typeof args.artifact_cache_key === "string" && args.artifact_cache_key.trim()
-      ? args.artifact_cache_key.trim()
-      : script.artifact_cache_key;
+    const artifactCacheKey =
+      typeof args.artifact_cache_key === "string" &&
+      args.artifact_cache_key.trim()
+        ? args.artifact_cache_key.trim()
+        : script.artifact_cache_key;
     if (!artifactCacheKey) {
-      throw new Error(`App '${scriptName}' does not have a cached deploy artifact`);
+      throw new Error(
+        `App '${scriptName}' does not have a cached deploy artifact`,
+      );
     }
-    const deploy = await rollbackWorkerDeployFromArtifactCache(this.env, {
-      artifactCacheKey,
-      hostname: this.deployHostname(),
-      expected: {
-        orgId: this.ctx.props.orgId,
-        workspaceId: this.ctx.props.workspaceId,
-        scriptName,
+    const deploy = await rollbackWorkerDeployFromArtifactCache(
+      this.env,
+      {
+        artifactCacheKey,
+        hostname: this.deployHostname(),
+        expected: {
+          orgId: this.ctx.props.orgId,
+          workspaceId: this.ctx.props.workspaceId,
+          scriptName,
+        },
+        threadId: this.ctx.props.threadId,
       },
-      threadId: this.ctx.props.threadId,
-    }, {
-      onDeploySideEffects: (info) => handleDeploySideEffects(this.env as never, info),
-    });
+      {
+        onDeploySideEffects: (info, scope) =>
+          handleDeploySideEffects(this.env as never, info, scope),
+      },
+    );
     if (!deploy.success) {
       return { success: false, app: scriptName, deploy };
     }
@@ -5280,8 +6738,11 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
   }
 
-  private async listDeployVersions(args: Record<string, unknown>): Promise<unknown> {
-    const scriptName = typeof args.script_name === "string" ? args.script_name.trim() : "";
+  private async listDeployVersions(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    const scriptName =
+      typeof args.script_name === "string" ? args.script_name.trim() : "";
     if (!scriptName) throw new Error("script_name is required");
     const script = await this.orgStub.getWorkerScript(scriptName);
     if (!script) throw new Error(`App '${scriptName}' not found`);
@@ -5289,7 +6750,11 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       throw new Error(`App '${scriptName}' belongs to a different workspace`);
     }
     const limit = typeof args.limit === "number" ? args.limit : 20;
-    const versions = await this.orgStub.listWorkerScriptDeployVersions(scriptName, this.ctx.props.workspaceId, limit);
+    const versions = await this.orgStub.listWorkerScriptDeployVersions(
+      scriptName,
+      this.ctx.props.workspaceId,
+      limit,
+    );
     return {
       app: scriptName,
       count: versions.length,
@@ -5307,7 +6772,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
 
   private deployHostname(): string {
     try {
-      return new URL(this.env.WORKER_BASE_URL || "https://camelai.dev").hostname;
+      return new URL(this.env.WORKER_BASE_URL || "https://camelai.dev")
+        .hostname;
     } catch {
       return "camelai.dev";
     }
@@ -5315,16 +6781,25 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
 
   private async appUrlForScriptName(scriptName: string): Promise<string> {
     const script = await this.orgStub.getWorkerScript(scriptName);
-    return script ? this.getAppUrl(script) : this.getAppUrl({ script_name: scriptName, custom_domain_hostname: null } as WorkerScript);
+    return script
+      ? this.getAppUrl(script)
+      : this.getAppUrl({
+          script_name: scriptName,
+          custom_domain_hostname: null,
+        } as WorkerScript);
   }
 
   private async deleteAppDeployment(script: WorkerScript): Promise<void> {
     if (script.workspace_id !== this.ctx.props.workspaceId) {
-      throw new Error(`App '${script.script_name}' belongs to a different workspace`);
+      throw new Error(
+        `App '${script.script_name}' belongs to a different workspace`,
+      );
     }
     const orgSlug = await this.getOrgSlug();
     if (!orgSlug) {
-      throw new Error(`Organization slug is required to delete app '${script.script_name}'`);
+      throw new Error(
+        `Organization slug is required to delete app '${script.script_name}'`,
+      );
     }
 
     await deleteDeployedAppRuntime(this.env, {
@@ -5336,7 +6811,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       this.ctx.props.userId || "system",
     );
     if (!deleted) {
-      throw new Error(`Failed to delete app metadata for '${script.script_name}'`);
+      throw new Error(
+        `Failed to delete app metadata for '${script.script_name}'`,
+      );
     }
     await this.env.APP_KV.delete(
       `script:${getDispatchScriptName(script.script_name, orgSlug)}`,
@@ -5344,7 +6821,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async deleteApp(args: Record<string, unknown>): Promise<unknown> {
-    const scriptName = typeof args.script_name === "string" ? args.script_name.trim() : "";
+    const scriptName =
+      typeof args.script_name === "string" ? args.script_name.trim() : "";
     if (!scriptName) throw new Error("script_name is required");
     const script = await this.orgStub.getWorkerScript(scriptName);
     if (!script) throw new Error(`App '${scriptName}' not found`);
@@ -5352,8 +6830,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       throw new Error(`App '${scriptName}' belongs to a different workspace`);
     }
 
-    const question =
-      `Delete deployed app "${script.script_name}"? This permanently removes its live deployment and URL. Its source project will be kept.`;
+    const question = `Delete deployed app "${script.script_name}"? This permanently removes its live deployment and URL. Its source project will be kept.`;
     const confirmation = await confirmDestructiveAction(
       (questionArgs) => this.askUserQuestion(questionArgs),
       {
@@ -5387,20 +6864,27 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async deleteProject(args: Record<string, unknown>): Promise<unknown> {
-    const projectName = typeof args.project === "string" ? args.project.trim() : "";
+    const projectName =
+      typeof args.project === "string" ? args.project.trim() : "";
     if (!projectName) throw new Error("project is required");
 
     const projects = await this.workspaceFs.listProjectsForMigrationReset();
     const nameKey = projectNameKey(projectName);
-    const target = projects.find((project) => projectNameKey(project.name) === nameKey);
+    const target = projects.find(
+      (project) => projectNameKey(project.name) === nameKey,
+    );
     if (!target) {
       throw new Error(`Project not found: ${projectName}`);
     }
 
     const confirmedTargets = collectProjectDeletionTargets(projects, target);
-    const confirmedTargetIds = new Set(confirmedTargets.map((project) => project.id));
+    const confirmedTargetIds = new Set(
+      confirmedTargets.map((project) => project.id),
+    );
     const linkedApps = (
-      await this.orgStub.listWorkerScriptsByWorkspace(this.ctx.props.workspaceId)
+      await this.orgStub.listWorkerScriptsByWorkspace(
+        this.ctx.props.workspaceId,
+      )
     ).filter(
       (script) =>
         typeof script.project_id === "string" &&
@@ -5409,14 +6893,15 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const cloneNames = confirmedTargets
       .filter((project) => project.id !== target.id)
       .map((project) => project.name);
-    const projectScope = cloneNames.length > 0
-      ? `project "${target.name}" and its ${cloneNames.length} clone project(s) (${cloneNames.join(", ")})`
-      : `project "${target.name}"`;
-    const appScope = linkedApps.length > 0
-      ? ` It will also permanently delete ${linkedApps.length} linked deployed app(s) and their live URLs: ${linkedApps.map((script) => script.script_name).join(", ")}.`
-      : "";
-    const question =
-      `Delete ${projectScope}? This removes the project files and metadata.${appScope} This cannot be undone.`;
+    const projectScope =
+      cloneNames.length > 0
+        ? `project "${target.name}" and its ${cloneNames.length} clone project(s) (${cloneNames.join(", ")})`
+        : `project "${target.name}"`;
+    const appScope =
+      linkedApps.length > 0
+        ? ` It will also permanently delete ${linkedApps.length} linked deployed app(s) and their live URLs: ${linkedApps.map((script) => script.script_name).join(", ")}.`
+        : "";
+    const question = `Delete ${projectScope}? This removes the project files and metadata.${appScope} This cannot be undone.`;
     const confirmation = await confirmDestructiveAction(
       (questionArgs) => this.askUserQuestion(questionArgs),
       {
@@ -5459,9 +6944,12 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       deletedSourceSnapshots += cleanup.sourceSnapshots;
       deletedSourceSnapshotBlobs += cleanup.sourceSnapshotBlobs;
     }
-    const cleanup = confirmedTargets.length > 0
-      ? await this.workspaceFs.removeProjects(confirmedTargets.map((project) => project.id))
-      : { deleted: [] };
+    const cleanup =
+      confirmedTargets.length > 0
+        ? await this.workspaceFs.removeProjects(
+            confirmedTargets.map((project) => project.id),
+          )
+        : { deleted: [] };
     deletedNames.push(...cleanup.deleted.map((project) => project.name));
 
     return {
@@ -5478,25 +6966,30 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
   }
 
-  private async deleteDoBackedProjectFiles(project: WorkspaceProject): Promise<{ fileEntries: number; sourceSnapshots: number; sourceSnapshotBlobs: number }> {
+  private async deleteDoBackedProjectFiles(project: WorkspaceProject): Promise<{
+    fileEntries: number;
+    sourceSnapshots: number;
+    sourceSnapshotBlobs: number;
+  }> {
     const files = new ProjectFilesystemClient(this.env, project.id);
-    const listing = await files.listFiles("/", { recursive: true, includeHidden: true, limit: 50_000 });
-    if (!listing.success) {
-      const notFound = typeof listing.error === "string" && /not found/i.test(listing.error);
-      if (notFound) return { fileEntries: 0, sourceSnapshots: 0, sourceSnapshotBlobs: 0 };
-      throw new Error(listing.error || `Failed to list project files for ${project.name}`);
-    }
-    let deleted = 0;
-    for (const entry of listing.files) {
-      const result = await files.deleteFile(entry.absolutePath, { recursive: true, force: true });
-      if (!result.success) {
-        throw new Error(result.error || `Failed to delete project file ${entry.absolutePath}`);
-      }
-      deleted += 1;
+    const deletion = await files.deleteFile("/", {
+      recursive: true,
+      force: true,
+    });
+    if (!deletion.success) {
+      throw new Error(
+        deletion.error || `Failed to delete project files for ${project.name}`,
+      );
     }
     const snapshots = await files.deleteSourceSnapshots();
+    const r2Cleanup = await files.drainR2Cleanup();
+    if (!r2Cleanup.success || r2Cleanup.pending !== 0) {
+      throw new Error(
+        `Project R2 cleanup is still pending for ${project.name}`,
+      );
+    }
     return {
-      fileEntries: deleted,
+      fileEntries: 1,
       sourceSnapshots: snapshots.snapshotsDeleted,
       sourceSnapshotBlobs: snapshots.blobsDeleted,
     };
@@ -5518,18 +7011,33 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async sendEmail(args: Record<string, unknown>): Promise<unknown> {
-    return this.channelTools.sendChannelEmailTool(this.chatContextFromProps(), args);
+    return this.channelTools.sendChannelEmailTool(
+      this.chatContextFromProps(),
+      args,
+    );
   }
 
-  private async sendSlackMessage(args: Record<string, unknown>): Promise<unknown> {
-    return this.channelTools.sendChannelSlackMessageTool(this.chatContextFromProps(), args);
+  private async sendSlackMessage(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    return this.channelTools.sendChannelSlackMessageTool(
+      this.chatContextFromProps(),
+      args,
+    );
   }
 
-  private async sendTelegramMessage(args: Record<string, unknown>): Promise<unknown> {
-    return this.channelTools.sendChannelTelegramMessageTool(this.chatContextFromProps(), args);
+  private async sendTelegramMessage(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
+    return this.channelTools.sendChannelTelegramMessageTool(
+      this.chatContextFromProps(),
+      args,
+    );
   }
 
-  private async sendDiscordMessage(args: Record<string, unknown>): Promise<unknown> {
+  private async sendDiscordMessage(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     this.discordSendInvocationCount += 1;
     const parentToolUseId = this.ctx.props.parentToolUseId?.trim();
     const operationId = parentToolUseId
@@ -5555,11 +7063,15 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return this.customDomains.get();
   }
 
-  private async setCustomDomain(args: Record<string, unknown>): Promise<unknown> {
+  private async setCustomDomain(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.customDomains.set(args);
   }
 
-  private async removeCustomDomain(args: Record<string, unknown>): Promise<unknown> {
+  private async removeCustomDomain(
+    args: Record<string, unknown>,
+  ): Promise<unknown> {
     return this.customDomains.remove(args);
   }
 
@@ -5581,11 +7093,11 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     capability: HostedCapability,
     args: Record<string, unknown>,
   ): Promise<string> {
-    const explicitKey = typeof args.toolUseId === "string"
-      ? args.toolUseId.trim()
-      : "";
+    const explicitKey =
+      typeof args.toolUseId === "string" ? args.toolUseId.trim() : "";
     const idempotencyKey = explicitKey || crypto.randomUUID();
-    const invocationScope = this.ctx.props.threadId || this.ctx.props.workspaceId;
+    const invocationScope =
+      this.ctx.props.threadId || this.ctx.props.workspaceId;
     const scopedIdempotencyKey = `${invocationScope}:${idempotencyKey}`;
     const allowance = await this.orgStub.consumeCapabilityAllowance({
       capability,
@@ -5595,7 +7107,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (!allowance.allowed) {
       throw new Error(
         `Daily ${capability.replaceAll("_", " ")} allowance reached. ` +
-        `This allowance resets at ${new Date(allowance.reset_at_ms).toISOString()}.`,
+          `This allowance resets at ${new Date(allowance.reset_at_ms).toISOString()}.`,
       );
     }
     return scopedIdempotencyKey;
@@ -5609,9 +7121,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (!result || typeof result !== "object" || Array.isArray(result)) return;
     const record = result as Record<string, unknown>;
     const costUsd = Number(record.costUSD ?? 0);
-    const provider = typeof record.provider === "string"
-      ? record.provider
-      : "unknown";
+    const provider =
+      typeof record.provider === "string" ? record.provider : "unknown";
     const durationMs = Number(record.durationMs ?? 0);
     await this.orgStub.recordUsage({
       workspace_id: this.ctx.props.workspaceId,
@@ -5624,7 +7135,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       usage_kind: "capability",
       usage_surface: "capability",
       cost_usd: Number.isFinite(costUsd) && costUsd > 0 ? costUsd : 0,
-      duration_ms: Number.isFinite(durationMs) && durationMs > 0 ? durationMs : undefined,
+      duration_ms:
+        Number.isFinite(durationMs) && durationMs > 0 ? durationMs : undefined,
       created_at_ms: Date.now(),
       source: capability,
       source_id: `${capability}:${idempotencyKey}`,
@@ -5632,7 +7144,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async webFetch(args: Record<string, unknown>): Promise<unknown> {
-    const idempotencyKey = await this.consumeHostedCapability("web_fetch", args);
+    const idempotencyKey = await this.consumeHostedCapability(
+      "web_fetch",
+      args,
+    );
     let failedAttempt = 0;
     const result = await this.webSearchClient(async (failure) => {
       failedAttempt += 1;
@@ -5647,7 +7162,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async webSearch(args: Record<string, unknown>): Promise<unknown> {
-    const idempotencyKey = await this.consumeHostedCapability("web_search", args);
+    const idempotencyKey = await this.consumeHostedCapability(
+      "web_search",
+      args,
+    );
     const result = await this.webSearchClient().search(args);
     await this.recordHostedCapabilityCost("web_search", idempotencyKey, result);
     return result;

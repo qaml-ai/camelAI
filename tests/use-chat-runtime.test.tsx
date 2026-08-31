@@ -301,6 +301,54 @@ describe("useChatRuntime", () => {
     expect(result.current.activeTurn?.id).toBe("turn-2");
   });
 
+  it("clears attempt-local output at reconnect and accepts a same-epoch live seed", async () => {
+    const { result } = renderHook(() => useChatRuntime({ threadId: "t1" }));
+    await waitFor(() => expect(controller).toBeDefined());
+    const activeTurn = {
+      id: "turn-1",
+      status: "running" as const,
+      acceptedAt: 1,
+      startedAt: 2,
+    };
+    const live = {
+      type: "live",
+      turnId: activeTurn.id,
+      epoch: "attempt-a",
+      seq: 1,
+      activeTurn,
+      message: {
+        id: "turn-1:assistant",
+        role: "assistant",
+        content: [{ type: "text", text: "attempt local" }],
+        createdAt: 2,
+        status: "running",
+      },
+    };
+    act(() => {
+      emit({ type: "snapshot", cursor: 1, messages: [], activeTurn });
+      emit(live);
+    });
+    await waitFor(() =>
+      expect(result.current.activeAssistantMessageId).toBe("turn-1:assistant"),
+    );
+
+    const previous = controller;
+    act(() => result.current.reconnect());
+    await waitFor(() => expect(controller).not.toBe(previous));
+    await waitFor(() =>
+      expect(result.current.activeAssistantMessageId).toBeNull(),
+    );
+    act(() => emit({ type: "reset", cursor: 1, messages: [], activeTurn }));
+    expect(result.current.runtimeMessages).toEqual([]);
+    act(() => emit({ ...live, message: { ...live.message, content: [{ type: "text", text: "seeded" }] } }));
+    await waitFor(() =>
+      expect(result.current.activeAssistantMessageId).toBe("turn-1:assistant"),
+    );
+    expect(result.current.messages.at(-1)?.content).toEqual([
+      { type: "text", text: "seeded" },
+    ]);
+  });
+
   it("coalesces a live burst to its latest frame and cancels it on a terminal reset", async () => {
     const activeTurn = {
       id: "turn-1",

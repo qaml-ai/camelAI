@@ -1,12 +1,26 @@
 import { mapWithConcurrency } from "../../../src/lib/map-with-concurrency";
 
 import { base64ToBytes } from "./base64-codec.js";
+import {
+  parseJsonBounded,
+  runtimeJsonLimits,
+} from "./chat-thread/bounded-json-parse.js";
+import { utf8ByteLength } from "./chat-thread/utf8-byte-length.js";
+import {
+  PROJECT_BUILD_MANIFEST_MAX_BYTES,
+  PROJECT_BUILD_MODULE_MAX_FILE_BYTES,
+  PROJECT_BUILD_OUTPUT_MAX_ENTRIES,
+  PROJECT_BUILD_OUTPUT_MAX_PATH_BYTES,
+  PROJECT_BUILD_SOURCE_LIST_MAX_PATH_BYTES,
+  PROJECT_BUILD_SOURCE_MAX_TOTAL_BYTES,
+  readSandboxFileBytes,
+  type ProjectBuildSandboxLike,
+} from "./project-worker-bundle.js";
 import { sha256Hex } from "./sha256.js";
 import type {
   WorkspaceFileStoreLike,
   WorkspaceListEntry,
 } from "./workspace-filesystem-do.js";
-import type { ProjectBuildSandboxLike } from "./project-worker-bundle.js";
 
 export const PROJECT_BUILD_ROOT = "/workspace";
 // A streamed WorkspaceFilesystemDO read occupies an outbound Worker connection
@@ -16,7 +30,7 @@ export const PROJECT_BUILD_ROOT = "/workspace";
 // traffic and drain every started read before the retry ladder can re-enter.
 const SOURCE_STREAM_READ_CONCURRENCY = 4;
 // Hashing is isolate-local and does not consume outbound connections.
-const SOURCE_HASH_CONCURRENCY = 16;
+const SOURCE_HASH_CONCURRENCY = 2;
 // Keep parallel Sandbox streams below the Worker connection ceiling while
 // giving cold, data-heavy projects enough lanes to overlap transfer latency.
 const SOURCE_ARCHIVE_MAX_LANES = 3;
@@ -64,7 +78,12 @@ export interface ProjectSourceCollection {
 
 export interface SourceManifest {
   schemaVersion: 1 | 2;
-  files: Array<{ path: string; size: number; sha256: string; modifiedAt?: string }>;
+  files: Array<{
+    path: string;
+    size: number;
+    sha256: string;
+    modifiedAt?: string;
+  }>;
 }
 
 export async function collectProjectSourceFiles(
@@ -81,18 +100,31 @@ export async function collectProjectSourceFiles(
     ? new Map(previousManifest.files.map((file) => [file.path, file]))
     : null;
   const listStartedAt = Date.now();
-  const listing = await files.listFiles("/", { recursive: true, includeHidden: true, limit: 50_000 });
+  const listing = await files.listFiles("/", {
+    recursive: true,
+    includeHidden: true,
+    limit: PROJECT_BUILD_OUTPUT_MAX_ENTRIES,
+    bounds: {
+      maxEntries: PROJECT_BUILD_OUTPUT_MAX_ENTRIES,
+      maxFiles: PROJECT_BUILD_OUTPUT_MAX_ENTRIES,
+      // Workspace list bounds account for the sum of every returned path;
+      // the stricter per-path ceiling is enforced below after the RPC.
+      maxPathBytes: PROJECT_BUILD_SOURCE_LIST_MAX_PATH_BYTES,
+      maxFileBytes: PROJECT_BUILD_MODULE_MAX_FILE_BYTES,
+      maxTotalBytes: PROJECT_BUILD_SOURCE_MAX_TOTAL_BYTES,
+    },
+  });
   const sourceListMs = Date.now() - listStartedAt;
-  if (!listing.success) throw new Error(listing.error || "Failed to list project files");
-  const listedFiles = listing.files
-    .filter((entry) => entry.type === "file")
-    .map((entry) => ({ entry, relativePath: normalizeRelativeBuildPath(entry.absolutePath) }))
-    .filter(({ relativePath }) => Boolean(relativePath) && !shouldIgnoreBuildSourcePath(relativePath));
+  if (!listing.success)
+    throw new Error(listing.error || "Failed to list project files");
+  const listedFiles = validateListedSourceFiles(listing.files);
 
   const filesToRead = listedFiles.filter(({ entry, relativePath }) => {
     const previous = previousFiles?.get(relativePath);
-    const metadataMatches = previous?.modifiedAt != null &&
-      previous.size === entry.size && previous.modifiedAt === entry.modifiedAt;
+    const metadataMatches =
+      previous?.modifiedAt != null &&
+      previous.size === entry.size &&
+      previous.modifiedAt === entry.modifiedAt;
     // Always re-read executable source for admission checks. Large unchanged
     // data/assets can safely reuse the prior content hash and avoid an R2 read.
     return !metadataMatches || shouldReadBuildSourceForValidation(relativePath);
@@ -103,38 +135,51 @@ export async function collectProjectSourceFiles(
   const sourceReadMs = Date.now() - readStartedAt;
 
   const hashStartedAt = Date.now();
-  const hashedFiles = await mapWithConcurrency(readFiles, SOURCE_HASH_CONCURRENCY, async (file) => {
-    const sha256 = await sha256Hex(file.bytes);
-    return {
-      ...file,
-      sha256,
-    };
-  });
+  const hashedFiles = await mapWithConcurrency(
+    readFiles,
+    SOURCE_HASH_CONCURRENCY,
+    async (file) => {
+      const sha256 = await sha256Hex(file.bytes);
+      return {
+        ...file,
+        sha256,
+      };
+    },
+  );
   const sourceHashMs = Date.now() - hashStartedAt;
   const readByPath = new Map(hashedFiles.map((file) => [file.path, file]));
-  const entries: ProjectSourceEntry[] = listedFiles.map(({ entry, relativePath }) => {
-    const read = readByPath.get(relativePath);
-    if (read) {
+  const entries: ProjectSourceEntry[] = listedFiles
+    .map(({ entry, relativePath }) => {
+      const read = readByPath.get(relativePath);
+      if (read) {
+        return {
+          path: relativePath,
+          size: read.bytes.byteLength,
+          modifiedAt: entry.modifiedAt,
+          sha256: read.sha256,
+        };
+      }
+      const previous = previousFiles?.get(relativePath);
+      if (!previous)
+        throw new Error(`Missing source bytes for ${relativePath}`);
       return {
         path: relativePath,
-        size: read.bytes.byteLength,
+        size: previous.size,
         modifiedAt: entry.modifiedAt,
-        sha256: read.sha256,
+        sha256: previous.sha256,
       };
-    }
-    const previous = previousFiles?.get(relativePath);
-    if (!previous) throw new Error(`Missing source bytes for ${relativePath}`);
-    return {
-      path: relativePath,
-      size: previous.size,
-      modifiedAt: entry.modifiedAt,
-      sha256: previous.sha256,
-    };
-  }).sort((a, b) => a.path.localeCompare(b.path));
-  const changedFiles = hashedFiles.filter((file) => {
-    const previous = previousFiles?.get(file.path);
-    return !previous || previous.size !== file.bytes.byteLength || previous.sha256 !== file.sha256;
-  }).map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 }));
+    })
+    .sort((a, b) => a.path.localeCompare(b.path));
+  const changedFiles = hashedFiles
+    .filter((file) => {
+      const previous = previousFiles?.get(file.path);
+      return (
+        !previous ||
+        previous.size !== file.bytes.byteLength ||
+        previous.sha256 !== file.sha256
+      );
+    })
+    .map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 }));
   const validationFiles = hashedFiles
     .filter((file) => shouldReadBuildSourceForValidation(file.path))
     .map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 }));
@@ -153,6 +198,67 @@ export async function collectProjectSourceFiles(
       sourceHashMs,
     },
   };
+}
+
+function validateListedSourceFiles(
+  entries: WorkspaceListEntry[],
+): Array<{ entry: WorkspaceListEntry; relativePath: string }> {
+  if (entries.length > PROJECT_BUILD_OUTPUT_MAX_ENTRIES) {
+    throw new Error(
+      `Project source exceeds the ${PROJECT_BUILD_OUTPUT_MAX_ENTRIES} entry limit`,
+    );
+  }
+  const selected: Array<{
+    entry: WorkspaceListEntry;
+    relativePath: string;
+  }> = [];
+  const seen = new Set<string>();
+  let totalBytes = 0;
+  for (const entry of entries) {
+    if (entry.type !== "file") continue;
+    if (
+      typeof entry.absolutePath !== "string" ||
+      entry.absolutePath.length > PROJECT_BUILD_OUTPUT_MAX_PATH_BYTES ||
+      utf8ByteLength(entry.absolutePath) > PROJECT_BUILD_OUTPUT_MAX_PATH_BYTES
+    ) {
+      throw new Error(
+        `Project source path exceeds the ${PROJECT_BUILD_OUTPUT_MAX_PATH_BYTES} byte limit`,
+      );
+    }
+    if (
+      !Number.isSafeInteger(entry.size) ||
+      entry.size < 0 ||
+      entry.size > PROJECT_BUILD_MODULE_MAX_FILE_BYTES
+    ) {
+      throw new Error(
+        `Project source ${entry.absolutePath} exceeds the ${PROJECT_BUILD_MODULE_MAX_FILE_BYTES} byte file limit`,
+      );
+    }
+    if (
+      typeof entry.modifiedAt !== "string" ||
+      entry.modifiedAt.length > PROJECT_BUILD_OUTPUT_MAX_PATH_BYTES
+    ) {
+      throw new Error(
+        `Project source ${entry.absolutePath} has invalid metadata`,
+      );
+    }
+    const relativePath = normalizeRelativeBuildPath(entry.absolutePath);
+    if (!relativePath || shouldIgnoreBuildSourcePath(relativePath)) continue;
+    if (seen.has(relativePath)) {
+      throw new Error(
+        `Project source contains a duplicate path: ${relativePath}`,
+      );
+    }
+    seen.add(relativePath);
+    if (entry.size > PROJECT_BUILD_SOURCE_MAX_TOTAL_BYTES - totalBytes) {
+      throw new Error(
+        `Project source exceeds the ${PROJECT_BUILD_SOURCE_MAX_TOTAL_BYTES} aggregate byte limit`,
+      );
+    }
+    totalBytes += entry.size;
+    selected.push({ entry, relativePath });
+  }
+  return selected;
 }
 
 /**
@@ -178,25 +284,38 @@ async function readProjectSourceFiles(
   let nextIndex = 0;
   let failed = false;
   let firstError: unknown;
-  const workerCount = Math.min(SOURCE_STREAM_READ_CONCURRENCY, filesToRead.length);
+  const workerCount = Math.min(
+    SOURCE_STREAM_READ_CONCURRENCY,
+    filesToRead.length,
+  );
 
-  await Promise.all(Array.from({ length: workerCount }, async () => {
-    for (;;) {
-      if (failed) return;
-      const index = nextIndex;
-      if (index >= filesToRead.length) return;
-      nextIndex += 1;
-      const { entry, relativePath } = filesToRead[index]!;
-      try {
-        const bytes = await readWorkspaceSourceBytes(files, entry.absolutePath, entry.size);
-        results[index] = { path: relativePath, bytes, modifiedAt: entry.modifiedAt };
-      } catch (error) {
-        if (!failed) firstError = error;
-        failed = true;
-        return;
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      for (;;) {
+        if (failed) return;
+        const index = nextIndex;
+        if (index >= filesToRead.length) return;
+        nextIndex += 1;
+        const { entry, relativePath } = filesToRead[index]!;
+        try {
+          const bytes = await readWorkspaceSourceBytes(
+            files,
+            entry.absolutePath,
+            entry.size,
+          );
+          results[index] = {
+            path: relativePath,
+            bytes,
+            modifiedAt: entry.modifiedAt,
+          };
+        } catch (error) {
+          if (!failed) firstError = error;
+          failed = true;
+          return;
+        }
       }
-    }
-  }));
+    }),
+  );
 
   if (failed) throw firstError;
   return results;
@@ -207,27 +326,42 @@ async function readWorkspaceSourceBytes(
   absolutePath: string,
   expectedSize: number,
 ): Promise<Uint8Array> {
+  if (
+    !Number.isSafeInteger(expectedSize) ||
+    expectedSize < 0 ||
+    expectedSize > PROJECT_BUILD_MODULE_MAX_FILE_BYTES
+  ) {
+    throw new Error(
+      `Project source ${absolutePath} exceeds the ${PROJECT_BUILD_MODULE_MAX_FILE_BYTES} byte file limit`,
+    );
+  }
   const streamed = await files.readFileStream(absolutePath);
   if (streamed.success && streamed.stream) {
-    // Preallocate from list metadata so a large source file never takes the
-    // older text/base64 path or accumulates a second set of stream chunks.
     const reader = streamed.stream.getReader();
-    let bytes = new Uint8Array(Math.max(0, expectedSize));
+    const bytes = new Uint8Array(expectedSize);
     let offset = 0;
     try {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
         if (!value?.byteLength) continue;
-        if (offset + value.byteLength > bytes.byteLength) {
-          const grown = new Uint8Array(Math.max(offset + value.byteLength, Math.max(1, bytes.byteLength * 2)));
-          grown.set(bytes);
-          bytes = grown;
+        if (value.byteLength > expectedSize - offset) {
+          await reader.cancel(
+            `Project source ${absolutePath} exceeded its listed byte size`,
+          );
+          throw new Error(
+            `Project source ${absolutePath} exceeded its listed byte size`,
+          );
         }
         bytes.set(value, offset);
         offset += value.byteLength;
       }
-      return offset === bytes.byteLength ? bytes : bytes.slice(0, offset);
+      if (offset !== expectedSize) {
+        throw new Error(
+          `Project source ${absolutePath} did not match its listed byte size`,
+        );
+      }
+      return bytes;
     } catch (error) {
       await reader.cancel(error).catch(() => {});
       throw error;
@@ -237,11 +371,33 @@ async function readWorkspaceSourceBytes(
   }
   const read = await files.readFile(absolutePath);
   if (!read.success || typeof read.content !== "string") {
-    throw new Error(read.error || streamed.error || `Failed to read ${absolutePath}`);
+    throw new Error(
+      read.error || streamed.error || `Failed to read ${absolutePath}`,
+    );
   }
-  return read.encoding === "base64"
-    ? base64ToBytes(read.content)
-    : new TextEncoder().encode(read.content);
+  let bytes: Uint8Array;
+  if (read.encoding === "base64") {
+    const maximumBase64Characters = Math.ceil(expectedSize / 3) * 4 + 4;
+    if (read.content.length > maximumBase64Characters) {
+      throw new Error(
+        `Project source ${absolutePath} exceeded its listed byte size`,
+      );
+    }
+    bytes = base64ToBytes(read.content);
+  } else {
+    if (utf8ByteLength(read.content) !== expectedSize) {
+      throw new Error(
+        `Project source ${absolutePath} did not match its listed byte size`,
+      );
+    }
+    bytes = new TextEncoder().encode(read.content);
+  }
+  if (bytes.byteLength !== expectedSize) {
+    throw new Error(
+      `Project source ${absolutePath} did not match its listed byte size`,
+    );
+  }
+  return bytes;
 }
 
 function shouldReadBuildSourceForValidation(path: string): boolean {
@@ -250,26 +406,41 @@ function shouldReadBuildSourceForValidation(path: string): boolean {
 
 export function shouldIgnoreBuildSourcePath(path: string): boolean {
   const parts = path.split("/");
-  return parts.some((part) =>
-    part === "node_modules" ||
-    part === ".camelai" ||
-    part === ".git" ||
-    part === ".wrangler" ||
-    part === ".cache" ||
-    part === "dist" ||
-    part === "build"
+  return parts.some(
+    (part) =>
+      part === "node_modules" ||
+      part === ".camelai" ||
+      part === ".git" ||
+      part === ".wrangler" ||
+      part === ".cache" ||
+      part === "dist" ||
+      part === "build",
   );
 }
 
 export function normalizeRelativeBuildPath(path: string): string {
-  return path.replace(/\\/g, "/").replace(/^\/+/, "").split("/").filter((part) => part && part !== "." && part !== "..").join("/");
+  return path
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .split("/")
+    .filter((part) => part && part !== "." && part !== "..")
+    .join("/");
 }
 
 export async function materializeProjectSourceFiles(
   sandbox: ProjectBuildSandboxLike,
   workdir: string,
   source: ProjectSourceCollection,
-): Promise<Pick<ProjectBuildSourceTimings, "materializeMs" | "previousManifestReadMs" | "archiveCreateMs" | "archiveWriteMs" | "materializeExecMs">> {
+): Promise<
+  Pick<
+    ProjectBuildSourceTimings,
+    | "materializeMs"
+    | "previousManifestReadMs"
+    | "archiveCreateMs"
+    | "archiveWriteMs"
+    | "materializeExecMs"
+  >
+> {
   const startedAt = Date.now();
   await sandbox.mkdir(workdir, { recursive: true });
   const manifest = sourceManifestForEntries(source.entries);
@@ -283,18 +454,26 @@ export async function materializeProjectSourceFiles(
   const archiveWriteStartedAt = Date.now();
   await Promise.all([
     ...archiveLanes.map((lane) => sandbox.writeFile(lane.path, lane.stream)),
-    sandbox.writeFile(manifestPath, JSON.stringify(manifest), { encoding: "utf8" }),
+    sandbox.writeFile(manifestPath, JSON.stringify(manifest), {
+      encoding: "utf8",
+    }),
   ]);
   const archiveWriteMs = Date.now() - archiveWriteStartedAt;
 
   const materializeExecStartedAt = Date.now();
-  await sandbox.exec(materializeCommand({
-    workdir,
-    currentManifestPath,
-    manifestPath,
-    archives: archiveLanes.map(({ path, compressed }) => ({ path, compressed })),
-    forceClean: source.previousManifest === null,
-  }), { cwd: PROJECT_BUILD_ROOT });
+  await sandbox.exec(
+    materializeCommand({
+      workdir,
+      currentManifestPath,
+      manifestPath,
+      archives: archiveLanes.map(({ path, compressed }) => ({
+        path,
+        compressed,
+      })),
+      forceClean: source.previousManifest === null,
+    }),
+    { cwd: PROJECT_BUILD_ROOT },
+  );
   const materializeExecMs = Date.now() - materializeExecStartedAt;
 
   return {
@@ -306,13 +485,17 @@ export async function materializeProjectSourceFiles(
   };
 }
 
-export function validatePackageJsonBuildScript(sourceFiles: ProjectSourceFile[]): string | null {
+export function validatePackageJsonBuildScript(
+  sourceFiles: ProjectSourceFile[],
+): string | null {
   const packageJson = sourceFiles.find((file) => file.path === "package.json");
-  if (!packageJson) return "Project package.json is required for deploy_project";
+  if (!packageJson)
+    return "Project package.json is required for deploy_project";
   const parsed = parseProjectPackageJson(packageJson);
   if (typeof parsed === "string") return parsed;
   const scripts = (parsed as { scripts?: unknown }).scripts;
-  const buildScriptMessage = "Project package.json must define scripts.build. Create a new project to get the standard react-router scaffold, and list every CLI used by scripts.build in dependencies or devDependencies. Data-analysis projects have no build step — use run_notebook to execute the notebook, then deploy_project to publish it as a static report app.";
+  const buildScriptMessage =
+    "Project package.json must define scripts.build. Create a new project to get the standard react-router scaffold, and list every CLI used by scripts.build in dependencies or devDependencies. Data-analysis projects have no build step — use run_notebook to execute the notebook, then deploy_project to publish it as a static report app.";
   if (!scripts || typeof scripts !== "object") return buildScriptMessage;
   const build = (scripts as { build?: unknown }).build;
   return typeof build === "string" && build.trim() ? null : buildScriptMessage;
@@ -329,7 +512,9 @@ const D1_STYLE_PREPARE_PATTERN = /\bsql\s*\.\s*prepare\s*\(/;
 // calls on SqlStorage build cleanly and only crash at runtime after deploy. Catch the
 // known footgun here for every project, with a corrective message that names the fix
 // (tsc only says the property doesn't exist).
-export function validateDoSqliteApiUsage(sourceFiles: ProjectSourceFile[]): string | null {
+export function validateDoSqliteApiUsage(
+  sourceFiles: ProjectSourceFile[],
+): string | null {
   const decoder = new TextDecoder();
   for (const file of sourceFiles) {
     if (!DO_SQLITE_CHECK_EXTENSIONS.test(file.path)) continue;
@@ -346,7 +531,9 @@ export function validateDoSqliteApiUsage(sourceFiles: ProjectSourceFile[]): stri
   return null;
 }
 
-function sourceManifestForEntries(sourceFiles: ProjectSourceEntry[]): SourceManifest {
+function sourceManifestForEntries(
+  sourceFiles: ProjectSourceEntry[],
+): SourceManifest {
   return {
     schemaVersion: 2,
     files: sourceFiles.map((file) => ({
@@ -362,7 +549,10 @@ async function readSourceManifestFromSandbox(
   sandbox: ProjectBuildSandboxLike,
   workdir: string,
 ): Promise<SourceManifest | null> {
-  if (!sandbox.readFile) return null;
+  // The SDK's scalar readFile RPC materializes the entire producer response
+  // before this isolate can inspect its size. Old manifests are only a cache;
+  // without streaming support, safely take the bounded cache-miss path.
+  if (!sandbox.readFileStream) return null;
   const manifestPath = sourceManifestPath(workdir);
   // A missing manifest is the normal first-build cache-miss path. Avoid using a
   // rejected readFile RPC as an existence probe: the eval runtime can surface a
@@ -372,16 +562,36 @@ async function readSourceManifestFromSandbox(
     const existence = await sandbox.exists(manifestPath);
     if (!existence.exists) return null;
   }
-  let read: { content: string };
+  let content: string;
   try {
-    read = await sandbox.readFile(manifestPath, { encoding: "utf8" });
+    const bytes = await readSandboxFileBytes(
+      sandbox,
+      manifestPath,
+      PROJECT_BUILD_MANIFEST_MAX_BYTES,
+    );
+    content = new TextDecoder().decode(bytes);
   } catch (error) {
     const message = String(error).toLowerCase();
-    if (message.includes("missing") || message.includes("not found") || message.includes("enoent")) return null;
+    if (
+      message.includes("missing") ||
+      message.includes("not found") ||
+      message.includes("enoent")
+    )
+      return null;
+    if (
+      (message.includes("exceeds") && message.includes("byte limit")) ||
+      message.includes("transport limits")
+    )
+      return null;
     throw error;
   }
   try {
-    return validateSourceManifest(JSON.parse(read.content));
+    return validateSourceManifest(
+      parseJsonBounded(
+        content,
+        runtimeJsonLimits(PROJECT_BUILD_MANIFEST_MAX_BYTES),
+      ),
+    );
   } catch {
     // Treat malformed old state as a cache miss. The materializer will wipe the
     // workdir before extracting the full source archive.
@@ -390,25 +600,72 @@ async function readSourceManifestFromSandbox(
 }
 
 function validateSourceManifest(value: unknown): SourceManifest {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid source manifest");
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("invalid source manifest");
   const record = value as SourceManifest;
-  if ((record.schemaVersion !== 1 && record.schemaVersion !== 2) || !Array.isArray(record.files)) throw new Error("invalid source manifest");
+  if (
+    (record.schemaVersion !== 1 && record.schemaVersion !== 2) ||
+    !Array.isArray(record.files)
+  )
+    throw new Error("invalid source manifest");
+  if (record.files.length > PROJECT_BUILD_OUTPUT_MAX_ENTRIES) {
+    throw new Error("invalid source manifest");
+  }
+  let totalBytes = 0;
+  const seen = new Set<string>();
   const files = record.files.map((file) => {
-    if (!file || typeof file !== "object" || Array.isArray(file)) throw new Error("invalid source manifest");
-    const entry = file as { path?: unknown; size?: unknown; sha256?: unknown; modifiedAt?: unknown };
-    if (typeof entry.path !== "string" || !entry.path || entry.path.includes("\0") || entry.path.startsWith("/")) {
+    if (!file || typeof file !== "object" || Array.isArray(file))
+      throw new Error("invalid source manifest");
+    const entry = file as {
+      path?: unknown;
+      size?: unknown;
+      sha256?: unknown;
+      modifiedAt?: unknown;
+    };
+    if (
+      typeof entry.path !== "string" ||
+      !entry.path ||
+      entry.path.includes("\0") ||
+      entry.path.startsWith("/") ||
+      entry.path.length > PROJECT_BUILD_OUTPUT_MAX_PATH_BYTES ||
+      utf8ByteLength(entry.path) > PROJECT_BUILD_OUTPUT_MAX_PATH_BYTES
+    ) {
       throw new Error("invalid source manifest");
     }
-    if (typeof entry.size !== "number" || entry.size < 0 || !Number.isFinite(entry.size)) throw new Error("invalid source manifest");
-    if (typeof entry.sha256 !== "string" || !/^[a-f0-9]{64}$/i.test(entry.sha256)) throw new Error("invalid source manifest");
-    if (entry.modifiedAt != null && typeof entry.modifiedAt !== "string") throw new Error("invalid source manifest");
+    if (
+      typeof entry.size !== "number" ||
+      !Number.isSafeInteger(entry.size) ||
+      entry.size < 0 ||
+      entry.size > PROJECT_BUILD_MODULE_MAX_FILE_BYTES
+    )
+      throw new Error("invalid source manifest");
+    if (
+      typeof entry.sha256 !== "string" ||
+      !/^[a-f0-9]{64}$/i.test(entry.sha256)
+    )
+      throw new Error("invalid source manifest");
+    if (
+      entry.modifiedAt != null &&
+      (typeof entry.modifiedAt !== "string" ||
+        entry.modifiedAt.length > PROJECT_BUILD_OUTPUT_MAX_PATH_BYTES)
+    )
+      throw new Error("invalid source manifest");
+    const path = normalizeRelativeBuildPath(entry.path);
+    if (!path || seen.has(path)) throw new Error("invalid source manifest");
+    seen.add(path);
+    if (entry.size > PROJECT_BUILD_SOURCE_MAX_TOTAL_BYTES - totalBytes) {
+      throw new Error("invalid source manifest");
+    }
+    totalBytes += entry.size;
     return {
-      path: normalizeRelativeBuildPath(entry.path),
+      path,
       size: entry.size,
       sha256: entry.sha256.toLowerCase(),
-      ...(typeof entry.modifiedAt === "string" ? { modifiedAt: entry.modifiedAt } : {}),
+      ...(typeof entry.modifiedAt === "string"
+        ? { modifiedAt: entry.modifiedAt }
+        : {}),
     };
-  }).filter((file) => file.path);
+  });
   return { schemaVersion: record.schemaVersion, files };
 }
 
@@ -424,15 +681,25 @@ function materializeCommand(input: {
   forceClean?: boolean;
 }): string {
   const commands = [
-    ...input.archives.map((archive) => `tar -t${archive.compressed ? "z" : ""}f ${shellQuote(archive.path)} >/dev/null`),
+    ...input.archives.map(
+      (archive) =>
+        `tar -t${archive.compressed ? "z" : ""}f ${shellQuote(archive.path)} >/dev/null`,
+    ),
     `CAMELAI_WORKDIR=${shellQuote(input.workdir)} CAMELAI_CURRENT_MANIFEST=${shellQuote(input.currentManifestPath)} CAMELAI_NEXT_MANIFEST=${shellQuote(input.manifestPath)} CAMELAI_FORCE_CLEAN=${input.forceClean ? "1" : "0"} bun -e ${shellQuote(SOURCE_MATERIALIZE_SCRIPT)}`,
   ];
-  commands.push(...input.archives.map((archive) =>
-    `tar -x${archive.compressed ? "z" : ""}f ${shellQuote(archive.path)} -C ${shellQuote(input.workdir)}`
-  ));
-  commands.push(`mv ${shellQuote(input.manifestPath)} ${shellQuote(input.currentManifestPath)}`);
+  commands.push(
+    ...input.archives.map(
+      (archive) =>
+        `tar -x${archive.compressed ? "z" : ""}f ${shellQuote(archive.path)} -C ${shellQuote(input.workdir)}`,
+    ),
+  );
+  commands.push(
+    `mv ${shellQuote(input.manifestPath)} ${shellQuote(input.currentManifestPath)}`,
+  );
   commands.push(`rm -f ${shellQuote(workdirArchivePrefix(input.workdir))}*`);
-  commands.push(`find ${shellQuote(input.workdir)} -type d -empty -delete 2>/dev/null || true`);
+  commands.push(
+    `find ${shellQuote(input.workdir)} -type d -empty -delete 2>/dev/null || true`,
+  );
   return commands.join(" && ");
 }
 
@@ -473,17 +740,30 @@ interface SourceArchiveLane {
   stream: ReadableStream<Uint8Array>;
 }
 
-function createArchiveLanes(workdir: string, sourceFiles: ProjectSourceFile[]): SourceArchiveLane[] {
+function createArchiveLanes(
+  workdir: string,
+  sourceFiles: ProjectSourceFile[],
+): SourceArchiveLane[] {
   if (sourceFiles.length === 0) return [];
-  const totalBytes = sourceFiles.reduce((sum, file) => sum + file.bytes.byteLength, 0);
+  const totalBytes = sourceFiles.reduce(
+    (sum, file) => sum + file.bytes.byteLength,
+    0,
+  );
   const laneCount = Math.min(
     SOURCE_ARCHIVE_MAX_LANES,
     sourceFiles.length,
     Math.max(1, Math.ceil(totalBytes / SOURCE_ARCHIVE_TARGET_LANE_BYTES)),
   );
-  const lanes = Array.from({ length: laneCount }, () => ({ bytes: 0, files: [] as ProjectSourceFile[] }));
-  for (const file of [...sourceFiles].sort((a, b) => b.bytes.byteLength - a.bytes.byteLength)) {
-    const lane = lanes.reduce((smallest, candidate) => candidate.bytes < smallest.bytes ? candidate : smallest);
+  const lanes = Array.from({ length: laneCount }, () => ({
+    bytes: 0,
+    files: [] as ProjectSourceFile[],
+  }));
+  for (const file of [...sourceFiles].sort(
+    (a, b) => b.bytes.byteLength - a.bytes.byteLength,
+  )) {
+    const lane = lanes.reduce((smallest, candidate) =>
+      candidate.bytes < smallest.bytes ? candidate : smallest,
+    );
     lane.files.push(file);
     lane.bytes += file.bytes.byteLength;
   }
@@ -494,7 +774,12 @@ function createArchiveLanes(workdir: string, sourceFiles: ProjectSourceFile[]): 
       path: `${workdirArchivePrefix(workdir)}${index}.tar${compressed ? ".gz" : ""}`,
       compressed,
       stream: compressed
-        ? stream.pipeThrough(new CompressionStream("gzip") as unknown as ReadableWritablePair<Uint8Array, Uint8Array>)
+        ? stream.pipeThrough(
+            new CompressionStream("gzip") as unknown as ReadableWritablePair<
+              Uint8Array,
+              Uint8Array
+            >,
+          )
         : stream,
     };
   });
@@ -504,12 +789,20 @@ function workdirArchivePrefix(workdir: string): string {
   return `${workdir}.source.`;
 }
 
-function createTarStream(sourceFiles: ProjectSourceFile[]): ReadableStream<Uint8Array> {
+function createTarStream(
+  sourceFiles: ProjectSourceFile[],
+): ReadableStream<Uint8Array> {
   const chunks: Uint8Array[] = [];
   for (const file of sourceFiles) {
     chunks.push(tarHeader(file.path, file.bytes.byteLength));
-    for (let offset = 0; offset < file.bytes.byteLength; offset += SOURCE_ARCHIVE_STREAM_CHUNK_BYTES) {
-      chunks.push(file.bytes.subarray(offset, offset + SOURCE_ARCHIVE_STREAM_CHUNK_BYTES));
+    for (
+      let offset = 0;
+      offset < file.bytes.byteLength;
+      offset += SOURCE_ARCHIVE_STREAM_CHUNK_BYTES
+    ) {
+      chunks.push(
+        file.bytes.subarray(offset, offset + SOURCE_ARCHIVE_STREAM_CHUNK_BYTES),
+      );
     }
     const padding = tarPadding(file.bytes.byteLength);
     if (padding > 0) chunks.push(new Uint8Array(padding));
@@ -546,28 +839,46 @@ function tarHeader(path: string, size: number): Uint8Array {
 
 function splitTarPath(path: string): { name: string; prefix?: string } {
   // oxlint-disable-next-line no-control-regex -- Tar paths must reject NUL and newline characters.
-  if (/[\u0000\r\n]/.test(path)) throw new Error(`Invalid source path for archive: ${path}`);
+  if (/[\u0000\r\n]/.test(path))
+    throw new Error(`Invalid source path for archive: ${path}`);
   const encoded = new TextEncoder().encode(path);
   if (encoded.byteLength <= 100) return { name: path };
   const parts = path.split("/");
   for (let index = 1; index < parts.length; index += 1) {
     const prefix = parts.slice(0, index).join("/");
     const name = parts.slice(index).join("/");
-    if (new TextEncoder().encode(prefix).byteLength <= 155 && new TextEncoder().encode(name).byteLength <= 100) {
+    if (
+      new TextEncoder().encode(prefix).byteLength <= 155 &&
+      new TextEncoder().encode(name).byteLength <= 100
+    ) {
       return { name, prefix };
     }
   }
   throw new Error(`Source path is too long for archive: ${path}`);
 }
 
-function writeTarString(header: Uint8Array, offset: number, length: number, value: string): void {
+function writeTarString(
+  header: Uint8Array,
+  offset: number,
+  length: number,
+  value: string,
+): void {
   const encoded = new TextEncoder().encode(value);
-  if (encoded.byteLength > length) throw new Error(`Tar field is too long: ${value}`);
+  if (encoded.byteLength > length)
+    throw new Error(`Tar field is too long: ${value}`);
   header.set(encoded, offset);
 }
 
-function writeTarOctal(header: Uint8Array, offset: number, length: number, value: number): void {
-  const text = value.toString(8).padStart(length - 1, "0").slice(-(length - 1));
+function writeTarOctal(
+  header: Uint8Array,
+  offset: number,
+  length: number,
+  value: number,
+): void {
+  const text = value
+    .toString(8)
+    .padStart(length - 1, "0")
+    .slice(-(length - 1));
   writeTarString(header, offset, length - 1, text);
   header[offset + length - 1] = 0;
 }
@@ -584,14 +895,18 @@ function tarPadding(size: number): number {
   return remainder === 0 ? 0 : 512 - remainder;
 }
 
-export function validatePackageJson(sourceFiles: ProjectSourceFile[]): string | null {
+export function validatePackageJson(
+  sourceFiles: ProjectSourceFile[],
+): string | null {
   const packageJson = sourceFiles.find((file) => file.path === "package.json");
   if (!packageJson) return "Project package.json is required";
   const parsed = parseProjectPackageJson(packageJson);
   return typeof parsed === "string" ? parsed : null;
 }
 
-function parseProjectPackageJson(packageJson: ProjectSourceFile): unknown | string {
+function parseProjectPackageJson(
+  packageJson: ProjectSourceFile,
+): unknown | string {
   let parsed: unknown;
   try {
     parsed = JSON.parse(new TextDecoder().decode(packageJson.bytes));

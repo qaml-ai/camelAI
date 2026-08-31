@@ -1,6 +1,16 @@
 import { DurableChatTurnStore } from "./durable-turn-store";
 import type { ChatSnapshotMessage, StoreRejection } from "./durable-turn-store";
 import { CHAT_RUNTIME_BOUNDS } from "../../../../src/lib/chat-runtime-bounds";
+import { parseJsonBounded, runtimeJsonLimits } from "./bounded-json-parse";
+import {
+  boundedJsonString,
+  jsonStringByteLength,
+  utf8ByteLength,
+} from "./utf8-byte-length";
+import {
+  parseRuntimeContent,
+  serializeRuntimeContent,
+} from "./chat-runtime-content";
 export interface TrustedChatRuntimeScope {
   threadId: string;
   workspaceId: string;
@@ -23,23 +33,21 @@ export interface ChatRuntimeCallbacks {
   coarseState(): unknown | Promise<unknown>;
 }
 export interface ChatRuntimeLiveUpdate {
-  turnId: string;
-  epoch: string;
+  turnId: string; epoch: string;
   activeTurn: { id: string; status: "running"; acceptedAt: number; startedAt?: number };
-  message: { id: string; role: "assistant"; content: string | readonly unknown[]; createdAt: number; status: "running" };
+  message: {
+    id: string; role: "assistant";
+    content: string | readonly unknown[];
+    createdAt: number; status: "running";
+  };
 }
-type ChatRuntimeLiveFrame = ChatRuntimeLiveUpdate & {
-  type: "live";
-  seq: number;
-};
+type ChatRuntimeLiveFrame = ChatRuntimeLiveUpdate & { type: "live"; seq: number };
 type LiveEpoch = {
-  turnId: string;
-  epoch: string;
+  turnId: string; epoch: string;
   latest: ChatRuntimeLiveUpdate;
-  dirty: boolean;
-  emitted: number;
-  emittedBytes: number;
-  lastEmitted: ChatRuntimeLiveFrame | null;
+  startedAt: number; deadlineAt: number; dirty: boolean;
+  emitted: number; emittedBytes: number;
+  lastFrame: Uint8Array | null;
   timer: ReturnType<typeof setTimeout> | null;
 };
 class LimitError extends Error {
@@ -90,7 +98,10 @@ async function readJsonBounded(request: Request): Promise<unknown> {
           text += decoder.decode(chunk.value, { stream: true });
         }
         text += decoder.decode();
-        return JSON.parse(text);
+        return parseJsonBounded(
+          text,
+          runtimeJsonLimits(CHAT_RUNTIME_BOUNDS.requestBytes),
+        );
       })(),
       CHAT_RUNTIME_BOUNDS.bodyReadMs,
     );
@@ -124,23 +135,23 @@ class BoundedSseWriter {
     );
   }
   comment(value = "hb"): boolean {
-    return this.write(`:${value}\n\n`, false);
+    return this.write(encoder.encode(`:${value}\n\n`), false);
   }
   frame(value: unknown): boolean {
-    let serialized: string;
-    try {
-      serialized = `data: ${JSON.stringify(value)}\n\n`;
-    } catch {
+    const chunk = encodeFrame(value);
+    if (!chunk) {
       this.close();
       return false;
     }
-    const written = this.write(serialized, true);
+    return this.encodedFrame(chunk);
+  }
+  encodedFrame(chunk: Uint8Array): boolean {
+    const written = this.write(chunk, true);
     if (!written) this.close();
     return written;
   }
-  private write(value: string, data: boolean): boolean {
+  private write(chunk: Uint8Array, data: boolean): boolean {
     if (this.closed) return false;
-    const chunk = encoder.encode(value);
     if (chunk.byteLength > CHAT_RUNTIME_BOUNDS.sseWriterBytes) return false;
     const remaining = Math.max(0, Math.floor(this.sink.desiredSize ?? 0));
     if (chunk.byteLength > remaining) {
@@ -190,15 +201,17 @@ function runtimeMessage(message: ChatSnapshotMessage) {
   const { id, role, content, createdAt, status } = message;
   return { id, role, content, createdAt, status };
 }
+function encodeFrame(value: unknown): Uint8Array | null {
+  try { return encoder.encode(`data: ${JSON.stringify(value)}\n\n`); }
+  catch { return null; }
+}
 function frameBytes(value: unknown): number {
-  return encoder.encode(`data: ${JSON.stringify(value)}\n\n`).byteLength;
+  try { return 8 + utf8ByteLength(JSON.stringify(value)); }
+  catch { return Number.POSITIVE_INFINITY; }
 }
 function liveIdentifier(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.length > 0 &&
-    value.length <= CHAT_RUNTIME_BOUNDS.identifierChars
-  );
+  return typeof value === "string" && value.length > 0 &&
+    value.length <= CHAT_RUNTIME_BOUNDS.identifierChars;
 }
 function finiteTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
@@ -232,6 +245,12 @@ function normalizeLiveUpdate(update: ChatRuntimeLiveUpdate): {
   let content: string | unknown[];
   try {
     if (typeof update.message.content === "string") {
+      if (
+        jsonStringByteLength(update.message.content) >
+        CHAT_RUNTIME_BOUNDS.liveMessageBytes
+      ) {
+        return { update: null, oversize: true };
+      }
       content = update.message.content;
     } else if (Array.isArray(update.message.content)) {
       if (
@@ -239,27 +258,8 @@ function normalizeLiveUpdate(update: ChatRuntimeLiveUpdate): {
       ) {
         return { update: null, oversize: true };
       }
-      for (const block of update.message.content) {
-        if (!block || typeof block !== "object" || Array.isArray(block)) {
-          return { update: null, oversize: false };
-        }
-        const descriptor = Object.getOwnPropertyDescriptor(block, "type");
-        if (
-          !descriptor ||
-          !("value" in descriptor) ||
-          typeof descriptor.value !== "string" ||
-          descriptor.value.length === 0
-        ) {
-          return { update: null, oversize: false };
-        }
-      }
-      const trace = JSON.stringify(update.message.content);
-      if (
-        encoder.encode(trace).byteLength > CHAT_RUNTIME_BOUNDS.liveMessageBytes
-      ) {
-        return { update: null, oversize: true };
-      }
-      content = JSON.parse(trace) as unknown[];
+      const trace = serializeRuntimeContent(update.message.content);
+      content = parseRuntimeContent(trace) ?? [];
     } else {
       return { update: null, oversize: false };
     }
@@ -287,9 +287,7 @@ function normalizeLiveUpdate(update: ChatRuntimeLiveUpdate): {
     },
   };
   try {
-    const messageBytes = encoder.encode(
-      JSON.stringify(normalized.message),
-    ).byteLength;
+    const messageBytes = utf8ByteLength(JSON.stringify(normalized.message));
     const largestFrame: ChatRuntimeLiveFrame = {
       type: "live",
       ...normalized,
@@ -310,40 +308,40 @@ function fitNewestMessages(
   payload: Record<string, unknown>,
   messages: Array<ReturnType<typeof runtimeMessage>>,
 ): void {
-  if (
-    !messages.length ||
-    frameBytes(payload) <= CHAT_RUNTIME_BOUNDS.sseWriterBytes
-  )
-    return;
-  const stringIndexes = messages.flatMap((message, index) =>
-    typeof message.content === "string" ? [index] : [],
-  );
-  if (!stringIndexes.length) return;
-  const target = stringIndexes.reduce((largest, index) =>
-    (messages[index].content as string).length >
-    (messages[largest].content as string).length
-      ? index
-      : largest,
-  );
+  if (!messages.length) return;
+  let target = -1, targetBytes = -1;
+  for (const [index, message] of messages.entries()) {
+    if (typeof message.content !== "string") continue;
+    const bytes = jsonStringByteLength(message.content);
+    if (bytes > targetBytes) { target = index; targetBytes = bytes; }
+  }
+  if (target < 0) return;
   const content = messages[target].content;
   if (typeof content !== "string") return;
-  let low = 0;
-  let high = content.length;
-  const prefix = (length: number) => {
-    let end = length;
-    if (end > 0 && /[\uD800-\uDBFF]/.test(content[end - 1])) end -= 1;
-    return content.slice(0, end) + (end < content.length ? "…" : "");
-  };
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2);
-    messages[target] = { ...messages[target], content: prefix(middle) };
-    if (frameBytes(payload) <= CHAT_RUNTIME_BOUNDS.sseWriterBytes) low = middle;
-    else high = middle - 1;
-  }
-  messages[target] = { ...messages[target], content: prefix(low) };
-  if (frameBytes(payload) > CHAT_RUNTIME_BOUNDS.sseWriterBytes) {
-    messages[target] = { ...messages[target], content: "" };
-  }
+  messages[target] = { ...messages[target], content: "" };
+  const empty = encodeFrame(payload);
+  if (!empty || empty.byteLength > CHAT_RUNTIME_BOUNDS.sseWriterBytes) return;
+  messages[target] = { ...messages[target], content: boundedJsonString(
+    content, CHAT_RUNTIME_BOUNDS.sseWriterBytes - empty.byteLength + 2) };
+}
+function liveRefillDelay(
+  live: LiveEpoch, frameBytes: number, now: number,
+): number | null {
+  const total = CHAT_RUNTIME_BOUNDS.liveBytesPerTurn;
+  const required = live.emittedBytes + frameBytes;
+  if (required > total || now > live.deadlineAt) return null;
+  const burst = Math.min(total, CHAT_RUNTIME_BOUNDS.liveBurstBytes);
+  const duration = Math.max(1, live.deadlineAt - live.startedAt);
+  const elapsed = Math.max(0, Math.min(duration, now - live.startedAt));
+  const allowance = Math.min(total,
+    burst + Math.floor(((total - burst) * elapsed) / duration));
+  if (required <= allowance) return 0;
+  if (now >= live.deadlineAt) return null;
+  const refill = total - burst;
+  if (refill <= 0) return null;
+  const targetElapsed = Math.ceil(((required - burst) * duration) / refill);
+  return Math.max(CHAT_RUNTIME_BOUNDS.liveFlushMs,
+    live.startedAt + targetElapsed - now);
 }
 /** A framework-free, bounded HTTP/SSE boundary around durable chat turns. */
 export class ChatRuntimeController {
@@ -410,7 +408,7 @@ export class ChatRuntimeController {
   }
   /**
    * Best-effort presentation only. Live frames never touch storage, the durable
-   * cursor, the outbox, or the turn lifecycle. Callers provide a cumulative
+   * cursor or the turn lifecycle. Callers provide a cumulative
    * view; bursts collapse into at most one bounded frame per flush interval.
    */
   publishLive(update: ChatRuntimeLiveUpdate): void {
@@ -418,7 +416,8 @@ export class ChatRuntimeController {
       this.liveEpoch &&
       (this.liveEpoch.emitted >= CHAT_RUNTIME_BOUNDS.liveFramesPerTurn ||
         this.liveEpoch.emittedBytes >= CHAT_RUNTIME_BOUNDS.liveBytesPerTurn)
-    ) return;
+    )
+      return;
     const normalized = normalizeLiveUpdate(update);
     if (!normalized.update) {
       if (normalized.oversize) {
@@ -437,18 +436,19 @@ export class ChatRuntimeController {
       // through clearLive so a stale producer can never retake presentation.
       return;
     }
-    const live =
-      current ??
-      (this.liveEpoch = {
-        turnId: normalized.update.turnId,
-        epoch: normalized.update.epoch,
-        latest: normalized.update,
-        dirty: false,
-        emitted: 0,
-        emittedBytes: 0,
-        lastEmitted: null,
-        timer: null,
-    });
+    let live = current;
+    if (!live) {
+      const acceptedAt = normalized.update.activeTurn.acceptedAt;
+      const startedAt = Math.min(Date.now(), acceptedAt);
+      live = this.liveEpoch = {
+        turnId: normalized.update.turnId, epoch: normalized.update.epoch,
+        latest: normalized.update, startedAt,
+        deadlineAt: Math.min(Number.MAX_SAFE_INTEGER,
+          startedAt + CHAT_RUNTIME_BOUNDS.turnLeaseMs),
+        dirty: false, emitted: 0, emittedBytes: 0,
+        lastFrame: null, timer: null,
+      };
+    }
     live.latest = normalized.update;
     live.dirty = true;
     if (live.timer !== null) return;
@@ -470,35 +470,47 @@ export class ChatRuntimeController {
   private flushLive(live: LiveEpoch): void {
     if (this.liveEpoch !== live) return;
     live.timer = null;
-    if (!live.dirty || live.emitted >= CHAT_RUNTIME_BOUNDS.liveFramesPerTurn ||
-      live.emittedBytes >= CHAT_RUNTIME_BOUNDS.liveBytesPerTurn) return;
-    live.dirty = false;
+    if (
+      !live.dirty ||
+      live.emitted >= CHAT_RUNTIME_BOUNDS.liveFramesPerTurn ||
+      live.emittedBytes >= CHAT_RUNTIME_BOUNDS.liveBytesPerTurn
+    )
+      return;
     const frame: ChatRuntimeLiveFrame = {
       type: "live",
       ...live.latest,
       seq: live.emitted + 1,
     };
-    const bytes = frameBytes(frame);
-    if (bytes > CHAT_RUNTIME_BOUNDS.sseWriterBytes) {
+    const encoded = encodeFrame(frame);
+    if (!encoded || encoded.byteLength > CHAT_RUNTIME_BOUNDS.sseWriterBytes) {
       this.clearLive(live.turnId, live.epoch);
       for (const connection of this.connections.values()) connection.close();
       return;
     }
-    if (bytes > CHAT_RUNTIME_BOUNDS.liveBytesPerTurn - live.emittedBytes) {
+    const bytes = encoded.byteLength;
+    const now = Date.now();
+    const refillDelay = liveRefillDelay(live, bytes, now);
+    if (refillDelay === null) {
       live.emittedBytes = CHAT_RUNTIME_BOUNDS.liveBytesPerTurn;
+      live.dirty = false;
       return;
     }
+    if (refillDelay > 0) {
+      live.timer = setTimeout(() => this.flushLive(live), refillDelay);
+      return;
+    }
+    live.dirty = false;
     live.emitted += 1;
     live.emittedBytes += bytes;
-    live.lastEmitted = frame;
+    live.lastFrame = encoded;
     for (const writer of this.connections.values()) {
-      if (!writer.closed && writer.liveReady) writer.frame(frame);
+      if (!writer.closed && writer.liveReady) writer.encodedFrame(encoded);
     }
   }
   private seedLive(writer: BoundedSseWriter): void {
-    const frame = this.liveEpoch?.lastEmitted;
+    const frame = this.liveEpoch?.lastFrame;
     if (!frame || writer.closed) return;
-    writer.frame(frame);
+    writer.encodedFrame(frame);
   }
   private scheduleKick(scope?: TrustedChatRuntimeScope): void {
     this.ctx.waitUntil(
@@ -543,11 +555,7 @@ export class ChatRuntimeController {
       return new Response("Invalid cursor", { status: 400 });
     }
     if (
-      this.connections.size >=
-        Math.min(
-          CHAT_RUNTIME_BOUNDS.sseWritersPerUser,
-          CHAT_RUNTIME_BOUNDS.sseWritersPerThread,
-        ) ||
+      this.connections.size >= CHAT_RUNTIME_BOUNDS.sseWritersPerThread ||
       this.reservedSseBytes + CHAT_RUNTIME_BOUNDS.sseWriterQueueBytes >
         CHAT_RUNTIME_BOUNDS.sseDoBytes
     ) {
@@ -621,15 +629,15 @@ export class ChatRuntimeController {
     await deadline(
       Promise.resolve().then(async () => {
         const snapshotVersion = writer.snapshotVersion;
-        const outbox = this.store.readOutbox(after > 0 ? after : null);
-        writer.frame({ type: "hello", cursor: outbox.cursor });
+        const cursor = this.store.revision();
+        writer.frame({ type: "hello", cursor });
         if (writer.closed) return;
-        if (after === 0 || outbox.reset || outbox.events.length) {
+        if (after === 0 || after !== cursor) {
           const snapshot = await Promise.resolve(this.store.latestSnapshot());
           this.sendSnapshot(
             writer,
             after === 0 ? "snapshot" : "reset",
-            outbox.cursor,
+            cursor,
             snapshot,
             await this.callbacks.coarseState(),
             snapshotVersion,
@@ -646,18 +654,21 @@ export class ChatRuntimeController {
     try {
       await deadline(
         Promise.resolve().then(async () => {
-          const changed = [...this.connections.values()]
-            .filter((writer) => !writer.closed)
-            .map((writer) => ({
-              writer,
-              outbox: this.store.readOutbox(writer.cursor),
-            }))
-            .filter(({ outbox }) => outbox.reset || outbox.events.length);
+          const cursor = this.store.revision();
+          const changed = [...this.connections.values()].filter(
+            (writer) => !writer.closed && writer.cursor !== cursor,
+          );
           if (!changed.length) return;
           const snapshot = await Promise.resolve(this.store.latestSnapshot());
           const state = await this.callbacks.coarseState();
-          for (const { writer, outbox } of changed) {
-            this.sendSnapshot(writer, "reset", outbox.cursor, snapshot, state);
+          const frame = this.buildSnapshotFrame(
+            "reset",
+            cursor,
+            snapshot,
+            state,
+          );
+          for (const writer of changed) {
+            this.writeSnapshot(writer, cursor, frame);
           }
         }),
         CHAT_RUNTIME_BOUNDS.runtimeCallbackMs,
@@ -683,6 +694,18 @@ export class ChatRuntimeController {
     ) {
       return;
     }
+    this.writeSnapshot(
+      writer,
+      cursor,
+      this.buildSnapshotFrame(type, cursor, snapshot, state),
+    );
+  }
+  private buildSnapshotFrame(
+    type: "snapshot" | "reset",
+    cursor: number,
+    snapshot: ReturnType<DurableChatTurnStore["latestSnapshot"]>,
+    state: unknown,
+  ): Uint8Array | null {
     const selected = snapshot.messages.slice(
       -CHAT_RUNTIME_BOUNDS.snapshotMessages,
     );
@@ -708,22 +731,47 @@ export class ChatRuntimeController {
         : null,
       ...(state === undefined ? {} : { state }),
     };
+    let encoded = encodeFrame(payload);
+    if (encoded && encoded.byteLength <= CHAT_RUNTIME_BOUNDS.sseWriterBytes) {
+      return encoded;
+    }
     const newestTurnId = selected.at(-1)?.turnId;
-    while (
-      messages.length &&
-      selected[0]?.turnId !== newestTurnId &&
-      frameBytes(payload) > CHAT_RUNTIME_BOUNDS.sseWriterBytes
-    ) {
-      selected.shift();
-      messages.shift();
+    const newestStart = selected.findIndex(
+      (message) => message.turnId === newestTurnId);
+    if (newestStart > 0) {
+      let low = 1, high = newestStart, keepFrom = newestStart;
+      while (low <= high) {
+        const middle = Math.floor((low + high) / 2);
+        payload.messages = messages.slice(middle);
+        const candidate = encodeFrame(payload);
+        if (candidate?.byteLength &&
+          candidate.byteLength <= CHAT_RUNTIME_BOUNDS.sseWriterBytes) {
+          encoded = candidate;
+          keepFrom = middle;
+          high = middle - 1;
+        } else low = middle + 1;
+      }
+      messages.splice(0, keepFrom);
+      payload.messages = messages;
+      if (encoded?.byteLength &&
+        encoded.byteLength <= CHAT_RUNTIME_BOUNDS.sseWriterBytes) return encoded;
     }
     fitNewestMessages(payload, messages);
-    if (frameBytes(payload) > CHAT_RUNTIME_BOUNDS.sseWriterBytes) {
-      delete payload.state;
-    }
-    if (writer.frame(payload)) {
+    encoded = encodeFrame(payload);
+    return encoded && encoded.byteLength <= CHAT_RUNTIME_BOUNDS.sseWriterBytes
+      ? encoded
+      : null;
+  }
+  private writeSnapshot(
+    writer: BoundedSseWriter,
+    cursor: number,
+    frame: Uint8Array | null,
+  ): void {
+    if (frame && writer.encodedFrame(frame)) {
       writer.cursor = cursor;
       writer.snapshotVersion += 1;
+    } else if (!frame) {
+      writer.close();
     }
   }
   private async messages(request: Request, url: URL): Promise<Response> {
@@ -758,7 +806,10 @@ export class ChatRuntimeController {
         this.ctx.storage.setAlarm(now),
         CHAT_RUNTIME_BOUNDS.alarmWriteMs,
       );
-    } catch {
+    } catch (error) {
+      if (error instanceof LimitError && error.kind === "timeout") {
+        this.ctx.abort("Alarm pre-arm timed out");
+      }
       return json({ error: "Could not schedule turn" }, 503);
     }
     const result = this.store.admit(
@@ -789,7 +840,6 @@ export class ChatRuntimeController {
         duplicate: result.duplicate,
         turnId: result.turn.id,
         status: result.turn.status,
-        revision: result.revision,
       },
       202,
     );

@@ -1,0 +1,39 @@
+{
+  "name": "@camelai/agentos-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "bun run --watch src/server/index.ts",
+    "dev:web": "vite --config web/vite.config.ts",
+    "build": "tsc -p tsconfig.json --noEmit && vite build --config web/vite.config.ts",
+    "start": "bun run src/server/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:live-smoke": "bun run scripts/live-smoke.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "smoke": "bash scripts/smoke.sh",
+    "docker:up": "docker compose up --build -d",
+    "docker:down": "docker compose down"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "bun-types": "^1.2.15",
+    "react": "^19",
+    "react-dom": "^19",
+    "typescript": "^5.8.2",
+    "vite": "^6",
+    "vitest": "^3.0.9"
+  },
+  "dependencies": {
+    "@agentos-software/pi": "0.2.7",
+    "@rivet-dev/agentos": "0.2.15",
+    "@rivet-dev/agentos-core": "^0.2.15",
+    "@rivetkit/react": "2.3.10",
+    "rivetkit": "2.3.10",
+    "zod": "^4.1.11"
+  }
+}

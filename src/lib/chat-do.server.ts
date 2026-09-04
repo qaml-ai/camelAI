@@ -940,6 +940,8 @@ export async function getPiCoreMessages(
 }
 
 export interface GroupNewChatRecentSource {
+  /** Newest settled render window only; the welcome screen must not scan an
+   * entire long-running thread to populate its best-effort "recent" cards. */
   messages: ParsedThreadMessage[];
   projectActivity: ThreadProjectActivity[];
 }

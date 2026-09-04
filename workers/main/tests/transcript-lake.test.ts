@@ -229,7 +229,7 @@ describe('PiCoreMessageStore tool duration stamping', () => {
   function createAppendHarness(durations: Map<string, number>) {
     const inserted: string[] = [];
     const exec = vi.fn((sql: string, ...args: unknown[]) => {
-      if (sql.trimStart().startsWith('CREATE TABLE') || sql.includes('INSERT OR IGNORE')) {
+      if (sql.trimStart().startsWith('CREATE ') || sql.includes('INSERT OR IGNORE')) {
         return { toArray: () => [] };
       }
       if (sql.includes('FROM pi_core_state')) {
@@ -241,10 +241,14 @@ describe('PiCoreMessageStore tool duration stamping', () => {
         inserted.push(args[1] as string);
         return { toArray: () => [] };
       }
+      if (sql.includes('INSERT INTO pi_core_message_keys')) {
+        return { toArray: () => [] };
+      }
       throw new Error(`Unexpected SQL: ${sql}`);
     });
     const store = new PiCoreMessageStore({
       sql: () => ({ exec }) as never,
+      transactionSync: (callback) => callback(),
       r2: () => ({}) as never,
       chatContext: () => CONTEXT,
       takeToolDurationMs: (toolCallId) => {

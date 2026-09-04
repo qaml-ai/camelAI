@@ -23,7 +23,7 @@ function createSqlHarness(rows: Array<{ idx: number; payload: string }>) {
   const exec = vi.fn((sql: string, ...params: unknown[]) => {
     const text = sql.trimStart();
     if (
-      text.startsWith('CREATE TABLE') ||
+      text.startsWith('CREATE ') ||
       text.includes('INSERT OR IGNORE INTO pi_core_state') ||
       text.startsWith('UPDATE pi_core_state')
     ) {
@@ -132,6 +132,7 @@ function createStoreHarness(rows: Array<{ idx: number; payload: string }>) {
   };
   const store = new PiCoreMessageStore({
     sql: () => ({ exec: sql.exec }) as never,
+    transactionSync: (callback) => callback(),
     r2: () => r2 as never,
     chatContext: () => ({
       orgId: 'org1',

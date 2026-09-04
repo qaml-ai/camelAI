@@ -79,7 +79,10 @@ import {
   type PiRuntimeEvent,
   type PiUiMessageChunk,
 } from '../../../src/lib/pi-chunk-encoder';
-import { uiMessageCreatedAtMs } from '../../../src/lib/ui-message-adapter';
+import {
+  uiMessageCreatedAtMs,
+  uiMessageToMessage,
+} from '../../../src/lib/ui-message-adapter';
 import { normalizePiUiMetadata, type PiUiMetadata, type RuntimeCallArtifact } from '../../../src/lib/runtime-artifacts';
 import type {
   LlmModel,
@@ -1742,7 +1745,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       compatibilityDate: CODE_MODE_COMPATIBILITY_DATE,
       mainModule: "index.js",
       modules: {
-        "index.js": { js: codeModeWorkerModule(code) },
+        "index.js": { js: await codeModeWorkerModule(code) },
       },
       env: { TOOLS: tools, AI: ai, CAMELAI: camelai, SECURE_FETCH: secureFetch, SCREENSHOT: screenshot, BROWSER: appBrowser },
     };
@@ -4189,8 +4192,29 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     messages: AgentEvalParsedMessage[];
     projectActivity: ThreadProjectActivity[];
   }> {
+    // This surface feeds recent connections/uploads on the group welcome page;
+    // it never needs an export of the entire transcript. Reuse the settled
+    // storage-boundary page so each candidate thread is capped at the same 50
+    // messages / 4 MB as chat rendering instead of multiplying O(thread) reads
+    // inside Promise.all.
+    const page = await this.getDerivedUiMessagePage();
+    const normalizedThreadId = threadId.trim() || this.chatContext?.threadId || "";
+    const messages = page.messages.map((uiMessage): AgentEvalParsedMessage => {
+      const legacy = uiMessageToMessage(uiMessage, {
+        threadId: normalizedThreadId,
+      });
+      return {
+        id: legacy.id,
+        thread_id: normalizedThreadId,
+        role: legacy.role,
+        content: legacy.content,
+        created_at: legacy.created_at,
+        forkEntryId: legacy.forkEntryId ?? legacy.id,
+        ...(legacy.sentDuringStreaming ? { sentDuringStreaming: true } : {}),
+      };
+    });
     return {
-      messages: await this.getPiCoreParsedMessages(threadId),
+      messages,
       projectActivity: await this.listProjectActivity(),
     };
   }
@@ -4758,6 +4782,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   private get piCoreStore(): PiCoreMessageStore {
     return (this.piCoreStoreInstance ??= new PiCoreMessageStore({
       sql: () => this.ctx.storage.sql,
+      transactionSync: (callback) => this.ctx.storage.transactionSync(callback),
       r2: () => this.env.R2_BUCKET,
       chatContext: () => this.chatContext,
       takeToolDurationMs: (toolCallId) => this.takePiToolDurationMs(toolCallId),
@@ -5199,13 +5224,33 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         return { status: "skipped_archive_truncated" };
       }
     }
-    // Serialize first (this can await R2/image work); swap the table contents
-    // with no await between DELETE and the INSERTs so an eviction or a
-    // concurrent reader never observes a half-written history.
-    const payloads: string[] = [];
-    for (const message of messages) {
+    // Serialize into a durable shadow table one row at a time. The previous
+    // `payloads: string[]` retained the entire replacement transcript in JS,
+    // on top of the message graph it came from. Readers continue to see the old
+    // live table during these awaits; the final swap below has no await.
+    const now = Date.now();
+    const rewriteId = crypto.randomUUID();
+    // Interrupted rewrites are harmless but would otherwise leave shadow rows
+    // forever. A per-rewrite id also prevents two interleaved admin/compaction
+    // calls from deleting or mixing each other's staged payloads.
+    this.ctx.storage.sql.exec(
+      "DELETE FROM pi_core_rewrite_staging WHERE created_at < ?",
+      now - 24 * 60 * 60 * 1000,
+    );
+    for (let index = 0; index < messages.length; index += 1) {
+      const message = messages[index];
+      const keyHash = await this.piCoreStore.piCoreMessageKeyHash(message);
       const serialized = await this.serializePiMessageForSqlStorageDetailed(message);
-      payloads.push(serialized.payload);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO pi_core_rewrite_staging
+          (rewrite_id, idx, payload, created_at, key_hash)
+         VALUES (?, ?, ?, ?, ?)`,
+        rewriteId,
+        index,
+        serialized.payload,
+        now,
+        keyHash,
+      );
     }
     // A session-trimmed image the serializer could not put back is written as a
     // reference, and render then shows a marker for it forever. It should never
@@ -5222,17 +5267,33 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         sampleKey: this.chatContext?.threadId,
       });
     }
-    const now = Date.now();
-    this.ctx.storage.sql.exec("DELETE FROM pi_core_messages");
-    for (let index = 0; index < payloads.length; index += 1) {
+    // Synchronous calls cannot interleave with another request, but they still
+    // need rollback atomicity: a quota/constraint failure after the DELETE must
+    // not expose an empty transcript or a revision whose row count is false.
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM pi_core_messages");
       this.ctx.storage.sql.exec(
-        "INSERT INTO pi_core_messages (idx, payload, created_at) VALUES (?, ?, ?)",
-        index,
-        payloads[index],
-        now,
+        `INSERT INTO pi_core_messages (idx, payload, created_at)
+         SELECT idx, payload, created_at
+           FROM pi_core_rewrite_staging
+          WHERE rewrite_id = ?
+          ORDER BY idx ASC`,
+        rewriteId,
       );
-    }
-    this.piCoreStore.markPiCoreChanged(payloads.length);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO pi_core_message_keys (idx, key_hash)
+         SELECT idx, key_hash
+           FROM pi_core_rewrite_staging
+          WHERE rewrite_id = ?
+          ORDER BY idx ASC`,
+        rewriteId,
+      );
+      this.ctx.storage.sql.exec(
+        "DELETE FROM pi_core_rewrite_staging WHERE rewrite_id = ?",
+        rewriteId,
+      );
+      this.piCoreStore.markPiCoreChanged(messages.length);
+    });
     // pi_core is renumbered from 0 and `messages` IS the new row list, so the
     // session's index space is now the identity mapping. Callers that keep the
     // session alive (post-turn compaction) assign `session.state.messages =

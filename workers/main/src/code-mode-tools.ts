@@ -35,7 +35,6 @@ import {
 import { PiContainerTools, PI_CONTAINER_TOOL_DEFINITIONS } from "./pi-container-tools";
 import { parseFilePreviewPath } from "./preview-paths";
 import type { ConnectionSetupResponse } from "./chat-thread-browser-prompts";
-import { CodeModeWebSearch } from "./code-mode-web-search";
 import {
   boundLakeErrorMessage,
   sendToolCallRecords,
@@ -87,8 +86,7 @@ import {
   type SandboxDeadlineExceededEvent,
   type SandboxExecDeadline,
 } from "./sandbox-exec-deadline";
-import { defaultProjectScaffoldFiles, normalizeProjectScaffoldTemplate, type ProjectScaffoldResult } from "./project-scaffold";
-import { addShadcnComponentsToProject, normalizeShadcnComponentList, SUPPORTED_SHADCN_BLOCKS, SUPPORTED_SHADCN_COMPONENTS } from "./shadcn-components";
+import type { ProjectScaffoldResult } from "./project-scaffold";
 import { connectAppBrowserSession, launchAppBrowserSession } from "./app-browser-binding";
 import { deployWorkerModulesDirect, rollbackWorkerDeployFromArtifactCache, type DirectDispatchDeployResult } from "./direct-dispatch-deploy";
 import { handleDeploySideEffects } from "./services/deploy";
@@ -808,7 +806,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   ),
   codeModeTool(
     "add_shadcn_component",
-    `Add bundled shadcn/ui components or full blocks (login pages, sidebar layouts, dashboards) to a DO-backed React Router project without npm registry access. Registry dependencies are resolved transitively and any npm packages a component needs are added to package.json automatically (installed on the next build). Prefer this over hand-writing standard UI components. Block pages land under /app/blocks/<name>/page.tsx and must be registered as a route in app/routes.ts. Supported components: ${SUPPORTED_SHADCN_COMPONENTS.join(", ")}. Supported blocks: ${SUPPORTED_SHADCN_BLOCKS.join(", ")}. Arguments: { project, component? or components?, force? }.`,
+    "Add bundled shadcn/ui components or full blocks (login pages, sidebar layouts, dashboards) to a DO-backed React Router project without npm registry access. Registry dependencies are resolved transitively and any npm packages a component needs are added to package.json automatically (installed on the next build). Prefer this over hand-writing standard UI components. Block pages land under /app/blocks/<name>/page.tsx and must be registered as a route in app/routes.ts. Use standard shadcn component or block names; an unsupported name returns the available catalog. Arguments: { project, component? or components?, force? }.",
     Type.Object({
       project: Type.String(),
       component: Type.Optional(Type.String()),
@@ -2217,6 +2215,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     project: WorkspaceProject,
     options: { template?: unknown; force?: boolean } = {},
   ): Promise<ProjectScaffoldResult> {
+    // Scaffold source, its pinned lockfile, and the bundled shadcn registry are
+    // large immutable strings. Only project creation needs them.
+    const { defaultProjectScaffoldFiles, normalizeProjectScaffoldTemplate } =
+      await import("./project-scaffold");
     const template = normalizeProjectScaffoldTemplate(options.template);
     const files = defaultProjectScaffoldFiles(project.name, template, normalizeDeployScriptName(project.name));
     const fileStore = new ProjectFilesystemClient(this.env, project.id);
@@ -2240,6 +2242,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   private async createProject(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     // Validate before creating: js_exec calls skip schema validation, and an
     // invalid template must not leave behind an empty registered project.
+    const { normalizeProjectScaffoldTemplate } = await import("./project-scaffold");
     const template = normalizeProjectScaffoldTemplate(args.template);
     const project = await this.workspaceFs.createProject(args);
     const scaffold = await this.writeProjectScaffold(project, { template });
@@ -4551,6 +4554,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
 
   private async addShadcnComponent(args: Record<string, unknown>): Promise<unknown> {
     const project = await this.resolveDoBackedProjectForAction(args, "add_shadcn_component");
+    const { addShadcnComponentsToProject, normalizeShadcnComponentList } =
+      await import("./shadcn-components");
     const components = normalizeShadcnComponentList(args);
     const result = await addShadcnComponentsToProject(
       new ProjectFilesystemClient(this.env, project.id),
@@ -5353,9 +5358,12 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return this.customDomains.retryHostnames();
   }
 
-  private webSearchClient(
+  private async webSearchClient(
     onProviderFailure?: (result: unknown) => Promise<void>,
-  ): CodeModeWebSearch {
+  ) {
+    // Web search pulls HTML parsing/readability dependencies into its module
+    // graph. Most coding turns never use it, so pay that heap cost on demand.
+    const { CodeModeWebSearch } = await import("./code-mode-web-search");
     return new CodeModeWebSearch(
       this.env,
       this.ctx.props.threadId || this.ctx.props.workspaceId,
@@ -5420,21 +5428,23 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   private async webFetch(args: Record<string, unknown>): Promise<unknown> {
     const idempotencyKey = await this.consumeHostedCapability("web_fetch", args);
     let failedAttempt = 0;
-    const result = await this.webSearchClient(async (failure) => {
+    const client = await this.webSearchClient(async (failure) => {
       failedAttempt += 1;
       await this.recordHostedCapabilityCost(
         "web_fetch",
         `${idempotencyKey}:failed-attempt:${failedAttempt}`,
         failure,
       );
-    }).fetch(args);
+    });
+    const result = await client.fetch(args);
     await this.recordHostedCapabilityCost("web_fetch", idempotencyKey, result);
     return result;
   }
 
   private async webSearch(args: Record<string, unknown>): Promise<unknown> {
     const idempotencyKey = await this.consumeHostedCapability("web_search", args);
-    const result = await this.webSearchClient().search(args);
+    const client = await this.webSearchClient();
+    const result = await client.search(args);
     await this.recordHostedCapabilityCost("web_search", idempotencyKey, result);
     return result;
   }

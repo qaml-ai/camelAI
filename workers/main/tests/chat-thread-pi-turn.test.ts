@@ -13281,7 +13281,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     const fake = Object.create(ChatThreadDO.prototype) as any;
     const exec = vi.fn((sql: string, ...params: unknown[]) => {
       if (
-        sql.trimStart().startsWith('CREATE TABLE') ||
+        sql.trimStart().startsWith('CREATE ') ||
         sql.includes('INSERT OR IGNORE INTO pi_core_state')
       ) {
         return { toArray: () => [] };
@@ -13360,6 +13360,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     const insertedPayloads: string[] = [];
     fake.ctx = {
       storage: {
+        transactionSync: (callback: () => unknown) => callback(),
         sql: {
           exec: vi.fn((sql: string, ...params: unknown[]) => {
             if (sql.includes('MAX(idx)')) {
@@ -13536,6 +13537,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     }));
     const store = new PiCoreMessageStore({
       sql: () => ({}) as SqlStorage,
+      transactionSync: (callback) => callback(),
       r2: () => ({ get }) as unknown as R2Bucket,
       chatContext: () => null,
     });
@@ -13578,6 +13580,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     // 500 KB cap was a cap on R2 images only.
     const store = new PiCoreMessageStore({
       sql: () => ({}) as SqlStorage,
+      transactionSync: (callback) => callback(),
       r2: () => ({ get: vi.fn() }) as unknown as R2Bucket,
       chatContext: () => null,
     });
@@ -13608,6 +13611,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     // Rung 3's stated cap — one small image — was inert against inline base64.
     const store = new PiCoreMessageStore({
       sql: () => ({}) as SqlStorage,
+      transactionSync: (callback) => callback(),
       r2: () => ({ get: vi.fn() }) as unknown as R2Bucket,
       chatContext: () => null,
     });
@@ -15485,10 +15489,16 @@ describe('ChatThreadDO Pi turn handling', () => {
       };
       const store = new PiCoreMessageStore({
         sql: unusedDependency,
+        transactionSync: (callback) => callback(),
         r2: unusedDependency,
         chatContext: () => null,
       });
-      vi.spyOn(store, 'loadFullPiCoreTranscriptUnbounded').mockResolvedValue([existingUser] as any[]);
+      vi.spyOn(store, 'ensurePiCoreTables').mockImplementation(() => {});
+      vi.spyOn(store, 'loadPiCoreCompaction').mockReturnValue(null);
+      vi.spyOn(store as any, 'backfillVisiblePiCoreMessageKeys').mockResolvedValue(undefined);
+      const existingHash = await (store as any).piCoreMessageKeyHash(existingUser);
+      vi.spyOn(store as any, 'findExistingPiCoreMessageKeyHashes')
+        .mockReturnValue(new Set([existingHash]));
       vi.spyOn(store, 'appendPiCoreMessages').mockImplementation(async (msgs: any[]) => {
         appended.push(...msgs);
       });
@@ -15527,10 +15537,16 @@ describe('ChatThreadDO Pi turn handling', () => {
       };
       const store = new PiCoreMessageStore({
         sql: unusedDependency,
+        transactionSync: (callback) => callback(),
         r2: unusedDependency,
         chatContext: () => null,
       });
-      vi.spyOn(store, 'loadFullPiCoreTranscriptUnbounded').mockResolvedValue([existingAssistant] as any[]);
+      vi.spyOn(store, 'ensurePiCoreTables').mockImplementation(() => {});
+      vi.spyOn(store, 'loadPiCoreCompaction').mockReturnValue(null);
+      vi.spyOn(store as any, 'backfillVisiblePiCoreMessageKeys').mockResolvedValue(undefined);
+      const existingHash = await (store as any).piCoreMessageKeyHash(existingAssistant);
+      vi.spyOn(store as any, 'findExistingPiCoreMessageKeyHashes')
+        .mockReturnValue(new Set([existingHash]));
       vi.spyOn(store, 'appendPiCoreMessages').mockImplementation(async (msgs: any[]) => {
         appended.push(...msgs);
       });

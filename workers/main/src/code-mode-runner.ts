@@ -1,5 +1,3 @@
-import { transform as sucraseTransform } from "sucrase";
-
 // js_exec user code runs inside an async function body, so wrap it the same way
 // before handing it to sucrase: that makes top-level `return`/`await` parse. The
 // wrapper contains no TypeScript, so it survives the transform byte-for-byte and
@@ -9,11 +7,15 @@ import { transform as sucraseTransform } from "sucrase";
 const TS_STRIP_PREFIX = "async function __camelTypeStrip__() {\n";
 const TS_STRIP_SUFFIX = "\n}";
 
-export function stripTypeScriptFromUserCode(userCode: string): string {
+export async function stripTypeScriptFromUserCode(userCode: string): Promise<string> {
   if (!userCode.trim()) return userCode;
   try {
+    // Sucrase brings its parser/token tables with it. Loading it only when a
+    // js_exec module is actually compiled keeps those allocations out of the
+    // long-lived ChatThreadDO baseline.
+    const { transform } = await import("sucrase");
     const wrapped = `${TS_STRIP_PREFIX}${userCode}${TS_STRIP_SUFFIX}`;
-    const stripped = sucraseTransform(wrapped, { transforms: ["typescript"] }).code;
+    const stripped = transform(wrapped, { transforms: ["typescript"] }).code;
     if (!stripped.startsWith(TS_STRIP_PREFIX) || !stripped.endsWith(TS_STRIP_SUFFIX)) {
       return userCode;
     }
@@ -50,8 +52,10 @@ export function prepareCodeModeUserCode(userCode: string): string {
   return `${lines.join("\n")}${trailingWhitespace}`;
 }
 
-export function codeModeWorkerModule(userCode: string): string {
-  const executableUserCode = prepareCodeModeUserCode(stripTypeScriptFromUserCode(userCode));
+export async function codeModeWorkerModule(userCode: string): Promise<string> {
+  const executableUserCode = prepareCodeModeUserCode(
+    await stripTypeScriptFromUserCode(userCode),
+  );
   const workerPrefixTemplate = String.raw`
 import { WorkerEntrypoint } from "cloudflare:workers";
 

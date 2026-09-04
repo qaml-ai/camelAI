@@ -13,7 +13,6 @@ import {
   AdminMcpOAuthProvider,
   type AdminMcpTokenGrantRecord,
 } from "../admin-mcp-oauth.js";
-import { fetchAdminApiWithValidatedAuth } from "./admin/index.js";
 import { getAdminIndexStub } from "./admin/helpers.js";
 import {
   errorToObservabilityFields,
@@ -87,6 +86,18 @@ const ADMIN_JS_EXEC_RUNTIME_BRIDGE_BINDING = "ADMIN_RUNTIME";
 const ADMIN_JS_EXEC_INPUT_BINDING = "ADMIN_INPUT";
 const ADMIN_JS_EXEC_BLOCKED_BINDINGS = new Set(["CODE_MODE_LOADER"]);
 const ADMIN_JS_EXEC_MAX_HTTP_BODY_CHARACTERS = 1_000_000;
+
+async function fetchAdminApiWithValidatedAuth(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  // The admin router carries hundreds of eagerly-created validation schemas.
+  // Dynamic import keeps it out of the baseline isolate heap; ESM itself
+  // memoizes successful module evaluation, so no mutable module-level cache is
+  // needed (and a rejected import remains retryable on the next isolate).
+  const adminApi = await import("./admin/index.js");
+  return adminApi.fetchAdminApiWithValidatedAuth(request, env);
+}
 
 function getBaseUrl(req: Request): string {
   const url = new URL(req.url);

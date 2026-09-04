@@ -164,6 +164,13 @@ export const PI_DURABLE_CUT_MAX_VISIBLE_CHARS = Math.floor(
 
 /** Rows per metadata probe while choosing the capped window's cut. */
 const PI_SESSION_LOAD_ROW_BATCH_SIZE = 256;
+/**
+ * Rows inspected per legacy message-key migration step. Payloads are still
+ * fetched one at a time; this only bounds the tiny idx metadata array.
+ */
+const PI_MESSAGE_KEY_BACKFILL_BATCH_SIZE = 64;
+/** SQLite bind count kept comfortably below platform limits. */
+const PI_MESSAGE_KEY_QUERY_BATCH_SIZE = 64;
 
 export interface PiImageHydrationBudget {
   /** Maximum images hydrated from R2. Inline images do not consume it. */
@@ -260,6 +267,7 @@ export function piCappedSessionLoadPlaceholder(args: {
 
 export interface PiCoreMessageStoreDeps {
   sql(): SqlStorage;
+  transactionSync<T>(callback: () => T): T;
   r2(): R2Bucket;
   chatContext(): ChatContextState | null;
   /** Privacy-safe allocation counters used by focused tests and diagnostics. */
@@ -327,6 +335,52 @@ export class PiCoreMessageStore {
     this.deps.sql().exec(
       `INSERT OR IGNORE INTO pi_core_state (id, generation, row_count)
        SELECT 1, 1, COUNT(*) FROM pi_core_messages`,
+    );
+    // Durable content identities make turn-end resume dedup proportional to
+    // the incoming tail instead of materializing the entire transcript. `idx`
+    // is the primary key because old histories may already contain duplicate
+    // messages; the lookup hash deliberately has a non-unique covering index.
+    this.deps.sql().exec(
+      `CREATE TABLE IF NOT EXISTS pi_core_message_keys (
+        idx INTEGER PRIMARY KEY,
+        key_hash TEXT NOT NULL
+      )`,
+    );
+    this.deps.sql().exec(
+      `CREATE INDEX IF NOT EXISTS pi_core_message_keys_by_hash
+       ON pi_core_message_keys (key_hash, idx)`,
+    );
+    // Admin repair and wholesale compaction still write pi_core_messages
+    // directly. Invalidate their identity row automatically; a subsequent
+    // keyed write repairs only missing mappings. Triggers avoid stale hashes
+    // when an idx is reused after a rewrite.
+    this.deps.sql().exec(
+      `CREATE TRIGGER IF NOT EXISTS pi_core_message_keys_after_delete
+       AFTER DELETE ON pi_core_messages
+       BEGIN
+         DELETE FROM pi_core_message_keys WHERE idx = OLD.idx;
+       END`,
+    );
+    this.deps.sql().exec(
+      `CREATE TRIGGER IF NOT EXISTS pi_core_message_keys_after_payload_update
+       AFTER UPDATE OF payload ON pi_core_messages
+       BEGIN
+         DELETE FROM pi_core_message_keys WHERE idx = NEW.idx;
+       END`,
+    );
+    // Whole-history rewrites serialize here incrementally, then swap into the
+    // live table with synchronous INSERT...SELECT statements. This keeps the
+    // old history visible across serializer awaits without retaining every new
+    // payload string in the isolate at once.
+    this.deps.sql().exec(
+      `CREATE TABLE IF NOT EXISTS pi_core_rewrite_staging (
+        rewrite_id TEXT NOT NULL,
+        idx INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        key_hash TEXT NOT NULL,
+        PRIMARY KEY (rewrite_id, idx)
+      )`,
     );
     // Staging buffer for the in-flight turn's not-yet-committed tail. It is a
     // discardable mirror of `agent.state.messages.slice(piMainBaselineIndex)`:
@@ -1351,6 +1405,129 @@ export class PiCoreMessageStore {
     } as unknown as AgentMessage;
   }
 
+  async piCoreMessageKeyHash(message: AgentMessage): Promise<string> {
+    return this.sha256Hex(piCoreMessageKey(message));
+  }
+
+  private putPiCoreMessageKeyHash(idx: number, keyHash: string): void {
+    this.deps.sql().exec(
+      `INSERT INTO pi_core_message_keys (idx, key_hash)
+       VALUES (?, ?)
+       ON CONFLICT(idx) DO UPDATE SET key_hash = excluded.key_hash`,
+      idx,
+      keyHash,
+    );
+  }
+
+  private putPiCoreMessageKeyHashIfPayloadMatches(
+    idx: number,
+    payload: string,
+    keyHash: string,
+  ): void {
+    // Hashing uses WebCrypto and therefore yields. An admin repair or rewrite
+    // can replace this idx while that promise is pending; only publish the hash
+    // if the live row still contains the exact bytes we inspected. Otherwise
+    // the next backfill pass sees the mapping as missing and hashes the new row.
+    this.deps.sql().exec(
+      `INSERT INTO pi_core_message_keys (idx, key_hash)
+       SELECT idx, ?
+         FROM pi_core_messages
+        WHERE idx = ? AND payload = ?
+       ON CONFLICT(idx) DO UPDATE SET key_hash = excluded.key_hash`,
+      keyHash,
+      idx,
+      payload,
+    );
+  }
+
+  /**
+   * Lazily index rows written before `pi_core_message_keys` existed.
+   *
+   * This migration can perform O(thread) storage work once for a legacy
+   * thread, but its peak heap is O(one payload): the metadata query selects
+   * only idxs, then each payload is fetched, parsed, hashed, and released
+   * before the next. Progress is durable after every row, so an isolate reset
+   * resumes rather than starts over. New histories never enter this loop.
+   */
+  private async backfillVisiblePiCoreMessageKeys(
+    firstKeptIndex: number,
+  ): Promise<void> {
+    for (;;) {
+      const missing = this.deps.sql()
+        .exec<{ idx: number }>(
+          `SELECT messages.idx
+             FROM pi_core_messages AS messages
+             LEFT JOIN pi_core_message_keys AS keys ON keys.idx = messages.idx
+            WHERE messages.idx >= ? AND keys.idx IS NULL
+            ORDER BY messages.idx ASC
+            LIMIT ?`,
+          firstKeptIndex,
+          PI_MESSAGE_KEY_BACKFILL_BATCH_SIZE,
+        )
+        .toArray();
+      if (missing.length === 0) return;
+
+      for (const candidate of missing) {
+        const idx = Math.max(0, Math.floor(Number(candidate.idx) || 0));
+        const row = this.deps.sql()
+          .exec<{ payload: string }>(
+            "SELECT payload FROM pi_core_messages WHERE idx = ? LIMIT 1",
+            idx,
+          )
+          .toArray()[0];
+        if (!row || typeof row.payload !== "string") continue;
+        let keyHash: string;
+        try {
+          this.deps.recordReadOperation?.("payload_row_parsed");
+          const parsed = JSON.parse(row.payload) as AgentMessage;
+          if (!parsed || typeof parsed !== "object" || !("role" in parsed)) {
+            keyHash = `invalid:${idx}`;
+          } else {
+            keyHash = await this.piCoreMessageKeyHash(parsed);
+          }
+        } catch {
+          // Mark corrupt rows as visited so every future append does not retry
+          // them. They never match a valid incoming SHA-256 identity.
+          keyHash = `invalid:${idx}`;
+        }
+        this.putPiCoreMessageKeyHashIfPayloadMatches(idx, row.payload, keyHash);
+      }
+    }
+  }
+
+  private findExistingPiCoreMessageKeyHashes(
+    keyHashes: readonly string[],
+    firstKeptIndex: number,
+  ): Set<string> {
+    const existing = new Set<string>();
+    for (
+      let offset = 0;
+      offset < keyHashes.length;
+      offset += PI_MESSAGE_KEY_QUERY_BATCH_SIZE
+    ) {
+      const batch = keyHashes.slice(
+        offset,
+        offset + PI_MESSAGE_KEY_QUERY_BATCH_SIZE,
+      );
+      if (batch.length === 0) continue;
+      const placeholders = batch.map(() => "?").join(", ");
+      const rows = this.deps.sql()
+        .exec<{ key_hash: string }>(
+          `SELECT DISTINCT keys.key_hash
+             FROM pi_core_message_keys AS keys
+             INNER JOIN pi_core_messages AS messages ON messages.idx = keys.idx
+            WHERE messages.idx >= ? AND keys.key_hash IN (${placeholders})`,
+          firstKeptIndex,
+          ...batch,
+        )
+        .toArray();
+      for (const row of rows) {
+        if (typeof row.key_hash === "string") existing.add(row.key_hash);
+      }
+    }
+    return existing;
+  }
+
   async appendPiCoreMessages(messages: AgentMessage[]): Promise<void> {
     if (messages.length === 0) return;
     this.ensurePiCoreTables();
@@ -1364,32 +1541,56 @@ export class PiCoreMessageStore {
     const now = Date.now();
     for (let offset = 0; offset < messages.length; offset += 1) {
       const message = this.stampPiToolDuration(messages[offset]);
+      const keyHash = await this.piCoreMessageKeyHash(message);
       const serialized = await this.serializePiMessageForSqlStorageDetailed(message);
-      this.deps.sql().exec(
-        "INSERT INTO pi_core_messages (idx, payload, created_at) VALUES (?, ?, ?)",
-        startIndex + offset,
-        serialized.payload,
-        now,
-      );
-      // Keep the scalar preflight in lockstep before the next serialization
-      // await, so an eviction can never leave durable rows behind its revision.
-      this.markPiCoreChanged(revisionBeforeAppend.count + offset + 1);
+      const idx = startIndex + offset;
+      // The payload, its identity index, and the scalar preflight are one
+      // durable fact. Keep them rollback-atomic so a quota/constraint failure
+      // cannot strand a row without its key or revision before the next await.
+      this.deps.transactionSync(() => {
+        this.deps.sql().exec(
+          "INSERT INTO pi_core_messages (idx, payload, created_at) VALUES (?, ?, ?)",
+          idx,
+          serialized.payload,
+          now,
+        );
+        this.putPiCoreMessageKeyHash(idx, keyHash);
+        this.markPiCoreChanged(revisionBeforeAppend.count + offset + 1);
+      });
     }
   }
 
   async appendPiCoreMessagesIfMissing(messages: AgentMessage[]): Promise<void> {
     if (messages.length === 0) return;
-    // Identity does not depend on provider image bytes. Keep compact external
-    // references so dedup never downloads an entire historical image set.
-    const existingMessages = await this.loadFullPiCoreTranscriptUnbounded({ imagePolicy: "reference" });
-    const existingKeys = new Set(
-      existingMessages.map((message) => piCoreMessageKey(message)),
+    this.ensurePiCoreTables();
+    const compaction = this.loadPiCoreCompaction();
+    const firstKeptIndex = compaction?.firstKeptIndex ?? 0;
+    await this.backfillVisiblePiCoreMessageKeys(firstKeptIndex);
+
+    const incoming: Array<{ message: AgentMessage; keyHash: string }> = [];
+    for (const message of messages) {
+      incoming.push({
+        message,
+        keyHash: await this.piCoreMessageKeyHash(message),
+      });
+    }
+    const existingKeys = this.findExistingPiCoreMessageKeyHashes(
+      incoming.map(({ keyHash }) => keyHash),
+      firstKeptIndex,
     );
-    const missing = messages.filter((message) => {
-      const key = piCoreMessageKey(message);
-      if (existingKeys.has(key)) return false;
-      existingKeys.add(key);
-      return true;
+    // A compaction summary is synthetic rather than a pi_core_messages row, but
+    // the legacy full-transcript dedup included it. Preserve that edge case.
+    if (compaction && firstKeptIndex > 0) {
+      existingKeys.add(
+        await this.piCoreMessageKeyHash(
+          createPiSummaryMessage(compaction.summary, compaction.updatedAt),
+        ),
+      );
+    }
+    const missing = incoming.flatMap(({ message, keyHash }) => {
+      if (existingKeys.has(keyHash)) return [];
+      existingKeys.add(keyHash);
+      return [message];
     });
     await this.appendPiCoreMessages(missing);
   }

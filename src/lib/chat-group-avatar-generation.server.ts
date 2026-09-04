@@ -4,10 +4,6 @@ import {
   type AuxiliaryAiMetadata,
   type AuxiliaryAiRunContext,
 } from "./auxiliary-ai.server";
-import {
-  parseGeneratedPictogramTerms,
-  resolveLucideIconTerms,
-} from "./lucide-icon-metadata";
 
 export const CHAT_GROUP_ICON_SELECTION_STRATEGY = "metadata_pictograms_v4";
 
@@ -61,6 +57,11 @@ export async function generateChatGroupIconWithOpenAI(
     throw error;
   }
 
+  // The generated Lucide catalog is sizeable and icon selection is an
+  // occasional background task. Do not allocate it in every SSR/DO isolate.
+  const { parseGeneratedPictogramTerms, resolveLucideIconTerms } = await import(
+    "./lucide-icon-metadata"
+  );
   const terms = parseGeneratedPictogramTerms(generated);
   if (terms.length === 0) {
     context?.onOutcome?.("unparseable_output");

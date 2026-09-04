@@ -51,14 +51,11 @@ export const SCANNED_DIRECTORIES = ["workers/main/src", "src"];
 export const ALLOWLIST = {
   "workers/main/src/chat-thread/pi-core-store.ts": {
     loadFullPiCoreTranscriptUnbounded: {
-      count: 3,
+      count: 2,
       why:
         "1 declaration; 1 use inside loadBoundedPiCoreSessionWindow's UNDER-CAP branch (the " +
-        "bounded loader is defined as 'the legacy load when the legacy load is affordable'); " +
-        "1 in appendPiCoreMessagesIfMissing. THE LAST ONE IS A KNOWN REMAINING O(thread) READ " +
-        "on the turn-end commit path — it reloads the transcript purely to build dedup keys. " +
-        "It is bounded in practice by the compaction watermark and is tracked as the next " +
-        "target; do not add a fourth.",
+        "bounded loader is defined as 'the legacy load when the legacy load is affordable'). " +
+        "Turn-end dedup now uses pi_core_message_keys and no longer gets an exception here.",
     },
   },
   "workers/main/src/chat-thread-do.ts": {
@@ -74,10 +71,10 @@ export const ALLOWLIST = {
       why: "1 declaration + the public RPC wrapper that is its only caller.",
     },
     getPiCoreParsedMessages: {
-      count: 5,
+      count: 4,
       why:
-        "1 RPC declaration; getGroupNewChatRecentSource (group-chat seeding); agentEvalResult " +
-        "(eval harness, off the user path); and the uiMirror dep wiring, which names the " +
+        "1 RPC declaration; agentEvalResult (eval harness, off the user path); and the " +
+        "uiMirror dep wiring, which names the " +
         "identifier twice on one line (key + delegate) and whose only remaining consumer is " +
         "the one-shot legacy author heal.",
     },

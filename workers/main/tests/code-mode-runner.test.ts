@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { codeModeWorkerModule, prepareCodeModeUserCode, stripTypeScriptFromUserCode } from '../src/code-mode-runner';
 
+const EMPTY_CODE_MODE_WORKER_SOURCE = await codeModeWorkerModule('');
+const SIMPLE_CODE_MODE_WORKER_SOURCE = await codeModeWorkerModule('return 1;');
+
 function createConnectionsFacade(binding: any): Record<string, unknown> {
   const legacyInvokeMethod = ['_', '_', 'invoke'].join('');
   const invokeConnectionMethod = (request: unknown) => {
@@ -92,16 +95,16 @@ function createToolHelp() {
 }
 
 describe('code mode runner connection facade', () => {
-  it('wraps global fetch through the secure fetch binding', () => {
-    const source = codeModeWorkerModule('await fetch("https://example.com");');
+  it('wraps global fetch through the secure fetch binding', async () => {
+    const source = await codeModeWorkerModule('await fetch("https://example.com");');
 
     expect(source).toContain('function installSecureFetch(secureFetchBinding)');
     expect(source).toContain('const cleanupSecureFetch = installSecureFetch(this.env.SECURE_FETCH);');
     expect(source).toContain('cleanupSecureFetch();');
   });
 
-  it('does not inject projects as a standalone user-code binding', () => {
-    const source = codeModeWorkerModule('const projects = ["local"]; return projects.length;');
+  it('does not inject projects as a standalone user-code binding', async () => {
+    const source = await codeModeWorkerModule('const projects = ["local"]; return projects.length;');
 
     expect(source).toContain('const PROJECTS = createProjectsFacade(rawTools)');
     expect(source).toContain('projects: env.PROJECTS');
@@ -110,8 +113,8 @@ describe('code mode runner connection facade', () => {
     expect(source).not.toContain('const projects = PROJECTS');
   });
 
-  it('generates helpful env.BROWSER errors for unsupported methods', () => {
-    const source = codeModeWorkerModule(
+  it('generates helpful env.BROWSER errors for unsupported methods', async () => {
+    const source = await codeModeWorkerModule(
       'const b = await env.BROWSER.launch({ scriptName: "app" });\nreturn await b.text();',
     );
 
@@ -204,8 +207,8 @@ describe('code mode runner connection facade', () => {
     );
   });
 
-  it('does not detach service binding methods when invoking a connection method', () => {
-    const source = codeModeWorkerModule(
+  it('does not detach service binding methods when invoking a connection method', async () => {
+    const source = await codeModeWorkerModule(
       'return await connections.remoteMcpAdmin.getDashboardSummary({ date: "2026-05-29" });',
     );
 
@@ -219,8 +222,8 @@ describe('code mode runner connection facade', () => {
 });
 
 describe('code mode runner js_exec module', () => {
-  it('enforces the wall-clock timeout inside the loaded worker invocation', () => {
-    const source = codeModeWorkerModule('await tools.analysis_exec({ command: "sleep 600" });');
+  it('enforces the wall-clock timeout inside the loaded worker invocation', async () => {
+    const source = await codeModeWorkerModule('await tools.analysis_exec({ command: "sleep 600" });');
 
     expect(source).toContain('async run(timeoutMs, maxTimeoutMs)');
     expect(source).toContain('const result = await Promise.race([');
@@ -229,8 +232,8 @@ describe('code mode runner js_exec module', () => {
     expect(source).toContain('if (timeoutHandle) clearTimeout(timeoutHandle)');
   });
 
-  it('does not pass runtime helper names as runUserCode parameters', () => {
-    const source = codeModeWorkerModule(
+  it('does not pass runtime helper names as runUserCode parameters', async () => {
+    const source = await codeModeWorkerModule(
       'const projects = await tools.list_projects();\nreturn projects;',
     );
 
@@ -239,8 +242,8 @@ describe('code mode runner js_exec module', () => {
     expect(source).not.toContain('async function runUserCode(tools');
   });
 
-  it('installs the documented store helper as a runtime global', () => {
-    const source = codeModeWorkerModule(
+  it('installs the documented store helper as a runtime global', async () => {
+    const source = await codeModeWorkerModule(
       'store("lastResult", 42);\nreturn load("lastResult");',
     );
 
@@ -250,7 +253,7 @@ describe('code mode runner js_exec module', () => {
   });
 
   it('keeps names on every runtime help entry so js_exec can initialize', () => {
-    const source = codeModeWorkerModule('');
+    const source = EMPTY_CODE_MODE_WORKER_SOURCE;
     expect(source).toContain('name: "text/store/load"');
     expect(source).toContain('name: "env.SCREENSHOT"');
 
@@ -265,8 +268,8 @@ describe('code mode runner js_exec module', () => {
 });
 
 describe('code mode runner TypeScript stripping', () => {
-  it('strips type annotations, casts, interfaces, and generics from user code', () => {
-    const stripped = stripTypeScriptFromUserCode([
+  it('strips type annotations, casts, interfaces, and generics from user code', async () => {
+    const stripped = await stripTypeScriptFromUserCode([
       'interface Row { id: number; name: string }',
       'const limit: number = 5;',
       'const rows = (await tools.list_apps({ limit })) as { data: Row[] };',
@@ -282,31 +285,31 @@ describe('code mode runner TypeScript stripping', () => {
     expect(stripped).toContain('return pick(rows.data);');
   });
 
-  it('leaves plain JavaScript intact, including ternaries and object literals', () => {
+  it('leaves plain JavaScript intact, including ternaries and object literals', async () => {
     const code = [
       'const config = { mode: enabled ? "on" : "off", retries: 3 };',
       'return await tools.set_preview({ app_name: config.mode });',
     ].join('\n');
-    expect(stripTypeScriptFromUserCode(code)).toBe(code);
+    expect(await stripTypeScriptFromUserCode(code)).toBe(code);
   });
 
-  it('supports top-level return and await, and falls back on unparseable code', () => {
-    expect(stripTypeScriptFromUserCode('return await tools.list_apps();')).toBe(
+  it('supports top-level return and await, and falls back on unparseable code', async () => {
+    expect(await stripTypeScriptFromUserCode('return await tools.list_apps();')).toBe(
       'return await tools.list_apps();',
     );
     const broken = 'const x = {;';
-    expect(stripTypeScriptFromUserCode(broken)).toBe(broken);
+    expect(await stripTypeScriptFromUserCode(broken)).toBe(broken);
   });
 
-  it('is applied by codeModeWorkerModule before embedding user code', () => {
-    const source = codeModeWorkerModule('const n: number = 1;\nreturn n;');
+  it('is applied by codeModeWorkerModule before embedding user code', async () => {
+    const source = await codeModeWorkerModule('const n: number = 1;\nreturn n;');
     expect(source).toContain('const n = 1;');
     expect(source).not.toContain('const n: number = 1;');
   });
 });
 
 function loadGeneratedToolHelp(): (allTools: unknown[]) => (input?: unknown) => any {
-  const source = codeModeWorkerModule('');
+  const source = EMPTY_CODE_MODE_WORKER_SOURCE;
   const start = source.indexOf('const TOOL_CATEGORY_DESCRIPTIONS');
   const end = source.indexOf('\n\nfunction createCamelAiFacade', start);
   expect(start).toBeGreaterThanOrEqual(0);
@@ -354,8 +357,8 @@ describe('code mode runner tools.help guide', () => {
     expect(result.categories.length).toBeGreaterThan(0);
   });
 
-  it('includes a targeted hint for JSON.parse on a tool result envelope', () => {
-    const { formatRuntimeError } = loadGeneratedRuntimeErrorHelpers();
+  it('includes a targeted hint for JSON.parse on a tool result envelope', async () => {
+    const { formatRuntimeError } = await loadGeneratedRuntimeErrorHelpers();
 
     const result = formatRuntimeError(new SyntaxError('"[object Object]" is not valid JSON'));
 
@@ -365,8 +368,8 @@ describe('code mode runner tools.help guide', () => {
     expect(result).toContain('parse result.data.text');
   });
 
-  it('reports js_exec code locations without leaking generated stack frames', () => {
-    const { formatRuntimeError, USER_CODE_START_LINE } = loadGeneratedRuntimeErrorHelpers([
+  it('reports js_exec code locations without leaking generated stack frames', async () => {
+    const { formatRuntimeError, USER_CODE_START_LINE } = await loadGeneratedRuntimeErrorHelpers([
       'const before = true;',
       'JSON.parse(await tools.read({ location: "project", project: "app", path: "package.json" }));',
       'const after = true;',
@@ -387,12 +390,12 @@ describe('code mode runner tools.help guide', () => {
   });
 });
 
-function loadGeneratedRuntimeErrorHelpers(userCode = ''): {
+async function loadGeneratedRuntimeErrorHelpers(userCode = ''): Promise<{
   formatRuntimeError: (error: unknown) => string;
   USER_CODE_START_LINE: number;
   USER_CODE_END_LINE: number;
-} {
-  const source = codeModeWorkerModule(userCode);
+}> {
+  const source = await codeModeWorkerModule(userCode);
   const start = source.indexOf('const USER_CODE_START_LINE');
   const end = source.indexOf('\n\nfunction createOutputConsole', start);
   expect(start).toBeGreaterThanOrEqual(0);
@@ -408,7 +411,7 @@ function loadGeneratedToolSearch(): {
   createToolsFacade: (entries: Array<[string, unknown]>, search: (input: unknown) => any) => Record<string, any>;
   schemaToTypeScript: (schema: unknown) => string;
 } {
-  const source = codeModeWorkerModule('');
+  const source = EMPTY_CODE_MODE_WORKER_SOURCE;
   const start = source.indexOf('const RUNTIME_HELP_ENTRIES');
   const end = source.indexOf('\n\nfunction createScreenshotFacade', start);
   expect(start).toBeGreaterThanOrEqual(0);
@@ -675,7 +678,7 @@ describe('code mode runner tools.search / tools.describe', () => {
 });
 
 describe('js_exec result-shape contracts', () => {
-  const source = codeModeWorkerModule('return 1;', { orgId: 'o', workspaceId: 'w' });
+  const source = SIMPLE_CODE_MODE_WORKER_SOURCE;
 
   it('tools.search returns { query, total, items, usage } directly, never { ok, data }', () => {
     // The sandbox search helper's return construction — locked so agents can
@@ -695,7 +698,7 @@ describe('js_exec result-shape contracts', () => {
 
 describe('empty js_exec output', () => {
   it('explains no-output runs instead of returning a silent blank', () => {
-    const source = codeModeWorkerModule('return 1;', { orgId: 'o', workspaceId: 'w' });
+    const source = SIMPLE_CODE_MODE_WORKER_SOURCE;
     // The blank case must be self-explaining: agents receiving "" invented
     // renderer failures (the "see attached image" incident). The message must
     // name the if/else pitfall since block-final scripts are the common cause.

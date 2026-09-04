@@ -195,6 +195,19 @@ describe('bounded read surfaces', () => {
     });
   });
 
+  it('group new-chat recent source reads one bounded render page', async () => {
+    await withReadThread(async (instance, meter) => {
+      const { result, usage } = await meter.measure(() =>
+        instance.getGroupNewChatRecentSource(READ_THREAD),
+      );
+      expect((result as any).messages.length).toBeGreaterThan(0);
+      expectWithinBudget(usage, WORKING_SET_BUDGETS.connectFirstPage);
+      expect(usage.piCoreBytesMaterialized).toBeLessThan(
+        readFixture.totalChars / 8,
+      );
+    });
+  });
+
   it('provider request prepare (transformContext)', async () => {
     await withReadThread(async (instance, meter) => {
       const loaded = await instance.loadBoundedPiCoreSessionWindow();

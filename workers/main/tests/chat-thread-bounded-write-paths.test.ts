@@ -186,6 +186,92 @@ describe('2a — bounded preserve keeps the history it is there to keep', () => 
   });
 });
 
+describe('2a — rewrite swap is rollback atomic', () => {
+  it('keeps live messages, identity keys, and revision together when the swap fails', async () => {
+    const thread = 'bounded-rewrite-rollback-atomic';
+    await runInDurableObject(threadStub(thread), async (instance: any) => {
+      seedChatContext(instance, thread);
+      instance.ensurePiCoreTables();
+      await instance.appendPiCoreMessages([
+        { role: 'user', content: 'before', timestamp: 1 },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'still here' }],
+          responseId: 'before-response',
+          timestamp: 2,
+        },
+      ]);
+
+      const readState = () => ({
+        messages: instance.ctx.storage.sql
+          .exec('SELECT idx, payload, created_at FROM pi_core_messages ORDER BY idx')
+          .toArray(),
+        keys: instance.ctx.storage.sql
+          .exec('SELECT idx, key_hash FROM pi_core_message_keys ORDER BY idx')
+          .toArray(),
+        revision: instance.piCoreStore.getPiCoreRevision(),
+      });
+      const before = readState();
+      expect(before.keys).toHaveLength(before.messages.length);
+
+      instance.ctx.storage.sql.exec(
+        `CREATE TRIGGER fail_rewrite_key_insert
+         BEFORE INSERT ON pi_core_message_keys
+         BEGIN
+           SELECT RAISE(ABORT, 'forced identity-key failure');
+         END`,
+      );
+      await expect(
+        instance.replacePiCoreMessages(
+          [{ role: 'user', content: 'replacement', timestamp: 3 }],
+          { uiRender: 'rebuild' },
+        ),
+      ).rejects.toThrow('forced identity-key failure');
+      instance.ctx.storage.sql.exec('DROP TRIGGER fail_rewrite_key_insert');
+
+      expect(readState()).toEqual(before);
+    });
+  });
+
+  it('rolls back an appended payload when its identity key cannot commit', async () => {
+    const thread = 'bounded-append-rollback-atomic';
+    await runInDurableObject(threadStub(thread), async (instance: any) => {
+      seedChatContext(instance, thread);
+      instance.ensurePiCoreTables();
+      await instance.appendPiCoreMessages([
+        { role: 'user', content: 'existing', timestamp: 1 },
+      ]);
+
+      const readState = () => ({
+        messages: instance.ctx.storage.sql
+          .exec('SELECT idx, payload, created_at FROM pi_core_messages ORDER BY idx')
+          .toArray(),
+        keys: instance.ctx.storage.sql
+          .exec('SELECT idx, key_hash FROM pi_core_message_keys ORDER BY idx')
+          .toArray(),
+        revision: instance.piCoreStore.getPiCoreRevision(),
+      });
+      const before = readState();
+
+      instance.ctx.storage.sql.exec(
+        `CREATE TRIGGER fail_append_key_insert
+         BEFORE INSERT ON pi_core_message_keys
+         BEGIN
+           SELECT RAISE(ABORT, 'forced append identity-key failure');
+         END`,
+      );
+      await expect(
+        instance.appendPiCoreMessages([
+          { role: 'user', content: 'must roll back', timestamp: 2 },
+        ]),
+      ).rejects.toThrow('forced append identity-key failure');
+      instance.ctx.storage.sql.exec('DROP TRIGGER fail_append_key_insert');
+
+      expect(readState()).toEqual(before);
+    });
+  });
+});
+
 describe('2a — a truncated archive refuses to become history loss', () => {
   it('abandons the rewrite rather than delete rows it could not archive', async () => {
     // The ceilings are runtime guards, not licences. When one stops the walk the

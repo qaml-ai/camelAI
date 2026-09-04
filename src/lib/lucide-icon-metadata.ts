@@ -152,15 +152,22 @@ function hasTokenMatch(
   );
 }
 
-const CANONICAL_METADATA_NAMES: Readonly<Record<string, boolean>> =
-  Object.freeze(
-    Object.fromEntries(LUCIDE_ICON_METADATA.map((entry) => [entry.name, true])),
+let canonicalMetadataNames: ReadonlySet<string> | undefined;
+
+function getCanonicalMetadataNames(): ReadonlySet<string> {
+  // Kept lazy because exact/alias matches do not otherwise need the full name
+  // set. More importantly, the catalog module itself is now loaded only for
+  // the infrequent avatar-generation path.
+  return canonicalMetadataNames ??= new Set(
+    LUCIDE_ICON_METADATA.map((entry) => entry.name),
   );
+}
 
 function findBaseModifierTokens(name: string): readonly string[] {
   const tokens = name.split("-");
+  const canonicalNames = getCanonicalMetadataNames();
   for (let length = tokens.length - 1; length > 0; length -= 1) {
-    if (CANONICAL_METADATA_NAMES[tokens.slice(0, length).join("-")]) {
+    if (canonicalNames.has(tokens.slice(0, length).join("-"))) {
       return tokens.slice(length);
     }
   }
@@ -186,11 +193,6 @@ function indexMetadataEntry(
     baseModifierTokens: findBaseModifierTokens(metadata.name),
   };
 }
-
-// This is immutable derived search data, not a cross-request cache. Building it
-// once keeps each background selection to a few small array scans.
-const SEARCH_INDEX: readonly SearchableMetadataEntry[] =
-  LUCIDE_ICON_METADATA.map(indexMetadataEntry);
 
 function scoreEntry(
   entry: SearchableMetadataEntry,
@@ -272,16 +274,30 @@ export function searchLucideIconMetadata(
   const queryTokens = phraseTokens(term);
   if (queryTokens.length === 0) return [];
 
-  return SEARCH_INDEX.flatMap((entry) => {
-    if (entry.metadata.name === DEFAULT_CHAT_GROUP_ICON) return [];
-    const candidate = scoreEntry(entry, query, queryTokens);
-    return candidate ? [candidate] : [];
-  })
-    .sort(
-      (left, right) =>
-        right.score - left.score || left.name.localeCompare(right.name),
-    )
-    .slice(0, limit);
+  // Score one catalog row at a time and retain only the requested leaders.
+  // The previous SEARCH_INDEX permanently expanded every alias/tag/category
+  // into normalized strings and token arrays, then flatMapped every match just
+  // to sort and discard almost all of them. Peak retained work is now O(limit),
+  // independent of the catalog size.
+  const leaders: LucideIconCandidate[] = [];
+  for (const metadata of LUCIDE_ICON_METADATA) {
+    if (metadata.name === DEFAULT_CHAT_GROUP_ICON) continue;
+    const candidate = scoreEntry(indexMetadataEntry(metadata), query, queryTokens);
+    if (!candidate) continue;
+    const insertAt = leaders.findIndex(
+      (existing) =>
+        candidate.score > existing.score ||
+        (candidate.score === existing.score &&
+          candidate.name.localeCompare(existing.name) < 0),
+    );
+    if (insertAt < 0) {
+      if (leaders.length < limit) leaders.push(candidate);
+    } else {
+      leaders.splice(insertAt, 0, candidate);
+      if (leaders.length > limit) leaders.pop();
+    }
+  }
+  return leaders;
 }
 
 function isClearCandidate(

@@ -111,14 +111,14 @@ describe('ChatThreadDO project activity RPCs', () => {
     vi.useRealTimers();
   });
 
-  it('returns parsed messages and activity from one combined read', async () => {
+  it('returns only the newest bounded page and does not walk older history', async () => {
     const fake = Object.create(ChatThreadDO.prototype) as any;
     const messages = [
       {
         id: 'message_1',
         thread_id: 'thread_1',
         role: 'user',
-        content: 'hello',
+        content: [{ type: 'text', text: 'hello' }],
         created_at: 10,
         forkEntryId: 'fork_1',
       },
@@ -126,13 +126,22 @@ describe('ChatThreadDO project activity RPCs', () => {
     const projectActivity = [
       { projectId: 'project_1', activityType: 'created', lastUsedAt: 20 },
     ];
-    fake.getPiCoreParsedMessages = vi.fn(async () => messages);
+    fake.getDerivedUiMessagePage = vi.fn(async () => ({
+      messages: [{
+        id: 'message_1',
+        role: 'user',
+        parts: [{ type: 'text', text: 'hello' }],
+        metadata: { pi: { createdAtMs: 10, forkEntryId: 'fork_1' } },
+      }],
+      nextCursor: 'dp:p:0',
+      hasMore: true,
+    }));
     fake.listProjectActivity = vi.fn(async () => projectActivity);
 
     await expect(
       ChatThreadDO.prototype.getGroupNewChatRecentSource.call(fake, 'thread_1'),
     ).resolves.toEqual({ messages, projectActivity });
-    expect(fake.getPiCoreParsedMessages).toHaveBeenCalledWith('thread_1');
+    expect(fake.getDerivedUiMessagePage).toHaveBeenCalledTimes(1);
     expect(fake.listProjectActivity).toHaveBeenCalledTimes(1);
   });
 });

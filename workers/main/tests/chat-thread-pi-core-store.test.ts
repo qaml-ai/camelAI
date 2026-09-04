@@ -28,12 +28,53 @@ function externalImageMessage(key = 'private/org/workspace/image.base64') {
 function createReadHarness(payloads: string[]) {
   const operations = { payloadRowsParsed: 0, r2ImagesHydrated: 0 };
   const get = vi.fn(async () => ({ text: async () => 'provider-image-data' }));
-  const exec = vi.fn((sql: string) => {
-    if (sql.trimStart().startsWith('CREATE TABLE') || sql.includes('INSERT OR IGNORE INTO pi_core_state')) {
+  const messageKeys = new Map<number, string>();
+  const exec = vi.fn((sql: string, ...params: unknown[]) => {
+    const text = sql.trimStart();
+    if (text.startsWith('CREATE ') || sql.includes('INSERT OR IGNORE INTO pi_core_state')) {
       return { toArray: () => [] };
     }
     if (sql.includes('FROM pi_core_compaction')) {
       return { toArray: () => [] };
+    }
+    if (sql.includes('LEFT JOIN pi_core_message_keys')) {
+      const firstKeptIndex = Number(params[0]);
+      const limit = Number(params[1]);
+      return {
+        toArray: () => payloads
+          .map((_, idx) => idx)
+          .filter((idx) => idx >= firstKeptIndex && !messageKeys.has(idx))
+          .slice(0, limit)
+          .map((idx) => ({ idx })),
+      };
+    }
+    if (
+      text.startsWith('INSERT INTO pi_core_message_keys') &&
+      sql.includes('SELECT idx')
+    ) {
+      const [keyHash, idxValue, expectedPayload] = params;
+      const idx = Number(idxValue);
+      if (payloads[idx] === expectedPayload) {
+        messageKeys.set(idx, String(keyHash));
+      }
+      return { toArray: () => [] };
+    }
+    if (text.startsWith('INSERT INTO pi_core_message_keys')) {
+      messageKeys.set(Number(params[0]), String(params[1]));
+      return { toArray: () => [] };
+    }
+    if (sql.includes('SELECT DISTINCT keys.key_hash')) {
+      const firstKeptIndex = Number(params[0]);
+      const candidates = new Set(params.slice(1).map(String));
+      return {
+        toArray: () => Array.from(messageKeys.entries())
+          .filter(([idx, hash]) => idx >= firstKeptIndex && candidates.has(hash))
+          .map(([, key_hash]) => ({ key_hash })),
+      };
+    }
+    if (sql.includes('SELECT payload FROM pi_core_messages WHERE idx = ?')) {
+      const payload = payloads[Number(params[0])];
+      return { toArray: () => payload === undefined ? [] : [{ payload }] };
     }
     if (sql.includes('SELECT payload FROM pi_core_messages')) {
       return { toArray: () => payloads.map((payload) => ({ payload })) };
@@ -42,6 +83,7 @@ function createReadHarness(payloads: string[]) {
   });
   const store = new PiCoreMessageStore({
     sql: () => ({ exec }) as never,
+    transactionSync: (callback) => callback(),
     r2: () => ({ get }) as never,
     chatContext: () => null,
     recordReadOperation: (operation) => {
@@ -49,7 +91,7 @@ function createReadHarness(payloads: string[]) {
       if (operation === 'r2_image_hydrated') operations.r2ImagesHydrated += 1;
     },
   });
-  return { store, operations, get };
+  return { store, operations, get, messageKeys };
 }
 
 describe('PiCoreMessageStore image hydration policy', () => {
@@ -126,6 +168,30 @@ describe('PiCoreMessageStore image hydration policy', () => {
     expect(harness.get).not.toHaveBeenCalled();
     expect(append).toHaveBeenCalledWith([]);
   });
+
+  it('does not publish a stale legacy key when a rewrite replaces the row during hashing', async () => {
+    const oldMessage = { role: 'user', content: 'old', timestamp: 1 };
+    const replacement = { role: 'user', content: 'replacement', timestamp: 1 };
+    const payloads = [JSON.stringify(oldMessage)];
+    const harness = createReadHarness(payloads);
+    const replacementHash = await harness.store.piCoreMessageKeyHash(replacement as never);
+    const hash = harness.store.piCoreMessageKeyHash.bind(harness.store);
+    let replaced = false;
+    vi.spyOn(harness.store, 'piCoreMessageKeyHash').mockImplementation(async (message) => {
+      const result = await hash(message);
+      if (!replaced) {
+        replaced = true;
+        payloads[0] = JSON.stringify(replacement);
+      }
+      return result;
+    });
+    const append = vi.spyOn(harness.store, 'appendPiCoreMessages').mockResolvedValue();
+
+    await harness.store.appendPiCoreMessagesIfMissing([replacement as never]);
+
+    expect(harness.messageKeys.get(0)).toBe(replacementHash);
+    expect(append).toHaveBeenCalledWith([]);
+  });
 });
 
 describe('PiCoreMessageStore compaction watermark', () => {
@@ -139,7 +205,7 @@ describe('PiCoreMessageStore compaction watermark', () => {
     const writes: Array<{ sql: string; params: unknown[] }> = [];
     const exec = vi.fn((sql: string, ...params: unknown[]) => {
       if (
-        sql.trimStart().startsWith('CREATE TABLE') ||
+        sql.trimStart().startsWith('CREATE ') ||
         sql.includes('INSERT OR IGNORE INTO pi_core_state')
       ) {
         return { toArray: () => [] };
@@ -177,6 +243,7 @@ describe('PiCoreMessageStore compaction watermark', () => {
     });
     const store = new PiCoreMessageStore({
       sql: () => ({ exec }) as never,
+      transactionSync: (callback) => callback(),
       r2: () => ({ get: vi.fn() }) as never,
       chatContext: () => null,
     });

@@ -3,40 +3,19 @@ import {
   chatSseCloseCodeForHttpStatus,
   isTerminalChatSseByeReason,
   isTerminalChatSseHttpStatus,
-  parseChatSseByeReason,
   type ChatSseByeReason,
 } from "./chat-sse-close";
 
 /**
- * Browser transport that impersonates an Agents-SDK agent socket on top of
- * plain HTTP: receive over one SSE stream per thread view, send over POST.
- *
- * It exists because a real cohort of users can never complete a WebSocket
- * handshake (TCP:443 blocked while HTTP rides QUIC/H3). `useAgentChat` and the
- * whole ai-chat server stack stay untouched — this object satisfies the exact
- * surface both consumers read off the socket (send / addEventListener(+signal) /
- * removeEventListener / getHttpUrl / agent / name / path / _pk /
- * connectionError, plus readyState / reconnect / call for Chat.tsx).
- *
- * Two deliberate departures from WebSocket semantics:
- * - `readyState` is OPEN while the stream is live OR dormant-by-design (the
- *   server parked it with `bye {"reason":"idle"}`). Sends are POSTs and do not
- *   need the stream, so the OPEN gates in Chat.tsx must not wedge the composer
- *   while a quiet thread is parked.
- * - The upstream channel is `POST .../call`, not the stream. Only the two resume
- *   handshake frames are carried (they need the live stream shim server-side);
- *   RPCs work even while the stream is down, which is the point of the change.
- *
- * Because sends no longer ride the stream, nothing upstream can notice a dead
- * receive path: two watchdogs own that here. `STREAM_SILENCE_TIMEOUT_MS` forces a
- * reattach when an open stream stops delivering bytes (the server's `:hb` is the
- * liveness signal), and a server-parked stream in a VISIBLE tab reattaches on a
- * short jittered delay instead of waiting for a wake signal that a focused tab
- * can never produce.
+ * Chat transport: native WebSocket send/receive, with completed HTTP polling
+ * and POST calls after a socket error or unexpected close. The historical
+ * SseAgentClient export remains the shared client interface used by chat hooks.
+ * No connection deadline or receive watchdog is added to the WebSocket.
  */
 
 /** Same numbers as WebSocket.CONNECTING/OPEN/CLOSED — consumers gate on
- * `readyState === SSE_READY_STATE_OPEN` (see the redefinition note above). */
+ * `readyState === SSE_READY_STATE_OPEN`. An intentionally idle-parked client
+ * also stays OPEN for sends, which wake its receive connection. */
 export const SSE_READY_STATE_CONNECTING = 0;
 export const SSE_READY_STATE_OPEN = 1;
 export const SSE_READY_STATE_CLOSED = 3;
@@ -45,19 +24,10 @@ export const MIN_RECONNECT_DELAY_MS = 2_000;
 export const MAX_RECONNECT_DELAY_MS = 15_000;
 const RECONNECT_BACKOFF_FACTOR = 1.3;
 const RECONNECT_JITTER_RATIO = 0.2;
-/** No response headers within this budget = dead attach; retry with backoff. */
-export const ATTACH_TIMEOUT_MS = 20_000;
+const POLL_REQUEST_TIMEOUT_MS = 20_000;
+export const POLL_INTERVAL_MS = 1_000;
+const POLL_HIDDEN_INTERVAL_MS = 5_000;
 export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
-/**
- * Total silence budget on an OPEN stream. The server writes a `:hb` comment
- * every 25s (SSE_HEARTBEAT_INTERVAL_MS) precisely so a stalled receive path is
- * detectable: a blackholed TCP path (NAT rebind, buffering intermediary, lost
- * FIN) never surfaces an error or EOF to the reader, and sends are independent
- * POSTs that keep succeeding, so nothing else can notice. ~2.5 missed beats,
- * well under the server's 5-minute idle grace. ANY byte re-arms it, comments
- * included.
- */
-export const STREAM_SILENCE_TIMEOUT_MS = 65_000;
 /**
  * The server parks a stream from server-side work alone (it has no client
  * liveness signal), so a visible tab that stays parked silently misses pushes
@@ -158,6 +128,7 @@ interface QueuedResumeFrame {
 }
 
 interface StreamEndInfo {
+  code?: number;
   status?: number | null;
   byeReason?: ChatSseByeReason | null;
   reason?: string;
@@ -240,11 +211,14 @@ export class SseAgentClient<State = unknown> {
   private attempt = 0;
   private abortController: AbortController | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private streamSilenceTimer: ReturnType<typeof setTimeout> | null = null;
   private idleReattachTimer: ReturnType<typeof setTimeout> | null = null;
   private lastStreamOpenAt = 0;
   private repeatIdleParks = 0;
   private wakeListenersAttached = false;
+  private receiveTransport: "websocket" | "poll" = "websocket";
+  private socket: WebSocket | null = null;
+
+  get transport(): "websocket" | "poll" { return this.receiveTransport; }
 
   constructor(options: SseAgentClientOptions<State>) {
     this.options = options;
@@ -333,8 +307,8 @@ export class SseAgentClient<State = unknown> {
   /**
    * The SDK sends frames without any readyState guard. Only the resume
    * handshake is live in this app; it needs the stream shim server-side, so it
-   * is queued until the stream is up and POSTed after that. Anything else is a
-   * frame this transport deliberately does not carry.
+   * is queued until the connection is up, then sent over WebSocket or POST.
+   * Other client frames must use the callable RPC interface.
    */
   send(data: string): void {
     const type = frameType(data);
@@ -343,7 +317,7 @@ export class SseAgentClient<State = unknown> {
       return;
     }
     console.warn(
-      `[sse-agent] Dropped an unsupported client frame (type "${type ?? "unknown"}"): the SSE transport only carries the resume handshake.`,
+      `[sse-agent] Dropped an unsupported client frame (type "${type ?? "unknown"}"): raw sends only carry the resume handshake; RPCs use call().`,
     );
   }
 
@@ -425,7 +399,7 @@ export class SseAgentClient<State = unknown> {
     this.generation += 1;
     this.clearReconnectTimer();
     this.clearIdleReattachTimer();
-    this.clearStreamSilenceTimer();
+    this.closeSocket();
     const controller = this.abortController;
     this.abortController = null;
     controller?.abort();
@@ -445,212 +419,152 @@ export class SseAgentClient<State = unknown> {
   private startGeneration(): void {
     const generation = (this.generation += 1);
     this.clearIdleReattachTimer();
-    this.clearStreamSilenceTimer();
+    this.closeSocket();
     const previous = this.abortController;
     this.abortController = null;
     previous?.abort();
-    void this.runStream(generation);
+    if (this.receiveTransport === "poll") {
+      this._pk = crypto.randomUUID();
+      void this.runPoll(generation, -1);
+    } else {
+      this.runSocket(generation);
+    }
   }
 
   private isStale(generation: number): boolean {
     return this.generation !== generation;
   }
 
-  private async runStream(generation: number): Promise<void> {
+  /** Keep one protocol connection across completed HTTP responses. A cursor is
+   * acknowledged only after its entire batch was delivered to the SDK. Failed
+   * HTTP reads retry that cursor, so a lost response cannot lose chat chunks.
+   * Polling stays selected for this view; a new view tries WebSocket again.
+   */
+  private async runPoll(generation: number, cursor: number, failures = 0): Promise<void> {
+    if (this.isStale(generation)) return;
     const controller = new AbortController();
     this.abortController = controller;
-    // A fresh _pk per generation: the server registers its stream shim under
-    // this id and resume POSTs must address that exact shim.
-    this._pk = crypto.randomUUID();
-    let attachTimedOut = false;
-    const attachTimer = setTimeout(() => {
-      attachTimedOut = true;
-      controller.abort();
-    }, ATTACH_TIMEOUT_MS);
-
-    let response: Response;
+    const timer = setTimeout(() => controller.abort(), POLL_REQUEST_TIMEOUT_MS);
+    let nextCursor = cursor;
+    let nextFailures = 0;
     try {
-      response = await globalThis.fetch(this.buildUrl("sse"), {
-        method: "GET",
-        headers: { Accept: "text/event-stream" },
+      const url = new URL(this.buildUrl("sse"), globalThis.location?.href ?? "http://localhost");
+      url.searchParams.set("transport", "poll");
+      url.searchParams.set("cursor", String(cursor));
+      const response = await globalThis.fetch(url.toString(), {
+        headers: { Accept: "application/json" },
         credentials: "same-origin",
         cache: "no-store",
         signal: controller.signal,
       });
-    } catch (error) {
-      clearTimeout(attachTimer);
       if (this.isStale(generation)) return;
-      this.reportError(
-        attachTimedOut
-          ? new Error("TIMEOUT: chat stream attach timed out")
-          : error,
-      );
-      this.emitClose({
-        reason: attachTimedOut ? "attach timeout" : errorMessage(error),
-      });
-      this.scheduleReconnect();
-      return;
-    }
-    clearTimeout(attachTimer);
-    if (this.isStale(generation)) {
-      void response.body?.cancel().catch(() => {});
-      return;
-    }
-
-    if (!response.ok) {
-      const status = response.status;
-      const reason = await readReasonBody(response);
-      if (this.isStale(generation)) return;
-      if (isTerminalChatSseHttpStatus(status)) {
+      if (isTerminalChatSseHttpStatus(response.status)) {
+        const reason = await readReasonBody(response);
+        if (this.isStale(generation)) return;
         this.latchTerminal({
-          code: chatSseCloseCodeForHttpStatus(status),
-          reason: reason || `chat stream rejected with status ${status}`,
-          status,
+          code: chatSseCloseCodeForHttpStatus(response.status),
+          status: response.status,
+          reason: reason || "Chat polling denied",
         });
         return;
       }
-      this.reportError(new Error(`Chat stream attach failed (${status}).`));
-      this.emitClose({ status, reason });
-      this.scheduleReconnect();
-      return;
-    }
-
-    // A 200 alone does not prove a stream: a captive portal / SSO interstitial /
-    // SPA fallback answers the attach with an HTML page, and treating that as
-    // open would enable the composer against a page that never yields a frame.
-    // Retryable, not terminal — the interception is a network condition.
-    const contentType = response.headers.get("content-type") ?? "";
-    if (!contentType.toLowerCase().includes("text/event-stream")) {
-      void response.body?.cancel().catch(() => {});
-      this.reportError(
-        new Error(
-          `Chat stream attach returned "${contentType || "no content type"}" instead of an event stream.`,
-        ),
-      );
-      this.emitClose({
-        status: response.status,
-        reason: `unexpected content type: ${contentType || "none"}`,
-      });
-      this.scheduleReconnect();
-      return;
-    }
-
-    if (!response.body) {
-      this.reportError(new Error("Chat stream attach returned no body."));
-      this.emitClose({ status: response.status, reason: "no stream body" });
-      this.scheduleReconnect();
-      return;
-    }
-
-    this.markOpen();
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let eventName = "";
-    let dataLines: string[] = [];
-    const bye: { seen: boolean; reason: ChatSseByeReason | null } = {
-      seen: false,
-      reason: null,
-    };
-    let readError: unknown = null;
-    let wentSilent = false;
-
-    // The only watchdog that survives past the response headers: `attachTimer`
-    // is already disarmed here, and a dead receive path produces no read, no
-    // error and no EOF.
-    const armSilenceTimer = () => {
-      this.clearStreamSilenceTimer();
-      this.streamSilenceTimer = setTimeout(() => {
-        this.streamSilenceTimer = null;
-        if (this.isStale(generation) || this.phase !== "open") return;
-        wentSilent = true;
-        // Aborting rejects the pending read, so the existing abnormal-end tail
-        // does the reporting and the reattach.
-        controller.abort();
-      }, STREAM_SILENCE_TIMEOUT_MS);
-    };
-    armSilenceTimer();
-
-    const dispatchPendingEvent = () => {
-      const name = eventName;
-      const payload = dataLines.join("\n");
-      eventName = "";
-      dataLines = [];
-      if (name === "bye") {
-        bye.seen = true;
-        bye.reason = parseChatSseByeReason(payload);
-        return;
-      }
-      if (!payload) return;
-      this.handleFrame(payload);
-    };
-
-    try {
-      while (!bye.seen) {
-        const chunk = await reader.read();
-        if (this.isStale(generation)) {
-          this.clearStreamSilenceTimer();
-          void reader.cancel().catch(() => {});
-          return;
-        }
-        if (chunk.done) break;
-        // Bytes are bytes: a `:hb` comment is liveness even though the parser
-        // below discards it.
-        armSilenceTimer();
-        buffer += decoder.decode(chunk.value, { stream: true });
-        let newlineIndex = buffer.indexOf("\n");
-        while (newlineIndex !== -1) {
-          const line = buffer.slice(0, newlineIndex).replace(/\r$/, "");
-          buffer = buffer.slice(newlineIndex + 1);
-          if (line === "") {
-            dispatchPendingEvent();
-          } else if (!line.startsWith(":")) {
-            const colon = line.indexOf(":");
-            const field = colon === -1 ? line : line.slice(0, colon);
-            const rawValue = colon === -1 ? "" : line.slice(colon + 1);
-            const value = rawValue.startsWith(" ") ? rawValue.slice(1) : rawValue;
-            if (field === "data") dataLines.push(value);
-            else if (field === "event") eventName = value;
-            // `id:`/`retry:` are ignored: v1 has no Last-Event-ID resume.
-          }
-          if (bye.seen) break;
-          newlineIndex = buffer.indexOf("\n");
-        }
-      }
-    } catch (error) {
-      readError = error;
-    }
-
-    this.clearStreamSilenceTimer();
-    if (this.isStale(generation)) return;
-    void reader.cancel().catch(() => {});
-
-    if (bye.seen) {
-      this.handleBye(bye.reason);
-      return;
-    }
-    if (readError) {
-      if (wentSilent) {
-        // Report the stall as what it is, not as the abort it was implemented
-        // with: the receive path was dead while the transport looked healthy.
-        this.reportError(
-          new Error(
-            `TIMEOUT: chat stream went silent for ${STREAM_SILENCE_TIMEOUT_MS}ms`,
-          ),
-        );
-        this.emitClose({ reason: "stream silence timeout" });
+      if (response.status === 409) {
+        // Eviction/redeploy/overflow: reconnect with the SDK handshake and
+        // backoff, so repeated resets cannot hammer the authorization path.
+        this.emitClose({ reason: "poll session expired" });
         this.scheduleReconnect();
         return;
       }
-      this.reportError(readError);
-      this.emitClose({ reason: errorMessage(readError) });
-      this.scheduleReconnect();
-      return;
+      if (!response.ok) throw new Error(`Chat poll failed (${response.status}).`);
+      const batch: unknown = await response.json();
+      if (this.isStale(generation)) return;
+      const parsed = batch as { cursor?: unknown; frames?: unknown } | null;
+      if (
+        !parsed || !Array.isArray(parsed.frames) ||
+        !parsed.frames.every((frame): frame is string => typeof frame === "string") ||
+        !Number.isSafeInteger(parsed.cursor) ||
+        parsed.cursor !== cursor + parsed.frames.length
+      ) throw new Error("Invalid chat poll response");
+      if (this.phase !== "open") this.markOpen();
+      for (const frame of parsed.frames) {
+        if (this.isStale(generation)) return;
+        this.handleFrame(frame);
+      }
+      nextCursor = parsed.cursor as number;
+    } catch (error) {
+      if (this.isStale(generation)) return;
+      this.reportError(error);
+      nextFailures = failures + 1;
+      if (nextFailures >= 3) {
+        this.emitClose({ reason: "poll receive failed" });
+        this.scheduleReconnect();
+        return;
+      }
+    } finally {
+      clearTimeout(timer);
     }
-    // EOF with no `bye`: the transport died, so reconnect.
-    this.emitClose({ reason: "stream ended" });
-    this.scheduleReconnect();
+    if (this.isStale(generation)) return;
+    const interval = typeof document !== "undefined" && document.visibilityState === "hidden"
+      ? POLL_HIDDEN_INTERVAL_MS : POLL_INTERVAL_MS;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.runPoll(generation, nextCursor, nextFailures);
+    }, nextFailures ? MIN_RECONNECT_DELAY_MS * 2 ** nextFailures : interval);
+  }
+
+  private closeSocket(): void {
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) {
+      socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
+      socket.close();
+    }
+  }
+
+  private usePolling(generation: number, reason: string, code?: number): void {
+    if (this.isStale(generation)) return;
+    for (const pending of Array.from(this.pendingCalls.values())) {
+      if (pending.dispatched) this.rejectCall(pending, new Error("Connection lost; the operation may have been accepted"));
+    }
+    this.receiveTransport = "poll";
+    this.emitClose({ reason, code });
+    if (this.isStale(generation) || this.phase === "closed" || this.phase === "terminal") return;
+    this.phase = "connecting";
+    this.startGeneration();
+  }
+
+  private runSocket(generation: number): void {
+    this._pk = crypto.randomUUID();
+    try {
+      const url = new URL(this.buildUrl("socket"), globalThis.location?.href ?? "http://localhost");
+      url.protocol = url.protocol === "http:" ? "ws:" : "wss:";
+      const socket = new WebSocket(url.toString());
+      this.socket = socket;
+      socket.onopen = () => {
+        if (!this.isStale(generation)) this.markOpen();
+      };
+      socket.onmessage = (event) => {
+        if (!this.isStale(generation) && typeof event.data === "string") this.handleFrame(event.data);
+      };
+      socket.onerror = () => {
+        if (this.isStale(generation)) return;
+        this.reportError(new Error("Chat WebSocket connection failed"));
+        this.usePolling(generation, "websocket error");
+      };
+      socket.onclose = (event) => {
+        if (this.isStale(generation)) return;
+        if (event.code === 1008) {
+          this.latchTerminal({ code: event.code, reason: event.reason || "forbidden" });
+        } else if (event.code === 1000 && event.reason === "idle") {
+          this.handleBye("idle");
+        } else {
+          this.usePolling(generation, event.reason || "websocket closed", event.code);
+        }
+      };
+    } catch (error) {
+      this.reportError(error);
+      this.usePolling(generation, "websocket unavailable");
+    }
   }
 
   private handleBye(reason: ChatSseByeReason | null): void {
@@ -785,6 +699,10 @@ export class SseAgentClient<State = unknown> {
   private async postResumeFrame(frame: QueuedResumeFrame): Promise<void> {
     const attempts = frame.attempts + 1;
     try {
+      if (this.receiveTransport === "websocket" && this.socket?.readyState === 1) {
+        this.socket.send(frame.body);
+        return;
+      }
       const response = await this.postFrame(frame.body);
       if (response.ok || response.status === 204) return;
       const status = response.status;
@@ -847,6 +765,16 @@ export class SseAgentClient<State = unknown> {
     // A dispatched call is a signal the thread is in use: bring a parked
     // stream back so the reply/broadcast path is live again.
     this.wake();
+    if (this.receiveTransport === "websocket" && this.socket?.readyState === 1) {
+      try {
+        this.socket.send(pending.body);
+      } catch (error) {
+        // Never replay an RPC after an ambiguous send: it may have side effects.
+        this.rejectCall(pending, error instanceof Error ? error : new Error(String(error)));
+        this.usePolling(this.generation, "websocket send failed");
+      }
+      return;
+    }
     void this.deliverCall(pending);
   }
 
@@ -961,7 +889,7 @@ export class SseAgentClient<State = unknown> {
     this.generation += 1;
     this.clearReconnectTimer();
     this.clearIdleReattachTimer();
-    this.clearStreamSilenceTimer();
+    this.closeSocket();
     const controller = this.abortController;
     this.abortController = null;
     controller?.abort();
@@ -1006,13 +934,6 @@ export class SseAgentClient<State = unknown> {
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
-    }
-  }
-
-  private clearStreamSilenceTimer(): void {
-    if (this.streamSilenceTimer !== null) {
-      clearTimeout(this.streamSilenceTimer);
-      this.streamSilenceTimer = null;
     }
   }
 
@@ -1111,7 +1032,7 @@ export class SseAgentClient<State = unknown> {
     this.wake();
   };
 
-  private buildUrl(suffix: "sse" | "call"): string {
+  private buildUrl(suffix: "sse" | "call" | "socket"): string {
     const params = new URLSearchParams();
     for (const [key, value] of Object.entries(this.query)) {
       if (value === null || value === undefined || value === "") continue;
@@ -1121,16 +1042,16 @@ export class SseAgentClient<State = unknown> {
     const base =
       this.httpBaseUrl ||
       `/agents/${this.agent}/${encodeURIComponent(this.name)}`;
-    return `${base}/${suffix}?${params.toString()}`;
+    return `${base}${suffix === "socket" ? "" : `/${suffix}`}?${params.toString()}`;
   }
 
   private emitClose(info: StreamEndInfo): void {
-    const code =
+    const code = info.code ?? (
       typeof info.status === "number"
         ? chatSseCloseCodeForHttpStatus(info.status)
         : info.byeReason
           ? chatSseCloseCodeForByeReason(info.byeReason)
-          : null;
+          : null);
     const event: SseAgentCloseEvent = {
       type: "close",
       target: this,

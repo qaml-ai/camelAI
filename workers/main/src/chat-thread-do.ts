@@ -142,6 +142,8 @@ import {
   createSseStreamSink,
   isClosedStreamSendError,
 } from "./chat-thread/sse-connection";
+import { PollConnectionSink } from "./chat-thread/poll-connection";
+import { createWebSocketSink } from "./chat-thread/websocket-connection";
 import { withoutReservedTransportHeaders } from "./chat-thread/transport-headers";
 
 
@@ -2841,14 +2843,13 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // No WebSocket upgrade is ever delegated to `Server.fetch`: the worker has
-    // no chat upgrade route left, so an upgrade cannot reach this DO. The
-    // partyserver/Agents connection machinery below is still live — the SSE
-    // shim drives onConnect/onMessage/onClose through it.
+    if (request.method === "GET" && request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+      await this.__unsafe_ensureInitialized();
+      return this.handleChatStreamAttach(request, url);
+    }
 
-    // Chat transport (SSE receive + POST send). This override never delegates
-    // plain HTTP to `Server.fetch`, so startup (onStart: stream restore, chat
-    // recovery, MCP) has to be forced before any frame is served.
+    // All transports drive the same wrapped SDK lifecycle through a synthetic
+    // connection. Plain HTTP also needs explicit SDK startup before dispatch.
     if (request.method === "GET" && url.pathname.endsWith("/sse")) {
       await this.__unsafe_ensureInitialized();
       return this.handleChatStreamAttach(request, url);
@@ -2985,6 +2986,25 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       request,
       url.searchParams.get("_pk")?.trim() || crypto.randomUUID(),
     );
+    // Polls use the same authenticated route, scoped connection id, wrapped
+    // protocol and POSTs as SSE. Only the receive sink differs. Each response
+    // is finite so inspection proxies can finish buffering and release it.
+    const websocket = request.headers.get("Upgrade")?.toLowerCase() === "websocket";
+    const polling = !websocket && url.searchParams.get("transport") === "poll";
+    const cursor = Number(url.searchParams.get("cursor") ?? "-1");
+    if (polling && (!Number.isSafeInteger(cursor) || cursor < -1)) {
+      return new Response("Invalid poll cursor", { status: 400 });
+    }
+    const existing = this.sseConnections.get(connectionId);
+    if (polling && existing?.sink instanceof PollConnectionSink) {
+      const batch = existing.sink.read(cursor);
+      return batch
+        ? Response.json(batch, { headers: { "Cache-Control": "no-store" } })
+        : new Response("Chat poll session expired", { status: 409 });
+    }
+    if (polling && cursor !== -1) {
+      return new Response("Chat poll session expired", { status: 409 });
+    }
     // A reattach that reuses `_pk` must not leave the previous shim registered:
     // broadcasts would go to a writer nobody reads. Retire it first, and let its
     // close chain finish — that cleanup is keyed by connection id, which this
@@ -3018,13 +3038,19 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       });
     }
 
-    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
-    const writer = writable.getWriter();
+    const pair = websocket ? new WebSocketPair() : null;
+    const serverSocket = pair?.[1];
+    serverSocket?.accept();
+    const stream = polling || websocket ? null : new TransformStream<Uint8Array, Uint8Array>();
+    const writer = stream?.writable.getWriter();
+    const sink = serverSocket ? createWebSocketSink(serverSocket) : writer
+      ? createSseStreamSink(writer, this.sseQueueBudget)
+      : new PollConnectionSink(this.sseQueueBudget);
     const connection = new SseConnection({
       id: connectionId,
       uri: request.url,
       server: this.resolvePartyServerName(),
-      sink: createSseStreamSink(writer, this.sseQueueBudget),
+      sink,
       onTeardown: (torndown, code, reason) =>
         this.teardownSseConnection(torndown, code, reason),
     });
@@ -3036,20 +3062,50 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     this.recordSseViewerPresence(true);
     this.startSseHeartbeat();
 
+    if (serverSocket) {
+      serverSocket.addEventListener("close", (event) => connection.abort(event.code, event.reason));
+      serverSocket.addEventListener("error", () => connection.abort(1006, "websocket_error"));
+      serverSocket.addEventListener("message", (event) => {
+        if (typeof event.data !== "string") return;
+        let frame: ChatTransportFrame | null;
+        try { frame = JSON.parse(event.data) as ChatTransportFrame; } catch { frame = null; }
+        const allowed = frame && (
+          frame.type === CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST ||
+          frame.type === CHAT_MESSAGE_TYPES.STREAM_RESUME_ACK ||
+          (frame.type === "rpc" && typeof frame.method === "string" && CHAT_TRANSPORT_CALLABLE_METHODS.has(frame.method))
+        );
+        if (!allowed) {
+          this.recordChatThreadObservabilityEvent("chat_ws_frame_blocked", {
+            operation: "websocket_frame", status: "blocked", severity: "warn",
+          });
+          connection.closeWithBye("forbidden", 1008, "unsupported_frame");
+          return;
+        }
+        this.sseIdleSince = null;
+        this.ctx.waitUntil(Promise.resolve(this.onMessage(connection as unknown as Connection, event.data)).catch((error) => {
+          if (isClosedStreamSendError(error)) return;
+          console.error("[ChatThreadDO] WebSocket message failed", error);
+          connection.closeWithBye("retry", 1011, "message_failed");
+        }));
+      });
+    }
+
     // Cancelling the response body errors the writable half; the request signal
     // covers proxies that abort without draining. Either way the stream is gone.
-    void writer.closed.then(
-      () => connection.abort(1006, "stream_closed"),
-      () => connection.abort(1006, "stream_closed"),
-    );
-    if (request.signal.aborted) {
-      connection.abort(1006, "client_aborted");
-    } else {
-      request.signal.addEventListener(
-        "abort",
-        () => connection.abort(1006, "client_aborted"),
-        { once: true },
+    if (writer) {
+      void writer.closed.then(
+        () => connection.abort(1006, "stream_closed"),
+        () => connection.abort(1006, "stream_closed"),
       );
+      if (request.signal.aborted) {
+        connection.abort(1006, "client_aborted");
+      } else {
+        request.signal.addEventListener(
+          "abort",
+          () => connection.abort(1006, "client_aborted"),
+          { once: true },
+        );
+      }
     }
 
     // The FULL wrapped chain, so the frame order (resume/pending/recovering →
@@ -3079,7 +3135,17 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         }),
     );
 
-    return new Response(readable, {
+    if (pair) return new Response(null, { status: 101, webSocket: pair[0] });
+    if (sink instanceof PollConnectionSink) {
+      this.recordChatThreadObservabilityEvent("chat_poll_session_started", {
+        operation: "poll_attach",
+        status: "connected",
+      });
+      return Response.json(sink.read(cursor), {
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
+    return new Response(stream!.readable, {
       headers: {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache, no-transform",

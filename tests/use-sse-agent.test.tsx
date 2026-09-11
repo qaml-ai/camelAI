@@ -1,31 +1,23 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { FakeChatSocket } from "./helpers/chat-socket";
+
 import { useSseAgent } from "@/lib/use-sse-agent";
 
 const THREAD_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const OTHER_THREAD_ID = "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const WORKSPACE_ID = "12121212-3434-4565-8787-909090909090";
 
-function sseResponse(): Response {
-  const body = new ReadableStream<Uint8Array>({ start: () => {} });
-  return new Response(body, {
-    status: 200,
-    headers: { "content-type": "text/event-stream" },
-  });
-}
-
 describe("useSseAgent", () => {
   let attachUrls: string[];
 
   beforeEach(() => {
     attachUrls = [];
-    vi.stubGlobal("fetch", async (input: unknown, init?: RequestInit) => {
-      if ((init?.method ?? "GET") === "GET") {
-        attachUrls.push(String(input));
-        return sseResponse();
-      }
-      return new Response(null, { status: 204 });
+    FakeChatSocket.autoOpen = true;
+    FakeChatSocket.instances = [];
+    vi.stubGlobal("WebSocket", class extends FakeChatSocket {
+      constructor(url: string) { super(url); attachUrls.push(url); }
     });
   });
 
@@ -88,7 +80,7 @@ describe("useSseAgent", () => {
     expect(first.readyState).toBe(3);
     expect(attachUrls).toHaveLength(2);
     expect(new URL(attachUrls[1]).pathname).toBe(
-      `/agents/chat-thread/${OTHER_THREAD_ID}/sse`,
+      `/agents/chat-thread/${OTHER_THREAD_ID}`,
     );
   });
 

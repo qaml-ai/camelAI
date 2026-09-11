@@ -10,7 +10,8 @@
  * - /api/integrations/telegram/webhook → Telegram Bot API webhook
  * - email() → Workspace email ingress (Cloudflare Email Routing)
  * - /api/threads/:id/preview → Thread preview API
- * - /agents/chat-thread/:thread/sse → ChatThreadDO chat stream (SSE)
+ * - /agents/chat-thread/:thread → ChatThreadDO WebSocket chat
+ * - /agents/chat-thread/:thread/sse → HTTP polling fallback / legacy SSE
  * - /agents/chat-thread/:thread/call → ChatThreadDO chat frames (POST)
  * - * → React Router SSR
  */
@@ -268,7 +269,14 @@ const routes: Route[] = [
   { method: 'GET', path: /^\/api\/integrations\/remote_mcp\/oauth$/, handler: handleRemoteMcpOAuthStart },
   { method: 'GET', path: /^\/api\/integrations\/remote_mcp\/callback$/, handler: handleRemoteMcpOAuthCallback },
 
-  // Chat transport (HTTP POST send + SSE receive). Plain HTTP: `websocket: true`
+  {
+    method: 'GET',
+    path: /^\/agents\/chat-thread\/([^/]+)$/,
+    handler: (context) => handleChatTransportRequest(context, 'websocket'),
+    websocket: true,
+  },
+  // HTTP polling/POST fallback and SSE for already-open older clients.
+  // Plain HTTP: `websocket: true`
   // would make the route loop skip them, and React Router would answer an
   // /agents/* miss with the SPA shell, so misses 404 here instead.
   {
@@ -286,9 +294,7 @@ const routes: Route[] = [
   // Workspace thread-status SSE stream (replaces the status WebSocket).
   { method: 'GET', path: /^\/api\/workspaces\/([^/]+)\/status\/stream$/, handler: handleWorkspaceStatusStream },
 
-  // WebSocket routes. Only `wrangler tail` log streaming still speaks WebSocket
-  // (cf-api-proxy hands this URL back as the tail endpoint); chat and workspace
-  // status are HTTP+SSE.
+  // Log-tail WebSocket (cf-api-proxy hands this URL back as the tail endpoint).
   { method: 'GET', path: /^\/ws\/logs$/, handler: handleLogsWebSocket, websocket: true },
 ];
 
@@ -308,12 +314,13 @@ const reactRouterHandler = createRequestHandler(
 
 /**
  * Chat transports sharing one authorization unit. The telemetry event NAMES are
- * unchanged from the retired WebSocket upgrade path (dashboards filter on
- * them); `operation` distinguishes the two HTTP transports.
+ * unchanged for dashboard continuity; `operation` distinguishes WebSocket,
+ * HTTP receive and POST calls.
  */
-type ChatTransport = 'sse' | 'call';
+type ChatTransport = 'sse' | 'call' | 'websocket';
 
 const CHAT_TRANSPORT_AUTH_OPERATIONS: Record<ChatTransport, string> = {
+  websocket: 'authorizeChatTransportRequest:websocket',
   sse: 'authorizeChatTransportRequest:sse',
   call: 'authorizeChatTransportRequest:call',
 };
@@ -324,6 +331,12 @@ async function authorizeChatTransportRequest(
   threadId: string,
   transport: ChatTransport,
 ): Promise<Request | Response> {
+  // Browsers do not apply CORS to WebSocket upgrades. A foreign page must not
+  // use a session cookie to open a chat socket on the user's behalf.
+  const origin = req.headers.get('Origin');
+  if (transport === 'websocket' && origin !== null && origin !== new URL(req.url).origin) {
+    return text('Forbidden origin', 403);
+  }
   const startedAt = Date.now();
   const operation = CHAT_TRANSPORT_AUTH_OPERATIONS[transport];
   const url = new URL(req.url);
@@ -481,11 +494,8 @@ export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
     const method = req.method;
-    // No chat/agent WebSocket upgrade path exists any more: only routes marked
-    // `websocket: true` (currently just /ws/logs) answer an upgrade, and every
-    // other upgrade attempt — including a stale bundle reaching for
-    // /agents/chat-thread/:id or /ws/workspaces/:id/status — falls through to
-    // the 404 below without touching authorization.
+    // Only explicitly marked routes accept upgrades: chat and log tail. Other
+    // upgrade paths, including retired workspace status sockets, remain 404s.
     const isWebSocket = req.headers.get('Upgrade') === 'websocket';
 
     for (const route of routes) {

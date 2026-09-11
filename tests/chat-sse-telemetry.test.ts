@@ -131,7 +131,7 @@ describe("chat SSE telemetry events", () => {
     trackChatStreamOpen(threadId);
     await beacons.flush();
 
-    const open = beacons.events().find((event) => event.event === "chat_sse_open");
+    const open = beacons.events().find((event) => event.event === "chat_ws_open");
     expect(open).toBeDefined();
     expect(open?.status).toBe("connect");
     expect(open?.severity).toBe("info");

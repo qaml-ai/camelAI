@@ -198,7 +198,7 @@ function closeCodeFor(info: ChatSseCloseInfo): number | null {
   return null;
 }
 
-export function trackChatStreamOpen(threadId: string): void {
+export function trackChatStreamOpen(threadId: string, transport: "websocket" | "poll" = "websocket"): void {
   const stats = statsFor(threadId);
   const now = Date.now();
   stats.opens += 1;
@@ -210,14 +210,14 @@ export function trackChatStreamOpen(threadId: string): void {
   stats.lastOpenAt = now;
   reportClientEvent({
     source: "chat_sse",
-    event: "chat_sse_open",
+    event: transport === "poll" ? "chat_poll_open" : "chat_ws_open",
     severity: "info",
     status: reconnect ? "reconnect" : "connect",
-    message: "Chat SSE stream opened.",
+    message: transport === "poll" ? "Chat HTTP polling connected." : "Chat WebSocket connected.",
     threadId,
     durationMs: msSinceLastClose,
     count: stats.opens,
-    details: { ...connectionContext(), ...lifecycleCounts(stats) },
+    details: { ...connectionContext(), ...lifecycleCounts(stats), transport },
   });
 }
 

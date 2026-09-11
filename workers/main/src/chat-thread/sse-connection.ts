@@ -49,6 +49,8 @@ export type SseByeReason = "idle" | "retry" | "forbidden" | "shutdown";
 
 /** Sink for one synthetic connection. No method may throw. */
 export interface SseConnectionSink {
+  /** Polling allows for throttled background-tab timers between requests. */
+  readonly stallTimeoutMs?: number;
   /** Returns false once the sink is gone. */
   send(payload: string): boolean;
   comment(text: string): boolean;
@@ -237,7 +239,7 @@ export class SseConnection {
   declare setState: (next: unknown) => unknown;
 
   private rawState: unknown = null;
-  private readonly sink: SseConnectionSink;
+  readonly sink: SseConnectionSink;
   private readonly onTeardown: SseConnectionOptions["onTeardown"];
   private done = false;
 
@@ -302,7 +304,7 @@ export class SseConnection {
     // byte cap to ever notice. Without this a phantom stream stays registered,
     // keeping `hasAvailableBrowserUser()` true and suppressing onClose's
     // last-socket auto-answer while a question waits out its 30-minute timeout.
-    if (this.sink.stalledFor(Date.now()) >= SSE_STREAM_STALL_MS) {
+    if (this.sink.stalledFor(Date.now()) >= (this.sink.stallTimeoutMs ?? SSE_STREAM_STALL_MS)) {
       this.finish(1006, "stream_stalled");
       return false;
     }

@@ -10,7 +10,8 @@ import {
 } from "./sse-agent-client";
 
 /**
- * `useAgent` replacement backed by SSE + POST (see sse-agent-client.ts).
+ * `useAgent` replacement backed by WebSocket + HTTP polling fallback.
+ * The historical hook/export names preserve the shared chat interface.
  *
  * Identity rules are load-bearing: the returned client is referentially stable
  * across renders (it is an effect dep in Chat.tsx and useAgentChat, and

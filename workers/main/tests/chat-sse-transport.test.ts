@@ -134,6 +134,112 @@ const seedChatContext = (instance: any, threadId: string, orgId = 'org-1') => {
   };
 };
 
+describe('ChatThreadDO HTTP polling fallback', () => {
+  it('delivers the real resume handshake and live output in completed, acknowledged responses', async () => {
+    const threadId = 'thread-poll-resume';
+    const pk = 'pk-poll';
+    const stub = threadStub(threadId);
+    await runInDurableObject(stub, async (instance: any) => {
+      seedChatContext(instance, threadId);
+      const streamId = instance._startStream('request-poll');
+      await instance._storeStreamChunk(streamId, JSON.stringify({ type: 'text-delta', delta: 'partial', id: 'part-1' }));
+      instance._flushChunkBuffer();
+    });
+    const poll = async (cursor: number, headers = identityHeaders()) => {
+      const url = new URL(attachUrl(threadId, { pk }));
+      url.searchParams.set('transport', 'poll');
+      url.searchParams.set('cursor', String(cursor));
+      return stub.fetch(url.toString(), { headers });
+    };
+    let cursor = -1;
+    const received: AnyRecord[] = [];
+    const read = async () => {
+      const response = await poll(cursor);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toContain('application/json');
+      const batch = await response.json() as { cursor: number; frames: string[] };
+      received.push(...batch.frames.map((frame) => JSON.parse(frame)));
+      cursor = batch.cursor;
+      return batch;
+    };
+    await waitFor(async () => {
+      await read();
+      return received.some((frame) => frame.type === 'cf_agent_stream_resuming');
+    }, 'poll resume notice');
+    const ack = await stub.fetch(callUrl(threadId, pk), {
+      method: 'POST', headers: identityHeaders(),
+      body: JSON.stringify({ type: 'cf_agent_stream_resume_ack', id: 'request-poll' }),
+    });
+    expect(ack.status).toBe(204);
+    await waitFor(async () => {
+      await read();
+      return received.some((frame) => frame.type === 'cf_agent_use_chat_response' && frame.replay);
+    }, 'polled SDK replay');
+    expect(received.some((frame) => String(frame.body).includes('partial'))).toBe(true);
+    // Same _pk from a different participant must never drain this receive queue.
+    expect((await poll(cursor, identityHeaders({ 'X-Chiridion-User-Id': 'user-2' }))).status).toBe(409);
+    expect((await poll(cursor, {})).status).toBe(409);
+    const wrongOrg = new URL(attachUrl(threadId, { pk, orgId: 'other-org' }));
+    wrongOrg.searchParams.set('transport', 'poll');
+    expect((await stub.fetch(wrongOrg.toString(), { headers: identityHeaders() })).status).toBe(403);
+    expect((await poll(0.5)).status).toBe(400);
+    await runInDurableObject(stub, (instance: any) => {
+      expect(instance._pendingResumeConnections.has(registryKey(pk))).toBe(false);
+      instance.broadcast(JSON.stringify({ type: 'poll_live_probe' }));
+    });
+    const lost = await (await poll(cursor)).json() as { cursor: number; frames: string[] };
+    const retry = await (await poll(cursor)).json() as { cursor: number; frames: string[] };
+    expect(retry).toEqual(lost);
+    expect(retry.frames.some((frame) => JSON.parse(frame).type === 'poll_live_probe')).toBe(true);
+    cursor = retry.cursor;
+    expect((await read()).frames).not.toContain(JSON.stringify({ type: 'poll_live_probe' }));
+    await runInDurableObject(stub, async (instance: any) => {
+      instance.sseConnections.get(registryKey(pk)).abort(1006, 'test_eviction');
+      await instance.sseCloseChains.get(registryKey(pk));
+      expect(instance.sseQueueBudget.total).toBe(0);
+    });
+    expect((await poll(cursor)).status).toBe(409);
+  });
+});
+
+describe('ChatThreadDO native WebSocket transport', () => {
+  it('receives the wrapped protocol, replies to RPCs, resumes output and blocks unsupported frames', async () => {
+    const threadId = 'thread-native-ws';
+    const pk = 'pk-native';
+    const stub = threadStub(threadId);
+    await runInDurableObject(stub, async (instance: any) => {
+      seedChatContext(instance, threadId);
+      const streamId = instance._startStream('request-native');
+      await instance._storeStreamChunk(streamId, JSON.stringify({ type: 'text-delta', delta: 'native partial', id: 'part-1' }));
+      instance._flushChunkBuffer();
+    });
+    const url = attachUrl(threadId, { pk }).replace('/sse?', '?');
+    const response = await stub.fetch(url, { headers: identityHeaders({ Upgrade: 'websocket' }) });
+    expect(response.status).toBe(101);
+    const socket = response.webSocket!;
+    const received: AnyRecord[] = [];
+    let closeCode: number | null = null;
+    socket.addEventListener('message', event => { received.push(JSON.parse(String(event.data))); });
+    socket.addEventListener('close', event => { closeCode = event.code; });
+    socket.accept();
+    await waitFor(() => received.some(frame => frame.type === 'cf_agent_stream_resuming'), 'native resume notice');
+    socket.send(JSON.stringify({ type: 'cf_agent_stream_resume_ack', id: 'request-native' }));
+    await waitFor(() => received.some(frame => frame.type === 'cf_agent_use_chat_response' && String(frame.body).includes('native partial')), 'native replay');
+    socket.send(JSON.stringify({ type: 'rpc', id: 'rpc-native', method: 'setPreviewTabsState', args: [[], null] }));
+    await waitFor(() => received.some(frame => frame.type === 'rpc' && frame.id === 'rpc-native'), 'native rpc response');
+    expect(received.find(frame => frame.id === 'rpc-native')).toMatchObject({ success: true });
+    // The wrapper must not let a socket bypass the HTTP callable allow-list.
+    socket.send(JSON.stringify({ type: 'rpc', id: 'blocked', method: 'destroy', args: [] }));
+    await waitFor(() => closeCode !== null, 'blocked frame closes connection');
+    expect(closeCode).toBe(1008);
+    socket.close();
+    await runInDurableObject(stub, async (instance: any) => {
+      await instance.sseCloseChains.get(registryKey(pk));
+      expect(instance.sseConnections.has(registryKey(pk))).toBe(false);
+    });
+  });
+});
+
 describe('ChatThreadDO SSE attach', () => {
   it('serves the wrapped connect chain in socket frame order', async () => {
     const threadId = 'thread-sse-attach-order';

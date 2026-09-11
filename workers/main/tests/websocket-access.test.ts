@@ -164,12 +164,9 @@ describe('Chat transport access guard', () => {
     expect(response.status).toBe(404);
   });
 
-  it('404s a chat WebSocket upgrade without running authorization', async () => {
+  it('upgrades an authorized chat WebSocket', async () => {
     const { workspaceId, threadId, signedToken } = await setupMemberSession();
 
-    // A fully authorized session: before the legacy path was removed this
-    // handshake admitted with 101. It must now miss the route table entirely —
-    // no upgrade, no accept-then-close, and no auth round trip.
     const response = await SELF.fetch(
       `http://example/agents/chat-thread/${threadId}?workspaceId=${workspaceId}&_pk=pk-ws`,
       {
@@ -182,15 +179,25 @@ describe('Chat transport access guard', () => {
       },
     );
 
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(101);
+    expect(response.webSocket).not.toBeNull();
+    response.webSocket!.accept();
+    response.webSocket!.close();
+  });
+
+  it('rejects a foreign-origin socket even with a valid session', async () => {
+    const { workspaceId, threadId, signedToken } = await setupMemberSession();
+    const response = await SELF.fetch(
+      `http://example/agents/chat-thread/${threadId}?workspaceId=${workspaceId}`,
+      { headers: { Upgrade: 'websocket', Origin: 'https://untrusted.example', 'X-Chiridion-Session-Id': signedToken } },
+    );
+    expect(response.status).toBe(403);
     expect(response.webSocket).toBeNull();
   });
 
-  it('404s an unauthenticated chat WebSocket upgrade the same way', async () => {
+  it('denies an unauthenticated chat WebSocket upgrade', async () => {
     const { workspaceId, threadId } = await setupMemberSession();
 
-    // A denial would have been 401/403 (or a 101 + 4401 close). The route is
-    // gone, so a stale bundle gets an ordinary 404 either way.
     const response = await SELF.fetch(
       `http://example/agents/chat-thread/${threadId}?workspaceId=${workspaceId}&_pk=pk-ws`,
       {
@@ -202,7 +209,7 @@ describe('Chat transport access guard', () => {
       },
     );
 
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(401);
     expect(response.webSocket).toBeNull();
   });
 

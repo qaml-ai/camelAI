@@ -259,6 +259,7 @@ type ChatAgentState = Partial<
 
 type ChatAgentClient = {
   readyState: number;
+  readonly transport: "websocket" | "poll";
   send(data: string): void;
   reconnect(): void;
   call<T = unknown>(
@@ -2977,10 +2978,9 @@ export default function Chat({
           // The transport can still report OPEN here (a parked stream does by
           // design). Force a fresh stream so the normal onOpen queue flush runs
           // instead of leaving the composer busy forever; a closed transport is
-          // reconnecting automatically. This is no longer the half-open
-          // detector — sends ride their own POSTs, so a dead receive path is
-          // owned by the transport's silence watchdog
-          // (STREAM_SILENCE_TIMEOUT_MS), not by an RPC failing.
+          // reconnecting automatically. Socket errors/closes select polling;
+          // a lost send acknowledgement retains this message's deduplication
+          // id across either transport.
           const transportOpen =
             chatAgentRef.current?.readyState === SSE_READY_STATE_OPEN;
           setReady(false);
@@ -3053,7 +3053,7 @@ export default function Chat({
     const id = threadId;
     if (!id) return;
     setReady(true);
-    trackChatStreamOpen(id);
+    trackChatStreamOpen(id, chatAgentRef.current?.transport);
     runVersionSkewCheck("stream_open");
 
     // History sync on (re)connect is owned by the ai-chat hook now: `resume: true`

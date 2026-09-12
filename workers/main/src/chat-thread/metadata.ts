@@ -1,17 +1,4 @@
-// Thread metadata generation for ChatThreadDO, extracted as a collaborator:
-// per-user-message org metadata updates (first message, preview, title kick),
-// OpenAI-backed thread title generation, chat group icon generation,
-// and the assistant-completion record + hover-summary persistence pipeline.
-// All state lives on the owning DO (chatContext, the title-generation and
-// completion high-water fields) and in Org/User/Workspace DOs; the class
-// itself is stateless and is cached for the owning DO's lifetime with closures
-// over its live deps (ChatThreadDO keeps thin same-named private delegates as
-// its internal API, and the public RPCs setTitle /
-// generateChatGroupAvatarForThread stay on the DO as thin orchestrators).
-// Sibling-method calls route back through the deps callbacks — i.e. through
-// the DO's delegates — so dynamic dispatch (and every
-// `ChatThreadDO.prototype['method'].call(fake)` test seam that stubs a sibling
-// on the fake) behaves exactly as it did when the bodies lived on the DO.
+// Thread titles, completion summaries, and chat-group icons.
 import {
   getThreadUserMessageSources,
   isPlaceholderThreadTitle,
@@ -87,50 +74,6 @@ export interface ChatThreadMetadataDeps {
       error?: unknown;
     },
   ): void;
-  // Sibling routing back through the owning DO's same-named delegates, so a
-  // stubbed sibling on a fake (or a subclass override) is honored exactly as
-  // it was when these methods lived on ChatThreadDO itself.
-  persistThreadAssistantCompletion(
-    context: ChatContextState,
-    completedAt: number,
-    summary: string | null,
-    summaryStatus: ThreadCompletionSummaryStatus | null,
-  ): Promise<AssistantCompletionPersistenceResult>;
-  recordCompletionSummaryStatus(
-    context: ChatContextState,
-    completedAt: number,
-    summaryStatus: ThreadCompletionSummaryStatus,
-    summary?: string,
-  ): Promise<void>;
-  generateAndPersistThreadAssistantCompletionSummary(
-    context: ChatContextState,
-    completedAt: number,
-    sourceText: string,
-  ): Promise<void>;
-  generateThreadTitleFromMessage(threadId: string, message: string): Promise<void>;
-  generateClaimedChatGroupAvatar(
-    threadId: string,
-    claim: ChatGroupIconGenerationClaim,
-    userStub: {
-      setGeneratedChatGroupIcon: (
-        groupId: string,
-        claimId: string,
-        icon: string,
-      ) => unknown;
-      markChatGroupAvatarGenerationFailed: (
-        groupId: string,
-        claimId: string,
-      ) => unknown;
-    },
-  ): Promise<void>;
-  maybeGenerateChatGroupAvatarForThread(
-    threadId: string,
-    trigger?: ChatGroupIconGenerationClaim["trigger"],
-  ): Promise<void>;
-  errorLogFields(error: unknown): {
-    errorName: string;
-    errorMessage: string;
-  };
 }
 
 export class ChatThreadMetadata {
@@ -169,7 +112,7 @@ export class ChatThreadMetadata {
       },
     );
 
-    const persistenceResult = await this.deps.persistThreadAssistantCompletion(
+    const persistenceResult = await this.persistThreadAssistantCompletion(
       context,
       completedAt,
       null,
@@ -213,7 +156,7 @@ export class ChatThreadMetadata {
     if (hasSummarySource) {
       this.deps.setAssistantCompletionRecordedAt(storedCompletedAt);
       this.deps.setAssistantCompletionSummaryRequestedAt(storedCompletedAt);
-      await this.deps.generateAndPersistThreadAssistantCompletionSummary(
+      await this.generateAndPersistThreadAssistantCompletionSummary(
         context,
         storedCompletedAt,
         summarySource!,
@@ -229,16 +172,7 @@ export class ChatThreadMetadata {
   ): Promise<AssistantCompletionPersistenceResult> {
     try {
       const orgId = this.deps.env().ORG.idFromName(context.orgId);
-      const getOrgStub = () => this.deps.env().ORG.get(orgId) as unknown as {
-        recordThreadAssistantCompletion(
-          id: string,
-          input: {
-            completedAt: number;
-            summary: string | null;
-            summaryStatus?: ThreadCompletionSummaryStatus | null;
-          },
-        ): Promise<number | false> | number | false;
-      };
+      const getOrgStub = () => this.deps.env().ORG.get(orgId);
       const storedCompletedAt = await this.deps.retryChatDurableObjectRpc(
         "OrgDO.recordThreadAssistantCompletion",
         () =>
@@ -267,7 +201,7 @@ export class ChatThreadMetadata {
     summaryStatus: ThreadCompletionSummaryStatus,
     summary?: string,
   ): Promise<void> {
-    const persistenceResult = await this.deps.persistThreadAssistantCompletion(
+    const persistenceResult = await this.persistThreadAssistantCompletion(
       context,
       completedAt,
       summary ?? null,
@@ -313,10 +247,10 @@ export class ChatThreadMetadata {
         { gatewayName: this.deps.env().CF_GATEWAY_NAME },
       );
       if (!summary) {
-        await this.deps.recordCompletionSummaryStatus(context, completedAt, "failed");
+        await this.recordCompletionSummaryStatus(context, completedAt, "failed");
         return;
       }
-      await this.deps.recordCompletionSummaryStatus(
+      await this.recordCompletionSummaryStatus(
         context,
         completedAt,
         "ready",
@@ -324,7 +258,7 @@ export class ChatThreadMetadata {
       );
     } catch (error) {
       console.error("[ChatThreadDO] failed to generate assistant completion summary", error);
-      await this.deps.recordCompletionSummaryStatus(context, completedAt, "failed");
+      await this.recordCompletionSummaryStatus(context, completedAt, "failed");
     }
   }
 
@@ -366,7 +300,7 @@ export class ChatThreadMetadata {
     }
 
     this.deps.setTitleGenerationInFlight(true);
-    await this.deps.generateThreadTitleFromMessage(context.threadId, titleSourceMessage);
+    await this.generateThreadTitleFromMessage(context.threadId, titleSourceMessage);
   }
 
   errorLogFields(error: unknown): {
@@ -439,7 +373,7 @@ export class ChatThreadMetadata {
         groupId: claim.id,
         workspaceId: context.workspaceId,
         orgId: context.orgId,
-        ...this.deps.errorLogFields(error),
+        ...this.errorLogFields(error),
       });
       this.deps.recordChatThreadObservabilityEvent("chat_group_icon_generation", {
         operation: `${CHAT_GROUP_ICON_SELECTION_STRATEGY}:${claim.trigger}`,
@@ -494,7 +428,7 @@ export class ChatThreadMetadata {
           groupId: claim.id,
           workspaceId: context.workspaceId,
           orgId: context.orgId,
-          ...this.deps.errorLogFields(error),
+          ...this.errorLogFields(error),
         });
         this.deps.recordChatThreadObservabilityEvent(
           "chat_group_icon_generation",
@@ -545,7 +479,7 @@ export class ChatThreadMetadata {
         groupId: claim.id,
         workspaceId: context.workspaceId,
         orgId: context.orgId,
-        ...this.deps.errorLogFields(error),
+        ...this.errorLogFields(error),
       });
       this.deps.recordChatThreadObservabilityEvent("chat_group_icon_generation", {
         operation: `${CHAT_GROUP_ICON_SELECTION_STRATEGY}:${claim.trigger}:persist`,
@@ -591,7 +525,7 @@ export class ChatThreadMetadata {
             normalizedThreadId,
           );
       if (!claim) return;
-      await this.deps.generateClaimedChatGroupAvatar(
+      await this.generateClaimedChatGroupAvatar(
         normalizedThreadId,
         claim,
         userStub,
@@ -601,7 +535,7 @@ export class ChatThreadMetadata {
         threadId: normalizedThreadId,
         workspaceId: context.workspaceId,
         orgId: context.orgId,
-        ...this.deps.errorLogFields(error),
+        ...this.errorLogFields(error),
       });
     }
   }
@@ -635,12 +569,11 @@ export class ChatThreadMetadata {
         await userStub.renameEmptySingleThreadGroupForThread(threadId, title);
         if (!isPlaceholderThreadTitle(title)) {
           this.deps.waitUntil(
-            this.deps
-              .maybeGenerateChatGroupAvatarForThread(threadId, "first_title")
+            this.maybeGenerateChatGroupAvatarForThread(threadId, "first_title")
               .catch((error) => {
                 console.error("[ChatThreadDO] failed to update chat group avatar", {
                   threadId,
-                  ...this.deps.errorLogFields(error),
+                  ...this.errorLogFields(error),
                 });
               }),
           );

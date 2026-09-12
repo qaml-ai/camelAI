@@ -41,13 +41,13 @@ describe('unbounded pi_core API quarantine', () => {
     // second, unrelated read.
     const violations = checkGuardedCallers(
       {
-        'workers/main/src/chat-thread/ui-mirror.ts': [
+        'workers/main/src/chat-thread-do.ts': [
           'getPiCoreParsedMessages(threadId: string): Promise<unknown[]>;',
           'await this.deps.getPiCoreParsedMessages(threadId);',
           'const everything = await this.deps.getPiCoreParsedMessages(threadId);',
         ].join('\n'),
       },
-      { 'workers/main/src/chat-thread/ui-mirror.ts': ALLOWLIST['workers/main/src/chat-thread/ui-mirror.ts'] },
+      { 'workers/main/src/chat-thread-do.ts': { getPiCoreParsedMessages: ALLOWLIST['workers/main/src/chat-thread-do.ts'].getPiCoreParsedMessages } },
     );
 
     expect(violations).toHaveLength(1);
@@ -58,10 +58,10 @@ describe('unbounded pi_core API quarantine', () => {
   it('ratchets: a removed caller must lower the allowlist, not linger', () => {
     const violations = checkGuardedCallers(
       {
-        'workers/main/src/chat-thread/ui-mirror.ts':
+        'workers/main/src/chat-thread-do.ts':
           'getPiCoreParsedMessages(threadId: string): Promise<unknown[]>;',
       },
-      { 'workers/main/src/chat-thread/ui-mirror.ts': ALLOWLIST['workers/main/src/chat-thread/ui-mirror.ts'] },
+      { 'workers/main/src/chat-thread-do.ts': { getPiCoreParsedMessages: ALLOWLIST['workers/main/src/chat-thread-do.ts'].getPiCoreParsedMessages } },
     );
 
     expect(violations).toHaveLength(1);

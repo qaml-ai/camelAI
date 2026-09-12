@@ -1,16 +1,4 @@
-// Workspace streaming-activity publisher for ChatThreadDO, extracted as a
-// collaborator: the trailing-debounced running-activity fan-in to the single
-// WorkspaceDO instance, the streaming liveness-lease heartbeat, and the
-// running-activity text normalization/rate-limit gates. All state lives on the
-// owning DO (pendingStreamingActivity, the flush/lease timers, the
-// running-activity high-water fields, and the WorkspaceDO stub cache); the
-// class itself is stateless and is cached for the owning DO's lifetime with
-// closures over its live deps (ChatThreadDO keeps thin same-named private delegates
-// as its internal API). Sibling-method calls route back through the deps
-// callbacks — i.e. through the DO's delegates — so dynamic dispatch (and every
-// `ChatThreadDO.prototype['method'].call(fake)` test seam that stubs a sibling
-// or reads/writes the plain DO fields on the fake) behaves exactly as it did
-// when the bodies lived on the DO.
+// Coalesced workspace activity updates and streaming leases.
 import type { WorkspaceDO } from "../workspace";
 import type { WorkspaceThreadStreamingOptions } from "../thread-status";
 import { normalizeThreadPreviewUserMessage } from "../../../../src/lib/thread-preview";
@@ -88,35 +76,6 @@ export interface ChatThreadStreamingActivityDeps {
       sampleKey?: string | null;
     },
   ): void;
-  // Sibling routing back through the owning DO's same-named delegates, so a
-  // stubbed sibling on a fake (or a subclass override) is honored exactly as
-  // it was when these methods lived on ChatThreadDO itself.
-  discardPendingStreamingActivity(): void;
-  stopStreamingLeaseHeartbeat(): void;
-  flushPendingStreamingActivity(): void;
-  getWorkspaceStatusStub(workspaceId: string): DurableObjectStub<WorkspaceDO>;
-  recordWorkspaceThreadStreaming(
-    workspaceId: string | null | undefined,
-    threadId: string | null | undefined,
-    isStreaming: boolean,
-    options?: WorkspaceThreadStreamingOptions,
-  ): Promise<void>;
-  queueStreamingActivityUpdate(
-    workspaceId: string,
-    threadId: string,
-    activityText: string,
-    activityAt: number,
-  ): void;
-  normalizeRunningActivityText(text: string | null | undefined): string | null;
-  shouldPublishRunningActivity(
-    activityText: string,
-    now: number,
-    immediate: boolean,
-  ): boolean;
-  publishRunningActivity(
-    text: string | null | undefined,
-    options?: { immediate?: boolean; activityAt?: number },
-  ): void;
 }
 
 export class ChatThreadStreamingActivity {
@@ -130,8 +89,8 @@ export class ChatThreadStreamingActivity {
     // is flipping. Drop it so it cannot race a terminal transition and resurrect
     // a "streaming" row. The authoritative streaming state is delivered
     // un-debounced by finishTurn / completion recording.
-    this.deps.discardPendingStreamingActivity();
-    this.deps.stopStreamingLeaseHeartbeat();
+    this.discardPendingStreamingActivity();
+    this.stopStreamingLeaseHeartbeat();
   }
 
   /**
@@ -146,20 +105,20 @@ export class ChatThreadStreamingActivity {
    * the loss-of-heartbeat signal the lease exists to detect.
    */
   startStreamingLeaseHeartbeat(): void {
-    this.deps.stopStreamingLeaseHeartbeat();
+    this.stopStreamingLeaseHeartbeat();
     this.deps.setStreamingLeaseRefreshTimer(setInterval(() => {
       if (!this.deps.isThreadStreaming()) {
         // Terminal paths stop the heartbeat via resetRunningActivityState;
         // this is a backstop so a missed clear-site cannot renew a dead turn
         // forever (which would recreate the exact stuck state the lease
         // is meant to prevent).
-        this.deps.stopStreamingLeaseHeartbeat();
+        this.stopStreamingLeaseHeartbeat();
         return;
       }
       const context = this.deps.chatContext();
       if (!context?.workspaceId || !context.threadId) return;
       this.deps.waitUntil(
-        this.deps.recordWorkspaceThreadStreaming(
+        this.recordWorkspaceThreadStreaming(
           context.workspaceId,
           context.threadId,
           true,
@@ -203,7 +162,7 @@ export class ChatThreadStreamingActivity {
     return this.deps.retryChatDurableObjectRpc(
       "WorkspaceDO.recordThreadStreaming",
       () =>
-        this.deps.getWorkspaceStatusStub(normalizedWorkspaceId).recordThreadStreaming(
+        this.getWorkspaceStatusStub(normalizedWorkspaceId).recordThreadStreaming(
           normalizedThreadId,
           isStreaming,
           options,
@@ -261,7 +220,7 @@ export class ChatThreadStreamingActivity {
       (existing.workspaceId !== normalizedWorkspaceId ||
         existing.threadId !== normalizedThreadId)
     ) {
-      this.deps.flushPendingStreamingActivity();
+      this.flushPendingStreamingActivity();
     }
 
     const prior = this.deps.pendingStreamingActivity();
@@ -276,7 +235,7 @@ export class ChatThreadStreamingActivity {
     if (this.deps.streamingActivityFlushTimer() === null) {
       this.deps.setStreamingActivityFlushTimer(setTimeout(() => {
         this.deps.setStreamingActivityFlushTimer(null);
-        this.deps.flushPendingStreamingActivity();
+        this.flushPendingStreamingActivity();
       }, WORKSPACE_STREAMING_ACTIVITY_DEBOUNCE_MS));
     }
   }
@@ -306,7 +265,7 @@ export class ChatThreadStreamingActivity {
     }
 
     this.deps.waitUntil(
-      this.deps.recordWorkspaceThreadStreaming(pending.workspaceId, pending.threadId, true, {
+      this.recordWorkspaceThreadStreaming(pending.workspaceId, pending.threadId, true, {
         activityText: pending.activityText,
         activityAt: pending.activityAt,
       }).catch((error) => {
@@ -352,7 +311,7 @@ export class ChatThreadStreamingActivity {
     text: string | null | undefined,
     options: { immediate?: boolean; activityAt?: number } = {},
   ): void {
-    const activityText = this.deps.normalizeRunningActivityText(text);
+    const activityText = this.normalizeRunningActivityText(text);
     if (!activityText) return;
     const context = this.deps.chatContext();
     if (!context?.workspaceId || !context.threadId) return;
@@ -360,7 +319,7 @@ export class ChatThreadStreamingActivity {
       typeof options.activityAt === "number" && Number.isFinite(options.activityAt)
         ? Math.floor(options.activityAt)
         : Date.now();
-    if (!this.deps.shouldPublishRunningActivity(activityText, now, options.immediate === true)) {
+    if (!this.shouldPublishRunningActivity(activityText, now, options.immediate === true)) {
       return;
     }
     this.deps.setRunningActivityLastText(activityText);
@@ -370,7 +329,7 @@ export class ChatThreadStreamingActivity {
     // update to the single WorkspaceDO instance. Terminal streaming transitions
     // (see finishTurn / recordThreadAssistantCompletion) flush or discard this
     // pending update so the workspace UI never sticks on "streaming".
-    this.deps.queueStreamingActivityUpdate(
+    this.queueStreamingActivityUpdate(
       context.workspaceId,
       context.threadId,
       activityText,
@@ -380,7 +339,7 @@ export class ChatThreadStreamingActivity {
 
   publishRunningUserMessageActivity(content: string | null | undefined): void {
     const preview = normalizeThreadPreviewUserMessage(content ?? "");
-    this.deps.publishRunningActivity(preview, { immediate: true });
+    this.publishRunningActivity(preview, { immediate: true });
   }
 
   publishPiToolActivity(
@@ -404,7 +363,7 @@ export class ChatThreadStreamingActivity {
             tool_use_id: toolCallId,
             content: piToolResultText(result),
           };
-    this.deps.publishRunningActivity(
+    this.publishRunningActivity(
       getToolSummary(tool, resultBlock, status, status === "running"),
       { immediate: true },
     );
@@ -416,7 +375,7 @@ export class ChatThreadStreamingActivity {
     const context = this.deps.chatContext();
     if (!context?.workspaceId || !context.threadId) return;
     this.deps.waitUntil(
-      this.deps.recordWorkspaceThreadStreaming(context.workspaceId, context.threadId, value).catch(
+      this.recordWorkspaceThreadStreaming(context.workspaceId, context.threadId, value).catch(
         (error) => console.error("[ChatThreadDO] failed to record workspace thread status", error),
       ),
     );

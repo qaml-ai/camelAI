@@ -1,15 +1,4 @@
-// Chat access grants + client-message dedup for ChatThreadDO, extracted as a
-// collaborator: the degraded-auth grant map (users who recently passed full
-// route-side authorization, admitted on reconnect when the authorization DOs
-// are unreachable) and the recently-accepted clientMessageId list (drops
-// duplicate sends when the browser retransmits after a reconnect). All state
-// lives in the DO's KV storage; the class itself is stateless and is cached
-// for the owning DO's lifetime with closures over its live deps
-// (ChatThreadDO keeps thin same-named private delegates as its internal API).
-// Sibling-method calls route back through the deps callbacks — i.e. through
-// the DO's delegates — so dynamic dispatch (and every
-// `ChatThreadDO.prototype['method'].call(fake)` test seam that stubs a sibling
-// on the fake) behaves exactly as it did when the bodies lived on the DO.
+// Recent authorization grants and accepted-message IDs, persisted in DO storage.
 import type { SyncKvStorage } from "./pi-turn-journal";
 
 // Users who have passed full route-side authorization for this thread,
@@ -30,10 +19,6 @@ const CHAT_RECENT_CLIENT_MESSAGE_IDS_MAX = 200;
 
 export interface ChatThreadAccessDeps {
   kv(): SyncKvStorage;
-  // Sibling routing back through the owning DO's same-named delegate, so a
-  // stubbed sibling on a fake (or a subclass override) is honored exactly as
-  // it was when these methods lived on ChatThreadDO itself.
-  readAuthorizedChatUserGrants(): Record<string, number>;
 }
 
 export class ChatThreadAccess {
@@ -50,7 +35,7 @@ export class ChatThreadAccess {
   }
 
   isPreviouslyAuthorizedChatUser(userId: string): boolean {
-    const grantedAt = this.deps.readAuthorizedChatUserGrants()[userId];
+    const grantedAt = this.readAuthorizedChatUserGrants()[userId];
     return (
       typeof grantedAt === "number" &&
       Date.now() - grantedAt < CHAT_DEGRADED_AUTH_GRANT_TTL_MS
@@ -58,7 +43,7 @@ export class ChatThreadAccess {
   }
 
   recordAuthorizedChatUser(userId: string): void {
-    const grants = this.deps.readAuthorizedChatUserGrants();
+    const grants = this.readAuthorizedChatUserGrants();
     const now = Date.now();
     const existing = grants[userId];
     if (

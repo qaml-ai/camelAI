@@ -84,15 +84,11 @@ import {
   uiMessageToMessage,
 } from '../../../src/lib/ui-message-adapter';
 import { normalizePiUiMetadata, type PiUiMetadata, type RuntimeCallArtifact } from '../../../src/lib/runtime-artifacts';
-import type {
-  LlmModel,
-  ThreadCompletionSummaryStatus,
-} from '../../../src/types';
+import type { LlmModel } from '../../../src/types';
 import type {
   ThreadProjectActivity,
   ThreadProjectActivityType,
 } from '../../../src/lib/thread-project-activity';
-import type { ChatGroupIconGenerationClaim } from "./identity/user-do";
 import {
   CAMEL_CODE_LLM_MODEL,
   CUSTOM_LLM_MODEL,
@@ -109,7 +105,6 @@ import {
   isSelfhostRuntime,
 } from "../../../src/lib/selfhost-ai-provider";
 import { isOrgBanned } from "./ban-list";
-import type { WorkspaceThreadStreamingOptions } from "./thread-status";
 
 import {
   createPiSystemPrompt,
@@ -145,7 +140,6 @@ import {
 import { PollConnectionSink } from "./chat-thread/poll-connection";
 import { createWebSocketSink } from "./chat-thread/websocket-connection";
 import { withoutReservedTransportHeaders } from "./chat-thread/transport-headers";
-
 
 import { retryTransientDurableObjectRpc } from "../../../src/lib/do-rpc-retry.server";
 
@@ -327,16 +321,13 @@ import {
 } from "./chat-thread/pi-core-store";
 
 // pi_core → ai-chat render-mirror machinery (ChatThreadUiMirror): the top-up
-// backfill, legacy time heal, user render skeleton, and wipe-and-rebuild resync.
+// backfill, user render skeleton, and wipe-and-rebuild resync.
 import { ChatThreadUiMirror } from "./chat-thread/ui-mirror";
 
 // Thread metadata generation (ChatThreadMetadata): per-user-message org
 // metadata updates, title generation, chat group avatar/emoji generation, and
 // the assistant-completion record + hover-summary persistence pipeline.
-import {
-  ChatThreadMetadata,
-  type AssistantCompletionPersistenceResult,
-} from "./chat-thread/metadata";
+import { ChatThreadMetadata } from "./chat-thread/metadata";
 
 // Preview-state primitives (ChatThreadPreviewState + the pure target/tab-id
 // normalizers): preview-target normalization and preview session persistence.
@@ -1645,7 +1636,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       this.activeTurnUserId = storedActiveTurnUserId.trim();
     }
 
-    this.activeAutomationRun = this.normalizeActiveAutomationRun(
+    this.activeAutomationRun = this.automationRun.normalizeActiveAutomationRun(
       ctx.storage.kv.get<unknown>(CHAT_ACTIVE_AUTOMATION_RUN_KEY),
     );
 
@@ -2734,7 +2725,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       if (
         !upgradeUserId ||
         !this.chatContext ||
-        !this.isPreviouslyAuthorizedChatUser(upgradeUserId)
+        !this.chatAccess.isPreviouslyAuthorizedChatUser(upgradeUserId)
       ) {
         // Cannot verify right now (or no prior grant) — not an authoritative
         // denial. 1013 keeps the client retrying full auth once DOs recover
@@ -2743,7 +2734,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         return;
       }
     } else if (upgradeUserId) {
-      this.recordAuthorizedChatUser(upgradeUserId);
+      this.chatAccess.recordAuthorizedChatUser(upgradeUserId);
     }
 
     this.captureChatContextFromRequest(url, ctx.request, connection);
@@ -2767,7 +2758,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     if (avatarThreadId) {
       this.ctx.waitUntil(
         Promise.resolve()
-          .then(() => this.maybeGenerateChatGroupAvatarForThread(avatarThreadId))
+          .then(() => this.threadMetadata.maybeGenerateChatGroupAvatarForThread(avatarThreadId))
           .catch((error) => {
             console.error("[ChatThreadDO] background chat-group avatar generation failed", error);
           }),
@@ -2926,12 +2917,12 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       if (
         !userId ||
         !this.chatContext ||
-        !this.isPreviouslyAuthorizedChatUser(userId)
+        !this.chatAccess.isPreviouslyAuthorizedChatUser(userId)
       ) {
         return new Response("auth_temporarily_unavailable", { status: 503 });
       }
     } else if (userId) {
-      this.recordAuthorizedChatUser(userId);
+      this.chatAccess.recordAuthorizedChatUser(userId);
     }
     return null;
   }
@@ -3857,7 +3848,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       });
       return;
     }
-    await this.maybeGenerateChatGroupAvatarForThread(
+    await this.threadMetadata.maybeGenerateChatGroupAvatarForThread(
       context.threadId,
       "first_title",
     );
@@ -3906,7 +3897,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     if (this.browserPrompts.pendingQuestionCount > pendingBefore) {
       const pending = this.browserPrompts.getOldestPendingQuestion();
       const question = pending?.questions[0]?.question ?? null;
-      this.updateActiveAutomationRun({
+      this.automationRun.updateActiveAutomationRun({
         status: "question",
         message: question,
         completedAt: null,
@@ -4623,7 +4614,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       this.cachedContextWindowByModel,
     );
 
-    this.setActiveAutomationRun(null);
+    this.automationRun.setActiveAutomationRun(null);
     this.browserPrompts.clearQuestions();
     this.titleGenerationInFlight = false;
     this.activeTurnUserId = null;
@@ -4634,11 +4625,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     return this.activeTurnUserId;
   }
 
-  // Automation-run state machine collaborator (see
-  // chat-thread-automation-run.ts). All state stays on this DO (the
-  // activeAutomationRun field + its KV mirror), and the memoized deps
-  // arrows close over `this` so a fake with stubbed siblings behaves exactly
-  // as when the bodies lived here.
+  // Scheduled-run state shares the DO lifetime.
   private get automationRun(): ChatThreadAutomationRun {
     return (this.automationRunInstance ??= new ChatThreadAutomationRun({
       env: () => this.env,
@@ -4650,49 +4637,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       },
       isThreadStreaming: () => this.isThreadStreaming(),
       pendingBrowserQuestionCount: () => this.browserPrompts.pendingQuestionCount,
-      setActiveAutomationRun: (value) => this.setActiveAutomationRun(value),
-      recordScheduledAutomationRun: (run, input) =>
-        this.recordScheduledAutomationRun(run, input),
-      updateActiveAutomationRun: (input) => this.updateActiveAutomationRun(input),
     }));
-  }
-
-  private normalizeActiveAutomationRun(
-    value: unknown,
-  ): ActiveAutomationRunState | null {
-    return this.automationRun.normalizeActiveAutomationRun(value);
-  }
-
-  private setActiveAutomationRun(
-    value: ActiveAutomationRunState | null,
-  ): void {
-    this.automationRun.setActiveAutomationRun(value);
-  }
-
-  private recordScheduledAutomationRun(
-    run: ActiveAutomationRunState,
-    input: {
-      status: "success" | "error" | "question" | "busy";
-      message?: string | null;
-      completedAt?: number | null;
-    },
-  ): Promise<boolean> {
-    return this.automationRun.recordScheduledAutomationRun(run, input);
-  }
-
-  private updateActiveAutomationRun(
-    input: {
-      status: "success" | "error" | "question" | "busy";
-      message?: string | null;
-      completedAt?: number | null;
-      clear?: boolean;
-    },
-  ): void {
-    this.automationRun.updateActiveAutomationRun(input);
-  }
-
-  private reconcileInactiveAutomationRun(reason: string): boolean {
-    return this.automationRun.reconcileInactiveAutomationRun(reason);
   }
 
   private setActiveTurnUserId(userId: string | null | undefined): void {
@@ -5469,7 +5414,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       readPiActiveTurn: () => this.readPiActiveTurn(),
       activePiStreamTurnId: () => this.activePiStreamTurnId,
       getPiCoreRevision: () => this.piCoreStore.getPiCoreRevision(),
-      getPiCoreParsedMessages: (threadId) => this.getPiCoreParsedMessages(threadId),
       readParsedPiCoreRowRange: (options) => this.readParsedPiCoreRowRange(options),
       setRenderHistoryChronology: (id, createdAt) =>
         this._setRenderHistoryChronology(id, createdAt),
@@ -6119,9 +6063,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     return changed ? next : messages;
   }
 
-
-
-
   // Thin seam over retryTransientDurableObjectRpc so tests can stub the
   // retry behavior on a fake `this` without real backoff sleeps.
   private retryChatDurableObjectRpc<T>(
@@ -6245,36 +6186,10 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     }
   }
 
-  // The degraded-auth grant map and recently-accepted clientMessageId dedup
-  // live in ./chat-thread/access; these thin delegates keep the DO-internal
-  // call surface (and its test seams) stable. Its memoized dependency callbacks
-  // resolve live DO state and route sibling calls through `this`, so stubbed
-  // seams keep working.
   private get chatAccess(): ChatThreadAccess {
     return (this.chatAccessInstance ??= new ChatThreadAccess({
       kv: () => this.ctx.storage.kv,
-      readAuthorizedChatUserGrants: () => this.readAuthorizedChatUserGrants(),
     }));
-  }
-
-  private readAuthorizedChatUserGrants(): Record<string, number> {
-    return this.chatAccess.readAuthorizedChatUserGrants();
-  }
-
-  private isPreviouslyAuthorizedChatUser(userId: string): boolean {
-    return this.chatAccess.isPreviouslyAuthorizedChatUser(userId);
-  }
-
-  private recordAuthorizedChatUser(userId: string): void {
-    this.chatAccess.recordAuthorizedChatUser(userId);
-  }
-
-  private hasRecentlyAcceptedClientMessage(clientMessageId: string): boolean {
-    return this.chatAccess.hasRecentlyAcceptedClientMessage(clientMessageId);
-  }
-
-  private recordAcceptedClientMessageId(clientMessageId: string): void {
-    this.chatAccess.recordAcceptedClientMessageId(clientMessageId);
   }
 
   // Lazily created so prototype-based test fakes work; holds enqueues that
@@ -6373,11 +6288,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     return (this.piModelMappingInstance ??= new PiModelMapping());
   }
 
-  // Chat send failure / error payload collaborator (see
-  // chat-thread-errors.ts). All state stays on this DO, and the memoized deps
-  // close over `this` so a fake with stubbed siblings
-  // behaves exactly as when the bodies lived here. Event delivery
-  // (pushChatEvent / broadcast) stays on this DO.
+  // Error classification reads the current turn context.
   private get chatErrors(): ChatThreadErrors {
     return (this.chatErrorsInstance ??= new ChatThreadErrors({
       chatContext: () => this.chatContext,
@@ -6392,31 +6303,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       },
       retryChatDurableObjectRpc: (operation, fn, options) =>
         this.retryChatDurableObjectRpc(operation, fn, options),
-      chatSendFailureStatus: (status, error) =>
-        this.chatSendFailureStatus(status, error),
-      isChatBillingOrCreditError: (error) => this.isChatBillingOrCreditError(error),
     }));
-  }
-
-  private chatSendFailureStatus(
-    status: "busy" | "error" | string,
-    error: unknown,
-  ): number {
-    return this.chatErrors.chatSendFailureStatus(status, error);
-  }
-
-  private isChatBillingOrCreditError(error: unknown): boolean {
-    return this.chatErrors.isChatBillingOrCreditError(error);
-  }
-
-  private chatSendErrorPayload(
-    error: unknown,
-    options: {
-      status?: "busy" | "error" | string;
-      fallbackMessage: string;
-    },
-  ): Record<string, unknown> {
-    return this.chatErrors.chatSendErrorPayload(error, options);
   }
 
   private async handleClientUserMessage(
@@ -6435,7 +6322,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       // browser retransmits when the acceptance ack was lost to a socket
       // drop): re-ack so the client clears its pending state, never enqueue
       // twice.
-      if (this.hasRecentlyAcceptedClientMessage(clientMessageId)) {
+      if (this.chatAccess.hasRecentlyAcceptedClientMessage(clientMessageId)) {
         return { status: "accepted" };
       }
 
@@ -6481,7 +6368,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     try {
       result = await enqueue;
     } catch (error) {
-      this.updateActiveAutomationRun({
+      this.automationRun.updateActiveAutomationRun({
         status: "error",
         message: error instanceof Error ? error.message : "Failed to send message",
         clear: true,
@@ -6506,7 +6393,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     // Only now is the id a safe dedupe marker: the message has actually
     // reached an accepted turn, so swallowing retransmits cannot lose it.
     if (clientMessageId) {
-      this.recordAcceptedClientMessageId(clientMessageId);
+      this.chatAccess.recordAcceptedClientMessageId(clientMessageId);
     }
 
     return result;
@@ -6579,9 +6466,9 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       if (!joinsExistingTurn) this.setActiveTurnUserId(context.userId);
       // Turn-start bookkeeping runs from agent_start once the run begins; the
       // spinner turns on via the derived sync after the fiber row is created (below).
-      this.publishRunningUserMessageActivity(rawContent);
+      this.streamingActivity.publishRunningUserMessageActivity(rawContent);
       this.ctx.waitUntil(
-        this.updateThreadMetadataForUserMessage(
+        this.threadMetadata.updateThreadMetadataForUserMessage(
           attributedContent,
           messageSource,
         ).catch((err) => {
@@ -6611,7 +6498,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       throw error;
     }
     if (!sent) {
-      this.updateActiveAutomationRun({
+      this.automationRun.updateActiveAutomationRun({
         status: "error",
         message: "Failed to send message",
         clear: true,
@@ -6709,11 +6596,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     this.previewState.persistPreviewState(includeVersion);
   }
 
-  // Workspace streaming-activity publisher collaborator (see
-  // chat-thread-streaming-activity.ts). All state stays on this DO as plain
-  // fields (test fakes read/write them directly), and the memoized deps close
-  // over `this` so a fake with stubbed siblings
-  // behaves exactly as when the bodies lived here.
   private get streamingActivity(): ChatThreadStreamingActivity {
     return (this.streamingActivityInstance ??= new ChatThreadStreamingActivity({
       chatContext: () => this.chatContext,
@@ -6751,72 +6633,12 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         this.retryChatDurableObjectRpc(operation, fn, options),
       recordChatThreadObservabilityEvent: (event, details) =>
         this.recordChatThreadObservabilityEvent(event, details),
-      discardPendingStreamingActivity: () => this.discardPendingStreamingActivity(),
-      stopStreamingLeaseHeartbeat: () => this.stopStreamingLeaseHeartbeat(),
-      flushPendingStreamingActivity: () => this.flushPendingStreamingActivity(),
-      getWorkspaceStatusStub: (workspaceId) => this.getWorkspaceStatusStub(workspaceId),
-      recordWorkspaceThreadStreaming: (workspaceId, threadId, isStreaming, options) =>
-        this.recordWorkspaceThreadStreaming(workspaceId, threadId, isStreaming, options),
-      queueStreamingActivityUpdate: (workspaceId, threadId, activityText, activityAt) =>
-        this.queueStreamingActivityUpdate(workspaceId, threadId, activityText, activityAt),
-      normalizeRunningActivityText: (text) => this.normalizeRunningActivityText(text),
-      shouldPublishRunningActivity: (activityText, now, immediate) =>
-        this.shouldPublishRunningActivity(activityText, now, immediate),
-      publishRunningActivity: (text, options) => this.publishRunningActivity(text, options),
     }));
   }
 
   private resetRunningActivityState(): void {
     this.streamingActivity.resetRunningActivityState();
     this.stopPiTurnAbsoluteTimeoutWatchdog();
-  }
-
-  private startStreamingLeaseHeartbeat(): void {
-    this.streamingActivity.startStreamingLeaseHeartbeat();
-  }
-
-  private stopStreamingLeaseHeartbeat(): void {
-    this.streamingActivity.stopStreamingLeaseHeartbeat();
-  }
-
-  private getWorkspaceStatusStub(workspaceId: string): DurableObjectStub<WorkspaceDO> {
-    return this.streamingActivity.getWorkspaceStatusStub(workspaceId);
-  }
-
-  private recordWorkspaceThreadStreaming(
-    workspaceId: string | null | undefined,
-    threadId: string | null | undefined,
-    isStreaming: boolean,
-    options?: WorkspaceThreadStreamingOptions,
-  ): Promise<void> {
-    return this.streamingActivity.recordWorkspaceThreadStreaming(
-      workspaceId,
-      threadId,
-      isStreaming,
-      options,
-    );
-  }
-
-  private queueStreamingActivityUpdate(
-    workspaceId: string,
-    threadId: string,
-    activityText: string,
-    activityAt: number,
-  ): void {
-    this.streamingActivity.queueStreamingActivityUpdate(
-      workspaceId,
-      threadId,
-      activityText,
-      activityAt,
-    );
-  }
-
-  private flushPendingStreamingActivity(): void {
-    this.streamingActivity.flushPendingStreamingActivity();
-  }
-
-  private discardPendingStreamingActivity(): void {
-    this.streamingActivity.discardPendingStreamingActivity();
   }
 
   private instrumentAiChatMemoryBoundaries(): void {
@@ -7133,53 +6955,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     });
   }
 
-  private normalizeRunningActivityText(text: string | null | undefined): string | null {
-    return this.streamingActivity.normalizeRunningActivityText(text);
-  }
-
-  private shouldPublishRunningActivity(
-    activityText: string,
-    now: number,
-    immediate: boolean,
-  ): boolean {
-    return this.streamingActivity.shouldPublishRunningActivity(
-      activityText,
-      now,
-      immediate,
-    );
-  }
-
-  private publishRunningActivity(
-    text: string | null | undefined,
-    options: { immediate?: boolean; activityAt?: number } = {},
-  ): void {
-    this.streamingActivity.publishRunningActivity(text, options);
-  }
-
-  private publishRunningUserMessageActivity(content: string | null | undefined): void {
-    this.streamingActivity.publishRunningUserMessageActivity(content);
-  }
-
-  private publishPiToolActivity(
-    toolCallId: string,
-    toolName: string,
-    args: Record<string, unknown>,
-    status: "running" | "complete" | "error",
-    result?: unknown,
-  ): void {
-    this.streamingActivity.publishPiToolActivity(
-      toolCallId,
-      toolName,
-      args,
-      status,
-      result,
-    );
-  }
-
-  private pushWorkspaceStreaming(value: boolean): void {
-    this.streamingActivity.pushWorkspaceStreaming(value);
-  }
-
   /**
    * Turn-start bookkeeping. Resets the completion-recording guard, clears stale
    * todos, and broadcasts state. Invoked once per run from the agent_start event.
@@ -7199,8 +6974,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       this.ctx.storage.kv.delete(CHAT_TODOS_KEY);
     }
     this.syncAgentState();
-    this.pushWorkspaceStreaming(true);
-    this.startStreamingLeaseHeartbeat();
+    this.streamingActivity.pushWorkspaceStreaming(true);
+    this.streamingActivity.startStreamingLeaseHeartbeat();
     this.startPiTurnAbsoluteTimeoutWatchdog();
     this.endChatMemoryPhase(memoryPhase);
   }
@@ -7238,7 +7013,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     const hadMarker = this.readPiActiveTurn() !== null;
     const hadLiveTurn = Boolean(this.activePiStreamTurnId || this.piSession?.state.isStreaming);
     if (!hadMarker && !hadLiveTurn) {
-      this.stopStreamingLeaseHeartbeat();
+      this.streamingActivity.stopStreamingLeaseHeartbeat();
       return;
     }
 
@@ -7261,8 +7036,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         errorType: "PiTurnAbsoluteTimeout",
       };
       this.syncAgentState();
-      this.pushChatEvent(this.piProviderErrorEvent(PI_TURN_ABSOLUTE_TIMEOUT_MESSAGE));
-      this.updateActiveAutomationRun({
+      this.pushChatEvent(this.chatErrors.piProviderErrorEvent(PI_TURN_ABSOLUTE_TIMEOUT_MESSAGE));
+      this.automationRun.updateActiveAutomationRun({
         status: "error",
         message: PI_TURN_ABSOLUTE_TIMEOUT_MESSAGE,
         clear: true,
@@ -7362,7 +7137,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
             : `[${outcome.status}] ${outcome.summary}`
           : "Automation completed without explicitly reporting an outcome"
         : null;
-      this.updateActiveAutomationRun({
+      this.automationRun.updateActiveAutomationRun({
         status,
         message,
         completedAt:
@@ -7388,7 +7163,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
             : Date.now();
         this.assistantCompletionRecordedAt = completedAt;
         this.ctx.waitUntil(
-          this.recordThreadAssistantCompletion(
+          this.threadMetadata.recordThreadAssistantCompletion(
             context,
             completedAt,
             options.summarySource ?? null,
@@ -7401,7 +7176,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         if (completedAt === null) return;
         this.assistantCompletionSummaryRequestedAt = completedAt;
         this.ctx.waitUntil(
-          this.generateAndPersistThreadAssistantCompletionSummary(
+          this.threadMetadata.generateAndPersistThreadAssistantCompletionSummary(
             context,
             completedAt,
             options.summarySource!,
@@ -7412,14 +7187,11 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       } else {
         // Not a completion (error/abort teardown): just clear the workspace
         // indicator. The completion branches clear it via recordThreadAssistantCompletion.
-        this.pushWorkspaceStreaming(false);
+        this.streamingActivity.pushWorkspaceStreaming(false);
       }
     }
   }
 
-  // Thread metadata generation collaborator (see chat-thread-metadata.ts).
-  // All state stays on this DO, and the memoized deps close over `this` so a
-  // fake with stubbed siblings behaves exactly as when the bodies lived here.
   private get threadMetadata(): ChatThreadMetadata {
     return (this.threadMetadataInstance ??= new ChatThreadMetadata({
       chatContext: () => this.chatContext,
@@ -7438,79 +7210,13 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       setTitle: (title, updatedAt) => this.setTitle(title, updatedAt),
       broadcastChat: (message) => this.broadcastChat(message),
       recordWorkspaceThreadStreaming: (workspaceId, threadId, isStreaming, options) =>
-        this.recordWorkspaceThreadStreaming(workspaceId, threadId, isStreaming, options),
+        this.streamingActivity.recordWorkspaceThreadStreaming(workspaceId, threadId, isStreaming, options),
       retryChatDurableObjectRpc: (operation, fn, options) =>
         this.retryChatDurableObjectRpc(operation, fn, options),
       recordChatThreadObservabilityEvent: (event, details) =>
         this.recordChatThreadObservabilityEvent(event, details),
-      persistThreadAssistantCompletion: (context, completedAt, summary, summaryStatus) =>
-        this.persistThreadAssistantCompletion(context, completedAt, summary, summaryStatus),
-      recordCompletionSummaryStatus: (context, completedAt, summaryStatus, summary) =>
-        this.recordCompletionSummaryStatus(context, completedAt, summaryStatus, summary),
-      generateAndPersistThreadAssistantCompletionSummary: (context, completedAt, sourceText) =>
-        this.generateAndPersistThreadAssistantCompletionSummary(context, completedAt, sourceText),
-      generateThreadTitleFromMessage: (threadId, message) =>
-        this.generateThreadTitleFromMessage(threadId, message),
-      generateClaimedChatGroupAvatar: (threadId, claim, userStub) =>
-        this.generateClaimedChatGroupAvatar(threadId, claim, userStub),
-      maybeGenerateChatGroupAvatarForThread: (threadId, trigger) =>
-        this.maybeGenerateChatGroupAvatarForThread(threadId, trigger),
-      errorLogFields: (error) => this.errorLogFields(error),
     }));
   }
-
-  private recordThreadAssistantCompletion(
-    context: ChatContextState,
-    completedAt: number,
-    summarySource: string | null,
-  ): Promise<void> {
-    return this.threadMetadata.recordThreadAssistantCompletion(
-      context,
-      completedAt,
-      summarySource,
-    );
-  }
-
-  private persistThreadAssistantCompletion(
-    context: ChatContextState,
-    completedAt: number,
-    summary: string | null,
-    summaryStatus: ThreadCompletionSummaryStatus | null,
-  ): Promise<AssistantCompletionPersistenceResult> {
-    return this.threadMetadata.persistThreadAssistantCompletion(
-      context,
-      completedAt,
-      summary,
-      summaryStatus,
-    );
-  }
-
-  private recordCompletionSummaryStatus(
-    context: ChatContextState,
-    completedAt: number,
-    summaryStatus: ThreadCompletionSummaryStatus,
-    summary?: string,
-  ): Promise<void> {
-    return this.threadMetadata.recordCompletionSummaryStatus(
-      context,
-      completedAt,
-      summaryStatus,
-      summary,
-    );
-  }
-
-  private generateAndPersistThreadAssistantCompletionSummary(
-    context: ChatContextState,
-    completedAt: number,
-    sourceText: string,
-  ): Promise<void> {
-    return this.threadMetadata.generateAndPersistThreadAssistantCompletionSummary(
-      context,
-      completedAt,
-      sourceText,
-    );
-  }
-
 
   async startInitialUserMessage(
     body: InitialUserMessageRequest,
@@ -7526,9 +7232,9 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       return { status: "error", error: "Missing message" };
     }
 
-    const automationRun = this.normalizeActiveAutomationRun(body.automationRun);
+    const automationRun = this.automationRun.normalizeActiveAutomationRun(body.automationRun);
     if (automationRun) {
-      this.reconcileInactiveAutomationRun(
+      this.automationRun.reconcileInactiveAutomationRun(
         "Automation run did not finish before the thread restarted",
       );
       if (
@@ -7541,7 +7247,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
           error: "Thread is busy with another run",
         };
       }
-      this.setActiveAutomationRun(automationRun);
+      this.automationRun.setActiveAutomationRun(automationRun);
     }
 
     try {
@@ -7560,11 +7266,11 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         persistUserMessageImmediately: true,
       });
       if (automationRun && result.status !== "accepted") {
-        this.setActiveAutomationRun(null);
+        this.automationRun.setActiveAutomationRun(null);
       }
       if (result.status !== "accepted") {
         this.pushChatEvent(
-          this.chatSendErrorPayload(result.error, {
+          this.chatErrors.chatSendErrorPayload(result.error, {
             status: result.status,
             fallbackMessage: "Failed to start initial message",
           }),
@@ -7573,10 +7279,10 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       return result;
     } catch (error) {
       if (automationRun) {
-        this.setActiveAutomationRun(null);
+        this.automationRun.setActiveAutomationRun(null);
       }
       this.pushChatEvent(
-        this.chatSendErrorPayload(error, {
+        this.chatErrors.chatSendErrorPayload(error, {
           fallbackMessage: "Failed to start initial message",
         }),
       );
@@ -7658,8 +7364,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
 
       this.setActiveTurnUserId(context.userId);
       // Turn-start bookkeeping runs from the agent_start event the prompt emits.
-      this.publishRunningUserMessageActivity(rawContent);
-      await this.updateThreadMetadataForUserMessage(
+      this.streamingActivity.publishRunningUserMessageActivity(rawContent);
+      await this.threadMetadata.updateThreadMetadataForUserMessage(
         attributedContent,
         body.messageSource ?? "eval",
       ).catch((error) => {
@@ -7696,7 +7402,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       } catch {
         // Best effort cleanup; the error below is the actionable eval failure.
       }
-      this.pushChatEvent(this.piProviderErrorEvent(message));
+      this.pushChatEvent(this.chatErrors.piProviderErrorEvent(message));
       this.finishTurn();
       this.setActiveTurnUserId(null);
       return await this.agentEvalResult("error", {
@@ -7704,8 +7410,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       });
     }
   }
-
-
 
   private async agentEvalResult(
     status: AgentEvalSessionResult["status"],
@@ -7725,7 +7429,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       }),
     };
   }
-
 
   /**
    * Whether a browser is reachable for a prompt. NOT the same as "a transport
@@ -7823,59 +7526,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         );
       }
     }
-  }
-
-  private updateThreadMetadataForUserMessage(
-    messageContent: string,
-    messageSource?: string | null,
-  ): Promise<void> {
-    return this.threadMetadata.updateThreadMetadataForUserMessage(
-      messageContent,
-      messageSource,
-    );
-  }
-
-  private errorLogFields(error: unknown): {
-    errorName: string;
-    errorMessage: string;
-  } {
-    return this.threadMetadata.errorLogFields(error);
-  }
-
-  private generateClaimedChatGroupAvatar(
-    threadId: string,
-    claim: ChatGroupIconGenerationClaim,
-    userStub: {
-      setGeneratedChatGroupIcon: (
-        groupId: string,
-        claimId: string,
-        icon: string,
-      ) => unknown;
-      markChatGroupAvatarGenerationFailed: (
-        groupId: string,
-        claimId: string,
-      ) => unknown;
-    },
-  ): Promise<void> {
-    return this.threadMetadata.generateClaimedChatGroupAvatar(
-      threadId,
-      claim,
-      userStub,
-    );
-  }
-
-  private maybeGenerateChatGroupAvatarForThread(
-    threadId: string,
-    trigger?: ChatGroupIconGenerationClaim["trigger"],
-  ): Promise<void> {
-    return this.threadMetadata.maybeGenerateChatGroupAvatarForThread(
-      threadId,
-      trigger,
-    );
-  }
-
-  private generateThreadTitleFromMessage(threadId: string, message: string): Promise<void> {
-    return this.threadMetadata.generateThreadTitleFromMessage(threadId, message);
   }
 
   private async ensurePiSessionReady(): Promise<void> {
@@ -9261,7 +8911,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     ) as ReturnType<typeof import("@earendil-works/pi-ai/compat").streamSimple>;
   }
 
-
   private recordPiProviderStreamTerminalError(
     model: Model<any>,
     message: string,
@@ -9278,7 +8927,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       error: message,
     });
   }
-
 
   private scopedCodeModeTools(
     context: ChatContextState,
@@ -9385,7 +9033,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
           };
           const summary = raw.summary.trim();
           if (!summary) throw new Error("Automation outcome summary is required");
-          this.setActiveAutomationRun({
+          this.automationRun.setActiveAutomationRun({
             ...run,
             reportedOutcome: { status: raw.status, summary },
           });
@@ -9644,7 +9292,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
           if (contentIndex === 0 || !this.piReasoningItemId) {
             this.piReasoningItemId = `pi_reasoning_${crypto.randomUUID()}`;
           }
-          this.publishRunningActivity("Thinking", { immediate: true });
+          this.streamingActivity.publishRunningActivity("Thinking", { immediate: true });
           break;
         }
         case "thinking_delta": {
@@ -9674,7 +9322,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
             itemId,
             delta: assistantEvent.delta,
           });
-          this.publishRunningActivity(this.piActiveItemText);
+          this.streamingActivity.publishRunningActivity(this.piActiveItemText);
           break;
         }
         case "toolcall_start": {
@@ -9690,7 +9338,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
           if (Object.keys(args).length > 0) {
             this.rememberPiToolArgs(toolCallId, args);
           }
-          this.publishPiToolActivity(toolCallId, toolName, args, "running");
+          this.streamingActivity.publishPiToolActivity(toolCallId, toolName, args, "running");
           this.pushPiRuntimeEvent("item/started", {
             threadId,
             item: piRuntimeToolItem(
@@ -9715,7 +9363,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         if (shouldSendCompleted) {
           this.piAssistantText += text;
           this.piActiveItemText = text;
-          this.publishRunningActivity(text, { immediate: true });
+          this.streamingActivity.publishRunningActivity(text, { immediate: true });
           this.pushPiRuntimeEvent("item/completed", {
             threadId: this.piRuntimeThreadId(),
             item: {
@@ -9739,7 +9387,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       const toolName = event.toolName || "tool";
       this.piToolStartedAtMs.set(toolCallId, Date.now());
       const args = this.rememberPiToolArgs(toolCallId, piEventArgs(event.args));
-      this.publishPiToolActivity(toolCallId, toolName, args, "running");
+      this.streamingActivity.publishPiToolActivity(toolCallId, toolName, args, "running");
       this.pushPiRuntimeEvent("item/started", {
         threadId: this.piRuntimeThreadId(),
         item: piRuntimeToolItem(toolCallId, toolName, args, "running"),
@@ -9791,7 +9439,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       if (contentItems.length > 0) {
         item.contentItems = contentItems;
       }
-      this.publishPiToolActivity(
+      this.streamingActivity.publishPiToolActivity(
         toolCallId,
         toolName,
         args,
@@ -9868,10 +9516,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         this.discardUnpersistedPiSessionMessages();
       }
       const completedAtMs = Date.now();
-      const turnStartedAtMs =
-        this.piAgentStartedAtMs || this.piTurnStartedAtMs || completedAtMs;
-      const turnDurationMs = Math.max(0, completedAtMs - turnStartedAtMs);
-      this.piAgentStartedAtMs = 0;
       const threadId = this.chatContext?.threadId || "";
       const finalText = stoppedByUser
         ? PI_USER_STOP_TEXT
@@ -9911,44 +9555,19 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       // an already-reported error could still reappear as a fresh banner on
       // every reload instead of staying inline in the transcript.
       if (!stoppedByUser && errorMessage) {
-        this.pushChatEvent(this.piProviderErrorEvent(errorMessage));
+        this.pushChatEvent(this.chatErrors.piProviderErrorEvent(errorMessage));
       }
-      this.pushPiRuntimeEvent("turn/completed", {
-        threadId,
-        ...(forkEntryId ? { forkEntryId } : {}),
+      this.publishPiTurnCompletion({
         completedAtMs,
-        turnDurationMs,
-        ...(this.piSdkTurnUsageTotal ? { usage: this.piSdkTurnUsageTotal } : {}),
-        ...(this.piSdkTurnIndex > 0 ? { sdkTurnCount: this.piSdkTurnIndex } : {}),
-      });
-      this.pushChatEvent({
-        type: "result",
-        threadId,
-        result: finalText,
-        sessionId: threadId,
-        completedAt: completedAtMs,
-      });
-      if (stoppedByUser) {
-        this.updateActiveAutomationRun({
-          status: "error",
-          message: PI_USER_STOP_TEXT,
-          completedAt: completedAtMs,
-          clear: true,
-        });
-      } else if (errorMessage) {
-        this.updateActiveAutomationRun({
-          status: "error",
-          message: errorMessage,
-          completedAt: completedAtMs,
-          clear: true,
-        });
-      }
-      this.finishTurn({
-        markUnread: true,
-        completedAt: completedAtMs,
+        finalText,
+        automationError: stoppedByUser ? PI_USER_STOP_TEXT : errorMessage,
         summarySource,
+        metadata: {
+          ...(forkEntryId ? { forkEntryId } : {}),
+          ...(this.piSdkTurnUsageTotal ? { usage: this.piSdkTurnUsageTotal } : {}),
+          ...(this.piSdkTurnIndex > 0 ? { sdkTurnCount: this.piSdkTurnIndex } : {}),
+        },
       });
-      this.setActiveTurnUserId(null);
       this.completeTodoStateForTurnEnd();
       this.piActiveItemId = null;
       this.piActiveItemText = "";
@@ -9965,6 +9584,46 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       return;
     }
 
+  }
+
+  // Publish a settled outcome after its path has committed work and emitted any
+  // error/stop/notice parts. Journal cleanup stays with the persistence owner.
+  private publishPiTurnCompletion(input: {
+    completedAtMs: number;
+    finalText: string;
+    automationError?: string;
+    summarySource?: string | null;
+    metadata?: {
+      forkEntryId?: string;
+      usage?: ReturnType<typeof piRuntimeUsageSummary>;
+      sdkTurnCount?: number;
+    };
+  }): void {
+    const { completedAtMs, finalText, automationError, summarySource } = input;
+    const threadId = this.chatContext?.threadId || "";
+    const startedAtMs = this.piAgentStartedAtMs || this.piTurnStartedAtMs || completedAtMs;
+    this.piAgentStartedAtMs = 0;
+    this.pushPiRuntimeEvent("turn/completed", {
+      threadId,
+      completedAtMs,
+      turnDurationMs: Math.max(0, completedAtMs - startedAtMs),
+      ...input.metadata,
+    });
+    this.pushChatEvent({
+      type: "result",
+      threadId,
+      result: finalText,
+      sessionId: threadId,
+      completedAt: completedAtMs,
+    });
+    // Clear unsuccessful automations before finishTurn can mark them successful.
+    if (automationError) {
+      this.automationRun.updateActiveAutomationRun({
+        status: "error", message: automationError, completedAt: completedAtMs, clear: true,
+      });
+    }
+    this.finishTurn({ markUnread: true, completedAt: completedAtMs, summarySource });
+    this.setActiveTurnUserId(null);
   }
 
   private async recordPiAssistantUsage(
@@ -10353,24 +10012,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     this.piSession.state.tools = this.createPiToolDefinitions(context);
   }
 
-  private recordCurrentThreadError(input: {
-    message: string;
-    source?: unknown;
-    errorKind?: unknown;
-    status?: unknown;
-    provider?: unknown;
-    model?: unknown;
-    createdAt?: number;
-  }): void {
-    this.chatErrors.recordCurrentThreadError(input);
-  }
-
   private emitChatError(message: string): void {
     this.pushChatEvent({ type: "error", error: message });
-  }
-
-  private piProviderErrorEvent(message: string): Record<string, unknown> {
-    return this.chatErrors.piProviderErrorEvent(message);
   }
 
   private pushChatEvent(payload: Record<string, unknown>): void {
@@ -10388,7 +10031,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
             ? payload.message.trim()
             : "";
       if (message) {
-        this.recordCurrentThreadError({
+        this.chatErrors.recordCurrentThreadError({
           message,
           source: payload.source,
           errorKind: payload.errorType ?? payload.error_kind,
@@ -11032,35 +10675,17 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         this.activePiStreamTurnId,
       ),
     );
-    const turnStartedAtMs =
-      this.piAgentStartedAtMs || this.piTurnStartedAtMs || completedAtMs;
-    this.piAgentStartedAtMs = 0;
     this.pushPiRuntimeEvent("item/agentMessage/delta", {
       threadId,
       itemId: `pi_user_stop_${stoppedAtMs}`,
       itemKind: "userStop",
       delta: PI_USER_STOP_TEXT,
     });
-    this.pushPiRuntimeEvent("turn/completed", {
-      threadId,
+    this.publishPiTurnCompletion({
       completedAtMs,
-      turnDurationMs: Math.max(0, completedAtMs - turnStartedAtMs),
+      finalText: PI_USER_STOP_TEXT,
+      automationError: PI_USER_STOP_TEXT,
     });
-    this.pushChatEvent({
-      type: "result",
-      threadId,
-      result: PI_USER_STOP_TEXT,
-      sessionId: threadId,
-      completedAt: completedAtMs,
-    });
-    this.updateActiveAutomationRun({
-      status: "error",
-      message: PI_USER_STOP_TEXT,
-      completedAt: completedAtMs,
-      clear: true,
-    });
-    this.finishTurn({ markUnread: true, completedAt: completedAtMs });
-    this.setActiveTurnUserId(null);
     this.completeTodoStateForTurnEnd();
     this.piUserStopRequestedAtMs = 0;
     this.resetRunningActivityState();
@@ -11182,8 +10807,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     console.error("[ChatThreadDO] Pi turn failed", error);
     const errorMessage =
       error instanceof Error ? error.message : String(error);
-    this.pushChatEvent(this.piProviderErrorEvent(errorMessage));
-    this.updateActiveAutomationRun({
+    this.pushChatEvent(this.chatErrors.piProviderErrorEvent(errorMessage));
+    this.automationRun.updateActiveAutomationRun({
       status: "error",
       message: errorMessage,
       clear: true,
@@ -11367,9 +10992,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     // Close the turn out on every channel the normal end-of-turn uses, so the
     // thread is immediately usable and no client is left spinning.
     const threadId = this.chatContext?.threadId || "";
-    const turnStartedAtMs =
-      this.piAgentStartedAtMs || this.piTurnStartedAtMs || completedAtMs;
-    this.piAgentStartedAtMs = 0;
     this.pushPiRuntimeEvent("item/agentMessage/delta", {
       threadId,
       itemId: `pi_turn_salvage_${completedAtMs}`,
@@ -11378,34 +11000,12 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       itemKind: "turnNotice",
       delta: PI_TURN_SALVAGE_NOTE,
     });
-    this.pushPiRuntimeEvent("turn/completed", {
-      threadId,
+    this.publishPiTurnCompletion({
       completedAtMs,
-      turnDurationMs: Math.max(0, completedAtMs - turnStartedAtMs),
-    });
-    this.pushChatEvent({
-      type: "result",
-      threadId,
-      result: PI_TURN_SALVAGE_NOTE,
-      sessionId: threadId,
-      completedAt: completedAtMs,
-    });
-    // An automation run whose turn never reached the model did not do what it was
-    // asked, so it closes as an error carrying the note — same shape as the
-    // user-stop teardown, and set BEFORE finishTurn so its success branch (which
-    // fires on markUnread) finds no run left to mark.
-    this.updateActiveAutomationRun({
-      status: "error",
-      message: PI_TURN_SALVAGE_NOTE,
-      completedAt: completedAtMs,
-      clear: true,
-    });
-    this.finishTurn({
-      markUnread: true,
-      completedAt: completedAtMs,
+      finalText: PI_TURN_SALVAGE_NOTE,
+      automationError: PI_TURN_SALVAGE_NOTE,
       summarySource: extractThreadCompletionSummarySource(work, PI_TURN_SALVAGE_NOTE),
     });
-    this.setActiveTurnUserId(null);
     await this.completeTodoStateForTurnEnd();
     // The warm session (if any) still holds the interrupted turn's uncommitted
     // tail, which pi_core has now absorbed — rebuild on the next turn.
@@ -11452,7 +11052,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       status: "abandoned",
       severity: "warn",
     });
-    this.updateActiveAutomationRun({
+    this.automationRun.updateActiveAutomationRun({
       status: "error",
       message: ctx.terminalMessage,
       clear: true,
@@ -11461,7 +11061,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     this.finishTurn();
     this.setActiveTurnUserId(null);
     try {
-      this.pushChatEvent(this.piProviderErrorEvent(ctx.terminalMessage));
+      this.pushChatEvent(this.chatErrors.piProviderErrorEvent(ctx.terminalMessage));
     } catch {
       // Best effort: the framework already delivered the terminal banner; the
       // observability event above is the actionable signal.
@@ -11500,7 +11100,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       size: attempt.isolateDeath,
       sampleKey: exceeded,
     });
-    this.updateActiveAutomationRun({
+    this.automationRun.updateActiveAutomationRun({
       status: "error",
       message: PI_TURN_RESUME_BUDGET_EXHAUSTED_MESSAGE,
       clear: true,
@@ -11510,7 +11110,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     this.setActiveTurnUserId(null);
     try {
       this.pushChatEvent(
-        this.piProviderErrorEvent(PI_TURN_RESUME_BUDGET_EXHAUSTED_MESSAGE),
+        this.chatErrors.piProviderErrorEvent(PI_TURN_RESUME_BUDGET_EXHAUSTED_MESSAGE),
       );
     } catch (error) {
       // Best effort: the durable terminal below is what a detached client reads.
@@ -11922,16 +11522,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       break;
     }
     return oldest ?? oldestIncludingSummaries;
-  }
-
-  /** @deprecated Kept for focused legacy-heal unit tests; not on the read path. */
-  private healLegacyUiMessageTimes(): Promise<void> {
-    return this.uiMirror.healLegacyUiMessageTimes();
-  }
-
-  /** @deprecated Kept for focused legacy-heal unit tests; not on the read path. */
-  private healLegacyUiMessageAuthors(): Promise<void> {
-    return this.uiMirror.healLegacyUiMessageAuthors();
   }
 
   /**

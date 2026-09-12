@@ -59,11 +59,11 @@ describe("ChatThreadDO agent eval sessions", () => {
     fake.recordChatThreadObservabilityEvent = vi.fn();
     fake.ensurePiSessionReady = vi.fn(async () => undefined);
     fake.applyMentionsForTurn = vi.fn(async (content: string) => content);
-    fake.updateThreadMetadataForUserMessage = vi.fn(async () => undefined);
+    fake.threadMetadata.updateThreadMetadataForUserMessage = vi.fn(async () => undefined);
     fake.setActiveTurnUserId = vi.fn();
     fake.markTurnStarted = vi.fn();
     fake.finishTurn = vi.fn();
-    fake.publishRunningUserMessageActivity = vi.fn();
+    fake.streamingActivity.publishRunningUserMessageActivity = vi.fn();
     fake.refreshPiSessionModel = vi.fn(async () => undefined);
     fake.withPiTurnInactivityTimeout = vi.fn(async (fn: () => Promise<unknown>) => fn());
     fake.getPiCoreParsedMessages = vi.fn(async () => parsedMessages);

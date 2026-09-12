@@ -52,13 +52,7 @@ describe('ChatThreadDO running-activity streaming debounce', () => {
     const { fake, recordThreadStreaming, waitUntilPromises } = createFake();
 
     for (let i = 0; i < 5; i += 1) {
-      ChatThreadDO.prototype['queueStreamingActivityUpdate'].call(
-        fake,
-        'workspace1',
-        'thread1',
-        `activity ${i}`,
-        1_000 + i,
-      );
+      fake.streamingActivity.queueStreamingActivityUpdate('workspace1', 'thread1', `activity ${i}`, 1_000 + i);
     }
 
     // No RPC has fired yet; everything is pending in the trailing window.
@@ -85,7 +79,7 @@ describe('ChatThreadDO running-activity streaming debounce', () => {
     vi.useFakeTimers();
     const { fake, recordThreadStreaming } = createFake();
 
-    ChatThreadDO.prototype['flushPendingStreamingActivity'].call(fake);
+    fake.streamingActivity.flushPendingStreamingActivity();
     vi.advanceTimersByTime(DEBOUNCE_MS);
 
     expect(recordThreadStreaming).not.toHaveBeenCalled();
@@ -95,13 +89,7 @@ describe('ChatThreadDO running-activity streaming debounce', () => {
     vi.useFakeTimers();
     const { fake, recordThreadStreaming, waitUntilPromises } = createFake();
 
-    ChatThreadDO.prototype['queueStreamingActivityUpdate'].call(
-      fake,
-      'workspace1',
-      'thread1',
-      'mid-turn activity',
-      2_000,
-    );
+    fake.streamingActivity.queueStreamingActivityUpdate('workspace1', 'thread1', 'mid-turn activity', 2_000);
     expect(fake.pendingStreamingActivity).not.toBeNull();
 
     // resetRunningActivityState runs on every streaming transition and must drop
@@ -124,13 +112,7 @@ describe('ChatThreadDO running-activity streaming debounce', () => {
     recordThreadStreaming.mockRejectedValueOnce(new Error('Network connection lost.'));
 
     expect(() =>
-      ChatThreadDO.prototype['queueStreamingActivityUpdate'].call(
-        fake,
-        'workspace1',
-        'thread1',
-        'activity',
-        3_000,
-      ),
+      fake.streamingActivity.queueStreamingActivityUpdate('workspace1', 'thread1', 'activity', 3_000),
     ).not.toThrow();
 
     // The trailing flush itself must not throw synchronously.
@@ -152,22 +134,10 @@ describe('ChatThreadDO running-activity streaming debounce', () => {
     vi.useFakeTimers();
     const { fake, recordThreadStreaming, waitUntilPromises } = createFake();
 
-    ChatThreadDO.prototype['queueStreamingActivityUpdate'].call(
-      fake,
-      'workspace1',
-      'threadA',
-      'activity A',
-      4_000,
-    );
+    fake.streamingActivity.queueStreamingActivityUpdate('workspace1', 'threadA', 'activity A', 4_000);
     // Re-pointing to a different thread must not silently drop threadA's latest
     // state; it is flushed before the new entry is queued.
-    ChatThreadDO.prototype['queueStreamingActivityUpdate'].call(
-      fake,
-      'workspace1',
-      'threadB',
-      'activity B',
-      4_100,
-    );
+    fake.streamingActivity.queueStreamingActivityUpdate('workspace1', 'threadB', 'activity B', 4_100);
 
     await flush(waitUntilPromises);
     expect(recordThreadStreaming).toHaveBeenCalledWith('threadA', true, {
@@ -188,13 +158,7 @@ describe('ChatThreadDO running-activity streaming debounce', () => {
     vi.useFakeTimers();
     const { fake, recordThreadStreaming, waitUntilPromises } = createFake();
 
-    ChatThreadDO.prototype['queueStreamingActivityUpdate'].call(
-      fake,
-      'workspace1',
-      'thread1',
-      'only activity',
-      5_000,
-    );
+    fake.streamingActivity.queueStreamingActivityUpdate('workspace1', 'thread1', 'only activity', 5_000);
     vi.advanceTimersByTime(DEBOUNCE_MS);
     await flush(waitUntilPromises);
 
@@ -250,7 +214,7 @@ describe('ChatThreadDO streaming lease heartbeat', () => {
     vi.useFakeTimers();
     const { fake, recordThreadStreaming, waitUntilPromises } = createFake();
 
-    ChatThreadDO.prototype['startStreamingLeaseHeartbeat'].call(fake);
+    fake.streamingActivity.startStreamingLeaseHeartbeat();
     expect(recordThreadStreaming).not.toHaveBeenCalled();
 
     vi.advanceTimersByTime(LEASE_REFRESH_MS);
@@ -270,7 +234,7 @@ describe('ChatThreadDO streaming lease heartbeat', () => {
     const { fake, recordThreadStreaming } = createFake();
     fake.isThreadStreaming = vi.fn(() => false);
 
-    ChatThreadDO.prototype['startStreamingLeaseHeartbeat'].call(fake);
+    fake.streamingActivity.startStreamingLeaseHeartbeat();
     vi.advanceTimersByTime(LEASE_REFRESH_MS * 3);
 
     expect(recordThreadStreaming).not.toHaveBeenCalled();
@@ -281,7 +245,7 @@ describe('ChatThreadDO streaming lease heartbeat', () => {
     vi.useFakeTimers();
     const { fake, recordThreadStreaming } = createFake();
 
-    ChatThreadDO.prototype['startStreamingLeaseHeartbeat'].call(fake);
+    fake.streamingActivity.startStreamingLeaseHeartbeat();
     ChatThreadDO.prototype['resetRunningActivityState'].call(fake);
     expect(fake.streamingLeaseRefreshTimer).toBeNull();
 

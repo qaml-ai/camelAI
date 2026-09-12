@@ -1956,23 +1956,23 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     analysis_list_connections: (binding) => binding.analysisListConnections(),
     warehouse_run_code: (binding, args) => binding.analysisRunCode(args),
     warehouse_list_connections: (binding) => binding.analysisListConnections(),
-    list_scheduled_prompts: (binding) => binding.listScheduledPrompts(),
-    create_scheduled_prompt: (binding, args) => binding.createScheduledPrompt(args),
-    update_scheduled_prompt: (binding, args) => binding.updateScheduledPrompt(args),
-    delete_scheduled_prompt: (binding, args) => binding.deleteScheduledPrompt(args),
-    run_scheduled_prompt_now: (binding, args) => binding.runScheduledPromptNow(args),
-    list_workflows: (binding) => binding.listDeterministicAutomations(),
-    validate_workflow: (binding, args) => binding.validateDeterministicAutomation(args),
-    create_workflow: (binding, args) => binding.createDeterministicAutomation(args),
-    update_workflow: (binding, args) => binding.updateDeterministicAutomation(args),
-    delete_workflow: (binding, args) => binding.deleteDeterministicAutomation(args),
-    run_workflow_now: (binding, args) => binding.runDeterministicAutomationNow(args),
-    get_workflow_run: (binding, args) => binding.getDeterministicAutomationRuns(args),
+    list_scheduled_prompts: (binding) => binding.scheduledPrompts.list(),
+    create_scheduled_prompt: (binding, args) => binding.scheduledPrompts.create(args),
+    update_scheduled_prompt: (binding, args) => binding.scheduledPrompts.update(args),
+    delete_scheduled_prompt: (binding, args) => binding.scheduledPrompts.delete(args),
+    run_scheduled_prompt_now: (binding, args) => binding.scheduledPrompts.runNow(args),
+    list_workflows: (binding) => binding.deterministicAutomations.list(),
+    validate_workflow: (binding, args) => binding.deterministicAutomations.validate(args),
+    create_workflow: (binding, args) => binding.deterministicAutomations.create(args),
+    update_workflow: (binding, args) => binding.deterministicAutomations.update(args),
+    delete_workflow: (binding, args) => binding.deterministicAutomations.delete(args),
+    run_workflow_now: (binding, args) => binding.deterministicAutomations.runNow(args),
+    get_workflow_run: (binding, args) => binding.deterministicAutomations.getRuns(args),
     workspace_info: (binding) => binding.getWorkspaceRuntimeInfo(),
-    list_integrations: (binding, args) => binding.listIntegrations(args),
-    list_integration_types: (binding, args) => binding.listIntegrationTypes(args),
-    create_integration: (binding, args) => binding.createIntegration(args),
-    prompt_connection_setup: (binding, args) => binding.promptConnectionSetup(args),
+    list_integrations: (binding, args) => binding.integrations.list(args),
+    list_integration_types: (binding, args) => binding.integrations.listTypes(args),
+    create_integration: (binding, args) => binding.integrations.create(args),
+    prompt_connection_setup: (binding, args) => binding.integrations.promptConnectionSetup(args),
     delete_connection: (binding, args) => binding.deleteConnection(args),
     delete_app: (binding, args) => binding.deleteApp(args),
     delete_project: (binding, args) => binding.deleteProject(args),
@@ -1980,10 +1980,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     send_slack_message: (binding, args) => binding.sendSlackMessage(args),
     send_telegram_message: (binding, args) => binding.sendTelegramMessage(args),
     send_discord_message: (binding, args) => binding.sendDiscordMessage(args),
-    get_custom_domain: (binding) => binding.getCustomDomain(),
-    set_custom_domain: (binding, args) => binding.setCustomDomain(args),
-    remove_custom_domain: (binding, args) => binding.removeCustomDomain(args),
-    retry_custom_domain_hostnames: (binding) => binding.retryCustomDomainHostnames(),
+    get_custom_domain: (binding) => binding.customDomains.get(),
+    set_custom_domain: (binding, args) => binding.customDomains.set(args),
+    remove_custom_domain: (binding, args) => binding.customDomains.remove(args),
+    retry_custom_domain_hostnames: (binding) => binding.customDomains.retryHostnames(),
     WebSearch: (binding, args) => binding.webSearch(args),
     WebFetch: (binding, args) => binding.webFetch(args),
     Agent: (binding, args, name) => binding.runSubagentTool(name, args),
@@ -3363,7 +3363,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           // to trip workerd's unhandled-rejection detector.
           return await this.createProject(args);
 
-
         case "set_project_description":
           return projectForAgent(await this.workspaceFs.setProjectDescription(args));
 
@@ -4386,54 +4385,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     });
   }
 
-  private async listScheduledPrompts(): Promise<unknown> {
-    return this.scheduledPrompts.list();
-  }
-
-  private async createScheduledPrompt(args: Record<string, unknown>): Promise<unknown> {
-    return this.scheduledPrompts.create(args);
-  }
-
-  private async updateScheduledPrompt(args: Record<string, unknown>): Promise<unknown> {
-    return this.scheduledPrompts.update(args);
-  }
-
-  private async deleteScheduledPrompt(args: Record<string, unknown>): Promise<unknown> {
-    return this.scheduledPrompts.delete(args);
-  }
-
-  private async runScheduledPromptNow(args: Record<string, unknown>): Promise<unknown> {
-    return this.scheduledPrompts.runNow(args);
-  }
-
-  private async listDeterministicAutomations(): Promise<unknown> {
-    return this.deterministicAutomations.list();
-  }
-
-  private async validateDeterministicAutomation(args: Record<string, unknown>): Promise<unknown> {
-    return this.deterministicAutomations.validate(args);
-  }
-
-  private async createDeterministicAutomation(args: Record<string, unknown>): Promise<unknown> {
-    return this.deterministicAutomations.create(args);
-  }
-
-  private async updateDeterministicAutomation(args: Record<string, unknown>): Promise<unknown> {
-    return this.deterministicAutomations.update(args);
-  }
-
-  private async deleteDeterministicAutomation(args: Record<string, unknown>): Promise<unknown> {
-    return this.deterministicAutomations.delete(args);
-  }
-
-  private async runDeterministicAutomationNow(args: Record<string, unknown>): Promise<unknown> {
-    return this.deterministicAutomations.runNow(args);
-  }
-
-  private async getDeterministicAutomationRuns(args: Record<string, unknown>): Promise<unknown> {
-    return this.deterministicAutomations.getRuns(args);
-  }
-
   private get integrations(): CodeModeIntegrations {
     return new CodeModeIntegrations({
       env: this.env,
@@ -4454,22 +4405,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           }): Promise<ConnectionSetupResponse>;
         }).promptConnectionSetup(input),
     });
-  }
-
-  private async listIntegrations(args: Record<string, unknown>): Promise<unknown> {
-    return this.integrations.list(args);
-  }
-
-  private listIntegrationTypes(args: Record<string, unknown>): Promise<unknown> {
-    return this.integrations.listTypes(args);
-  }
-
-  private async createIntegration(args: Record<string, unknown>): Promise<unknown> {
-    return this.integrations.create(args);
-  }
-
-  private async promptConnectionSetup(args: Record<string, unknown>): Promise<unknown> {
-    return this.integrations.promptConnectionSetup(args);
   }
 
   private async deleteConnection(args: Record<string, unknown>): Promise<unknown> {
@@ -5340,22 +5275,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       workspaceId: this.ctx.props.workspaceId,
       userId: this.ctx.props.userId,
     });
-  }
-
-  private async getCustomDomain(): Promise<unknown> {
-    return this.customDomains.get();
-  }
-
-  private async setCustomDomain(args: Record<string, unknown>): Promise<unknown> {
-    return this.customDomains.set(args);
-  }
-
-  private async removeCustomDomain(args: Record<string, unknown>): Promise<unknown> {
-    return this.customDomains.remove(args);
-  }
-
-  private async retryCustomDomainHostnames(): Promise<unknown> {
-    return this.customDomains.retryHostnames();
   }
 
   private async webSearchClient(

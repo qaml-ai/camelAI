@@ -1,17 +1,4 @@
-// Chat send failure / error payload helpers for ChatThreadDO, extracted as a
-// collaborator: the send-failure HTTP status + billing classification, the
-// structured chat-send error payload, the Pi provider-error event payload,
-// and the deduplicated OrgDO thread-error metadata recorder. Only computation
-// and the OrgDO metadata write live here — event delivery (pushChatEvent /
-// broadcast) stays on the DO, which passes the built payloads along. All
-// state lives on the owning DO (the billing-source/provider turn fields, the
-// Pi session, and the recordedChatErrors dedupe map); the class itself is
-// stateless and is cached for the owning DO's lifetime with closures over its
-// live deps (ChatThreadDO keeps thin same-named private delegates as its internal
-// API). Sibling-method calls route back through the deps callbacks — i.e.
-// through the DO's delegates — so dynamic dispatch (and every
-// `ChatThreadDO.prototype['method'].call(fake)` test seam that stubs a sibling
-// on the fake) behaves exactly as it did when the bodies lived on the DO.
+// Error classification and deduplicated OrgDO records. The DO owns delivery.
 import type { Agent as PiCoreAgent } from "@earendil-works/pi-agent-core";
 import {
   buildChatErrorEventPayload,
@@ -53,11 +40,6 @@ export interface ChatThreadErrorsDeps {
     fn: () => Promise<T>,
     options?: { attempts?: number; initialDelayMs?: number },
   ): Promise<T>;
-  // Sibling routing back through the owning DO's same-named delegates, so a
-  // stubbed sibling on a fake (or a subclass override) is honored exactly as
-  // it was when these methods lived on ChatThreadDO itself.
-  chatSendFailureStatus(status: "busy" | "error" | string, error: unknown): number;
-  isChatBillingOrCreditError(error: unknown): boolean;
 }
 
 export class ChatThreadErrors {
@@ -68,7 +50,7 @@ export class ChatThreadErrors {
     error: unknown,
   ): number {
     if (status === "busy") return 409;
-    if (this.deps.isChatBillingOrCreditError(error)) return 402;
+    if (this.isChatBillingOrCreditError(error)) return 402;
     const message = error instanceof Error ? error.message : String(error ?? "");
     return piProviderErrorMetadata(message).status ?? 500;
   }
@@ -103,7 +85,7 @@ export class ChatThreadErrors {
           : "";
     const message = rawMessage.trim() || options.fallbackMessage;
     const metadata = piProviderErrorMetadata(message);
-    const status = this.deps.chatSendFailureStatus(
+    const status = this.chatSendFailureStatus(
       options.status ?? "error",
       message,
     );
@@ -111,7 +93,7 @@ export class ChatThreadErrors {
       type: "error",
       error: message,
       status,
-      ...(this.deps.isChatBillingOrCreditError(message)
+      ...(this.isChatBillingOrCreditError(message)
         ? { errorType: "billing" }
         : {}),
       ...(this.deps.piCurrentBillingSource() === "byok" || this.deps.piCurrentBillingSource() === "hosted"

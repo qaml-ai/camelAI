@@ -1,15 +1,4 @@
-// Automation-run state machine for ChatThreadDO, extracted as a collaborator:
-// the persisted active scheduled-automation run lock (normalize / set /
-// clear), result reporting back to the owning WorkspaceCronDO, and the
-// stale-lock reconciliation that runs before a new automation start. All
-// state lives on the owning DO (the activeAutomationRun field mirrored into
-// KV storage); the class itself is stateless and is cached for the owning DO's
-// lifetime with closures over its live deps (ChatThreadDO keeps thin same-named
-// private delegates as its internal API). Sibling-method calls route back
-// through the deps callbacks — i.e. through the DO's delegates — so dynamic
-// dispatch (and every `ChatThreadDO.prototype['method'].call(fake)` test seam
-// that stubs a sibling on the fake) behaves exactly as it did when the bodies
-// lived on the DO.
+// Durable scheduled-run state and result reporting to WorkspaceCronDO.
 import type { WorkspaceCronDO } from "../workspace-cron";
 import type { SyncKvStorage } from "./pi-turn-journal";
 
@@ -45,24 +34,6 @@ export interface ChatThreadAutomationRunDeps {
   // DO-side operations (shared helpers whose behavior is owned elsewhere).
   isThreadStreaming(): boolean;
   pendingBrowserQuestionCount(): number;
-  // Sibling routing back through the owning DO's same-named delegates, so a
-  // stubbed sibling on a fake (or a subclass override) is honored exactly as
-  // it was when these methods lived on ChatThreadDO itself.
-  setActiveAutomationRun(value: ActiveAutomationRunState | null): void;
-  recordScheduledAutomationRun(
-    run: ActiveAutomationRunState,
-    input: {
-      status: "success" | "error" | "question" | "busy";
-      message?: string | null;
-      completedAt?: number | null;
-    },
-  ): Promise<boolean>;
-  updateActiveAutomationRun(input: {
-    status: "success" | "error" | "question" | "busy";
-    message?: string | null;
-    completedAt?: number | null;
-    clear?: boolean;
-  }): void;
 }
 
 export class ChatThreadAutomationRun {
@@ -145,10 +116,10 @@ export class ChatThreadAutomationRun {
     const run = this.deps.activeAutomationRun();
     if (!run) return;
     if (input.clear) {
-      this.deps.setActiveAutomationRun(null);
+      this.setActiveAutomationRun(null);
     }
     this.deps.waitUntil(
-      this.deps.recordScheduledAutomationRun(run, input).catch((error) => {
+      this.recordScheduledAutomationRun(run, input).catch((error) => {
         console.error(
           "[ChatThreadDO] failed to record scheduled automation run",
           error,
@@ -166,7 +137,7 @@ export class ChatThreadAutomationRun {
     ) {
       return false;
     }
-    this.deps.updateActiveAutomationRun({
+    this.updateActiveAutomationRun({
       status: "error",
       message: reason,
       completedAt: Date.now(),

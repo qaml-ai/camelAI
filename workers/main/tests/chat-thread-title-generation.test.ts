@@ -128,11 +128,7 @@ describe("ChatThreadDO title generation", () => {
       resolveClaim,
     } = createFakeThread();
 
-    await ChatThreadDO.prototype["generateThreadTitleFromMessage"].call(
-      fake,
-      "thread1",
-      "help me plan database migrations",
-    );
+    await fake.threadMetadata.generateThreadTitleFromMessage("thread1", "help me plan database migrations");
 
     expect(orgStub.updateThread).toHaveBeenCalledWith(
       "thread1",
@@ -190,11 +186,7 @@ describe("ChatThreadDO title generation", () => {
       resolveClaim,
     } = createFakeThread({ iconFails: true });
 
-    await ChatThreadDO.prototype["generateThreadTitleFromMessage"].call(
-      fake,
-      "thread1",
-      "help me plan database migrations",
-    );
+    await fake.threadMetadata.generateThreadTitleFromMessage("thread1", "help me plan database migrations");
 
     expect(fake.titleGenerationInFlight).toBe(false);
     expect(aiRun).toHaveBeenCalledTimes(1);
@@ -230,9 +222,7 @@ describe("ChatThreadDO title generation", () => {
       resolveClaim,
     } = createFakeThread();
 
-    const task = ChatThreadDO.prototype[
-      "maybeGenerateChatGroupAvatarForThread"
-    ].call(fake, "thread1");
+    const task = fake.threadMetadata.maybeGenerateChatGroupAvatarForThread("thread1");
 
     expect(userStub.claimChatGroupAvatarGenerationForThread).toHaveBeenCalledWith(
       "thread1",
@@ -268,9 +258,7 @@ describe("ChatThreadDO title generation", () => {
       status: "user",
     });
 
-    const task = ChatThreadDO.prototype[
-      "maybeGenerateChatGroupAvatarForThread"
-    ].call(fake, "thread1");
+    const task = fake.threadMetadata.maybeGenerateChatGroupAvatarForThread("thread1");
     resolveClaim(makeClaim());
     await task;
 
@@ -331,9 +319,7 @@ describe("ChatThreadDO title generation", () => {
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const { fake, userStub, aiRun } = createFakeThread({ aiMissing: true });
 
-    await ChatThreadDO.prototype[
-      "maybeGenerateChatGroupAvatarForThread"
-    ].call(fake, "thread1");
+    await fake.threadMetadata.maybeGenerateChatGroupAvatarForThread("thread1");
 
     expect(userStub.claimChatGroupAvatarGenerationForThread).not.toHaveBeenCalled();
     expect(userStub.setGeneratedChatGroupIcon).not.toHaveBeenCalled();
@@ -351,9 +337,7 @@ describe("ChatThreadDO title generation", () => {
       userId: null,
     };
 
-    await ChatThreadDO.prototype[
-      "maybeGenerateChatGroupAvatarForThread"
-    ].call(fake, "thread1");
+    await fake.threadMetadata.maybeGenerateChatGroupAvatarForThread("thread1");
 
     expect(userStub.claimChatGroupAvatarGenerationForThread).not.toHaveBeenCalled();
     expect(fake.broadcastChat).not.toHaveBeenCalled();

@@ -430,7 +430,7 @@ describe("ChatThreadDO completion summaries", () => {
     };
     fake.activeAutomationRun = activeAutomationRun;
     fake.browserPrompts = { pendingQuestionCount: 1 };
-    fake.updateActiveAutomationRun = vi.fn();
+    fake.automationRun.updateActiveAutomationRun = vi.fn();
 
     ChatThreadDO.prototype["finishTurn"].call(fake, {
       markUnread: true,
@@ -439,7 +439,7 @@ describe("ChatThreadDO completion summaries", () => {
     });
     await Promise.all(waitUntilPromises);
 
-    expect(fake.updateActiveAutomationRun).not.toHaveBeenCalled();
+    expect(fake.automationRun.updateActiveAutomationRun).not.toHaveBeenCalled();
     expect(fake.activeAutomationRun).toBe(activeAutomationRun);
   });
 
@@ -455,7 +455,7 @@ describe("ChatThreadDO completion summaries", () => {
         summary: "Both exports were read back and verified.",
       },
     };
-    fake.updateActiveAutomationRun = vi.fn();
+    fake.automationRun.updateActiveAutomationRun = vi.fn();
 
     ChatThreadDO.prototype["finishTurn"].call(fake, {
       markUnread: true,
@@ -464,7 +464,7 @@ describe("ChatThreadDO completion summaries", () => {
     });
     await Promise.all(waitUntilPromises);
 
-    expect(fake.updateActiveAutomationRun).toHaveBeenCalledWith({
+    expect(fake.automationRun.updateActiveAutomationRun).toHaveBeenCalledWith({
       status: "success",
       message: "Both exports were read back and verified.",
       completedAt: 123,
@@ -474,7 +474,7 @@ describe("ChatThreadDO completion summaries", () => {
 
   it("records a scheduled run as failed when an explicit outcome is missing or non-success", async () => {
     const { fake, waitUntilPromises } = createFakeThread();
-    fake.updateActiveAutomationRun = vi.fn();
+    fake.automationRun.updateActiveAutomationRun = vi.fn();
     fake.activeAutomationRun = {
       workspaceId: "workspace1",
       automationId: "prompt1",
@@ -488,7 +488,7 @@ describe("ChatThreadDO completion summaries", () => {
       summarySource: null,
     });
     await Promise.all(waitUntilPromises);
-    expect(fake.updateActiveAutomationRun).toHaveBeenLastCalledWith({
+    expect(fake.automationRun.updateActiveAutomationRun).toHaveBeenLastCalledWith({
       status: "error",
       message: "Automation completed without explicitly reporting an outcome",
       completedAt: 123,
@@ -512,7 +512,7 @@ describe("ChatThreadDO completion summaries", () => {
       summarySource: null,
     });
     await Promise.all(waitUntilPromises);
-    expect(fake.updateActiveAutomationRun).toHaveBeenLastCalledWith({
+    expect(fake.automationRun.updateActiveAutomationRun).toHaveBeenLastCalledWith({
       status: "error",
       message: "[partial] The database export worked, but readback failed.",
       completedAt: 456,
@@ -523,7 +523,7 @@ describe("ChatThreadDO completion summaries", () => {
   it("reuses one WorkspaceDO stub for ordered status writes", async () => {
     const { fake, waitUntilPromises } = createFakeThread();
 
-    ChatThreadDO.prototype["publishRunningActivity"].call(fake, "Thinking", {
+    fake.streamingActivity.publishRunningActivity("Thinking", {
       immediate: true,
     });
     ChatThreadDO.prototype["finishTurn"].call(fake, {

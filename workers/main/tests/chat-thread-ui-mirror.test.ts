@@ -4,19 +4,6 @@ import { describe, expect, it, vi } from 'vitest';
 import { ChatThreadUiMirror } from '../src/chat-thread/ui-mirror';
 import type { AgentEvalParsedMessage } from '../src/chat-thread/types';
 
-function uiUser(
-  id: string,
-  text: string,
-  metadata: Record<string, unknown>,
-): UIMessage {
-  return {
-    id,
-    role: 'user',
-    parts: [{ type: 'text', text, state: 'done' }],
-    metadata,
-  } as UIMessage;
-}
-
 function createHarness(options: {
   messages?: UIMessage[];
   piMessages?: AgentEvalParsedMessage[];
@@ -33,7 +20,6 @@ function createHarness(options: {
     messages = next;
   });
   let piRevision = { generation: 1, count: options.piMessages?.length ?? 0 };
-  const getPiCoreParsedMessages = vi.fn(async () => options.piMessages ?? []);
   // The bounded forward reader the top-up now uses. This stand-in serves the
   // whole fixture as ONE range (these fixtures are a handful of rows) and then
   // reports the walk finished, which is exactly what the real reader does when
@@ -94,7 +80,6 @@ function createHarness(options: {
       activeTurn ? { turnId: 'turn-1', openedAt: 1 } : null,
     activePiStreamTurnId: () => (activeStream ? 'turn-1' : null),
     getPiCoreRevision: () => piRevision,
-    getPiCoreParsedMessages,
     readParsedPiCoreRowRange,
     setRenderHistoryChronology: vi.fn(),
     reloadAiChatMessagesOrdered: vi.fn(),
@@ -113,7 +98,6 @@ function createHarness(options: {
       return messages;
     },
     persistRenderMessages,
-    getPiCoreParsedMessages,
     readParsedPiCoreRowRange,
     memoryPhases,
     recordChatThreadObservabilityEvent,
@@ -148,7 +132,7 @@ describe('ChatThreadUiMirror top-up preflight', () => {
 
     await harness.mirror.topUpUiMessagesFromPiCore();
 
-    expect(harness.getPiCoreParsedMessages).not.toHaveBeenCalled();
+    expect(harness.readParsedPiCoreRowRange).not.toHaveBeenCalled();
     expect(harness.persistRenderMessages).not.toHaveBeenCalled();
     expect(harness.memoryPhases).toEqual(['pi_topup_preflight']);
   });
@@ -179,207 +163,6 @@ describe('ChatThreadUiMirror author attribution', () => {
     });
   });
 
-  it('repairs linked raw UI rows once without changing ids, parts, or unknown metadata', async () => {
-    const rawParts = [{ type: 'text', text: 'raw visible text', state: 'done' }] as UIMessage['parts'];
-    const harness = createHarness({
-      messages: [
-        {
-          id: 'user-1',
-          role: 'user',
-          parts: rawParts,
-          metadata: {
-            piCoreMessageKey: '1234',
-            channelHistory: true,
-            unknown: { preserved: true },
-            pi: { createdAtMs: 1234 },
-          },
-        } as UIMessage,
-        {
-          id: 'assistant-1',
-          role: 'assistant',
-          parts: [{ type: 'text', text: 'answer', state: 'done' }],
-        } as UIMessage,
-      ],
-      piMessages: [
-        {
-          id: 'pi-user-1',
-          thread_id: 'thread-1',
-          role: 'user',
-          content: '[email message from Illiana Reed (illiana@example.com)]: model text',
-          created_at: 1234,
-          forkEntryId: '',
-        },
-      ],
-    });
-
-    await harness.mirror.healLegacyUiMessageAuthors();
-
-    expect(harness.persistRenderMessages).toHaveBeenCalledTimes(1);
-    const healed = harness.messages[0];
-    expect(healed.id).toBe('user-1');
-    expect(healed.parts).toBe(rawParts);
-    expect(healed.parts).toEqual([
-      { type: 'text', text: 'raw visible text', state: 'done' },
-    ]);
-    expect(healed.metadata).toEqual({
-      piCoreMessageKey: '1234',
-      channelHistory: true,
-      unknown: { preserved: true },
-      pi: { createdAtMs: 1234 },
-      authorDisplayName: 'Illiana Reed',
-      source: 'email',
-    });
-    expect(harness.recordChatThreadObservabilityEvent).toHaveBeenCalledWith(
-      'pi_ui_message_authors_healed',
-      {
-        operation: 'heal_legacy_ui_message_authors',
-        status: 'healed',
-        count: 1,
-      },
-    );
-    expect(harness.kvValues.get('uiMessagesAuthorAttributionHealV1')).toBe(true);
-
-    await harness.mirror.healLegacyUiMessageAuthors();
-    expect(harness.getPiCoreParsedMessages).toHaveBeenCalledTimes(1);
-    expect(harness.persistRenderMessages).toHaveBeenCalledTimes(1);
-  });
-
-  it('preserves independent source attribution without fabricating an author', async () => {
-    const harness = createHarness({
-      messages: [
-        uiUser('source-only', 'raw body', { piCoreMessageKey: '10' }),
-        uiUser('unmatched', 'other body', { piCoreMessageKey: '20' }),
-      ],
-      piMessages: [
-        {
-          id: 'pi-source-only',
-          thread_id: 'thread-1',
-          role: 'user',
-          content: '[email message]: canonical body',
-          created_at: 10,
-          forkEntryId: '',
-        },
-      ],
-    });
-
-    await harness.mirror.healLegacyUiMessageAuthors();
-
-    expect(harness.messages[0].metadata).toEqual({
-      piCoreMessageKey: '10',
-      source: 'email',
-    });
-    expect(
-      (harness.messages[0].metadata as Record<string, unknown>)
-        .authorDisplayName,
-    ).toBeUndefined();
-    expect(harness.messages[1].metadata).toEqual({ piCoreMessageKey: '20' });
-    expect(harness.kvValues.get('uiMessagesAuthorAttributionHealV1')).toBe(true);
-  });
-
-  it('uses exact render ids to disambiguate colliding Pi timestamps', async () => {
-    const harness = createHarness({
-      messages: [
-        uiUser('render-user-1', 'first raw body', { piCoreMessageKey: '10' }),
-        uiUser('render-user-2', 'second raw body', { piCoreMessageKey: '10' }),
-      ],
-      piMessages: [
-        {
-          id: 'pi-user-1',
-          thread_id: 'thread-1',
-          role: 'user',
-          content: '[web message from First User]: first canonical body',
-          created_at: 10,
-          forkEntryId: '',
-          renderMessageId: 'render-user-1',
-        },
-        {
-          id: 'pi-user-2',
-          thread_id: 'thread-1',
-          role: 'user',
-          content: '[slack message from Second User]: second canonical body',
-          created_at: 10,
-          forkEntryId: '',
-          renderMessageId: 'render-user-2',
-        },
-      ],
-    });
-
-    await harness.mirror.healLegacyUiMessageAuthors();
-
-    expect(harness.messages[0].metadata).toEqual({
-      piCoreMessageKey: '10',
-      authorDisplayName: 'First User',
-      source: 'web',
-    });
-    expect(harness.messages[1].metadata).toEqual({
-      piCoreMessageKey: '10',
-      authorDisplayName: 'Second User',
-      source: 'slack',
-    });
-  });
-
-  it('leaves timestamp collisions without render ids safely unstamped', async () => {
-    const harness = createHarness({
-      messages: [
-        uiUser('ambiguous-user-1', 'first raw body', { piCoreMessageKey: '10' }),
-        uiUser('ambiguous-user-2', 'second raw body', { piCoreMessageKey: '10' }),
-      ],
-      piMessages: [
-        {
-          id: 'pi-user-1',
-          thread_id: 'thread-1',
-          role: 'user',
-          content: '[web message from First User]: first canonical body',
-          created_at: 10,
-          forkEntryId: '',
-        },
-        {
-          id: 'pi-user-2',
-          thread_id: 'thread-1',
-          role: 'user',
-          content: '[web message from Second User]: second canonical body',
-          created_at: 10,
-          forkEntryId: '',
-        },
-      ],
-    });
-
-    await harness.mirror.healLegacyUiMessageAuthors();
-
-    expect(harness.persistRenderMessages).not.toHaveBeenCalled();
-    expect(harness.messages[0].metadata).toEqual({ piCoreMessageKey: '10' });
-    expect(harness.messages[1].metadata).toEqual({ piCoreMessageKey: '10' });
-    expect(harness.kvValues.get('uiMessagesAuthorAttributionHealV1')).toBe(true);
-  });
-
-  it('defers without marking during an active turn and retries when idle', async () => {
-    const harness = createHarness({
-      activeTurn: true,
-      messages: [uiUser('user-1', 'raw', { piCoreMessageKey: '1' })],
-      piMessages: [
-        {
-          id: 'pi-user-1',
-          thread_id: 'thread-1',
-          role: 'user',
-          content: '[web message from Illiana Reed]: canonical',
-          created_at: 1,
-          forkEntryId: '',
-        },
-      ],
-    });
-
-    await harness.mirror.healLegacyUiMessageAuthors();
-    expect(harness.kvValues.has('uiMessagesAuthorAttributionHealV1')).toBe(false);
-    expect(harness.getPiCoreParsedMessages).not.toHaveBeenCalled();
-
-    harness.setActiveTurn(false);
-    await harness.mirror.healLegacyUiMessageAuthors();
-    expect(harness.messages[0].metadata).toMatchObject({
-      authorDisplayName: 'Illiana Reed',
-      source: 'web',
-    });
-    expect(harness.kvValues.get('uiMessagesAuthorAttributionHealV1')).toBe(true);
-  });
 });
 
 describe('ChatThreadUiMirror salvage backfill', () => {

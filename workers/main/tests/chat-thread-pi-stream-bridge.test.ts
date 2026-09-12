@@ -245,83 +245,6 @@ describe('ChatThreadDO bounded render history', () => {
     });
   });
 
-  it('heals timestamps across durable pages before setting the one-shot marker', async () => {
-    const stub = await newChatThreadStub('thread-render-history-time-heal-pages');
-    await runInDurableObject(stub, async (instance: any) => {
-      instance.chatContext = { threadId: 'thread-render-history-time-heal-pages' };
-      await instance.persistMessages(
-        Array.from({ length: 60 }, (_, index) => ({
-          id: `legacy-time-${String(index).padStart(3, '0')}`,
-          role: 'assistant',
-          parts: [{ type: 'text', text: `answer ${index}`, state: 'done' }],
-        })),
-      );
-
-      await instance.healLegacyUiMessageTimes();
-
-      const rows = instance.ctx.storage.sql
-        .exec<{ message: string }>(
-          'SELECT message FROM cf_ai_chat_agent_messages ORDER BY chronology_key',
-        )
-        .toArray();
-      expect(rows).toHaveLength(60);
-      expect(
-        rows.every((row: { message: string }) => {
-          const message = JSON.parse(row.message) as AnyRecord;
-          return typeof (message.metadata as AnyRecord | undefined)?.pi === 'object'
-            && typeof ((message.metadata as AnyRecord).pi as AnyRecord).createdAtMs === 'number';
-        }),
-      ).toBe(true);
-      expect(instance.ctx.storage.kv.get('uiMessagesTimeHealDone')).toBe(true);
-    });
-  });
-
-  it('heals author attribution on rows older than the resident window', async () => {
-    const stub = await newChatThreadStub('thread-render-history-author-heal-pages');
-    await runInDurableObject(stub, async (instance: any) => {
-      instance.chatContext = {
-        threadId: 'thread-render-history-author-heal-pages',
-      };
-      instance.ensurePiCoreTables();
-      const messages = Array.from({ length: 60 }, (_, index) => {
-        const timestamp = 10_000 + index;
-        const id = `legacy-author-${String(index).padStart(3, '0')}`;
-        seedPiCoreRow(instance, index, {
-          role: 'user',
-          content: `[web message from User ${index}]: canonical`,
-          timestamp,
-          uiMetadata: { renderMessageId: id },
-        });
-        return {
-          id,
-          role: 'user',
-          parts: [{ type: 'text', text: `raw ${index}`, state: 'done' }],
-          metadata: {
-            piCoreMessageKey: String(timestamp),
-            pi: { createdAtMs: timestamp },
-          },
-        };
-      });
-      await instance.persistMessages(messages);
-
-      await instance.healLegacyUiMessageAuthors();
-
-      const oldest = instance.ctx.storage.sql
-        .exec<{ message: string }>(
-          'SELECT message FROM cf_ai_chat_agent_messages WHERE id = ?',
-          'legacy-author-000',
-        )
-        .one();
-      expect(JSON.parse(oldest.message).metadata).toMatchObject({
-        authorDisplayName: 'User 0',
-        source: 'web',
-      });
-      expect(
-        instance.ctx.storage.kv.get('uiMessagesAuthorAttributionHealV1'),
-      ).toBe(true);
-    });
-  });
-
   it('reports the total durable row count after a rebuild, not resident count', async () => {
     const stub = await newChatThreadStub('thread-render-history-resync-count');
     await runInDurableObject(stub, async (instance: any) => {
@@ -1182,49 +1105,6 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
     });
   });
 
-  it('heals legacy rows without time metadata from the created_at column', async () => {
-    const stub = await newChatThreadStub('thread-time-heal');
-    await runInDurableObject(stub, async (instance: any) => {
-      instance.chatContext = { threadId: 'thread-time-heal' };
-      instance.ensurePiCoreTables();
-      // A pre-stamp legacy assistant row (only forkEntryId, like rows persisted
-      // before the ai-chat streaming migration) plus an already-stamped one.
-      await instance.persistMessages([
-        {
-          id: 'legacy-1',
-          role: 'assistant',
-          parts: [{ type: 'text', text: 'old answer', state: 'done' }],
-          metadata: { pi: { forkEntryId: 'resp-old' } },
-        },
-        {
-          id: 'stamped-1',
-          role: 'assistant',
-          parts: [{ type: 'text', text: 'new answer', state: 'done' }],
-          metadata: { pi: { forkEntryId: 'resp-new', completedAtMs: 1751931600000 } },
-        },
-      ]);
-      instance.ctx.storage.sql.exec(
-        "UPDATE cf_ai_chat_agent_messages SET created_at = '2026-07-08 00:29:19.695' WHERE id = 'legacy-1'",
-      );
-      instance.reloadAiChatMessagesOrdered();
-
-      await instance.healLegacyUiMessageTimes();
-      const messages = await instance.getUiMessages();
-      const legacy = messages.find((m: AnyRecord) => m.id === 'legacy-1') as AnyRecord;
-      const pi = (legacy.metadata as AnyRecord).pi as AnyRecord;
-      expect(pi.createdAtMs).toBe(Date.parse('2026-07-08T00:29:19.695Z'));
-      expect(pi.forkEntryId).toBe('resp-old');
-      const stamped = messages.find((m: AnyRecord) => m.id === 'stamped-1') as AnyRecord;
-      expect((stamped.metadata as AnyRecord).pi).toEqual({
-        forkEntryId: 'resp-new',
-        completedAtMs: 1751931600000,
-      });
-      // One-shot: the marker is set and a later legacy-shaped row (mid-turn
-      // streaming rows legitimately lack metadata) is not re-healed.
-      expect(instance.ctx.storage.kv.get('uiMessagesTimeHealDone')).toBe(true);
-    });
-  });
-
   it('defers the time heal while a turn is in flight', async () => {
     const stub = await newChatThreadStub('thread-time-heal-gate');
     await runInDurableObject(stub, async (instance: any) => {
@@ -1589,7 +1469,7 @@ describe('ChatThreadDO onConnect render-history delivery', () => {
     fake.isThreadStreaming = vi.fn(() => false);
     fake.syncAgentState = vi.fn();
     fake.recordChatThreadObservabilityEvent = vi.fn();
-    fake.maybeGenerateChatGroupAvatarForThread = vi.fn(async () => {});
+    fake.threadMetadata.maybeGenerateChatGroupAvatarForThread = vi.fn(async () => {});
     fake.background = background;
     return fake;
   };
@@ -2240,8 +2120,6 @@ describe('ChatThreadDO stall-watchdog heartbeat', () => {
   });
 });
 
-
-
 describe('ChatThreadDO.abortTurnForAbsoluteTimeout', () => {
   it('surfaces a user-visible stop before going idle', async () => {
     const fake = Object.create(ChatThreadDO.prototype) as any;
@@ -2266,13 +2144,13 @@ describe('ChatThreadDO.abortTurnForAbsoluteTimeout', () => {
     fake.finishTurn = vi.fn();
     fake.syncAgentState = vi.fn();
     fake.pushChatEvent = vi.fn();
-    fake.piProviderErrorEvent = vi.fn((message: string) => ({
+    fake.chatErrors.piProviderErrorEvent = vi.fn((message: string) => ({
       type: 'error',
       error: message,
     }));
-    fake.updateActiveAutomationRun = vi.fn();
+    fake.automationRun.updateActiveAutomationRun = vi.fn();
     fake.recordChatThreadObservabilityEvent = vi.fn();
-    fake.stopStreamingLeaseHeartbeat = vi.fn();
+    fake.streamingActivity.stopStreamingLeaseHeartbeat = vi.fn();
 
     await ChatThreadDO.prototype['abortTurnForAbsoluteTimeout'].call(
       fake,
@@ -2424,14 +2302,12 @@ describe('ChatThreadDO stranded-marker healing on page open', () => {
     fake.captureChatContextFromRequest = vi.fn();
     fake.sweepOrphanedActiveTurnMarker = vi.fn(async () => {});
     fake.topUpUiMessagesFromPiCore = vi.fn(async () => {});
-    fake.healLegacyUiMessageTimes = vi.fn(async () => {});
-    fake.healLegacyUiMessageAuthors = vi.fn(async () => {});
     fake.messages = [];
     fake.isThreadStreaming = vi.fn(() => false);
     fake.currentTodos = [];
     fake.syncAgentState = vi.fn();
     fake.recordChatThreadObservabilityEvent = vi.fn();
-    fake.maybeGenerateChatGroupAvatarForThread = vi.fn(async () => {});
+    fake.threadMetadata.maybeGenerateChatGroupAvatarForThread = vi.fn(async () => {});
     const background: Promise<unknown>[] = [];
     fake.ctx = { waitUntil: vi.fn((promise: Promise<unknown>) => background.push(promise)) };
     const connection = { send: vi.fn(), close: vi.fn() };
@@ -2447,7 +2323,7 @@ describe('ChatThreadDO stranded-marker healing on page open', () => {
     await Promise.all(background);
     expect(fake.sweepOrphanedActiveTurnMarker).toHaveBeenCalledTimes(1);
     expect(fake.ctx.waitUntil).toHaveBeenCalledTimes(2);
-    expect(fake.maybeGenerateChatGroupAvatarForThread).toHaveBeenCalledWith('t1');
+    expect(fake.threadMetadata.maybeGenerateChatGroupAvatarForThread).toHaveBeenCalledWith('t1');
     // The sweep ran before the stale-todo/agent-state derivation read the marker.
     expect(
       fake.sweepOrphanedActiveTurnMarker.mock.invocationCallOrder[0],

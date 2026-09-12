@@ -704,7 +704,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     fake.piStreamWriter = null;
     fake.piPreAttachChunkBuffer = null;
     fake.ctx = { storage: { sql: {} } };
-    fake.recordCurrentThreadError = vi.fn();
+    fake.chatErrors.recordCurrentThreadError = vi.fn();
     fake.recordChatThreadObservabilityEvent = vi.fn();
     fake.syncAgentState = vi.fn();
     fake.broadcastChat = vi.fn();
@@ -895,13 +895,9 @@ describe('ChatThreadDO Pi turn handling', () => {
       },
     };
     fake.titleGenerationInFlight = false;
-    fake.generateThreadTitleFromMessage = vi.fn(async () => undefined);
+    fake.threadMetadata.generateThreadTitleFromMessage = vi.fn(async () => undefined);
 
-    await ChatThreadDO.prototype['updateThreadMetadataForUserMessage'].call(
-      fake,
-      attributedMessage,
-      'web',
-    );
+    await fake.threadMetadata.updateThreadMetadataForUserMessage(attributedMessage, 'web');
 
     expect(orgStub.recordThreadUserMessage).toHaveBeenCalledWith(
       'thread1',
@@ -913,7 +909,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       'thread1',
       longMessage,
     );
-    expect(fake.generateThreadTitleFromMessage).toHaveBeenCalledWith(
+    expect(fake.threadMetadata.generateThreadTitleFromMessage).toHaveBeenCalledWith(
       'thread1',
       longMessage.slice(0, 500),
     );
@@ -952,16 +948,12 @@ describe('ChatThreadDO Pi turn handling', () => {
       },
     };
     fake.titleGenerationInFlight = false;
-    fake.generateThreadTitleFromMessage = vi.fn(async () => undefined);
+    fake.threadMetadata.generateThreadTitleFromMessage = vi.fn(async () => undefined);
 
-    await ChatThreadDO.prototype['updateThreadMetadataForUserMessage'].call(
-      fake,
-      userMessage,
-      'web',
-    );
+    await fake.threadMetadata.updateThreadMetadataForUserMessage(userMessage, 'web');
 
     expect(orgStub.setThreadFirstUserMessage).not.toHaveBeenCalled();
-    expect(fake.generateThreadTitleFromMessage).toHaveBeenCalledWith(
+    expect(fake.threadMetadata.generateThreadTitleFromMessage).toHaveBeenCalledWith(
       'thread1',
       userMessage,
     );
@@ -1086,7 +1078,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     fake.ensurePiSessionReady = vi.fn(async () => undefined);
     fake.readPiActiveTurn = vi.fn(() => null);
     fake.applyMentionsForTurn = vi.fn(async (content: string) => content);
-    fake.updateThreadMetadataForUserMessage = vi.fn(async () => {});
+    fake.threadMetadata.updateThreadMetadataForUserMessage = vi.fn(async () => {});
     fake.warmWorkspaceContainerForTurn = vi.fn(async () => undefined);
     const persisted: any[] = [];
     fake.appendPiCoreMessagesIfMissing = vi.fn(async (messages: any[]) => {
@@ -1166,12 +1158,12 @@ describe('ChatThreadDO Pi turn handling', () => {
     fake.finishTurn = vi.fn();
     fake.syncAgentState = vi.fn();
     fake.broadcastRunnerClients = vi.fn();
-    fake.publishRunningUserMessageActivity = vi.fn();
-    fake.updateActiveAutomationRun = vi.fn();
+    fake.streamingActivity.publishRunningUserMessageActivity = vi.fn();
+    fake.automationRun.updateActiveAutomationRun = vi.fn();
     fake.ensurePiSessionReady = vi.fn(async () => undefined);
     fake.readPiActiveTurn = vi.fn(() => null);
     fake.applyMentionsForTurn = vi.fn(async (content: string) => content);
-    fake.updateThreadMetadataForUserMessage = vi.fn(async () => {});
+    fake.threadMetadata.updateThreadMetadataForUserMessage = vi.fn(async () => {});
     fake.warmWorkspaceContainerForTurn = vi.fn(async () => undefined);
     fake.appendPiCoreMessagesIfMissing = vi.fn(async () => {
       order.push('persist');
@@ -1544,7 +1536,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       waitUntil: vi.fn(),
     };
     fake.recordChatThreadObservabilityEvent = vi.fn();
-    fake.setActiveAutomationRun = vi.fn();
+    fake.automationRun.setActiveAutomationRun = vi.fn();
     fake.pushChatEvent = vi.fn((event: any) => events.push(event));
     fake.enqueueRunnerUserMessage = vi.fn(async () => {
       throw error;
@@ -1588,7 +1580,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       waitUntil: vi.fn(),
     };
     fake.recordChatThreadObservabilityEvent = vi.fn();
-    fake.setActiveAutomationRun = vi.fn();
+    fake.automationRun.setActiveAutomationRun = vi.fn();
     fake.enqueueRunnerUserMessage = vi.fn(async () => ({ status: 'accepted' }));
 
     const result = await ChatThreadDO.prototype.startInitialUserMessage.call(fake, {
@@ -1608,7 +1600,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       status: 'busy',
       error: 'Thread is busy with another run',
     });
-    expect(fake.setActiveAutomationRun).not.toHaveBeenCalled();
+    expect(fake.automationRun.setActiveAutomationRun).not.toHaveBeenCalled();
     expect(fake.enqueueRunnerUserMessage).not.toHaveBeenCalled();
     expect(fake.activeAutomationRun).toBe(activeAutomationRun);
   });
@@ -1700,11 +1692,11 @@ describe('ChatThreadDO Pi turn handling', () => {
     fake.markTurnStarted = vi.fn();
     fake.finishTurn = vi.fn();
     fake.syncAgentState = vi.fn();
-    fake.publishRunningUserMessageActivity = vi.fn();
+    fake.streamingActivity.publishRunningUserMessageActivity = vi.fn();
     fake.broadcastRunnerClients = vi.fn();
     fake.ensurePiSessionReady = vi.fn(async () => undefined);
     fake.applyMentionsForTurn = vi.fn(async (content: string) => content);
-    fake.updateThreadMetadataForUserMessage = vi.fn(async () => {});
+    fake.threadMetadata.updateThreadMetadataForUserMessage = vi.fn(async () => {});
     fake.warmWorkspaceContainerForTurn = vi.fn(async () => undefined);
     fake.sendRunnerCommand = vi.fn((command: any) => {
       sentCommands.push(command);
@@ -1720,7 +1712,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(result).toEqual({ status: 'accepted' });
     expect(fake.ensurePiSessionReady).not.toHaveBeenCalled();
     expect(fake.syncAgentState).toHaveBeenCalled();
-    expect(fake.publishRunningUserMessageActivity).toHaveBeenCalledWith(
+    expect(fake.streamingActivity.publishRunningUserMessageActivity).toHaveBeenCalledWith(
       'please also add tests',
     );
     expect(sentCommands).toHaveLength(1);
@@ -1808,7 +1800,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     fake.markTurnStarted = vi.fn();
     fake.finishTurn = vi.fn();
     fake.setActiveTurnUserId = vi.fn();
-    fake.updateActiveAutomationRun = vi.fn();
+    fake.automationRun.updateActiveAutomationRun = vi.fn();
 
     await expect(ChatThreadDO.prototype['handleClientUserMessage'].call(fake, {
       content: 'hello',
@@ -1818,7 +1810,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       error: 'connection dropped',
     });
 
-    expect(fake.updateActiveAutomationRun).toHaveBeenCalledWith({
+    expect(fake.automationRun.updateActiveAutomationRun).toHaveBeenCalledWith({
       status: 'error',
       message: 'connection dropped',
       clear: true,
@@ -1872,7 +1864,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     };
     fake.retryChatDurableObjectRpc = vi.fn((_name: string, fn: () => Promise<unknown>) => fn());
 
-    ChatThreadDO.prototype['recordCurrentThreadError'].call(fake, {
+    fake.chatErrors.recordCurrentThreadError({
       message: 'Hosted model credit limit reached',
       source: 'runner_send',
       provider: 'openai',
@@ -1921,7 +1913,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     fake.markTurnStarted = vi.fn();
     fake.finishTurn = vi.fn();
     fake.setActiveTurnUserId = vi.fn();
-    fake.updateActiveAutomationRun = vi.fn();
+    fake.automationRun.updateActiveAutomationRun = vi.fn();
 
     const first = ChatThreadDO.prototype['handleClientUserMessage'].call(fake, {
       content: 'hello',
@@ -1994,33 +1986,33 @@ describe('ChatThreadDO Pi turn handling', () => {
 
     // Never authorized: no grant.
     expect(
-      ChatThreadDO.prototype['isPreviouslyAuthorizedChatUser'].call(fake, 'user-1'),
+      fake.chatAccess.isPreviouslyAuthorizedChatUser('user-1'),
     ).toBe(false);
 
     // Fresh full auth grants degraded access.
-    ChatThreadDO.prototype['recordAuthorizedChatUser'].call(fake, 'user-1');
+    fake.chatAccess.recordAuthorizedChatUser('user-1');
     expect(
-      ChatThreadDO.prototype['isPreviouslyAuthorizedChatUser'].call(fake, 'user-1'),
+      fake.chatAccess.isPreviouslyAuthorizedChatUser('user-1'),
     ).toBe(true);
 
     // Grants expire after the TTL window.
     store = { 'user-1': Date.now() - 25 * 60 * 60 * 1000 };
     expect(
-      ChatThreadDO.prototype['isPreviouslyAuthorizedChatUser'].call(fake, 'user-1'),
+      fake.chatAccess.isPreviouslyAuthorizedChatUser('user-1'),
     ).toBe(false);
 
     // Legacy bare-id list format grants nothing.
     store = ['user-1'];
     expect(
-      ChatThreadDO.prototype['isPreviouslyAuthorizedChatUser'].call(fake, 'user-1'),
+      fake.chatAccess.isPreviouslyAuthorizedChatUser('user-1'),
     ).toBe(false);
 
     // Recording prunes expired grants from the stored map.
     store = { 'user-stale': Date.now() - 25 * 60 * 60 * 1000 };
-    ChatThreadDO.prototype['recordAuthorizedChatUser'].call(fake, 'user-2');
+    fake.chatAccess.recordAuthorizedChatUser('user-2');
     expect(store).not.toHaveProperty('user-stale');
     expect(
-      ChatThreadDO.prototype['isPreviouslyAuthorizedChatUser'].call(fake, 'user-2'),
+      fake.chatAccess.isPreviouslyAuthorizedChatUser('user-2'),
     ).toBe(true);
   });
 
@@ -2046,8 +2038,8 @@ describe('ChatThreadDO Pi turn handling', () => {
     fake.applyMentionsForTurn = vi.fn(async (content: string) => content);
     fake.readPiActiveTurn = vi.fn(() => null);
     fake.setActiveTurnUserId = vi.fn();
-    fake.publishRunningUserMessageActivity = vi.fn();
-    fake.updateThreadMetadataForUserMessage = vi.fn(async () => {});
+    fake.streamingActivity.publishRunningUserMessageActivity = vi.fn();
+    fake.threadMetadata.updateThreadMetadataForUserMessage = vi.fn(async () => {});
     fake.sendRunnerCommand = vi.fn(() => true);
     fake.syncAgentState = vi.fn();
     fake.ctx = { waitUntil: vi.fn() };
@@ -4666,11 +4658,11 @@ describe('ChatThreadDO Pi turn handling', () => {
 
   it('disposes the hung Pi session and preserves the marker for recovery when the reply stream stalls', async () => {
     const { fake, events } = createPiEventFake();
-    fake.updateActiveAutomationRun = vi.fn();
+    fake.automationRun.updateActiveAutomationRun = vi.fn();
     fake.refreshPiSessionModel = vi.fn(async () => undefined);
     fake.syncAgentState = vi.fn();
     fake.recordChatThreadObservabilityEvent = vi.fn();
-    fake.piProviderErrorEvent = vi.fn((m: string) => ({ type: 'error', error: m }));
+    fake.chatErrors.piProviderErrorEvent = vi.fn((m: string) => ({ type: 'error', error: m }));
     // A stalled owner prompt no longer runs a bespoke timeout: ai-chat's
     // chatStreamStallTimeoutMs watchdog cancels the reply stream, and onChatMessage's
     // response wrapper disposes the hung session. Because disposePiSession()
@@ -5501,7 +5493,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       runId: 'run1',
       requiresExplicitOutcome: true,
     };
-    fake.setActiveAutomationRun = vi.fn((value) => {
+    fake.automationRun.setActiveAutomationRun = vi.fn((value) => {
       fake.activeAutomationRun = value;
     });
     const context = {
@@ -5517,7 +5509,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       status: 'success',
       summary: '  Export and readback verified.  ',
     });
-    expect(fake.setActiveAutomationRun).toHaveBeenCalledWith({
+    expect(fake.automationRun.setActiveAutomationRun).toHaveBeenCalledWith({
       ...fake.activeAutomationRun,
       reportedOutcome: {
         status: 'success',
@@ -11250,9 +11242,9 @@ describe('ChatThreadDO Pi turn handling', () => {
     fake.finishTurn = vi.fn();
     fake.setActiveTurnUserId = vi.fn();
     fake.syncAgentState = vi.fn();
-    fake.updateActiveAutomationRun = vi.fn();
+    fake.automationRun.updateActiveAutomationRun = vi.fn();
     fake.pushChatEvent = vi.fn();
-    fake.piProviderErrorEvent = vi.fn((message: string) => ({ type: 'error', message }));
+    fake.chatErrors.piProviderErrorEvent = vi.fn((message: string) => ({ type: 'error', message }));
     fake.appendPiCoreMessagesIfMissing = vi.fn();
     fake.attachCodeModeArtifactsToToolResult = vi.fn(async (message: any) => message);
     fake.extractLatestPiAssistantText = vi.fn(() => 'final reply');
@@ -11377,7 +11369,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(fake.pushChatEvent).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'error', message: 'Provider exploded' }),
     );
-    expect(fake.updateActiveAutomationRun).toHaveBeenCalledWith(
+    expect(fake.automationRun.updateActiveAutomationRun).toHaveBeenCalledWith(
       expect.objectContaining({ status: 'error', clear: true }),
     );
     expect(fake.finishTurn).toHaveBeenCalled();
@@ -11419,7 +11411,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(fake.clearPiActiveTurnAndJournal).toHaveBeenCalled();
     expect(fake.finishTurn).toHaveBeenCalled();
     expect(fake.setActiveTurnUserId).toHaveBeenCalledWith(null);
-    expect(fake.updateActiveAutomationRun).toHaveBeenCalledWith(
+    expect(fake.automationRun.updateActiveAutomationRun).toHaveBeenCalledWith(
       expect.objectContaining({ status: 'error', clear: true }),
     );
     expect(fake.pushChatEvent).toHaveBeenCalledWith(
@@ -11528,7 +11520,7 @@ describe('ChatThreadDO Pi turn handling', () => {
         }),
       );
       // Same teardown as handlePiRecoveryExhausted.
-      expect(fake.updateActiveAutomationRun).toHaveBeenCalledWith(
+      expect(fake.automationRun.updateActiveAutomationRun).toHaveBeenCalledWith(
         expect.objectContaining({ status: 'error', clear: true }),
       );
       expect(fake.pushChatEvent).toHaveBeenCalledWith(
@@ -12315,7 +12307,7 @@ describe('ChatThreadDO Pi turn handling', () => {
         expect(fake.pushChatEvent).toHaveBeenCalledWith(
           expect.objectContaining({ type: 'result' }),
         );
-        expect(fake.updateActiveAutomationRun).toHaveBeenCalledWith(
+        expect(fake.automationRun.updateActiveAutomationRun).toHaveBeenCalledWith(
           expect.objectContaining({
             status: 'error',
             message: expect.stringContaining('interrupted'),
@@ -12889,7 +12881,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       fake.createPiUserStopMessage = vi.fn(() => stopMessage);
       fake.pushPiRuntimeEvent = vi.fn();
       fake.pushChatEvent = vi.fn((event: any) => events.push(event));
-      fake.updateActiveAutomationRun = vi.fn();
+      fake.automationRun.updateActiveAutomationRun = vi.fn();
       fake.finishTurn = vi.fn();
       fake.setActiveTurnUserId = vi.fn();
       fake.completeTodoStateForTurnEnd = vi.fn();
@@ -13970,7 +13962,7 @@ describe('ChatThreadDO Pi turn handling', () => {
 
   it('emits and persists a final stopped-by-user Pi message after a user stop', async () => {
     const { fake, events } = createPiEventFake();
-    fake.updateActiveAutomationRun = vi.fn();
+    fake.automationRun.updateActiveAutomationRun = vi.fn();
     const inFlight = [
       { role: 'user', content: 'build it', timestamp: 100 },
       {
@@ -14057,7 +14049,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       result: 'Stopped by user',
     }));
     expect(events.some((event) => event.type === 'error')).toBe(false);
-    expect(fake.updateActiveAutomationRun).toHaveBeenCalledWith({
+    expect(fake.automationRun.updateActiveAutomationRun).toHaveBeenCalledWith({
       status: 'error',
       message: 'Stopped by user',
       completedAt: expect.any(Number),
@@ -14078,7 +14070,7 @@ describe('ChatThreadDO Pi turn handling', () => {
 
   it('preserves js_exec artifact metadata when persisting a stopped Pi turn', async () => {
     const { fake } = createPiEventFake();
-    fake.updateActiveAutomationRun = vi.fn();
+    fake.automationRun.updateActiveAutomationRun = vi.fn();
     const artifact = {
       id: 'artifact_1',
       kind: 'outbound_email',
@@ -14332,15 +14324,13 @@ describe('ChatThreadDO Pi turn handling', () => {
       storage: { kv: { put: vi.fn() } },
       waitUntil: vi.fn((promise: Promise<unknown>) => background.push(promise)),
     };
-    fake.maybeGenerateChatGroupAvatarForThread = vi.fn(async () => undefined);
+    fake.threadMetadata.maybeGenerateChatGroupAvatarForThread = vi.fn(async () => undefined);
     fake.messages = [];
     fake.chatIsStreaming = false;
     fake.currentTodos = [{ content: 'Old task', status: 'in_progress' }];
     fake.syncAgentState = vi.fn();
     fake.sweepOrphanedActiveTurnMarker = vi.fn(async () => {});
     fake.topUpUiMessagesFromPiCore = vi.fn(async () => {});
-    fake.healLegacyUiMessageTimes = vi.fn(async () => {});
-    fake.healLegacyUiMessageAuthors = vi.fn(async () => {});
     fake.recordChatThreadObservabilityEvent = vi.fn();
     // Mirror the real method: it clears the todos and syncs an override marking
     // them completed.
@@ -15589,7 +15579,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       fake.agentEvalEventCollector = null;
       fake.activePiStreamTurnId = 'turn-1';
       fake.ctx = { storage: { sql: {} } };
-      fake.recordCurrentThreadError = vi.fn();
+      fake.chatErrors.recordCurrentThreadError = vi.fn();
       fake.syncAgentState = vi.fn();
       fake.piChunkEncoder = new PiChunkEncoder({ messageId: 'turn-1' });
       fake.piStreamWriter = { write: (chunk: any) => writes.push(chunk) };

@@ -71,21 +71,9 @@ export const ALLOWLIST = {
       why: "1 declaration + the public RPC wrapper that is its only caller.",
     },
     getPiCoreParsedMessages: {
-      count: 4,
-      why:
-        "1 RPC declaration; agentEvalResult (eval harness, off the user path); and the " +
-        "uiMirror dep wiring, which names the " +
-        "identifier twice on one line (key + delegate) and whose only remaining consumer is " +
-        "the one-shot legacy author heal.",
-    },
-  },
-  "workers/main/src/chat-thread/ui-mirror.ts": {
-    getPiCoreParsedMessages: {
       count: 2,
       why:
-        "1 dep type; healLegacyUiMessageAuthors, a one-shot gated migration for rows written " +
-        "before author metadata existed. Delete both when that heal is retired — the top-up " +
-        "itself reads ranges now (stage 2b).",
+        "1 RPC declaration; agentEvalResult (eval harness, off the user path).",
     },
   },
   "workers/main/src/routes/admin-mcp.ts": {

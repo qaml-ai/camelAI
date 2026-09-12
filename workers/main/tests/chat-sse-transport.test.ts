@@ -601,7 +601,7 @@ describe('ChatThreadDO POST /call', () => {
     const stub = threadStub(threadId);
     await runInDurableObject(stub, async (instance: any) => {
       seedChatContext(instance, threadId);
-      instance.recordAcceptedClientMessageId('client-msg-1');
+      instance.chatAccess.recordAcceptedClientMessageId('client-msg-1');
       instance.enqueueRunnerUserMessage = () => {
         throw new Error('must not enqueue a duplicate send');
       };

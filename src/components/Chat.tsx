@@ -1306,6 +1306,7 @@ export default function Chat({
   };
 
   const prevInitialUiMessagesRef = useRef(stableInitialUiMessages);
+  const awaitingInitialHistoryRef = useRef(isLoadingMessages);
   const prevInitialTodosRef = useRef(initialTodos);
   const hasSyncedInitialPreviewRef = useRef(false);
   const previousPreviewThreadIdRef = useRef(threadId);
@@ -1328,6 +1329,9 @@ export default function Chat({
   // The hook owns history once it has any, so we never clobber a live turn or
   // overwrite a populated transcript with an empty loader result.
   useEffect(() => {
+    const resolvedInitialHistory =
+      awaitingInitialHistoryRef.current && !isLoadingMessages;
+    if (!isLoadingMessages) awaitingInitialHistoryRef.current = false;
     if (stableInitialUiMessages === prevInitialUiMessagesRef.current) return;
     prevInitialUiMessagesRef.current = stableInitialUiMessages;
     if (readOnly) return;
@@ -1336,10 +1340,24 @@ export default function Chat({
     if (stableInitialUiMessages.length === 0 && currentUiMessages.length > 0) {
       return;
     }
+    // The deferred initial read can finish after the first live turn. Once
+    // streaming stops, the busy guard above no longer protects its response.
+    // Reject an initial snapshot that omits an assistant already delivered by
+    // the connection; subsequent revalidations still recover missed history.
+    if (resolvedInitialHistory) {
+      const snapshotIds = new Set(stableInitialUiMessages.map(({ id }) => id));
+      if (
+        currentUiMessages.some(
+          ({ id, role }) => role === "assistant" && !snapshotIds.has(id),
+        )
+      ) {
+        return;
+      }
+    }
     if (uiMessagesEquivalent(currentUiMessages, stableInitialUiMessages))
       return;
     piChatRef.current.setUiMessages(stableInitialUiMessages);
-  }, [stableInitialUiMessages, readOnly]);
+  }, [stableInitialUiMessages, readOnly, isLoadingMessages]);
 
   // Drop optimistic pending bubbles once their persisted skeleton has echoed
   // back through the hook (matched by id / clientMessageId), so the local list

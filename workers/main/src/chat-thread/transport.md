@@ -15,7 +15,10 @@ wakes on activity. A newly mounted view tries WebSocket again.
 Polling uses the same authenticated route as legacy SSE:
 `GET /agents/chat-thread/:id/sse?transport=poll&_pk=...&cursor=...`. Each response
 is completed JSON containing protocol frames and a cursor. Visible tabs poll
-every second; hidden tabs every five seconds. The next request acknowledges the
+every 250 ms during an active turn and every second while idle; hidden tabs
+poll every five seconds. A successful RPC or resume POST expedites the next
+scheduled poll without overlapping an in-flight request or bypassing receive-error
+backoff. Intervals begin after the preceding response finishes. The next request acknowledges the
 previous batch, so a lost HTTP response can be retried without dropping frames.
 The server retains one connection across polls and runs the same wrapped SDK
 connect/message/close and resume chains. Polling sends use `POST /call`.

@@ -26,6 +26,7 @@ import { useVersionSkewWatch } from "@/hooks/use-version-skew-watch";
 import { maxThreadStatus } from "@/lib/thread-status";
 import { isPlaceholderThreadTitle } from "@/lib/thread-title";
 import { writePinnedGroupCountHint } from "@/lib/pinned-groups-cookie";
+import { markThreadViewed } from "@/lib/mark-thread-viewed.client";
 import {
   ChatGroupsContext,
 } from "@/hooks/chat-groups-context";
@@ -1549,9 +1550,7 @@ export function ChatGroupsProvider({
         markViewedEnabled &&
         shouldMarkActiveIdleThreadViewed(status, threadId, activeThreadIdRef.current)
       ) {
-        void fetch(`/api/threads/${encodeURIComponent(threadId)}/mark-viewed`, {
-          method: "POST",
-        }).catch(() => {});
+        void markThreadViewed(threadId);
       }
 
       setLocalThreadStatuses((current) => {
@@ -1660,9 +1659,7 @@ export function ChatGroupsProvider({
     };
     const markActiveThreadViewed = (threadId: string) => {
       if (!markViewedEnabled) return;
-      void fetch(`/api/threads/${encodeURIComponent(threadId)}/mark-viewed`, {
-        method: "POST",
-      }).catch(() => {});
+      void markThreadViewed(threadId);
     };
 
     const handleStatusMessage = (data: string) => {

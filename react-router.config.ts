@@ -7,6 +7,9 @@ export default {
   // App directory contains routes
   appDirectory: 'src',
 
+  // Avoid a route-discovery round trip before opening a new thread.
+  routeDiscovery: { mode: 'initial' },
+
   // Enable Vite environment API for proper Cloudflare Workers SSR
   future: {
     v8_viteEnvironmentApi: true,

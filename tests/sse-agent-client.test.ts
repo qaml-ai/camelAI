@@ -165,4 +165,81 @@ describe('chat WebSocket client with HTTP polling fallback', () => {
     controller.abort(); socket().frame({ type: 'probe' });
     expect(listener).toHaveBeenCalledOnce();
   });
+
+  it('polls active turns every 250ms and returns to idle cadence on completion', async () => {
+    client.start(); socket().fail(); await flush();
+    sink.send(JSON.stringify({ type: 'cf_agent_use_chat_response', id: 'turn-1', body: '{"type":"start"}', done: false }));
+    await vi.advanceTimersByTimeAsync(1_000);
+    sink.send(JSON.stringify({ type: 'cf_agent_use_chat_response', id: 'turn-1', body: '{"type":"text-delta","id":"text","delta":"Hello"}', done: false }));
+    await vi.advanceTimersByTimeAsync(249);
+    expect(messages).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(messages).toHaveLength(2);
+    sink.send(JSON.stringify({ type: 'cf_agent_use_chat_response', id: 'turn-1', body: '', done: true }));
+    await vi.advanceTimersByTimeAsync(250);
+    expect(messages).toHaveLength(3);
+    const count = polls.length;
+    await vi.advanceTimersByTimeAsync(999);
+    expect(polls).toHaveLength(count);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(polls).toHaveLength(count + 1);
+  });
+
+  it.each(['rpc', 'resume'])('polls immediately after a successful %s POST', async kind => {
+    client.start(); socket().fail(); await flush();
+    sink.send(JSON.stringify({ type: 'cf_agent_chat_messages', messages: [] }));
+    if (kind === 'rpc') await client.call('sendMessage', ['hello']);
+    else client.send(JSON.stringify({ type: 'cf_agent_stream_resume_ack', id: 'turn-1' }));
+    await flush();
+    expect(polls).toHaveLength(2);
+    expect(messages).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(polls).toHaveLength(3); // The old timer was replaced, not duplicated.
+  });
+
+  it('does not overlap an in-flight poll when a POST completes', async () => {
+    client.start(); socket().fail(); await flush();
+    const originalFetch = globalThis.fetch;
+    let finishPoll!: () => void;
+    const pendingPoll = new Promise<void>(resolve => { finishPoll = resolve; });
+    const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method !== 'POST') await pendingPoll;
+      return originalFetch(input, init);
+    });
+    vi.stubGlobal('fetch', fetch);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await client.call('sendMessage', ['hello']);
+    expect(fetch.mock.calls.filter(([, init]) => init?.method !== 'POST')).toHaveLength(1);
+    finishPoll(); await flush();
+    expect(polls).toHaveLength(2);
+    client.close();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(polls).toHaveLength(2);
+  });
+
+  it('keeps hidden-tab polling slow even during an active turn', async () => {
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    try {
+      sink.send(JSON.stringify({ type: 'cf_agent_stream_resuming', id: 'turn-1' }));
+      client.start(); socket().fail(); await flush();
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(polls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(polls).toHaveLength(2);
+    } finally {
+      visibility.mockRestore();
+    }
+  });
+
+  it('does not bypass receive-error backoff after a successful POST', async () => {
+    client.start(); socket().fail(); await flush();
+    loseResponse = true;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(polls).toHaveLength(2);
+    await client.call('sendMessage', ['hello']);
+    await vi.advanceTimersByTimeAsync(3_999);
+    expect(polls).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(polls).toHaveLength(3);
+  });
 });

@@ -26,6 +26,7 @@ const RECONNECT_BACKOFF_FACTOR = 1.3;
 const RECONNECT_JITTER_RATIO = 0.2;
 const POLL_REQUEST_TIMEOUT_MS = 20_000;
 export const POLL_INTERVAL_MS = 1_000;
+const POLL_ACTIVE_INTERVAL_MS = 250;
 const POLL_HIDDEN_INTERVAL_MS = 5_000;
 export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 /**
@@ -211,6 +212,8 @@ export class SseAgentClient<State = unknown> {
   private attempt = 0;
   private abortController: AbortController | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private scheduledPoll: (() => void) | null = null;
+  private pollTurnActive = false;
   private idleReattachTimer: ReturnType<typeof setTimeout> | null = null;
   private lastStreamOpenAt = 0;
   private repeatIdleParks = 0;
@@ -418,6 +421,7 @@ export class SseAgentClient<State = unknown> {
 
   private startGeneration(): void {
     const generation = (this.generation += 1);
+    this.pollTurnActive = false;
     this.clearIdleReattachTimer();
     this.closeSocket();
     const previous = this.abortController;
@@ -505,11 +509,24 @@ export class SseAgentClient<State = unknown> {
     }
     if (this.isStale(generation)) return;
     const interval = typeof document !== "undefined" && document.visibilityState === "hidden"
-      ? POLL_HIDDEN_INTERVAL_MS : POLL_INTERVAL_MS;
-    this.reconnectTimer = setTimeout(() => {
+      ? POLL_HIDDEN_INTERVAL_MS
+      : this.pollTurnActive ? POLL_ACTIVE_INTERVAL_MS : POLL_INTERVAL_MS;
+    const poll = () => {
       this.reconnectTimer = null;
+      this.scheduledPoll = null;
       void this.runPoll(generation, nextCursor, nextFailures);
-    }, nextFailures ? MIN_RECONNECT_DELAY_MS * 2 ** nextFailures : interval);
+    };
+    // Only a healthy, scheduled poll can be expedited by an accepted POST.
+    // An in-flight request owns its cursor, and failures retain their backoff.
+    this.scheduledPoll = nextFailures ? null : poll;
+    this.reconnectTimer = setTimeout(poll, nextFailures ? MIN_RECONNECT_DELAY_MS * 2 ** nextFailures : interval);
+  }
+
+  private expediteScheduledPoll(): void {
+    const poll = this.scheduledPoll;
+    if (!poll) return;
+    this.clearReconnectTimer();
+    poll();
   }
 
   private closeSocket(): void {
@@ -614,6 +631,14 @@ export class SseAgentClient<State = unknown> {
     this.dispatch("message", event);
     const frame = parseFrame(payload);
     const type = typeof frame?.type === "string" ? frame.type : null;
+    // Track activity for polling cadence; the SDK owns message reconciliation.
+    if (type === "cf_agent_use_chat_response") {
+      this.pollTurnActive = frame?.done !== true;
+    } else if (type === "cf_agent_stream_resuming" || type === "cf_agent_stream_pending") {
+      this.pollTurnActive = true;
+    } else if (type === "cf_agent_chat_clear" || (type === "cf_agent_stream_resume_none" && frame?.reason === "idle")) {
+      this.pollTurnActive = false;
+    }
     if (frame && type && this.interceptFrame(type, frame)) return;
     this.safeInvoke("message", () => this.options.onMessage?.(event));
   }
@@ -704,7 +729,10 @@ export class SseAgentClient<State = unknown> {
         return;
       }
       const response = await this.postFrame(frame.body);
-      if (response.ok || response.status === 204) return;
+      if (response.ok) {
+        this.expediteScheduledPoll();
+        return;
+      }
       const status = response.status;
       if (status === 409) {
         // The stream shim is gone: reattach, then replay the frame once.
@@ -794,6 +822,7 @@ export class SseAgentClient<State = unknown> {
           return;
         }
         this.applyRpcFrame(frame, pending);
+        if (frame.success !== false) this.expediteScheduledPoll();
         return;
       }
       const status = response.status;
@@ -931,6 +960,7 @@ export class SseAgentClient<State = unknown> {
   }
 
   private clearReconnectTimer(): void {
+    this.scheduledPoll = null;
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

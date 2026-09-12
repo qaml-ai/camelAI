@@ -20,6 +20,7 @@ import {
 } from "@/lib/cookies.server";
 import type { MentionableProject } from "@/lib/mentions";
 import { resolveDisplayChatData } from "@/lib/chat-thread-display";
+import { markThreadViewed } from "@/lib/mark-thread-viewed.client";
 import { loadWorkspaceMentionSources } from "@/lib/mention-sources.server";
 import { getEnv } from "@/lib/cloudflare.server";
 import { getAppUrlContext } from "@/lib/app-url.server";
@@ -1123,16 +1124,7 @@ export default function ChatPage() {
     if (!markViewedEnabled || readOnly || !workspaceId || !displayThreadId) return;
 
     markThreadIdleRef.current(displayThreadId);
-    const controller = new AbortController();
-    void fetch(
-      `/api/threads/${encodeURIComponent(displayThreadId)}/mark-viewed`,
-      { method: "POST", signal: controller.signal },
-    )
-      .catch((error) => {
-        if (error instanceof DOMException && error.name === "AbortError") return;
-        console.warn("Failed to mark active chat viewed:", error);
-      });
-    return () => controller.abort();
+    void markThreadViewed(displayThreadId);
   }, [
     displayThreadId,
     markViewedEnabled,

@@ -2229,7 +2229,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(fake.piCurrentUsageProvider).toBe('openrouter');
   });
 
-  it('routes the persisted camelCode id to Luna through AI Gateway OpenRouter', async () => {
+  it('routes the persisted camelCode id to Luna through the AI Gateway fallback route', async () => {
     const fake = Object.create(ChatThreadDO.prototype) as any;
     fake.env = {
       CF_ACCOUNT_ID: 'acct_1',
@@ -2266,10 +2266,11 @@ describe('ChatThreadDO Pi turn handling', () => {
 
     expect(getModel).toHaveBeenCalledWith('openai', 'gpt-5.6-luna');
     expect(model.model).toMatchObject({
-      id: 'openai/gpt-5.6-luna',
+      id: 'dynamic/luna-muse-fallback',
       provider: 'cloudflare-ai-gateway',
-      api: 'openai-responses',
-      baseUrl: 'https://gateway.ai.cloudflare.com/v1/acct_1/gateway_1/openrouter',
+      // Dynamic routes are served only by /compat/chat/completions.
+      api: 'openai-completions',
+      baseUrl: 'https://gateway.ai.cloudflare.com/v1/acct_1/gateway_1/compat',
       input: ['text', 'image'],
     });
     expect(model.model.headers).not.toHaveProperty('x-sticky-key');
@@ -2283,7 +2284,9 @@ describe('ChatThreadDO Pi turn handling', () => {
       'deepseek-v4-auto',
     );
     expect(fake.resolveCurrentByokCredentials).not.toHaveBeenCalled();
-    expect(fake.piCurrentUsageProvider).toBe('openrouter');
+    // Usage is now attributed to the gateway route rather than OpenRouter
+    // directly, matching the other hosted dynamic-route tiers.
+    expect(fake.piCurrentUsageProvider).toBe('compat');
   });
 
   it('falls back to camelCode when hosted credits are exhausted', async () => {
@@ -2339,7 +2342,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       billingSource: 'hosted',
       creditChargeable: false,
       model: {
-        id: 'openai/gpt-5.6-luna',
+        id: 'dynamic/luna-muse-fallback',
         provider: 'cloudflare-ai-gateway',
       },
     });
@@ -2550,7 +2553,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     });
   });
 
-  it('keeps camelCode Luna on the hosted OpenRouter route instead of BYOK', async () => {
+  it('keeps camelCode Luna on the hosted gateway fallback route instead of BYOK', async () => {
     const fake = Object.create(ChatThreadDO.prototype) as any;
     fake.env = {
       CF_ACCOUNT_ID: 'acct_1',
@@ -2584,13 +2587,13 @@ describe('ChatThreadDO Pi turn handling', () => {
     );
 
     expect(model.model).toMatchObject({
-      id: 'openai/gpt-5.6-luna',
+      id: 'dynamic/luna-muse-fallback',
       provider: 'cloudflare-ai-gateway',
-      baseUrl: 'https://gateway.ai.cloudflare.com/v1/acct_1/gateway_1/openrouter',
+      baseUrl: 'https://gateway.ai.cloudflare.com/v1/acct_1/gateway_1/compat',
     });
     expect(model.apiKey).toBe('cf-token');
     expect(model.billingSource).toBe('hosted');
-    expect(model.usageProvider).toBe('openrouter');
+    expect(model.usageProvider).toBe('compat');
     expect(fake.checkHostedPiModelAccess).toHaveBeenCalledOnce();
   });
 
@@ -4790,15 +4793,18 @@ describe('ChatThreadDO Pi turn handling', () => {
     });
   });
 
-  it('resolves the persisted camelCode id to hosted Luna on OpenRouter', () => {
+  it('resolves the persisted camelCode id to the gateway Luna/Muse fallback route', () => {
     const result = new PiModelMapping().resolvePiModelReference('deepseek-v4-auto');
 
+    // Hosted camelCode must reach the dynamic route so the gateway can fall
+    // back to Muse Spark when Luna's endpoints are rate limited.
     expect(result).toEqual({
       provider: 'openai',
       modelId: 'gpt-5.6-luna',
-      hostedGatewayProvider: 'openrouter',
-      hostedModelId: 'openai/gpt-5.6-luna',
+      hostedGatewayProvider: 'compat',
+      hostedModelId: 'dynamic/luna-muse-fallback',
       byokAllowed: false,
+      api: 'openai-completions',
     });
   });
 

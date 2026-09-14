@@ -101,9 +101,20 @@ export class PiModelMapping {
         // backend uses the existing Luna-over-OpenRouter route. This lets old
         // threads and free-mode fallbacks move off the self-hosted DeepSeek
         // pool without a thread-model migration.
+        //
+        // Hosted traffic goes through an AI Gateway dynamic route so the
+        // gateway falls back to Muse Spark when Luna's endpoints are rate
+        // limited. Every available Luna endpoint in a region can be the same
+        // provider, so a model-level fallback is the only reliable escape.
+        // Dynamic routes are reachable only through the gateway's
+        // /compat/chat/completions endpoint, so this tier uses the completions
+        // shape like the other two hosted fallback routes.
         return {
           ...openAiReference("gpt-5.6-luna"),
           byokAllowed: false,
+          api: "openai-completions",
+          hostedGatewayProvider: "compat",
+          hostedModelId: "dynamic/luna-muse-fallback",
         };
       case "deepseek-v4-flash":
         return {

@@ -1,5 +1,4 @@
 import type { LlmModel, LlmProvider } from "@/types";
-import { getByokProviderMeta } from "./byok-providers";
 import { isLlmModelCoveredByByokProvider } from "./llm-provider-config";
 
 export const CREDIT_SEND_BLOCKED_MESSAGE =
@@ -10,7 +9,6 @@ export interface ChatApiErrorDetails {
   status: number | null;
   providerErrorType: string | null;
   providerMessage: string | null;
-  isRateLimit: boolean;
 }
 
 export interface ChatApiErrorContext {
@@ -20,19 +18,6 @@ export interface ChatApiErrorContext {
 }
 
 export type ChatApiErrorPresentation =
-  | {
-      kind: "byok_rate_limit";
-      title: string;
-      message: string;
-      providerLabel: string | null;
-      providerUrl: string | null;
-      providerLinkLabel: string | null;
-    }
-  | {
-      kind: "hosted_rate_limit";
-      title: string;
-      message: string;
-    }
   | {
       kind: "billing_action";
       title: string;
@@ -194,26 +179,11 @@ export function parseChatApiError(error: unknown): ChatApiErrorDetails {
   const providerMessage =
     extractProviderMessage(parsed) ||
     (rawMessage ? removeErrorPrefix(rawMessage) : null);
-  const normalized = [
-    rawMessage,
-    providerErrorType,
-    providerMessage,
-  ]
-    .filter((value): value is string => Boolean(value))
-    .join(" ")
-    .toLowerCase();
-  const isRateLimit =
-    status === 429 ||
-    providerErrorType?.toLowerCase() === "rate_limit_error" ||
-    /\brate[- ]?limited?\b/.test(normalized) ||
-    normalized.includes("rate limit");
-
   return {
     rawMessage,
     status,
     providerErrorType,
     providerMessage,
-    isRateLimit,
   };
 }
 
@@ -287,50 +257,12 @@ function isCurrentTurnByok(context: ChatApiErrorContext): boolean {
   );
 }
 
-function byokRateLimitPresentation(
-  provider: LlmProvider | null | undefined,
-): Extract<ChatApiErrorPresentation, { kind: "byok_rate_limit" }> {
-  const providerMeta = getByokProviderMeta(provider);
-  const providerLabel = providerMeta?.label ?? null;
-  const providerName = providerLabel ?? "your API provider";
-
-  return {
-    kind: "byok_rate_limit",
-    providerLabel,
-    providerUrl: providerMeta?.getKeyUrl ?? null,
-    providerLinkLabel:
-      providerMeta?.settingsLinkLabel ?? providerMeta?.getKeyLinkLabel ?? null,
-    title: providerLabel
-      ? `Your ${providerLabel} API key is rate limited`
-      : "Your API key is rate limited",
-    message: `${providerName} rejected this request because your account hit an API rate limit. This limit is controlled by ${providerName}, not camelAI. Increase your limits in ${providerName}, reduce current usage, or wait 60 seconds and try again.`,
-  };
-}
-
-function hostedRateLimitPresentation(): Extract<
-  ChatApiErrorPresentation,
-  { kind: "hosted_rate_limit" }
-> {
-  return {
-    kind: "hosted_rate_limit",
-    title: "The model provider is temporarily rate limiting camelAI",
-    message:
-      "Wait 60 seconds and try again. If this keeps happening, contact support. Your workspace is saved.",
-  };
-}
-
 export function getChatApiErrorPresentation(
   error: unknown,
   context: ChatApiErrorContext = {},
 ): ChatApiErrorPresentation {
   const details = parseChatApiError(error);
   const message = details.providerMessage || "An unknown error occurred";
-
-  if (details.isRateLimit) {
-    return isCurrentTurnByok(context)
-      ? byokRateLimitPresentation(context.llmProvider)
-      : hostedRateLimitPresentation();
-  }
 
   const lowerMessage = message.toLowerCase();
   if (isOpenAiSubscriptionReconnectRequired(lowerMessage)) {
@@ -386,14 +318,3 @@ export function getChatApiErrorPresentation(
   };
 }
 
-export function isRateLimitChatApiErrorPresentation(
-  presentation: ChatApiErrorPresentation,
-): presentation is Extract<
-  ChatApiErrorPresentation,
-  { kind: "byok_rate_limit" | "hosted_rate_limit" }
-> {
-  return (
-    presentation.kind === "byok_rate_limit" ||
-    presentation.kind === "hosted_rate_limit"
-  );
-}

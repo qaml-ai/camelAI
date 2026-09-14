@@ -10,7 +10,6 @@ import {
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import React from "react";
-import { BYOK_PROVIDERS } from "@/lib/byok-providers";
 import { CHAT_SSE_CLOSE_UNAUTHORIZED } from "@/lib/chat-sse-close";
 
 const mockNavigate = vi.fn();
@@ -538,13 +537,13 @@ describe("Chat AskUserQuestion composer focus", () => {
     expect(prompt).toHaveValue("");
   });
 
-  it("uses worker provider metadata for BYOK rate-limit errors via agent state", async () => {
+  it("shows the provider message for a rate-limit error via agent state", async () => {
     render(
       <Chat
         threadId="thread-1"
         workspaceId="ws-1"
         initialMessages={[]}
-        llmProvider={null}
+        llmProvider="anthropic"
       />,
     );
 
@@ -563,47 +562,11 @@ describe("Chat AskUserQuestion composer focus", () => {
       });
     });
 
-    expect(
-      await screen.findByText("Your Bedrock API key is rate limited"),
-    ).toBeInTheDocument();
-    const link = screen.getByRole("link", {
-      name: /Open the AWS Bedrock console/,
-    });
-    expect(link).toHaveAttribute("href", BYOK_PROVIDERS.bedrock.getKeyUrl);
-  });
-
-  it("falls back to the current provider when error provider metadata is absent", async () => {
-    render(
-      <Chat
-        threadId="thread-1"
-        workspaceId="ws-1"
-        initialMessages={[]}
-        llmProvider="anthropic"
-      />,
-    );
-
-    const agent = getMainAgent();
-    act(() => {
-      agent.emitOpen();
-      agent.emitStateUpdate({
-        lastError: {
-          id: "error-2",
-          error: RATE_LIMIT_ERROR,
-          billingSource: "byok",
-          provider: null,
-          status: null,
-          errorType: null,
-        },
-      });
-    });
-
-    expect(
-      await screen.findByText("Your Anthropic API key is rate limited"),
-    ).toBeInTheDocument();
-    const link = screen.getByRole("link", {
-      name: /Open Anthropic API settings/,
-    });
-    expect(link).toHaveAttribute("href", BYOK_PROVIDERS.anthropic.getKeyUrl);
+    // Rate limits are no longer special-cased into a per-provider card, so the
+    // provider's own wording reaches the user and no wait is invented.
+    expect(await screen.findByText(/rate limited/)).toBeInTheDocument();
+    expect(screen.queryByText(/60 seconds/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /Bedrock console/ })).toBeNull();
   });
 
   it("mounts the SSE transport for the thread without the WebSocket timing knobs", () => {

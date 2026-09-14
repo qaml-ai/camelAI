@@ -23,12 +23,10 @@ import { CollapsibleUserMessage } from '@/components/collapsible-user-message';
 import { ChannelLogo } from '@/components/chat/channel-logo';
 import {
   ChatApiErrorNotice,
-  ChatRateLimitNotice,
 } from '@/components/chat-api-error-notice';
 import { isSupportedSlashCommand } from '@/lib/slash-commands';
 import {
   getChatApiErrorPresentation,
-  isRateLimitChatApiErrorPresentation,
 } from '@/lib/chat-api-errors';
 import { parseByokProvider } from '@/lib/byok-providers';
 import { parseUploadRefsFromContent } from '@/lib/chat-attachment-refs';
@@ -424,8 +422,6 @@ export function ContentBlockRenderer({
         key: `error-${index}`,
         node: presentation.kind === 'provider_auth_action' ? (
           <ChatApiErrorNotice presentation={presentation} />
-        ) : isRateLimitChatApiErrorPresentation(presentation) ? (
-          <ChatRateLimitNotice presentation={presentation} />
         ) : (
           <div className="flex gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />

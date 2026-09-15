@@ -194,3 +194,74 @@ describe("PiContainerTools", () => {
     });
   });
 });
+
+describe("PiContainerTools grep bounds", () => {
+  function workspaceWith(files: Array<{ path: string; size: number; content: string }>) {
+    const readFile = vi.fn(async (absolutePath: string) => {
+      const match = files.find((file) => file.path === absolutePath);
+      return match
+        ? { success: true, content: match.content, isBinary: false }
+        : { success: false };
+    });
+    const listFiles = vi.fn(async () => ({
+      success: true,
+      files: files.map((file) => ({
+        type: "file",
+        absolutePath: file.path,
+        size: file.size,
+      })),
+    }));
+    const workspace = { readFile, listFiles } as unknown as WorkspaceFilesystemLike;
+    return { workspace, readFile, listFiles };
+  }
+
+  it("skips oversized files instead of reading them across RPC", async () => {
+    // Workers RPC rejects values over 32MiB, so the read must never happen.
+    const { workspace, readFile } = workspaceWith([
+      { path: "/workspace/huge.log", size: 35_000_000, content: "needle" },
+      { path: "/workspace/small.ts", size: 20, content: "needle here" },
+    ]);
+    const tools = new PiContainerTools(workspace);
+
+    const output = await tools.callTool("grep", {
+      pattern: "needle",
+      location: "workspace",
+    });
+
+    expect(readFile).toHaveBeenCalledTimes(1);
+    expect(readFile).toHaveBeenCalledWith("/workspace/small.ts");
+    expect(JSON.stringify(output)).toContain("small.ts");
+    expect(JSON.stringify(output)).not.toContain("huge.log");
+  });
+
+  it("caps a caller-supplied match limit", async () => {
+    const lines = Array.from({ length: 5_000 }, (_, index) => `needle ${index}`).join("\n");
+    const { workspace } = workspaceWith([
+      { path: "/workspace/many.txt", size: lines.length, content: lines },
+    ]);
+    const tools = new PiContainerTools(workspace);
+
+    const output = await tools.callTool("grep", {
+      pattern: "needle",
+      location: "workspace",
+      limit: 100_000,
+    });
+
+    // The ceiling, not the caller's number, decides how much is returned.
+    expect(JSON.stringify(output)).toContain("1000 matches limit reached");
+  });
+
+  it("honours a leading (?i) inline flag that JavaScript regex rejects", async () => {
+    const { workspace } = workspaceWith([
+      { path: "/workspace/notes.md", size: 40, content: "Persistent MEMORY note" },
+    ]);
+    const tools = new PiContainerTools(workspace);
+
+    const output = await tools.callTool("grep", {
+      pattern: "(?i)(persistent|memory)",
+      location: "workspace",
+    });
+
+    expect(JSON.stringify(output)).toContain("notes.md");
+  });
+});

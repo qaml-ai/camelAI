@@ -24,6 +24,13 @@ const CONTAINER_CWD = "/workspace";
 const DEFAULT_MAX_LINES = 2000;
 const DEFAULT_MAX_BYTES = 50 * 1024;
 const GREP_MAX_LINE_LENGTH = 500;
+// Workers RPC rejects serialized values over 32MiB, so a single large file in a
+// workspace used to fail the whole search. Skip anything unreasonable for a text
+// search rather than reading it across the boundary.
+const GREP_MAX_FILE_BYTES = 2 * 1024 * 1024;
+// A caller-supplied match limit has to have a ceiling; without one a large
+// enough limit rebuilds the same oversized payload.
+const GREP_MAX_MATCHES = 1000;
 
 type ToolContent =
   | { type: "text"; text: string }
@@ -550,14 +557,22 @@ export class PiContainerTools {
   private async grep(args: Record<string, unknown>): Promise<PiContainerToolResult> {
     if (typeof args.pattern !== "string" || !args.pattern.trim()) throw new Error("pattern is required");
     const path = normalizePath(args.path);
-    const limit = Math.max(1, typeof args.limit === "number" ? args.limit : 100);
+    const limit = Math.min(
+      GREP_MAX_MATCHES,
+      Math.max(1, typeof args.limit === "number" ? args.limit : 100),
+    );
     const globRegex = typeof args.glob === "string" && args.glob.trim()
       ? globToRegex(args.glob.trim())
       : null;
+    // Models often write Python-style inline flags. JavaScript rejects them as
+    // an invalid group, so honour a leading (?i) as the ignore-case flag.
+    const inlineIgnoreCase = /^\(\?i\)/.test(args.pattern);
+    const pattern = inlineIgnoreCase ? args.pattern.slice(4) : args.pattern;
+    const ignoreCase = args.ignoreCase === true || inlineIgnoreCase;
     const matcher = args.literal
       ? null
-      : new RegExp(args.pattern, args.ignoreCase ? "i" : "");
-    const literal = args.ignoreCase ? args.pattern.toLowerCase() : args.pattern;
+      : new RegExp(pattern, ignoreCase ? "i" : "");
+    const literal = ignoreCase ? pattern.toLowerCase() : pattern;
     const listing = await this.workspace.listFiles(path, {
       recursive: true,
       includeHidden: true,
@@ -566,16 +581,21 @@ export class PiContainerTools {
     if (!listing.success) throw new Error(listing.error || `Failed to search ${path}`);
     const matches: string[] = [];
     let lineTruncated = false;
+    let skippedLargeFiles = 0;
     for (const entry of listing.files) {
       if (entry.type !== "file") continue;
       const displayPath = relativeTo(path, entry.absolutePath).replace(/\\/g, "/");
       if (globRegex && !globRegex.test(displayPath)) continue;
+      if (typeof entry.size === "number" && entry.size > GREP_MAX_FILE_BYTES) {
+        skippedLargeFiles += 1;
+        continue;
+      }
       const file = await this.workspace.readFile(entry.absolutePath);
       if (!file.success || file.isBinary) continue;
       const lines = String(file.content ?? "").split("\n");
       for (let index = 0; index < lines.length; index += 1) {
         const line = lines[index];
-        const haystack = args.ignoreCase ? line.toLowerCase() : line;
+        const haystack = ignoreCase ? line.toLowerCase() : line;
         if (matcher ? matcher.test(line) : haystack.includes(literal)) {
           const text = line.length > GREP_MAX_LINE_LENGTH
             ? `${line.slice(0, GREP_MAX_LINE_LENGTH)}... [truncated]`
@@ -593,12 +613,14 @@ export class PiContainerTools {
     const notices: string[] = [];
     if (matches.length >= limit) notices.push(`${limit} matches limit reached. Use limit=${limit * 2} for more, or refine pattern`);
     if (lineTruncated) notices.push(`Some lines truncated to ${GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines`);
+    if (skippedLargeFiles > 0) notices.push(`${skippedLargeFiles} file(s) over ${GREP_MAX_FILE_BYTES / (1024 * 1024)}MB skipped`);
     return result(
       `${content}${notices.length ? `\n\n[${notices.join(". ")}]` : ""}`,
       {
         ...(truncation ? { truncation } : {}),
         ...(matches.length >= limit ? { matchLimitReached: limit } : {}),
         ...(lineTruncated ? { linesTruncated: true } : {}),
+        ...(skippedLargeFiles > 0 ? { skippedLargeFiles } : {}),
       },
     );
   }

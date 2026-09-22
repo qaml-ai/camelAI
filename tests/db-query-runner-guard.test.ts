@@ -1,4 +1,7 @@
+import { spawnSync } from 'node:child_process';
 import { Readable } from 'node:stream';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { describe, it, expect, vi } from 'vitest';
 import {
   blockedAddressReason,
@@ -13,6 +16,7 @@ import {
   ensureExportParentDirectory,
   exportFileSizeAfterClose,
   streamMysqlRows,
+  writeResultAndExit,
   DEFAULT_ROW_LIMIT,
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
@@ -347,5 +351,48 @@ describe('parquet column typing (Go encoder parity)', () => {
     expect(parquetValueFor(PARQUET_KIND.STRING, Buffer.from('bytes'))).toBe('bytes');
     expect(parquetValueFor(PARQUET_KIND.STRING, { a: 1 })).toBe('{"a":1}'); // json columns
     expect(parquetValueFor(PARQUET_KIND.STRING, true)).toBe('true');
+  });
+});
+
+describe('runner result delivery', () => {
+  it('exits only after the result line has flushed', () => {
+    const calls: string[] = [];
+    let flush: () => void = () => {};
+    writeResultAndExit('{"ok":true}', {
+      write: (chunk: string, done: () => void) => {
+        calls.push(`write:${chunk}`);
+        flush = done;
+      },
+      exit: (code: number) => calls.push(`exit:${code}`),
+    });
+    expect(calls).toEqual(['write:{"ok":true}']);
+    flush();
+    expect(calls).toEqual(['write:{"ok":true}', 'exit:0']);
+  });
+
+  it('exits even while a peer socket that never closes keeps the event loop alive', () => {
+    // Regression for 2026-09-18: over the relay a lost FIN left the driver
+    // socket open, node never exited, and the sandbox exec timed out with the
+    // successful result stranded in an unreturned stdout.
+    const runner = pathToFileURL(
+      resolve(__dirname, '../workers/main/db-query-sandbox-assets/runner/db-query-runner.mjs'),
+    ).href;
+    const script = `
+      import net from 'node:net';
+      import { writeResultAndExit } from ${JSON.stringify(runner)};
+      const server = net.createServer({ allowHalfOpen: true }, () => {}).listen(0, '127.0.0.1', () => {
+        const socket = net.connect(server.address().port, '127.0.0.1');
+        socket.on('connect', () => writeResultAndExit('{"ok":true}'));
+      });
+    `;
+    const started = Date.now();
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    expect(child.stdout).toBe('{"ok":true}');
+    expect(Date.now() - started).toBeLessThan(5_000);
   });
 });

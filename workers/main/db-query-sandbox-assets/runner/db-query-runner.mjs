@@ -785,6 +785,26 @@ async function runMssqlQuery(socket, request) {
 
 // --- shared runner ------------------------------------------------------------
 
+/**
+ * Write the single stdout result line, then exit once it has flushed.
+ *
+ * Never wait for the event loop to drain: a driver socket whose peer FIN never
+ * arrives (the relay path is `cloudflared access tcp` → tunnel → gost, and a
+ * lost half-close anywhere on it leaves the socket open) keeps node alive after
+ * the result is written. The sandbox exec only returns on process exit, so the
+ * worker would see a 45s exec timeout with no stdout even though the query
+ * succeeded — every MySQL query failed exactly this way from 2026-09-18.
+ *
+ * @param {string} payload
+ * @param {{ write?: (chunk: string, done: () => void) => unknown, exit?: (code: number) => unknown }} [io]
+ */
+export function writeResultAndExit(
+  payload,
+  { write = (chunk, done) => process.stdout.write(chunk, done), exit = (code) => process.exit(code) } = {},
+) {
+  write(payload, () => exit(0));
+}
+
 /** JSON.stringify replacer: keep bigints and binary columns transportable. */
 function jsonSafe(_key, value) {
   if (typeof value === "bigint") return value.toString();
@@ -863,7 +883,7 @@ async function main() {
     payload = JSON.stringify({ ok: false, error: errorPayload(error) }, jsonSafe);
   }
   // The single line of stdout IS the result the worker parses; keep it clean.
-  process.stdout.write(payload);
+  writeResultAndExit(payload);
 }
 
 // ===========================================================================
@@ -1152,7 +1172,7 @@ async function exportMain() {
     payload = JSON.stringify({ ok: false, error: errorPayload(error) });
   }
   // The single line of stdout IS the result the worker parses; keep it clean.
-  process.stdout.write(payload);
+  writeResultAndExit(payload);
 }
 
 // Only run as a script (DB_QUERY_REQUEST present); importing this module for

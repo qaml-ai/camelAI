@@ -23,7 +23,12 @@ import {
   projectBuildTransientCause,
   withProjectBuildServiceErrorMapping,
 } from '../src/project-build-readiness';
-import { runDbQuery, type DbQueryDeps, type DbQueryRequest } from '../src/db-query-service';
+import {
+  runDbExport,
+  runDbQuery,
+  type DbQueryDeps,
+  type DbQueryRequest,
+} from '../src/db-query-service';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -590,6 +595,137 @@ describe('db-query under a client-side deadline', () => {
     const assertion = expect(promise).rejects.toThrow(/forwarder never became ready/);
     await vi.advanceTimersByTimeAsync(31_000);
     await assertion;
+  });
+});
+
+describe('db-query wedged-container recovery', () => {
+  const RELAY = { hostname: 'db-relay.example.dev', socksUsername: 'u', socksPassword: 'p' };
+
+  function wedgeDeps(overrides: Record<string, unknown>) {
+    return {
+      relay: RELAY,
+      readinessTimeoutMs: 30_000,
+      onDeadlineExceeded: vi.fn(),
+      sandbox: {
+        ensureReady: vi.fn(async () => {}),
+        ensureRelayEgress: vi.fn(async () => {}),
+        ensureWarehouseExportMount: vi.fn(async () => {}),
+        startProcess: vi.fn(async () => ({})),
+        exec: vi.fn(async () => ({ stdout: 'up', stderr: '', exitCode: 0 })),
+        restartWedgedContainer: vi.fn(async () => ({ restarted: true, reason: 'forced' })),
+        ...overrides,
+      },
+    } as unknown as DbQueryDeps & {
+      sandbox: { restartWedgedContainer: ReturnType<typeof vi.fn> };
+    };
+  }
+
+  it('destroys the container when startup never returns, and still fails this call', async () => {
+    // The prod incident: every query for four days died here at 135s and the
+    // container never self-healed.
+    vi.useFakeTimers();
+    const deps = wedgeDeps({ ensureReady: vi.fn(() => new Promise<never>(() => {})) });
+
+    const promise = runDbQuery(deps, { engine: 'postgres', sql: 'select 1' } as DbQueryRequest);
+    const assertion = expect(promise).rejects.toThrow(
+      /db_query_container_start did not return within/,
+    );
+    // 120s SDK startup ceiling + 15s grace.
+    await vi.advanceTimersByTimeAsync(135_001);
+    await assertion;
+
+    expect(deps.sandbox.restartWedgedContainer).toHaveBeenCalledTimes(1);
+    expect(deps.sandbox.restartWedgedContainer.mock.calls[0][0]).toMatchObject({
+      operation: 'db_query_container_start',
+      error: expect.stringContaining('SandboxDeadlineExceededError'),
+    });
+    // No in-call retry: the heal is for the next call.
+    expect(deps.sandbox.ensureReady).toHaveBeenCalledTimes(1);
+    expect(deps.sandbox.exec).not.toHaveBeenCalled();
+  });
+
+  it('destroys the container when relay egress configuration never returns', async () => {
+    vi.useFakeTimers();
+    const deps = wedgeDeps({ ensureRelayEgress: vi.fn(() => new Promise<never>(() => {})) });
+
+    const promise = runDbQuery(deps, { engine: 'postgres', sql: 'select 1' } as DbQueryRequest);
+    const assertion = expect(promise).rejects.toThrow(/db_query_relay_egress did not return within/);
+    await vi.advanceTimersByTimeAsync(135_001);
+    await assertion;
+
+    expect(deps.sandbox.restartWedgedContainer).toHaveBeenCalledTimes(1);
+    expect(deps.sandbox.restartWedgedContainer.mock.calls[0][0]).toMatchObject({
+      operation: 'db_query_relay_egress',
+    });
+  });
+
+  it('destroys the container when the export setup prelude never answers', async () => {
+    vi.useFakeTimers();
+    const deps = wedgeDeps({ exec: vi.fn(() => new Promise<never>(() => {})) });
+
+    const promise = runDbExport(
+      deps,
+      { engine: 'postgres', sql: 'select 1' } as DbQueryRequest,
+      'warehouse/ws-1',
+      '/warehouse/ws-1/x.parquet',
+    );
+    const assertion = expect(promise).rejects.toThrow(/db_export_setup did not return within/);
+    await vi.advanceTimersByTimeAsync(45_001);
+    await assertion;
+
+    expect(deps.sandbox.restartWedgedContainer.mock.calls[0][0]).toMatchObject({
+      operation: 'db_export_setup',
+    });
+    expect(deps.sandbox.ensureWarehouseExportMount).not.toHaveBeenCalled();
+  });
+
+  it('never destroys the container for a slow QUERY or a relay that answers "down"', async () => {
+    vi.useFakeTimers();
+    const slowQuery = wedgeDeps({
+      exec: vi.fn(async (command: string) => {
+        if (command.includes('/dev/tcp/')) return { stdout: 'up', stderr: '', exitCode: 0 };
+        return new Promise<never>(() => {});
+      }),
+    });
+    const queryPromise = runDbQuery(slowQuery, {
+      engine: 'postgres',
+      sql: 'select pg_sleep(600)',
+      timeoutMs: 30_000,
+    } as DbQueryRequest);
+    const queryAssertion = expect(queryPromise).rejects.toThrow(/db_query did not return within/);
+    await vi.advanceTimersByTimeAsync(60_001);
+    await queryAssertion;
+    expect(slowQuery.sandbox.restartWedgedContainer).not.toHaveBeenCalled();
+
+    const relayDown = wedgeDeps({
+      exec: vi.fn(async () => ({ stdout: 'down', stderr: '', exitCode: 0 })),
+    });
+    const relayPromise = runDbQuery(relayDown, { engine: 'postgres', sql: 'select 1' } as DbQueryRequest);
+    const relayAssertion = expect(relayPromise).rejects.toThrow(/forwarder never became ready/);
+    await vi.advanceTimersByTimeAsync(31_000);
+    await relayAssertion;
+    expect(relayDown.sandbox.restartWedgedContainer).not.toHaveBeenCalled();
+  });
+
+  it('surfaces the original deadline error when the heal request itself fails', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const deps = wedgeDeps({
+        ensureReady: vi.fn(() => new Promise<never>(() => {})),
+        restartWedgedContainer: vi.fn(async () => {
+          throw new Error('DO unreachable');
+        }),
+      });
+
+      const promise = runDbQuery(deps, { engine: 'postgres', sql: 'select 1' } as DbQueryRequest);
+      const assertion = expect(promise).rejects.toBeInstanceOf(SandboxDeadlineExceededError);
+      await vi.advanceTimersByTimeAsync(135_001);
+      await assertion;
+      expect(deps.sandbox.restartWedgedContainer).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

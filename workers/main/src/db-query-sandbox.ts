@@ -10,6 +10,13 @@ import {
   waitForWritableLocalMount,
 } from "./analysis-sandbox.js";
 import { DB_QUERY_SLEEP_AFTER } from "./container-sizing.js";
+import {
+  createSandboxZombieHealState,
+  createZombieHealTarget,
+  healZombieSandboxContainer,
+  type SandboxZombieRestartOutcome,
+  type ZombieHealableSandbox,
+} from "./sandbox-zombie-recovery.js";
 import type { Env } from "./types.js";
 
 /** R2 binding name the export mount resolves against (credential-less mount). */
@@ -90,6 +97,51 @@ export class DbQuerySandbox extends Sandbox<Env> {
   override async onStop(): Promise<void> {
     this.clearMountBookkeeping();
     await super.onStop();
+  }
+
+  /**
+   * Wedged-teardown bookkeeping, per DO instance (see
+   * SandboxZombieHealState).
+   */
+  private zombieHealState = createSandboxZombieHealState();
+
+  /**
+   * Worker-side self-heal for a WEDGED container: db-query-service.ts calls
+   * this when a setup operation (container start, relay egress, forwarder
+   * prelude, export mount) outlives its client-side deadline. Same bounded
+   * destroy + durable cooldown the build/analysis sandboxes use, so a broken
+   * image gets one restart per window instead of a restart loop.
+   *
+   * `requireRunningContainer: false` because the prod incident this exists for
+   * was a START that never completed: the container never reported running,
+   * yet `destroy()` was exactly what cleared it.
+   *
+   * The failing call still fails; the heal is for the NEXT call.
+   */
+  async restartWedgedContainer(request: {
+    operation: string;
+    /** Only the text crosses the RPC hop. */
+    error?: string;
+  }): Promise<SandboxZombieRestartOutcome> {
+    return healZombieSandboxContainer(
+      this.zombieHealTarget,
+      "DbQuerySandbox",
+      { operation: request.operation, trigger: "setup_deadline", error: request.error },
+      { requireRunningContainer: false },
+    );
+  }
+
+  /** `ctx` is protected, so the shared helper gets an explicit public view. */
+  private get zombieHealTarget(): ZombieHealableSandbox {
+    return createZombieHealTarget({
+      ctx: this.ctx,
+      env: this.env,
+      destroy: () => this.destroy(),
+      healState: this.zombieHealState,
+      // `destroy()` does not synchronously run `onStop`; drop the mount
+      // verdicts for the dead container here too.
+      onContainerDestroyed: () => this.clearMountBookkeeping(),
+    });
   }
 
   /**

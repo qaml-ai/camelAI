@@ -140,6 +140,29 @@ describe("forceSandboxZombieRestart", () => {
     expect(destroy).not.toHaveBeenCalled();
   });
 
+  it("destroys a wedged START (never running) when the caller opts out of the running check", async () => {
+    const { host, destroy, store } = createHost({ running: false });
+
+    const outcome = await forceSandboxZombieRestart(
+      host,
+      { operation: "db_query_container_start", trigger: "setup_deadline" },
+      { nowMs: 1_000, requireRunningContainer: false },
+    );
+
+    expect(outcome).toMatchObject({ restarted: true, reason: "forced" });
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(store.get(SANDBOX_ZOMBIE_RESTART_AT_KEY)).toBe(1_000);
+
+    // Still one restart per cooldown: a broken image cannot restart-loop.
+    const again = await forceSandboxZombieRestart(
+      host,
+      { operation: "db_query_container_start", trigger: "setup_deadline" },
+      { nowMs: 1_000 + SANDBOX_ZOMBIE_RESTART_COOLDOWN_MS - 1, requireRunningContainer: false },
+    );
+    expect(again).toMatchObject({ restarted: false, reason: "rate_limited" });
+    expect(destroy).toHaveBeenCalledTimes(1);
+  });
+
   it("reports (and records) a destroy that fails without throwing", async () => {
     const { host, recorded } = createHost({
       destroy: async () => {
@@ -346,6 +369,34 @@ describe("healZombieSandboxContainer", () => {
       expect(blobs).toContain("ProjectBuildSandbox");
       expect(blobs).toContain("readiness_probe");
       expect(blobs).toContain("probe_session_death");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("emits the same event for a DbQuerySandbox setup-deadline restart", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { sandbox, destroy, writeDataPoint } = createSandbox({ running: false });
+
+      const outcome = await healZombieSandboxContainer(
+        sandbox,
+        "DbQuerySandbox",
+        {
+          operation: "db_query_container_start",
+          trigger: "setup_deadline",
+          error: "SandboxDeadlineExceededError: db_query_container_start did not return",
+        },
+        { requireRunningContainer: false },
+      );
+
+      expect(outcome).toMatchObject({ restarted: true, reason: "forced" });
+      expect(destroy).toHaveBeenCalledTimes(1);
+      const blobs = writeDataPoint.mock.calls[0][0].blobs as string[];
+      expect(blobs).toContain(SANDBOX_ZOMBIE_RESTART_EVENT);
+      expect(blobs).toContain("DbQuerySandbox");
+      expect(blobs).toContain("db_query_container_start");
+      expect(blobs).toContain("setup_deadline");
     } finally {
       warn.mockRestore();
     }

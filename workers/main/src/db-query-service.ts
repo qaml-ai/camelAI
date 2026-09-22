@@ -24,6 +24,7 @@ import {
   createSandboxExecDeadline,
   isSandboxDeadlineExceededError,
   SANDBOX_EXEC_DEADLINE_GRACE_MS,
+  SandboxDeadlineExceededError,
   type SandboxDeadlineExceededEvent,
   type SandboxExecDeadline,
 } from "./sandbox-exec-deadline.js";
@@ -176,6 +177,15 @@ export interface DbQuerySandboxStub {
     command: string,
     options?: { cwd?: string; timeout?: number; env?: Record<string, string | undefined> },
   ): Promise<SandboxExecResult>;
+  /**
+   * Wedged-container self-heal (DbQuerySandbox.restartWedgedContainer):
+   * bounded destroy, rate-limited DO-side. Optional so test fakes and older
+   * stubs without it keep working.
+   */
+  restartWedgedContainer?(request: {
+    operation: string;
+    error?: string;
+  }): Promise<{ restarted: boolean; reason: string } | undefined>;
 }
 
 export interface DbQueryDeps {
@@ -337,6 +347,58 @@ async function ensureRelayForwarder(
   }
 }
 
+/**
+ * Run the SETUP half of a call (container start, relay egress, forwarder
+ * prelude) and, when any of it outlives its client-side deadline, ask the DO
+ * to destroy the container so the NEXT call boots clean.
+ *
+ * Without this a wedged container never self-healed: prod saw one workspace
+ * fail `db_query_container_start` at its 135s budget on every query for four
+ * days (403 in a row) until a manual `destroy()` fixed it instantly.
+ *
+ * Deliberately narrow: only SandboxDeadlineExceededError from setup. The
+ * runner exec's own deadline is a slow QUERY, the forwarder's "never became
+ * ready" (probes answer, port stays down) is relay configuration, and the
+ * export mount has its own in-place recovery (mountOrRecover) — none of those
+ * is fixed by destroying a container other calls may be using. The original error is always re-thrown and
+ * there is no in-call retry: the caller has already spent a setup budget of up
+ * to 135s, and a second cold start inside the same call would double that.
+ */
+async function withWedgedSetupRecovery(deps: DbQueryDeps, run: () => Promise<void>): Promise<void> {
+  try {
+    await run();
+  } catch (error) {
+    // These deadlines are created in this module, so the error is always the
+    // local class (never the name-only RPC shape isSandboxDeadlineExceededError
+    // also accepts).
+    if (error instanceof SandboxDeadlineExceededError) {
+      await requestWedgedContainerRestart(deps, error);
+    }
+    throw error;
+  }
+}
+
+/** Best-effort: a failed heal request must never mask the deadline error. */
+async function requestWedgedContainerRestart(
+  deps: DbQueryDeps,
+  error: SandboxDeadlineExceededError,
+): Promise<void> {
+  if (typeof deps.sandbox.restartWedgedContainer !== "function") return;
+  try {
+    // The DO records `build_sandbox_zombie_restart` (component DbQuerySandbox,
+    // trigger setup_deadline) itself; nothing to emit on this side.
+    await deps.sandbox.restartWedgedContainer({
+      operation: error.operation,
+      error: `${error.name}: ${error.message}`,
+    });
+  } catch (restartError) {
+    console.warn("[db-query] wedged container restart request failed", {
+      operation: error.operation,
+      error: restartError instanceof Error ? restartError.message : String(restartError),
+    });
+  }
+}
+
 /** Relay forwarder readiness, deadline-bounded after startup/egress setup. */
 async function ensureRelayPrelude(deps: DbQueryDeps, setup: SandboxExecDeadline): Promise<void> {
   const relay = deps.relay;
@@ -385,8 +447,10 @@ function parseRunnerOutput(exec: SandboxExecResult): DbQueryResult {
  * bare `import "pg"` resolves against the baked node_modules.
  */
 export async function runDbQuery(deps: DbQueryDeps, request: DbQueryRequest): Promise<DbQueryResult> {
-  await ensureDbQuerySandboxReady(deps);
-  await ensureRelayPrelude(deps, dbQuerySetupDeadline(deps, "db_query_setup"));
+  await withWedgedSetupRecovery(deps, async () => {
+    await ensureDbQuerySandboxReady(deps);
+    await ensureRelayPrelude(deps, dbQuerySetupDeadline(deps, "db_query_setup"));
+  });
 
   const containerTimeoutMs = (request.timeoutMs ?? DEFAULT_QUERY_TIMEOUT_MS) + EXEC_OVERHEAD_MS;
   const exec = await dbQueryDeadline(deps, "db_query", containerTimeoutMs).run(() =>
@@ -444,8 +508,10 @@ export async function runDbExport(
   mountPrefix: string,
   exportPath: string,
 ): Promise<DbExportResult> {
-  await ensureDbQuerySandboxReady(deps);
-  await ensureRelayPrelude(deps, dbQuerySetupDeadline(deps, "db_export_setup"));
+  await withWedgedSetupRecovery(deps, async () => {
+    await ensureDbQuerySandboxReady(deps);
+    await ensureRelayPrelude(deps, dbQuerySetupDeadline(deps, "db_export_setup"));
+  });
   // The mount is an exec-class container call too: unbounded, it hung exports
   // exactly like the readiness probes did. Its OWN budget, not a share of the
   // forwarder's — a slow-but-healthy mount must not be cut short by however

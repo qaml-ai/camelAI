@@ -1,14 +1,15 @@
 import { mkdir } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
-import { Agent, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
+import { Agent, convertToLlm, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
 import { isContextOverflow, isRetryableAssistantError, type AssistantMessage } from "@earendil-works/pi-ai";
 import { parentRpc } from "./rpc.ts";
 import { executeCode } from "./codemode.ts";
 import type { AgentConfig, ToolBridge } from "./protocol.ts";
 import { buildSystemPrompt } from "./system-prompt.ts";
 import { fileAppendLog } from "../shared/append-log.ts";
-import { Transcript, legacySnapshotPath, transcriptPath, type TranscriptRecord } from "./transcript.ts";
-import { boundedContext, recoverInterruptedTurn, validateInitialMessages, validateUserMessages } from "./history.ts";
+import { Transcript, legacySnapshotPath, readTranscript, summaryMessage, transcriptPath, type CompactionState, type TranscriptRecord } from "./transcript.ts";
+import { boundedContext, interruptedTurnRepairs, validateInitialMessages, validateUserMessages } from "./history.ts";
+import { compactionSettings, contextTokens, explicitKeyStream, needsCompaction, runCompaction } from "./compaction.ts";
 import { codeRequest, DEFAULT_RETRY } from "./limits.ts";
 
 const rpc = parentRpc(() => process.kill(-process.pid, "SIGKILL"));
@@ -18,6 +19,58 @@ let transcript: Transcript;
 let busy = false;
 let active: AbortController | undefined;
 let persistenceError: unknown;
+/** Messages a compaction folded into the summary during the current run, still in Pi's live state. */
+let dropped = new WeakSet<AgentMessage>();
+let summary: { state: CompactionState; message: AgentMessage } | undefined;
+
+function summaryView(): AgentMessage[] {
+  const state = transcript.compaction;
+  if (!state) return [];
+  if (summary?.state !== state) summary = { state, message: summaryMessage(state) };
+  return [summary.message];
+}
+
+/** The model's context: the current summary plus live messages not yet folded into it. */
+function liveView(messages: AgentMessage[]): AgentMessage[] {
+  return [...summaryView(), ...messages.filter(message => message.role !== "compactionSummary" && !dropped.has(message))];
+}
+
+/** Summarize older context into the transcript. Failures leave the context as is; the next request retries. */
+async function compactNow(reason: "threshold" | "overflow", signal?: AbortSignal): Promise<boolean> {
+  if (!config.apiKey) return false;
+  rpc.send({ type: "event", event: { type: "compaction_start", reason } });
+  try {
+    const context = transcript.context.slice();
+    const offset = transcript.offset;
+    // An overflow means the real limit is lower than assumed: keep about a fifth of the context.
+    const keepRecentTokens = reason === "overflow" ? Math.max(1_000, Math.floor(contextTokens(liveView(context)) * 0.2)) : undefined;
+    const outcome = await runCompaction({ context, offset, previous: transcript.compaction, model: config.model, apiKey: config.apiKey, signal, keepRecentTokens });
+    if ("skipped" in outcome) {
+      rpc.send({ type: "event", event: { type: "compaction_end", reason, skipped: outcome.skipped } });
+      return false;
+    }
+    for (const message of context.slice(0, outcome.state.cut - offset)) dropped.add(message);
+    await transcript.compact(outcome.state);
+    rpc.send({ type: "event", event: { type: "compaction_end", reason, tokensBefore: outcome.state.tokensBefore, summarizedMessages: outcome.state.cut - offset, keptMessages: transcript.context.length } });
+    return true;
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    rpc.send({ type: "event", event: { type: "compaction_end", reason, error: error instanceof Error ? error.message : String(error) } });
+    return false;
+  }
+}
+
+/** Before every model request: compact when the context is too big, trimming only as a last resort. */
+async function contextFor(messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> {
+  let view = liveView(messages);
+  const systemTokens = Math.ceil(agent!.state.systemPrompt.length / 4);
+  if (needsCompaction(view, config.model, systemTokens) && await compactNow("threshold", signal)) view = liveView(messages);
+  // Same budget as the compaction threshold, so this only trims when compaction could not run.
+  const budget = config.model.contextWindow - compactionSettings(config.model).reserveTokens - systemTokens;
+  const bounded = boundedContext(view, budget);
+  if (bounded.length !== view.length) rpc.send({ type: "event", event: { type: "context_trimmed", retainedMessages: bounded.length, omittedMessages: view.length - bounded.length } });
+  return bounded;
+}
 
 function bridge(signal: AbortSignal): ToolBridge {
   return {
@@ -53,13 +106,33 @@ function userMessages(value: unknown): AgentMessage[] {
   return messages;
 }
 
-/** Retry transient provider failures by retracting the error and continuing the same turn. */
-async function retryTransientErrors(signal: AbortSignal) {
+/**
+ * Recover failed responses within the same turn: a context overflow compacts and
+ * continues once; transient provider failures retry with backoff. The failed
+ * response is retracted either way, so it never becomes history.
+ */
+async function recoverFailedResponses(signal: AbortSignal) {
   const policy = config.retry ?? DEFAULT_RETRY;
+  let overflowHandled = false;
   for (let attempt = 1; ; attempt++) {
     const last = agent!.state.messages.at(-1) as AssistantMessage | undefined;
     if (signal.aborted || !last || last.role !== "assistant" || last.stopReason !== "error") return;
-    if (isContextOverflow(last, config.model.contextWindow) || !isRetryableAssistantError(last)) return;
+    if (isContextOverflow(last, config.model.contextWindow)) {
+      if (overflowHandled) return;
+      overflowHandled = true;
+      await transcript.retract();
+      agent!.state.messages = agent!.state.messages.slice(0, -1);
+      if (!await compactNow("overflow", signal)) {
+        // Keep the error visible: nothing could be summarized, so a retry would overflow again.
+        await transcript.push(last);
+        agent!.state.messages = [...agent!.state.messages, last];
+        return;
+      }
+      await agent!.continue();
+      attempt--;
+      continue;
+    }
+    if (!isRetryableAssistantError(last)) return;
     if (attempt > policy.maxAttempts) {
       rpc.send({ type: "event", event: { type: "auto_retry_end", success: false, attempt: attempt - 1, finalError: last.errorMessage } });
       return;
@@ -88,9 +161,10 @@ rpc.handler = async (method, params) => {
     let recovered = false;
     if (transcript.active) {
       // Close the interrupted turn instead of refusing work until an operator intervenes.
-      await transcript.replace(recoverInterruptedTurn(transcript.messages), false);
+      await transcript.append(interruptedTurnRepairs(transcript.context));
+      await transcript.setActive(false);
       recovered = true;
-    } else if (transcript.messages.length === 0 && config.initialMessages?.length) {
+    } else if (transcript.total === 0 && config.initialMessages?.length) {
       validateInitialMessages(config.initialMessages);
       await transcript.replace(config.initialMessages);
     }
@@ -120,15 +194,15 @@ rpc.handler = async (method, params) => {
       initialState: {
         model: config.model,
         systemPrompt: buildSystemPrompt(config.systemPrompt),
-        tools: [jsExec, ...directTools], messages: [...transcript.messages],
+        tools: [jsExec, ...directTools], messages: transcript.view(),
         thinkingLevel: config.thinkingLevel ?? "off",
       },
       getApiKey: () => config.apiKey,
-      transformContext: async messages => {
-        const bounded = boundedContext(messages, config.model.contextWindow, agent!.state.systemPrompt);
-        if (bounded.length !== messages.length) rpc.send({ type: "event", event: { type: "context_trimmed", retainedMessages: bounded.length, omittedMessages: messages.length - bounded.length } });
-        return bounded;
-      },
+      // Only the tenant's explicit key, never provider keys from the process environment.
+      streamFn: explicitKeyStream(),
+      // Renders compaction summaries for the model (the default drops non-chat roles).
+      convertToLlm,
+      transformContext: (messages, signal) => contextFor(messages, signal),
       sessionId: config.id,
       toolExecution: "parallel",
     });
@@ -140,10 +214,10 @@ rpc.handler = async (method, params) => {
       }
       rpc.send({ type: "event", event });
     });
-    return { pid: process.pid, recovered, messages: transcript.messages.length };
+    return { pid: process.pid, recovered, messages: transcript.total };
   }
   if (!agent) throw new Error("Agent is not initialized");
-  if (method === "status") return { pid: process.pid, busy, messages: transcript.messages.length };
+  if (method === "status") return { pid: process.pid, busy, messages: transcript.total, contextMessages: transcript.context.length, compacted: !!transcript.compaction };
   if (method === "configure") {
     if (busy) throw new Error("Agent is busy");
     if (params.systemPrompt !== undefined) { config.systemPrompt = params.systemPrompt; agent.state.systemPrompt = buildSystemPrompt(params.systemPrompt); }
@@ -153,7 +227,8 @@ rpc.handler = async (method, params) => {
     if (params.tools !== undefined) { config.tools = params.tools; agent.state.tools = [agent.state.tools.find(tool => tool.name === "js_exec")!, ...directAgentTools(config.tools)]; }
     return { configured: true };
   }
-  if (method === "history") return { messages: transcript.messages };
+  // Full history comes from the log; memory holds only the working set.
+  if (method === "history") return { messages: await readTranscript(config.directory) };
   if (method === "steer" || method === "followUp") {
     // Pi queues these whether or not a run is active; an idle queue drains into the next run.
     const messages = params.message !== undefined ? userMessages(params.message) : undefined;
@@ -175,11 +250,16 @@ rpc.handler = async (method, params) => {
     if (method === "continue") await agent.continue();
     else if (promptMessages) await agent.prompt(promptMessages);
     else await agent.prompt(params.text, params.images);
-    await retryTransientErrors(active.signal);
+    await recoverFailedResponses(active.signal);
     if (persistenceError) throw persistenceError;
     await transcript.setActive(false);
-    return { messages: transcript.messages.length, error: agent.state.errorMessage ?? null };
+    return { messages: transcript.total, error: agent.state.errorMessage ?? null };
   } finally {
+    // Release what compaction folded away: the next run starts from summary + kept messages.
+    if (method !== "execute" && !persistenceError) {
+      agent.state.messages = transcript.view();
+      dropped = new WeakSet();
+    }
     await rpc.request("cancel-tools");
     active = undefined;
     busy = false;

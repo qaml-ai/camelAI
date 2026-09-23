@@ -53,7 +53,7 @@ test("transcript appends one record per message and imports a legacy snapshot on
   const transcript = new Transcript(fileAppendLog<TranscriptRecord>(join(root, "transcript.jsonl")));
   await transcript.load(join(root, "session.json"));
   assert.equal(transcript.active, true);
-  assert.equal(transcript.messages.length, 1);
+  assert.equal(transcript.total, 1);
   await transcript.setActive(false);
   await transcript.push({ role: "user", content: "next", timestamp: 2 });
   await transcript.push({ role: "assistant", content: [], stopReason: "error", errorMessage: "503", timestamp: 3 } as any);

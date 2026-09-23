@@ -10,9 +10,9 @@ test("context bounds discard whole older turns without mutating durable history"
     { role: "toolResult", toolCallId: "a", toolName: "read", content: [{ type: "text", text: "old result" }], timestamp: 2 },
     { role: "user", content: "Latest instruction", timestamp: 3 },
   ] as AgentMessage[];
-  assert.deepEqual(boundedContext(messages, 2000, ""), messages.slice(3));
+  assert.deepEqual(boundedContext(messages, 1024), messages.slice(3));
   assert.equal(messages.length, 4);
-  assert.throws(() => boundedContext(messages.slice(0, 3), 2000, ""), /current turn exceeds/);
+  assert.throws(() => boundedContext(messages.slice(0, 3), 1024), /current turn exceeds/);
 });
 
 test("interrupted-turn recovery preserves settled native results and marks only missing tool ids unknown", () => {

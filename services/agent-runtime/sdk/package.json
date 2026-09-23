@@ -1,30 +1,39 @@
 {
   "name": "@qaml-ai/agent-runtime",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "SDK for the camelAI hosted agent runtime: define tools in your app, and the runtime runs the model loop, history and sandbox.",
   "type": "module",
   "license": "UNLICENSED",
-  "repository": { "type": "git", "url": "git+https://github.com/qaml-ai/camelAI.git", "directory": "services/agent-runtime/sdk" },
-  "publishConfig": { "registry": "https://npm.pkg.github.com" },
-  "engines": { "node": ">=22" },
-  "exports": {
-    ".": { "types": "./dist/clients/typescript.d.ts", "default": "./dist/clients/typescript.js" },
-    "./node": { "types": "./dist/clients/node.d.ts", "default": "./dist/clients/node.js" }
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qaml-ai/camelAI.git",
+    "directory": "services/agent-runtime/sdk"
   },
-  "files": ["dist", "README.md"],
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/clients/typescript.d.ts",
+      "default": "./dist/clients/typescript.js"
+    },
+    "./node": {
+      "types": "./dist/clients/node.d.ts",
+      "default": "./dist/clients/node.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "typebox": "1.1.38"
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-agent-core": "0.80.6",
-    "@earendil-works/pi-ai": "0.80.6"
-  },
-  "peerDependenciesMeta": {
-    "@earendil-works/pi-agent-core": { "optional": true },
-    "@earendil-works/pi-ai": { "optional": true }
   }
 }

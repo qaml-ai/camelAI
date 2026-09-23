@@ -115,9 +115,8 @@ export class ServiceAgent extends Agent {
     for (const name of Object.keys(this.client.tools)) if (!Object.hasOwn(tools, name)) delete this.client.tools[name];
     await this.client.configure({ systemPrompt: this.state.systemPrompt, tools, thinkingLevel: this.state.thinkingLevel });
     // Refresh from the service, never upload a DO-mutated transcript after import.
-    const history = await this.client.history();
-    if (history.interrupted) throw new Error('Agent service needs explicit interruption reconciliation before continuing');
-    this.mirror.messages = history.messages;
+    // The service closes an interrupted turn itself when the agent restarts; no gate here.
+    this.mirror.messages = (await this.client.history()).messages;
     this.controller!.signal.throwIfAborted();
     this.requestId = crypto.randomUUID();
     // Persist before submission: an uncertain response must never create a second run.

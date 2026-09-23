@@ -86,7 +86,7 @@ class PythonSDKTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(result["output"][0]), {"saved": "hold"})
         self.assertEqual(len(writes), 2)
         self.assertNotEqual(writes[0][1], writes[1][1])
-        self.assertFalse((await agent.outcomes())["needsReconciliation"])
+        self.assertTrue(all(call["state"] == "completed" for call in (await agent.outcomes())["calls"]))
         await agent.destroy()
 
 

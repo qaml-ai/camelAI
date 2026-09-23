@@ -45,7 +45,7 @@ export interface CreateAgentOptions extends AgentOptions {
   thinkingLevel?: ThinkingLevel;
   initialMessages?: AgentMessage[];
 }
-export interface AgentHistory { messages: AgentMessage[]; interrupted: boolean }
+export interface AgentHistory { messages: AgentMessage[] }
 export interface RequestOptions { idempotencyKey?: string; timeoutMs?: number }
 export class AgentError extends Error {
   status: number;
@@ -228,8 +228,12 @@ export class AgentClient {
               const id = Number(lines.find(line => line.startsWith("id:"))?.slice(3));
               if (!Number.isSafeInteger(id) || id <= 0) throw new AgentError("Invalid SSE cursor");
               if (id <= this.journal.cursor) continue;
-              await this.receive(JSON.parse(data));
-              this.journal.cursor = id; await this.save();
+              const event = JSON.parse(data) as ClientEvent;
+              await this.receive(event);
+              this.journal.cursor = id;
+              // Display events are replayable only from the host's memory; persisting the
+              // cursor for each one would cost a storage write per streamed token.
+              if (event.type !== "event") await this.save();
             }
             if (byteLength(buffer) > FRAME_BYTES) throw new AgentError("SSE frame too large");
           }
@@ -286,9 +290,9 @@ export class AgentClient {
       await this.http(`/calls/${call.id}/outcome`, "POST", receipt.outcome);
       this.delivered.add(call.id); return;
     }
-    if (call.state === "uncertain") return; // Explicit reconciliation, never execute again.
+    if (call.state === "uncertain") return; // Already settled as unknown; never execute again.
     let value: Outcome;
-    if (call.state === "started") value = { error: "Client lost its execution outcome; reconciliation required", uncertain: true };
+    if (call.state === "started") value = { error: "The application lost this tool call's outcome; it may or may not have taken effect", uncertain: true };
     else {
       this.journal.calls[call.id] = { state: "started" }; await this.save();
       try {
@@ -363,8 +367,6 @@ export class AgentClient {
   continue(options?: RequestOptions) { return this.request("continue", {}, options); }
   steer(text: string) { return this.request("steer", { text }); }
   followUp(text: string) { return this.request("followUp", { text }); }
-  /** Explicitly acknowledge unknown effects from an interrupted tool call before continuing. */
-  reconcileHistory() { return this.request("reconcile", { acknowledged: true }); }
   async configure(options: { systemPrompt?: string; thinkingLevel?: ThinkingLevel; tools?: Tools }) {
     const result = await this.request("configure", { ...options, ...(options.tools ? { tools: definitions(options.tools) } : {}) });
     if (options.tools) {
@@ -380,8 +382,6 @@ export class AgentClient {
   abort() { return this.request("abort"); }
   requestStatus(id: string) { return this.http(`/requests/${encodeURIComponent(id)}`); }
   outcomes(): Promise<SessionState> { return this.http("/state"); }
-  reconcile(callId: string, verified: Outcome) { return this.http(`/calls/${encodeURIComponent(callId)}/reconcile`, "POST", verified, false); }
-  acknowledgeRequest(requestId: string) { return this.http(`/requests/${encodeURIComponent(requestId)}/reconcile`, "POST", { acknowledged: true }, false); }
 
   async close() {
     this.closed = true; this.stream?.abort();

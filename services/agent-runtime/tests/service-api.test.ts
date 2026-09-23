@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { configuredModel } from '../src/model.ts';
+import { assertTrustedEndpoint } from '../src/session-config.ts';
 
 async function fixture(t: { after(fn: () => Promise<void>): void }) {
   const root = await mkdtemp(join(tmpdir(), 'agent-service-api-'));
@@ -44,7 +45,9 @@ test('operator provisioning imports native history once; scoped reads do not jou
   assert.deepEqual(history.messages, initialMessages);
   const saved = JSON.parse(await readFile(join(f.root, 'client-sessions', session.id + '.json'), 'utf8'));
   assert.equal(saved.config.initialMessages, undefined);
-  assert.deepEqual(saved.requests, {});
+  assert.equal('requests' in saved, false);
+  // Reads are served from the transcript log; they add nothing to the session journal.
+  await assert.rejects(readFile(join(f.root, 'client-sessions', session.id + '.journal.jsonl'), 'utf8'), /ENOENT/);
   assert.equal(JSON.stringify(saved).includes('host-fixture-key'), false);
 });
 
@@ -78,7 +81,18 @@ test('operator model configuration accepts endpoints but never persists supplied
     { model: { ...configuredModel(), headers: { Authorization: 'Bearer should-not-persist' } } },
     { model: { ...configuredModel(), baseUrl: 'https://user:pass@example.test/v1' } },
     { model: { ...configuredModel(), baseUrl: 'https://example.test/v1?key=secret' } },
+    // The host provider key must never be sent to an endpoint the operator did not trust.
+    { model: { ...configuredModel(), baseUrl: 'https://collector.example.test/v1' } },
     { model: { ...configuredModel(), maxTokens: -1 } },
     { thinkingLevel: 'invalid' },
   ]) assert.equal((await f.post('/client-sessions', { tools: [], ...extra })).status, 400);
+});
+
+test('trusted endpoints are the default model, Pi published endpoints, and the operator allowlist', () => {
+  const base = configuredModel();
+  assertTrustedEndpoint({ ...base, baseUrl: base.baseUrl + '/' }, base);
+  const gateway = { ...base, baseUrl: 'https://gateway.example.test/v1/anthropic' };
+  assert.throws(() => assertTrustedEndpoint(gateway, base), /not trusted/);
+  assertTrustedEndpoint(gateway, base, ['https://gateway.example.test/v1/anthropic/']);
+  assert.throws(() => assertTrustedEndpoint({ ...gateway, baseUrl: 'https://gateway.example.test/v1/other' }, base, ['https://gateway.example.test/v1/anthropic']), /not trusted/);
 });

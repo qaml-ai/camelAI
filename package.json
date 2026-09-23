@@ -110,7 +110,7 @@
 		"test:e2e:staging-billing": "node scripts/run-staging-billing-e2e.mjs",
 		"publish:e2e:staging-billing": "E2E_REPORT_DIR=playwright-report-staging-billing node scripts/publish-e2e-report.mjs",
 		"build:renderer": "node scripts/build-notebook-renderer.mjs",
-		"test:agent-service-adapter": "tsc -p tests/tsconfig.agent-service.json && node --experimental-strip-types --test tests/agent-service-adapter.test.ts"
+		"test:agent-service-adapter": "tsc -p tests/tsconfig.agent-service.json && node --experimental-strip-types --test --test-timeout=30000 tests/agent-service-adapter.test.ts"
 	},
 	"dependencies": {
 		"@ai-sdk/react": "^3.0.204",

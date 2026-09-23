@@ -50,12 +50,12 @@ async function fixture(t: any, reply: (body: any) => any) {
   };
   t.after(async () => {
     for (const agent of agents) await agent.closeService();
-    sessions.close(); await supervisor.close();
+    await sessions.close(); await supervisor.close();
     for (const host of [server, provider]) { host.closeAllConnections(); await new Promise<void>(resolve => host.close(() => resolve())); }
     await rm(root, { recursive: true, force: true });
   });
   return { create, get supervisor() { return supervisor; }, async restartService() {
-    sessions.close(); await supervisor.close();
+    await sessions.close(); await supervisor.close();
     supervisor = new AgentSupervisor(join(root, "agents"));
     sessions = new ClientSessions(supervisor, { root: join(root, "sessions"), secret: token, apiKey: "fixture", toolTimeoutMs: 5000 });
   }, get requestId() { return requestId; }, get credentials() { return credentials!; } };
@@ -204,7 +204,7 @@ test("host restart surfaces interrupted execution without silently repeating the
   const saved = f.requestId;
   await f.restartService(); release.resolve();
   const next = f.create(); await next.connectService();
-  await assert.rejects(next.resumeServiceRun(), /Host stopped during execution; reconcile before retrying/);
+  await assert.rejects(next.resumeServiceRun(), /The runtime stopped during this request/);
   assert.equal(calls, 1); assert.equal(f.requestId, saved);
   await assert.rejects(next.prompt("Retry"), /existing service request/);
   assert.equal(calls, 1);

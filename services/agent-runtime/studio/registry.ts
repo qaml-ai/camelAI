@@ -44,7 +44,7 @@ export function snapshotAgent(snapshot: RegistrySnapshot, previous: Run[]): Agen
       const outcome = request.outcome;
       const result = outcome?.result as any;
       run.error = outcome?.error ?? result?.error;
-      if (run.status !== 'cancelled') run.status = request.state === 'uncertain' ? 'interrupted' : run.error ? 'failed' : 'completed';
+      if (run.status !== 'cancelled') run.status = request.outcome?.uncertain ? 'interrupted' : run.error ? 'failed' : 'completed';
       run.ended = request.endedAt ?? run.ended ?? Date.now();
       if (!run.answer && request.method === 'execute') run.answer = JSON.stringify(result ?? outcome ?? {}, null, 2);
     }

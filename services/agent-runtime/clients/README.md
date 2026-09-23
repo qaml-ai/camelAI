@@ -55,10 +55,10 @@ environment variables. `save(sessionId, journal)` must resolve only after commit
 
 Keep `agent.session` in secret storage and reconnect with
 `runtime.connectAgent(credentials, { tools, onEvent })`. An async
-`onEvent(event, requestId)` finishes before its replay cursor is committed.
+`onEvent(event, requestId)` finishes before the SDK moves past its event.
 `history()`, `continue()`, `steer(text)`, `followUp(text)`, and `configure(...)`
-operate on the same persistent agent. `reconcileHistory()` explicitly acknowledges
-unknown tool effects after interruption; it does not replay those effects.
+operate on the same persistent agent. `steer` and `followUp` are accepted while
+the agent is idle and delivered to its next run.
 
 ## Python
 
@@ -169,7 +169,6 @@ bun services/agent-runtime/examples/release-board.ts --prompt \
 | `agent.status()` / `agent.abort()` | Same | Inspect or cancel a turn |
 | `agent.outcomes()` | Same | Inspect recorded requests and tool outcomes |
 | `agent.requestStatus(id)` | `agent.request_status(id)` | Recover a timed-out request's result |
-| `agent.reconcile(callId, {result})` | `agent.reconcile(call_id, {"result": value})` | Record an explicitly verified uncertain tool outcome |
 | `agent.close()` | Same | Disconnect locally, retain hosted agent |
 | `agent.destroy()` | Same | Revoke the session and stop its agent |
 
@@ -188,11 +187,13 @@ application, keep the agent connected across multiple prompts.
 
 ## What reconnects guarantee
 
-The host persists numbered events and replays them using `Last-Event-ID`. Both
-SDKs reconnect with backoff and retain their cursors. A bounded replay window
-holds up to 512 events / approximately 2 MiB; if the cursor falls behind it,
+The host numbers events and replays them from memory using `Last-Event-ID`.
+Both SDKs reconnect with backoff. A bounded replay window holds up to 512 events
+/ approximately 2 MiB; if the cursor falls behind it, or the host restarted,
 SDKs recover requests/tool calls from saved session state and emit `replay_gap`.
-Old display events outside that window are not reconstructed.
+Display events (token deltas, progress) outside that window are not
+reconstructed, and SDKs persist their cursor only for tool calls and responses,
+never once per streamed token.
 
 A tool must obtain a **one-time execution claim** before running. The SDK saves
 its result locally before POSTing it. If the result acknowledgement is lost, it
@@ -200,11 +201,13 @@ resends that saved result. Replayed events do not re-execute a completed tool.
 A brief SSE disconnect leaves already-running callbacks and their HTTP uploads
 active, so it doesn't automatically turn a successful write into a failure.
 
-If a client dies after starting a tool but before saving its result, the runtime
-cannot know whether the side effect happened. It marks the call uncertain and
-blocks further execution until the application checks the real state and uses
-`reconcile()`. Late results are retained as evidence; they do not silently unblock
-an uncertain turn. Timeouts and cancellation are not rollback.
+If a client dies after starting a tool but before saving its result, or a tool
+times out after being claimed, the runtime cannot know whether the side effect
+happened. It settles the call as `uncertain` and gives the model an explicit
+"outcome unknown" result, so the turn continues and the model can check the
+real state before repeating anything. Nothing waits for an operator. A result
+that arrives later is kept as `lateOutcome` evidence and published as a
+`tool_late_outcome` event. Timeouts and cancellation are not rollback.
 
 This is **not an exactly-once transaction across the SDK and your database**.
 Business authorization, transactional writes, and application idempotency stay
@@ -215,22 +218,23 @@ execution. Keep handlers and schemas trusted.
 
 ## Persistence and prototype limits
 
-- Host journals use atomic, fsynced JSON files under `AGENT_DATA_DIR/client-sessions`.
+- Host journals are append-only logs under `AGENT_DATA_DIR/client-sessions`,
+  fsynced when a request is accepted, a tool call is claimed, and an outcome
+  is recorded.
   SDK receipts/cursors default to `.agent-runtime/client-sdk`, configurable with
   `stateDirectory` / `state_directory` or `AGENT_CLIENT_STATE_DIR`. Use persistent,
   application-owned directories. Do not share one SDK journal between concurrent
   application processes.
-- Settled sessions and deduplication records survive a host restart with the same
-  data directory and operator secret. An interrupted model turn still uses the
-  existing conservative transcript-reconciliation policy. Acknowledging an
-  uncertain request with `acknowledgeRequest` / `acknowledge_request` does not
-  repair an interrupted Pi transcript or rerun the turn.
+- Sessions and deduplication records survive a host restart with the same data
+  directory and operator secret. A request that was running when the host died
+  completes with an `uncertain` error; the interrupted turn is closed with
+  "outcome unknown" results when the agent next starts, and is never rerun.
 - Session credentials expire after 24 hours and can be revoked via `destroy()`.
-  There is no renewal or automatic cleanup policy yet. The prototype retains up
-  to 128 sessions, 1,024 request records and 1,024 tool records per session, and a
-  32 MiB session journal ceiling. It refuses additional work instead of deleting
-  deduplication evidence. This file store is intended for small prototypes, not
-  distributed hosting or high-volume event ingestion.
+  There is no renewal or automatic cleanup policy yet. Sessions load lazily and
+  unload when idle. Once a journal grows, settled records are folded away,
+  keeping the most recent 256 requests and 256 tool calls for idempotent
+  retries; retrying an older request ID starts it again. This file store is
+  local to one host, not distributed hosting.
 - Tool calls default to a 15-second deadline. The existing sandbox, schema,
   argument, result and concurrency limits remain enforced. JSON frames are
   capped at 1.1 MB, with bounded SSE output buffering and no event compression.
@@ -240,8 +244,8 @@ execution. Keep handlers and schemas trusted.
   separate work. No browser or production application route has been switched.
 
 The wire transport is ordinary HTTP: `GET /clients/:id/events` streams SSE;
-`POST /clients/:id/requests` accepts idempotent requests; call-specific `claim`,
-`outcome`, and `reconcile` endpoints manage execution. Application code should
+`POST /clients/:id/requests` accepts idempotent requests; call-specific `claim` and
+`outcome` endpoints manage execution. Application code should
 use the SDK rather than implement this protocol itself.
 
 Validation: `bun run test:agent-runtime` covers the host and TypeScript SDK;

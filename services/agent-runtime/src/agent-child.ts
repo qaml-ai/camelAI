@@ -1,26 +1,23 @@
-import { mkdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
+import { mkdir } from "node:fs/promises";
+import { setTimeout as sleep } from "node:timers/promises";
+import { Agent, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
+import { isContextOverflow, isRetryableAssistantError, type AssistantMessage } from "@earendil-works/pi-ai";
 import { parentRpc } from "./rpc.ts";
 import { executeCode } from "./codemode.ts";
-import type { AgentConfig, Snapshot, ToolBridge } from "./protocol.ts";
+import type { AgentConfig, ToolBridge } from "./protocol.ts";
 import { buildSystemPrompt } from "./system-prompt.ts";
-import { writeDurableJson } from "../shared/durable-json.ts";
-import { boundedContext, reconcileMessages, validateInitialMessages } from "./history.ts";
-import { codeRequest } from "./limits.ts";
+import { fileAppendLog } from "../shared/append-log.ts";
+import { Transcript, legacySnapshotPath, transcriptPath, type TranscriptRecord } from "./transcript.ts";
+import { boundedContext, recoverInterruptedTurn, validateInitialMessages, validateUserMessages } from "./history.ts";
+import { codeRequest, DEFAULT_RETRY } from "./limits.ts";
 
 const rpc = parentRpc(() => process.kill(-process.pid, "SIGKILL"));
 let agent: Agent | undefined;
 let config: AgentConfig;
+let transcript: Transcript;
 let busy = false;
 let active: AbortController | undefined;
-let snapshot: Snapshot = { version: 1, active: false, messages: [] };
 let persistenceError: unknown;
-
-async function checkpoint() {
-  const path = join(config.directory, "session.json");
-  writeDurableJson(path, snapshot);
-}
 
 function bridge(signal: AbortSignal): ToolBridge {
   return {
@@ -50,18 +47,52 @@ function directAgentTools(tools: AgentConfig["tools"]): AgentTool[] {
     }));
 }
 
+function userMessages(value: unknown): AgentMessage[] {
+  const messages = (Array.isArray(value) ? value : [value]) as AgentMessage[];
+  validateUserMessages(messages);
+  return messages;
+}
+
+/** Retry transient provider failures by retracting the error and continuing the same turn. */
+async function retryTransientErrors(signal: AbortSignal) {
+  const policy = config.retry ?? DEFAULT_RETRY;
+  for (let attempt = 1; ; attempt++) {
+    const last = agent!.state.messages.at(-1) as AssistantMessage | undefined;
+    if (signal.aborted || !last || last.role !== "assistant" || last.stopReason !== "error") return;
+    if (isContextOverflow(last, config.model.contextWindow) || !isRetryableAssistantError(last)) return;
+    if (attempt > policy.maxAttempts) {
+      rpc.send({ type: "event", event: { type: "auto_retry_end", success: false, attempt: attempt - 1, finalError: last.errorMessage } });
+      return;
+    }
+    const delayMs = policy.baseDelayMs * 2 ** (attempt - 1);
+    rpc.send({ type: "event", event: { type: "auto_retry_start", attempt, maxAttempts: policy.maxAttempts, delayMs, errorMessage: last.errorMessage ?? "Unknown error" } });
+    // The failed attempt is not history: drop it from the log and the live state.
+    await transcript.retract();
+    agent!.state.messages = agent!.state.messages.slice(0, -1);
+    try { await sleep(delayMs, undefined, { signal }); }
+    catch { return; }
+    await agent!.continue();
+    if ((agent!.state.messages.at(-1) as AssistantMessage | undefined)?.stopReason !== "error") {
+      rpc.send({ type: "event", event: { type: "auto_retry_end", success: true, attempt } });
+    }
+  }
+}
+
 rpc.handler = async (method, params) => {
   if (method === "init") {
     if (agent) throw new Error("Agent already initialized");
     config = params;
     await mkdir(config.directory, { recursive: true, mode: 0o700 });
-    try { snapshot = JSON.parse(await readFile(join(config.directory, "session.json"), "utf8")); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    if (snapshot.version !== 1 || !Array.isArray(snapshot.messages)) throw new Error("Invalid session snapshot");
-    if (!snapshot.active && snapshot.messages.length === 0 && config.initialMessages?.length) {
+    transcript = new Transcript(fileAppendLog<TranscriptRecord>(transcriptPath(config.directory)));
+    await transcript.load(legacySnapshotPath(config.directory));
+    let recovered = false;
+    if (transcript.active) {
+      // Close the interrupted turn instead of refusing work until an operator intervenes.
+      await transcript.replace(recoverInterruptedTurn(transcript.messages), false);
+      recovered = true;
+    } else if (transcript.messages.length === 0 && config.initialMessages?.length) {
       validateInitialMessages(config.initialMessages);
-      snapshot.messages = config.initialMessages;
-      await checkpoint();
+      await transcript.replace(config.initialMessages);
     }
     const directTools = directAgentTools(config.tools);
     const jsExec: AgentTool = {
@@ -89,7 +120,7 @@ rpc.handler = async (method, params) => {
       initialState: {
         model: config.model,
         systemPrompt: buildSystemPrompt(config.systemPrompt),
-        tools: [jsExec, ...directTools], messages: snapshot.messages,
+        tools: [jsExec, ...directTools], messages: [...transcript.messages],
         thinkingLevel: config.thinkingLevel ?? "off",
       },
       getApiKey: () => config.apiKey,
@@ -103,18 +134,16 @@ rpc.handler = async (method, params) => {
     });
     agent.subscribe(async event => {
       if (event.type === "message_end") {
-        // Keep native Pi messages intact, including reasoning/signatures and
-        // ordered tool results. Never round-trip through browser render history.
-        snapshot.messages.push(event.message);
-        try { await checkpoint(); }
+        // One durable append per finished message. Streaming deltas are never persisted.
+        try { await transcript.push(event.message); }
         catch (error) { persistenceError = error; agent!.abort(); throw error; }
       }
       rpc.send({ type: "event", event });
     });
-    return { pid: process.pid, interrupted: snapshot.active, messages: snapshot.messages.length };
+    return { pid: process.pid, recovered, messages: transcript.messages.length };
   }
   if (!agent) throw new Error("Agent is not initialized");
-  if (method === "status") return { pid: process.pid, busy, interrupted: snapshot.active && !busy, messages: snapshot.messages.length };
+  if (method === "status") return { pid: process.pid, busy, messages: transcript.messages.length };
   if (method === "configure") {
     if (busy) throw new Error("Agent is busy");
     if (params.systemPrompt !== undefined) { config.systemPrompt = params.systemPrompt; agent.state.systemPrompt = buildSystemPrompt(params.systemPrompt); }
@@ -124,51 +153,32 @@ rpc.handler = async (method, params) => {
     if (params.tools !== undefined) { config.tools = params.tools; agent.state.tools = [agent.state.tools.find(tool => tool.name === "js_exec")!, ...directAgentTools(config.tools)]; }
     return { configured: true };
   }
-  if (method === "history") return { messages: snapshot.messages, interrupted: snapshot.active && !busy };
-  if (method === "reconcile") {
-    if (busy) throw new Error("Agent is busy");
-    if (params.acknowledged !== true) throw new Error("Acknowledge interrupted effects before reconciliation");
-    if (snapshot.active) {
-      snapshot.messages = reconcileMessages(snapshot.messages);
-      snapshot.active = false;
-      try { await checkpoint(); } catch (error) { snapshot.active = true; persistenceError = error; throw error; }
-      agent.state.messages = snapshot.messages;
-    }
-    return { reconciled: true, messages: snapshot.messages.length };
-  }
+  if (method === "history") return { messages: transcript.messages };
   if (method === "steer" || method === "followUp") {
-    if (!busy) throw new Error("Agent is not running; send a prompt instead");
-    if (params.message !== undefined) {
-      validateInitialMessages([params.message]);
-      agent[method](params.message);
-    } else {
-      if (typeof params.text !== "string" || !params.text.trim()) throw new Error("Prompt text is required");
-      agent[method]({ role: "user", content: params.text, timestamp: Date.now() });
-    }
-    return { queued: true };
+    // Pi queues these whether or not a run is active; an idle queue drains into the next run.
+    const messages = params.message !== undefined ? userMessages(params.message) : undefined;
+    if (!messages && (typeof params.text !== "string" || !params.text.trim())) throw new Error("Prompt text is required");
+    for (const message of messages ?? [{ role: "user", content: params.text, timestamp: Date.now() } as AgentMessage]) agent[method](message);
+    return { queued: true, running: busy };
   }
   if (method === "abort") { active?.abort(); agent.abort(); return { aborted: true }; }
   if (method !== "prompt" && method !== "execute" && method !== "continue") throw new Error(`Unknown method: ${method}`);
   if (busy) throw new Error("Agent is busy");
-  if (persistenceError) throw new Error("Session persistence failed; restart and inspect session.json");
-  if (snapshot.active) throw new Error("Interrupted turn needs reconciliation; inspect session.json before resuming side effects");
+  if (persistenceError) throw new Error(`Session persistence failed: ${String(persistenceError)}`);
   if (method === "prompt" && params.message === undefined && (typeof params.text !== "string" || !params.text.trim())) throw new Error("Prompt text is required");
+  const promptMessages = method === "prompt" && params.message !== undefined ? userMessages(params.message) : undefined;
   busy = true;
   active = new AbortController();
   try {
     if (method === "execute") return await executeCode({ ...codeRequest(params), directory: config.directory, bridge: bridge(active.signal), signal: active.signal, onEvent: event => rpc.send({ type: "event", event }) });
-    snapshot.active = true;
-    await checkpoint();
+    await transcript.setActive(true);
     if (method === "continue") await agent.continue();
-    else if (params.message !== undefined) {
-      validateInitialMessages(Array.isArray(params.message) ? params.message : [params.message]);
-      await agent.prompt(params.message);
-    } else await agent.prompt(params.text, params.images);
+    else if (promptMessages) await agent.prompt(promptMessages);
+    else await agent.prompt(params.text, params.images);
+    await retryTransientErrors(active.signal);
     if (persistenceError) throw persistenceError;
-    snapshot.messages = [...agent.state.messages];
-    snapshot.active = false;
-    await checkpoint();
-    return { messages: snapshot.messages.length, error: agent.state.errorMessage ?? null };
+    await transcript.setActive(false);
+    return { messages: transcript.messages.length, error: agent.state.errorMessage ?? null };
   } finally {
     await rpc.request("cancel-tools");
     active = undefined;

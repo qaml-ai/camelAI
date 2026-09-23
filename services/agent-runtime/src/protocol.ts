@@ -22,11 +22,8 @@ export interface AgentConfig {
   tools: ToolDefinition[];
   initialMessages?: AgentMessage[];
   thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-}
-export interface Snapshot {
-  version: 1;
-  active: boolean;
-  messages: AgentMessage[];
+  /** Host policy for retrying transient provider errors. */
+  retry?: { maxAttempts: number; baseDelayMs: number };
 }
 export type WireMessage =
   | { type: "request"; id: string; method: string; params: any }

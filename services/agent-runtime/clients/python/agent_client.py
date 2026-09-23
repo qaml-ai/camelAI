@@ -222,9 +222,12 @@ class AgentClient:
                             cursor = int(next(line[3:] for line in lines if line.startswith("id:")))
                             if cursor <= self.journal["cursor"]:
                                 continue
-                            self._receive(json.loads(data))
+                            event = json.loads(data)
+                            self._receive(event)
                             self.journal["cursor"] = cursor
-                            self._save()
+                            # Display events replay only from host memory; don't write per token.
+                            if event.get("type") != "event":
+                                self._save()
                         if len(buffer) > 1_100_000:
                             raise AgentError("SSE frame too large")
             except asyncio.CancelledError:
@@ -295,7 +298,7 @@ class AgentClient:
         if call["state"] == "uncertain":
             return
         if call["state"] == "started":
-            value = {"error": "Client lost its execution outcome; reconciliation required", "uncertain": True}
+            value = {"error": "The application lost this tool call's outcome; it may or may not have taken effect", "uncertain": True}
         else:
             self.journal["calls"][call_id] = {"state": "started"}
             self._save()
@@ -376,14 +379,6 @@ class AgentClient:
     async def request_status(self, request_id):
         from urllib.parse import quote
         return await self._http(f"/requests/{quote(request_id, safe='')}")
-
-    async def reconcile(self, call_id, verified_outcome):
-        from urllib.parse import quote
-        return await self._http(f"/calls/{quote(call_id, safe='')}/reconcile", "POST", verified_outcome, retry=False)
-
-    async def acknowledge_request(self, request_id):
-        from urllib.parse import quote
-        return await self._http(f"/requests/{quote(request_id, safe='')}/reconcile", "POST", {"acknowledged": True}, retry=False)
 
     async def close(self):
         if self.closed:

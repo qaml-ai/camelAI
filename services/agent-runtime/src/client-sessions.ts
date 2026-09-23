@@ -7,34 +7,48 @@ import { errorText } from "./protocol.ts";
 import type { AgentSupervisor } from "./supervisor.ts";
 import { configurationUpdate } from "./session-config.ts";
 import { validateDefinitions } from "./tool-policy.ts";
+import { validateUserMessages } from "./history.ts";
+import { readTranscript } from "./transcript.ts";
 import { writeDurableJson, canonical } from "../shared/durable-json.ts";
+import { fileAppendLog, type AppendLog } from "../shared/append-log.ts";
 import { FRAME_BYTES, type CallRecord, type ClientEvent, type Outcome, type RequestRecord } from "../shared/client-protocol.ts";
-
 import { agentMetadata, type AgentMetadata } from "../shared/agent-metadata.ts";
 
 class HttpError extends Error {
   status: number;
   constructor(status: number, message: string) { super(message); this.status = status; }
 }
-interface SavedSession {
-  metadata?: AgentMetadata;
-  version: 2; id: string; digest: string; expiresAt: number; revoked: boolean;
-  definitions: ToolDefinition[]; provisionHash: string;
-  config: Omit<AgentConfig, "id" | "directory" | "tools" | "apiKey">;
-  cursor: number; events: { id: number; at?: number; data: ClientEvent }[];
-  calls: Record<string, CallRecord>; requests: Record<string, RequestRecord>;
+type SessionConfig = Omit<AgentConfig, "id" | "directory" | "tools" | "apiKey">;
+/** Rarely-changing session identity and configuration; rewritten only when it changes. */
+interface SessionHeader {
+  version: 3; id: string; digest: string; expiresAt: number; revoked: boolean;
+  metadata?: AgentMetadata; definitions: ToolDefinition[]; provisionHash: string; config: SessionConfig;
 }
+/** Upserts of request and tool-call records, appended as their state changes. */
+type JournalRecord = { t: "request"; record: RequestRecord } | { t: "call"; record: CallRecord };
+type BufferedEvent = { id: number; bytes: number; data: ClientEvent };
 type Session = {
-  saved: SavedSession; response?: ServerResponse; starting?: Promise<unknown>;
+  header: SessionHeader;
+  requests: Map<string, RequestRecord>;
+  calls: Map<string, CallRecord>;
+  log: AppendLog<JournalRecord>;
+  /** Streamed events live only in memory; durable state is recovered through /state. */
+  cursor: number; events: BufferedEvent[]; eventBytes: number;
+  response?: ServerResponse; starting?: Promise<unknown>;
   pending: Map<string, (outcome: Outcome) => void>;
   fault?: Error;
+  lastActive: number;
 };
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const validId = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9_-]{1,80}$/.test(value);
+const validSessionId = (value: string) => /^client_[a-f0-9]{40}$/.test(value);
 const has = (object: object, key: string) => Object.hasOwn(object, key);
-const MAX_RECORDS = 1024;
 const RUN_METHODS = ["prompt", "execute", "continue"];
-const REQUEST_METHODS = [...RUN_METHODS, "status", "abort", "history", "steer", "followUp", "reconcile", "configure"];
+const REQUEST_METHODS = [...RUN_METHODS, "status", "abort", "history", "steer", "followUp", "configure"];
+/** Settled records kept for idempotent retries once the journal is folded. */
+const RETAINED_SETTLED = 256;
+const FOLD_AFTER_RECORDS = 2048;
+const MAX_BUFFERED_EVENTS = 512;
 
 export async function readJson(req: IncomingMessage, maximum = FRAME_BYTES) {
   const chunks: Buffer[] = [];
@@ -59,99 +73,203 @@ function outcome(value: any): Outcome {
   }
   throw new HttpError(400, "Supply either result or error");
 }
+const settled = (state: string) => !["running", "offered", "started"].includes(state);
 
-/** SSE carries durable events; POST mutations use persistent request/call IDs. */
+export interface ClientSessionOptions {
+  root: string; secret: string; apiKey?: string; toolTimeoutMs?: number; ttlMs?: number; eventBytes?: number;
+  /** Stop an agent's process, and unload its session, after this long without activity. */
+  idleMs?: number;
+  retry?: AgentConfig["retry"];
+}
+
+/**
+ * SSE carries streamed events; POST mutations use persistent request/call IDs.
+ * Sessions load lazily and unload when idle, so only active agents use memory.
+ */
 export class ClientSessions {
   readonly sessions = new Map<string, Session>();
+  private readonly loading = new Map<string, Promise<Session | undefined>>();
   readonly supervisor: AgentSupervisor;
-  readonly options: { root: string; secret: string; apiKey?: string; toolTimeoutMs?: number; ttlMs?: number; eventBytes?: number };
+  readonly options: ClientSessionOptions;
   readonly heartbeat: ReturnType<typeof setInterval>;
   private closed = false;
 
-  constructor(supervisor: AgentSupervisor, options: ClientSessions["options"]) {
+  constructor(supervisor: AgentSupervisor, options: ClientSessionOptions) {
     this.supervisor = supervisor;
     this.options = options;
     mkdirSync(options.root, { recursive: true, mode: 0o700 });
-    for (const name of readdirSync(options.root).filter(name => /^client_[a-f0-9]{40}\.json$/.test(name))) {
-      const saved = JSON.parse(readFileSync(join(options.root, name), "utf8")) as SavedSession;
-      if (saved.version !== 2 || saved.id + ".json" !== name) throw new Error("Invalid client session journal");
-      const session: Session = { saved, pending: new Map() };
-      this.sessions.set(saved.id, session);
-      // A dead host cannot assert the outcome of an accepted turn or claimed tool.
-      for (const request of Object.values(saved.requests)) if (request.state === "running") {
-        request.state = "uncertain";
-        request.outcome = { error: "Host restarted during request; reconcile before retrying", uncertain: true };
-      }
-      for (const call of Object.values(saved.calls)) {
-        if (call.state === "started") { call.state = "uncertain"; call.outcome = { error: "Host restarted during tool execution", uncertain: true }; }
-        else if (call.state === "offered") { call.state = "cancelled"; call.outcome = { error: "Host restarted before execution claim" }; }
-      }
-      this.save(session);
-    }
-    this.heartbeat = setInterval(() => {
-      for (const session of this.sessions.values()) {
-        if (!session.saved.revoked && session.saved.expiresAt <= Date.now()) {
-          this.remove(session.saved.id);
-          void supervisor.stop(session.saved.id).catch(() => {});
-        } else if (session.response && !session.response.write(": heartbeat\n\n")) session.response.destroy();
-      }
-    }, 5000);
+    this.heartbeat = setInterval(() => this.tick(), Math.min(5000, Math.max(50, Math.floor((options.idleMs ?? 5 * 60_000) / 2))));
     this.heartbeat.unref();
   }
 
-  private save(session: Session) {
+  private headerPath(id: string) { return join(this.options.root, `${id}.json`); }
+  private journalPath(id: string) { return join(this.options.root, `${id}.journal.jsonl`); }
+
+  private readHeader(id: string): SessionHeader | undefined {
+    if (!validSessionId(id)) return undefined;
+    try { return JSON.parse(readFileSync(this.headerPath(id), "utf8")); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  }
+
+  private writeHeader(session: Session) {
     if (session.fault) throw session.fault;
-    try {
-      if (Buffer.byteLength(JSON.stringify(session.saved)) > 32 * 1024 * 1024) throw new Error("Session journal full; create a new agent after reconciliation");
-      writeDurableJson(join(this.options.root, `${session.saved.id}.json`), session.saved);
-    } catch (error) {
-      // A failed disk commit must never turn into a successful retry from RAM.
-      session.fault = new Error(`Session persistence failed: ${errorText(error)}`);
-      session.response?.destroy();
-      for (const finish of session.pending.values()) finish({ error: session.fault.message, uncertain: true });
-      throw session.fault;
+    try { writeDurableJson(this.headerPath(session.header.id), session.header); }
+    catch (error) { this.fail(session, error); throw session.fault; }
+  }
+
+  private load(id: string): Promise<Session | undefined> {
+    const loaded = this.sessions.get(id);
+    if (loaded) return Promise.resolve(loaded);
+    let loading = this.loading.get(id);
+    if (!loading) {
+      loading = this.read(id).finally(() => this.loading.delete(id));
+      this.loading.set(id, loading);
     }
+    return loading;
+  }
+
+  private async read(id: string): Promise<Session | undefined> {
+    let header = this.readHeader(id) as any;
+    if (!header) return undefined;
+    const log = fileAppendLog<JournalRecord>(this.journalPath(id));
+    const session: Session = {
+      header, requests: new Map(), calls: new Map(), log,
+      // Cursors restart above any cursor from an earlier process, so clients see a gap, never a repeat.
+      cursor: Date.now() * 1000, events: [], eventBytes: 0, pending: new Map(), lastActive: Date.now(),
+    };
+    if (header.version === 2) {
+      // Version 2 rewrote requests, calls and buffered events into this header on every event.
+      for (const record of Object.values(header.requests ?? {}) as RequestRecord[]) session.requests.set(record.id, record);
+      for (const record of Object.values(header.calls ?? {}) as CallRecord[]) session.calls.set(record.id, record);
+      const { requests: _requests, calls: _calls, events: _events, cursor: _cursor, ...rest } = header;
+      session.header = header = { ...rest, version: 3 };
+      await log.rewrite(() => this.snapshot(session));
+      this.writeHeader(session);
+    } else {
+      for (const record of await log.read()) this.apply(session, record);
+    }
+    if (header.version !== 3 || header.id !== id) throw new Error("Invalid client session header");
+    // Loading means no process in this host owns the session, so nothing it recorded is still running.
+    for (const request of session.requests.values()) if (request.state === "running") {
+      this.upsertRequest(session, { ...request, state: "completed", endedAt: Date.now(), outcome: { error: "The runtime restarted during this request", uncertain: true } });
+    }
+    for (const call of session.calls.values()) {
+      if (call.state === "started") this.upsertCall(session, { ...call, state: "uncertain", outcome: { error: "The runtime restarted during this tool call; its outcome is unknown", uncertain: true } });
+      else if (call.state === "offered") this.upsertCall(session, { ...call, state: "cancelled", outcome: { error: "The runtime restarted before this tool call was claimed" } });
+    }
+    await log.flush(true);
+    this.sessions.set(id, session);
+    return session;
+  }
+
+  private apply(session: Session, entry: JournalRecord) {
+    if (entry.t === "request") session.requests.set(entry.record.id, entry.record);
+    else if (entry.t === "call") session.calls.set(entry.record.id, entry.record);
+  }
+
+  private snapshot(session: Session): JournalRecord[] {
+    return [
+      ...[...session.requests.values()].map(record => ({ t: "request" as const, record })),
+      ...[...session.calls.values()].map(record => ({ t: "call" as const, record })),
+    ];
+  }
+
+  private upsertRequest(session: Session, record: RequestRecord) {
+    session.requests.set(record.id, record);
+    session.log.append({ t: "request", record });
+    return record;
+  }
+  private upsertCall(session: Session, record: CallRecord) {
+    session.calls.set(record.id, record);
+    session.log.append({ t: "call", record });
+    return record;
+  }
+
+  /** Write appended journal records. Durable flushes gate acknowledgements and side effects. */
+  private async commit(session: Session, durable: boolean) {
+    if (session.fault) throw session.fault;
+    try { await session.log.flush(durable); }
+    catch (error) { this.fail(session, error); throw session.fault; }
+  }
+  private commitLater(session: Session) { void this.commit(session, false).catch(() => {}); }
+
+  private fail(session: Session, error: unknown) {
+    if (session.fault) return;
+    // A failed disk commit must never turn into a successful retry from memory.
+    session.fault = new Error(`Session persistence failed: ${errorText(error)}`);
+    session.response?.destroy();
+    for (const finish of session.pending.values()) finish({ error: session.fault.message, uncertain: true });
+  }
+
+  /** Drop old settled records once the journal is long, keeping recent ones for idempotent retries. */
+  private async fold(session: Session) {
+    if (session.log.appendedSinceRewrite < FOLD_AFTER_RECORDS) return;
+    const prune = <T extends { id: string; state: string }>(records: Map<string, T>, at: (record: T) => number) => {
+      const old = [...records.values()].filter(record => settled(record.state)).sort((a, b) => at(a) - at(b));
+      for (const record of old.slice(0, Math.max(0, old.length - RETAINED_SETTLED))) records.delete(record.id);
+    };
+    prune(session.requests, record => record.endedAt ?? record.startedAt ?? 0);
+    prune(session.calls, record => record.createdAt ?? 0);
+    try { await session.log.rewrite(() => this.snapshot(session)); }
+    catch (error) { this.fail(session, error); }
   }
 
   private publish(session: Session, data: ClientEvent) {
     if (this.closed || session.fault) return;
-    if (Buffer.byteLength(JSON.stringify(data)) > FRAME_BYTES) {
+    let text = JSON.stringify(data);
+    if (Buffer.byteLength(text) > FRAME_BYTES) {
       // Control outcomes remain in the journal; oversized display events are explicit gaps.
       data = { type: "event", requestId: "", event: { type: "event_omitted", reason: "Event exceeded transport limit" } };
+      text = JSON.stringify(data);
     }
-    const record = { id: ++session.saved.cursor, at: Date.now(), data };
-    session.saved.events.push(record);
+    const event: BufferedEvent = { id: ++session.cursor, bytes: Buffer.byteLength(text), data };
+    session.events.push(event);
+    session.eventBytes += event.bytes;
+    session.lastActive = Date.now();
     const limit = this.options.eventBytes ?? 2 * 1024 * 1024;
-    while (session.saved.events.length > 1 && (session.saved.events.length > 512 || Buffer.byteLength(JSON.stringify(session.saved.events)) > limit)) session.saved.events.shift();
-    this.save(session);
+    while (session.events.length > 1 && (session.events.length > MAX_BUFFERED_EVENTS || session.eventBytes > limit)) session.eventBytes -= session.events.shift()!.bytes;
     const res = session.response;
     if (res && !res.destroyed) {
-      const frame = `id: ${record.id}\ndata: ${JSON.stringify(record.data)}\n\n`;
+      const frame = `id: ${event.id}\ndata: ${text}\n\n`;
       if (res.writableLength + Buffer.byteLength(frame) > 2 * FRAME_BYTES) res.destroy();
       else res.write(frame);
     }
   }
 
-  private blocked(session: Session) {
-    return Object.values(session.saved.calls).some(call => call.state === "uncertain") ||
-      Object.values(session.saved.requests).some(request => request.state === "uncertain");
+  private busy(session: Session) {
+    return !!session.starting || session.pending.size > 0 || [...session.requests.values()].some(request => request.state === "running");
+  }
+
+  /** Stop the least recently active idle agent process when the host is at capacity. */
+  private async makeRoom(except: string) {
+    while (this.supervisor.full) {
+      const idle = [...this.sessions.values()]
+        .filter(session => session.header.id !== except && this.supervisor.agents.has(session.header.id) && !this.busy(session))
+        .sort((a, b) => a.lastActive - b.lastActive)[0];
+      if (!idle) throw new HttpError(503, "Agent capacity reached; retry when another agent is idle");
+      await this.supervisor.stop(idle.header.id);
+    }
   }
 
   private ensureStarted(session: Session) {
-    if (this.closed || session.saved.revoked) return Promise.reject(new HttpError(410, "Session closed"));
+    if (this.closed || session.header.revoked) return Promise.reject(new HttpError(410, "Session closed"));
     if (session.fault) return Promise.reject(session.fault);
-    if (this.supervisor.agents.has(session.saved.id) && !session.starting) return Promise.resolve();
-    return session.starting ??= this.supervisor.start(session.saved.id, { ...session.saved.config, apiKey: this.options.apiKey }, {
-      definitions: session.saved.definitions,
-      call: (name, args, signal, context) => this.call(session, name, args, signal, context),
-    }).then(result => {
-      // Bootstrap history has been checkpointed by the runtime; keep only one authority.
-      if (session.saved.config.initialMessages !== undefined) {
-        delete session.saved.config.initialMessages;
-        this.save(session);
+    session.lastActive = Date.now();
+    if (this.supervisor.agents.has(session.header.id) && !session.starting) return Promise.resolve();
+    return session.starting ??= (async () => {
+      await this.makeRoom(session.header.id);
+      const result = await this.supervisor.start(session.header.id, { ...session.header.config, apiKey: this.options.apiKey, ...(this.options.retry ? { retry: this.options.retry } : {}) }, {
+        definitions: session.header.definitions,
+        call: (name, args, signal, context) => this.call(session, name, args, signal, context),
+      });
+      // Bootstrap history has been imported into the transcript; keep only one authority.
+      if (session.header.config.initialMessages !== undefined) {
+        delete session.header.config.initialMessages;
+        this.writeHeader(session);
       }
+      if (result.recovered) this.publish(session, { type: "event", requestId: "", event: { type: "turn_recovered", reason: "The runtime restarted during a turn; unresolved tool calls were marked unknown" } });
       return result;
-    }).finally(() => { session.starting = undefined; });
+    })().finally(() => { session.starting = undefined; });
   }
 
   async create(definitions: ToolDefinition[], config: Omit<AgentConfig, "id" | "directory" | "tools">, key: string = randomUUID(), metadata: AgentMetadata = {}) {
@@ -162,138 +280,145 @@ export class ClientSessions {
     const token = createHmac("sha256", this.options.secret).update(`client-v2:${key}`).digest("hex");
     const { apiKey: _key, ...safeConfig } = config;
     const provisionHash = hash(canonical({ definitions, config: safeConfig, ...(Object.keys(metadata).length ? { metadata } : {}) }));
-    let session = this.sessions.get(id);
+    let session = await this.load(id);
     if (session) {
-      if (session.saved.provisionHash !== provisionHash) throw new HttpError(409, "Idempotency key reused with different configuration");
-      if (session.saved.revoked || session.saved.expiresAt <= Date.now()) throw new HttpError(410, "Session expired or revoked");
+      if (session.header.provisionHash !== provisionHash) throw new HttpError(409, "Idempotency key reused with different configuration");
+      if (session.header.revoked || session.header.expiresAt <= Date.now()) throw new HttpError(410, "Session expired or revoked");
     } else {
-      if (this.sessions.size >= 128) throw new HttpError(429, "Client session retention capacity reached");
-      session = { pending: new Map(), saved: {
-        version: 2, id, digest: hash(token), expiresAt: Date.now() + (this.options.ttlMs ?? 24 * 60 * 60 * 1000), revoked: false,
-        metadata, definitions, config: safeConfig, provisionHash, cursor: 0, events: [], calls: {}, requests: {},
-      } };
+      session = {
+        header: { version: 3, id, digest: hash(token), expiresAt: Date.now() + (this.options.ttlMs ?? 24 * 60 * 60 * 1000), revoked: false, metadata, definitions, config: safeConfig, provisionHash },
+        requests: new Map(), calls: new Map(), log: fileAppendLog<JournalRecord>(this.journalPath(id)),
+        cursor: Date.now() * 1000, events: [], eventBytes: 0, pending: new Map(), lastActive: Date.now(),
+      };
+      this.writeHeader(session);
       this.sessions.set(id, session);
-      this.save(session);
     }
     await this.ensureStarted(session);
     const status = await this.supervisor.request(id, "status");
-    return { id, token, expiresAt: session.saved.expiresAt, ...status };
+    return { id, token, expiresAt: session.header.expiresAt, ...status };
   }
 
   list() {
-    return [...this.sessions.values()].filter(s => !s.saved.revoked && s.saved.expiresAt > Date.now()).map(s => ({
-      id: s.saved.id, name: s.saved.metadata?.name ?? s.saved.id, type: s.saved.metadata?.type ?? 'general',
-      connected: !!s.response && !s.response.destroyed,
-    }));
+    const result: { id: string; name: string; type: string; connected: boolean }[] = [];
+    for (const name of readdirSync(this.options.root)) {
+      const match = /^(client_[a-f0-9]{40})\.json$/.exec(name);
+      const header = match && (this.sessions.get(match[1])?.header ?? this.readHeader(match[1]));
+      if (!header || header.revoked || header.expiresAt <= Date.now()) continue;
+      const response = this.sessions.get(header.id)?.response;
+      result.push({ id: header.id, name: header.metadata?.name ?? header.id, type: header.metadata?.type ?? "general", connected: !!response && !response.destroyed });
+    }
+    return result;
   }
 
-  inspect(id: string) {
-    const metadata = this.list().find(a => a.id === id);
-    if (!metadata) throw new HttpError(404, "Agent not found");
-    const saved = this.sessions.get(id)!.saved;
-    return { ...metadata, tools: saved.definitions, systemPrompt: saved.config.systemPrompt ?? '',
-      cursor: saved.cursor, events: saved.events, requests: Object.values(saved.requests), calls: Object.values(saved.calls) };
+  async inspect(id: string) {
+    const metadata = this.list().find(agent => agent.id === id);
+    const session = metadata && await this.load(id);
+    if (!metadata || !session) throw new HttpError(404, "Agent not found");
+    return { ...metadata, tools: session.header.definitions, systemPrompt: session.header.config.systemPrompt ?? "",
+      cursor: session.cursor, events: session.events.map(({ id, data }) => ({ id, data })), requests: [...session.requests.values()], calls: [...session.calls.values()] };
+  }
+
+  /** The transcript, from the live agent when it runs, otherwise straight from its log. */
+  private async history(session: Session) {
+    if (this.supervisor.agents.has(session.header.id)) return this.supervisor.request(session.header.id, "history");
+    return { messages: await readTranscript(join(this.supervisor.root, session.header.id)) };
   }
 
   /** Called before operator authentication; this route requires a scoped credential. */
   async handle(req: IncomingMessage, res: ServerResponse, operator = false): Promise<boolean> {
     if (!(req.url ?? "").startsWith("/clients/")) return false;
     try {
-      const match = /^\/clients\/(client_[a-f0-9]{40})(?:\/(events|state|metadata|history|requests|calls)(?:\/([A-Za-z0-9_-]{1,80})(?:\/(claim|outcome|reconcile))?)?)?$/.exec(req.url ?? "");
-      const session = match && this.sessions.get(match[1]);
-      const header = req.headers.authorization ?? "";
-      if (!session || req.headers.origin || (!operator && (!header.startsWith("Bearer ") || !timingSafeEqual(Buffer.from(hash(header.slice(7)), "hex"), Buffer.from(session.saved.digest, "hex"))))) throw new HttpError(401, "Unauthorized");
+      const match = /^\/clients\/(client_[a-f0-9]{40})(?:\/(events|state|metadata|history|requests|calls)(?:\/([A-Za-z0-9_-]{1,80})(?:\/(claim|outcome))?)?)?$/.exec(req.url ?? "");
+      // Authenticate against the small header before loading the journal.
+      const header = match ? this.sessions.get(match[1])?.header ?? this.readHeader(match[1]) : undefined;
+      const authorization = req.headers.authorization ?? "";
+      if (!header || req.headers.origin || (!operator && (!authorization.startsWith("Bearer ") || !timingSafeEqual(Buffer.from(hash(authorization.slice(7)), "hex"), Buffer.from(header.digest, "hex"))))) throw new HttpError(401, "Unauthorized");
+      if (header.revoked || header.expiresAt <= Date.now()) throw new HttpError(410, "Session expired or revoked");
+      const session = await this.load(header.id);
+      if (!session) throw new HttpError(401, "Unauthorized");
       if (session.fault) throw session.fault;
-      if (session.saved.revoked || session.saved.expiresAt <= Date.now()) throw new HttpError(410, "Session expired or revoked");
+      session.lastActive = Date.now();
       const [, id, resource, resourceId, action] = match!;
       if (operator && !(resource === "requests" && req.method === "POST" && !resourceId)) throw new HttpError(403, "Operator bridge only accepts requests");
       if (req.method === "POST" && resource === "metadata" && !resourceId) {
-        session.saved.metadata = agentMetadata(await readJson(req, 4096));
-        this.save(session);
-        json(res, 200, session.saved.metadata);
+        session.header.metadata = agentMetadata(await readJson(req, 4096));
+        this.writeHeader(session);
+        json(res, 200, session.header.metadata);
       } else if (req.method === "DELETE" && !resource) {
-        this.remove(id);
+        await this.remove(id);
         await this.supervisor.stop(id);
         json(res, 200, { stopped: true });
       } else if (req.method === "GET" && resource === "events" && !resourceId) {
         const rawCursor = req.headers["last-event-id"] ?? "0";
         if (typeof rawCursor !== "string" || !/^\d+$/.test(rawCursor)) throw new HttpError(400, "Invalid event cursor");
         const cursor = Number(rawCursor);
-        if (!Number.isSafeInteger(cursor) || cursor > session.saved.cursor) throw new HttpError(400, "Invalid event cursor");
-        const first = session.saved.events[0]?.id ?? session.saved.cursor + 1;
-        if (cursor < first - 1) throw new HttpError(409, "REPLAY_GAP: recover from session state");
-        await this.ensureStarted(session);
+        if (!Number.isSafeInteger(cursor)) throw new HttpError(400, "Invalid event cursor");
+        // Cursor 0 means a new client: it takes whatever is buffered. Anything else must be contiguous.
+        const first = session.events[0]?.id ?? session.cursor + 1;
+        if (cursor !== 0 && (cursor > session.cursor || cursor < first - 1)) throw new HttpError(409, "REPLAY_GAP: recover from session state");
         session.response?.end();
         session.response = res;
         res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store", "X-Accel-Buffering": "no" });
-        res.write(`event: ready\ndata: ${JSON.stringify({ version: 2, agentId: id })}\n\n`);
-        for (const event of session.saved.events) if (event.id > cursor) {
+        res.write(`event: ready\ndata: ${JSON.stringify({ version: 3, agentId: id })}\n\n`);
+        for (const event of session.events) if (event.id > cursor) {
           const frame = `id: ${event.id}\ndata: ${JSON.stringify(event.data)}\n\n`;
           if (res.writableLength + Buffer.byteLength(frame) > 2 * FRAME_BYTES) { res.destroy(); break; }
           res.write(frame);
         }
         res.on("close", () => { if (session.response === res) session.response = undefined; });
       } else if (req.method === "GET" && resource === "history" && !resourceId) {
-        await this.ensureStarted(session);
-        json(res, 200, await this.supervisor.request(id, "history"));
+        json(res, 200, await this.history(session));
       } else if (req.method === "GET" && resource === "state" && !resourceId) {
-        json(res, 200, { cursor: session.saved.cursor, calls: Object.values(session.saved.calls), requests: Object.values(session.saved.requests), needsReconciliation: this.blocked(session) });
+        json(res, 200, { cursor: session.cursor, calls: [...session.calls.values()], requests: [...session.requests.values()] });
       } else if (req.method === "POST" && resource === "requests" && !resourceId) {
         const body = await readJson(req, FRAME_BYTES);
         if (!validId(body?.id) || !REQUEST_METHODS.includes(body.method) || !body.params || typeof body.params !== "object" || Array.isArray(body.params)) throw new HttpError(400, "Invalid request");
-        if (body.method === "configure") {
-          try { configurationUpdate(body.params); }
-          catch (error) { throw new HttpError(400, errorText(error)); }
-        }
+        try {
+          if (body.method === "configure") configurationUpdate(body.params);
+          // Assistant and tool-result history is runtime-owned; callers may only add user input.
+          if (["prompt", "steer", "followUp"].includes(body.method) && body.params.message !== undefined) validateUserMessages(Array.isArray(body.params.message) ? body.params.message : [body.params.message]);
+        } catch (error) { throw new HttpError(400, errorText(error)); }
         const fingerprint = hash(canonical({ method: body.method, params: body.params }));
-        const existing = has(session.saved.requests, body.id) ? session.saved.requests[body.id] : undefined;
+        const existing = session.requests.get(body.id);
         if (existing) {
           if (existing.fingerprint !== fingerprint) throw new HttpError(409, "Request ID reused with different arguments");
           json(res, 200, existing); // Includes the committed response after a lost POST ack.
-        } else {
-          if (this.blocked(session) && RUN_METHODS.includes(body.method)) throw new HttpError(409, "Reconciliation required: inspect uncertain outcomes before continuing");
-          if (Object.keys(session.saved.requests).length >= MAX_RECORDS) throw new HttpError(429, "Request journal full; start a new session");
-          if (Object.values(session.saved.requests).filter(request => request.state === "running").length >= 8) throw new HttpError(429, "Too many requests");
-          await this.ensureStarted(session);
-          // Concurrent retries may have waited on the same process startup.
-          if (has(session.saved.requests, body.id)) {
-            const accepted = session.saved.requests[body.id];
-            if (accepted.fingerprint !== fingerprint) throw new HttpError(409, "Request ID reused with different arguments");
-            json(res, 200, accepted);
-            return true;
-          }
-          const record: RequestRecord = { startedAt: Date.now(), ...(body.method === "prompt" && typeof body.params.text === "string" ? { prompt: body.params.text } : {}), ...(body.method === "execute" && typeof body.params.code === "string" ? { code: body.params.code } : {}), id: body.id, method: body.method, fingerprint, state: "running" };
-          Object.defineProperty(session.saved.requests, body.id, { value: record, enumerable: true, writable: true, configurable: true });
-          this.save(session);
-          json(res, 202, record);
-          void this.run(session, record, body.params);
+          return true;
         }
+        if ([...session.requests.values()].filter(request => request.state === "running").length >= 8) throw new HttpError(429, "Too many requests");
+        // Reads and aborts never need a process; everything else runs in the agent.
+        if (!["history", "status", "abort"].includes(body.method)) await this.ensureStarted(session);
+        // Concurrent retries may have waited on the same process startup.
+        const accepted = session.requests.get(body.id);
+        if (accepted) {
+          if (accepted.fingerprint !== fingerprint) throw new HttpError(409, "Request ID reused with different arguments");
+          json(res, 200, accepted);
+          return true;
+        }
+        const record = this.upsertRequest(session, { startedAt: Date.now(), ...(body.method === "prompt" && typeof body.params.text === "string" ? { prompt: body.params.text } : {}), ...(body.method === "execute" && typeof body.params.code === "string" ? { code: body.params.code } : {}), id: body.id, method: body.method, fingerprint, state: "running" });
+        await this.commit(session, true);
+        json(res, 202, record);
+        void this.run(session, record, body.params);
       } else if (req.method === "GET" && resource === "requests" && resourceId && !action) {
-        if (!has(session.saved.requests, resourceId)) throw new HttpError(404, "Unknown request");
-        json(res, 200, session.saved.requests[resourceId]);
+        const record = session.requests.get(resourceId);
+        if (!record) throw new HttpError(404, "Unknown request");
+        json(res, 200, record);
       } else if (req.method === "POST" && resourceId && resource === "calls") {
-        if (!has(session.saved.calls, resourceId)) throw new HttpError(404, "Unknown tool call");
-        const call = session.saved.calls[resourceId];
+        const call = session.calls.get(resourceId);
+        if (!call) throw new HttpError(404, "Unknown tool call");
         if (action === "claim") {
           await readJson(req);
-          if (call.state !== "offered" || call.deadline <= Date.now() || this.blocked(session)) json(res, 200, { execute: false, call });
-          else { call.state = "started"; this.save(session); json(res, 200, { execute: true }); }
-        } else if (action === "outcome" || action === "reconcile") {
-          const value = outcome(await readJson(req));
-          if (action === "reconcile") {
-            if (value.uncertain) throw new HttpError(400, "Reconciliation requires a verified outcome");
-            if (call.state !== "uncertain") throw new HttpError(409, "Only uncertain calls need reconciliation");
-            call.state = "completed"; call.outcome = value;
-            this.save(session);
-          } else this.recordOutcome(session, call, value);
-          json(res, 200, { recorded: true, state: call.state });
+          if (call.state !== "offered" || call.deadline <= Date.now()) json(res, 200, { execute: false, call });
+          else {
+            this.upsertCall(session, { ...call, state: "started" });
+            // The claim must be durable before the client performs the side effect.
+            await this.commit(session, true);
+            json(res, 200, { execute: true });
+          }
+        } else if (action === "outcome") {
+          await this.recordOutcome(session, call, outcome(await readJson(req)));
+          json(res, 200, { recorded: true, state: session.calls.get(call.id)!.state });
         } else throw new HttpError(404, "Unknown call operation");
-      } else if (req.method === "POST" && resource === "requests" && resourceId && action === "reconcile") {
-        const body = await readJson(req);
-        if (!has(session.saved.requests, resourceId) || session.saved.requests[resourceId].state !== "uncertain" || body?.acknowledged !== true) throw new HttpError(409, "Acknowledge an uncertain request after inspecting its effects");
-        session.saved.requests[resourceId].state = "completed";
-        this.save(session);
-        json(res, 200, { acknowledged: true });
       } else throw new HttpError(404, "Unknown client route");
     } catch (error) {
       if (res.headersSent) res.destroy();
@@ -302,27 +427,37 @@ export class ClientSessions {
     return true;
   }
 
-  private async run(session: Session, record: RequestRecord, params: unknown) {
-    let value: Outcome;
-    try {
-      const result = await this.supervisor.request(session.saved.id, record.method, params, RUN_METHODS.includes(record.method)
-        ? event => { try { this.publish(session, { type: "event", requestId: record.id, event }); } catch { void this.supervisor.request(session.saved.id, "abort").catch(() => {}); } } : undefined);
-      if (record.method === "configure") {
-        const updates = configurationUpdate(params);
-        const { tools, ...config } = updates;
-        if (tools !== undefined) session.saved.definitions = tools;
-        session.saved.config = { ...session.saved.config, ...config };
-        this.save(session);
-      }
-      value = { result };
-    } catch (error) { value = { error: errorText(error) }; }
-    if (this.closed || session.fault || record.state !== "running") return;
-    record.state = "completed"; record.outcome = value; record.endedAt = Date.now();
-    try { this.publish(session, { type: "response", id: record.id, outcome: value }); }
-    catch { /* The persistence fault blocks every subsequent request. */ }
+  private async execute(session: Session, record: RequestRecord, params: any) {
+    const id = session.header.id;
+    const live = this.supervisor.agents.has(id);
+    if (record.method === "history") return this.history(session);
+    if (record.method === "status" && !live) return { running: false };
+    if (record.method === "abort" && !live) return { aborted: false, running: false };
+    const result = await this.supervisor.request(id, record.method, params, RUN_METHODS.includes(record.method)
+      ? event => this.publish(session, { type: "event", requestId: record.id, event }) : undefined);
+    if (record.method === "configure") {
+      const { tools, ...config } = configurationUpdate(params);
+      if (tools !== undefined) session.header.definitions = tools;
+      session.header.config = { ...session.header.config, ...config };
+      this.writeHeader(session);
+    }
+    return result;
   }
 
-  private recordOutcome(session: Session, call: CallRecord, value: Outcome) {
+  private async run(session: Session, record: RequestRecord, params: unknown) {
+    let value: Outcome;
+    try { value = { result: await this.execute(session, record, params) }; }
+    catch (error) { value = { error: errorText(error) }; }
+    if (this.closed || session.fault || session.requests.get(record.id)?.state !== "running") return;
+    this.upsertRequest(session, { ...record, state: "completed", outcome: value, endedAt: Date.now() });
+    try { await this.commit(session, true); }
+    catch { return; /* The fault is reported to every later request. */ }
+    session.lastActive = Date.now();
+    this.publish(session, { type: "response", id: record.id, outcome: value });
+    await this.fold(session);
+  }
+
+  private async recordOutcome(session: Session, call: CallRecord, value: Outcome) {
     if (call.state === "completed") {
       if (canonical(call.outcome) !== canonical(value)) throw new HttpError(409, "Conflicting tool outcome");
       return;
@@ -331,26 +466,26 @@ export class ClientSessions {
     if (call.state === "offered") throw new HttpError(409, "Tool has not been claimed");
     if (call.state === "uncertain") {
       if (call.lateOutcome && canonical(call.lateOutcome) !== canonical(value)) throw new HttpError(409, "Conflicting late outcome");
-      call.lateOutcome = value; // Evidence, never silently unblocks a timed-out turn.
-      this.save(session);
+      if (call.lateOutcome) return;
+      // The model already saw "unknown"; keep the real result as evidence and tell observers.
+      this.upsertCall(session, { ...call, lateOutcome: value });
+      await this.commit(session, true);
+      this.publish(session, { type: "event", requestId: call.requestId ?? "", event: { type: "tool_late_outcome", callId: call.id, toolCallId: call.toolCallId, name: call.name, outcome: value } });
       return;
     }
-    call.state = value.uncertain ? "uncertain" : "completed";
-    call.outcome = value;
-    this.save(session);
+    this.upsertCall(session, { ...call, state: value.uncertain ? "uncertain" : "completed", outcome: value });
+    await this.commit(session, true);
     session.pending.get(call.id)?.(value);
-    if (value.uncertain) void this.supervisor.request(session.saved.id, "abort").catch(() => {});
   }
 
   private call(session: Session, name: string, args: Record<string, unknown>, signal: AbortSignal, context?: { toolCallId: string }): Promise<unknown> {
     signal.throwIfAborted();
-    if (this.closed || session.fault || session.saved.revoked) return Promise.reject(new Error("Client session unavailable"));
-    if (this.blocked(session)) return Promise.reject(new Error("Reconciliation required before more tool calls"));
-    if (Object.keys(session.saved.calls).length >= MAX_RECORDS) return Promise.reject(new Error("Tool journal full; start a new session"));
+    if (this.closed || session.fault || session.header.revoked) return Promise.reject(new Error("Client session unavailable"));
     if (session.pending.size >= 32) return Promise.reject(new Error("Too many pending client tools"));
-    const request = Object.values(session.saved.requests).find(r => r.state === "running" && RUN_METHODS.includes(r.method));
-    const call: CallRecord = { ...(context ? { toolCallId: context.toolCallId } : {}), ...(request ? { requestId: request.id } : {}), createdAt: Date.now(), id: randomUUID(), name, args, state: "offered", deadline: Date.now() + (this.options.toolTimeoutMs ?? 15_000) };
-    session.saved.calls[call.id] = call;
+    const request = [...session.requests.values()].find(r => r.state === "running" && RUN_METHODS.includes(r.method));
+    const call = this.upsertCall(session, { ...(context ? { toolCallId: context.toolCallId } : {}), ...(request ? { requestId: request.id } : {}), createdAt: Date.now(), id: randomUUID(), name, args, state: "offered", deadline: Date.now() + (this.options.toolTimeoutMs ?? 15_000) });
+    // An offer needs no durable commit: after a restart, unclaimed offers are cancelled.
+    this.commitLater(session);
     return new Promise((resolve, reject) => {
       const finish = (value: Outcome) => {
         if (!session.pending.delete(call.id)) return;
@@ -358,52 +493,75 @@ export class ClientSessions {
         if ("error" in value) reject(new Error(value.error)); else resolve(value.result);
       };
       const cancel = (reason: string) => {
-        if (!["offered", "started"].includes(call.state)) return;
-        const uncertain = call.state === "started";
-        call.state = uncertain ? "uncertain" : "cancelled";
-        call.outcome = { error: uncertain ? `${reason}; tool outcome unknown. Reconciliation required.` : `${reason} before tool execution claim`, ...(uncertain ? { uncertain: true } : {}) };
-        try { this.publish(session, { type: "tool_cancel", id: call.id }); }
-        catch { /* save() already faults and rejects the pending call. */ }
-        finish(call.outcome);
-        if (uncertain) void this.supervisor.request(session.saved.id, "abort").catch(() => {});
+        const current = session.calls.get(call.id)!;
+        if (!["offered", "started"].includes(current.state)) return;
+        const uncertain = current.state === "started";
+        const settledCall = this.upsertCall(session, { ...current, state: uncertain ? "uncertain" : "cancelled", outcome: uncertain
+          ? { error: `${reason} after the application started it. Its outcome is unknown: it may or may not have taken effect.`, uncertain: true }
+          : { error: `${reason} before the application started it` } });
+        this.commitLater(session);
+        this.publish(session, { type: "tool_cancel", id: call.id });
+        // The model receives the unknown outcome and decides what to do; the turn keeps going.
+        finish(settledCall.outcome!);
       };
-      const abort = () => cancel("Tool cancelled");
-      const timer = setTimeout(() => cancel("Client tool timed out"), Math.max(1, call.deadline - Date.now()));
+      const abort = () => cancel("Tool call cancelled");
+      const timer = setTimeout(() => cancel("Tool call timed out"), Math.max(1, call.deadline - Date.now()));
       session.pending.set(call.id, finish);
       signal.addEventListener("abort", abort, { once: true });
-      try { this.publish(session, { type: "tool_call", call: { ...call } }); }
-      catch (error) { finish({ error: errorText(error), uncertain: true }); }
+      this.publish(session, { type: "tool_call", call: { ...call } });
     });
   }
 
-  remove(id: string) {
-    const session = this.sessions.get(id);
-    if (!session || session.saved.revoked) return;
-    session.saved.revoked = true;
-    this.interrupt(session, "Session revoked");
+  async remove(id: string) {
+    const session = await this.load(id);
+    if (!session || session.header.revoked) return;
+    session.header.revoked = true;
+    this.writeHeader(session);
+    await this.interrupt(session, "Session revoked");
     session.response?.end();
   }
 
-  private interrupt(session: Session, reason: string) {
-    for (const call of Object.values(session.saved.calls)) if (["offered", "started"].includes(call.state)) {
+  private async interrupt(session: Session, reason: string) {
+    for (const call of session.calls.values()) if (["offered", "started"].includes(call.state)) {
       const uncertain = call.state === "started";
-      call.state = uncertain ? "uncertain" : "cancelled";
-      call.outcome = { error: reason, ...(uncertain ? { uncertain: true } : {}) };
+      this.upsertCall(session, { ...call, state: uncertain ? "uncertain" : "cancelled", outcome: { error: reason, ...(uncertain ? { uncertain: true } : {}) } });
     }
-    for (const request of Object.values(session.saved.requests)) if (request.state === "running") {
-      request.state = "uncertain"; request.outcome = { error: reason, uncertain: true };
+    for (const request of session.requests.values()) if (request.state === "running") {
+      this.upsertRequest(session, { ...request, state: "completed", endedAt: Date.now(), outcome: { error: reason, uncertain: true } });
     }
-    this.save(session);
-    for (const [id, finish] of session.pending) finish(session.saved.calls[id].outcome!);
+    for (const [id, finish] of session.pending) finish(session.calls.get(id)!.outcome!);
+    await this.commit(session, true);
   }
 
-  close() {
+  /** Expire sessions, keep SSE alive, and release idle agents' processes and memory. */
+  private tick() {
+    const now = Date.now();
+    const idleMs = this.options.idleMs ?? 5 * 60_000;
+    for (const session of this.sessions.values()) {
+      const id = session.header.id;
+      if (!session.header.revoked && session.header.expiresAt <= now) {
+        void this.remove(id).then(() => this.supervisor.stop(id)).catch(() => {});
+        continue;
+      }
+      if (session.response && !session.response.write(": heartbeat\n\n")) session.response.destroy();
+      if (this.busy(session) || now - session.lastActive < idleMs) continue;
+      if (this.supervisor.agents.has(id)) void this.supervisor.stop(id).catch(() => {});
+      else if (!session.response && !session.fault) {
+        // Nothing is connected or running: everything needed later is on disk.
+        this.sessions.delete(id);
+        void session.log.close().catch(() => {});
+      }
+    }
+  }
+
+  async close() {
     this.closed = true;
     clearInterval(this.heartbeat);
     for (const session of this.sessions.values()) {
-      try { this.interrupt(session, "Host stopped during execution; reconcile before retrying"); }
-      catch { /* Already faulted; disk state will be recovered conservatively. */ }
+      try { await this.interrupt(session, "The runtime stopped during this request"); }
+      catch { /* Already faulted; the next load recovers conservatively from disk. */ }
       session.response?.end();
+      await session.log.close().catch(() => {});
     }
   }
 }

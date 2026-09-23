@@ -99,9 +99,10 @@ service is unavailable. Actual microphone/audio quality requires a human check.
 `.agent-runtime/studio` stores local session credentials, model conversation
 history, release data, SQLite inventory, completed run traces and reviews. The
 runtime's existing 24-hour scoped session expiry still applies. Restarting with
-the same directory resumes settled conversations; interrupted model turns may
-require the runtime's existing manual reconciliation. This demo doesn't add
-crash-safe continuation or extend expired credentials. Keep this directory
+the same directory resumes conversations; a model turn interrupted by the
+restart is closed with "outcome unknown" tool results, not continued. This demo
+doesn't extend expired credentials. Run traces come from the host's in-memory
+event buffer, so traces of runs before a restart are not shown. Keep this directory
 private; traces intentionally contain prompts and tool data.
 
 The inspector retains 50 runs per agent, at most 300 trace entries per run, and

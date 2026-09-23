@@ -12,6 +12,9 @@ export const SANDBOX_LIMITS = Object.freeze({
   outputEvents: 1024,
 });
 
+/** Transient provider failures (overload, rate limit, 5xx, network) are retried with backoff. */
+export const DEFAULT_RETRY = Object.freeze({ maxAttempts: 3, baseDelayMs: 2_000 });
+
 export function jsonWithinLimit(value: unknown, maxBytes: number, label: string): string {
   const json = JSON.stringify(value);
   if (json === undefined || Buffer.byteLength(json) > maxBytes) throw new Error(`${label} exceeds JSON size limit`);

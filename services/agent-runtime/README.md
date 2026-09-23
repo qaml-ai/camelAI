@@ -64,10 +64,11 @@ native model tool-call IDs are separate identifiers.
 This is still a local integration: model/provider selection is fixed at agent
 creation and uses the runtime's configured credential. Mid-conversation provider
 switching, production billing parity, long-running build/deploy tools, and full
-DO-eviction recovery have not been certified. Uncertain calls require explicit
-reconciliation; the service does not automatically replay side effects. Context
-limits currently drop old complete turns from provider input while retaining full
-durable history; this is not semantic summarization.
+DO-eviction recovery have not been certified. A tool call whose outcome is lost
+settles as "unknown" and the model decides what to do next; the service never
+replays side effects and never waits for an operator. Context limits currently
+drop old complete turns from provider input while retaining full durable
+history; this is not semantic summarization.
 
 `LOCAL_AGENT_RUNTIME_URL` and `LOCAL_AGENT_RUNTIME_TOKEN` opt the loopback app in;
 there is no in-DO execution fallback on this branch. Both settings are required. Local state lives under
@@ -135,7 +136,7 @@ curl -H "Authorization: Bearer $AGENT_RUNTIME_TOKEN" -X DELETE \
 | Request | Behavior |
 | --- | --- |
 | `POST /agents/:id` | Start an agent, loading its saved session if present |
-| `GET /agents/:id` | PID, busy/interrupted state, message count |
+| `GET /agents/:id` | PID, busy state, message count |
 | `POST /agents/:id/prompt` | `{text}`; stream Pi events and a final result as NDJSON |
 | `POST /agents/:id/execute` | `{code, timeoutMs?, maxOutputCharacters?}`; diagnostic codemode execution, outside the Pi transcript |
 | `POST /agents/:id/abort` | Abort the current prompt/script and signal pending tools |
@@ -178,15 +179,45 @@ Tool RPCs are correlated by unique IDs, so reverse completion order is safe.
 External side effects cannot be rolled back by a process kill or AbortSignal.
 Adapters must honor cancellation and must implement idempotency for writes.
 
-Native Pi messages are saved atomically after `message_end`, preserving message
-objects instead of converting them to UI messages. A settled process can be
-restarted with its history. An interrupted prompt leaves an active marker and
-refuses further work until its effects/history have been reconciled. This
-prototype deliberately has no automatic re-drive: repeating an interrupted
-tool could duplicate a side effect. There is no reconciliation API yet; inspect
-the snapshot and reconcile it offline with the process stopped. Diagnostic
-`execute` calls are not journaled. Snapshots are local files, not replicated
-durable storage, and the whole transcript is loaded into memory.
+## Persistence
+
+Nothing is serialized per streamed delta. Each agent has two append-only logs:
+
+- `transcript.jsonl`: one durable record per finished native Pi message
+  (`message_end`), plus turn start/end markers. Messages stay native instead of
+  being converted to UI messages. A retried provider error is retracted.
+- `<session>.journal.jsonl`: request and tool-call state changes. It is fsynced
+  only where correctness needs it: accepting a request, claiming a tool call
+  (before the application performs the side effect), and recording outcomes.
+  Old settled records are folded away, keeping the most recent 256 of each
+  for idempotent retries.
+
+Streamed events (token deltas, tool progress) are kept in a bounded in-memory
+buffer for SSE replay. After a host restart a client's cursor falls outside the
+buffer, it receives `REPLAY_GAP`, and it recovers durable state from `/state`
+and `/history`. The session header (`<session>.json`) is rewritten only when
+configuration or metadata changes.
+
+If the runtime dies mid-turn, the next start closes the turn automatically:
+tool calls without results get an explicit "outcome unknown" result, and a
+runtime notice is added so the model neither assumes success nor repeats the
+effect blindly. The interrupted request completes with an `uncertain` error.
+Nothing is re-driven automatically and nothing blocks later requests.
+
+Transient provider failures (overload, rate limits, 5xx, dropped streams) are
+retried in the same turn with exponential backoff (3 attempts from 2 s).
+Context overflow is not retried.
+
+Sessions load lazily and unload after `AGENT_IDLE_MS` (default 5 minutes)
+without activity; the agent's process stops at the same point. When all
+`AGENT_MAX_PROCESSES` slots are in use, the least recently active idle agent is
+stopped to make room. Logs are local files, not replicated storage; the whole
+transcript of an active agent is still held in memory.
+
+The host provider key is only sent to trusted endpoints: the default model's,
+Pi's published endpoint for the requested provider and model, or an entry in
+`AGENT_ALLOWED_BASE_URLS` (comma-separated). Scoped credentials can only submit
+user messages; assistant and tool-result history is produced by the runtime.
 
 ## Tenant isolation contract
 
@@ -273,10 +304,12 @@ isolate-death recovery. A browser/DO reconnect observes the saved service reques
 ID. It never re-prompts the model to reconstruct a UI stream. The DO retains only
 a UI turn marker, the SDK receipt cursor, and a render projection.
 
-The service persists native messages and tool outcomes. A killed service run is
-interrupted and requires explicit reconciliation before continuation; unknown
-side effects are never automatically repeated. No degraded retry ladder,
-salvage mode, or retry budget is needed in the application.
+The service persists native messages and tool outcomes. A killed service run
+completes with an uncertain error, and the agent's next start closes the turn
+with "outcome unknown" tool results; unknown side effects are never
+automatically repeated. The service retries transient provider errors itself,
+so no degraded retry ladder, salvage mode, or retry budget is needed in the
+application.
 
 Remaining production migration work includes model/provider reconfiguration,
 billing enforcement at the inference boundary, and testing application tools

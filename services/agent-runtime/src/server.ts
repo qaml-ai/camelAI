@@ -12,10 +12,16 @@ import { ClientSessions } from "./client-sessions.ts";
 const token = process.env.AGENT_RUNTIME_TOKEN;
 if (!token || token.length < 24) throw new Error("Set AGENT_RUNTIME_TOKEN to at least 24 random characters");
 const root = resolve(process.env.AGENT_DATA_DIR ?? ".agent-runtime");
-const supervisor = new AgentSupervisor(join(root, "sessions"), { runtime: process.env.AGENT_RUNTIME });
+const maxAgents = Number(process.env.AGENT_MAX_PROCESSES ?? 8);
+if (!Number.isInteger(maxAgents) || maxAgents < 1) throw new Error("AGENT_MAX_PROCESSES must be a positive integer");
+const supervisor = new AgentSupervisor(join(root, "sessions"), { runtime: process.env.AGENT_RUNTIME, maxAgents });
 const model = configuredModel();
 const toolTimeoutMs = Number(process.env.AGENT_TOOL_TIMEOUT_MS ?? 15_000);
 if (!Number.isInteger(toolTimeoutMs) || toolTimeoutMs < 1 || toolTimeoutMs > 15 * 60_000) throw new Error("AGENT_TOOL_TIMEOUT_MS must be an integer between 1 and 900000");
+const idleMs = Number(process.env.AGENT_IDLE_MS ?? 5 * 60_000);
+if (!Number.isInteger(idleMs) || idleMs < 1000) throw new Error("AGENT_IDLE_MS must be an integer of at least 1000");
+// Endpoints beyond the default model's and Pi's published ones that may receive the host provider key.
+const allowedBaseUrls = (process.env.AGENT_ALLOWED_BASE_URLS ?? "").split(",").map(value => value.trim()).filter(Boolean);
 const server = createServer(async (req, res) => {
   if (await clients.handle(req, res)) return;
   const received = Buffer.from(req.headers.authorization ?? "");
@@ -32,7 +38,7 @@ const server = createServer(async (req, res) => {
     const registered = /^\/registry\/(client_[a-f0-9]{40})(\/requests)?$/.exec(req.url ?? "");
     if (registered) {
       if (req.method === "GET" && !registered[2]) {
-        const agent = clients.inspect(registered[1]);
+        const agent = await clients.inspect(registered[1]);
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(agent)); return;
       }
       if (req.method === "POST" && registered[2]) {
@@ -49,7 +55,7 @@ const server = createServer(async (req, res) => {
       const params = JSON.parse(body);
       const key = req.headers["idempotency-key"];
       if (key !== undefined && typeof key !== "string") throw new Error("Invalid idempotency key");
-      const config = sessionConfig(params, model, process.env.AGENT_SYSTEM_PROMPT);
+      const config = sessionConfig(params, model, process.env.AGENT_SYSTEM_PROMPT, allowedBaseUrls);
       const result = await clients.create(params.tools, config, key, { name: params.name, type: params.type });
       res.writeHead(201, { "Content-Type": "application/json", "Cache-Control": "no-store" }).end(JSON.stringify(result));
       return;
@@ -67,7 +73,7 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && !action) {
       result = await supervisor.start(id, { model, apiKey: process.env.AGENT_API_KEY, ...(process.env.AGENT_SYSTEM_PROMPT ? { systemPrompt: process.env.AGENT_SYSTEM_PROMPT } : {}) }, await localTools(join(root, "workspaces", id)));
     } else if (req.method === "GET" && !action) result = await supervisor.request(id, "status");
-    else if (req.method === "DELETE" && !action) { clients.remove(id); await supervisor.stop(id); result = { stopped: true }; }
+    else if (req.method === "DELETE" && !action) { await clients.remove(id); await supervisor.stop(id); result = { stopped: true }; }
     else if (req.method === "POST" && action === "abort") result = await supervisor.request(id, "abort");
     else if (req.method === "POST" && (action === "prompt" || action === "execute")) {
       streaming = true;
@@ -89,13 +95,12 @@ const server = createServer(async (req, res) => {
     res.end(JSON.stringify({ type: "error", error: errorText(error) }) + "\n");
   }
 });
-const clients = new ClientSessions(supervisor, { root: join(root, "client-sessions"), secret: token, apiKey: process.env.AGENT_API_KEY, toolTimeoutMs });
+const clients = new ClientSessions(supervisor, { root: join(root, "client-sessions"), secret: token, apiKey: process.env.AGENT_API_KEY, toolTimeoutMs, idleMs });
 server.requestTimeout = 30_000;
 server.listen(Number(process.env.PORT ?? 8790), process.env.HOST ?? "127.0.0.1", () => {
   console.log(JSON.stringify({ type: "listening", address: server.address() }));
 });
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => {
-  clients.close();
   server.close();
-  void supervisor.close().then(() => process.exit(0));
+  void clients.close().then(() => supervisor.close()).then(() => process.exit(0));
 });

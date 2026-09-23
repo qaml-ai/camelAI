@@ -8,7 +8,7 @@
     "demo:clients": "bun examples/run.ts",
     "demo:typescript": "bun examples/release-board.ts",
     "demo:python": "python3 examples/inventory.py",
-    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test": "node --experimental-strip-types --test --test-timeout=30000 tests/*.test.ts",
     "test:python": "python3 tests/python_sdk.py",
     "typecheck": "tsc -p tsconfig.json && tsc -p studio/tsconfig.json",
     "studio": "bun studio/server.ts",

@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { once } from "node:events";
 import { childProcess, type Rpc } from "./rpc.ts";
 import type { AgentConfig, ToolBridge } from "./protocol.ts";
+import type { RequestMethod } from "../shared/client-protocol.ts";
 import type { ChildProcess } from "node:child_process";
 import { validateDefinitions, validateToolCall } from "./tool-policy.ts";
 import { jsonWithinLimit, SANDBOX_LIMITS } from "./limits.ts";
@@ -31,7 +32,7 @@ export class AgentSupervisor {
     if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new Error("Invalid agent id");
     validateDefinitions(bridge.definitions);
     if (this.agents.has(id) || this.starting.has(id)) throw new Error("Agent already exists");
-    if (this.agents.size + this.starting.size >= (this.options.maxAgents ?? 8)) throw new Error("VM agent capacity reached");
+    if (this.full) throw new Error("VM agent capacity reached");
     this.starting.add(id);
     try {
       const directory = resolve(join(this.root, id));
@@ -74,7 +75,10 @@ export class AgentSupervisor {
     } finally { this.starting.delete(id); }
   }
 
-  async request(id: string, method: "prompt" | "execute" | "abort" | "status" | "history" | "continue" | "steer" | "followUp" | "reconcile" | "configure", params: any = {}, onEvent?: (event: any) => void) {
+  /** No capacity for another agent process; callers may stop an idle agent first. */
+  get full() { return this.agents.size + this.starting.size >= (this.options.maxAgents ?? 8); }
+
+  async request(id: string, method: RequestMethod, params: any = {}, onEvent?: (event: any) => void) {
     const handle = this.agents.get(id);
     if (!handle) throw new Error("Agent not found");
     if (method === "configure" && params.tools !== undefined) validateDefinitions(params.tools);

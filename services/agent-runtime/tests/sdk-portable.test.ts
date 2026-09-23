@@ -5,15 +5,16 @@ import { AgentRuntime, memoryJournalStore, type JournalStore, type SessionCreden
 const session: SessionCredentials = { id: `client_${"a".repeat(40)}`, token: "scoped-test-token", expiresAt: Date.now() + 60_000 };
 const tick = () => new Promise(resolve => setTimeout(resolve, 10));
 
-test("portable SDK awaits event consumers before persisting replay cursor and attaches with saved credentials", async () => {
+test("portable SDK awaits event consumers, persists the cursor only for control events, and attaches with saved credentials", async () => {
   const backing = memoryJournalStore();
   await backing.save(session.id, { version: 1, cursor: 4, calls: {} });
   const gate = Promise.withResolvers<void>();
   const started = Promise.withResolvers<void>();
   const committed = Promise.withResolvers<void>();
+  let saves = 0;
   const store: JournalStore = {
     load: id => backing.load(id),
-    async save(id, journal) { await backing.save(id, journal); if (journal.cursor === 5) committed.resolve(); },
+    async save(id, journal) { saves++; await backing.save(id, journal); if (journal.cursor === 6) committed.resolve(); },
   };
   let eventStream: ReadableStreamDefaultController<Uint8Array>;
   const encode = new TextEncoder();
@@ -30,7 +31,7 @@ test("portable SDK awaits event consumers before persisting replay cursor and at
       return new Response(stream, { headers: { "Content-Type": "text/event-stream" } });
     }
     assert.ok(url.endsWith("/state"));
-    return Response.json({ cursor: 4, calls: [], requests: [], needsReconciliation: false });
+    return Response.json({ cursor: 4, calls: [], requests: [] });
   };
   const client = await new AgentRuntime({ fetch: fetcher, journalStore: store }).connectAgent(session, {
     tools: {}, async onEvent(_event, requestId) { requestIds.push(requestId); started.resolve(); await gate.promise; },
@@ -39,9 +40,13 @@ test("portable SDK awaits event consumers before persisting replay cursor and at
     eventStream!.enqueue(encode.encode('id: 5\ndata: {"type":"event","requestId":"turn-123","event":{"type":"message_end"}}\n\n'));
     await started.promise;
     await tick();
+    gate.resolve(); await tick();
+    // A display event costs no storage write, even after its consumer settles.
+    assert.equal(saves, 0);
     assert.equal((await backing.load(session.id))?.cursor, 4);
-    gate.resolve(); await committed.promise;
-    assert.equal((await backing.load(session.id))?.cursor, 5);
+    eventStream!.enqueue(encode.encode('id: 6\ndata: {"type":"tool_cancel","id":"none"}\n\n'));
+    await committed.promise;
+    assert.equal((await backing.load(session.id))?.cursor, 6);
     assert.deepEqual(requestIds, ["turn-123"]);
   } finally { gate.resolve(); await client.close(); }
 });
@@ -77,7 +82,7 @@ test("async journals commit before claiming side effects and before delivering t
       controller.enqueue(new TextEncoder().encode('event: ready\ndata: {}\n\n'));
       init?.signal?.addEventListener("abort", () => controller.close(), { once: true });
     } }), { headers: { "Content-Type": "text/event-stream" } });
-    if (url.endsWith("/state")) return Response.json({ cursor: 0, calls: [], requests: [], needsReconciliation: false });
+    if (url.endsWith("/state")) return Response.json({ cursor: 0, calls: [], requests: [] });
     if (url.endsWith("/claim")) {
       assert.equal((await backing.load(session.id))?.calls["call-1"].state, "started");
       claimed = true; return Response.json({ execute: true });
@@ -109,7 +114,7 @@ test("native fetch is bound to the global receiver required by Workers", async (
       controller.enqueue(new TextEncoder().encode('event: ready\ndata: {}\n\n'));
       init?.signal?.addEventListener("abort", () => controller.close(), { once: true });
     } }), { headers: { "Content-Type": "text/event-stream" } });
-    return Response.json({ cursor: 0, calls: [], requests: [], needsReconciliation: false });
+    return Response.json({ cursor: 0, calls: [], requests: [] });
   };
   try {
     const client = await new AgentRuntime().connectAgent(session, { tools: {} });

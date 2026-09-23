@@ -1,11 +1,26 @@
+import { getModel } from '@earendil-works/pi-ai/compat';
 import type { AgentConfig } from './protocol.ts';
 import { validateDefinitions } from './tool-policy.ts';
 import { validateInitialMessages } from './history.ts';
 
 type SessionConfig = Omit<AgentConfig, 'id' | 'directory' | 'tools' | 'apiKey'>;
 
-/** Only operator-authenticated provisioning may choose an inference endpoint. */
-export function sessionConfig(input: any, defaultModel: AgentConfig['model'], defaultPrompt?: string): SessionConfig {
+const endpoint = (value: string) => { const url = new URL(value); return `${url.origin}${url.pathname.replace(/\/+$/, '')}`; };
+
+/**
+ * The host's provider key is sent to whatever endpoint the model names, so an
+ * agent may only use an endpoint the host already trusts: the default model's,
+ * Pi's published endpoint for that provider and model, or an operator allowlist.
+ */
+export function assertTrustedEndpoint(model: AgentConfig['model'], defaultModel: AgentConfig['model'], allowedBaseUrls: string[] = []) {
+  const target = endpoint(model.baseUrl);
+  const published = (getModel as (provider: string, id: string) => AgentConfig['model'] | undefined)(model.provider, model.id)?.baseUrl;
+  const trusted = [defaultModel.baseUrl, ...(published ? [published] : []), ...allowedBaseUrls].map(endpoint);
+  if (!trusted.includes(target)) throw new Error(`Model endpoint ${target} is not trusted by this runtime; add it to AGENT_ALLOWED_BASE_URLS`);
+}
+
+/** Only operator-authenticated provisioning may choose a model, and only among trusted endpoints. */
+export function sessionConfig(input: any, defaultModel: AgentConfig['model'], defaultPrompt?: string, allowedBaseUrls: string[] = []): SessionConfig {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Invalid session configuration');
   if ('apiKey' in input) throw new Error('Configure credentials on the runtime host, not in agent configuration');
   const model = input.model ?? defaultModel;
@@ -17,6 +32,7 @@ export function sessionConfig(input: any, defaultModel: AgentConfig['model'], de
   const url = new URL(model.baseUrl);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('Model baseUrl must be an HTTP(S) endpoint without credentials or query parameters');
   if (model.headers || model.apiKey || model.token) throw new Error('Model credentials and custom headers must be configured on the runtime host');
+  assertTrustedEndpoint(model, defaultModel, allowedBaseUrls);
   const updates = configurationUpdate({
     ...(input.systemPrompt !== undefined || defaultPrompt !== undefined ? { systemPrompt: input.systemPrompt !== undefined ? input.systemPrompt : defaultPrompt } : {}),
     ...(input.thinkingLevel !== undefined ? { thinkingLevel: input.thinkingLevel } : {}),

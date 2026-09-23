@@ -21,6 +21,8 @@ work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 CLIENT_ID="$client_id" python3 -c 'import json, os, sys
 secret = sys.stdin.read().strip()
 if not secret: sys.exit("No client secret on stdin")
+if secret == os.environ["CLIENT_ID"]: sys.exit("That is the client ID, not the client secret; generate a secret in the OAuth app settings")
+if len(secret) != 40 or any(c not in "0123456789abcdef" for c in secret): sys.exit("That does not look like a GitHub client secret (40 hex characters)")
 json.dump({"clientId": os.environ["CLIENT_ID"], "clientSecret": secret}, open(sys.argv[1], "w"))' "$work/github.json"
 id="$SECRET_PREFIX/github-oauth"
 if aws secretsmanager describe-secret --secret-id "$id" >/dev/null 2>&1; then

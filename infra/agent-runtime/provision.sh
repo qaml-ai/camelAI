@@ -44,7 +44,8 @@ aws iam put-role-policy --role-name "$NAME" --policy-name agent-runtime --policy
     "arn:aws:secretsmanager:$REGION:$ACCOUNT_ID:secret:$SECRET_PREFIX/session-secret-*",
     "arn:aws:secretsmanager:$REGION:$ACCOUNT_ID:secret:$SECRET_PREFIX/tenants-*",
     "arn:aws:secretsmanager:$REGION:$ACCOUNT_ID:secret:$SECRET_PREFIX/secrets-key-*",
-    "arn:aws:secretsmanager:$REGION:$ACCOUNT_ID:secret:$SECRET_PREFIX/github-oauth-*"]},
+    "arn:aws:secretsmanager:$REGION:$ACCOUNT_ID:secret:$SECRET_PREFIX/github-oauth-*",
+    "arn:aws:secretsmanager:$REGION:$ACCOUNT_ID:secret:$SECRET_PREFIX/executor-token-*"]},
   {"Effect":"Allow","Action":"ecr:GetAuthorizationToken","Resource":"*"},
   {"Effect":"Allow","Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer","ecr:BatchCheckLayerAvailability"],
    "Resource":"arn:aws:ecr:$REGION:$ACCOUNT_ID:repository/$ECR_REPOSITORY"}]}

@@ -138,6 +138,8 @@ curl https://agents.camelai.dev/healthz
   the host is at its limit, the least recently used idle agent is stopped; if
   none is idle, the request is refused (429 for a tenant's limit, 503 for the
   host's).
-- Sandboxed code runs on the same host as agent state. That's acceptable for
-  trusted teammates, but not for untrusted tenants until the executor tier
-  (phase 5) exists.
+- Unless executor hosts are deployed, sandboxed code runs on the same host as
+  agent state. That's acceptable for trusted teammates, but not for untrusted
+  tenants. [`executor/`](executor/README.md) moves `js_exec` onto separate hosts
+  that have no credentials, no IAM role and no network beyond the runtime's
+  callback port.

@@ -13,9 +13,12 @@ export function validateDefinitions(definitions: ToolDefinition[]) {
       throw new Error("Invalid tool definition");
     }
     if (!/^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(tool.name) ||
-      ["then", "constructor", "prototype", "search", "describe"].includes(tool.name) || names.has(tool.name)) {
+      ["js_exec", "then", "constructor", "prototype", "search", "describe"].includes(tool.name) || names.has(tool.name)) {
       throw new Error(`Invalid, duplicate, or reserved tool name: ${tool.name}`);
     }
+    if (tool.exposure !== undefined && !["direct", "codemode", "both"].includes(tool.exposure)) throw new Error("Invalid tool exposure");
+    if (tool.executionMode !== undefined && !["sequential", "parallel"].includes(tool.executionMode)) throw new Error("Invalid tool execution mode");
+    if (tool.resultFormat !== undefined && !["json", "content"].includes(tool.resultFormat)) throw new Error("Invalid tool result format");
     names.add(tool.name);
   }
 }

@@ -382,19 +382,7 @@ export class PiCoreMessageStore {
         PRIMARY KEY (rewrite_id, idx)
       )`,
     );
-    // Staging buffer for the in-flight turn's not-yet-committed tail. It is a
-    // discardable mirror of `agent.state.messages.slice(piMainBaselineIndex)`:
-    // filled at message_end/tool_execution_end, drained (committed to
-    // pi_core_messages) at turn_end, and dropped wholesale on a failed/aborted
-    // turn. On a cold load with `piActiveTurn` set, it is folded back in to
-    // resume the interrupted turn.
-    this.deps.sql().exec(
-      `CREATE TABLE IF NOT EXISTS pi_turn_journal (
-        seq INTEGER PRIMARY KEY,
-        payload TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-      )`,
-    );
+
   }
 
   async sha256Hex(value: string): Promise<string> {

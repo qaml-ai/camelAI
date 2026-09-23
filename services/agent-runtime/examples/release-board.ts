@@ -1,4 +1,4 @@
-import { AgentRuntime, schema, tool } from "../clients/typescript.ts";
+import { AgentRuntime, schema, tool } from "../clients/node.ts";
 
 // Your existing TypeScript app owns this state. The agent never imports it.
 const issues = [

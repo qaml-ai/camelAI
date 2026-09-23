@@ -15,6 +15,8 @@ import type {
   BeforeToolCallContext,
   BeforeToolCallResult,
   AgentMessage,
+  Agent as PiAgent,
+  AgentOptions,
   AgentTool,
   AgentToolResult,
 } from "@earendil-works/pi-agent-core";
@@ -291,6 +293,12 @@ export interface PiAfterToolCallOptions {
 }
 
 export interface PiToolSurfaceDeps {
+  /** Service execution adapter; application tools keep their scoped authorization. */
+  createExternalAgent(
+    options: AgentOptions,
+    context: ChatContextState,
+    allowWebTools?: boolean,
+  ): Promise<PiAgent & { closeService?(): Promise<void> }>;
   // DO operations the tool closures invoke.
   scopedCodeModeTools(
     context: ChatContextState,
@@ -347,12 +355,6 @@ export interface PiToolSurfaceDeps {
     context: BeforeToolCallContext,
     signal?: AbortSignal,
   ): Promise<BeforeToolCallResult | undefined>;
-  streamPiModel(
-    model: Model<any>,
-    context: Parameters<typeof import("@earendil-works/pi-ai/compat").streamSimple>[1],
-    options: Parameters<typeof import("@earendil-works/pi-ai/compat").streamSimple>[2],
-    streamSimple: typeof import("@earendil-works/pi-ai/compat").streamSimple,
-  ): ReturnType<typeof import("@earendil-works/pi-ai/compat").streamSimple>;
   recordPiAssistantUsage(
     message: AgentMessage,
     durationMs: number,
@@ -647,14 +649,14 @@ export async function runPiSubagentTool(
     throw new Error(`${toolName} requires a prompt`);
   }
 
-  const { Agent } = await import("@earendil-works/pi-agent-core");
-  const { getModel, streamSimple } = await import("@earendil-works/pi-ai/compat");
+  const { getModel } = await import("@earendil-works/pi-ai/compat");
   const resolveCurrentModel =
     deps.piModelResolver() ?? (() => deps.resolvePiModel(context, {}, getModel));
-  let modelConfig = await resolveCurrentModel();
+  const modelConfig = await resolveCurrentModel();
   const usageUserId = deps.activeTurnUserId();
+  await deps.assertUserLlmUsageAccess(context, modelConfig, usageUserId);
   const childSessionId = `${context.threadId}:${toolName}:${crypto.randomUUID()}`;
-  const child = new Agent({
+  const childOptions: AgentOptions = {
     initialState: {
       systemPrompt: await deps.createPiSubagentSystemPrompt(context, isExplore),
       model: capPiMainRequestOutput(modelConfig.model),
@@ -666,22 +668,14 @@ export async function runPiSubagentTool(
       messages: [],
       thinkingLevel: "medium",
     },
-    getApiKey: async () => {
-      const current = await resolveCurrentModel();
-      modelConfig = current;
-      child.state.model = capPiMainRequestOutput(current.model);
-      await deps.assertUserLlmUsageAccess(context, current, usageUserId);
-      return current.apiKey;
-    },
     beforeToolCall: (toolContext, signal) =>
       deps.beforePiToolCall(toolContext, signal),
     afterToolCall: (toolContext, signal) =>
       deps.afterPiToolCall(toolContext, signal),
-    streamFn: (model, llmContext, options) =>
-      deps.streamPiModel(model, llmContext, options, streamSimple),
     sessionId: childSessionId,
     toolExecution: "parallel",
-  });
+  };
+  const child = await deps.createExternalAgent(childOptions, context, false);
 
   let assistantText = "";
   let latestAssistantText = "";
@@ -755,6 +749,7 @@ export async function runPiSubagentTool(
   const abort = () => child.abort();
   if (signal?.aborted) {
     unsubscribe();
+    await child.closeService?.();
     throw new Error(`${toolName} was aborted`);
   }
   signal?.addEventListener("abort", abort, { once: true });
@@ -773,6 +768,7 @@ export async function runPiSubagentTool(
   } finally {
     signal?.removeEventListener("abort", abort);
     unsubscribe();
+    await child.closeService?.();
   }
 
   const finalText =
@@ -827,13 +823,12 @@ export async function runPiCapabilityAgentTool(
     );
   }
 
-  const { Agent } = await import("@earendil-works/pi-agent-core");
-  const { getModel, streamSimple } = await import("@earendil-works/pi-ai/compat");
+  const { getModel } = await import("@earendil-works/pi-ai/compat");
   const isResearch = toolName === "Research";
   const capabilityModel = isResearch
     ? RESEARCH_CAPABILITY_MODEL
     : ORACLE_CAPABILITY_MODEL;
-  let modelConfig = await deps.resolvePiCapabilityModel(
+  const modelConfig = await deps.resolvePiCapabilityModel(
     context,
     capabilityModel,
     getModel,
@@ -866,9 +861,10 @@ export async function runPiCapabilityAgentTool(
     : childToolDefinitions;
   const systemPrompt = capabilityAgentSystemPrompt(toolName);
   const usageUserId = deps.activeTurnUserId();
+  await deps.assertUserLlmUsageAccess(context, modelConfig, usageUserId);
   const childSessionId = `${context.threadId}:${toolName}:${crypto.randomUUID()}`;
 
-  const child = new Agent({
+  const childOptions: AgentOptions = {
     initialState: {
       systemPrompt,
       model: capOutputTokens(modelConfig.model),
@@ -876,32 +872,19 @@ export async function runPiCapabilityAgentTool(
       messages: [],
       thinkingLevel: isResearch ? "medium" : "high",
     },
-    getApiKey: async () => {
-      const current = await deps.resolvePiCapabilityModel(
-        context,
-        capabilityModel,
-        getModel,
-      );
-      modelConfig = current;
-      child.state.model = capOutputTokens(current.model);
-      await deps.assertUserLlmUsageAccess(context, current, usageUserId);
-      return current.apiKey;
-    },
     beforeToolCall: (toolContext, childSignal) =>
       deps.beforePiToolCall(toolContext, childSignal),
     // Gate tool-result image stripping on the capability child's own model
     // (e.g. a vision-capable Oracle on a text-only camelCode thread), not the
-    // main session's; `modelConfig` is reassigned in getApiKey, so the closure
-    // always sees the current capability model.
+    // main session's model.
     afterToolCall: (toolContext, childSignal) =>
       deps.afterPiToolCall(toolContext, childSignal, {
         consumerModel: modelConfig.model,
       }),
-    streamFn: (model, llmContext, options) =>
-      deps.streamPiModel(model, llmContext, options, streamSimple),
     sessionId: childSessionId,
     toolExecution: "sequential",
-  });
+  };
+  const child = await deps.createExternalAgent(childOptions, context, isResearch);
 
   let assistantText = "";
   let latestAssistantText = "";
@@ -977,6 +960,7 @@ export async function runPiCapabilityAgentTool(
   const abort = () => child.abort();
   if (signal?.aborted) {
     unsubscribe();
+    await child.closeService?.();
     throw new Error(`${toolName} was aborted`);
   }
   signal?.addEventListener("abort", abort, { once: true });
@@ -996,6 +980,7 @@ export async function runPiCapabilityAgentTool(
   } finally {
     signal?.removeEventListener("abort", abort);
     unsubscribe();
+    await child.closeService?.();
   }
 
   const finalText =

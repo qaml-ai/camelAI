@@ -2,10 +2,10 @@
 
 Run multiple agents on a Unix VM, one long-lived Pi process per agent, with a
 fresh QuickJS/WebAssembly sandbox in a disposable process for each `js_exec` invocation. Node or Bun hosts the process; guest code never executes in their JavaScript context. This is an opt-in
-prototype; the application still runs its production agent inside ChatThreadDO.
+prototype; on this branch the application uses this service for all agent execution.
 
 ```text
-HTTP client / TypeScript or Python SSE client / future ChatThreadDO adapter
+HTTP client / TypeScript or Python SSE client
   -> VM supervisor (auth, capacity, process lifecycle, tool bridge)
       -> agent A process (Pi loop, model key, native Pi transcript)
           -> disposable codemode process
@@ -19,7 +19,7 @@ Pi packages as the application. Code preparation was extracted from the existing
 Worker runner into `packages/agent-core/code-mode-source.ts`; both runners share
 TypeScript stripping and trailing-expression behavior. The prototype uses a
 small standalone prompt, rather than the platform prompt advertising unavailable
-capabilities. It does not yet move the whole production harness out of the DO.
+capabilities. Application authorization, tools, and UI projection remain in the app.
 
 ## Interactive local demos
 
@@ -27,6 +27,55 @@ Run `bun run agent:studio` from the repository root for agent chat URLs, live
 TypeScript/Python application state, code/tool traces, run reviews and browser
 voice controls. See [Local Agent Studio](studio/README.md) for Python setup,
 model configuration and the distinction between live and scripted runs.
+
+## Run the real application as an SDK client
+
+From the camelAI repository root, run `bun run dev:external-agent`, then open
+`http://localhost:3001/chat`. This starts local auth, the app, and a loopback
+runtime. The launcher uses `SELFHOST_AI_*` or an existing `OPENROUTER_API_KEY`
+with Sonnet 4.6. The runtime host receives the provider credential; agent
+configuration and SDK journals never store it. Stop with Ctrl-C.
+
+```text
+camelAI browser -> ChatThreadDO (UI projection and application policy)
+                    -> general TypeScript SDK / HTTP + SSE
+                        -> service: model requests, Pi loop, history, context limits
+                            -> QuickJS/WASM -> scoped SDK tool callbacks -> camelAI
+```
+
+`workers/main/src/chat-thread/service-agent.ts` is a camelAI-owned UI compatibility
+adapter. It uses the same public SDK as other applications. The service contains
+no camelAI/Cloudflare callbacks or workspace concepts. Agent/Explore and capability
+subagents also use the service when this local flag is enabled.
+
+On first attachment, the local app imports its loaded native history into an
+empty service agent. It stores the returned scoped credential and SDK delivery
+journal in the DO. Subsequent turns read service history; they never replace it
+with the DO's copy. The existing DO transcript is retained as a render/usage
+projection so the current UI works. Large legacy chats still use the app's bounded
+initial import, not a complete historical migration.
+
+The service owns model requests and `js_exec` now. Application tools retain their
+existing authorization and policy checks. QuickJS exposes registered JSON tools,
+not the old Worker `env` bindings or generic fetch; the local prompt reflects
+that difference. Native tool results retain text/image content. SDK receipts and
+native model tool-call IDs are separate identifiers.
+
+This is still a local integration: model/provider selection is fixed at agent
+creation and uses the runtime's configured credential. Mid-conversation provider
+switching, production billing parity, long-running build/deploy tools, and full
+DO-eviction recovery have not been certified. Uncertain calls require explicit
+reconciliation; the service does not automatically replay side effects. Context
+limits currently drop old complete turns from provider input while retaining full
+durable history; this is not semantic summarization.
+
+`LOCAL_AGENT_RUNTIME_URL` and `LOCAL_AGENT_RUNTIME_TOKEN` opt the loopback app in;
+there is no in-DO execution fallback on this branch. Both settings are required. Local state lives under
+`.agent-runtime/application/`. Containers are disabled for chat/file-tool trials;
+`LOCAL_AGENT_CONTAINERS=1` enables the existing container setup. Optional local
+Cloudflare AI features such as automatic titles may lack required bindings.
+
+For the independent project layout and installation, see [STANDALONE.md](STANDALONE.md).
 
 ## Run locally or on a VM
 
@@ -139,6 +188,42 @@ the snapshot and reconcile it offline with the process stopped. Diagnostic
 `execute` calls are not journaled. Snapshots are local files, not replicated
 durable storage, and the whole transcript is loaded into memory.
 
+## Tenant isolation contract
+
+This prototype is **single-tenant, with one trusted operator**. Separate agent
+processes and scoped SDK session credentials do not constitute a multi-tenant
+authorization system. The operator credential controls the whole runtime.
+
+- **Generated code:** QuickJS/WASM confines generated JavaScript to the exposed
+  capabilities. It does not enforce tenant ownership of agents, tools or data.
+- **Application tools:** Tool implementations are trusted host code. Applications
+  must limit them to the intended workspace, data and credentials; model-supplied
+  arguments are not a trusted source of tenant identity.
+- **Shared chat:** Anyone who can reach `/a/:agentId` can access that agent's
+  shared conversation and send prompts. The URL does not create a private
+  conversation per visitor. Studio's developer access protects inspection and
+  configuration data, not access to the shared conversation.
+- **Host resources:** Guest execution limits do not enforce per-tenant quotas
+  or isolate all host-process memory, filesystem permissions and network access.
+
+Before deploying a shared multi-tenant service, implement authenticated tenant
+identity as an end-to-end authorization boundary: derive it from verified
+credentials and carry it through agent creation, storage access, tool connections
+and every API access check. Bind tool capabilities and credentials to that
+identity. Do not treat knowledge of an agent ID as permission to access it, and
+define an explicit access policy for end-user chat links.
+
+Acceptance tests must prove tenant A cannot list, read, prompt, inspect, stop or
+attach tools to tenant B's agents, including after reconnects and restarts.
+Then enforce per-tenant concurrency, CPU/memory, tool-use and inference-spending
+quotas. Restrict host-process permissions and use OS/container containment as
+appropriate for the code being hosted; hosting customers' arbitrary Node/Python
+tool implementations requires a separate isolation boundary.
+
+Multiple agents per VM remains the intended architecture; this does not require
+a VM per tenant. A `tenantId` field alone provides no protection, so add it with
+the authentication and enforcement design rather than as a placeholder.
+
 ## Sandbox boundary and remaining production work
 
 The guest has ECMAScript built-ins plus `tools`, `text` and captured `console`
@@ -168,7 +253,7 @@ or proof against engine vulnerabilities. Production shared-VM operation still
 needs OS/container containment and resource quotas around the executor, tenant
 authentication, tool-specific authorization, controlled egress for tool hosts,
 and a maintained engine/security update process. Agent shutdown reaps its Unix
-process group. Production ChatThreadDO routing remains unchanged.
+process group. No deployed environment has been changed.
 
 ## Integration seam and next extraction
 
@@ -183,20 +268,17 @@ The agent and its scripts never import DO classes. A production adapter should
 implement the bridge with a short-lived, thread-scoped RPC capability back to
 the Worker, retaining its authorization and confirmation checks.
 
-The next integration step is an opt-in ChatThreadDO driver that replaces the
-in-isolate Pi session with supervisor requests and consumes Pi events through
-the existing UI chunk encoder. Before switching real users, port/bridge these
-existing behaviors:
+The application no longer owns model retries, model-context compaction, or
+isolate-death recovery. A browser/DO reconnect observes the saved service request
+ID. It never re-prompts the model to reconstruct a UI stream. The DO retains only
+a UI turn marker, the SDK receipt cursor, and a render projection.
 
-- `chat-thread-do.ts` model resolution, provider-specific routing, prompt/skills,
-  context transformation/compaction, billing and usage checks.
-- `chat-thread/pi-tools.ts` top-level interactive tools, subagent spawning and
-  scoped tool discovery; subagents should call supervisor `start`, not `new Agent`
-  inside the parent process.
-- `pi_core_*` ownership, turn journals, tool outcome evidence, steering,
-  interrupted-history repair, bounded recovery and durable replay cursors.
-- `pi-chunk-encoder.ts` streaming, previews, artifacts, completion metadata and
-  reconnect/resume behavior.
+The service persists native messages and tool outcomes. A killed service run is
+interrupted and requires explicit reconciliation before continuation; unknown
+side effects are never automatically repeated. No degraded retry ladder,
+salvage mode, or retry budget is needed in the application.
 
-No existing browser/Worker route has been switched, no VM has been provisioned,
-and no deployment is required to review or run this prototype.
+Remaining production migration work includes model/provider reconfiguration,
+billing enforcement at the inference boundary, and testing application tools
+under real deployment conditions. Configuration changes during a run are rejected;
+they do not abort and regenerate the turn. Nothing has been deployed.

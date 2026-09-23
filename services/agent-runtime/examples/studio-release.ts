@@ -1,4 +1,4 @@
-import { AgentRuntime, schema, tool, type AgentClient } from '../clients/typescript.ts';
+import { AgentRuntime, schema, tool, type AgentClient } from '../clients/node.ts';
 import { readFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { writeDurableJson } from '../shared/durable-json.ts';

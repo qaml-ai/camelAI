@@ -230,3 +230,61 @@ test("HTTP control plane authenticates, streams codemode output, and stops agent
   assert.match(await bypass.text(), /Unknown codemode option: runtime/);
   assert.equal((await fetch(base, { method: "DELETE", headers })).status, 200);
 });
+
+test("native tools preserve content and imported history is owned by the service after restart", async t => {
+  const requests: any[] = [];
+  const chosen = await fakeProvider(t, body => {
+    requests.push(body);
+    if (requests.length === 1) return { role: "assistant", tool_calls: [{ index: 0, id: "native_1", type: "function", function: { name: "inspect", arguments: "{}" } }] };
+    return { role: "assistant", content: "Native result received." };
+  });
+  const { supervisor } = await fixture(t);
+  let calls = 0;
+  const bridge = {
+    definitions: [{ name: "inspect", description: "Read native content", parameters: { type: "object" }, exposure: "direct" as const, resultFormat: "content" as const }],
+    async call() { calls++; return { content: [{ type: "text", text: "native-content-marker" }], details: { ok: true } }; },
+  };
+  const initialMessages = [{ role: "user" as const, content: "import-marker", timestamp: 1 }];
+  await supervisor.start("native", { model: chosen, apiKey: "fixture", initialMessages }, bridge);
+  await supervisor.request("native", "prompt", { message: { role: "user", content: "Call inspect", timestamp: 2 } });
+  assert.equal(calls, 1);
+  assert.ok(requests[0].tools.some((tool: any) => tool.function.name === "inspect"));
+  assert.ok(requests[1].messages.some((message: any) => message.role === "tool" && message.content === "native-content-marker"));
+  const before = await supervisor.request("native", "history");
+  assert.equal(before.messages[0].content, "import-marker");
+  await supervisor.stop("native");
+  await supervisor.start("native", { model: chosen, apiKey: "fixture", initialMessages: [{ role: "user", content: "must-not-overwrite", timestamp: 3 }] }, bridge);
+  assert.deepEqual((await supervisor.request("native", "history")).messages, before.messages);
+  await supervisor.request("native", "configure", { systemPrompt: "Changed role.", tools: [] });
+  await supervisor.request("native", "prompt", { text: "Next" });
+  assert.equal(requests.at(-1).tools.length, 1);
+  assert.ok(requests.at(-1).messages[0].content.includes("Changed role."));
+});
+
+test("explicit crash reconciliation closes missing tool outcomes without replaying their effects", async t => {
+  const chosen = await fakeProvider(t, () => ({ role: "assistant", tool_calls: [{ index: 0, id: "uncertain_1", type: "function", function: { name: "effect", arguments: "{}" } }] }));
+  const { supervisor } = await fixture(t);
+  const started = Promise.withResolvers<void>();
+  let calls = 0;
+  const bridge = {
+    definitions: [{ name: "effect", description: "Side effect", parameters: {}, exposure: "direct" as const }],
+    async call() { calls++; started.resolve(); return new Promise(() => {}); },
+  };
+  await supervisor.start("crash", { model: chosen, apiKey: "fixture" }, bridge);
+  const rejected = assert.rejects(supervisor.request("crash", "prompt", { text: "Perform effect" }), /stopped|exited/);
+  await started.promise;
+  await supervisor.stop("crash");
+  await rejected;
+  await supervisor.start("crash", { model: chosen, apiKey: "fixture" }, bridge);
+  await assert.rejects(supervisor.request("crash", "reconcile", {}), /Acknowledge/);
+  await supervisor.request("crash", "reconcile", { acknowledged: true });
+  const history = await supervisor.request("crash", "history");
+  assert.equal(history.interrupted, false);
+  assert.equal(calls, 1);
+  const unknown = history.messages.find((message: any) => message.role === "toolResult");
+  assert.equal(unknown.toolCallId, "uncertain_1");
+  assert.equal(unknown.isError, true);
+  assert.match(unknown.content[0].text, /unknown/);
+  await supervisor.stop("crash");
+  assert.equal((await supervisor.start("crash", { model: chosen }, bridge)).interrupted, false);
+});

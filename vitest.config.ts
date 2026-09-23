@@ -18,6 +18,6 @@ export default defineConfig({
     setupFiles: ['./tests/setup.ts'],
     globals: true,
     include: ['tests/**/*.test.ts', 'tests/**/*.test.tsx'],
-    exclude: ['tests/integration/**'],
+    exclude: ['tests/integration/**', 'tests/agent-service-adapter.test.ts'],
   },
 });

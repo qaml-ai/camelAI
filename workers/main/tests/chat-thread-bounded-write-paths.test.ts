@@ -119,7 +119,6 @@ async function compactPreserving(
     ...all.slice(-keptTailRows),
   ];
   await instance.replacePiCoreMessages(compacted, { uiRender: 'preserve' });
-  instance.clearPiCoreCompaction();
 }
 
 describe('2a — bounded preserve keeps the history it is there to keep', () => {

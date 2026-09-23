@@ -36,6 +36,7 @@ describe("ChatThreadDO agent state sync", () => {
   it("syncs initial state from onStart instead of the constructor", async () => {
     const fake = Object.create(ChatThreadDO.prototype) as any;
     fake.syncAgentState = vi.fn();
+    fake.readPiActiveTurn = vi.fn(() => null);
 
     await ChatThreadDO.prototype.onStart.call(fake);
 

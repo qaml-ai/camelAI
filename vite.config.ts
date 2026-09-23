@@ -54,6 +54,12 @@ function suppressUndiciTerminatedErrors(): Plugin {
 }
 
 function withLocalDevVars(config: WorkerConfig): Partial<WorkerConfig> | void {
+  const localAgentRuntimeUrl = process.env.LOCAL_AGENT_RUNTIME_URL;
+  const localAgentRuntimeToken = process.env.LOCAL_AGENT_RUNTIME_TOKEN;
+  const localAgentProviderVars = localAgentRuntimeUrl ? Object.fromEntries(
+    ['SELFHOST_AI_PROVIDER', 'SELFHOST_AI_API_KEY', 'SELFHOST_AI_API', 'SELFHOST_AI_BASE_URL', 'SELFHOST_AI_MODEL', 'SELFHOST_AI_NAME']
+      .filter(key => process.env[key]).map(key => [key, process.env[key]!]),
+  ) : {};
   const isLocalE2E = process.env.E2E_LOCAL === '1';
   const localAuthBypass = process.env.LOCAL_AUTH_BYPASS;
   const localAuthBypassHosts = process.env.LOCAL_AUTH_BYPASS_HOSTS;
@@ -75,6 +81,7 @@ function withLocalDevVars(config: WorkerConfig): Partial<WorkerConfig> | void {
   const testLlmReplayUrl = process.env.TEST_LLM_REPLAY_URL;
 
   if (
+    !localAgentRuntimeUrl &&
     !localAuthBypass &&
     !localAuthBypassHosts &&
     !localAuthUserEmail &&
@@ -101,6 +108,8 @@ function withLocalDevVars(config: WorkerConfig): Partial<WorkerConfig> | void {
       : {}),
     vars: {
       ...(config.vars ?? {}),
+      ...localAgentProviderVars,
+      ...(localAgentRuntimeUrl ? { LOCAL_AGENT_RUNTIME_URL: localAgentRuntimeUrl, LOCAL_AGENT_RUNTIME_TOKEN: localAgentRuntimeToken ?? "" } : {}),
       ...(testLlmReplayUrl ? { TEST_LLM_REPLAY_URL: testLlmReplayUrl } : {}),
       ...(localAuthBypass ? { LOCAL_AUTH_BYPASS: localAuthBypass } : {}),
       ...(localAuthBypassHosts
@@ -185,7 +194,7 @@ export default defineConfig(({ command }) => {
     suppressUndiciTerminatedErrors(),
     cloudflare({
       configPath: './wrangler.jsonc',
-      config: withLocalDevVars,
+      config: command === 'serve' ? withLocalDevVars : undefined,
       viteEnvironment: { name: 'ssr' },
       // E2E (E2E_LOCAL=1) runs fully local: disable remote bindings so wrangler
       // dev doesn't open a remote proxy session (which needs a Cloudflare login

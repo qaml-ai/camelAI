@@ -7,7 +7,7 @@ import type { ChildProcess } from "node:child_process";
 import { validateDefinitions, validateToolCall } from "./tool-policy.ts";
 import { jsonWithinLimit, SANDBOX_LIMITS } from "./limits.ts";
 
-type Handle = { child: ChildProcess; rpc: Rpc; calls: Set<AbortController>; listeners: Set<(event: any) => void>; groupKilled: boolean };
+type Handle = { bridge: ToolBridge; child: ChildProcess; rpc: Rpc; calls: Set<AbortController>; listeners: Set<(event: any) => void>; groupKilled: boolean };
 
 function killGroup(handle: Handle) {
   if (handle.groupKilled || !handle.child.pid) return;
@@ -37,7 +37,7 @@ export class AgentSupervisor {
       const directory = resolve(join(this.root, id));
       await mkdir(directory, { recursive: true, mode: 0o700 });
       const { child, rpc } = childProcess("./agent-child.ts", directory, this.options.runtime, true);
-      const handle: Handle = { child, rpc, calls: new Set(), listeners: new Set(), groupKilled: false };
+      const handle: Handle = { bridge, child, rpc, calls: new Set(), listeners: new Set(), groupKilled: false };
       this.agents.set(id, handle);
       this.starting.delete(id);
       const cleanup = () => {
@@ -61,7 +61,7 @@ export class AgentSupervisor {
         const controller = new AbortController();
         handle.calls.add(controller);
         try {
-          const result = await bridge.call(checked.tool.name, checked.args, controller.signal);
+          const result = await bridge.call(checked.tool.name, checked.args, controller.signal, params.toolCallId ? { toolCallId: params.toolCallId } : undefined);
           controller.signal.throwIfAborted();
           return JSON.parse(jsonWithinLimit(result, SANDBOX_LIMITS.resultBytes, "Tool result"));
         }
@@ -74,12 +74,17 @@ export class AgentSupervisor {
     } finally { this.starting.delete(id); }
   }
 
-  async request(id: string, method: "prompt" | "execute" | "abort" | "status", params: any = {}, onEvent?: (event: any) => void) {
+  async request(id: string, method: "prompt" | "execute" | "abort" | "status" | "history" | "continue" | "steer" | "followUp" | "reconcile" | "configure", params: any = {}, onEvent?: (event: any) => void) {
     const handle = this.agents.get(id);
     if (!handle) throw new Error("Agent not found");
+    if (method === "configure" && params.tools !== undefined) validateDefinitions(params.tools);
     if (method === "abort") for (const call of handle.calls) call.abort();
     if (onEvent) handle.listeners.add(onEvent);
-    try { return await handle.rpc.request(method, params); }
+    try {
+      const result = await handle.rpc.request(method, params);
+      if (method === "configure" && params.tools !== undefined) handle.bridge.definitions = params.tools;
+      return result;
+    }
     finally { if (onEvent) handle.listeners.delete(onEvent); }
   }
 

@@ -52,3 +52,14 @@ describe("createPiSystemPrompt deployed CONNECTIONS binding", () => {
     expect(prompt).toContain("## Subagent Mode");
   });
 });
+
+ describe("external sandbox instructions", () => {
+  it("advertises only registered QuickJS tools, without Worker runtime globals", () => {
+    const prompt = createPiSystemPrompt(context, { skillNames: [], executionRuntime: "quickjs" });
+    expect(prompt).toContain("QuickJS/WASM");
+    expect(prompt).not.toContain('await env.CONNECTIONS.find');
+    expect(prompt).not.toContain('await env.AI.run');
+    expect(prompt).not.toContain('await env.BROWSER.launch');
+    expect(prompt).toContain('tools.search');
+  });
+});

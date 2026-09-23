@@ -4,13 +4,13 @@ Expose ordinary application functions. The runtime runs the model loop, saves
 conversation history, and executes generated code in QuickJS/WASM. The SDK
 handles provisioning, SSE, tool results, reconnects, and shutdown.
 
-These are local prototype SDKs for Node/Bun and Python; no package has been
+These are local prototype SDKs for trusted TypeScript backends and Python; no package has been
 published. Remote connections require HTTPS. The model key stays on the host.
 
 ## TypeScript
 
 ```ts
-import { AgentRuntime, schema, tool } from "./services/agent-runtime/clients/typescript.ts";
+import { AgentRuntime, schema, tool } from "./services/agent-runtime/clients/node.ts";
 
 const runtime = new AgentRuntime({
   url: "http://127.0.0.1:8790",
@@ -46,6 +46,19 @@ try {
   await agent.destroy();
 }
 ```
+
+The Node/Bun entry shown above persists tool receipts and event cursors to disk.
+For Cloudflare Workers or other Web API environments, import `clients/typescript.ts`
+instead and inject `journalStore: { load, save }` backed by your application's
+durable storage. That portable entry defaults to memory and does not read
+environment variables. `save(sessionId, journal)` must resolve only after commit.
+
+Keep `agent.session` in secret storage and reconnect with
+`runtime.connectAgent(credentials, { tools, onEvent })`. An async
+`onEvent(event, requestId)` finishes before its replay cursor is committed.
+`history()`, `continue()`, `steer(text)`, `followUp(text)`, and `configure(...)`
+operate on the same persistent agent. `reconcileHistory()` explicitly acknowledges
+unknown tool effects after interruption; it does not replay those effects.
 
 ## Python
 

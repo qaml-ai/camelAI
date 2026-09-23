@@ -6,6 +6,7 @@
 		"skipLibCheck": true,
 		"strict": true,
 		"noEmit": true,
+		"allowImportingTsExtensions": true,
 		"esModuleInterop": true,
 		"module": "esnext",
 		"moduleResolution": "bundler",
@@ -27,5 +28,5 @@
 		"**/*.tsx",
 		".react-router/types/**/*"
 	],
-	"exclude": ["node_modules", "chat-do", "scripts", "workers", "sandbox", "services", "packages", "packages/**/*", "build", "dist"]
+	"exclude": ["tests/agent-service-adapter.test.ts", "node_modules", "chat-do", "scripts", "workers", "sandbox", "services", "packages", "packages/**/*", "build", "dist"]
 }

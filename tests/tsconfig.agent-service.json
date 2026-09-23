@@ -1,0 +1,5 @@
+{
+  "extends": "../services/agent-runtime/tsconfig.json",
+  "include": ["agent-service-adapter.test.ts"],
+  "exclude": []
+}

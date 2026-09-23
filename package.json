@@ -7,6 +7,7 @@
 	"scripts": {
 		"dev": "react-router dev",
 		"dev:app": "react-router dev",
+		"dev:external-agent": "bun services/agent-runtime/examples/run-application.ts",
 		"dev:local-auth": "LOCAL_AUTH_BYPASS=1 WORKER_BASE_URL=http://localhost:3001 react-router dev",
 		"build": "bun run build:cf && bun run check:pi-bedrock-build",
 		"build:cf": "bun run build:renderer && react-router build",
@@ -108,7 +109,8 @@
 		"test:e2e:ui": "playwright test --ui",
 		"test:e2e:staging-billing": "node scripts/run-staging-billing-e2e.mjs",
 		"publish:e2e:staging-billing": "E2E_REPORT_DIR=playwright-report-staging-billing node scripts/publish-e2e-report.mjs",
-		"build:renderer": "node scripts/build-notebook-renderer.mjs"
+		"build:renderer": "node scripts/build-notebook-renderer.mjs",
+		"test:agent-service-adapter": "tsc -p tests/tsconfig.agent-service.json && node --experimental-strip-types --test tests/agent-service-adapter.test.ts"
 	},
 	"dependencies": {
 		"@ai-sdk/react": "^3.0.204",

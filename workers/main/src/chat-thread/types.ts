@@ -97,6 +97,8 @@ export interface CloudflareEmailSender {
 }
 
 export interface ChatEnv extends WorkspaceFilesystemEnv {
+  LOCAL_AGENT_RUNTIME_URL?: string;
+  LOCAL_AGENT_RUNTIME_TOKEN?: string;
   // Main app static assets. Notebook deploys read the pre-built renderer SPA
   // from /notebook-renderer/ to synthesize published-notebook workers.
   ASSETS?: Fetcher;

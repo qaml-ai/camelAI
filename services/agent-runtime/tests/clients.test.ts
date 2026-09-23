@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { AgentSupervisor } from "../src/supervisor.ts";
 import { ClientSessions, readJson } from "../src/client-sessions.ts";
 import { configuredModel } from "../src/model.ts";
-import { AgentClient, AgentRuntime, tool, schema, type AgentOptions, type RuntimeOptions, type Tool } from "../clients/typescript.ts";
+import { AgentClient, AgentRuntime, tool, schema, type AgentOptions, type RuntimeOptions, type Tool } from "../clients/node.ts";
 import type { Api, Model } from "@earendil-works/pi-ai";
 
 const token = "fixture-operator-secret-32-characters";

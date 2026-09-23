@@ -344,7 +344,7 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
     // is stashed; the session is warm and idle so onChatMessage takes the prompt path.
     fake.readPiActiveTurn = vi.fn(() => ({ turnId, openedAt: 1 }));
     fake.pendingPiPromptQueue = [{ userMessage: { role: 'user', content: 'hi' } }];
-    fake.refreshPiSessionModel = vi.fn(async () => {});
+    fake.ensurePiSessionReady = vi.fn(async () => {});
     fake.withPiTurnInactivityTimeout = vi.fn(async (fn: () => unknown) => fn());
     fake.piEventHandlerChain = Promise.resolve();
     fake.syncAgentState = vi.fn();
@@ -399,6 +399,7 @@ describe('ChatThreadDO native stream bridge (commit 3b)', () => {
     fake.piSession = null; // cold/disposed session
     fake.piEventHandlerChain = Promise.resolve();
     fake.syncAgentState = vi.fn();
+    fake.ensurePiSessionReady = vi.fn(async () => {});
     fake.resumeActivePiTurn = vi.fn(async () => {});
 
     const response = (await ChatThreadDO.prototype['onChatMessage'].call(
@@ -1572,11 +1573,6 @@ describe('ChatThreadDO onConnect render-history delivery', () => {
 });
 
 describe('ChatThreadDO double-send admission (queue-correct)', () => {
-  const journalRows = (instance: any): Array<{ seq: number; payload: string }> =>
-    instance.ctx.storage.sql
-      .exec('SELECT seq, payload FROM pi_turn_journal ORDER BY seq ASC')
-      .toArray() as Array<{ seq: number; payload: string }>;
-
   it('delivers BOTH rapid fresh sends: first prompted, second steered (REGRESSION)', async () => {
     const stub = await newChatThreadStub('thread-double-send');
     await runInDurableObject(stub, async (instance: any) => {
@@ -1610,12 +1606,8 @@ describe('ChatThreadDO double-send admission (queue-correct)', () => {
       expect(first).toBe(true);
       expect(second).toBe(true);
 
-      // The journal durably holds BOTH accepted prompts (append, not replace).
-      const rows = journalRows(instance);
-      expect(rows).toHaveLength(2);
-      expect(rows[0].payload).toContain('first message');
-      expect(rows[1].payload).toContain('second message');
-
+      expect(instance.pendingPiPromptQueue.map((entry: any) => entry.userMessage.content)).toEqual(['first message', 'second message']);
+      instance.ensurePiSessionReady = vi.fn(async () => {});
       // onChatMessage (driven by saveMessages in production) drains the queue.
       const response = (await instance.onChatMessage(() => {}, {})) as Response;
       await response.text();
@@ -1628,12 +1620,7 @@ describe('ChatThreadDO double-send admission (queue-correct)', () => {
       expect(session.steer.mock.calls[0][0]).toMatchObject({
         content: 'second message',
       });
-      // The steered message was steer-journaled for eviction redelivery.
-      const steerJournal = instance.ctx.storage.kv.get('piSteerJournal') ?? [];
-      expect(steerJournal).toHaveLength(1);
-      expect(String(steerJournal[0])).toContain('second message');
-      // The turn journal still holds both until turn end commits them.
-      expect(journalRows(instance)).toHaveLength(2);
+      expect(instance.ctx.storage.kv.get('piSteerJournal')).toBeUndefined();
     });
   });
 
@@ -1661,7 +1648,8 @@ describe('ChatThreadDO double-send admission (queue-correct)', () => {
           timestamp: 1000,
         }),
       ).toBe(true);
-      expect(journalRows(instance)).toHaveLength(1);
+      expect(instance.pendingPiPromptQueue).toHaveLength(1);
+      instance.ensurePiSessionReady = vi.fn(async () => {});
 
       const response = (await instance.onChatMessage(() => {}, {})) as Response;
       await response.text();
@@ -1692,117 +1680,6 @@ describe('ChatThreadDO double-send admission (queue-correct)', () => {
 });
 
 describe('ChatThreadDO recovery classification and partial reconciliation', () => {
-  it('onChatRecovery declines the orphan-partial persist (persist: false)', async () => {
-    const result = await ChatThreadDO.prototype['onChatRecovery'].call(
-      Object.create(ChatThreadDO.prototype),
-      {} as never,
-    );
-    expect(result).toEqual({ persist: false });
-  });
-
-  it('trims trailing incomplete parts from the live row before a resume continuation', async () => {
-    const fake = Object.create(ChatThreadDO.prototype) as any;
-    fake.recordChatThreadObservabilityEvent = vi.fn();
-    fake.ensurePiSessionReady = vi.fn(async () => {});
-    // Well under the marker's progress-independent resume budgets.
-    fake.recordPiActiveTurnResumeAttempt = vi.fn(() => ({
-      total: 1,
-      isolateDeath: 1,
-      voluntary: 0,
-      charged: 'isolate_death',
-    }));
-    fake.activePiStreamTurnId = 'turn-1';
-    fake.piMainBaselineIndex = 0;
-    const order: string[] = [];
-    fake.piSession = {
-      state: { messages: [{ role: 'user', content: 'q' }] },
-      continue: vi.fn(async () => order.push('continue')),
-    };
-    fake.messages = [
-      { id: 'u1', role: 'user', parts: [] },
-      {
-        id: 'turn-1',
-        role: 'assistant',
-        parts: [
-          {
-            type: 'tool-bash',
-            toolCallId: 'tc1',
-            state: 'output-available',
-            input: {},
-            output: { content: 'ok', isError: false },
-          },
-          { type: 'text', text: 'half of the ans', state: 'streaming' },
-        ],
-      },
-    ];
-    fake.persistMessages = vi.fn(async (messages: AnyRecord[]) => {
-      order.push('persist');
-      fake.messages = messages;
-    });
-
-    await ChatThreadDO.prototype['resumeActivePiTurn'].call(fake);
-
-    // Settled tool work stays; the mid-stream text is dropped BEFORE continue()
-    // regenerates the message, so the render row can't end up half+full.
-    expect(order).toEqual(['persist', 'continue']);
-    const live = fake.messages.find((m: AnyRecord) => m.id === 'turn-1');
-    expect(live.parts).toHaveLength(1);
-    expect(live.parts[0]).toMatchObject({ toolCallId: 'tc1' });
-  });
-
-  it('stamps committed fork ids on the live row when the resume owes no output', async () => {
-    const fake = Object.create(ChatThreadDO.prototype) as any;
-    fake.recordChatThreadObservabilityEvent = vi.fn();
-    fake.ensurePiSessionReady = vi.fn(async () => {});
-    fake.recordPiActiveTurnResumeAttempt = vi.fn(() => ({
-      total: 1,
-      isolateDeath: 1,
-      voluntary: 0,
-      charged: 'isolate_death',
-    }));
-    fake.activePiStreamTurnId = 'turn-1';
-    fake.piMainBaselineIndex = 0;
-    fake.piSession = {
-      state: {
-        messages: [
-          { role: 'user', content: 'q', timestamp: 1 },
-          {
-            role: 'assistant',
-            content: [{ type: 'text', text: 'answer' }],
-            timestamp: 2,
-            responseId: 'resp-x',
-          },
-        ],
-      },
-    };
-    fake.attachCodeModeArtifactsToToolResult = vi.fn(async (m: unknown) => m);
-    fake.appendPiCoreMessagesIfMissing = vi.fn(async () => {});
-    fake.clearPiActiveTurnAndJournal = vi.fn(async () => {});
-    fake.finishTurn = vi.fn();
-    fake.setActiveTurnUserId = vi.fn();
-    fake.completeTodoStateForTurnEnd = vi.fn(async () => {});
-    fake.messages = [
-      {
-        id: 'turn-1',
-        role: 'assistant',
-        parts: [{ type: 'text', text: 'answer', state: 'done' }],
-      },
-    ];
-    fake.persistMessages = vi.fn(async (messages: AnyRecord[]) => {
-      fake.messages = messages;
-    });
-
-    await ChatThreadDO.prototype['resumeActivePiTurn'].call(fake);
-
-    // The orphan-persisted partial already displays the committed content; its
-    // stamped fork ids keep the top-up from converting the rows again.
-    const live = fake.messages.find((m: AnyRecord) => m.id === 'turn-1');
-    expect(live.metadata?.pi?.forkEntryIds).toEqual(['resp-x']);
-    expect(fake.piSession.continue).toBeUndefined();
-    expect(fake.finishTurn).toHaveBeenCalledWith(
-      expect.objectContaining({ markUnread: true }),
-    );
-  });
 
   it('does NOT dispose the session when the reply stream completes normally', async () => {
     const fake = Object.create(ChatThreadDO.prototype) as any;
@@ -1812,7 +1689,7 @@ describe('ChatThreadDO recovery classification and partial reconciliation', () =
     fake.pendingPiPromptQueue = [
       { userMessage: { role: 'user', content: 'hi' } },
     ];
-    fake.refreshPiSessionModel = vi.fn(async () => {});
+    fake.ensurePiSessionReady = vi.fn(async () => {});
     fake.recordPiTurnJournalSteerMessage = vi.fn();
     fake.piEventHandlerChain = Promise.resolve();
     fake.syncAgentState = vi.fn();
@@ -1842,54 +1719,6 @@ describe('ChatThreadDO recovery classification and partial reconciliation', () =
       'pi_turn_stream_stall_abort',
       expect.anything(),
     );
-  });
-
-  // The reply reader's cancel() fires on TWO paths: a real mid-turn stall/eviction
-  // (turn still in flight, activePiStreamTurnId set) and ai-chat releasing the
-  // reader after the terminal finish chunk (turn already settled, id cleared, but
-  // the Pi session reused). The discriminator is activePiStreamTurnId, NOT
-  // piSession — the reused session stays truthy after a clean finish.
-  describe('onPiReplyStreamCancelled discriminates stall from post-finish close', () => {
-    it('disposes and raises stall_abort when a turn is still in flight', () => {
-      const fake = Object.create(ChatThreadDO.prototype) as any;
-      fake.chatContext = { threadId: 'thread-stall' };
-      fake.activePiStreamTurnId = 'turn-in-flight';
-      fake.piSession = { state: { isStreaming: true } };
-      fake.disposePiSession = vi.fn();
-      fake.recordChatThreadObservabilityEvent = vi.fn();
-
-      ChatThreadDO.prototype['onPiReplyStreamCancelled'].call(fake);
-
-      expect(fake.disposePiSession).toHaveBeenCalledTimes(1);
-      expect(fake.recordChatThreadObservabilityEvent).toHaveBeenCalledWith(
-        'pi_turn_stream_stall_abort',
-        expect.objectContaining({ status: 'aborted' }),
-      );
-    });
-
-    it('does NOT dispose the reused session on a post-finish reader release', () => {
-      const fake = Object.create(ChatThreadDO.prototype) as any;
-      fake.chatContext = { threadId: 'thread-finish-race' };
-      // Turn settled: the execute finally cleared the id, but the Pi session is
-      // reused for the next turn so it is still present (the case the old
-      // `!piSession && !activePiStreamTurnId` guard got wrong).
-      fake.activePiStreamTurnId = null;
-      fake.piSession = { state: { isStreaming: false } };
-      fake.disposePiSession = vi.fn();
-      fake.recordChatThreadObservabilityEvent = vi.fn();
-
-      ChatThreadDO.prototype['onPiReplyStreamCancelled'].call(fake);
-
-      expect(fake.disposePiSession).not.toHaveBeenCalled();
-      expect(fake.recordChatThreadObservabilityEvent).not.toHaveBeenCalledWith(
-        'pi_turn_stream_stall_abort',
-        expect.anything(),
-      );
-      expect(fake.recordChatThreadObservabilityEvent).toHaveBeenCalledWith(
-        'pi_turn_stream_closed',
-        expect.objectContaining({ severity: 'debug' }),
-      );
-    });
   });
 });
 
@@ -2241,40 +2070,6 @@ describe('ChatThreadDO.forceClearHungTurn', () => {
 // report the dead turn as busy forever. getUiMessages (the SSR loader, the first
 // page-open touch) and onConnect now run the same guarded sweep.
 describe('ChatThreadDO stranded-marker healing on page open', () => {
-  it('sweeps a stranded marker on getUiMessages and lets the gated top-up run', async () => {
-    const stub = await newChatThreadStub('thread-stranded-marker');
-    await runInDurableObject(stub, async (instance: any) => {
-      instance.chatContext = { threadId: 'thread-stranded-marker' };
-      instance.ensurePiCoreTables();
-      seedPiCoreRow(instance, 0, { role: 'user', content: 'q', timestamp: 1000 });
-      seedPiCoreRow(instance, 1, {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'a' }],
-        timestamp: 1100,
-        responseId: 'resp-1',
-      });
-      // A dead turn: stale marker (older than the stall window), no live
-      // session, no queued prompt, no ai-chat recovery incident/flag.
-      instance.ctx.storage.kv.put('piActiveTurn', {
-        turnId: 'turn-dead',
-        openedAt: Date.now() - 11 * 60_000,
-      });
-      // setState needs the PartyServer name bootstrap the test harness skips.
-      instance.syncAgentState = () => {};
-      expect(instance.getRuntimeStatus().isStreaming).toBe(true);
-
-      const messages = await instance.getUiMessages();
-
-      expect(instance.ctx.storage.kv.get('piActiveTurn')).toBeUndefined();
-      expect(instance.getRuntimeStatus().isStreaming).toBe(false);
-      // With the marker swept the top-up is no longer gated: the dead turn's
-      // committed pi_core rows convert into render history on this same load.
-      expect(messages.map((m: AnyRecord) => m.id)).toEqual([
-        'pi_user_1000_0',
-        'resp-1',
-      ]);
-    });
-  });
 
   it('leaves a live (fresh) marker alone on getUiMessages', async () => {
     const stub = await newChatThreadStub('thread-live-marker');
@@ -2286,6 +2081,7 @@ describe('ChatThreadDO stranded-marker healing on page open', () => {
         openedAt: Date.now(),
       });
       instance.syncAgentState = () => {};
+      instance.piSession = { state: { isStreaming: true } };
 
       await instance.getUiMessages();
 

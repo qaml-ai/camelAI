@@ -5,10 +5,13 @@ export interface ToolDefinition {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
+  resultFormat?: "json" | "content";
+  exposure?: "direct" | "codemode" | "both";
+  executionMode?: "sequential" | "parallel";
 }
 export interface ToolBridge {
   definitions: ToolDefinition[];
-  call(name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<unknown>;
+  call(name: string, args: Record<string, unknown>, signal: AbortSignal, context?: { toolCallId: string }): Promise<unknown>;
 }
 export interface AgentConfig {
   id: string;
@@ -17,6 +20,8 @@ export interface AgentConfig {
   apiKey?: string;
   systemPrompt?: string;
   tools: ToolDefinition[];
+  initialMessages?: AgentMessage[];
+  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 }
 export interface Snapshot {
   version: 1;

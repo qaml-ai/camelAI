@@ -1,9 +1,9 @@
 export const FRAME_BYTES = 1_100_000;
 export type Outcome = { result: unknown; error?: never; uncertain?: never } | { error: string; uncertain?: boolean; result?: never };
 export interface SessionCredentials { id: string; token: string; expiresAt: number }
-export type RequestMethod = "prompt" | "execute" | "status" | "abort";
+export type RequestMethod = "prompt" | "execute" | "status" | "abort" | "history" | "continue" | "steer" | "followUp" | "reconcile" | "configure";
 export type CallRecord = {
-  id: string; requestId?: string; createdAt?: number; name: string; args: Record<string, unknown>; deadline: number;
+  id: string; toolCallId?: string; requestId?: string; createdAt?: number; name: string; args: Record<string, unknown>; deadline: number;
   state: "offered" | "started" | "completed" | "cancelled" | "uncertain";
   outcome?: Outcome; lateOutcome?: Outcome;
 };

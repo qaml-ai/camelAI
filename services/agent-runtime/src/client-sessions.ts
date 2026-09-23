@@ -5,6 +5,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AgentConfig, ToolDefinition } from "./protocol.ts";
 import { errorText } from "./protocol.ts";
 import type { AgentSupervisor } from "./supervisor.ts";
+import { configurationUpdate } from "./session-config.ts";
 import { validateDefinitions } from "./tool-policy.ts";
 import { writeDurableJson, canonical } from "../shared/durable-json.ts";
 import { FRAME_BYTES, type CallRecord, type ClientEvent, type Outcome, type RequestRecord } from "../shared/client-protocol.ts";
@@ -32,6 +33,8 @@ const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 const validId = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9_-]{1,80}$/.test(value);
 const has = (object: object, key: string) => Object.hasOwn(object, key);
 const MAX_RECORDS = 1024;
+const RUN_METHODS = ["prompt", "execute", "continue"];
+const REQUEST_METHODS = [...RUN_METHODS, "status", "abort", "history", "steer", "followUp", "reconcile", "configure"];
 
 export async function readJson(req: IncomingMessage, maximum = FRAME_BYTES) {
   const chunks: Buffer[] = [];
@@ -140,7 +143,14 @@ export class ClientSessions {
     if (this.supervisor.agents.has(session.saved.id) && !session.starting) return Promise.resolve();
     return session.starting ??= this.supervisor.start(session.saved.id, { ...session.saved.config, apiKey: this.options.apiKey }, {
       definitions: session.saved.definitions,
-      call: (name, args, signal) => this.call(session, name, args, signal),
+      call: (name, args, signal, context) => this.call(session, name, args, signal, context),
+    }).then(result => {
+      // Bootstrap history has been checkpointed by the runtime; keep only one authority.
+      if (session.saved.config.initialMessages !== undefined) {
+        delete session.saved.config.initialMessages;
+        this.save(session);
+      }
+      return result;
     }).finally(() => { session.starting = undefined; });
   }
 
@@ -189,7 +199,7 @@ export class ClientSessions {
   async handle(req: IncomingMessage, res: ServerResponse, operator = false): Promise<boolean> {
     if (!(req.url ?? "").startsWith("/clients/")) return false;
     try {
-      const match = /^\/clients\/(client_[a-f0-9]{40})(?:\/(events|state|metadata|requests|calls)(?:\/([A-Za-z0-9_-]{1,80})(?:\/(claim|outcome|reconcile))?)?)?$/.exec(req.url ?? "");
+      const match = /^\/clients\/(client_[a-f0-9]{40})(?:\/(events|state|metadata|history|requests|calls)(?:\/([A-Za-z0-9_-]{1,80})(?:\/(claim|outcome|reconcile))?)?)?$/.exec(req.url ?? "");
       const session = match && this.sessions.get(match[1]);
       const header = req.headers.authorization ?? "";
       if (!session || req.headers.origin || (!operator && (!header.startsWith("Bearer ") || !timingSafeEqual(Buffer.from(hash(header.slice(7)), "hex"), Buffer.from(session.saved.digest, "hex"))))) throw new HttpError(401, "Unauthorized");
@@ -223,18 +233,25 @@ export class ClientSessions {
           res.write(frame);
         }
         res.on("close", () => { if (session.response === res) session.response = undefined; });
+      } else if (req.method === "GET" && resource === "history" && !resourceId) {
+        await this.ensureStarted(session);
+        json(res, 200, await this.supervisor.request(id, "history"));
       } else if (req.method === "GET" && resource === "state" && !resourceId) {
         json(res, 200, { cursor: session.saved.cursor, calls: Object.values(session.saved.calls), requests: Object.values(session.saved.requests), needsReconciliation: this.blocked(session) });
       } else if (req.method === "POST" && resource === "requests" && !resourceId) {
-        const body = await readJson(req, 256_000);
-        if (!validId(body?.id) || !["prompt", "execute", "status", "abort"].includes(body.method) || !body.params || typeof body.params !== "object" || Array.isArray(body.params)) throw new HttpError(400, "Invalid request");
+        const body = await readJson(req, FRAME_BYTES);
+        if (!validId(body?.id) || !REQUEST_METHODS.includes(body.method) || !body.params || typeof body.params !== "object" || Array.isArray(body.params)) throw new HttpError(400, "Invalid request");
+        if (body.method === "configure") {
+          try { configurationUpdate(body.params); }
+          catch (error) { throw new HttpError(400, errorText(error)); }
+        }
         const fingerprint = hash(canonical({ method: body.method, params: body.params }));
         const existing = has(session.saved.requests, body.id) ? session.saved.requests[body.id] : undefined;
         if (existing) {
           if (existing.fingerprint !== fingerprint) throw new HttpError(409, "Request ID reused with different arguments");
           json(res, 200, existing); // Includes the committed response after a lost POST ack.
         } else {
-          if (this.blocked(session) && ["prompt", "execute"].includes(body.method)) throw new HttpError(409, "Reconciliation required: inspect uncertain outcomes before continuing");
+          if (this.blocked(session) && RUN_METHODS.includes(body.method)) throw new HttpError(409, "Reconciliation required: inspect uncertain outcomes before continuing");
           if (Object.keys(session.saved.requests).length >= MAX_RECORDS) throw new HttpError(429, "Request journal full; start a new session");
           if (Object.values(session.saved.requests).filter(request => request.state === "running").length >= 8) throw new HttpError(429, "Too many requests");
           await this.ensureStarted(session);
@@ -288,8 +305,15 @@ export class ClientSessions {
   private async run(session: Session, record: RequestRecord, params: unknown) {
     let value: Outcome;
     try {
-      const result = await this.supervisor.request(session.saved.id, record.method, params, ["prompt", "execute"].includes(record.method)
+      const result = await this.supervisor.request(session.saved.id, record.method, params, RUN_METHODS.includes(record.method)
         ? event => { try { this.publish(session, { type: "event", requestId: record.id, event }); } catch { void this.supervisor.request(session.saved.id, "abort").catch(() => {}); } } : undefined);
+      if (record.method === "configure") {
+        const updates = configurationUpdate(params);
+        const { tools, ...config } = updates;
+        if (tools !== undefined) session.saved.definitions = tools;
+        session.saved.config = { ...session.saved.config, ...config };
+        this.save(session);
+      }
       value = { result };
     } catch (error) { value = { error: errorText(error) }; }
     if (this.closed || session.fault || record.state !== "running") return;
@@ -318,14 +342,14 @@ export class ClientSessions {
     if (value.uncertain) void this.supervisor.request(session.saved.id, "abort").catch(() => {});
   }
 
-  private call(session: Session, name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
+  private call(session: Session, name: string, args: Record<string, unknown>, signal: AbortSignal, context?: { toolCallId: string }): Promise<unknown> {
     signal.throwIfAborted();
     if (this.closed || session.fault || session.saved.revoked) return Promise.reject(new Error("Client session unavailable"));
     if (this.blocked(session)) return Promise.reject(new Error("Reconciliation required before more tool calls"));
     if (Object.keys(session.saved.calls).length >= MAX_RECORDS) return Promise.reject(new Error("Tool journal full; start a new session"));
     if (session.pending.size >= 32) return Promise.reject(new Error("Too many pending client tools"));
-    const request = Object.values(session.saved.requests).find(r => r.state === "running" && ["prompt", "execute"].includes(r.method));
-    const call: CallRecord = { ...(request ? { requestId: request.id } : {}), createdAt: Date.now(), id: randomUUID(), name, args, state: "offered", deadline: Date.now() + (this.options.toolTimeoutMs ?? 15_000) };
+    const request = Object.values(session.saved.requests).find(r => r.state === "running" && RUN_METHODS.includes(r.method));
+    const call: CallRecord = { ...(context ? { toolCallId: context.toolCallId } : {}), ...(request ? { requestId: request.id } : {}), createdAt: Date.now(), id: randomUUID(), name, args, state: "offered", deadline: Date.now() + (this.options.toolTimeoutMs ?? 15_000) };
     session.saved.calls[call.id] = call;
     return new Promise((resolve, reject) => {
       const finish = (value: Outcome) => {

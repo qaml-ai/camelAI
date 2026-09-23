@@ -5,13 +5,17 @@ import { AgentSupervisor } from "./supervisor.ts";
 import { configuredModel } from "./model.ts";
 import { localTools } from "./local-tools.ts";
 import { errorText } from "./protocol.ts";
+import { sessionConfig } from "./session-config.ts";
 import { ClientSessions } from "./client-sessions.ts";
+
 
 const token = process.env.AGENT_RUNTIME_TOKEN;
 if (!token || token.length < 24) throw new Error("Set AGENT_RUNTIME_TOKEN to at least 24 random characters");
 const root = resolve(process.env.AGENT_DATA_DIR ?? ".agent-runtime");
 const supervisor = new AgentSupervisor(join(root, "sessions"), { runtime: process.env.AGENT_RUNTIME });
 const model = configuredModel();
+const toolTimeoutMs = Number(process.env.AGENT_TOOL_TIMEOUT_MS ?? 15_000);
+if (!Number.isInteger(toolTimeoutMs) || toolTimeoutMs < 1 || toolTimeoutMs > 15 * 60_000) throw new Error("AGENT_TOOL_TIMEOUT_MS must be an integer between 1 and 900000");
 const server = createServer(async (req, res) => {
   if (await clients.handle(req, res)) return;
   const received = Buffer.from(req.headers.authorization ?? "");
@@ -40,15 +44,13 @@ const server = createServer(async (req, res) => {
       let body = "";
       for await (const chunk of req) {
         body += chunk;
-        if (Buffer.byteLength(body) > 256_000) throw new Error("Request too large");
+        if (Buffer.byteLength(body) > 18 * 1024 * 1024) throw new Error("Request too large");
       }
       const params = JSON.parse(body);
       const key = req.headers["idempotency-key"];
       if (key !== undefined && typeof key !== "string") throw new Error("Invalid idempotency key");
-      const systemPrompt = params.systemPrompt ?? process.env.AGENT_SYSTEM_PROMPT;
-      if (params.systemPrompt !== undefined && typeof params.systemPrompt !== "string") throw new Error("systemPrompt must be a string");
-      if (systemPrompt !== undefined && (!systemPrompt.trim() || systemPrompt.length > 32000)) throw new Error("systemPrompt must contain 1–32000 characters");
-      const result = await clients.create(params.tools, { model, apiKey: process.env.AGENT_API_KEY, ...(systemPrompt !== undefined ? { systemPrompt } : {}) }, key, { name: params.name, type: params.type });
+      const config = sessionConfig(params, model, process.env.AGENT_SYSTEM_PROMPT);
+      const result = await clients.create(params.tools, config, key, { name: params.name, type: params.type });
       res.writeHead(201, { "Content-Type": "application/json", "Cache-Control": "no-store" }).end(JSON.stringify(result));
       return;
     }
@@ -87,7 +89,7 @@ const server = createServer(async (req, res) => {
     res.end(JSON.stringify({ type: "error", error: errorText(error) }) + "\n");
   }
 });
-const clients = new ClientSessions(supervisor, { root: join(root, "client-sessions"), secret: token, apiKey: process.env.AGENT_API_KEY });
+const clients = new ClientSessions(supervisor, { root: join(root, "client-sessions"), secret: token, apiKey: process.env.AGENT_API_KEY, toolTimeoutMs });
 server.requestTimeout = 30_000;
 server.listen(Number(process.env.PORT ?? 8790), process.env.HOST ?? "127.0.0.1", () => {
   console.log(JSON.stringify({ type: "listening", address: server.address() }));

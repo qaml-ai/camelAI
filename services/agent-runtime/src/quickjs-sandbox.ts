@@ -2,7 +2,7 @@ import {
   newQuickJSWASMModuleFromVariant, newVariant, RELEASE_SYNC,
   type QuickJSHandle, type QuickJSDeferredPromise,
 } from "quickjs-emscripten";
-import { prepareCodeModeUserCode, stripTypeScriptFromUserCode } from "../../../packages/agent-core/code-mode-source.ts";
+import { prepareCodeModeUserCode, stripTypeScriptFromUserCode } from "../shared/code-mode-source.ts";
 import { SANDBOX_LIMITS, jsonWithinLimit } from "./limits.ts";
 import { validateDefinitions, validateToolCall } from "./tool-policy.ts";
 import { SANDBOX_BOOTSTRAP } from "./sandbox-bootstrap.ts";

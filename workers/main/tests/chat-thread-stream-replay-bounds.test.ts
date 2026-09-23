@@ -622,12 +622,12 @@ describe('wake circuit breaker', () => {
       // ChatThreadDO.onStart would only ever be written after the read that
       // kills the isolate — the counter would never leave 0 and the quarantine
       // would never fire for the one failure it exists for.
-      const observed: Array<{ count?: number; boundedRecoveryRead: boolean }> = [];
+      const observed: Array<{ count?: number; hasRecoveryReadOverride: boolean }> = [];
       const originalCheck = instance._checkRunFibers.bind(instance);
       instance._checkRunFibers = async (...args: unknown[]) => {
         observed.push({
           count: (instance.ctx.storage.kv.get('wakeOomGuard') as { count?: number })?.count,
-          boundedRecoveryRead: Object.prototype.hasOwnProperty.call(
+          hasRecoveryReadOverride: Object.prototype.hasOwnProperty.call(
             instance,
             '_getPartialStreamText',
           ),
@@ -637,7 +637,8 @@ describe('wake circuit breaker', () => {
 
       await instance.onStart();
 
-      expect(observed).toEqual([{ count: 1, boundedRecoveryRead: true }]);
+      expect(observed).toEqual([{ count: 1, hasRecoveryReadOverride: false }]);
+      expect(instance.chatRecovery).toBe(false);
     });
   });
 
@@ -650,7 +651,8 @@ describe('wake circuit breaker', () => {
       expect(instance.boundedReplayStream).toBe(instance._resumableStream);
       expect(
         Object.prototype.hasOwnProperty.call(instance, '_getPartialStreamText'),
-      ).toBe(true);
+      ).toBe(false);
+      expect(instance.chatRecovery).toBe(false);
       expect(typeof instance._resumableStream.replayCompletedChunksByRequestId).toBe(
         'function',
       );
@@ -732,101 +734,6 @@ describe('wake circuit breaker', () => {
       const quarantine = events.filter((entry) => entry.event === 'chat_do_wake_quarantine');
       expect(quarantine.length).toBe(1);
       expect(quarantine[0]!.details).toMatchObject({ status: 'skipped_small_buffer' });
-    });
-  });
-});
-
-describe('bounded recovery-classification read', () => {
-  const seedRestoredStream = (
-    instance: any,
-    streamId: string,
-    requestId: string,
-    bodies: string[],
-  ) => {
-    instance.ctx.storage.sql.exec(
-      'insert into cf_ai_chat_stream_metadata (id, request_id, status, created_at, message_id, is_continuation)' +
-        ' values (?, ?, ?, ?, ?, ?)',
-      streamId,
-      requestId,
-      'streaming',
-      Date.now(),
-      null,
-      0,
-    );
-    bodies.forEach((body, index) => {
-      instance.ctx.storage.sql.exec(
-        'insert into cf_ai_chat_stream_chunks (id, stream_id, body, chunk_index, created_at) values (?, ?, ?, ?, ?)',
-        `chunk-${streamId}-${index}`,
-        streamId,
-        body,
-        index,
-        Date.now(),
-      );
-    });
-  };
-
-  it('reads the full prefix for a buffer inside the ceiling', async () => {
-    const threadId = 'thread-recovery-partial-small';
-    const stub = threadStub(threadId);
-    await runInDurableObject(stub, async (instance: any) => {
-      seedChatContext(instance, threadId);
-      const streamId = 'stream-recovery-small';
-      seedRestoredStream(instance, streamId, 'request-recovery-small', [
-        JSON.stringify({ type: 'text-start', id: 'part-1' }),
-        JSON.stringify({ type: 'text-delta', id: 'part-1', delta: 'hello ' }),
-        JSON.stringify({ type: 'text-delta', id: 'part-1', delta: 'world' }),
-      ]);
-
-      // OOM-FIX.md fix 3: the recovery partial must still be built from the FULL
-      // prefix for every stream the store-side ceiling governs.
-      expect(instance._getPartialStreamText(streamId).text).toBe('hello world');
-      expect(instance._isStreamReplayDegraded(streamId)).toBe(false);
-    });
-  });
-
-  it('never materializes a buffer that predates the ceiling', async () => {
-    const threadId = 'thread-recovery-partial-whale';
-    const stub = threadStub(threadId);
-    await runInDurableObject(stub, async (instance: any) => {
-      seedChatContext(instance, threadId);
-      const events = captureObservabilityEvents(instance);
-      instance.replayBoundOverrides = { recoveryPartialMaxStoredBytes: 2_000 };
-      const streamId = 'stream-recovery-whale';
-      // What an eviction left behind before the store-side cap existed: rows the
-      // cap can never remove, read whole by the framework's own wake-time fiber
-      // recovery, before any app code gets to run.
-      seedRestoredStream(
-        instance,
-        streamId,
-        'request-recovery-whale',
-        Array.from({ length: 10 }, (_unused, index) =>
-          JSON.stringify({ type: 'text-delta', id: 'part-1', delta: `${index}`.repeat(1_000) }),
-        ),
-      );
-
-      const stream = instance._resumableStream;
-      let bodyReads = 0;
-      const sdkGetStreamChunks = stream.getStreamChunks.bind(stream);
-      stream.getStreamChunks = (id: string) => {
-        bodyReads += 1;
-        return sdkGetStreamChunks(id);
-      };
-
-      expect(instance._getPartialStreamText(streamId)).toEqual({
-        text: '',
-        parts: [],
-        hasSettledToolResults: false,
-      });
-      expect(bodyReads).toBe(0);
-      // Remembered durably, so the next wake does not re-decide from a byte sum
-      // in a currency the live tally never used.
-      expect(instance._isStreamReplayDegraded(streamId)).toBe(true);
-      expect(instance.ctx.storage.kv.get('chatReplayDegradedStreams')).toEqual([streamId]);
-      expect(
-        events.filter((entry) => entry.event === 'chat_stream_replay_degraded'),
-      ).toEqual([
-        expect.objectContaining({ details: expect.objectContaining({ status: 'recovery_read_skipped' }) }),
-      ]);
     });
   });
 });

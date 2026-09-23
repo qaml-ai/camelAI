@@ -3,7 +3,7 @@
     "target": "ES2024", "module": "ESNext", "moduleResolution": "bundler", "strict": true,
     "noEmit": true, "allowImportingTsExtensions": true, "skipLibCheck": true,
     "jsx": "react-jsx", "types": ["node", "vite/client"], "lib": ["ES2024", "DOM", "DOM.Iterable"],
-    "paths": { "@/*": ["../../../src/*"] }
+    "paths": { "@/*": ["./web/*"] }
   },
   "include": ["./**/*.ts", "./**/*.tsx"]
 }

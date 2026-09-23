@@ -18,6 +18,8 @@ describe('privacy-safe chat memory aggregates', () => {
       instance.ensurePiCoreTables();
       sql.exec('DELETE FROM cf_ai_chat_agent_messages');
       sql.exec('DELETE FROM pi_core_messages');
+      // Older threads can retain this table; telemetry still measures its footprint.
+      sql.exec('CREATE TABLE IF NOT EXISTS pi_turn_journal (seq integer primary key, payload text, created_at integer)');
       sql.exec('DELETE FROM pi_turn_journal');
       // NOTE: this test previously CREATED cf_ai_chat_stream_chunks itself, which
       // is why the telemetry pointing at that table went unnoticed — the table
@@ -226,73 +228,7 @@ describe('privacy-safe chat memory aggregates', () => {
     expect(events).toHaveLength(4);
   });
 
-  it('samples pi_context_budget on the same rule, so a 25-request turn cannot flood', () => {
-    // One event per provider request would be 25 rows a turn on every thread.
-    // The budget event rides the phase sampler: throttled while the thread is
-    // small, unthrottled once it is heavy enough to be an OOM candidate.
-    const events: Array<Record<string, unknown>> = [];
-    const fake = Object.create(ChatThreadDO.prototype) as any;
-    fake.chatContext = { threadId: 'thread-id' };
-    fake.lastChatMemoryPhaseAt = new Map();
-    // The budget event reads the LAST measured stats (the phase start already
-    // paid for them) instead of running another aggregate per provider request.
-    const stats = { totalRows: 1, totalBytes: 42, maxRowBytes: 42, stores: {} };
-    fake.cachedChatMemoryStats = stats;
-    fake.readChatMemoryStats = () => {
-      throw new Error('recordPiContextBudget must not re-measure the thread');
-    };
-    fake.recordChatThreadObservabilityEvent = (
-      _event: string,
-      details: Record<string, unknown>,
-    ) => events.push(details);
-    const footprint = {
-      messageCount: 3,
-      tokens: 1_000,
-      bytes: 2_000,
-      imageCount: 1,
-      imageChars: 500,
-    };
-    const record = (outcome: Record<string, unknown> = { status: 'unchanged' }) =>
-      ChatThreadDO.prototype['recordPiContextBudget'].call(
-        fake,
-        footprint,
-        { id: 'model-x' },
-        outcome,
-      );
-
-    record();
-    record();
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
-      operation: 'provider_request_prepare',
-      status: 'unchanged',
-      count: 1_000,
-      size: 2_000,
-      model: 'model-x',
-      // The fourth extra count is the size of the view that actually shipped;
-      // with nothing compacted it is the size that went in. The last two are the
-      // store's per-request image counters — provider-context omissions and R2
-      // hydrations — which are what separate a thread losing its screenshots
-      // from one that never had any.
-      extraCounts: [1, 500, 3, 2_000, 0, 0],
-    });
-
-    stats.totalBytes = 1024 * 1024;
-    record();
-    record();
-    expect(events).toHaveLength(3);
-
-    // A cut that shrank the context reports both numbers, and the one failure
-    // mode the alert cares about raises severity on its own.
-    record({ status: 'summarized', resultTokens: 300, resultBytes: 600 });
-    expect(events[3]).toMatchObject({
-      status: 'summarized',
-      size: 2_000,
-      extraCounts: [1, 500, 3, 600, 0, 0],
-    });
-    record({ status: 'no_cut' });
-    expect(events[4]).toMatchObject({ status: 'no_cut', severity: 'warn' });
-  });
+  ;
 });
 
 describe('observability numeric dimensions', () => {
@@ -357,11 +293,10 @@ describe('ChatThreadDO memory telemetry integration', () => {
     });
   });
 
-  it('leaves chat recovery retry configuration unchanged', async () => {
+  it('disables framework execution recovery', async () => {
     const stub = await newChatThreadStub('thread-memory-retries-unchanged');
     await runInDurableObject(stub, async (instance: any) => {
-      expect(instance.chatRecovery).toMatchObject({ maxAttempts: 3 });
-      expect(instance.chatRecovery).not.toHaveProperty('maxOomRetries');
+      expect(instance.chatRecovery).toBe(false);
     });
   });
 

@@ -1,8 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { ChatThreadDO } from "../src/chat-thread-do";
 import { summarizePiMessages } from "../src/chat-thread/pi-compaction";
-import { runPiSubagentTool } from "../src/chat-thread/pi-tools";
 import { UserLlmUsageLimitError } from "../src/user-llm-usage-policy";
 
 const context = {
@@ -24,199 +22,17 @@ const modelConfig = {
 };
 
 describe("ChatThreadDO user LLM usage gate", () => {
-  it("gates and settles exactly once through an actual main Agent pull", async () => {
-    const checkUserLlmUsageAccess = vi.fn(async () => ({
-      allowed: true,
-      reason: "within_limits" as const,
-      evaluated_at_ms: 1,
-      blocking_limit: null,
-      limits: [],
-    }));
-    const recordUsage = vi.fn(async () => undefined);
-    const waitUntilTasks: Promise<unknown>[] = [];
-    const mainModelConfig = {
-      ...modelConfig,
-      model: {
-        id: "claude-sonnet-5",
-        provider: "anthropic",
-        api: "anthropic-messages",
-        contextWindow: 128_000,
-        maxTokens: 4_096,
-        input: ["text"],
-      },
-    };
-    const streamPiModel = vi.fn(() => {
-      const stream = createAssistantMessageEventStream();
-      const message = {
-        role: "assistant",
-        content: [{ type: "text", text: "main result" }],
-        provider: "anthropic",
-        model: "claude-sonnet-5",
-        responseId: "response-main-lifecycle",
-        stopReason: "stop",
-        usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 12 },
-        timestamp: Date.now(),
-      } as any;
-      stream.push({ type: "start", partial: { ...message, content: [] } });
-      stream.push({ type: "text_delta", delta: "main result", partial: message });
-      stream.push({ type: "done", reason: "stop", message });
-      stream.end();
-      return stream;
-    });
+  it("binds service authorization to the initiating user and application model policy", async () => {
     const fake = Object.create(ChatThreadDO.prototype) as any;
-    fake.chatContext = context;
-    fake.env = {
-      ORG: {
-        idFromName: vi.fn((value: string) => value),
-        get: vi.fn(() => ({ checkUserLlmUsageAccess, recordUsage })),
-      },
-    };
-    fake.ctx = { waitUntil: (task: Promise<unknown>) => waitUntilTasks.push(task) };
-    fake.piEventHandlerChain = Promise.resolve();
-    fake.llmUsageSettlementChain = Promise.resolve();
-    fake.pendingLlmUsageSettlements = [];
-    fake.noLlmLimitsCachedUserId = null;
-    fake.resolvePiModel = vi.fn(async () => mainModelConfig);
-    fake.withChatMemoryPhase = vi.fn(async (_phase: string, task: () => unknown) => task());
-    fake.loadFullPiCoreTranscriptUnbounded = vi.fn(async () => []);
-    fake.loadBoundedPiCoreSessionWindow = vi.fn(async () => ({
-      messages: [],
-      window: {
-        firstRowIdx: 0,
-        summaryOffset: 0,
-        capped: false,
-        totalChars: 0,
-        loadedChars: 0,
-        totalRows: 0,
-        loadedRows: 0,
-      },
-    }));
-    fake.readPiActiveTurn = vi.fn(() => null);
-    fake.createPiSystemPrompt = vi.fn(() => "system");
-    fake.createPiToolDefinitions = vi.fn(() => []);
-    fake.transformPiProviderContext = vi.fn(async (messages: unknown[]) => messages);
-    fake.refreshPiSessionCapabilitySurface = vi.fn();
-    fake.streamPiModel = streamPiModel;
+    fake.env = { LOCAL_AGENT_RUNTIME_URL: "http://127.0.0.1:8789", LOCAL_AGENT_RUNTIME_TOKEN: "operator" };
     fake.getActiveTurnUserId = vi.fn(() => "initiating-user");
-    fake.touchPiTurnProgress = vi.fn();
-    fake.attachCodeModeArtifactsToToolResult = vi.fn(async (message: unknown) => message);
-    fake.annotatePiProviderErrorMessages = vi.fn((messages: unknown[]) => messages);
-    fake.appendPiCoreMessagesIfMissing = vi.fn(async () => undefined);
-    fake.clearPiTurnJournal = vi.fn();
-    fake.pushPiRuntimeEvent = vi.fn();
-    fake.piRuntimeThreadId = vi.fn(() => "thread1");
-    fake.retryChatDurableObjectRpc = vi.fn(
-      async (_operation: string, task: () => Promise<unknown>) => task(),
-    );
-    fake.piCurrentBillingSource = "byok";
-    fake.piCurrentCreditChargeable = false;
-    fake.piCurrentUsageProvider = "anthropic";
-    fake.piCurrentUsageModel = "subagent-model-must-not-leak";
-    fake.piUserStopRequestedAtMs = 0;
-    fake.piTurnStartedAtMs = Date.now();
-    fake.piSdkTurnIndex = 0;
-    fake.piSdkTurnUsageTotal = null;
-    fake.handlePiSessionEvent = async (event: { type: string }) => {
-      if (event.type !== "turn_end") return;
-      await ChatThreadDO.prototype["handlePiSessionEvent"].call(fake, event);
-    };
-
-    const session = await ChatThreadDO.prototype["createPiSession"].call(
-      fake,
-      context,
-      {},
-    );
-    fake.piSession = session;
-    await session.prompt("answer once");
-    await fake.piEventHandlerChain;
-    await fake.llmUsageSettlementChain;
-    await Promise.all(waitUntilTasks);
-
-    expect(checkUserLlmUsageAccess).toHaveBeenCalledOnce();
-    expect(streamPiModel).toHaveBeenCalledOnce();
-    expect(recordUsage).toHaveBeenCalledOnce();
-    expect(recordUsage).toHaveBeenCalledWith(expect.objectContaining({
-      user_id: "initiating-user",
-      usage_surface: "agent",
-      input_tokens: 10,
-      output_tokens: 2,
-      source: "pi_assistant",
-    }));
-  });
-
-  it("gates and settles exactly once through an actual child Agent pull", async () => {
-    const gate = vi.fn(async () => undefined);
-    const recordUsage = vi.fn(async () => undefined);
-    const waitUntilTasks: Promise<unknown>[] = [];
-    const modelConfig = {
-      model: {
-        id: "claude-sonnet-5",
-        provider: "anthropic",
-        api: "anthropic-messages",
-        contextWindow: 128_000,
-        maxTokens: 4_096,
-        input: ["text"],
-      },
-      apiKey: "key",
-      headers: {},
-      provider: "anthropic",
-      modelId: "claude-sonnet-5",
-      billingSource: "byok",
-      creditChargeable: false,
-      usageProvider: "anthropic",
-    };
-    const streamPiModel = vi.fn(() => {
-      const stream = createAssistantMessageEventStream();
-      const message = {
-        role: "assistant",
-        content: [{ type: "text", text: "child result" }],
-        provider: "anthropic",
-        model: "claude-sonnet-5",
-        stopReason: "stop",
-        usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 12 },
-        timestamp: Date.now(),
-      } as any;
-      stream.push({ type: "start", partial: { ...message, content: [] } });
-      stream.push({ type: "text_delta", delta: "child result", partial: message });
-      stream.push({ type: "done", reason: "stop", message });
-      stream.end();
-      return stream;
-    });
-    const deps = {
-      piModelResolver: () => async () => modelConfig,
-      activeTurnUserId: () => "initiating-user",
-      assertUserLlmUsageAccess: gate,
-      createPiSubagentSystemPrompt: vi.fn(async () => "system"),
-      createPiToolDefinitions: vi.fn(() => []),
-      beforePiToolCall: vi.fn(),
-      afterPiToolCall: vi.fn(),
-      streamPiModel,
-      recordPiAssistantUsage: recordUsage,
-      waitUntil: (task: Promise<unknown>) => waitUntilTasks.push(task),
-    } as any;
-
-    await expect(runPiSubagentTool(
-      deps,
-      context as any,
-      "Agent",
-      { prompt: "do one thing" },
-    )).resolves.toMatchObject({ content: expect.any(Array) });
-    await Promise.all(waitUntilTasks);
-    expect(gate).toHaveBeenCalledOnce();
-    expect(streamPiModel).toHaveBeenCalledOnce();
-    expect(recordUsage).toHaveBeenCalledOnce();
-    expect(recordUsage).toHaveBeenCalledWith(
-      expect.objectContaining({ role: "assistant" }),
-      expect.any(Number),
-      "byok",
-      false,
-      "anthropic",
-      expect.objectContaining({
-        userId: "initiating-user",
-        model: "claude-sonnet-5",
-        usageSurface: "subagent",
-      }),
-    );
+    fake.assertPiUserLlmUsageAccess = vi.fn(async () => undefined);
+    const options = ChatThreadDO.prototype["serviceAgentOptions"].call(fake, context, modelConfig, context.threadId);
+    await options.authorize();
+    expect(fake.assertPiUserLlmUsageAccess).toHaveBeenCalledExactlyOnceWith(context, modelConfig, "initiating-user");
+    const denial = new Error("usage denied");
+    fake.assertPiUserLlmUsageAccess.mockRejectedValueOnce(denial);
+    await expect(options.authorize()).rejects.toThrow(denial);
   });
 
   it("waits for settlement and rechecks no-limits before every later pull", async () => {

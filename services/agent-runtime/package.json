@@ -10,6 +10,44 @@
     "demo:python": "python3 examples/inventory.py",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "test:python": "python3 tests/python_sdk.py",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json && tsc -p studio/tsconfig.json",
+    "studio": "bun studio/server.ts",
+    "build": "vite build --config studio/vite.config.ts"
+  },
+  "version": "0.1.0",
+  "description": "Standalone agent process supervisor, QuickJS codemode, SDKs and local Studio",
+  "engines": {
+    "node": ">=22.21.0"
+  },
+  "exports": {
+    ".": "./clients/typescript.ts",
+    "./node": "./clients/node.ts",
+    "./supervisor": "./src/supervisor.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.80.6",
+    "@earendil-works/pi-ai": "0.80.6",
+    "quickjs-emscripten": "0.32.0",
+    "sucrase": "^3.35.1",
+    "typebox": "1.1.38",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "lucide-react": "^0.562.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^3.4.0",
+    "radix-ui": "^1.4.3",
+    "vite": "8.0.16",
+    "@vitejs/plugin-react": "^6.0.2",
+    "@tailwindcss/postcss": "^4",
+    "tailwindcss": "^4"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "@types/node": "^20.19.27",
+    "@types/react": "^19",
+    "@types/react-dom": "^19"
   }
 }

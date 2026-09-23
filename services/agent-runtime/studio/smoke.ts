@@ -1,4 +1,4 @@
-import { AgentRuntime, tool, schema, type AgentClient } from '../clients/typescript.ts';
+import { AgentRuntime, tool, schema, type AgentClient } from '../clients/node.ts';
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';

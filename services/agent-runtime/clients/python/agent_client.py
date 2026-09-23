@@ -112,11 +112,13 @@ class AgentRuntime:
         self.http = httpx.AsyncClient(timeout=10, follow_redirects=False)
         self.agents = []
 
-    async def create_agent(self, *, tools, system_prompt=None, name=None, type=None, idempotency_key=None, on_event=None, on_error=None):
+    async def create_agent(self, *, tools, system_prompt=None, name=None, type=None, model=None, thinking_level=None, idempotency_key=None, on_event=None, on_error=None):
+        """Provision an agent. `model` is "provider/model-id", e.g. "anthropic/claude-sonnet-5"."""
         if not self.api_key:
             raise AgentError("Set api_key or AGENT_RUNTIME_TOKEN to provision an agent")
+        optional = {"name": name, "type": type, "systemPrompt": system_prompt, "model": model, "thinkingLevel": thinking_level}
         session = await _http(self.http, self.base, "/client-sessions", self.api_key, "POST",
-                              {"tools": [item.definition() for item in tools], **({"name": name} if name is not None else {}), **({"type": type} if type is not None else {}), **({"systemPrompt": system_prompt} if system_prompt is not None else {})},
+                              {"tools": [item.definition() for item in tools], **{key: value for key, value in optional.items() if value is not None}},
                               headers={"Idempotency-Key": idempotency_key or str(uuid.uuid4())})
         return await self.connect_agent(session, tools=tools, on_event=on_event, on_error=on_error)
 
@@ -366,6 +368,11 @@ class AgentClient:
 
     async def set_metadata(self, *, name, type):
         return await self._http("/metadata", "POST", {"name": name, "type": type})
+
+    async def configure(self, *, model=None, system_prompt=None, thinking_level=None):
+        """Change the model ("provider/model-id"), system prompt or thinking level between runs."""
+        params = {key: value for key, value in {"model": model, "systemPrompt": system_prompt, "thinkingLevel": thinking_level}.items() if value is not None}
+        return await self.request("configure", params)
 
     async def status(self):
         return await self.request("status")

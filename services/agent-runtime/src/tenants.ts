@@ -12,6 +12,8 @@ export interface Tenant {
   tokenSha256: string;
   /** Provider name (Pi's `model.provider`, e.g. "anthropic") → API key. */
   apiKeys: Record<string, string>;
+  /** GitHub login that signs in to the console as this tenant. */
+  github?: string;
 }
 
 /** The single-token mode used before tenants existed; its agents keep their original IDs. */
@@ -52,7 +54,8 @@ export class Tenants {
       if (hashes.has(tenant.tokenSha256)) throw new Error(`Tenant ${tenant.id} reuses another tenant's token`);
       if (!tenant.apiKeys || typeof tenant.apiKeys !== "object" || Object.values(tenant.apiKeys).some(key => typeof key !== "string" || !key)) throw new Error(`Tenant ${tenant.id} has invalid apiKeys`);
       hashes.add(tenant.tokenSha256);
-      next.set(tenant.id, { id: tenant.id, tokenSha256: tenant.tokenSha256, apiKeys: { ...tenant.apiKeys } });
+      if (tenant.github !== undefined && (typeof tenant.github !== "string" || !/^[A-Za-z0-9-]{1,39}$/.test(tenant.github))) throw new Error(`Tenant ${tenant.id} has an invalid github login`);
+      next.set(tenant.id, { id: tenant.id, tokenSha256: tenant.tokenSha256, apiKeys: { ...tenant.apiKeys }, ...(tenant.github ? { github: tenant.github } : {}) });
     }
     this.byId = next;
   }
@@ -65,6 +68,17 @@ export class Tenants {
     for (const tenant of this.byId.values()) if (timingSafeEqual(digest, Buffer.from(tenant.tokenSha256, "hex"))) match = tenant;
     return match;
   }
+
+  has(id: string) { return this.byId.has(id); }
+
+  /** The admin-defined tenant a GitHub login signs in as, if any (case-insensitive). */
+  byGithub(login: string) {
+    for (const tenant of this.byId.values()) if (tenant.github?.toLowerCase() === login.toLowerCase()) return tenant.id;
+    return undefined;
+  }
+
+  /** Providers an admin configured keys for (`*` covers any provider). Names only. */
+  providers(id: string) { return Object.keys(this.byId.get(id)?.apiKeys ?? {}); }
 
   /** The key an agent of `tenantId` uses for `provider`; `*` is a tenant-wide fallback. */
   apiKey(tenantId: string, provider: string): string | undefined {

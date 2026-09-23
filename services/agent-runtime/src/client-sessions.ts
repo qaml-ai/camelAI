@@ -87,6 +87,8 @@ export interface ClientSessionOptions {
   /** Stop an agent's process, and unload its session, after this long without activity. */
   idleMs?: number;
   retry?: AgentConfig["retry"];
+  /** Called with each finished assistant message that reports token usage. */
+  onUsage?: (tenant: string, agentId: string, message: { provider?: string; model?: string; usage: any; timestamp?: number }) => void;
 }
 
 /**
@@ -258,6 +260,10 @@ export class ClientSessions {
     }
   }
 
+  private apiKey(session: Session, provider: string) {
+    return this.options.apiKeyFor ? this.options.apiKeyFor(session.header.tenant ?? DEFAULT_TENANT, provider) : this.options.apiKey;
+  }
+
   private ensureStarted(session: Session) {
     if (this.closed || session.header.revoked) return Promise.reject(new HttpError(410, "Session closed"));
     if (session.fault) return Promise.reject(session.fault);
@@ -265,7 +271,7 @@ export class ClientSessions {
     if (this.supervisor.agents.has(session.header.id) && !session.starting) return Promise.resolve();
     return session.starting ??= (async () => {
       await this.makeRoom(session.header.id);
-      const apiKey = this.options.apiKeyFor ? this.options.apiKeyFor(session.header.tenant ?? DEFAULT_TENANT, session.header.config.model.provider) : this.options.apiKey;
+      const apiKey = this.apiKey(session, session.header.config.model.provider);
       const result = await this.supervisor.start(session.header.id, { ...session.header.config, apiKey, ...(this.options.retry ? { retry: this.options.retry } : {}) }, {
         definitions: session.header.definitions,
         call: (name, args, signal, context) => this.call(session, name, args, signal, context),
@@ -311,14 +317,18 @@ export class ClientSessions {
 
   /** Agents owned by `tenant`, or every agent when no tenant is given. */
   list(tenant?: string) {
-    const result: { id: string; name: string; type: string; connected: boolean }[] = [];
+    const result: { id: string; name: string; type: string; model: string; connected: boolean; running: boolean; expiresAt: number }[] = [];
     for (const name of readdirSync(this.options.root)) {
       const match = /^(client_[a-f0-9]{40})\.json$/.exec(name);
       const header = match && (this.sessions.get(match[1])?.header ?? this.readHeader(match[1]));
       if (!header || header.revoked || header.expiresAt <= Date.now()) continue;
       if (tenant !== undefined && (header.tenant ?? DEFAULT_TENANT) !== tenant) continue;
       const response = this.sessions.get(header.id)?.response;
-      result.push({ id: header.id, name: header.metadata?.name ?? header.id, type: header.metadata?.type ?? "general", connected: !!response && !response.destroyed });
+      result.push({
+        id: header.id, name: header.metadata?.name ?? header.id, type: header.metadata?.type ?? "general",
+        model: `${header.config.model.provider}/${header.config.model.id}`,
+        connected: !!response && !response.destroyed, running: this.supervisor.agents.has(header.id), expiresAt: header.expiresAt,
+      });
     }
     return result;
   }
@@ -329,6 +339,39 @@ export class ClientSessions {
     if (!metadata || !session) throw new HttpError(404, "Agent not found");
     return { ...metadata, tools: session.header.definitions, systemPrompt: session.header.config.systemPrompt ?? "",
       cursor: session.cursor, events: session.events.map(({ id, data }) => ({ id, data })), requests: [...session.requests.values()], calls: [...session.calls.values()] };
+  }
+
+  /** A tenant's view of one agent's history; undefined when the agent is not theirs. */
+  async agentHistory(id: string, tenant: string) {
+    const session = this.list(tenant).some(agent => agent.id === id) ? await this.load(id) : undefined;
+    return session && this.history(session);
+  }
+
+  /** Abort the running turn of a tenant's agent. Returns false when the agent is not theirs. */
+  async abortAgent(id: string, tenant: string) {
+    if (!this.list(tenant).some(agent => agent.id === id)) return false;
+    if (this.supervisor.agents.has(id)) await this.supervisor.request(id, "abort");
+    return true;
+  }
+
+  /**
+   * A tenant's key for `provider` changed: stop that tenant's idle agents using it
+   * so their next request starts with the new key. Busy agents keep their key
+   * until their turn ends and they go idle.
+   */
+  async providerKeyChanged(tenant: string, provider: string) {
+    for (const session of this.sessions.values()) {
+      if ((session.header.tenant ?? DEFAULT_TENANT) !== tenant || session.header.config.model.provider !== provider) continue;
+      if (this.supervisor.agents.has(session.header.id) && !this.busy(session)) await this.supervisor.stop(session.header.id);
+    }
+  }
+
+  /** Revoke a tenant's agent and stop its process. Its files stay on disk. */
+  async destroyAgent(id: string, tenant: string) {
+    if (!this.list(tenant).some(agent => agent.id === id)) return false;
+    await this.remove(id);
+    await this.supervisor.stop(id);
+    return true;
   }
 
   /** The transcript, from the live agent when it runs, otherwise straight from its log. */
@@ -389,34 +432,8 @@ export class ClientSessions {
       } else if (req.method === "GET" && resource === "state" && !resourceId) {
         json(res, 200, { cursor: session.cursor, calls: [...session.calls.values()], requests: [...session.requests.values()] });
       } else if (req.method === "POST" && resource === "requests" && !resourceId) {
-        const body = await readJson(req, FRAME_BYTES);
-        if (!validId(body?.id) || !REQUEST_METHODS.includes(body.method) || !body.params || typeof body.params !== "object" || Array.isArray(body.params)) throw new HttpError(400, "Invalid request");
-        try {
-          if (body.method === "configure") configurationUpdate(body.params);
-          // Assistant and tool-result history is runtime-owned; callers may only add user input.
-          if (["prompt", "steer", "followUp"].includes(body.method) && body.params.message !== undefined) validateUserMessages(Array.isArray(body.params.message) ? body.params.message : [body.params.message]);
-        } catch (error) { throw new HttpError(400, errorText(error)); }
-        const fingerprint = hash(canonical({ method: body.method, params: body.params }));
-        const existing = session.requests.get(body.id);
-        if (existing) {
-          if (existing.fingerprint !== fingerprint) throw new HttpError(409, "Request ID reused with different arguments");
-          json(res, 200, existing); // Includes the committed response after a lost POST ack.
-          return true;
-        }
-        if ([...session.requests.values()].filter(request => request.state === "running").length >= 8) throw new HttpError(429, "Too many requests");
-        // Reads and aborts never need a process; everything else runs in the agent.
-        if (!["history", "status", "abort"].includes(body.method)) await this.ensureStarted(session);
-        // Concurrent retries may have waited on the same process startup.
-        const accepted = session.requests.get(body.id);
-        if (accepted) {
-          if (accepted.fingerprint !== fingerprint) throw new HttpError(409, "Request ID reused with different arguments");
-          json(res, 200, accepted);
-          return true;
-        }
-        const record = this.upsertRequest(session, { startedAt: Date.now(), ...(body.method === "prompt" && typeof body.params.text === "string" ? { prompt: body.params.text } : {}), ...(body.method === "execute" && typeof body.params.code === "string" ? { code: body.params.code } : {}), id: body.id, method: body.method, fingerprint, state: "running" });
-        await this.commit(session, true);
-        json(res, 202, record);
-        void this.run(session, record, body.params);
+        const { status, record } = await this.accept(session, await readJson(req, FRAME_BYTES));
+        json(res, status, record);
       } else if (req.method === "GET" && resource === "requests" && resourceId && !action) {
         const record = session.requests.get(resourceId);
         if (!record) throw new HttpError(404, "Unknown request");
@@ -445,21 +462,72 @@ export class ClientSessions {
     return true;
   }
 
+  /**
+   * Accept an idempotent request: 200 with the existing record for a retried ID,
+   * or 202 once the new record is durable and the work has started.
+   */
+  private async accept(session: Session, body: any): Promise<{ status: 200 | 202; record: RequestRecord }> {
+    if (!validId(body?.id) || !REQUEST_METHODS.includes(body.method) || !body.params || typeof body.params !== "object" || Array.isArray(body.params)) throw new HttpError(400, "Invalid request");
+    try {
+      if (body.method === "configure") configurationUpdate(body.params);
+      // Assistant and tool-result history is runtime-owned; callers may only add user input.
+      if (["prompt", "steer", "followUp"].includes(body.method) && body.params.message !== undefined) validateUserMessages(Array.isArray(body.params.message) ? body.params.message : [body.params.message]);
+    } catch (error) { throw new HttpError(400, errorText(error)); }
+    const fingerprint = hash(canonical({ method: body.method, params: body.params }));
+    const existing = () => {
+      const record = session.requests.get(body.id);
+      if (record && record.fingerprint !== fingerprint) throw new HttpError(409, "Request ID reused with different arguments");
+      return record;
+    };
+    // A retried ID returns the committed record, including its outcome after a lost ack.
+    const retried = existing();
+    if (retried) return { status: 200, record: retried };
+    if ([...session.requests.values()].filter(request => request.state === "running").length >= 8) throw new HttpError(429, "Too many requests");
+    // Reads and aborts never need a process; everything else runs in the agent.
+    if (!["history", "status", "abort"].includes(body.method)) await this.ensureStarted(session);
+    // Concurrent retries may have waited on the same process startup.
+    const raced = existing();
+    if (raced) return { status: 200, record: raced };
+    const record = this.upsertRequest(session, { startedAt: Date.now(), ...(body.method === "prompt" && typeof body.params.text === "string" ? { prompt: body.params.text } : {}), ...(body.method === "execute" && typeof body.params.code === "string" ? { code: body.params.code } : {}), id: body.id, method: body.method, fingerprint, state: "running" });
+    await this.commit(session, true);
+    void this.run(session, record, body.params);
+    return { status: 202, record };
+  }
+
+  /** Submit a request to a tenant's agent on the tenant's behalf (REST API and console). */
+  async submit(id: string, tenant: string, body: { id: string; method: string; params: Record<string, unknown> }) {
+    const session = this.list(tenant).some(agent => agent.id === id) ? await this.load(id) : undefined;
+    if (!session) throw new HttpError(404, "Unknown agent");
+    if (session.fault) throw session.fault;
+    session.lastActive = Date.now();
+    return (await this.accept(session, body)).record;
+  }
+
   private async execute(session: Session, record: RequestRecord, params: any) {
     const id = session.header.id;
     const live = this.supervisor.agents.has(id);
     if (record.method === "history") return this.history(session);
     if (record.method === "status" && !live) return { running: false };
     if (record.method === "abort" && !live) return { aborted: false, running: false };
-    const result = await this.supervisor.request(id, record.method, params, RUN_METHODS.includes(record.method)
-      ? event => this.publish(session, { type: "event", requestId: record.id, event }) : undefined);
     if (record.method === "configure") {
-      const { tools, ...config } = configurationUpdate(params);
+      const update = configurationUpdate(params);
+      // A new model may belong to another provider: the agent needs that provider's key.
+      const apiKey = update.model ? this.apiKey(session, update.model.provider) : undefined;
+      if (update.model && this.options.apiKeyFor && !apiKey) throw new Error(`No ${update.model.provider} API key is configured for this tenant; set one with PUT /v1/providers/${update.model.provider}/key`);
+      const result = await this.supervisor.request(id, "configure", { ...update, ...(apiKey ? { apiKey } : {}) });
+      const { tools, ...config } = update;
       if (tools !== undefined) session.header.definitions = tools;
       session.header.config = { ...session.header.config, ...config };
       this.writeHeader(session);
+      return result;
     }
-    return result;
+    return this.supervisor.request(id, record.method, params, RUN_METHODS.includes(record.method)
+      ? event => {
+          if (event?.type === "message_end" && event.message?.role === "assistant" && event.message.usage) {
+            this.options.onUsage?.(session.header.tenant ?? DEFAULT_TENANT, id, event.message);
+          }
+          this.publish(session, { type: "event", requestId: record.id, event });
+        } : undefined);
   }
 
   private async run(session: Session, record: RequestRecord, params: unknown) {

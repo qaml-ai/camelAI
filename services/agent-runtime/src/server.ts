@@ -1,5 +1,7 @@
-import { createServer } from "node:http";
-import { resolve, join } from "node:path";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { readFile } from "node:fs/promises";
+import { resolve, join, extname, normalize, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { AgentSupervisor } from "./supervisor.ts";
 import { configuredModel } from "./model.ts";
 import { localTools } from "./local-tools.ts";
@@ -7,6 +9,9 @@ import { errorText } from "./protocol.ts";
 import { sessionConfig } from "./session-config.ts";
 import { ClientSessions } from "./client-sessions.ts";
 import { DEFAULT_TENANT, Tenants } from "./tenants.ts";
+import { Accounts } from "./accounts.ts";
+import { ConsoleAuth } from "./console-auth.ts";
+import { handleApi } from "./api.ts";
 
 // Hosted mode reads tenants (operator token hashes and provider keys) from AGENT_TENANTS_FILE.
 // Without it, one operator token (AGENT_RUNTIME_TOKEN) and key (AGENT_API_KEY) serve everything.
@@ -25,6 +30,49 @@ const idleMs = Number(process.env.AGENT_IDLE_MS ?? 5 * 60_000);
 if (!Number.isInteger(idleMs) || idleMs < 1000) throw new Error("AGENT_IDLE_MS must be an integer of at least 1000");
 // Endpoints beyond the default model's and Pi's published ones that may receive a provider key.
 const allowedBaseUrls = (process.env.AGENT_ALLOWED_BASE_URLS ?? "").split(",").map(value => value.trim()).filter(Boolean);
+const port = Number(process.env.PORT ?? 8790);
+const publicUrl = (process.env.AGENT_PUBLIC_URL ?? `http://127.0.0.1:${port}`).replace(/\/+$/, "");
+// Tenant-set provider keys are encrypted with AGENT_SECRETS_KEY; without it tenants cannot store keys.
+const accounts = new Accounts({ tenants, root: join(root, "tenants"), secretsKey: process.env.AGENT_SECRETS_KEY });
+const github = process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET
+  ? { clientId: process.env.GITHUB_CLIENT_ID, clientSecret: process.env.GITHUB_CLIENT_SECRET, org: process.env.GITHUB_ORG ?? "qaml-ai",
+      webUrl: process.env.AGENT_GITHUB_WEB_URL, apiUrl: process.env.AGENT_GITHUB_API_URL }
+  : undefined;
+const consoleAuth = new ConsoleAuth({ accounts, secret: sessionSecret, publicUrl, github });
+const consoleDir = resolve(process.env.AGENT_CONSOLE_DIR ?? fileURLToPath(new URL("../console/dist", import.meta.url)));
+
+/** Provision an agent for `tenant`: the shared path behind POST /client-sessions and POST /v1/agents. */
+async function createAgent(tenant: string, params: any, key?: string) {
+  const config = sessionConfig(params, model, process.env.AGENT_SYSTEM_PROMPT, allowedBaseUrls);
+  // A single-tenant development host may run code-only agents without a model key.
+  if (!tenants.legacy && !accounts.hasKey(tenant, config.model.provider)) {
+    throw new Error(`No ${config.model.provider} API key is configured for tenant ${tenant}; set one with PUT /v1/providers/${config.model.provider}/key`);
+  }
+  return clients.create(params.tools ?? [], config, key, { name: params.name, type: params.type }, tenant);
+}
+
+const CONTENT_TYPES: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon", ".json": "application/json", ".woff2": "font/woff2" };
+/** Serve the console's static build; unknown paths get index.html for client-side routing. */
+async function serveConsole(req: IncomingMessage, res: ServerResponse) {
+  const path = new URL(req.url ?? "/", publicUrl).pathname;
+  if (path === "/console") { res.writeHead(302, { Location: "/console/" }).end(); return; }
+  const relative = normalize(decodeURIComponent(path.slice("/console/".length))).replace(/^(\.\.(\/|\\|$))+/, "");
+  const file = join(consoleDir, relative);
+  const asset = relative && !relative.endsWith("/") && file.startsWith(consoleDir + sep);
+  let body: Buffer;
+  try { body = await readFile(asset ? file : join(consoleDir, "index.html")); }
+  catch {
+    try { body = await readFile(join(consoleDir, "index.html")); }
+    catch { res.writeHead(404, { "Content-Type": "text/plain" }).end("The console is not built on this host"); return; }
+  }
+  const type = asset ? CONTENT_TYPES[extname(file)] ?? "application/octet-stream" : CONTENT_TYPES[".html"];
+  res.writeHead(200, {
+    "Content-Type": type,
+    "Cache-Control": asset && relative.startsWith("assets/") ? "public, max-age=31536000, immutable" : "no-store",
+    "Content-Security-Policy": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+    "X-Content-Type-Options": "nosniff", "Referrer-Policy": "same-origin",
+  }).end(body);
+}
 
 async function body(req: import("node:http").IncomingMessage, limit: number) {
   let text = "";
@@ -39,8 +87,13 @@ const server = createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/healthz") {
     res.writeHead(200, { "Content-Type": "application/json" }).end('{"ok":true}'); return;
   }
+  if (await consoleAuth.handle(req, res)) return;
+  if (await handleApi(req, res, { accounts, clients, consoleAuth, createAgent, verifyKeys: process.env.AGENT_VERIFY_KEYS !== "false" })) return;
+  if (req.method === "GET" && (req.url === "/console" || req.url?.startsWith("/console/"))) { await serveConsole(req, res); return; }
+  if (req.method === "GET" && req.url === "/") { res.writeHead(302, { Location: "/console/" }).end(); return; }
   if (await clients.handle(req, res)) return;
-  const tenant = tenants.authenticate(req.headers.authorization);
+  const principal = accounts.authenticate(req.headers.authorization);
+  const tenant = principal && { id: principal.tenant };
   if (!tenant) { res.writeHead(401).end(); return; }
   let streaming = false;
   try {
@@ -63,10 +116,7 @@ const server = createServer(async (req, res) => {
       const params = await body(req, 18 * 1024 * 1024);
       const key = req.headers["idempotency-key"];
       if (key !== undefined && typeof key !== "string") throw new Error("Invalid idempotency key");
-      const config = sessionConfig(params, model, process.env.AGENT_SYSTEM_PROMPT, allowedBaseUrls);
-      // A single-tenant development host may run code-only agents without a model key.
-      if (!tenants.legacy && !tenants.apiKey(tenant.id, config.model.provider)) throw new Error(`No ${config.model.provider} API key is configured for tenant ${tenant.id}`);
-      const result = await clients.create(params.tools, config, key, { name: params.name, type: params.type }, tenant.id);
+      const result = await createAgent(tenant.id, params, key);
       res.writeHead(201, { "Content-Type": "application/json", "Cache-Control": "no-store" }).end(JSON.stringify(result));
       return;
     }
@@ -103,11 +153,12 @@ const server = createServer(async (req, res) => {
 });
 const clients = new ClientSessions(supervisor, {
   root: join(root, "client-sessions"), secret: sessionSecret, toolTimeoutMs, idleMs,
-  apiKeyFor: (tenant, provider) => tenants.apiKey(tenant, provider),
+  apiKeyFor: (tenant, provider) => accounts.apiKey(tenant, provider),
+  onUsage: (tenant, agent, message) => { void accounts.recordUsage(tenant, agent, message).catch(error => console.error(JSON.stringify({ type: "usage_record_failed", error: errorText(error) }))); },
 });
 server.requestTimeout = 30_000;
-server.listen(Number(process.env.PORT ?? 8790), process.env.HOST ?? "127.0.0.1", () => {
-  console.log(JSON.stringify({ type: "listening", address: server.address(), tenants: tenants.legacy ? "single" : "file" }));
+server.listen(port, process.env.HOST ?? "127.0.0.1", () => {
+  console.log(JSON.stringify({ type: "listening", address: server.address(), tenants: tenants.legacy ? "single" : "file", github: !!github, keyStorage: accounts.canStoreKeys }));
 });
 process.on("SIGHUP", () => {
   try { tenants.reload(); console.log(JSON.stringify({ type: "tenants_reloaded" })); }

@@ -41,7 +41,12 @@ export interface CreateAgentOptions extends AgentOptions {
   systemPrompt?: string;
   name?: string;
   type?: string;
-  model?: Model<Api>;
+  /**
+   * A model from the runtime's catalog as "provider/model-id" (see GET /v1/models),
+   * e.g. "anthropic/claude-sonnet-5" or "openrouter/openai/gpt-5.2". A full Pi
+   * model object is also accepted if its endpoint is trusted by the runtime.
+   */
+  model?: string | Model<Api>;
   thinkingLevel?: ThinkingLevel;
   initialMessages?: AgentMessage[];
 }
@@ -367,7 +372,8 @@ export class AgentClient {
   continue(options?: RequestOptions) { return this.request("continue", {}, options); }
   steer(text: string) { return this.request("steer", { text }); }
   followUp(text: string) { return this.request("followUp", { text }); }
-  async configure(options: { systemPrompt?: string; thinkingLevel?: ThinkingLevel; tools?: Tools }) {
+  /** Change the prompt, thinking level, tools, or model ("provider/model-id") between runs. */
+  async configure(options: { systemPrompt?: string; thinkingLevel?: ThinkingLevel; tools?: Tools; model?: string }) {
     const result = await this.request("configure", { ...options, ...(options.tools ? { tools: definitions(options.tools) } : {}) });
     if (options.tools) {
       for (const key of Object.keys(this.tools)) delete this.tools[key];

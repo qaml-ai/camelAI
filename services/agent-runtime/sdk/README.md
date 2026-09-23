@@ -46,6 +46,7 @@ const runtime = new AgentRuntime({
 const agent = await runtime.createAgent({
   name: "Inventory planner",
   type: "inventory",
+  model: "anthropic/claude-sonnet-5", // any "provider/model-id" from GET /v1/models
   systemPrompt: "You plan restocks. Never place orders.",
   tools: {
     read_inventory: tool({
@@ -65,6 +66,26 @@ const agent = await runtime.createAgent({
 
 await agent.prompt("Plan restocks for anything below target.");
 ```
+
+Switch models between turns with `await agent.configure({ model: "openai/gpt-5.2" })`;
+the history carries over. Your tenant needs a key for that provider.
+
+## Console and REST API
+
+Sign in at https://agents.camelai.dev/console with GitHub (qaml-ai members) to add
+provider keys, browse models, create API tokens, watch agents and see usage.
+Everything there is also available over REST with an API token:
+
+```sh
+curl -X PUT https://agents.camelai.dev/v1/providers/anthropic/key \
+  -H "Authorization: Bearer $AGENT_RUNTIME_TOKEN" -H "Content-Type: application/json" \
+  -d '{"apiKey": "sk-ant-..."}'
+curl "https://agents.camelai.dev/v1/models?available=true" -H "Authorization: Bearer $AGENT_RUNTIME_TOKEN"
+```
+
+The routes are `/v1/me`, `/v1/providers` (+ `/:provider/key`), `/v1/models`,
+`/v1/agents` (+ `/:id`, `/:id/history`, `/:id/prompt`, `/:id/abort`),
+`/v1/tokens` and `/v1/usage`; see `services/agent-runtime/src/api.ts`.
 
 Save `agent.session` (it contains a scoped credential) to reconnect later with
 `runtime.connectAgent(session, { tools })`. Pass the same `idempotencyKey` to

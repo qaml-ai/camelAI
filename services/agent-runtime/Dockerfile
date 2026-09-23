@@ -19,6 +19,8 @@ RUN node -e '\
 
 COPY src ./src
 COPY shared ./shared
+# Built on the host first (npm run build:console); served at /console/.
+COPY console/dist ./console/dist
 
 RUN mkdir -p /data && chown node:node /data
 USER node

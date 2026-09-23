@@ -19,6 +19,10 @@ Resources (AWS account `904534089871`, `us-west-2`), all named `camelai-agent-ru
   - `camelai/agent-runtime/tenants`: operator token hashes and provider API keys.
   - `camelai/agent-runtime/operator-token/<tenant>`: each tenant's operator
     token, for handing to that person.
+  - `camelai/agent-runtime/secrets-key`: the AES-256 key that encrypts
+    provider keys tenants set themselves. Losing it makes those keys unreadable.
+  - `camelai/agent-runtime/github-oauth`: the console's GitHub OAuth app
+    (optional; see below).
 - Daily EBS snapshots at 09:00 UTC, 7 kept (Data Lifecycle Manager)
 
 On the instance, Caddy (`agent-runtime-caddy.service`) terminates TLS and
@@ -39,7 +43,33 @@ AGENT_RUNTIME_TOKEN=$(aws secretsmanager get-secret-value --region us-west-2 \
   node --experimental-strip-types services/agent-runtime/deploy/smoke.ts
 ```
 
-## Tenants
+## Console and self-service
+
+`https://agents.camelai.dev/console` is where people manage their own tenant:
+- add or replace provider keys, which are checked with the provider and stored encrypted;
+- browse models;
+- mint and revoke API tokens;
+- inspect and prompt agents;
+- see usage.
+
+Everything in the console is also available as the REST API under `/v1`, for
+scripts that authenticate with an API token.
+
+Sign-in uses GitHub and is limited to active members of the `qaml-ai` org. A
+member's first sign-in creates a tenant named after their GitHub login. An
+admin tenant is linked to a GitHub login by adding `"github": "<login>"` to its
+entry in the tenants secret. Token sign-in also works: paste an operator token
+or an API token.
+
+To enable GitHub sign-in, an org owner creates an OAuth app at
+https://github.com/organizations/qaml-ai/settings/applications/new with:
+- homepage `https://agents.camelai.dev`
+- callback URL `https://agents.camelai.dev/console/auth/callback`
+
+Then run `infra/agent-runtime/github-oauth.sh <client-id>` and paste the client
+secret when prompted.
+
+## Tenants (admin)
 
 Each person gets a tenant with its own operator token and provider keys. Their
 agents are invisible to other tenants, and their model usage bills to their

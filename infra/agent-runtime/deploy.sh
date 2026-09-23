@@ -13,10 +13,13 @@ aws() { command aws --region "$REGION" "$@"; }
 
 registry="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
 tag=$(git -C "$repo" rev-parse --short=12 HEAD)
-if [[ -n "$(git -C "$repo" status --porcelain -- services/agent-runtime/src services/agent-runtime/shared services/agent-runtime/package.json services/agent-runtime/Dockerfile)" ]]; then
+if [[ -n "$(git -C "$repo" status --porcelain -- services/agent-runtime/src services/agent-runtime/shared services/agent-runtime/console services/agent-runtime/package.json services/agent-runtime/Dockerfile)" ]]; then
   tag="$tag-dirty-$(date +%Y%m%d%H%M%S)"
 fi
 image="$registry/$ECR_REPOSITORY:$tag"
+
+echo "==> Building the console"
+(cd "$repo/services/agent-runtime" && npx --no-install vite build --config console/vite.config.ts >/dev/null)
 
 echo "==> Building $image"
 aws ecr get-login-password | docker login --username AWS --password-stdin "$registry" >/dev/null
@@ -67,7 +70,7 @@ echo "==> Installing on $instance"
 params=$(python3 -c 'import json,sys; print(json.dumps({"commands": [sys.argv[1]]}))' "$(printf 'echo %s | base64 -d | bash' "$(printf '%s' "$remote" | base64 | tr -d '\n')")")
 command_id=$(aws ssm send-command --instance-ids "$instance" --document-name AWS-RunShellScript \
   --comment "deploy $tag" --parameters "$params" --query Command.CommandId --output text)
-for i in $(seq 1 90); do
+for _ in $(seq 1 90); do
   status=$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$instance" --query Status --output text 2>/dev/null || echo Pending)
   [[ "$status" == Pending || "$status" == InProgress || "$status" == Delayed ]] || break
   sleep 2

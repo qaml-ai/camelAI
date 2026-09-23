@@ -5,4 +5,8 @@ studio
 examples
 tests
 clients
+sdk
+deploy
 **/__pycache__
+console/*
+!console/dist

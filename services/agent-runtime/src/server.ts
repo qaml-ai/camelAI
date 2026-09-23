@@ -58,10 +58,13 @@ async function serveConsole(req: IncomingMessage, res: ServerResponse) {
   if (path === "/console") { res.writeHead(302, { Location: "/console/" }).end(); return; }
   const relative = normalize(decodeURIComponent(path.slice("/console/".length))).replace(/^(\.\.(\/|\\|$))+/, "");
   const file = join(consoleDir, relative);
-  const asset = relative && !relative.endsWith("/") && file.startsWith(consoleDir + sep);
-  let body: Buffer;
-  try { body = await readFile(asset ? file : join(consoleDir, "index.html")); }
-  catch {
+  let asset = !!relative && !relative.endsWith("/") && file.startsWith(consoleDir + sep);
+  let body: Buffer | undefined;
+  if (asset) {
+    try { body = await readFile(file); } catch { asset = false; }
+  }
+  // Anything that is not a built file is a client-side route: serve the app shell.
+  if (!body) {
     try { body = await readFile(join(consoleDir, "index.html")); }
     catch { res.writeHead(404, { "Content-Type": "text/plain" }).end("The console is not built on this host"); return; }
   }

@@ -20,6 +20,11 @@ chmod 600 "$DIR/tenants.json"
 {
   echo "AGENT_TENANTS_FILE=/etc/agent-runtime/tenants.json"
   echo "AGENT_SESSION_SECRET=$(secret session-secret)"
+  echo "AGENT_SECRETS_KEY=$(secret secrets-key)"
+  # GitHub console sign-in is optional until the OAuth app exists (see github-oauth.sh).
+  if github=$(secret github-oauth 2>/dev/null); then
+    python3 -c 'import json, sys; g = json.loads(sys.argv[1]); print("GITHUB_CLIENT_ID=" + g["clientId"]); print("GITHUB_CLIENT_SECRET=" + g["clientSecret"])' "$github"
+  fi
   cat "$DIR/runtime.defaults.env"
 } > "$DIR/runtime.env"
 chmod 600 "$DIR/runtime.env"

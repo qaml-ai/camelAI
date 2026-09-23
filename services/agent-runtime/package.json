@@ -10,9 +10,10 @@
     "demo:python": "python3 examples/inventory.py",
     "test": "node --experimental-strip-types --test --test-timeout=30000 tests/*.test.ts",
     "test:python": "python3 tests/python_sdk.py",
-    "typecheck": "tsc -p tsconfig.json && tsc -p studio/tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p studio/tsconfig.json && tsc -p console/tsconfig.json",
     "studio": "bun studio/server.ts",
-    "build": "vite build --config studio/vite.config.ts"
+    "build": "vite build --config studio/vite.config.ts",
+    "build:console": "vite build --config console/vite.config.ts"
   },
   "version": "0.1.0",
   "description": "Standalone agent process supervisor, QuickJS codemode, SDKs and local Studio",

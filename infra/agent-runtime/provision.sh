@@ -21,6 +21,11 @@ if ! aws secretsmanager describe-secret --secret-id "$SECRET_PREFIX/session-secr
     --description "Derives agent runtime client session tokens. Rotating it invalidates every session token." \
     --secret-string "$(openssl rand -hex 32)" >/dev/null
 fi
+if ! aws secretsmanager describe-secret --secret-id "$SECRET_PREFIX/secrets-key" >/dev/null 2>&1; then
+  aws secretsmanager create-secret --name "$SECRET_PREFIX/secrets-key" \
+    --description "AES-256 key that encrypts tenant-set provider keys at rest. Losing it makes stored keys unreadable." \
+    --secret-string "$(openssl rand -hex 32)" >/dev/null
+fi
 if ! aws secretsmanager describe-secret --secret-id "$SECRET_PREFIX/tenants" >/dev/null 2>&1; then
   aws secretsmanager create-secret --name "$SECRET_PREFIX/tenants" \
     --description "Agent runtime tenants: operator token hashes and provider API keys. Edit with infra/agent-runtime/tenant.sh." \
@@ -37,7 +42,9 @@ aws iam put-role-policy --role-name "$NAME" --policy-name agent-runtime --policy
 {"Version":"2012-10-17","Statement":[
   {"Effect":"Allow","Action":"secretsmanager:GetSecretValue","Resource":[
     "arn:aws:secretsmanager:$REGION:$ACCOUNT_ID:secret:$SECRET_PREFIX/session-secret-*",
-    "arn:aws:secretsmanager:$REGION:$ACCOUNT_ID:secret:$SECRET_PREFIX/tenants-*"]},
+    "arn:aws:secretsmanager:$REGION:$ACCOUNT_ID:secret:$SECRET_PREFIX/tenants-*",
+    "arn:aws:secretsmanager:$REGION:$ACCOUNT_ID:secret:$SECRET_PREFIX/secrets-key-*",
+    "arn:aws:secretsmanager:$REGION:$ACCOUNT_ID:secret:$SECRET_PREFIX/github-oauth-*"]},
   {"Effect":"Allow","Action":"ecr:GetAuthorizationToken","Resource":"*"},
   {"Effect":"Allow","Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer","ecr:BatchCheckLayerAvailability"],
    "Resource":"arn:aws:ecr:$REGION:$ACCOUNT_ID:repository/$ECR_REPOSITORY"}]}

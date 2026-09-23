@@ -523,7 +523,8 @@ export class ClientSessions {
     }
     return this.supervisor.request(id, record.method, params, RUN_METHODS.includes(record.method)
       ? event => {
-          if (event?.type === "message_end" && event.message?.role === "assistant" && event.message.usage) {
+          // Failed calls report zero usage; count only responses the provider completed.
+          if (event?.type === "message_end" && event.message?.role === "assistant" && event.message.usage && event.message.stopReason !== "error") {
             this.options.onUsage?.(session.header.tenant ?? DEFAULT_TENANT, id, event.message);
           }
           this.publish(session, { type: "event", requestId: record.id, event });

@@ -241,3 +241,18 @@ test("usage is recorded per response and summed per day and model", async t => {
   assert.deepEqual(usage.days.map(day => [day.day, day.responses]), [["2026-09-01", 2], ["2026-09-02", 1]]);
   assert.equal((await accounts.usage("bob", 0)).totals.responses, 0);
 });
+
+test("console routes serve the app shell as HTML, never as a download", async t => {
+  const { call } = await runtime(t);
+  for (const path of ["/console/", "/console/agents", "/console/agents/client_x/requests"]) {
+    const response = await call(path);
+    // Built checkouts serve the shell; unbuilt ones say so, but a route is never application/octet-stream.
+    if (response.status === 200) assert.match(response.headers.get("content-type")!, /^text\/html/);
+    else assert.equal(response.status, 404);
+  }
+  // An encoded traversal reaches the server intact; it must never serve files outside the build.
+  for (const path of ["/console/%2e%2e/src/server.ts", "/console/..%2f..%2fsrc%2fserver.ts"]) {
+    const escaped = await call(path);
+    assert.equal(String(escaped.json).includes("createServer"), false, path);
+  }
+});

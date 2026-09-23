@@ -13,6 +13,7 @@ import { writeDurableJson, canonical } from "../shared/durable-json.ts";
 import { fileAppendLog, type AppendLog } from "../shared/append-log.ts";
 import { FRAME_BYTES, type CallRecord, type ClientEvent, type Outcome, type RequestRecord } from "../shared/client-protocol.ts";
 import { agentMetadata, type AgentMetadata } from "../shared/agent-metadata.ts";
+import { DEFAULT_TENANT } from "./tenants.ts";
 
 class HttpError extends Error {
   status: number;
@@ -22,6 +23,8 @@ type SessionConfig = Omit<AgentConfig, "id" | "directory" | "tools" | "apiKey">;
 /** Rarely-changing session identity and configuration; rewritten only when it changes. */
 interface SessionHeader {
   version: 3; id: string; digest: string; expiresAt: number; revoked: boolean;
+  /** Owning tenant; absent on sessions created before tenants existed (the default tenant). */
+  tenant?: string;
   metadata?: AgentMetadata; definitions: ToolDefinition[]; provisionHash: string; config: SessionConfig;
 }
 /** Upserts of request and tool-call records, appended as their state changes. */
@@ -76,7 +79,11 @@ function outcome(value: any): Outcome {
 const settled = (state: string) => !["running", "offered", "started"].includes(state);
 
 export interface ClientSessionOptions {
-  root: string; secret: string; apiKey?: string; toolTimeoutMs?: number; ttlMs?: number; eventBytes?: number;
+  root: string; secret: string; toolTimeoutMs?: number; ttlMs?: number; eventBytes?: number;
+  /** Fallback provider key when `apiKeyFor` is absent (single-tenant hosts and tests). */
+  apiKey?: string;
+  /** The provider key an agent uses, resolved per tenant at process start; never persisted. */
+  apiKeyFor?: (tenant: string, provider: string) => string | undefined;
   /** Stop an agent's process, and unload its session, after this long without activity. */
   idleMs?: number;
   retry?: AgentConfig["retry"];
@@ -258,7 +265,8 @@ export class ClientSessions {
     if (this.supervisor.agents.has(session.header.id) && !session.starting) return Promise.resolve();
     return session.starting ??= (async () => {
       await this.makeRoom(session.header.id);
-      const result = await this.supervisor.start(session.header.id, { ...session.header.config, apiKey: this.options.apiKey, ...(this.options.retry ? { retry: this.options.retry } : {}) }, {
+      const apiKey = this.options.apiKeyFor ? this.options.apiKeyFor(session.header.tenant ?? DEFAULT_TENANT, session.header.config.model.provider) : this.options.apiKey;
+      const result = await this.supervisor.start(session.header.id, { ...session.header.config, apiKey, ...(this.options.retry ? { retry: this.options.retry } : {}) }, {
         definitions: session.header.definitions,
         call: (name, args, signal, context) => this.call(session, name, args, signal, context),
       });
@@ -272,21 +280,24 @@ export class ClientSessions {
     })().finally(() => { session.starting = undefined; });
   }
 
-  async create(definitions: ToolDefinition[], config: Omit<AgentConfig, "id" | "directory" | "tools">, key: string = randomUUID(), metadata: AgentMetadata = {}) {
+  async create(definitions: ToolDefinition[], config: Omit<AgentConfig, "id" | "directory" | "tools">, key: string = randomUUID(), metadata: AgentMetadata = {}, tenant = DEFAULT_TENANT) {
     metadata = agentMetadata(metadata);
     validateDefinitions(definitions);
     if (!validId(key)) throw new HttpError(400, "Invalid provisioning idempotency key");
-    const id = `client_${hash(key).slice(0, 40)}`;
-    const token = createHmac("sha256", this.options.secret).update(`client-v2:${key}`).digest("hex");
+    // Idempotency keys are per tenant; the default tenant keeps its pre-tenant IDs and tokens.
+    const scoped = tenant === DEFAULT_TENANT ? key : `${tenant}:${key}`;
+    const id = `client_${hash(scoped).slice(0, 40)}`;
+    const token = createHmac("sha256", this.options.secret).update(`client-v2:${scoped}`).digest("hex");
     const { apiKey: _key, ...safeConfig } = config;
     const provisionHash = hash(canonical({ definitions, config: safeConfig, ...(Object.keys(metadata).length ? { metadata } : {}) }));
     let session = await this.load(id);
     if (session) {
+      if ((session.header.tenant ?? DEFAULT_TENANT) !== tenant) throw new HttpError(409, "Idempotency key belongs to another tenant");
       if (session.header.provisionHash !== provisionHash) throw new HttpError(409, "Idempotency key reused with different configuration");
       if (session.header.revoked || session.header.expiresAt <= Date.now()) throw new HttpError(410, "Session expired or revoked");
     } else {
       session = {
-        header: { version: 3, id, digest: hash(token), expiresAt: Date.now() + (this.options.ttlMs ?? 24 * 60 * 60 * 1000), revoked: false, metadata, definitions, config: safeConfig, provisionHash },
+        header: { version: 3, id, ...(tenant === DEFAULT_TENANT ? {} : { tenant }), digest: hash(token), expiresAt: Date.now() + (this.options.ttlMs ?? 24 * 60 * 60 * 1000), revoked: false, metadata, definitions, config: safeConfig, provisionHash },
         requests: new Map(), calls: new Map(), log: fileAppendLog<JournalRecord>(this.journalPath(id)),
         cursor: Date.now() * 1000, events: [], eventBytes: 0, pending: new Map(), lastActive: Date.now(),
       };
@@ -298,20 +309,22 @@ export class ClientSessions {
     return { id, token, expiresAt: session.header.expiresAt, ...status };
   }
 
-  list() {
+  /** Agents owned by `tenant`, or every agent when no tenant is given. */
+  list(tenant?: string) {
     const result: { id: string; name: string; type: string; connected: boolean }[] = [];
     for (const name of readdirSync(this.options.root)) {
       const match = /^(client_[a-f0-9]{40})\.json$/.exec(name);
       const header = match && (this.sessions.get(match[1])?.header ?? this.readHeader(match[1]));
       if (!header || header.revoked || header.expiresAt <= Date.now()) continue;
+      if (tenant !== undefined && (header.tenant ?? DEFAULT_TENANT) !== tenant) continue;
       const response = this.sessions.get(header.id)?.response;
       result.push({ id: header.id, name: header.metadata?.name ?? header.id, type: header.metadata?.type ?? "general", connected: !!response && !response.destroyed });
     }
     return result;
   }
 
-  async inspect(id: string) {
-    const metadata = this.list().find(agent => agent.id === id);
+  async inspect(id: string, tenant?: string) {
+    const metadata = this.list(tenant).find(agent => agent.id === id);
     const session = metadata && await this.load(id);
     if (!metadata || !session) throw new HttpError(404, "Agent not found");
     return { ...metadata, tools: session.header.definitions, systemPrompt: session.header.config.systemPrompt ?? "",
@@ -324,15 +337,20 @@ export class ClientSessions {
     return { messages: await readTranscript(join(this.supervisor.root, session.header.id)) };
   }
 
-  /** Called before operator authentication; this route requires a scoped credential. */
-  async handle(req: IncomingMessage, res: ServerResponse, operator = false): Promise<boolean> {
+  /**
+   * Called before operator authentication; this route requires a scoped credential.
+   * `operatorTenant` is set only for the authenticated operator bridge, which may
+   * submit requests to that tenant's own agents without their session token.
+   */
+  async handle(req: IncomingMessage, res: ServerResponse, operatorTenant?: string): Promise<boolean> {
+    const operator = operatorTenant !== undefined;
     if (!(req.url ?? "").startsWith("/clients/")) return false;
     try {
       const match = /^\/clients\/(client_[a-f0-9]{40})(?:\/(events|state|metadata|history|requests|calls)(?:\/([A-Za-z0-9_-]{1,80})(?:\/(claim|outcome))?)?)?$/.exec(req.url ?? "");
       // Authenticate against the small header before loading the journal.
       const header = match ? this.sessions.get(match[1])?.header ?? this.readHeader(match[1]) : undefined;
       const authorization = req.headers.authorization ?? "";
-      if (!header || req.headers.origin || (!operator && (!authorization.startsWith("Bearer ") || !timingSafeEqual(Buffer.from(hash(authorization.slice(7)), "hex"), Buffer.from(header.digest, "hex"))))) throw new HttpError(401, "Unauthorized");
+      if (!header || req.headers.origin || (operator && (header.tenant ?? DEFAULT_TENANT) !== operatorTenant) || (!operator && (!authorization.startsWith("Bearer ") || !timingSafeEqual(Buffer.from(hash(authorization.slice(7)), "hex"), Buffer.from(header.digest, "hex"))))) throw new HttpError(401, "Unauthorized");
       if (header.revoked || header.expiresAt <= Date.now()) throw new HttpError(410, "Session expired or revoked");
       const session = await this.load(header.id);
       if (!session) throw new HttpError(401, "Unauthorized");

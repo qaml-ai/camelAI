@@ -2,18 +2,20 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { configuredModel } from '../src/model.ts';
 import { assertTrustedEndpoint } from '../src/session-config.ts';
 
-async function fixture(t: { after(fn: () => Promise<void>): void }) {
+async function fixture(t: { after(fn: () => Promise<void>): void }, env: (root: string) => Record<string, string> = () => ({})) {
   const root = await mkdtemp(join(tmpdir(), 'agent-service-api-'));
   const operator = 'operator-fixture-secret-at-least-24-chars';
   const child = spawn(process.execPath, ['--experimental-strip-types', fileURLToPath(new URL('../src/server.ts', import.meta.url))], {
-    env: { PATH: process.env.PATH, HOME: root, AGENT_DATA_DIR: root, AGENT_RUNTIME_TOKEN: operator, AGENT_API_KEY: 'host-fixture-key', PORT: '0', HOST: '127.0.0.1' },
+    env: { PATH: process.env.PATH, HOME: root, AGENT_DATA_DIR: root, AGENT_RUNTIME_TOKEN: operator, AGENT_API_KEY: 'host-fixture-key', PORT: '0', HOST: '127.0.0.1', ...env(root) } as NodeJS.ProcessEnv,
     stdio: ['ignore', 'pipe', 'inherit'],
   });
   t.after(async () => {
@@ -29,7 +31,7 @@ async function fixture(t: { after(fn: () => Promise<void>): void }) {
   const headers = (token: string) => ({ Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' });
   const post = (path: string, body: unknown, token = operator) => fetch(base + path, { method: 'POST', headers: headers(token), body: JSON.stringify(body) });
   const get = (path: string, token = operator) => fetch(base + path, { headers: headers(token) });
-  return { root, post, get };
+  return { root, post, get, child };
 }
 
 test('operator provisioning imports native history once; scoped reads do not journal transcript copies', async t => {
@@ -95,4 +97,45 @@ test('trusted endpoints are the default model, Pi published endpoints, and the o
   assert.throws(() => assertTrustedEndpoint(gateway, base), /not trusted/);
   assertTrustedEndpoint(gateway, base, ['https://gateway.example.test/v1/anthropic/']);
   assert.throws(() => assertTrustedEndpoint({ ...gateway, baseUrl: 'https://gateway.example.test/v1/other' }, base, ['https://gateway.example.test/v1/anthropic']), /not trusted/);
+});
+
+test('tenants provision and see only their own agents, billed to their own provider keys', async t => {
+  const sha = (value: string) => createHash('sha256').update(value).digest('hex');
+  const alice = 'alice-operator-token-at-least-24-chars', bob = 'bob-operator-token-at-least-24-chars', carol = 'carol-operator-token-at-least-24-chars';
+  const tenantsFile = (root: string) => join(root, 'tenants.json');
+  const tenants = (extra = {}) => JSON.stringify({ tenants: {
+    alice: { tokenSha256: sha(alice), apiKeys: { [configuredModel().provider]: 'alice-provider-key' } },
+    bob: { tokenSha256: sha(bob), apiKeys: {} }, ...extra,
+  } });
+  let path = '';
+  const f = await fixture(t, root => {
+    path = tenantsFile(root);
+    writeFileSync(path, tenants());
+    return { AGENT_TENANTS_FILE: path, AGENT_RUNTIME_TOKEN: '', AGENT_SESSION_SECRET: 'fixture-session-secret-with-32-characters!' };
+  });
+  assert.equal((await fetch(new URL('/healthz', (await f.get('/registry', alice)).url))).status, 200);
+  assert.equal((await f.post('/client-sessions', { tools: [] }, 'operator-fixture-secret-at-least-24-chars')).status, 401, 'legacy token is not a tenant');
+  const created = await f.post('/client-sessions', { tools: [], name: 'Alice agent' }, alice);
+  assert.equal(created.status, 201);
+  const agent = await created.json() as any;
+  const missingKey = await f.post('/client-sessions', { tools: [] }, bob);
+  assert.equal(missingKey.status, 400);
+  assert.match((await missingKey.json() as any).error, /No .* API key is configured for tenant bob/);
+  assert.deepEqual((await (await f.get('/registry', alice)).json() as any[]).map(a => a.name), ['Alice agent']);
+  assert.deepEqual(await (await f.get('/registry', bob)).json(), []);
+  assert.equal((await f.get(`/registry/${agent.id}`, bob)).status, 400);
+  assert.equal((await f.post(`/registry/${agent.id}/requests`, { id: 'cross', method: 'status', params: {} }, bob)).status, 401);
+  assert.equal((await f.post(`/registry/${agent.id}/requests`, { id: 'own', method: 'status', params: {} }, alice)).status, 202);
+  // The same idempotency key in another tenant is a different agent.
+  const sameKey = (token: string) => fetch(new URL('/client-sessions', (created as Response).url), { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'Idempotency-Key': 'shared-key' }, body: JSON.stringify({ tools: [] }) });
+  await writeFile(path, tenants({ carol: { tokenSha256: sha(carol), apiKeys: { '*': 'carol-provider-key' } } }));
+  f.child.kill('SIGHUP');
+  let carolAgent: Response | undefined;
+  for (let i = 0; i < 50 && carolAgent?.status !== 201; i++) { carolAgent = await sameKey(carol); if (carolAgent.status !== 201) await new Promise(resolve => setTimeout(resolve, 20)); }
+  assert.equal(carolAgent!.status, 201);
+  const aliceShared = await sameKey(alice);
+  assert.notEqual((await aliceShared.json() as any).id, (await carolAgent!.json() as any).id);
+  const header = JSON.parse(await readFile(join(f.root, 'client-sessions', `${agent.id}.json`), 'utf8'));
+  assert.equal(header.tenant, 'alice');
+  assert.equal(JSON.stringify(header).includes('alice-provider-key'), false);
 });

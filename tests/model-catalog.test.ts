@@ -329,7 +329,7 @@ describe('MODEL_CATALOG', () => {
       'deepseek-v4-flash',
       'kimi-k2.7-code',
       'grok-4.5',
-      'glm-5.2',
+      'glm-5.3',
     ]);
   });
 

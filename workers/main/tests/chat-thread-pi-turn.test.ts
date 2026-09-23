@@ -2229,6 +2229,50 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(fake.piCurrentUsageProvider).toBe('openrouter');
   });
 
+  it.each(['glm-5.3', 'glm-5.2'])(
+    'resolves %s to GLM 5.3 with supported reasoning efforts through AI Gateway',
+    async (modelId) => {
+      const fake = Object.create(ChatThreadDO.prototype) as any;
+      fake.env = {
+        CF_ACCOUNT_ID: 'acct_1',
+        CF_GATEWAY_NAME: 'gateway_1',
+        AI_GATEWAY_AUTH_TOKEN: 'cf-token',
+      };
+      fake.chatContext = { orgId: 'org1', workspaceId: 'workspace1', threadId: 'thread1' };
+      fake.resolveCurrentByokCredentials = vi.fn(async () => null);
+      fake.checkHostedPiModelAccess = vi.fn(async () => ({
+        creditChargeable: true,
+        vllmPriority: '0',
+      }));
+
+      const getModel = vi.fn(() => undefined);
+      const result = await ChatThreadDO.prototype['resolvePiModel'].call(
+        fake,
+        fake.chatContext,
+        { CHIRIDION_MODEL: modelId },
+        getModel,
+      );
+
+      expect(getModel).toHaveBeenCalledWith('openrouter', 'z-ai/glm-5.3');
+      expect(result.model).toMatchObject({
+        id: 'z-ai/glm-5.3:nitro',
+        provider: 'cloudflare-ai-gateway',
+        api: 'openai-completions',
+        reasoning: true,
+        input: ['text'],
+        compat: { supportsReasoningEffort: true },
+        thinkingLevelMap: {
+          off: null,
+          minimal: 'low', low: 'low', medium: 'high', high: 'high', xhigh: 'max', max: 'max',
+        },
+        cost: { input: 0.84, output: 2.64, cacheRead: 0.156, cacheWrite: 0 },
+        contextWindow: 1048576,
+        maxTokens: 131072,
+      });
+      expect(result.modelId).toBe('z-ai/glm-5.3');
+    },
+  );
+
   it('routes the persisted camelCode id to Luna through the AI Gateway fallback route', async () => {
     const fake = Object.create(ChatThreadDO.prototype) as any;
     fake.env = {
@@ -4780,6 +4824,18 @@ describe('ChatThreadDO Pi turn handling', () => {
       hostedModelId: routeModel,
     });
   });
+
+  it.each(['glm-5.3', 'glm-5.2', 'glm-latest', 'z-ai/glm-5.2', 'z-ai/glm-latest'])(
+    'routes %s to GLM 5.3 with Nitro for hosted requests',
+    (model) => {
+      expect(new PiModelMapping().resolvePiModelReference(model)).toEqual({
+        provider: 'openrouter',
+        modelId: 'z-ai/glm-5.3',
+        hostedGatewayProvider: 'openrouter',
+        hostedModelId: 'z-ai/glm-5.3:nitro',
+      });
+    },
+  );
 
   it('resolves deepseek-v4-pro to the AI Gateway dynamic route with an OpenRouter lookup id', () => {
     const result = new PiModelMapping().resolvePiModelReference('deepseek-v4-pro');

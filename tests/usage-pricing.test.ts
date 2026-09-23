@@ -46,6 +46,25 @@ describe("calculateUsageCostUsd", () => {
     );
   });
 
+  it("prices GLM 5.3 aliases while retaining historical GLM 5.2 pricing", () => {
+    const usage = {
+      inputTokens: 1_000_000,
+      outputTokens: 1_000_000,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 1_000_000,
+    };
+
+    for (const model of ["glm-5.3", "z-ai/glm-5.3", "camel/z-ai/glm-5.3:nitro"]) {
+      expect(lookupPricingOrNull(model)).toEqual({
+        inputPerToken: 0.00000084,
+        outputPerToken: 0.00000264,
+        cacheReadPerToken: 0.000000156,
+      });
+      expect(calculateUsageCostUsd({ ...usage, model })).toBeCloseTo(3.636);
+    }
+    expect(calculateUsageCostUsd({ ...usage, model: "z-ai/glm-5.2" })).toBeCloseTo(5.5);
+  });
+
   it("prices GPT-5.6 aliases and long prompts", () => {
     expect(lookupPricing("openai/gpt-5.6-terra")).toMatchObject({
       inputPerToken: 0.000002,

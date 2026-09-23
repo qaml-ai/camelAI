@@ -278,6 +278,17 @@ const modelPricingTable: Record<string, ModelPricing> = {
     outputPerToken: 0.000006,
     cacheReadPerToken: 0.0000005,
   },
+  // OpenRouter /api/v1/models pricing snapshot, 2026-09-23.
+  "z-ai/glm-5.3": {
+    inputPerToken: 0.00000084,
+    outputPerToken: 0.00000264,
+    cacheReadPerToken: 0.000000156,
+  },
+  "glm-5.3": {
+    inputPerToken: 0.00000084,
+    outputPerToken: 0.00000264,
+    cacheReadPerToken: 0.000000156,
+  },
   "z-ai/glm-5.2": {
     inputPerToken: 0.0000012,
     outputPerToken: 0.0000041,
@@ -441,6 +452,7 @@ export function lookupPricingOrNull(model: string): ModelPricing | null {
   }
   if (normalized.includes("grok-4.5")) return modelPricingTable["x-ai/grok-4.5"];
   if (normalized.includes("grok-4.3")) return modelPricingTable["x-ai/grok-4.5"];
+  if (normalized.includes("glm-5.3")) return modelPricingTable["z-ai/glm-5.3"];
   if (normalized.includes("glm-5.2")) return modelPricingTable["z-ai/glm-5.2"];
   if (normalized.includes("deepseek-v4-auto")) {
     return modelPricingTable["deepseek-v4-auto"];

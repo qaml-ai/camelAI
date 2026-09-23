@@ -152,8 +152,10 @@ describe("normalizeLegacyModel (back-compat shim)", () => {
     expect(normalizeLegacyModel("x-ai/grok-4.3")).toBe("x-ai/grok-4.5");
     expect(normalizeLegacyModel("grok-latest")).toBe("x-ai/grok-4.5");
     expect(normalizeLegacyModel("grok-4.5")).toBe("x-ai/grok-4.5");
-    expect(normalizeLegacyModel("glm-5.2")).toBe("z-ai/glm-5.2");
-    expect(normalizeLegacyModel("glm-latest")).toBe("z-ai/glm-5.2");
+    expect(normalizeLegacyModel("glm-5.2")).toBe("z-ai/glm-5.3");
+    expect(normalizeLegacyModel("z-ai/glm-5.2")).toBe("z-ai/glm-5.3");
+    expect(normalizeLegacyModel("glm-5.3")).toBe("z-ai/glm-5.3");
+    expect(normalizeLegacyModel("glm-latest")).toBe("z-ai/glm-5.3");
     expect(normalizeLegacyModel("gemini-3.5-flash")).toBe("google/gemini-3.5-flash");
   });
 

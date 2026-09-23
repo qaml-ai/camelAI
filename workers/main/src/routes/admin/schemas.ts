@@ -172,7 +172,7 @@ export const LlmModelSchema = z.enum([
   "custom",
   "kimi-k2.7-code",
   "grok-4.5",
-  "glm-5.2",
+  "glm-5.3",
   "gemini-3.5-flash",
   "gemini-3-flash-preview",
   "deepseek-v4-pro",

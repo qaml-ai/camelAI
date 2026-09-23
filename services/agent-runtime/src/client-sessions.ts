@@ -1,6 +1,4 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AgentConfig, ToolDefinition } from "./protocol.ts";
 import { errorText } from "./protocol.ts";
@@ -8,9 +6,10 @@ import type { AgentSupervisor } from "./supervisor.ts";
 import { configurationUpdate } from "./session-config.ts";
 import { validateDefinitions } from "./tool-policy.ts";
 import { validateUserMessages } from "./history.ts";
-import { readTranscript } from "./transcript.ts";
-import { writeDurableJson, canonical } from "../shared/durable-json.ts";
-import { fileAppendLog, type AppendLog } from "../shared/append-log.ts";
+import { canonical } from "../shared/durable-json.ts";
+import type { AppendLog } from "../shared/append-log.ts";
+import { fileStorage, PreconditionFailed, type Storage } from "../shared/storage.ts";
+import type { Lease, LeaseStore } from "../shared/leases.ts";
 import { FRAME_BYTES, type CallRecord, type ClientEvent, type Outcome, type RequestRecord } from "../shared/client-protocol.ts";
 import { agentMetadata, type AgentMetadata } from "../shared/agent-metadata.ts";
 import { DEFAULT_TENANT } from "./tenants.ts";
@@ -19,6 +18,13 @@ class HttpError extends Error {
   status: number;
   constructor(status: number, message: string) { super(message); this.status = status; }
 }
+/** Another live node owns this agent; the server forwards the request there. */
+export class NotOwner extends HttpError {
+  owner: string;
+  constructor(owner: string) { super(503, `This agent is served by another node; retry`); this.owner = owner; }
+}
+/** What `list` needs, kept per tenant so listing never scans every agent. */
+interface IndexEntry { id: string; tenant: string; name: string; type: string; model: string; expiresAt: number; revoked: boolean }
 type SessionConfig = Omit<AgentConfig, "id" | "directory" | "tools" | "apiKey">;
 /** Rarely-changing session identity and configuration; rewritten only when it changes. */
 interface SessionHeader {
@@ -32,6 +38,9 @@ type JournalRecord = { t: "request"; record: RequestRecord } | { t: "call"; reco
 type BufferedEvent = { id: number; bytes: number; data: ClientEvent };
 type Session = {
   header: SessionHeader;
+  /** Version of the stored header this node last read or wrote; writes are conditional on it. */
+  headerVersion?: string;
+  lease?: Lease;
   requests: Map<string, RequestRecord>;
   calls: Map<string, CallRecord>;
   log: AppendLog<JournalRecord>;
@@ -79,11 +88,20 @@ function outcome(value: any): Outcome {
 const settled = (state: string) => !["running", "offered", "started"].includes(state);
 
 export interface ClientSessionOptions {
-  root: string; secret: string; toolTimeoutMs?: number; ttlMs?: number; eventBytes?: number;
+  secret: string; toolTimeoutMs?: number; ttlMs?: number; eventBytes?: number;
+  /** Single-host shorthand for `storage: fileStorage(root)`. */
+  root?: string;
+  storage?: Storage;
+  /** Key prefix for this component's documents and logs within `storage`. */
+  prefix?: string;
+  /** With leases, each agent is served by one node at a time, identified by `node` (its internal URL). */
+  leases?: LeaseStore;
+  node?: string;
+  leaseTtlMs?: number;
   /** Fallback provider key when `apiKeyFor` is absent (single-tenant hosts and tests). */
   apiKey?: string;
   /** The provider key an agent uses, resolved per tenant at process start; never persisted. */
-  apiKeyFor?: (tenant: string, provider: string) => string | undefined;
+  apiKeyFor?: (tenant: string, provider: string) => Promise<string | undefined> | string | undefined;
   /** At most this many agent processes per tenant at once (default: no per-tenant limit). */
   maxProcessesPerTenant?: number;
   /** Stop an agent's process, and unload its session, after this long without activity. */
@@ -102,30 +120,74 @@ export class ClientSessions {
   private readonly loading = new Map<string, Promise<Session | undefined>>();
   readonly supervisor: AgentSupervisor;
   readonly options: ClientSessionOptions;
+  readonly storage: Storage;
   readonly heartbeat: ReturnType<typeof setInterval>;
+  private readonly renewal?: ReturnType<typeof setInterval>;
   private closed = false;
 
   constructor(supervisor: AgentSupervisor, options: ClientSessionOptions) {
+    if (!options.storage && !options.root) throw new Error("ClientSessions needs storage or root");
     this.supervisor = supervisor;
     this.options = options;
-    mkdirSync(options.root, { recursive: true, mode: 0o700 });
+    this.storage = options.storage ?? fileStorage(options.root!);
     this.heartbeat = setInterval(() => this.tick(), Math.min(5000, Math.max(50, Math.floor((options.idleMs ?? 5 * 60_000) / 2))));
     this.heartbeat.unref();
+    if (options.leases) {
+      this.renewal = setInterval(() => void this.renewLeases(), Math.floor(this.leaseTtl / 3));
+      this.renewal.unref();
+    }
   }
 
-  private headerPath(id: string) { return join(this.options.root, `${id}.json`); }
-  private journalPath(id: string) { return join(this.options.root, `${id}.journal.jsonl`); }
+  private get leaseTtl() { return this.options.leaseTtlMs ?? 30_000; }
+  private get node() { return this.options.node ?? "local"; }
+  private headerKey(id: string) { return `${this.options.prefix ?? ""}${id}`; }
+  private journalKey(id: string) { return `${this.options.prefix ?? ""}${id}.journal`; }
+  private indexKey(tenant: string, id = "") { return `${this.options.prefix ?? ""}index/${tenant}/${id}`; }
 
-  private readHeader(id: string): SessionHeader | undefined {
+  private async readHeader(id: string): Promise<{ value: SessionHeader; version: string } | undefined> {
     if (!validSessionId(id)) return undefined;
-    try { return JSON.parse(readFileSync(this.headerPath(id), "utf8")); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+    return this.storage.readJson<SessionHeader>(this.headerKey(id));
   }
 
-  private writeHeader(session: Session) {
+  /** Write the header (conditional on the version this node holds) and its index entry. */
+  private async writeHeader(session: Session) {
     if (session.fault) throw session.fault;
-    try { writeDurableJson(this.headerPath(session.header.id), session.header); }
-    catch (error) { this.fail(session, error); throw session.fault; }
+    const header = session.header;
+    try {
+      session.headerVersion = await this.storage.writeJson(this.headerKey(header.id), header, session.headerVersion ?? null);
+      const entry: IndexEntry = {
+        id: header.id, tenant: header.tenant ?? DEFAULT_TENANT, name: header.metadata?.name ?? header.id, type: header.metadata?.type ?? "general",
+        model: `${header.config.model.provider}/${header.config.model.id}`, expiresAt: header.expiresAt, revoked: header.revoked,
+      };
+      await this.storage.writeJson(this.indexKey(entry.tenant, header.id), entry);
+    } catch (error) {
+      this.fail(session, error instanceof PreconditionFailed ? new Error("Another node changed this agent; it moved") : error);
+      throw session.fault;
+    }
+  }
+
+  /** Build the per-tenant index for sessions created before it existed. Safe to repeat. */
+  async init() {
+    const prefix = this.options.prefix ?? "";
+    const indexed = new Set((await this.storage.listJson(`${prefix}index/`)).map(key => key.slice(key.lastIndexOf("/") + 1)));
+    for (const key of await this.storage.listJson(prefix)) {
+      const id = key.slice(prefix.length);
+      if (!validSessionId(id) || indexed.has(id)) continue;
+      const stored = await this.readHeader(id);
+      if (!stored) continue;
+      const header = stored.value;
+      await this.storage.writeJson(this.indexKey(header.tenant ?? DEFAULT_TENANT, id), {
+        id, tenant: header.tenant ?? DEFAULT_TENANT, name: header.metadata?.name ?? id, type: header.metadata?.type ?? "general",
+        model: `${header.config.model.provider}/${header.config.model.id}`, expiresAt: header.expiresAt, revoked: header.revoked,
+      } satisfies IndexEntry);
+    }
+  }
+
+  /** The live owner of an agent when it is another node; undefined when this node can serve it. */
+  async ownerElsewhere(id: string): Promise<string | undefined> {
+    if (!this.options.leases || this.sessions.has(id)) return undefined;
+    const lease = await this.options.leases.get(id);
+    return lease?.live && lease.owner !== this.node ? lease.owner : undefined;
   }
 
   private load(id: string): Promise<Session | undefined> {
@@ -140,11 +202,27 @@ export class ClientSessions {
   }
 
   private async read(id: string): Promise<Session | undefined> {
-    let header = this.readHeader(id) as any;
-    if (!header) return undefined;
-    const log = fileAppendLog<JournalRecord>(this.journalPath(id));
+    const stored = await this.readHeader(id);
+    if (!stored) return undefined;
+    // Take ownership before reading the journal, so no other node appends meanwhile.
+    let lease: Lease | undefined;
+    if (this.options.leases) {
+      const acquired = await this.options.leases.acquire(id, this.node, this.leaseTtl);
+      if ("heldBy" in acquired) throw new NotOwner(acquired.heldBy.owner);
+      lease = acquired.lease;
+    }
+    try { return await this.loadOwned(id, lease); }
+    catch (error) { if (lease) await this.options.leases!.release(lease).catch(() => {}); throw error; }
+  }
+
+  private async loadOwned(id: string, lease?: Lease): Promise<Session | undefined> {
+    // Re-read after acquiring: the previous owner may have written since.
+    const stored = await this.readHeader(id);
+    if (!stored) return undefined;
+    let header = stored.value as any;
+    const log = this.storage.log<JournalRecord>(this.journalKey(id));
     const session: Session = {
-      header, requests: new Map(), calls: new Map(), log,
+      header, headerVersion: stored.version, lease, requests: new Map(), calls: new Map(), log,
       // Cursors restart above any cursor from an earlier process, so clients see a gap, never a repeat.
       cursor: Date.now() * 1000, events: [], eventBytes: 0, pending: new Map(), lastActive: Date.now(),
     };
@@ -155,12 +233,12 @@ export class ClientSessions {
       const { requests: _requests, calls: _calls, events: _events, cursor: _cursor, ...rest } = header;
       session.header = header = { ...rest, version: 3 };
       await log.rewrite(() => this.snapshot(session));
-      this.writeHeader(session);
+      await this.writeHeader(session);
     } else {
       for (const record of await log.read()) this.apply(session, record);
     }
     if (header.version !== 3 || header.id !== id) throw new Error("Invalid client session header");
-    // Loading means no process in this host owns the session, so nothing it recorded is still running.
+    // Loading means no process anywhere owns the session, so nothing it recorded is still running.
     for (const request of session.requests.values()) if (request.state === "running") {
       this.upsertRequest(session, { ...request, state: "completed", endedAt: Date.now(), outcome: { error: "The runtime restarted during this request", uncertain: true } });
     }
@@ -275,7 +353,7 @@ export class ClientSessions {
     }
   }
 
-  private apiKey(session: Session, provider: string) {
+  private async apiKey(session: Session, provider: string) {
     return this.options.apiKeyFor ? this.options.apiKeyFor(session.header.tenant ?? DEFAULT_TENANT, provider) : this.options.apiKey;
   }
 
@@ -286,7 +364,7 @@ export class ClientSessions {
     if (this.supervisor.agents.has(session.header.id) && !session.starting) return Promise.resolve();
     return session.starting ??= (async () => {
       await this.makeRoom(session);
-      const apiKey = this.apiKey(session, session.header.config.model.provider);
+      const apiKey = await this.apiKey(session, session.header.config.model.provider);
       const result = await this.supervisor.start(session.header.id, { ...session.header.config, apiKey, ...(this.options.retry ? { retry: this.options.retry } : {}) }, {
         definitions: session.header.definitions,
         call: (name, args, signal, context) => this.call(session, name, args, signal, context),
@@ -294,14 +372,14 @@ export class ClientSessions {
       // Bootstrap history has been imported into the transcript; keep only one authority.
       if (session.header.config.initialMessages !== undefined) {
         delete session.header.config.initialMessages;
-        this.writeHeader(session);
+        await this.writeHeader(session);
       }
       if (result.recovered) this.publish(session, { type: "event", requestId: "", event: { type: "turn_recovered", reason: "The runtime restarted during a turn; unresolved tool calls were marked unknown" } });
       return result;
     })().finally(() => { session.starting = undefined; });
   }
 
-  async create(definitions: ToolDefinition[], config: Omit<AgentConfig, "id" | "directory" | "tools">, key: string = randomUUID(), metadata: AgentMetadata = {}, tenant = DEFAULT_TENANT) {
+  async create(definitions: ToolDefinition[], config: Omit<AgentConfig, "id" | "directory" | "tools">, key: string = randomUUID(), metadata: AgentMetadata = {}, tenant = DEFAULT_TENANT): Promise<{ id: string; token: string; expiresAt: number; [status: string]: unknown }> {
     metadata = agentMetadata(metadata);
     validateDefinitions(definitions);
     if (!validId(key)) throw new HttpError(400, "Invalid provisioning idempotency key");
@@ -311,18 +389,40 @@ export class ClientSessions {
     const token = createHmac("sha256", this.options.secret).update(`client-v2:${scoped}`).digest("hex");
     const { apiKey: _key, ...safeConfig } = config;
     const provisionHash = hash(canonical({ definitions, config: safeConfig, ...(Object.keys(metadata).length ? { metadata } : {}) }));
+    // Re-provisioning an agent another node serves only needs its header: nothing to start here.
+    if (await this.ownerElsewhere(id)) {
+      const stored = await this.readHeader(id);
+      if (stored) {
+        if ((stored.value.tenant ?? DEFAULT_TENANT) !== tenant) throw new HttpError(409, "Idempotency key belongs to another tenant");
+        if (stored.value.provisionHash !== provisionHash) throw new HttpError(409, "Idempotency key reused with different configuration");
+        if (stored.value.revoked || stored.value.expiresAt <= Date.now()) throw new HttpError(410, "Session expired or revoked");
+        return { id, token, expiresAt: stored.value.expiresAt, running: true };
+      }
+    }
     let session = await this.load(id);
     if (session) {
       if ((session.header.tenant ?? DEFAULT_TENANT) !== tenant) throw new HttpError(409, "Idempotency key belongs to another tenant");
       if (session.header.provisionHash !== provisionHash) throw new HttpError(409, "Idempotency key reused with different configuration");
       if (session.header.revoked || session.header.expiresAt <= Date.now()) throw new HttpError(410, "Session expired or revoked");
     } else {
+      let lease: Lease | undefined;
+      if (this.options.leases) {
+        const acquired = await this.options.leases.acquire(id, this.node, this.leaseTtl);
+        if ("heldBy" in acquired) throw new NotOwner(acquired.heldBy.owner);
+        lease = acquired.lease;
+      }
       session = {
         header: { version: 3, id, ...(tenant === DEFAULT_TENANT ? {} : { tenant }), digest: hash(token), expiresAt: Date.now() + (this.options.ttlMs ?? 24 * 60 * 60 * 1000), revoked: false, metadata, definitions, config: safeConfig, provisionHash },
-        requests: new Map(), calls: new Map(), log: fileAppendLog<JournalRecord>(this.journalPath(id)),
+        lease, requests: new Map(), calls: new Map(), log: this.storage.log<JournalRecord>(this.journalKey(id)),
         cursor: Date.now() * 1000, events: [], eventBytes: 0, pending: new Map(), lastActive: Date.now(),
       };
-      this.writeHeader(session);
+      // A conditional create: if a concurrent request made this agent first, retry as a load.
+      try { await this.writeHeader(session); }
+      catch (error) {
+        if (lease) await this.options.leases!.release(lease).catch(() => {});
+        if (session.fault?.message.includes("moved")) return this.create(definitions, config, key, metadata, tenant);
+        throw error;
+      }
       this.sessions.set(id, session);
     }
     await this.ensureStarted(session);
@@ -330,26 +430,28 @@ export class ClientSessions {
     return { id, token, expiresAt: session.header.expiresAt, ...status };
   }
 
-  /** Agents owned by `tenant`, or every agent when no tenant is given. */
-  list(tenant?: string) {
-    const result: { id: string; name: string; type: string; model: string; connected: boolean; running: boolean; expiresAt: number }[] = [];
-    for (const name of readdirSync(this.options.root)) {
-      const match = /^(client_[a-f0-9]{40})\.json$/.exec(name);
-      const header = match && (this.sessions.get(match[1])?.header ?? this.readHeader(match[1]));
-      if (!header || header.revoked || header.expiresAt <= Date.now()) continue;
-      if (tenant !== undefined && (header.tenant ?? DEFAULT_TENANT) !== tenant) continue;
-      const response = this.sessions.get(header.id)?.response;
-      result.push({
-        id: header.id, name: header.metadata?.name ?? header.id, type: header.metadata?.type ?? "general",
-        model: `${header.config.model.provider}/${header.config.model.id}`,
-        connected: !!response && !response.destroyed, running: this.supervisor.agents.has(header.id), expiresAt: header.expiresAt,
-      });
-    }
-    return result;
+  /** A tenant's agents, from its index. `running` covers agents served by any node. */
+  async list(tenant: string) {
+    const keys = await this.storage.listJson(this.indexKey(tenant));
+    const entries = await mapLimit(keys, 16, key => this.storage.readJson<IndexEntry>(key));
+    const live = entries.filter((entry): entry is { value: IndexEntry; version: string } => !!entry && !entry.value.revoked && entry.value.expiresAt > Date.now());
+    return mapLimit(live, 16, async ({ value }) => {
+      const local = this.sessions.get(value.id);
+      const response = local?.response;
+      const running = this.supervisor.agents.has(value.id) || (!local && !!this.options.leases && !!(await this.options.leases.get(value.id))?.live);
+      return { id: value.id, name: value.name, type: value.type, model: value.model, connected: !!response && !response.destroyed, running, expiresAt: value.expiresAt };
+    });
   }
 
-  async inspect(id: string, tenant?: string) {
-    const metadata = this.list(tenant).find(agent => agent.id === id);
+  /** Whether `id` is one of `tenant`'s live agents (one read, not a listing). */
+  async owns(id: string, tenant: string) {
+    if (!validSessionId(id)) return false;
+    const entry = await this.storage.readJson<IndexEntry>(this.indexKey(tenant, id));
+    return !!entry && !entry.value.revoked && entry.value.expiresAt > Date.now();
+  }
+
+  async inspect(id: string, tenant: string) {
+    const metadata = (await this.owns(id, tenant)) ? (await this.list(tenant)).find(agent => agent.id === id) : undefined;
     const session = metadata && await this.load(id);
     if (!metadata || !session) throw new HttpError(404, "Agent not found");
     return { ...metadata, tools: session.header.definitions, systemPrompt: session.header.config.systemPrompt ?? "",
@@ -358,13 +460,13 @@ export class ClientSessions {
 
   /** A tenant's view of one agent's history; undefined when the agent is not theirs. */
   async agentHistory(id: string, tenant: string) {
-    const session = this.list(tenant).some(agent => agent.id === id) ? await this.load(id) : undefined;
+    const session = (await this.owns(id, tenant)) ? await this.load(id) : undefined;
     return session && this.history(session);
   }
 
   /** Abort the running turn of a tenant's agent. Returns false when the agent is not theirs. */
   async abortAgent(id: string, tenant: string) {
-    if (!this.list(tenant).some(agent => agent.id === id)) return false;
+    if (!await this.owns(id, tenant)) return false;
     if (this.supervisor.agents.has(id)) await this.supervisor.request(id, "abort");
     return true;
   }
@@ -383,7 +485,7 @@ export class ClientSessions {
 
   /** Revoke a tenant's agent and stop its process. Its files stay on disk. */
   async destroyAgent(id: string, tenant: string) {
-    if (!this.list(tenant).some(agent => agent.id === id)) return false;
+    if (!await this.owns(id, tenant)) return false;
     await this.remove(id);
     await this.supervisor.stop(id);
     return true;
@@ -392,7 +494,7 @@ export class ClientSessions {
   /** The transcript, from the live agent when it runs, otherwise straight from its log. */
   private async history(session: Session) {
     if (this.supervisor.agents.has(session.header.id)) return this.supervisor.request(session.header.id, "history");
-    return { messages: await readTranscript(join(this.supervisor.root, session.header.id)) };
+    return { messages: await this.supervisor.history(session.header.id) };
   }
 
   /**
@@ -406,7 +508,7 @@ export class ClientSessions {
     try {
       const match = /^\/clients\/(client_[a-f0-9]{40})(?:\/(events|state|metadata|history|requests|calls)(?:\/([A-Za-z0-9_-]{1,80})(?:\/(claim|outcome))?)?)?$/.exec(req.url ?? "");
       // Authenticate against the small header before loading the journal.
-      const header = match ? this.sessions.get(match[1])?.header ?? this.readHeader(match[1]) : undefined;
+      const header = match ? this.sessions.get(match[1])?.header ?? (await this.readHeader(match[1]))?.value : undefined;
       const authorization = req.headers.authorization ?? "";
       if (!header || req.headers.origin || (operator && (header.tenant ?? DEFAULT_TENANT) !== operatorTenant) || (!operator && (!authorization.startsWith("Bearer ") || !timingSafeEqual(Buffer.from(hash(authorization.slice(7)), "hex"), Buffer.from(header.digest, "hex"))))) throw new HttpError(401, "Unauthorized");
       if (header.revoked || header.expiresAt <= Date.now()) throw new HttpError(410, "Session expired or revoked");
@@ -418,7 +520,7 @@ export class ClientSessions {
       if (operator && !(resource === "requests" && req.method === "POST" && !resourceId)) throw new HttpError(403, "Operator bridge only accepts requests");
       if (req.method === "POST" && resource === "metadata" && !resourceId) {
         session.header.metadata = agentMetadata(await readJson(req, 4096));
-        this.writeHeader(session);
+        await this.writeHeader(session);
         json(res, 200, session.header.metadata);
       } else if (req.method === "DELETE" && !resource) {
         await this.remove(id);
@@ -511,7 +613,7 @@ export class ClientSessions {
 
   /** Submit a request to a tenant's agent on the tenant's behalf (REST API and console). */
   async submit(id: string, tenant: string, body: { id: string; method: string; params: Record<string, unknown> }) {
-    const session = this.list(tenant).some(agent => agent.id === id) ? await this.load(id) : undefined;
+    const session = (await this.owns(id, tenant)) ? await this.load(id) : undefined;
     if (!session) throw new HttpError(404, "Unknown agent");
     if (session.fault) throw session.fault;
     session.lastActive = Date.now();
@@ -527,13 +629,13 @@ export class ClientSessions {
     if (record.method === "configure") {
       const update = configurationUpdate(params);
       // A new model may belong to another provider: the agent needs that provider's key.
-      const apiKey = update.model ? this.apiKey(session, update.model.provider) : undefined;
+      const apiKey = update.model ? await this.apiKey(session, update.model.provider) : undefined;
       if (update.model && this.options.apiKeyFor && !apiKey) throw new Error(`No ${update.model.provider} API key is configured for this tenant; set one with PUT /v1/providers/${update.model.provider}/key`);
       const result = await this.supervisor.request(id, "configure", { ...update, ...(apiKey ? { apiKey } : {}) });
       const { tools, ...config } = update;
       if (tools !== undefined) session.header.definitions = tools;
       session.header.config = { ...session.header.config, ...config };
-      this.writeHeader(session);
+      await this.writeHeader(session);
       return result;
     }
     return this.supervisor.request(id, record.method, params, RUN_METHODS.includes(record.method)
@@ -618,7 +720,7 @@ export class ClientSessions {
     const session = await this.load(id);
     if (!session || session.header.revoked) return;
     session.header.revoked = true;
-    this.writeHeader(session);
+    await this.writeHeader(session);
     await this.interrupt(session, "Session revoked");
     session.response?.end();
   }
@@ -649,21 +751,51 @@ export class ClientSessions {
       if (this.busy(session) || now - session.lastActive < idleMs) continue;
       if (this.supervisor.agents.has(id)) void this.supervisor.stop(id).catch(() => {});
       else if (!session.response && !session.fault) {
-        // Nothing is connected or running: everything needed later is on disk.
-        this.sessions.delete(id);
-        void session.log.close().catch(() => {});
+        // Nothing is connected or running: everything needed later is in storage.
+        void this.unload(session);
       }
+    }
+  }
+
+  /** Drop a session from memory and give up its lease so any node can serve it next. */
+  private async unload(session: Session) {
+    if (this.sessions.get(session.header.id) === session) this.sessions.delete(session.header.id);
+    await session.log.close().catch(() => {});
+    if (session.lease) await this.options.leases!.release(session.lease).catch(() => {});
+  }
+
+  /** Keep ownership of loaded agents; an agent whose lease was lost is fenced immediately. */
+  private async renewLeases() {
+    for (const session of [...this.sessions.values()]) {
+      if (!session.lease || this.closed) continue;
+      const renewed = await this.options.leases!.renew(session.lease, this.leaseTtl).catch(() => undefined);
+      if (renewed) { session.lease = renewed; continue; }
+      // Another node may already be serving it: stop writing, stop the agent, forget it.
+      this.fail(session, new Error("This node lost ownership of the agent"));
+      session.response?.destroy();
+      if (this.sessions.get(session.header.id) === session) this.sessions.delete(session.header.id);
+      await this.supervisor.stop(session.header.id).catch(() => {});
     }
   }
 
   async close() {
     this.closed = true;
     clearInterval(this.heartbeat);
-    for (const session of this.sessions.values()) {
+    if (this.renewal) clearInterval(this.renewal);
+    for (const session of [...this.sessions.values()]) {
       try { await this.interrupt(session, "The runtime stopped during this request"); }
-      catch { /* Already faulted; the next load recovers conservatively from disk. */ }
+      catch { /* Already faulted; the next load recovers conservatively from storage. */ }
       session.response?.end();
-      await session.log.close().catch(() => {});
+      await this.unload(session);
     }
   }
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, work: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) { const index = next++; results[index] = await work(items[index]); }
+  }));
+  return results;
 }

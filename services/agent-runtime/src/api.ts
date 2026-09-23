@@ -54,7 +54,7 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, conte
   const url = new URL(req.url ?? "/", "http://runtime");
   if (url.pathname !== "/v1" && !url.pathname.startsWith("/v1/")) return false;
   try {
-    const principal = authenticate(req, context);
+    const principal = await authenticate(req, context);
     const parts = url.pathname.split("/").slice(2).map(decodeURIComponent);
     const method = req.method ?? "GET";
     const { accounts, clients } = context;
@@ -64,14 +64,14 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, conte
     if (route === "GET me") {
       send(res, 200, { tenant, via: principal.via, ...("login" in principal ? { login: principal.login } : {}), canStoreKeys: accounts.canStoreKeys });
     } else if (route === "GET providers" && parts.length === 1) {
-      const keys = new Map(accounts.keyStatus(tenant).map(status => [status.provider, status]));
+      const keys = new Map((await accounts.keyStatus(tenant)).map(status => [status.provider, status]));
       const wildcard = keys.get("*");
       send(res, 200, listProviders().map(provider => ({ ...provider, key: keys.get(provider.id) ?? (wildcard && provider.apiKey ? wildcard : null) })));
     } else if (parts[0] === "providers" && parts[2] === "key" && parts.length === 3 && (method === "PUT" || method === "DELETE")) {
       const provider = providerInfo(parts[1]);
       if (!provider) throw new ApiError(404, `Unknown provider ${parts[1]}; see GET /v1/providers`);
       if (method === "DELETE") {
-        if (!accounts.deleteKey(tenant, provider.id)) throw new ApiError(404, `No ${provider.id} key set by this tenant`);
+        if (!await accounts.deleteKey(tenant, provider.id)) throw new ApiError(404, `No ${provider.id} key set by this tenant`);
         await clients.providerKeyChanged(tenant, provider.id);
         send(res, 200, { deleted: true });
         return true;
@@ -83,17 +83,18 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, conte
       if (!apiKey || apiKey.length > 4096 || /\s/.test(apiKey)) throw new ApiError(400, "Send {\"apiKey\": \"...\"} with the provider's API key");
       const check = body.verify === false || context.verifyKeys === false ? { status: "unverified" as const, detail: "Verification skipped" } : await checkProviderKey(provider.id, apiKey);
       if (check.status === "invalid") throw new ApiError(422, check.detail);
-      accounts.setKey(tenant, provider.id, apiKey);
+      await accounts.setKey(tenant, provider.id, apiKey);
       await clients.providerKeyChanged(tenant, provider.id);
       send(res, 200, { provider: provider.id, last4: apiKey.slice(-4), verification: check });
     } else if (route === "GET models") {
       const provider = url.searchParams.get("provider") ?? undefined;
       const available = url.searchParams.get("available") === "true";
       const supported = new Set(listProviders().filter(entry => entry.apiKey).map(entry => entry.id));
-      const models = listModels(provider).map(model => ({ ...model, available: supported.has(model.provider) && accounts.hasKey(tenant, model.provider) }));
+      const keyed = await accounts.keyedProviders(tenant);
+      const models = listModels(provider).map(model => ({ ...model, available: supported.has(model.provider) && keyed(model.provider) }));
       send(res, 200, available ? models.filter(model => model.available) : models);
     } else if (route === "GET agents" && parts.length === 1) {
-      send(res, 200, clients.list(tenant));
+      send(res, 200, await clients.list(tenant));
     } else if (route === "POST agents" && parts.length === 1) {
       const key = req.headers["idempotency-key"];
       if (key !== undefined && typeof key !== "string") throw new ApiError(400, "Invalid Idempotency-Key");
@@ -101,13 +102,13 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, conte
     } else if (parts[0] === "agents" && parts[1]) {
       await agentRoute(req, res, context, tenant, parts.slice(1), method);
     } else if (route === "GET tokens") {
-      send(res, 200, accounts.listTokens(tenant));
+      send(res, 200, await accounts.listTokens(tenant));
     } else if (route === "POST tokens" && parts.length === 1) {
       const body = await readBody(req, 4096);
-      send(res, 201, accounts.createToken(tenant, body.name));
+      send(res, 201, await accounts.createToken(tenant, body.name));
     } else if (route === "DELETE tokens" && parts[1]) {
       if (principal.tokenId === parts[1]) throw new ApiError(400, "A token cannot revoke itself; use another token or the console");
-      if (!accounts.revokeToken(tenant, parts[1])) throw new ApiError(404, "Unknown token");
+      if (!await accounts.revokeToken(tenant, parts[1])) throw new ApiError(404, "Unknown token");
       send(res, 200, { revoked: true });
     } else if (route === "GET usage") {
       const days = Math.min(365, Math.max(1, Number(url.searchParams.get("days") ?? 30) || 30));
@@ -122,13 +123,13 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, conte
   return true;
 }
 
-function authenticate(req: IncomingMessage, context: ApiContext): Principal & { login?: string } {
+async function authenticate(req: IncomingMessage, context: ApiContext): Promise<Principal & { login?: string }> {
   if (req.headers.authorization) {
-    const principal = context.accounts.authenticate(req.headers.authorization);
+    const principal = await context.accounts.authenticate(req.headers.authorization);
     if (!principal) throw new ApiError(401, "Invalid token");
     return principal;
   }
-  const principal = context.consoleAuth.principal(req);
+  const principal = await context.consoleAuth.principal(req);
   if (!principal) throw new ApiError(401, "Sign in, or send Authorization: Bearer <token>");
   if (!["GET", "HEAD"].includes(req.method ?? "GET") && !context.consoleAuth.allowsMutation(req)) throw new ApiError(403, "Console requests must be same-origin");
   return principal;
@@ -137,7 +138,7 @@ function authenticate(req: IncomingMessage, context: ApiContext): Principal & { 
 async function agentRoute(req: IncomingMessage, res: ServerResponse, context: ApiContext, tenant: string, parts: string[], method: string) {
   const { clients } = context;
   const [id, resource, resourceId] = parts;
-  if (!clients.list(tenant).some(agent => agent.id === id)) throw new ApiError(404, "Unknown agent");
+  if (!await clients.owns(id, tenant)) throw new ApiError(404, "Unknown agent");
   if (method === "GET" && !resource) {
     send(res, 200, await clients.inspect(id, tenant));
   } else if (method === "DELETE" && !resource) {

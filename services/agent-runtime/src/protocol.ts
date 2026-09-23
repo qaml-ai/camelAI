@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
+import type { StorageDescriptor } from "../shared/storage-config.ts";
 
 export interface ToolDefinition {
   name: string;
@@ -24,6 +25,9 @@ export interface AgentConfig {
   thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   /** Host policy for retrying transient provider errors. */
   retry?: { maxAttempts: number; baseDelayMs: number };
+  /** Where the transcript lives; without it, `transcript.jsonl` in `directory`. */
+  storage?: StorageDescriptor;
+  transcriptKey?: string;
 }
 export type WireMessage =
   | { type: "request"; id: string; method: string; params: any }

@@ -26,13 +26,22 @@ export type TranscriptRecord =
   /** The model's context from now on is `summary` plus messages from index `cut`. */
   | ({ t: "compaction" } & CompactionState);
 
-/** Read an agent's full history without its process. Never writes, so it is safe beside a live owner. */
+/** Read an agent's full history from a single-host directory, including a legacy snapshot. */
 export async function readTranscript(directory: string): Promise<AgentMessage[]> {
   const records = await fileAppendLog<TranscriptRecord>(transcriptPath(directory)).read();
   if (!records.length) {
     try { return (JSON.parse(await readFile(legacySnapshotPath(directory), "utf8")) as { messages: AgentMessage[] }).messages ?? []; }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
   }
+  return historyOf(records);
+}
+
+/** Read an agent's full history from any log. Never writes, so it is safe beside a live owner. */
+export async function readTranscriptLog(log: AppendLog<TranscriptRecord>): Promise<AgentMessage[]> {
+  return historyOf(await log.read());
+}
+
+function historyOf(records: TranscriptRecord[]): AgentMessage[] {
   let messages: AgentMessage[] = [];
   for (const record of records) {
     if (record.t === "message") messages.push(record.message);

@@ -7,6 +7,9 @@ import type { RequestMethod } from "../shared/client-protocol.ts";
 import type { ChildProcess } from "node:child_process";
 import { validateDefinitions, validateToolCall } from "./tool-policy.ts";
 import { jsonWithinLimit, SANDBOX_LIMITS } from "./limits.ts";
+import { openStorage, type StorageDescriptor } from "../shared/storage-config.ts";
+import type { Storage } from "../shared/storage.ts";
+import { readTranscript, readTranscriptLog } from "./transcript.ts";
 
 type Handle = { bridge: ToolBridge; child: ChildProcess; rpc: Rpc; calls: Set<AbortController>; listeners: Set<(event: any) => void>; groupKilled: boolean };
 
@@ -22,10 +25,25 @@ export class AgentSupervisor {
   readonly agents = new Map<string, Handle>();
   readonly starting = new Set<string>();
   readonly root: string;
-  readonly options: { runtime?: string; maxAgents?: number };
-  constructor(root: string, options: { runtime?: string; maxAgents?: number } = {}) {
+  readonly options: { runtime?: string; maxAgents?: number; storage?: StorageDescriptor };
+  private storage?: Promise<Storage>;
+  /**
+   * `root` holds each agent's local working directory (its sandbox cwd). With
+   * `storage`, transcripts live there under `sessions/<id>/transcript` instead of
+   * in the working directory, so any host can load the agent.
+   */
+  constructor(root: string, options: { runtime?: string; maxAgents?: number; storage?: StorageDescriptor } = {}) {
     this.root = root;
     this.options = options;
+  }
+
+  static transcriptKey(id: string) { return `sessions/${id}/transcript`; }
+
+  /** An agent's full history without its process. */
+  async history(id: string) {
+    if (!this.options.storage) return readTranscript(resolve(join(this.root, id)));
+    this.storage ??= openStorage(this.options.storage);
+    return readTranscriptLog((await this.storage).log(AgentSupervisor.transcriptKey(id)));
   }
 
   async start(id: string, config: Omit<AgentConfig, "id" | "directory" | "tools">, bridge: ToolBridge) {
@@ -69,7 +87,8 @@ export class AgentSupervisor {
         finally { handle.calls.delete(controller); }
       };
       const timeout = setTimeout(() => { rpc.close("Agent initialization timed out"); killGroup(handle); }, 30_000);
-      try { return await rpc.request("init", { ...config, id, directory, tools: bridge.definitions }); }
+      const location = this.options.storage ? { storage: this.options.storage, transcriptKey: AgentSupervisor.transcriptKey(id) } : {};
+      try { return await rpc.request("init", { ...config, ...location, id, directory, tools: bridge.definitions }); }
       catch (error) { await this.stop(id); throw error; }
       finally { clearTimeout(timeout); }
     } finally { this.starting.delete(id); }

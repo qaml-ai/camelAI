@@ -7,7 +7,9 @@ import { executeCode } from "./codemode.ts";
 import type { AgentConfig, ToolBridge } from "./protocol.ts";
 import { buildSystemPrompt } from "./system-prompt.ts";
 import { fileAppendLog } from "../shared/append-log.ts";
-import { Transcript, legacySnapshotPath, readTranscript, summaryMessage, transcriptPath, type CompactionState, type TranscriptRecord } from "./transcript.ts";
+import { Transcript, legacySnapshotPath, readTranscript, readTranscriptLog, summaryMessage, transcriptPath, type CompactionState, type TranscriptRecord } from "./transcript.ts";
+import { openStorage } from "../shared/storage-config.ts";
+import type { Storage } from "../shared/storage.ts";
 import { boundedContext, interruptedTurnRepairs, validateInitialMessages, validateUserMessages } from "./history.ts";
 import { compactionSettings, contextTokens, explicitKeyStream, needsCompaction, runCompaction } from "./compaction.ts";
 import { codeRequest, DEFAULT_RETRY } from "./limits.ts";
@@ -16,6 +18,7 @@ const rpc = parentRpc(() => process.kill(-process.pid, "SIGKILL"));
 let agent: Agent | undefined;
 let config: AgentConfig;
 let transcript: Transcript;
+let storage: Storage | undefined;
 let busy = false;
 let active: AbortController | undefined;
 let persistenceError: unknown;
@@ -156,8 +159,14 @@ rpc.handler = async (method, params) => {
     if (agent) throw new Error("Agent already initialized");
     config = params;
     await mkdir(config.directory, { recursive: true, mode: 0o700 });
-    transcript = new Transcript(fileAppendLog<TranscriptRecord>(transcriptPath(config.directory)));
-    await transcript.load(legacySnapshotPath(config.directory));
+    if (config.storage && config.transcriptKey) {
+      storage = await openStorage(config.storage);
+      transcript = new Transcript(storage.log<TranscriptRecord>(config.transcriptKey));
+      await transcript.load();
+    } else {
+      transcript = new Transcript(fileAppendLog<TranscriptRecord>(transcriptPath(config.directory)));
+      await transcript.load(legacySnapshotPath(config.directory));
+    }
     let recovered = false;
     if (transcript.active) {
       // Close the interrupted turn instead of refusing work until an operator intervenes.
@@ -228,7 +237,7 @@ rpc.handler = async (method, params) => {
     return { configured: true };
   }
   // Full history comes from the log; memory holds only the working set.
-  if (method === "history") return { messages: await readTranscript(config.directory) };
+  if (method === "history") return { messages: storage ? await readTranscriptLog(storage.log(config.transcriptKey!)) : await readTranscript(config.directory) };
   if (method === "steer" || method === "followUp") {
     // Pi queues these whether or not a run is active; an idle queue drains into the next run.
     const messages = params.message !== undefined ? userMessages(params.message) : undefined;

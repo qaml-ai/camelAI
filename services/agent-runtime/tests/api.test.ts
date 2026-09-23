@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { checkProviderKey } from "../src/key-check.ts";
 import { Accounts } from "../src/accounts.ts";
 import { Tenants } from "../src/tenants.ts";
+import { fileStorage } from "../shared/storage.ts";
 
 const sha = (value: string) => createHash("sha256").update(value).digest("hex");
 const alice = "alice-operator-token-at-least-24-chars";
@@ -228,18 +229,21 @@ test("key checks treat only 401/403 as invalid and send each API's auth header",
   assert.equal((await checkProviderKey("openai", "k4", (async () => { throw new Error("offline"); }) as typeof fetch)).status, "unverified");
 });
 
-test("usage is recorded per response and summed per day and model", async t => {
+test("usage is recorded per response and summed per day and model across nodes", async t => {
   const root = await mkdtemp(join(tmpdir(), "agent-usage-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const accounts = new Accounts({ tenants: new Tenants({ legacyToken: "legacy-token-with-24-characters" }), root });
+  const tenants = new Tenants({ legacyToken: "legacy-token-with-24-characters" });
+  const nodeA = new Accounts({ tenants, storage: fileStorage(root), node: "http://10.0.0.1:8790" });
+  const nodeB = new Accounts({ tenants, storage: fileStorage(root), node: "http://10.0.0.2:8790" });
   const message = (at: number, input: number) => ({ provider: "anthropic", model: "claude-sonnet-5", timestamp: at, usage: { input, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 0.5 } } });
-  await accounts.recordUsage("alice", "agent-1", message(Date.UTC(2026, 8, 1, 10), 100));
-  await accounts.recordUsage("alice", "agent-2", message(Date.UTC(2026, 8, 1, 18), 50));
-  await accounts.recordUsage("alice", "agent-1", message(Date.UTC(2026, 8, 2, 9), 1));
-  const usage = await accounts.usage("alice", Date.UTC(2026, 8, 1));
+  nodeA.recordUsage("alice", "agent-1", message(Date.UTC(2026, 8, 1, 10), 100));
+  nodeB.recordUsage("alice", "agent-2", message(Date.UTC(2026, 8, 1, 18), 50));
+  nodeA.recordUsage("alice", "agent-1", message(Date.UTC(2026, 8, 2, 9), 1));
+  await nodeB.flushUsage();
+  const usage = await nodeA.usage("alice", Date.UTC(2026, 8, 1));
   assert.deepEqual(usage.totals, { responses: 3, input: 151, output: 30, cacheRead: 0, cacheWrite: 0, cost: 1.5 });
   assert.deepEqual(usage.days.map(day => [day.day, day.responses]), [["2026-09-01", 2], ["2026-09-02", 1]]);
-  assert.equal((await accounts.usage("bob", 0)).totals.responses, 0);
+  assert.equal((await nodeA.usage("bob", 0)).totals.responses, 0);
 });
 
 test("console routes serve the app shell as HTML, never as a download", async t => {

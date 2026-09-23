@@ -40,7 +40,7 @@ export class ConsoleAuth {
   }
 
   /** The signed-in principal from the session cookie, if valid and unexpired. */
-  principal(req: IncomingMessage): (Principal & { login?: string }) | undefined {
+  async principal(req: IncomingMessage): Promise<(Principal & { login?: string }) | undefined> {
     const raw = cookies(req)[SESSION_COOKIE];
     if (!raw) return undefined;
     const [payload, signature] = raw.split(".");
@@ -50,7 +50,7 @@ export class ConsoleAuth {
     if (expected.length !== given.length || !timingSafeEqual(expected, given)) return undefined;
     let session: { tenant: string; login?: string; exp: number };
     try { session = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")); } catch { return undefined; }
-    if (typeof session.exp !== "number" || session.exp < Date.now() || !this.options.accounts.exists(session.tenant)) return undefined;
+    if (typeof session.exp !== "number" || session.exp < Date.now() || !await this.options.accounts.exists(session.tenant)) return undefined;
     return { tenant: session.tenant, via: "console", ...(session.login ? { login: session.login } : {}) };
   }
 
@@ -115,7 +115,7 @@ export class ConsoleAuth {
         const membership = await fetch(`${api}/user/memberships/orgs/${encodeURIComponent(github.org)}`, { headers, signal: AbortSignal.timeout(10_000) });
         const member = membership.ok && (await membership.json() as { state?: string }).state === "active";
         if (!member) throw new Error(`Only members of the ${github.org} GitHub organization can sign in`);
-        const tenant = this.options.accounts.tenantForGithub(user.login);
+        const tenant = await this.options.accounts.tenantForGithub(user.login);
         redirect("/console/", [clearState, this.startSession(tenant, user.login)]);
       } catch (error) {
         redirect(`/console/?error=${encodeURIComponent((error as Error).message)}`, [clearState]);
@@ -129,7 +129,7 @@ export class ConsoleAuth {
         for await (const chunk of req) { body += chunk; if (body.length > 4096) throw new Error("too large"); }
         token = JSON.parse(body).token;
       } catch { json(400, { error: "Send {\"token\": \"...\"}" }); return true; }
-      const principal = typeof token === "string" ? this.options.accounts.authenticate(`Bearer ${token}`) : undefined;
+      const principal = typeof token === "string" ? await this.options.accounts.authenticate(`Bearer ${token}`) : undefined;
       if (!principal) { json(401, { error: "Unknown token" }); return true; }
       json(200, { tenant: principal.tenant }, [this.startSession(principal.tenant)]);
     } else if (route === "logout" && req.method === "POST") {

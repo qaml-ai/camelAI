@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
 import { resolve, join, extname, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,9 @@ import { localTools } from "./local-tools.ts";
 import { errorText } from "./protocol.ts";
 import { sessionConfig } from "./session-config.ts";
 import { ClientSessions } from "./client-sessions.ts";
+import { openStorage, storageFromEnvironment } from "../shared/storage-config.ts";
+import { postgresLeases, storageLeases, type LeaseStore } from "../shared/leases.ts";
+import type { Storage } from "../shared/storage.ts";
 import { DEFAULT_TENANT, Tenants } from "./tenants.ts";
 import { Accounts } from "./accounts.ts";
 import { ConsoleAuth } from "./console-auth.ts";
@@ -24,7 +27,31 @@ const maxAgents = Number(process.env.AGENT_MAX_PROCESSES ?? 8);
 if (!Number.isInteger(maxAgents) || maxAgents < 1) throw new Error("AGENT_MAX_PROCESSES must be a positive integer");
 const maxProcessesPerTenant = Number(process.env.AGENT_MAX_PROCESSES_PER_TENANT ?? Math.max(1, Math.ceil(maxAgents / 2)));
 if (!Number.isInteger(maxProcessesPerTenant) || maxProcessesPerTenant < 1) throw new Error("AGENT_MAX_PROCESSES_PER_TENANT must be a positive integer");
-const supervisor = new AgentSupervisor(join(root, "sessions"), { runtime: process.env.AGENT_RUNTIME, maxAgents });
+const port = Number(process.env.PORT ?? 8790);
+// Durable state: local files by default, or shared storage (S3) so any node can serve any agent.
+const storageDescriptor = storageFromEnvironment(root);
+const storage = await openStorage(storageDescriptor);
+const distributed = storageDescriptor.kind === "s3" || !!(storageDescriptor.kind === "file" && storageDescriptor.shared);
+// How peers reach this node; it is also the lease owner name.
+const node = (process.env.AGENT_NODE_URL ?? `http://127.0.0.1:${port}`).replace(/\/+$/, "");
+const leases = await leasesFromEnvironment(storage);
+const supervisor = new AgentSupervisor(join(root, "sessions"), { runtime: process.env.AGENT_RUNTIME, maxAgents, ...(distributed ? { storage: storageDescriptor } : {}) });
+
+/** AGENT_LEASES: none | storage | postgres (AGENT_LEASES_POSTGRES_URL). Distributed storage defaults to storage leases. */
+async function leasesFromEnvironment(storage: Storage): Promise<LeaseStore | undefined> {
+  const kind = process.env.AGENT_LEASES ?? (distributed ? "storage" : "none");
+  if (kind === "none") {
+    if (distributed) throw new Error("Shared storage needs leases so two nodes never serve the same agent");
+    return undefined;
+  }
+  if (kind === "storage") return storageLeases(storage);
+  if (kind === "postgres") {
+    if (!process.env.AGENT_LEASES_POSTGRES_URL) throw new Error("AGENT_LEASES=postgres needs AGENT_LEASES_POSTGRES_URL");
+    const { default: pg } = await import("pg");
+    return postgresLeases(new pg.Pool({ connectionString: process.env.AGENT_LEASES_POSTGRES_URL, max: 10 }));
+  }
+  throw new Error(`Unknown AGENT_LEASES: ${kind}`);
+}
 const model = configuredModel();
 const toolTimeoutMs = Number(process.env.AGENT_TOOL_TIMEOUT_MS ?? 15_000);
 if (!Number.isInteger(toolTimeoutMs) || toolTimeoutMs < 1 || toolTimeoutMs > 15 * 60_000) throw new Error("AGENT_TOOL_TIMEOUT_MS must be an integer between 1 and 900000");
@@ -32,10 +59,9 @@ const idleMs = Number(process.env.AGENT_IDLE_MS ?? 5 * 60_000);
 if (!Number.isInteger(idleMs) || idleMs < 1000) throw new Error("AGENT_IDLE_MS must be an integer of at least 1000");
 // Endpoints beyond the default model's and Pi's published ones that may receive a provider key.
 const allowedBaseUrls = (process.env.AGENT_ALLOWED_BASE_URLS ?? "").split(",").map(value => value.trim()).filter(Boolean);
-const port = Number(process.env.PORT ?? 8790);
 const publicUrl = (process.env.AGENT_PUBLIC_URL ?? `http://127.0.0.1:${port}`).replace(/\/+$/, "");
 // Tenant-set provider keys are encrypted with AGENT_SECRETS_KEY; without it tenants cannot store keys.
-const accounts = new Accounts({ tenants, root: join(root, "tenants"), secretsKey: process.env.AGENT_SECRETS_KEY });
+const accounts = new Accounts({ tenants, storage, secretsKey: process.env.AGENT_SECRETS_KEY, node });
 const github = process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET
   ? { clientId: process.env.GITHUB_CLIENT_ID, clientSecret: process.env.GITHUB_CLIENT_SECRET, org: process.env.GITHUB_ORG ?? "qaml-ai",
       webUrl: process.env.AGENT_GITHUB_WEB_URL, apiUrl: process.env.AGENT_GITHUB_API_URL }
@@ -47,7 +73,7 @@ const consoleDir = resolve(process.env.AGENT_CONSOLE_DIR ?? fileURLToPath(new UR
 async function createAgent(tenant: string, params: any, key?: string) {
   const config = sessionConfig(params, model, process.env.AGENT_SYSTEM_PROMPT, allowedBaseUrls);
   // A single-tenant development host may run code-only agents without a model key.
-  if (!tenants.legacy && !accounts.hasKey(tenant, config.model.provider)) {
+  if (!tenants.legacy && !await accounts.hasKey(tenant, config.model.provider)) {
     throw new Error(`No ${config.model.provider} API key is configured for tenant ${tenant}; set one with PUT /v1/providers/${config.model.provider}/key`);
   }
   return clients.create(params.tools ?? [], config, key, { name: params.name, type: params.type }, tenant);
@@ -88,23 +114,47 @@ async function body(req: import("node:http").IncomingMessage, limit: number) {
   return text ? JSON.parse(text) : {};
 }
 
+/** The agent a request addresses, if any: `/clients/<id>`, `/v1/agents/<id>` or `/registry/<id>`. */
+const agentOf = (url = "") => /^\/(?:clients|v1\/agents|registry)\/(client_[a-f0-9]{40})(?:[/?]|$)/.exec(url)?.[1];
+const FORWARDED = "x-agent-runtime-forwarded";
+
+/** Stream a request to the node that owns its agent, and stream the answer back (SSE included). */
+function forward(req: IncomingMessage, res: ServerResponse, owner: string) {
+  const target = new URL(req.url ?? "/", owner);
+  const upstream = httpRequest(target, { method: req.method, headers: { ...req.headers, host: target.host, [FORWARDED]: node } }, answer => {
+    res.writeHead(answer.statusCode ?? 502, answer.headers);
+    answer.pipe(res);
+    // Piping does not end the client's response when the owner dies mid-stream; cut it so the client reconnects now.
+    answer.on("close", () => { if (!answer.complete) res.destroy(); });
+  });
+  upstream.on("error", () => { if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" }).end('{"error":"The node serving this agent is unreachable; retry"}'); else res.destroy(); });
+  res.on("close", () => upstream.destroy());
+  req.pipe(upstream);
+}
+
 const server = createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/healthz") {
     res.writeHead(200, { "Content-Type": "application/json" }).end('{"ok":true}'); return;
+  }
+  // One node serves each agent; anything addressed to an agent another node holds goes there.
+  const agent = leases && !req.headers[FORWARDED] ? agentOf(req.url) : undefined;
+  if (agent) {
+    const owner = await clients.ownerElsewhere(agent).catch(() => undefined);
+    if (owner) { forward(req, res, owner); return; }
   }
   if (await consoleAuth.handle(req, res)) return;
   if (await handleApi(req, res, { accounts, clients, consoleAuth, createAgent, verifyKeys: process.env.AGENT_VERIFY_KEYS !== "false" })) return;
   if (req.method === "GET" && (req.url === "/console" || req.url?.startsWith("/console/"))) { await serveConsole(req, res); return; }
   if (req.method === "GET" && req.url === "/") { res.writeHead(302, { Location: "/console/" }).end(); return; }
   if (await clients.handle(req, res)) return;
-  const principal = accounts.authenticate(req.headers.authorization);
+  const principal = await accounts.authenticate(req.headers.authorization);
   const tenant = principal && { id: principal.tenant };
   if (!tenant) { res.writeHead(401).end(); return; }
   let streaming = false;
   try {
     if (req.headers.origin) { res.writeHead(403).end(); return; }
     if (req.method === "GET" && req.url === "/registry") {
-      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(clients.list(tenant.id))); return;
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(await clients.list(tenant.id))); return;
     }
     const registered = /^\/registry\/(client_[a-f0-9]{40})(\/requests)?$/.exec(req.url ?? "");
     if (registered) {
@@ -157,10 +207,14 @@ const server = createServer(async (req, res) => {
   }
 });
 const clients = new ClientSessions(supervisor, {
-  root: join(root, "client-sessions"), secret: sessionSecret, toolTimeoutMs, idleMs, maxProcessesPerTenant,
+  secret: sessionSecret, toolTimeoutMs, idleMs, maxProcessesPerTenant,
   apiKeyFor: (tenant, provider) => accounts.apiKey(tenant, provider),
-  onUsage: (tenant, agent, message) => { void accounts.recordUsage(tenant, agent, message).catch(error => console.error(JSON.stringify({ type: "usage_record_failed", error: errorText(error) }))); },
+  onUsage: (tenant, agent, message) => accounts.recordUsage(tenant, agent, message),
+  storage, prefix: "client-sessions/", leases, node, leaseTtlMs: Number(process.env.AGENT_LEASE_TTL_MS ?? 30_000),
 });
+// One-time migrations of single-host data (both are no-ops once done).
+await clients.init();
+await accounts.init();
 server.requestTimeout = 30_000;
 server.listen(port, process.env.HOST ?? "127.0.0.1", () => {
   console.log(JSON.stringify({ type: "listening", address: server.address(), tenants: tenants.legacy ? "single" : "file", github: !!github, keyStorage: accounts.canStoreKeys }));
@@ -171,5 +225,5 @@ process.on("SIGHUP", () => {
 });
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => {
   server.close();
-  void clients.close().then(() => supervisor.close()).then(() => process.exit(0));
+  void clients.close().then(() => supervisor.close()).then(() => accounts.flushUsage()).catch(() => {}).then(() => process.exit(0));
 });

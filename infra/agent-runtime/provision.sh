@@ -101,16 +101,47 @@ aws ec2 associate-address --allocation-id "$eip" --instance-id "$instance" >/dev
 ip=$(aws ec2 describe-addresses --allocation-ids "$eip" --query 'Addresses[0].PublicIp' --output text)
 echo "public IP: $ip"
 
-log "Daily EBS snapshots (7 kept)"
+log "EBS snapshots (hourly, 48 kept; daily, 7 kept)"
 if ! aws iam get-role --role-name AWSDataLifecycleManagerDefaultRole >/dev/null 2>&1; then
   aws dlm create-default-role --resource-type snapshot >/dev/null
   sleep 10
 fi
-if [[ -z "$(aws dlm get-lifecycle-policies --target-tags "Backup=$NAME" --query 'Policies[0].PolicyId' --output text 2>/dev/null | grep -v None || true)" ]]; then
-  aws dlm create-lifecycle-policy --description "$NAME daily snapshots" --state ENABLED \
-    --execution-role-arn "arn:aws:iam::$ACCOUNT_ID:role/AWSDataLifecycleManagerDefaultRole" \
-    --policy-details "{\"ResourceTypes\":[\"VOLUME\"],\"TargetTags\":[{\"Key\":\"Backup\",\"Value\":\"$NAME\"}],\"Schedules\":[{\"Name\":\"daily\",\"CreateRule\":{\"Interval\":24,\"IntervalUnit\":\"HOURS\",\"Times\":[\"09:00\"]},\"RetainRule\":{\"Count\":7},\"CopyTags\":true}]}" >/dev/null
+snapshot_policy="{\"ResourceTypes\":[\"VOLUME\"],\"TargetTags\":[{\"Key\":\"Backup\",\"Value\":\"$NAME\"}],\"Schedules\":[
+  {\"Name\":\"hourly\",\"CreateRule\":{\"Interval\":1,\"IntervalUnit\":\"HOURS\"},\"RetainRule\":{\"Count\":48},\"CopyTags\":true},
+  {\"Name\":\"daily\",\"CreateRule\":{\"Interval\":24,\"IntervalUnit\":\"HOURS\",\"Times\":[\"09:00\"]},\"RetainRule\":{\"Count\":7},\"CopyTags\":true}]}"
+policy=$(aws dlm get-lifecycle-policies --target-tags "Backup=$NAME" --query 'Policies[0].PolicyId' --output text 2>/dev/null || echo None)
+if [[ "$policy" == "None" || -z "$policy" ]]; then
+  aws dlm create-lifecycle-policy --description "$NAME snapshots" --state ENABLED \
+    --execution-role-arn "arn:aws:iam::$ACCOUNT_ID:role/AWSDataLifecycleManagerDefaultRole" --policy-details "$snapshot_policy" >/dev/null
+else
+  aws dlm update-lifecycle-policy --policy-id "$policy" --description "$NAME snapshots" --state ENABLED --policy-details "$snapshot_policy" >/dev/null
 fi
+
+log "Self-healing and alerts"
+# The host recovers onto new hardware if AWS's side fails, and reboots if the OS stops responding.
+aws cloudwatch put-metric-alarm --alarm-name "$NAME-system-check" --alarm-description "Recover $NAME onto healthy hardware" \
+  --namespace AWS/EC2 --metric-name StatusCheckFailed_System --dimensions Name=InstanceId,Value="$instance" \
+  --statistic Maximum --period 60 --evaluation-periods 2 --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold \
+  --alarm-actions "arn:aws:automate:$REGION:ec2:recover"
+aws cloudwatch put-metric-alarm --alarm-name "$NAME-instance-check" --alarm-description "Reboot $NAME when its OS stops responding" \
+  --namespace AWS/EC2 --metric-name StatusCheckFailed_Instance --dimensions Name=InstanceId,Value="$instance" \
+  --statistic Maximum --period 60 --evaluation-periods 3 --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold \
+  --alarm-actions "arn:aws:automate:$REGION:ec2:reboot"
+# Route 53 health checks publish their metric in us-east-1, so the alert topic lives there.
+alerts=$(command aws --region us-east-1 sns create-topic --name "$NAME-alerts" --query TopicArn --output text)
+check=$(command aws route53 list-health-checks --query "HealthChecks[?HealthCheckConfig.FullyQualifiedDomainName=='$HOSTNAME' && HealthCheckConfig.ResourcePath=='/healthz'].Id | [0]" --output text)
+if [[ "$check" == "None" || -z "$check" ]]; then
+  check=$(command aws route53 create-health-check --caller-reference "$NAME-$(date +%s)" --health-check-config \
+    "Type=HTTPS,FullyQualifiedDomainName=$HOSTNAME,Port=443,ResourcePath=/healthz,RequestInterval=30,FailureThreshold=3,EnableSNI=true" \
+    --query HealthCheck.Id --output text)
+  command aws route53 change-tags-for-resource --resource-type healthcheck --resource-id "$check" --add-tags Key=Name,Value="$NAME"
+fi
+command aws --region us-east-1 cloudwatch put-metric-alarm --alarm-name "$NAME-healthz" --alarm-description "Health check of $HOSTNAME/healthz is failing" \
+  --namespace AWS/Route53 --metric-name HealthCheckStatus --dimensions Name=HealthCheckId,Value="$check" \
+  --statistic Minimum --period 60 --evaluation-periods 3 --threshold 1 --comparison-operator LessThanThreshold \
+  --treat-missing-data breaching --alarm-actions "$alerts" --ok-actions "$alerts"
+echo "alerts topic: $alerts"
+echo "subscribe with: aws sns subscribe --region us-east-1 --topic-arn $alerts --protocol email --notification-endpoint <you@example.com>"
 
 log "DNS $HOSTNAME -> $ip (Cloudflare, DNS-only)"
 if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then

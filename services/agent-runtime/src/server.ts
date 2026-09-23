@@ -22,6 +22,8 @@ if (!sessionSecret || sessionSecret.length < (process.env.AGENT_SESSION_SECRET ?
 const root = resolve(process.env.AGENT_DATA_DIR ?? ".agent-runtime");
 const maxAgents = Number(process.env.AGENT_MAX_PROCESSES ?? 8);
 if (!Number.isInteger(maxAgents) || maxAgents < 1) throw new Error("AGENT_MAX_PROCESSES must be a positive integer");
+const maxProcessesPerTenant = Number(process.env.AGENT_MAX_PROCESSES_PER_TENANT ?? Math.max(1, Math.ceil(maxAgents / 2)));
+if (!Number.isInteger(maxProcessesPerTenant) || maxProcessesPerTenant < 1) throw new Error("AGENT_MAX_PROCESSES_PER_TENANT must be a positive integer");
 const supervisor = new AgentSupervisor(join(root, "sessions"), { runtime: process.env.AGENT_RUNTIME, maxAgents });
 const model = configuredModel();
 const toolTimeoutMs = Number(process.env.AGENT_TOOL_TIMEOUT_MS ?? 15_000);
@@ -155,7 +157,7 @@ const server = createServer(async (req, res) => {
   }
 });
 const clients = new ClientSessions(supervisor, {
-  root: join(root, "client-sessions"), secret: sessionSecret, toolTimeoutMs, idleMs,
+  root: join(root, "client-sessions"), secret: sessionSecret, toolTimeoutMs, idleMs, maxProcessesPerTenant,
   apiKeyFor: (tenant, provider) => accounts.apiKey(tenant, provider),
   onUsage: (tenant, agent, message) => { void accounts.recordUsage(tenant, agent, message).catch(error => console.error(JSON.stringify({ type: "usage_record_failed", error: errorText(error) }))); },
 });

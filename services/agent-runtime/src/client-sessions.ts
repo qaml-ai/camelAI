@@ -84,6 +84,8 @@ export interface ClientSessionOptions {
   apiKey?: string;
   /** The provider key an agent uses, resolved per tenant at process start; never persisted. */
   apiKeyFor?: (tenant: string, provider: string) => string | undefined;
+  /** At most this many agent processes per tenant at once (default: no per-tenant limit). */
+  maxProcessesPerTenant?: number;
   /** Stop an agent's process, and unload its session, after this long without activity. */
   idleMs?: number;
   retry?: AgentConfig["retry"];
@@ -249,14 +251,27 @@ export class ClientSessions {
     return !!session.starting || session.pending.size > 0 || [...session.requests.values()].some(request => request.state === "running");
   }
 
-  /** Stop the least recently active idle agent process when the host is at capacity. */
-  private async makeRoom(except: string) {
+  /**
+   * Make room to start `starting`'s process: first within its tenant's quota, so one
+   * tenant cannot take every slot, then on the host. Only idle agents are stopped,
+   * least recently active first.
+   */
+  private async makeRoom(starting: Session) {
+    const tenantOf = (session: Session) => session.header.tenant ?? DEFAULT_TENANT;
+    const live = (filter: (session: Session) => boolean) => [...this.sessions.values()]
+      .filter(session => session !== starting && this.supervisor.agents.has(session.header.id) && filter(session));
+    const evictIdle = async (candidates: Session[]) => {
+      const idle = candidates.filter(session => !this.busy(session)).sort((a, b) => a.lastActive - b.lastActive)[0];
+      if (idle) await this.supervisor.stop(idle.header.id);
+      return !!idle;
+    };
+    const quota = this.options.maxProcessesPerTenant;
+    const sameTenant = (session: Session) => tenantOf(session) === tenantOf(starting);
+    while (quota && live(sameTenant).length >= quota) {
+      if (!await evictIdle(live(sameTenant))) throw new HttpError(429, `This tenant already has ${quota} agents running; retry when one finishes`);
+    }
     while (this.supervisor.full) {
-      const idle = [...this.sessions.values()]
-        .filter(session => session.header.id !== except && this.supervisor.agents.has(session.header.id) && !this.busy(session))
-        .sort((a, b) => a.lastActive - b.lastActive)[0];
-      if (!idle) throw new HttpError(503, "Agent capacity reached; retry when another agent is idle");
-      await this.supervisor.stop(idle.header.id);
+      if (!await evictIdle(live(() => true))) throw new HttpError(503, "Agent capacity reached; retry when another agent is idle");
     }
   }
 
@@ -270,7 +285,7 @@ export class ClientSessions {
     session.lastActive = Date.now();
     if (this.supervisor.agents.has(session.header.id) && !session.starting) return Promise.resolve();
     return session.starting ??= (async () => {
-      await this.makeRoom(session.header.id);
+      await this.makeRoom(session);
       const apiKey = this.apiKey(session, session.header.config.model.provider);
       const result = await this.supervisor.start(session.header.id, { ...session.header.config, apiKey, ...(this.options.retry ? { retry: this.options.retry } : {}) }, {
         definitions: session.header.definitions,

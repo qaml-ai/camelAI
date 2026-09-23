@@ -23,7 +23,12 @@ Resources (AWS account `904534089871`, `us-west-2`), all named `camelai-agent-ru
     provider keys tenants set themselves. Losing it makes those keys unreadable.
   - `camelai/agent-runtime/github-oauth`: the console's GitHub OAuth app
     (optional; see below).
-- Daily EBS snapshots at 09:00 UTC, 7 kept (Data Lifecycle Manager)
+- EBS snapshots: hourly (48 kept) and daily at 09:00 UTC (7 kept), via Data Lifecycle Manager
+- CloudWatch alarms: the instance recovers onto new hardware when the AWS system
+  check fails, and reboots when its instance check fails
+- A Route 53 HTTPS health check on `/healthz`, alarming to the SNS topic
+  `camelai-agent-runtime-alerts` in us-east-1. Subscribe with
+  `aws sns subscribe --region us-east-1 --topic-arn arn:aws:sns:us-east-1:904534089871:camelai-agent-runtime-alerts --protocol email --notification-endpoint <email>`
 
 On the instance, Caddy (`agent-runtime-caddy.service`) terminates TLS and
 proxies to the runtime container (`agent-runtime.service`). Agent state lives in
@@ -126,11 +131,13 @@ curl https://agents.camelai.dev/healthz
 
 ## Limits of this deployment
 
-- Every agent lives on one host and its EBS volume. Losing the host means
-  restoring from the last daily snapshot, and anything newer is lost.
-- The runtime still runs one process per active agent. Up to 16 run at once;
-  idle agents stop after 5 minutes, and the least recently used idle agent is
-  stopped when all 16 are busy.
+- Every agent lives on one host and its EBS volume. Losing the volume means
+  restoring from the last hourly snapshot, and up to an hour of work is lost.
+- The runtime still runs one process per active agent. Up to 16 run at once,
+  and at most 8 per tenant. Idle agents stop after 5 minutes. When a tenant or
+  the host is at its limit, the least recently used idle agent is stopped; if
+  none is idle, the request is refused (429 for a tenant's limit, 503 for the
+  host's).
 - Sandboxed code runs on the same host as agent state. That's acceptable for
   trusted teammates, but not for untrusted tenants until the executor tier
   (phase 5) exists.

@@ -13,10 +13,10 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 
 const token = "fixture-operator-secret-32-characters";
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-async function fixture(t: { after: (fn: () => Promise<void>) => void }, options: { timeout?: number; eventBytes?: number; idleMs?: number; maxAgents?: number } = {}) {
+async function fixture(t: { after: (fn: () => Promise<void>) => void }, options: { timeout?: number; eventBytes?: number; idleMs?: number; maxAgents?: number; perTenant?: number } = {}) {
   const root = await mkdtemp(join(tmpdir(), "camelai-sse-test-"));
   const supervisor = new AgentSupervisor(join(root, "agents"), { runtime: process.env.AGENT_RUNTIME, maxAgents: options.maxAgents });
-  let sessions = new ClientSessions(supervisor, { root: join(root, "sessions"), secret: token, apiKey: "fixture-only", toolTimeoutMs: options.timeout ?? 3000, eventBytes: options.eventBytes, idleMs: options.idleMs });
+  let sessions = new ClientSessions(supervisor, { root: join(root, "sessions"), secret: token, apiKey: "fixture-only", toolTimeoutMs: options.timeout ?? 3000, eventBytes: options.eventBytes, idleMs: options.idleMs, maxProcessesPerTenant: options.perTenant });
   let model = configuredModel();
   const server = createServer(async (req, res) => {
     if (await sessions.handle(req, res)) return;
@@ -291,4 +291,20 @@ test("scoped credentials cannot inject assistant or tool history", async t => {
     assert.equal(response.status, 400);
     assert.match((await response.json() as any).error, /Only user messages/);
   }
+});
+
+test("a tenant's process quota refuses new agents while its agents are busy, then reuses idle slots", async t => {
+  const f = await fixture(t, { maxAgents: 4, perTenant: 1 });
+  const release = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<void>();
+  const busy = await f.start({ echo: echo(async () => { entered.resolve(); await release.promise; return "done"; }) });
+  const running = busy.execute('return await tools.echo({value:"x"})');
+  await entered.promise;
+  const second = new AgentRuntime(f.runtimeOptions);
+  await assert.rejects(second.createAgent({ tools: {} }), /already has 1 agents running/);
+  release.resolve();
+  await running;
+  const other = await f.start();
+  assert.equal((await other.execute("return 1")).output[0], "1");
+  assert.equal(f.supervisor.agents.has(busy.session.id), false, "the idle agent gave up its slot");
 });

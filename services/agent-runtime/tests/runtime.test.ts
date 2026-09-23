@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import { once } from "node:events";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { AgentSupervisor } from "../src/supervisor.ts";
+import { AgentSupervisor, type Hosting } from "../src/supervisor.ts";
 import { localTools } from "../src/local-tools.ts";
 import { configuredModel } from "../src/model.ts";
 import { readTranscript } from "../src/transcript.ts";
@@ -16,7 +16,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 const model = configuredModel();
 async function fixture(t: { after: (fn: () => Promise<void>) => void }, maxAgents = 4) {
   const root = await mkdtemp(join(tmpdir(), "camelai-runtime-test-"));
-  const supervisor = new AgentSupervisor(join(root, "sessions"), { runtime: process.env.AGENT_RUNTIME, maxAgents });
+  const supervisor = new AgentSupervisor(join(root, "sessions"), { runtime: process.env.AGENT_RUNTIME, maxAgents, hosting: process.env.AGENT_HOSTING as Hosting | undefined });
   t.after(async () => { await supervisor.close(); await rm(root, { recursive: true, force: true }); });
   const start = async (id: string, chosen = model, systemPrompt?: string) => supervisor.start(id, { model: chosen, apiKey: "fixture-only", systemPrompt }, await localTools(join(root, "workspaces", id)));
   return { root, supervisor, start };
@@ -25,7 +25,7 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }, maxAgent
 test("two real agent processes compose tools concurrently, with distinct workspaces and code processes", async t => {
   const { root, supervisor, start } = await fixture(t, 2);
   const [a, b] = await Promise.all([start("a"), start("b")]);
-  assert.notEqual(a.pid, b.pid);
+  if (supervisor.hosting === "process") assert.notEqual(a.pid, b.pid);
   await assert.rejects(start("c"), /capacity/);
   await assert.rejects(start("a"), /already exists/);
   const outputs = await Promise.all(["a", "b"].map(id => supervisor.request(id, "execute", { code: `
@@ -128,7 +128,7 @@ test("real Pi provider loop calls codemode and persists native messages across p
   assert.ok(requests[1].messages.some((m: any) => m.role === "tool" && m.content.includes("from Pi")));
   await supervisor.stop("pi");
   const restarted = await start("pi", chosen, applicationPrompt);
-  assert.notEqual(restarted.pid, first.pid);
+  if (supervisor.hosting === "process") assert.notEqual(restarted.pid, first.pid);
   assert.equal(restarted.messages, 4);
   await supervisor.request("pi", "prompt", { text: "What did you do?" });
   assert.ok(requests[2].messages.some((m: any) => m.content === "File verified."));
@@ -171,11 +171,13 @@ test("stopping an agent also kills a CPU-bound codemode child", async t => {
   const running = supervisor.request("a", "execute", { code: 'text("started");\nwhile (true) {}' }, () => started.resolve());
   const rejected = assert.rejects(running, /stopped|exited/);
   await started.promise;
-  const agentPid = supervisor.agents.get("a")!.child.pid;
-  const children = execFileSync("ps", ["-axo", "pid=,ppid="], { encoding: "utf8" }).trim().split("\n")
-    .map(line => line.trim().split(/\s+/).map(Number)).filter(([, ppid]) => ppid === agentPid);
+  // The sandbox child's parent is the agent's process, or this one when agents run inline.
+  const handle = supervisor.agents.get("a")!;
+  const agentPid = handle.kind === "process" ? handle.child.pid : process.pid;
+  const children = execFileSync("ps", ["-axo", "pid=,ppid=,command="], { encoding: "utf8" }).trim().split("\n")
+    .map(line => line.trim().split(/\s+/)).filter(([, ppid, ...command]) => Number(ppid) === agentPid && command.join(" ").includes("code-child"));
   assert.equal(children.length, 1);
-  const pid = children[0][0];
+  const pid = Number(children[0][0]);
   await supervisor.stop("a");
   await rejected;
   // Allow the OS to reap the orphan after the entire process group is killed.

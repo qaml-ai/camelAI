@@ -34,7 +34,7 @@ async function cluster(t: { after(fn: () => Promise<void>): void }) {
     const child = spawn(process.execPath, ["--experimental-strip-types", "--disable-warning=ExperimentalWarning", fileURLToPath(new URL("../src/server.ts", import.meta.url))], {
       env: {
         PATH: process.env.PATH, HOME: root, PORT: String(port), HOST: "127.0.0.1", AGENT_NODE_URL: url,
-        AGENT_DATA_DIR: join(root, "shared"), AGENT_STORAGE: "shared-file", AGENT_LEASE_TTL_MS: "1500",
+        AGENT_DATA_DIR: join(root, "shared"), AGENT_STORAGE: "shared-file", AGENT_LEASE_TTL_MS: "1500", AGENT_SCHEDULER_INTERVAL_MS: "200",
         AGENT_TENANTS_FILE: join(root, "tenants.json"), AGENT_SESSION_SECRET: "cluster-session-secret-with-32-characters!",
       } as NodeJS.ProcessEnv,
       stdio: ["ignore", "pipe", "inherit"],
@@ -79,6 +79,18 @@ test("any node serves any agent: requests are forwarded to the owner, and a surv
   assert.equal((await state()).requests.length, 2, "both requests are in the one journal A keeps");
   assert.deepEqual(calls, ["one", "two"]);
 
+  // A wake-up scheduled through B is delivered to the agent on A, by whichever node claims it.
+  const schedule = await viaB.schedule({ code: 'return await tools.lookup({ key: "timer" })', inSeconds: 0 });
+  const wakeId = `schedule-${schedule.id}-${schedule.dueAt}`;
+  for (let tries = 0; !(await state()).requests.some((request: any) => request.id === wakeId); tries++) {
+    assert.ok(tries < 100, "the wake-up was delivered");
+    await sleep(100);
+  }
+  const woken = await viaB.waitForRequest(wakeId, { timeoutMs: 20_000 });
+  assert.equal(woken.output[0], "value-of-timer");
+  assert.deepEqual(await viaB.schedules(), []);
+  calls.splice(calls.indexOf("timer"), 1);
+
   // Re-provisioning through B returns the same agent without starting a second copy.
   const again = await fetch(`${b.url}/client-sessions`, {
     method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "Idempotency-Key": "shared-agent" },
@@ -93,7 +105,7 @@ test("any node serves any agent: requests are forwarded to the owner, and a surv
   await sleep(1500 + 2000 + 500);
   const result = await viaB.execute('return await tools.lookup({ key: "three" })', { timeoutMs: 20_000 });
   assert.equal(result.output[0], "value-of-three");
-  assert.ok((await state()).requests.length >= 3, "the journal A wrote is intact under B");
+  assert.ok((await state()).requests.length >= 4, "the journal A wrote is intact under B");
   assert.deepEqual(calls, ["one", "two", "three"]);
   const agents = await (await fetch(`${b.url}/v1/agents`, { headers: { Authorization: `Bearer ${token}` } })).json() as any[];
   assert.deepEqual(agents.map(agent => agent.id), [viaA.session.id]);

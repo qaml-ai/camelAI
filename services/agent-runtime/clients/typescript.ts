@@ -51,6 +51,7 @@ export interface CreateAgentOptions extends AgentOptions {
   initialMessages?: AgentMessage[];
 }
 export interface AgentHistory { messages: AgentMessage[] }
+export interface Schedule { id: string; agent: string; text?: string; code?: string; dueAt: number; everySeconds?: number; createdAt: number }
 export interface RequestOptions { idempotencyKey?: string; timeoutMs?: number }
 export class AgentError extends Error {
   status: number;
@@ -308,6 +309,8 @@ export class AgentClient {
           value = { error: "Tool execution was already claimed; outcome unknown", uncertain: true };
         } else {
           const timer = setTimeout(() => controller.abort(), Math.max(1, call.deadline - Date.now()));
+          // A callback that ignores cancellation must not keep a closed client's process alive until the deadline.
+          (timer as { unref?: () => void }).unref?.();
           try {
             const definition = this.tools[call.name];
             if (!Object.hasOwn(this.tools, call.name) || !Check(definition.input, call.args)) throw new Error("Tool is missing or arguments failed validation");
@@ -384,6 +387,15 @@ export class AgentClient {
   execute(code: string, options?: RequestOptions & { timeoutMs?: number; executionTimeoutMs?: number }) {
     return this.request("execute", { code, ...(options?.executionTimeoutMs ? { timeoutMs: options.executionTimeoutMs } : {}) }, options);
   }
+  /**
+   * Wake this agent later: with `text` it gets a prompt, with `code` it runs sandboxed
+   * code against your tools. `everySeconds` (at least 60) repeats it.
+   */
+  schedule(input: { text?: string; code?: string; at?: string | Date; inSeconds?: number; everySeconds?: number }): Promise<Schedule> {
+    return this.http("/schedules", "POST", { ...input, ...(input.at instanceof Date ? { at: input.at.toISOString() } : {}) }, false);
+  }
+  schedules(): Promise<Schedule[]> { return this.http("/schedules"); }
+  unschedule(id: string) { return this.http(`/schedules/${encodeURIComponent(id)}`, "DELETE", undefined, false); }
   status() { return this.request("status"); }
   abort() { return this.request("abort"); }
   requestStatus(id: string) { return this.http(`/requests/${encodeURIComponent(id)}`); }

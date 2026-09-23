@@ -6,6 +6,7 @@ import type { ConsoleAuth } from "./console-auth.ts";
 import { listModels, listProviders, providerInfo } from "./catalog.ts";
 import { checkProviderKey } from "./key-check.ts";
 import { errorText } from "./protocol.ts";
+import { scheduleInput, type Scheduler } from "./scheduler.ts";
 
 /**
  * Tenant self-service REST API. Every console action goes through these routes,
@@ -22,6 +23,7 @@ import { errorText } from "./protocol.ts";
  *   POST   /v1/agents/:id/prompt               { text } → accepted request
  *   GET    /v1/agents/:id/requests/:requestId
  *   POST   /v1/agents/:id/abort
+ *   GET    /v1/agents/:id/schedules            POST { text, at | inSeconds, everySeconds? }; DELETE …/schedules/:id
  *   GET    /v1/tokens                          POST { name } mints one; DELETE /v1/tokens/:id
  *   GET    /v1/usage?days=30
  */
@@ -32,6 +34,7 @@ export interface ApiContext {
   /** Provision an agent for a tenant (shared with POST /client-sessions). */
   createAgent(tenant: string, params: any, idempotencyKey?: string): Promise<unknown>;
   verifyKeys?: boolean;
+  scheduler?: Scheduler;
 }
 
 class ApiError extends Error {
@@ -153,6 +156,16 @@ async function agentRoute(req: IncomingMessage, res: ServerResponse, context: Ap
     const body = await readBody(req, 1024 * 1024);
     if (typeof body.text !== "string" || !body.text.trim()) throw new ApiError(400, "Send {\"text\": \"...\"}");
     send(res, 202, await clients.submit(id, tenant, { id: body.requestId ?? randomUUID(), method: "prompt", params: { text: body.text } }));
+  } else if (resource === "schedules" && context.scheduler) {
+    if (method === "GET" && !resourceId) send(res, 200, await context.scheduler.list(id));
+    else if (method === "POST" && !resourceId) {
+      let input;
+      try { input = scheduleInput(await readBody(req, 64 * 1024)); } catch (error) { throw new ApiError(400, errorText(error)); }
+      send(res, 201, await context.scheduler.create({ agent: id, tenant, ...input }));
+    } else if (method === "DELETE" && resourceId) {
+      if (!await context.scheduler.remove(id, resourceId)) throw new ApiError(404, "Unknown schedule");
+      send(res, 200, { deleted: true });
+    } else throw new ApiError(404, "Unknown schedule route");
   } else if (method === "GET" && resource === "requests" && resourceId) {
     const request = (await clients.inspect(id, tenant)).requests.find(record => record.id === resourceId);
     if (!request) throw new ApiError(404, "Unknown request");

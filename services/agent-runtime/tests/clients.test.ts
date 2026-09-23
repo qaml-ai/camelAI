@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { AgentSupervisor } from "../src/supervisor.ts";
+import { AgentSupervisor, type Hosting } from "../src/supervisor.ts";
 import { ClientSessions, readJson } from "../src/client-sessions.ts";
 import { configuredModel } from "../src/model.ts";
 import { AgentClient, AgentRuntime, tool, schema, type AgentOptions, type RuntimeOptions, type Tool } from "../clients/node.ts";
@@ -15,7 +15,7 @@ const token = "fixture-operator-secret-32-characters";
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function fixture(t: { after: (fn: () => Promise<void>) => void }, options: { timeout?: number; eventBytes?: number; idleMs?: number; maxAgents?: number; perTenant?: number } = {}) {
   const root = await mkdtemp(join(tmpdir(), "camelai-sse-test-"));
-  const supervisor = new AgentSupervisor(join(root, "agents"), { runtime: process.env.AGENT_RUNTIME, maxAgents: options.maxAgents });
+  const supervisor = new AgentSupervisor(join(root, "agents"), { runtime: process.env.AGENT_RUNTIME, hosting: process.env.AGENT_HOSTING as Hosting | undefined, maxAgents: options.maxAgents });
   let sessions = new ClientSessions(supervisor, { root: join(root, "sessions"), secret: token, apiKey: "fixture-only", toolTimeoutMs: options.timeout ?? 3000, eventBytes: options.eventBytes, idleMs: options.idleMs, maxProcessesPerTenant: options.perTenant });
   let model = configuredModel();
   const server = createServer(async (req, res) => {
@@ -68,7 +68,8 @@ test("SDK provisions scoped SSE sessions, infers tools, and controls lifecycle w
   const f = await fixture(t);
   const a = await f.start({ echo: echo(() => "A") });
   const b = await f.start({ echo: echo(() => "B") });
-  assert.notEqual((await a.status()).pid, (await b.status()).pid);
+  // Separate processes unless agents are hosted inline.
+  if (f.supervisor.hosting === "process") assert.notEqual((await a.status()).pid, (await b.status()).pid);
   const result = await Promise.all([a, b].map(agent => agent.execute('return await tools.echo({value:"hi"})')));
   assert.deepEqual(result.map(result => result.output), [["A"], ["B"]]);
   const headers = { Authorization: `Bearer ${b.session.token}` };
@@ -307,4 +308,43 @@ test("a tenant's process quota refuses new agents while its agents are busy, the
   const other = await f.start();
   assert.equal((await other.execute("return 1")).output[0], "1");
   assert.equal(f.supervisor.agents.has(busy.session.id), false, "the idle agent gave up its slot");
+});
+
+test("runs queue per agent: a busy agent accepts more work, and runs that never began survive a host restart", async t => {
+  const f = await fixture(t, { timeout: 30_000 });
+  const release = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<void>();
+  let executions = 0;
+  const agent = await f.start({ echo: echo(async () => { executions++; entered.resolve(); await release.promise; return "slow"; }) });
+  // Back-to-back: the second waits for the first instead of failing with "busy".
+  const first = agent.execute('return await tools.echo({value:"a"})', { idempotencyKey: "first" });
+  await entered.promise;
+  const second = agent.execute("return 2", { idempotencyKey: "second" });
+  await sleep(100);
+  const queued = (await agent.outcomes()).requests.find(request => request.id === "second")!;
+  assert.equal(queued.state, "running");
+  assert.equal(queued.began, undefined, "queued, not begun");
+  assert.equal("params" in queued, false, "queued parameters stay internal");
+  release.resolve();
+  assert.equal((await first).output[0], "slow");
+  assert.equal((await second).output[0], "2");
+
+  // A run that began is settled as unknown on restart; one still queued simply runs later.
+  const blocked = Promise.withResolvers<void>();
+  const agent2 = await f.start({ echo: echo(async () => { blocked.resolve(); return new Promise(() => {}); }) });
+  const began = agent2.execute('return await tools.echo({value:"b"})', { idempotencyKey: "began" }).catch(error => error);
+  await blocked.promise;
+  const waiting = agent2.execute("return 3", { idempotencyKey: "waiting" }).catch(error => error);
+  await sleep(100);
+  await agent2.close();
+  await began; await waiting;
+  await f.restartHost();
+  const resumed = await new AgentRuntime(f.runtimeOptions).connectAgent(agent2.session, { tools: {} });
+  f.clients.push(resumed);
+  const settledWaiting = await resumed.waitForRequest("waiting", { timeoutMs: 20_000 });
+  assert.equal(settledWaiting.output[0], "3", "the queued run ran exactly once after the restart");
+  const beganRecord = (await resumed.outcomes()).requests.find(request => request.id === "began")!;
+  assert.equal(beganRecord.state, "completed");
+  assert.equal(beganRecord.outcome && "error" in beganRecord.outcome && beganRecord.outcome.uncertain, true);
+  assert.equal(executions, 1);
 });

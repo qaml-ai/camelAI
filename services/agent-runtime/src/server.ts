@@ -2,7 +2,7 @@ import { createServer, request as httpRequest, type IncomingMessage, type Server
 import { readFile } from "node:fs/promises";
 import { resolve, join, extname, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AgentSupervisor } from "./supervisor.ts";
+import { AgentSupervisor, type Hosting } from "./supervisor.ts";
 import { configuredModel } from "./model.ts";
 import { localTools } from "./local-tools.ts";
 import { errorText } from "./protocol.ts";
@@ -15,6 +15,8 @@ import { DEFAULT_TENANT, Tenants } from "./tenants.ts";
 import { Accounts } from "./accounts.ts";
 import { ConsoleAuth } from "./console-auth.ts";
 import { handleApi } from "./api.ts";
+import { Scheduler } from "./scheduler.ts";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 // Hosted mode reads tenants (operator token hashes and provider keys) from AGENT_TENANTS_FILE.
 // Without it, one operator token (AGENT_RUNTIME_TOKEN) and key (AGENT_API_KEY) serve everything.
@@ -35,7 +37,9 @@ const distributed = storageDescriptor.kind === "s3" || !!(storageDescriptor.kind
 // How peers reach this node; it is also the lease owner name.
 const node = (process.env.AGENT_NODE_URL ?? `http://127.0.0.1:${port}`).replace(/\/+$/, "");
 const leases = await leasesFromEnvironment(storage);
-const supervisor = new AgentSupervisor(join(root, "sessions"), { runtime: process.env.AGENT_RUNTIME, maxAgents, ...(distributed ? { storage: storageDescriptor } : {}) });
+const hosting = (process.env.AGENT_HOSTING ?? "process") as Hosting;
+if (!["process", "inline"].includes(hosting)) throw new Error("AGENT_HOSTING must be process or inline");
+const supervisor = new AgentSupervisor(join(root, "sessions"), { runtime: process.env.AGENT_RUNTIME, maxAgents, hosting, ...(distributed ? { storage: storageDescriptor } : {}) });
 
 /** AGENT_LEASES: none | storage | postgres (AGENT_LEASES_POSTGRES_URL). Distributed storage defaults to storage leases. */
 async function leasesFromEnvironment(storage: Storage): Promise<LeaseStore | undefined> {
@@ -114,8 +118,44 @@ async function body(req: import("node:http").IncomingMessage, limit: number) {
   return text ? JSON.parse(text) : {};
 }
 
-/** The agent a request addresses, if any: `/clients/<id>`, `/v1/agents/<id>` or `/registry/<id>`. */
-const agentOf = (url = "") => /^\/(?:clients|v1\/agents|registry)\/(client_[a-f0-9]{40})(?:[/?]|$)/.exec(url)?.[1];
+/** The agent a request addresses, if any: `/clients/<id>`, `/v1/agents/<id>`, `/registry/<id>` or `/internal/agents/<id>`. */
+const agentOf = (url = "") => /^\/(?:clients|v1\/agents|registry|internal\/agents)\/(client_[a-f0-9]{40})(?:[/?]|$)/.exec(url)?.[1];
+
+/** Node-to-node requests are signed with the session secret all nodes share. */
+const internalSignature = (timestamp: string, path: string, body: string) =>
+  createHmac("sha256", sessionSecret!).update(`internal:${timestamp}:${path}:${createHash("sha256").update(body).digest("hex")}`).digest("hex");
+
+/** Submit a request to an agent wherever it is served: here, or on the node that owns it. */
+async function submitAnywhere(agent: string, tenant: string, request: { id: string; method: string; params: Record<string, unknown> }) {
+  const owner = await clients.ownerElsewhere(agent);
+  if (!owner) return clients.submit(agent, tenant, request);
+  const path = `/internal/agents/${agent}/requests`;
+  const body = JSON.stringify({ tenant, request });
+  const timestamp = String(Date.now());
+  const response = await fetch(new URL(path, owner), {
+    method: "POST", body, signal: AbortSignal.timeout(15_000),
+    headers: { "Content-Type": "application/json", "x-agent-runtime-internal": `${timestamp}.${internalSignature(timestamp, path, body)}` },
+  });
+  if (!response.ok) throw Object.assign(new Error(`Owner rejected the request: HTTP ${response.status}`), { status: response.status });
+  return response.json();
+}
+
+async function handleInternal(req: IncomingMessage, res: ServerResponse) {
+  const match = /^\/internal\/agents\/(client_[a-f0-9]{40})\/requests$/.exec(req.url ?? "");
+  if (!match || req.method !== "POST") { res.writeHead(404).end(); return; }
+  let body = "";
+  for await (const chunk of req) { body += chunk; if (body.length > 1_100_000) { res.writeHead(413).end(); return; } }
+  const [timestamp, signature] = String(req.headers["x-agent-runtime-internal"] ?? "").split(".");
+  const expected = Buffer.from(internalSignature(timestamp ?? "", req.url!, body));
+  const given = Buffer.from(signature ?? "");
+  if (!timestamp || Math.abs(Date.now() - Number(timestamp)) > 60_000 || expected.length !== given.length || !timingSafeEqual(expected, given)) { res.writeHead(401).end(); return; }
+  try {
+    const { tenant, request } = JSON.parse(body);
+    res.writeHead(202, { "Content-Type": "application/json" }).end(JSON.stringify(await clients.submit(match[1], tenant, request)));
+  } catch (error) {
+    res.writeHead((error as { status?: number }).status ?? 400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: errorText(error) }));
+  }
+}
 const FORWARDED = "x-agent-runtime-forwarded";
 
 /** Stream a request to the node that owns its agent, and stream the answer back (SSE included). */
@@ -142,8 +182,9 @@ const server = createServer(async (req, res) => {
     const owner = await clients.ownerElsewhere(agent).catch(() => undefined);
     if (owner) { forward(req, res, owner); return; }
   }
+  if (req.url?.startsWith("/internal/")) { await handleInternal(req, res); return; }
   if (await consoleAuth.handle(req, res)) return;
-  if (await handleApi(req, res, { accounts, clients, consoleAuth, createAgent, verifyKeys: process.env.AGENT_VERIFY_KEYS !== "false" })) return;
+  if (await handleApi(req, res, { accounts, clients, consoleAuth, createAgent, scheduler, verifyKeys: process.env.AGENT_VERIFY_KEYS !== "false" })) return;
   if (req.method === "GET" && (req.url === "/console" || req.url?.startsWith("/console/"))) { await serveConsole(req, res); return; }
   if (req.method === "GET" && req.url === "/") { res.writeHead(302, { Location: "/console/" }).end(); return; }
   if (await clients.handle(req, res)) return;
@@ -211,13 +252,23 @@ const clients = new ClientSessions(supervisor, {
   apiKeyFor: (tenant, provider) => accounts.apiKey(tenant, provider),
   onUsage: (tenant, agent, message) => accounts.recordUsage(tenant, agent, message),
   storage, prefix: "client-sessions/", leases, node, leaseTtlMs: Number(process.env.AGENT_LEASE_TTL_MS ?? 30_000),
+  get scheduler() { return scheduler; },
 });
+// Wake-ups are delivered as prompts with ids derived from the schedule, so repeats are no-ops.
+const scheduler = new Scheduler({
+  storage, node,
+  deliver: async (schedule, requestId) => {
+    const request = schedule.code !== undefined ? { method: "execute", params: { code: schedule.code } } : { method: "prompt", params: { text: schedule.text! } };
+    await submitAnywhere(schedule.agent, schedule.tenant, { id: requestId, ...request });
+  },
+});
+scheduler.start(Number(process.env.AGENT_SCHEDULER_INTERVAL_MS ?? 5_000));
 // One-time migrations of single-host data (both are no-ops once done).
 await clients.init();
 await accounts.init();
 server.requestTimeout = 30_000;
 server.listen(port, process.env.HOST ?? "127.0.0.1", () => {
-  console.log(JSON.stringify({ type: "listening", address: server.address(), tenants: tenants.legacy ? "single" : "file", github: !!github, keyStorage: accounts.canStoreKeys }));
+  console.log(JSON.stringify({ type: "listening", address: server.address(), tenants: tenants.legacy ? "single" : "file", hosting, storage: storageDescriptor.kind, github: !!github, keyStorage: accounts.canStoreKeys }));
 });
 process.on("SIGHUP", () => {
   try { tenants.reload(); console.log(JSON.stringify({ type: "tenants_reloaded" })); }
@@ -225,5 +276,6 @@ process.on("SIGHUP", () => {
 });
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => {
   server.close();
+  scheduler.stop();
   void clients.close().then(() => supervisor.close()).then(() => accounts.flushUsage()).catch(() => {}).then(() => process.exit(0));
 });

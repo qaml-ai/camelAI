@@ -13,7 +13,12 @@ export type CallRecord = {
 };
 export type RequestRecord = {
   id: string; startedAt?: number; endedAt?: number; prompt?: string; code?: string; fingerprint: string; method: RequestMethod;
+  /** "running" covers queued runs too: a run has begun once `began` is set. */
   state: "running" | "completed"; outcome?: Outcome;
+  /** When the agent actually started this run (runs queue behind each other). */
+  began?: number;
+  /** Kept until the run begins, so a queued run survives a restart and runs exactly once. */
+  params?: unknown;
 };
 export type ClientEvent =
   | { type: "tool_call"; call: CallRecord }

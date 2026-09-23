@@ -6,7 +6,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { AgentSupervisor } from "../src/supervisor.ts";
+import { AgentSupervisor, type Hosting } from "../src/supervisor.ts";
 import { explicitKeyStream } from "../src/compaction.ts";
 
 type Body = { messages: { role: string; content: unknown }[] };
@@ -44,7 +44,7 @@ async function provider(t: { after(fn: () => Promise<void>): void }, options: { 
 
 async function fixture(t: { after(fn: () => Promise<void>): void }) {
   const root = await mkdtemp(join(tmpdir(), "compaction-test-"));
-  const supervisor = new AgentSupervisor(join(root, "agents"), { runtime: process.env.AGENT_RUNTIME });
+  const supervisor = new AgentSupervisor(join(root, "agents"), { runtime: process.env.AGENT_RUNTIME, hosting: process.env.AGENT_HOSTING as Hosting | undefined });
   t.after(async () => { await supervisor.close(); await rm(root, { recursive: true, force: true }); });
   return supervisor;
 }

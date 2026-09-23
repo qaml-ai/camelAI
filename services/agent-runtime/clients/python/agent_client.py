@@ -374,6 +374,18 @@ class AgentClient:
         params = {key: value for key, value in {"model": model, "systemPrompt": system_prompt, "thinkingLevel": thinking_level}.items() if value is not None}
         return await self.request("configure", params)
 
+    async def schedule(self, *, text=None, code=None, at=None, in_seconds=None, every_seconds=None):
+        """Wake this agent later with a prompt (text) or sandboxed code; every_seconds (>= 60) repeats it."""
+        body = {key: value for key, value in {"text": text, "code": code, "at": at, "inSeconds": in_seconds, "everySeconds": every_seconds}.items() if value is not None}
+        return await self._http("/schedules", "POST", body, retry=False)
+
+    async def schedules(self):
+        return await self._http("/schedules")
+
+    async def unschedule(self, schedule_id):
+        from urllib.parse import quote
+        return await self._http(f"/schedules/{quote(schedule_id, safe='')}", "DELETE", None, retry=False)
+
     async def status(self):
         return await self.request("status")
 

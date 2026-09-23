@@ -13,6 +13,7 @@ import type { Lease, LeaseStore } from "../shared/leases.ts";
 import { FRAME_BYTES, type CallRecord, type ClientEvent, type Outcome, type RequestRecord } from "../shared/client-protocol.ts";
 import { agentMetadata, type AgentMetadata } from "../shared/agent-metadata.ts";
 import { DEFAULT_TENANT } from "./tenants.ts";
+import { scheduleInput, type Scheduler } from "./scheduler.ts";
 
 class HttpError extends Error {
   status: number;
@@ -48,6 +49,8 @@ type Session = {
   cursor: number; events: BufferedEvent[]; eventBytes: number;
   response?: ServerResponse; starting?: Promise<unknown>;
   pending: Map<string, (outcome: Outcome) => void>;
+  /** Runs (prompt, execute, continue) execute one at a time, in the order accepted. */
+  runs: Promise<void>;
   fault?: Error;
   lastActive: number;
 };
@@ -56,6 +59,8 @@ const validId = (value: unknown): value is string => typeof value === "string" &
 const validSessionId = (value: string) => /^client_[a-f0-9]{40}$/.test(value);
 const has = (object: object, key: string) => Object.hasOwn(object, key);
 const RUN_METHODS = ["prompt", "execute", "continue"];
+/** Requests an agent may have accepted but not finished, queued runs included. */
+const MAX_OPEN_REQUESTS = 32;
 const REQUEST_METHODS = [...RUN_METHODS, "status", "abort", "history", "steer", "followUp", "configure"];
 /** Settled records kept for idempotent retries once the journal is folded. */
 const RETAINED_SETTLED = 256;
@@ -86,6 +91,8 @@ function outcome(value: any): Outcome {
   throw new HttpError(400, "Supply either result or error");
 }
 const settled = (state: string) => !["running", "offered", "started"].includes(state);
+/** A request as callers see it: queued parameters stay internal. */
+const visible = ({ params: _params, ...record }: RequestRecord): RequestRecord => record;
 
 export interface ClientSessionOptions {
   secret: string; toolTimeoutMs?: number; ttlMs?: number; eventBytes?: number;
@@ -107,6 +114,8 @@ export interface ClientSessionOptions {
   /** Stop an agent's process, and unload its session, after this long without activity. */
   idleMs?: number;
   retry?: AgentConfig["retry"];
+  /** Durable wake-ups for agents (`/clients/:id/schedules`). */
+  scheduler?: Scheduler;
   /** Called with each finished assistant message that reports token usage. */
   onUsage?: (tenant: string, agentId: string, message: { provider?: string; model?: string; usage: any; timestamp?: number }) => void;
 }
@@ -224,7 +233,7 @@ export class ClientSessions {
     const session: Session = {
       header, headerVersion: stored.version, lease, requests: new Map(), calls: new Map(), log,
       // Cursors restart above any cursor from an earlier process, so clients see a gap, never a repeat.
-      cursor: Date.now() * 1000, events: [], eventBytes: 0, pending: new Map(), lastActive: Date.now(),
+      cursor: Date.now() * 1000, events: [], eventBytes: 0, pending: new Map(), runs: Promise.resolve(), lastActive: Date.now(),
     };
     if (header.version === 2) {
       // Version 2 rewrote requests, calls and buffered events into this header on every event.
@@ -239,8 +248,11 @@ export class ClientSessions {
     }
     if (header.version !== 3 || header.id !== id) throw new Error("Invalid client session header");
     // Loading means no process anywhere owns the session, so nothing it recorded is still running.
+    // Queued runs that never began are safe to run now; anything that began has an unknown outcome.
+    const queued: RequestRecord[] = [];
     for (const request of session.requests.values()) if (request.state === "running") {
-      this.upsertRequest(session, { ...request, state: "completed", endedAt: Date.now(), outcome: { error: "The runtime restarted during this request", uncertain: true } });
+      if (RUN_METHODS.includes(request.method) && !request.began && request.params !== undefined) queued.push(request);
+      else this.upsertRequest(session, { ...request, state: "completed", endedAt: Date.now(), outcome: { error: "The runtime restarted during this request", uncertain: true } });
     }
     for (const call of session.calls.values()) {
       if (call.state === "started") this.upsertCall(session, { ...call, state: "uncertain", outcome: { error: "The runtime restarted during this tool call; its outcome is unknown", uncertain: true } });
@@ -248,6 +260,7 @@ export class ClientSessions {
     }
     await log.flush(true);
     this.sessions.set(id, session);
+    for (const record of queued.sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0))) this.enqueue(session, record, record.params);
     return session;
   }
 
@@ -414,7 +427,7 @@ export class ClientSessions {
       session = {
         header: { version: 3, id, ...(tenant === DEFAULT_TENANT ? {} : { tenant }), digest: hash(token), expiresAt: Date.now() + (this.options.ttlMs ?? 24 * 60 * 60 * 1000), revoked: false, metadata, definitions, config: safeConfig, provisionHash },
         lease, requests: new Map(), calls: new Map(), log: this.storage.log<JournalRecord>(this.journalKey(id)),
-        cursor: Date.now() * 1000, events: [], eventBytes: 0, pending: new Map(), lastActive: Date.now(),
+        cursor: Date.now() * 1000, events: [], eventBytes: 0, pending: new Map(), runs: Promise.resolve(), lastActive: Date.now(),
       };
       // A conditional create: if a concurrent request made this agent first, retry as a load.
       try { await this.writeHeader(session); }
@@ -455,7 +468,7 @@ export class ClientSessions {
     const session = metadata && await this.load(id);
     if (!metadata || !session) throw new HttpError(404, "Agent not found");
     return { ...metadata, tools: session.header.definitions, systemPrompt: session.header.config.systemPrompt ?? "",
-      cursor: session.cursor, events: session.events.map(({ id, data }) => ({ id, data })), requests: [...session.requests.values()], calls: [...session.calls.values()] };
+      cursor: session.cursor, events: session.events.map(({ id, data }) => ({ id, data })), requests: [...session.requests.values()].map(visible), calls: [...session.calls.values()] };
   }
 
   /** A tenant's view of one agent's history; undefined when the agent is not theirs. */
@@ -506,7 +519,7 @@ export class ClientSessions {
     const operator = operatorTenant !== undefined;
     if (!(req.url ?? "").startsWith("/clients/")) return false;
     try {
-      const match = /^\/clients\/(client_[a-f0-9]{40})(?:\/(events|state|metadata|history|requests|calls)(?:\/([A-Za-z0-9_-]{1,80})(?:\/(claim|outcome))?)?)?$/.exec(req.url ?? "");
+      const match = /^\/clients\/(client_[a-f0-9]{40})(?:\/(events|state|metadata|history|requests|calls|schedules)(?:\/([A-Za-z0-9_-]{1,80})(?:\/(claim|outcome))?)?)?$/.exec(req.url ?? "");
       // Authenticate against the small header before loading the journal.
       const header = match ? this.sessions.get(match[1])?.header ?? (await this.readHeader(match[1]))?.value : undefined;
       const authorization = req.headers.authorization ?? "";
@@ -544,17 +557,29 @@ export class ClientSessions {
           res.write(frame);
         }
         res.on("close", () => { if (session.response === res) session.response = undefined; });
+      } else if (resource === "schedules" && this.options.scheduler) {
+        const scheduler = this.options.scheduler;
+        const tenant = session.header.tenant ?? DEFAULT_TENANT;
+        if (req.method === "GET" && !resourceId) json(res, 200, await scheduler.list(id));
+        else if (req.method === "POST" && !resourceId) {
+          let input;
+          try { input = scheduleInput(await readJson(req, 64 * 1024)); } catch (error) { throw new HttpError(400, errorText(error)); }
+          try { json(res, 201, await scheduler.create({ agent: id, tenant, ...input })); } catch (error) { throw new HttpError(400, errorText(error)); }
+        } else if (req.method === "DELETE" && resourceId) {
+          if (!await scheduler.remove(id, resourceId)) throw new HttpError(404, "Unknown schedule");
+          json(res, 200, { deleted: true });
+        } else throw new HttpError(404, "Unknown schedule route");
       } else if (req.method === "GET" && resource === "history" && !resourceId) {
         json(res, 200, await this.history(session));
       } else if (req.method === "GET" && resource === "state" && !resourceId) {
-        json(res, 200, { cursor: session.cursor, calls: [...session.calls.values()], requests: [...session.requests.values()] });
+        json(res, 200, { cursor: session.cursor, calls: [...session.calls.values()], requests: [...session.requests.values()].map(visible) });
       } else if (req.method === "POST" && resource === "requests" && !resourceId) {
         const { status, record } = await this.accept(session, await readJson(req, FRAME_BYTES));
         json(res, status, record);
       } else if (req.method === "GET" && resource === "requests" && resourceId && !action) {
         const record = session.requests.get(resourceId);
         if (!record) throw new HttpError(404, "Unknown request");
-        json(res, 200, record);
+        json(res, 200, visible(record));
       } else if (req.method === "POST" && resourceId && resource === "calls") {
         const call = session.calls.get(resourceId);
         if (!call) throw new HttpError(404, "Unknown tool call");
@@ -598,17 +623,23 @@ export class ClientSessions {
     };
     // A retried ID returns the committed record, including its outcome after a lost ack.
     const retried = existing();
-    if (retried) return { status: 200, record: retried };
-    if ([...session.requests.values()].filter(request => request.state === "running").length >= 8) throw new HttpError(429, "Too many requests");
-    // Reads and aborts never need a process; everything else runs in the agent.
-    if (!["history", "status", "abort"].includes(body.method)) await this.ensureStarted(session);
+    if (retried) return { status: 200, record: visible(retried) };
+    if ([...session.requests.values()].filter(request => request.state === "running").length >= MAX_OPEN_REQUESTS) throw new HttpError(429, "Too many requests queued for this agent");
+    const isRun = RUN_METHODS.includes(body.method);
+    // Reads and aborts never need a process; runs start it when their turn comes.
+    if (!isRun && !["history", "status", "abort"].includes(body.method)) await this.ensureStarted(session);
     // Concurrent retries may have waited on the same process startup.
     const raced = existing();
-    if (raced) return { status: 200, record: raced };
-    const record = this.upsertRequest(session, { startedAt: Date.now(), ...(body.method === "prompt" && typeof body.params.text === "string" ? { prompt: body.params.text } : {}), ...(body.method === "execute" && typeof body.params.code === "string" ? { code: body.params.code } : {}), id: body.id, method: body.method, fingerprint, state: "running" });
+    if (raced) return { status: 200, record: visible(raced) };
+    const record = this.upsertRequest(session, {
+      startedAt: Date.now(), ...(body.method === "prompt" && typeof body.params.text === "string" ? { prompt: body.params.text } : {}),
+      ...(body.method === "execute" && typeof body.params.code === "string" ? { code: body.params.code } : {}),
+      id: body.id, method: body.method, fingerprint, state: "running", ...(isRun ? { params: body.params } : {}),
+    });
     await this.commit(session, true);
-    void this.run(session, record, body.params);
-    return { status: 202, record };
+    if (isRun) this.enqueue(session, record, body.params);
+    else void this.run(session, record, body.params);
+    return { status: 202, record: visible(record) };
   }
 
   /** Submit a request to a tenant's agent on the tenant's behalf (REST API and console). */
@@ -648,12 +679,28 @@ export class ClientSessions {
         } : undefined);
   }
 
+  /** Queue a run behind the agent's earlier runs; a busy agent never rejects work. */
+  private enqueue(session: Session, record: RequestRecord, params: unknown) {
+    session.runs = session.runs.then(() => this.run(session, record, params)).catch(() => {});
+  }
+
   private async run(session: Session, record: RequestRecord, params: unknown) {
     let value: Outcome;
-    try { value = { result: await this.execute(session, record, params) }; }
+    try {
+      if (RUN_METHODS.includes(record.method)) {
+        if (this.closed || session.fault || session.requests.get(record.id)?.state !== "running") return;
+        await this.ensureStarted(session);
+        // Durable before any side effect: after a crash this run is "began", never repeated.
+        const { params: _params, ...rest } = session.requests.get(record.id)!;
+        record = this.upsertRequest(session, { ...rest, began: Date.now() });
+        await this.commit(session, true);
+      }
+      value = { result: await this.execute(session, record, params) };
+    }
     catch (error) { value = { error: errorText(error) }; }
     if (this.closed || session.fault || session.requests.get(record.id)?.state !== "running") return;
-    this.upsertRequest(session, { ...record, state: "completed", outcome: value, endedAt: Date.now() });
+    const { params: _params, ...finished } = record;
+    this.upsertRequest(session, { ...finished, state: "completed", outcome: value, endedAt: Date.now() });
     try { await this.commit(session, true); }
     catch { return; /* The fault is reported to every later request. */ }
     session.lastActive = Date.now();
@@ -686,7 +733,7 @@ export class ClientSessions {
     signal.throwIfAborted();
     if (this.closed || session.fault || session.header.revoked) return Promise.reject(new Error("Client session unavailable"));
     if (session.pending.size >= 32) return Promise.reject(new Error("Too many pending client tools"));
-    const request = [...session.requests.values()].find(r => r.state === "running" && RUN_METHODS.includes(r.method));
+    const request = [...session.requests.values()].find(r => r.state === "running" && RUN_METHODS.includes(r.method) && r.began);
     const call = this.upsertCall(session, { ...(context ? { toolCallId: context.toolCallId } : {}), ...(request ? { requestId: request.id } : {}), createdAt: Date.now(), id: randomUUID(), name, args, state: "offered", deadline: Date.now() + (this.options.toolTimeoutMs ?? 15_000) });
     // An offer needs no durable commit: after a restart, unclaimed offers are cancelled.
     this.commitLater(session);
@@ -725,13 +772,17 @@ export class ClientSessions {
     session.response?.end();
   }
 
-  private async interrupt(session: Session, reason: string) {
+  /** Settle in-flight work. With `keepQueued`, runs that never began stay queued for the next owner. */
+  private async interrupt(session: Session, reason: string, keepQueued = false) {
     for (const call of session.calls.values()) if (["offered", "started"].includes(call.state)) {
       const uncertain = call.state === "started";
       this.upsertCall(session, { ...call, state: uncertain ? "uncertain" : "cancelled", outcome: { error: reason, ...(uncertain ? { uncertain: true } : {}) } });
     }
     for (const request of session.requests.values()) if (request.state === "running") {
-      this.upsertRequest(session, { ...request, state: "completed", endedAt: Date.now(), outcome: { error: reason, uncertain: true } });
+      const queued = RUN_METHODS.includes(request.method) && !request.began;
+      if (queued && keepQueued) continue;
+      const { params: _params, ...rest } = request;
+      this.upsertRequest(session, { ...rest, state: "completed", endedAt: Date.now(), outcome: queued ? { error: reason } : { error: reason, uncertain: true } });
     }
     for (const [id, finish] of session.pending) finish(session.calls.get(id)!.outcome!);
     await this.commit(session, true);
@@ -783,7 +834,7 @@ export class ClientSessions {
     clearInterval(this.heartbeat);
     if (this.renewal) clearInterval(this.renewal);
     for (const session of [...this.sessions.values()]) {
-      try { await this.interrupt(session, "The runtime stopped during this request"); }
+      try { await this.interrupt(session, "The runtime stopped during this request", true); }
       catch { /* Already faulted; the next load recovers conservatively from storage. */ }
       session.response?.end();
       await this.unload(session);

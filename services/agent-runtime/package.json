@@ -1,0 +1,15 @@
+{
+  "name": "@camelai/agent-runtime-prototype",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/server.ts",
+    "demo": "bun src/demo.ts",
+    "demo:clients": "bun examples/run.ts",
+    "demo:typescript": "bun examples/release-board.ts",
+    "demo:python": "python3 examples/inventory.py",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test:python": "python3 tests/python_sdk.py",
+    "typecheck": "tsc -p tsconfig.json"
+  }
+}

@@ -50,6 +50,7 @@ worker-side). There is no in-repo Go sandbox-host or data-proxy tree.
 - The Go data-proxy (external `qaml-ai/project-runtime-service` `cmd/data-proxy`) is **retired**: SQL queries and warehouse exports now run in the `DbQuerySandbox` Cloudflare container (`workers/main/src/db-query-service.ts` + `data-proxy.ts` compat surface), and the `SANDBOX_HOST` VPC binding is gone. Do not reintroduce either. Decommission checklist: `docs/db-egress-relay.md`.
 - `sandbox/` - Agent skills, project scaffold templates (`create-worker/`), and the canonical `validate-notebook.py` (byte-copied into `workers/main/analysis-sandbox-assets/` for the analysis image build context). Not the agent control plane or harness — those live in `workers/main` (`chat-thread-do.ts`, Pi tools, Dockerfiles).
 - `scripts/` - Deploy, eval, self-host, and maintenance scripts.
+- `services/agent-runtime/` - Opt-in VM agent prototype: supervisor, one Pi process per agent, QuickJS/WASM codemode sandboxes hosted by Node/Bun, and scoped tool adapter. See its README; verify with `bun run test:agent-runtime`. Shared codemode source preparation lives in `packages/agent-core/`.
 - `docs/` - Supporting documentation; see `docs/README.md` for the canonical index (many `*-plan.md` / feedback files are historical).
 - `plans/` - Active cross-cutting architecture plans (e.g. OrgDO split, no-VM build/deploy).
 - `infra/` - Terraform for the static-IP database egress relay VM (`infra/db-egress-relay/`); `infra/selfhost/` for self-host cloud templates. See `infra/README.md`.

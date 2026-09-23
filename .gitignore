@@ -4,6 +4,8 @@
 /node_modules
 /sandbox/node_modules
 /services/**/node_modules
+/.agent-runtime/
+/services/agent-runtime/.agent-runtime/
 /.pnp
 .pnp.*
 .bun
@@ -118,3 +120,5 @@ workers/main/src/embedded-skills.ts
 
 .firecrawl/
 __pycache__/
+
+services/agent-runtime/studio/dist/

@@ -4,6 +4,12 @@ import { codeModeWorkerModule, prepareCodeModeUserCode, stripTypeScriptFromUserC
 const EMPTY_CODE_MODE_WORKER_SOURCE = await codeModeWorkerModule('');
 const SIMPLE_CODE_MODE_WORKER_SOURCE = await codeModeWorkerModule('return 1;');
 
+it('strips TypeScript combined with modern JS without prepending downlevel helpers', async () => {
+  const stripped = await stripTypeScriptFromUserCode('const value: string = input?.name ?? "default";\nreturn value;');
+  expect(stripped).toContain('const value = input?.name ?? "default";');
+  expect(stripped).not.toContain(': string');
+});
+
 function createConnectionsFacade(binding: any): Record<string, unknown> {
   const legacyInvokeMethod = ['_', '_', 'invoke'].join('');
   const invokeConnectionMethod = (request: unknown) => {

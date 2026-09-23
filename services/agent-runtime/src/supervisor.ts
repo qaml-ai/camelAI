@@ -11,6 +11,7 @@ import { openStorage, type StorageDescriptor } from "../shared/storage-config.ts
 import type { Storage } from "../shared/storage.ts";
 import { readTranscript, readTranscriptLog } from "./transcript.ts";
 import { createAgentHost } from "./agent-host.ts";
+import { pickExecutor, type Executions, type ExecutorEndpoint, type RemoteExecutor } from "./executions.ts";
 
 /**
  * How agents run. "process": each agent is its own Node process (strong memory
@@ -23,7 +24,8 @@ type Common = { bridge: ToolBridge; calls: Set<AbortController>; listeners: Set<
 type ProcessHandle = Common & { kind: "process"; child: ChildProcess; rpc: Rpc; groupKilled: boolean };
 type InlineHandle = Common & { kind: "inline"; host: ReturnType<typeof createAgentHost>; stop: (error: Error) => void; stopped: Promise<never> };
 type Handle = ProcessHandle | InlineHandle;
-type SupervisorOptions = { runtime?: string; maxAgents?: number; storage?: StorageDescriptor; hosting?: Hosting };
+/** With `executor`, agents run js_exec on executor hosts; tool callbacks are relayed back into the owning agent. */
+export type SupervisorOptions = { runtime?: string; maxAgents?: number; storage?: StorageDescriptor; hosting?: Hosting; executor?: { endpoint: ExecutorEndpoint; executions: Executions } };
 
 function killGroup(handle: ProcessHandle) {
   if (handle.groupKilled || !handle.child.pid) return;
@@ -74,6 +76,18 @@ export class AgentSupervisor {
   }
   private cancelTools(handle: Handle) { for (const call of handle.calls) call.abort(); return null; }
 
+  /**
+   * Mint a capability for one remote execution. Its tool callbacks arrive on the
+   * callback listener and go to `dispatch`: the agent's own executeCode handler,
+   * which applies the same validation and quotas as a local execution.
+   */
+  private grantExecution(handle: Handle, timeoutMs: number, dispatch: (call: { name: unknown; args: unknown }) => Promise<unknown>) {
+    const executor = this.options.executor;
+    if (!executor) throw new Error("No code executor is configured");
+    const grant = executor.executions.register(timeoutMs, dispatch, handle);
+    return { id: grant.id, token: grant.token, callbackUrl: grant.callbackUrl, executorUrl: pickExecutor(executor.endpoint), executorToken: executor.endpoint.token };
+  }
+
   async start(id: string, config: Omit<AgentConfig, "id" | "directory" | "tools">, bridge: ToolBridge) {
     if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new Error("Invalid agent id");
     validateDefinitions(bridge.definitions);
@@ -84,7 +98,7 @@ export class AgentSupervisor {
       const directory = resolve(join(this.root, id));
       await mkdir(directory, { recursive: true, mode: 0o700 });
       const location = this.options.storage ? { storage: this.options.storage, transcriptKey: AgentSupervisor.transcriptKey(id) } : {};
-      const init = { ...config, ...location, id, directory, tools: bridge.definitions };
+      const init = { ...config, ...location, id, directory, tools: bridge.definitions, remoteExecutor: !!this.options.executor };
       return this.hosting === "inline" ? await this.startInline(id, init, bridge) : await this.startProcess(id, directory, init, bridge);
     } finally { this.starting.delete(id); }
   }
@@ -96,6 +110,7 @@ export class AgentSupervisor {
     this.starting.delete(id);
     const cleanup = () => {
       this.cancelTools(handle);
+      this.options.executor?.executions.releaseOwner(handle);
       // A VM is Unix: reap the entire agent process group, including a
       // codemode child stuck in synchronous code when its agent dies.
       try { killGroup(handle); }
@@ -107,6 +122,11 @@ export class AgentSupervisor {
     rpc.onEvent = event => { for (const listener of handle.listeners) listener(event); };
     rpc.handler = async (method, params) => {
       if (method === "cancel-tools") return this.cancelTools(handle);
+      if (method === "release-execution") { this.options.executor?.executions.release(String(params.id), handle); return null; }
+      if (method === "register-execution") {
+        const grant = this.grantExecution(handle, params.timeoutMs, call => rpc.request("execution-tool", { id: grant.id, ...call }));
+        return grant;
+      }
       if (method !== "tool") throw new Error("Unknown tool");
       return this.dispatchTool(handle, params);
     };
@@ -125,6 +145,13 @@ export class AgentSupervisor {
       emit: event => { for (const listener of handle.listeners) listener(structuredClone(event)); },
       tool: (name, args, toolCallId) => this.dispatchTool(handle, { name, args: structuredClone(args), toolCallId }),
       cancelTools: async () => this.cancelTools(handle),
+      // Inline, the callback reaches the agent's handler directly; no relay is needed.
+      executor: this.options.executor && {
+        register: async (timeoutMs, dispatch) => {
+          const grant = this.grantExecution(handle, timeoutMs, call => dispatch(structuredClone(call)));
+          return { ...grant, release: () => this.options.executor!.executions.release(grant.id, handle) };
+        },
+      } satisfies RemoteExecutor | undefined,
     });
     this.agents.set(id, handle);
     this.starting.delete(id);
@@ -166,6 +193,7 @@ export class AgentSupervisor {
     } else {
       // Callers see the same failure as a killed process; the host writes nothing more.
       handle.stop(new Error("Agent stopped"));
+      this.options.executor?.executions.releaseOwner(handle);
       await handle.host.dispose();
     }
     if (this.agents.get(id) === handle) this.agents.delete(id);

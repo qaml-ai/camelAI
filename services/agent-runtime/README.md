@@ -286,6 +286,32 @@ authentication, tool-specific authorization, controlled egress for tool hosts,
 and a maintained engine/security update process. Agent shutdown reaps its Unix
 process group. No deployed environment has been changed.
 
+### Remote executors
+
+Setting `AGENT_EXECUTOR_URL` and `AGENT_EXECUTOR_TOKEN` moves `js_exec` off the
+runtime host. With them set, `executeCode()` posts each program to an executor
+(`src/executor/server.ts`, the same image with a different command). The
+executor runs it in the same fresh code-child and QuickJS limits, and streams
+output back as NDJSON. The executor holds no credentials or agent state, and it
+clears its own environment at startup.
+
+Guest tool calls come back to a separate runtime listener
+(`AGENT_EXECUTOR_CALLBACK_PORT`, default 8791) at
+`POST /internal/executions/:id/tools`. The executor reaches that listener
+through `AGENT_EXECUTOR_CALLBACK_URL`. Each call carries a random capability,
+minted for that one execution, that expires at its deadline.
+
+The agent process has no HTTP server, so the supervisor registers the
+execution. The supervisor then relays each callback over IPC into the owning
+agent's `executeCode`. That relay runs the same validation, quotas and
+`ToolBridge` path as a local child. The runtime never trusts the executor: it
+checks streamed output against the same limits. When the runtime aborts or
+times out, it disconnects, and the executor kills the child.
+
+Without these variables, execution stays local and unchanged. Deployment is
+covered in [`infra/agent-runtime/executor`](../../infra/agent-runtime/executor/README.md),
+and the tests are in `tests/executor.test.ts`.
+
 ## Integration seam and next extraction
 
 `AgentSupervisor` is the embeddable host API. `ToolBridge` is the key platform

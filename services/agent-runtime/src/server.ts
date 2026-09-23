@@ -16,6 +16,7 @@ import { Accounts } from "./accounts.ts";
 import { ConsoleAuth } from "./console-auth.ts";
 import { handleApi } from "./api.ts";
 import { Scheduler } from "./scheduler.ts";
+import { Executions, executorEndpoint } from "./executions.ts";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 // Hosted mode reads tenants (operator token hashes and provider keys) from AGENT_TENANTS_FILE.
@@ -39,7 +40,15 @@ const node = (process.env.AGENT_NODE_URL ?? `http://127.0.0.1:${port}`).replace(
 const leases = await leasesFromEnvironment(storage);
 const hosting = (process.env.AGENT_HOSTING ?? "process") as Hosting;
 if (!["process", "inline"].includes(hosting)) throw new Error("AGENT_HOSTING must be process or inline");
-const supervisor = new AgentSupervisor(join(root, "sessions"), { runtime: process.env.AGENT_RUNTIME, maxAgents, hosting, ...(distributed ? { storage: storageDescriptor } : {}) });
+// With AGENT_EXECUTOR_URL, js_exec runs on executor hosts that hold no credentials or agent state.
+// They call tools back through a separate listener on a private address, never the public one.
+const executor = process.env.AGENT_EXECUTOR_URL ? {
+  endpoint: executorEndpoint(process.env.AGENT_EXECUTOR_URL, process.env.AGENT_EXECUTOR_TOKEN),
+  executions: new Executions(process.env.AGENT_EXECUTOR_CALLBACK_URL ?? ""),
+} : undefined;
+const callbackPort = Number(process.env.AGENT_EXECUTOR_CALLBACK_PORT ?? 8791);
+if (!Number.isInteger(callbackPort) || callbackPort < 1 || callbackPort > 65535) throw new Error("AGENT_EXECUTOR_CALLBACK_PORT must be a TCP port");
+const supervisor = new AgentSupervisor(join(root, "sessions"), { runtime: process.env.AGENT_RUNTIME, maxAgents, hosting, executor, ...(distributed ? { storage: storageDescriptor } : {}) });
 
 /** AGENT_LEASES: none | storage | postgres (AGENT_LEASES_POSTGRES_URL). Distributed storage defaults to storage leases. */
 async function leasesFromEnvironment(storage: Storage): Promise<LeaseStore | undefined> {
@@ -270,12 +279,22 @@ server.requestTimeout = 30_000;
 server.listen(port, process.env.HOST ?? "127.0.0.1", () => {
   console.log(JSON.stringify({ type: "listening", address: server.address(), tenants: tenants.legacy ? "single" : "file", hosting, storage: storageDescriptor.kind, github: !!github, keyStorage: accounts.canStoreKeys }));
 });
+const callbacks = executor && createServer(async (req, res) => {
+  if (!await executor.executions.handle(req, res)) res.writeHead(404).end();
+});
+if (callbacks) {
+  callbacks.requestTimeout = 10_000;
+  callbacks.listen(callbackPort, process.env.HOST ?? "127.0.0.1", () => {
+    console.log(JSON.stringify({ type: "executor_callbacks_listening", address: callbacks.address(), executors: executor!.endpoint.urls }));
+  });
+}
 process.on("SIGHUP", () => {
   try { tenants.reload(); console.log(JSON.stringify({ type: "tenants_reloaded" })); }
   catch (error) { console.error(JSON.stringify({ type: "tenants_reload_failed", error: errorText(error) })); }
 });
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => {
   server.close();
+  callbacks?.close();
   scheduler.stop();
   void clients.close().then(() => supervisor.close()).then(() => accounts.flushUsage()).catch(() => {}).then(() => process.exit(0));
 });

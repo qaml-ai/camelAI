@@ -3,6 +3,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { Agent, convertToLlm, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
 import { isContextOverflow, isRetryableAssistantError, type AssistantMessage } from "@earendil-works/pi-ai";
 import { executeCode } from "./codemode.ts";
+import type { RemoteExecutor } from "./executions.ts";
 import type { AgentConfig, ToolBridge } from "./protocol.ts";
 import { buildSystemPrompt } from "./system-prompt.ts";
 import { fileAppendLog } from "../shared/append-log.ts";
@@ -20,6 +21,8 @@ export interface HostIO {
   tool(name: string, args: Record<string, unknown>, toolCallId?: string): Promise<any>;
   /** Abort the application tool calls this agent has in flight. */
   cancelTools(): Promise<unknown>;
+  /** Registers remote executions when js_exec runs on executor hosts (`config.remoteExecutor`). */
+  executor?: RemoteExecutor;
 }
 
 /**
@@ -28,6 +31,7 @@ export interface HostIO {
  */
 export function createAgentHost(io: HostIO) {
   let agent: Agent | undefined;
+  const executor = () => config?.remoteExecutor ? io.executor : undefined;
   let config: AgentConfig;
   let transcript: Transcript;
   let storage: Storage | undefined;
@@ -201,7 +205,7 @@ export function createAgentHost(io: HostIO) {
         execute: async (id, args, signal, onUpdate) => {
           try {
             const result = await executeCode({
-              ...codeRequest(args), directory: config.directory, bridge: bridge(signal ?? new AbortController().signal), signal,
+              ...codeRequest(args), directory: config.directory, bridge: bridge(signal ?? new AbortController().signal), signal, executor: executor(),
               onEvent: event => {
                 io.emit({ type: "codemode", toolCallId: id, event });
                 onUpdate?.({ content: [{ type: "text", text: JSON.stringify(event) }], details: event });
@@ -266,7 +270,7 @@ export function createAgentHost(io: HostIO) {
     busy = true;
     active = new AbortController();
     try {
-      if (method === "execute") return await executeCode({ ...codeRequest(params), directory: config.directory, bridge: bridge(active.signal), signal: active.signal, onEvent: event => io.emit(event) });
+      if (method === "execute") return await executeCode({ ...codeRequest(params), directory: config.directory, bridge: bridge(active.signal), signal: active.signal, executor: executor(), onEvent: event => io.emit(event) });
       await transcript.setActive(true);
       if (method === "continue") await agent.continue();
       else if (promptMessages) await agent.prompt(promptMessages);

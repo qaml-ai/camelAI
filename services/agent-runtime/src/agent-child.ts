@@ -11,6 +11,7 @@ import { Transcript, legacySnapshotPath, readTranscript, summaryMessage, transcr
 import { boundedContext, interruptedTurnRepairs, validateInitialMessages, validateUserMessages } from "./history.ts";
 import { compactionSettings, contextTokens, explicitKeyStream, needsCompaction, runCompaction } from "./compaction.ts";
 import { codeRequest, DEFAULT_RETRY } from "./limits.ts";
+import type { RemoteExecutor, ToolDispatch } from "./executions.ts";
 
 const rpc = parentRpc(() => process.kill(-process.pid, "SIGKILL"));
 let agent: Agent | undefined;
@@ -71,6 +72,20 @@ async function contextFor(messages: AgentMessage[], signal?: AbortSignal): Promi
   if (bounded.length !== view.length) rpc.send({ type: "event", event: { type: "context_trimmed", retainedMessages: bounded.length, omittedMessages: view.length - bounded.length } });
   return bounded;
 }
+
+/** Remote executions in flight, by id; the supervisor relays their tool callbacks here. */
+const executions = new Map<string, ToolDispatch>();
+const remote: RemoteExecutor = {
+  async register(timeoutMs, dispatch) {
+    const grant = await rpc.request("register-execution", { timeoutMs });
+    executions.set(grant.id, dispatch);
+    return { ...grant, release: () => {
+      executions.delete(grant.id);
+      rpc.request("release-execution", { id: grant.id }).catch(() => {});
+    } };
+  },
+};
+const executor = () => config.remoteExecutor ? remote : undefined;
 
 function bridge(signal: AbortSignal): ToolBridge {
   return {
@@ -180,7 +195,7 @@ rpc.handler = async (method, params) => {
       execute: async (id, args, signal, onUpdate) => {
         try {
           const result = await executeCode({
-            ...codeRequest(args), directory: config.directory, bridge: bridge(signal ?? new AbortController().signal), signal,
+            ...codeRequest(args), directory: config.directory, bridge: bridge(signal ?? new AbortController().signal), signal, executor: executor(),
             onEvent: event => {
               rpc.send({ type: "event", event: { type: "codemode", toolCallId: id, event } });
               onUpdate?.({ content: [{ type: "text", text: JSON.stringify(event) }], details: event });
@@ -216,6 +231,11 @@ rpc.handler = async (method, params) => {
     });
     return { pid: process.pid, recovered, messages: transcript.total };
   }
+  if (method === "execution-tool") {
+    const dispatch = executions.get(params.id);
+    if (!dispatch) throw new Error("Execution ended");
+    return dispatch({ name: params.name, args: params.args });
+  }
   if (!agent) throw new Error("Agent is not initialized");
   if (method === "status") return { pid: process.pid, busy, messages: transcript.total, contextMessages: transcript.context.length, compacted: !!transcript.compaction };
   if (method === "configure") {
@@ -245,7 +265,7 @@ rpc.handler = async (method, params) => {
   busy = true;
   active = new AbortController();
   try {
-    if (method === "execute") return await executeCode({ ...codeRequest(params), directory: config.directory, bridge: bridge(active.signal), signal: active.signal, onEvent: event => rpc.send({ type: "event", event }) });
+    if (method === "execute") return await executeCode({ ...codeRequest(params), directory: config.directory, bridge: bridge(active.signal), signal: active.signal, executor: executor(), onEvent: event => rpc.send({ type: "event", event }) });
     await transcript.setActive(true);
     if (method === "continue") await agent.continue();
     else if (promptMessages) await agent.prompt(promptMessages);

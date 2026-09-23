@@ -12,6 +12,7 @@ import { DEFAULT_TENANT, Tenants } from "./tenants.ts";
 import { Accounts } from "./accounts.ts";
 import { ConsoleAuth } from "./console-auth.ts";
 import { handleApi } from "./api.ts";
+import { Executions, executorEndpoint } from "./executions.ts";
 
 // Hosted mode reads tenants (operator token hashes and provider keys) from AGENT_TENANTS_FILE.
 // Without it, one operator token (AGENT_RUNTIME_TOKEN) and key (AGENT_API_KEY) serve everything.
@@ -24,7 +25,15 @@ const maxAgents = Number(process.env.AGENT_MAX_PROCESSES ?? 8);
 if (!Number.isInteger(maxAgents) || maxAgents < 1) throw new Error("AGENT_MAX_PROCESSES must be a positive integer");
 const maxProcessesPerTenant = Number(process.env.AGENT_MAX_PROCESSES_PER_TENANT ?? Math.max(1, Math.ceil(maxAgents / 2)));
 if (!Number.isInteger(maxProcessesPerTenant) || maxProcessesPerTenant < 1) throw new Error("AGENT_MAX_PROCESSES_PER_TENANT must be a positive integer");
-const supervisor = new AgentSupervisor(join(root, "sessions"), { runtime: process.env.AGENT_RUNTIME, maxAgents });
+// With AGENT_EXECUTOR_URL, js_exec runs on executor hosts that hold no credentials or agent state.
+// They call tools back through a separate listener on a private address, never the public one.
+const executor = process.env.AGENT_EXECUTOR_URL ? {
+  endpoint: executorEndpoint(process.env.AGENT_EXECUTOR_URL, process.env.AGENT_EXECUTOR_TOKEN),
+  executions: new Executions(process.env.AGENT_EXECUTOR_CALLBACK_URL ?? ""),
+} : undefined;
+const callbackPort = Number(process.env.AGENT_EXECUTOR_CALLBACK_PORT ?? 8791);
+if (!Number.isInteger(callbackPort) || callbackPort < 1 || callbackPort > 65535) throw new Error("AGENT_EXECUTOR_CALLBACK_PORT must be a TCP port");
+const supervisor = new AgentSupervisor(join(root, "sessions"), { runtime: process.env.AGENT_RUNTIME, maxAgents, executor });
 const model = configuredModel();
 const toolTimeoutMs = Number(process.env.AGENT_TOOL_TIMEOUT_MS ?? 15_000);
 if (!Number.isInteger(toolTimeoutMs) || toolTimeoutMs < 1 || toolTimeoutMs > 15 * 60_000) throw new Error("AGENT_TOOL_TIMEOUT_MS must be an integer between 1 and 900000");
@@ -165,11 +174,21 @@ server.requestTimeout = 30_000;
 server.listen(port, process.env.HOST ?? "127.0.0.1", () => {
   console.log(JSON.stringify({ type: "listening", address: server.address(), tenants: tenants.legacy ? "single" : "file", github: !!github, keyStorage: accounts.canStoreKeys }));
 });
+const callbacks = executor && createServer(async (req, res) => {
+  if (!await executor.executions.handle(req, res)) res.writeHead(404).end();
+});
+if (callbacks) {
+  callbacks.requestTimeout = 10_000;
+  callbacks.listen(callbackPort, process.env.HOST ?? "127.0.0.1", () => {
+    console.log(JSON.stringify({ type: "executor_callbacks_listening", address: callbacks.address(), executors: executor!.endpoint.urls }));
+  });
+}
 process.on("SIGHUP", () => {
   try { tenants.reload(); console.log(JSON.stringify({ type: "tenants_reloaded" })); }
   catch (error) { console.error(JSON.stringify({ type: "tenants_reload_failed", error: errorText(error) })); }
 });
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => {
   server.close();
+  callbacks?.close();
   void clients.close().then(() => supervisor.close()).then(() => process.exit(0));
 });

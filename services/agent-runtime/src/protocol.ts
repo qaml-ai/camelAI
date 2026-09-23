@@ -22,6 +22,8 @@ export interface AgentConfig {
   tools: ToolDefinition[];
   initialMessages?: AgentMessage[];
   thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  /** js_exec runs on an executor host, registered through the supervisor. */
+  remoteExecutor?: boolean;
   /** Host policy for retrying transient provider errors. */
   retry?: { maxAttempts: number; baseDelayMs: number };
 }

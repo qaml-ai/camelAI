@@ -300,28 +300,31 @@ const PI_MODEL_CATALOG_FALLBACKS: Record<string, Model<any>> = {
     contextWindow: 500000,
     maxTokens: 128000,
   } satisfies Model<"openai-responses">,
-  "openrouter/z-ai/glm-5.2": {
-    id: "z-ai/glm-5.2",
-    name: "Z.ai: GLM 5.2",
+  "openrouter/z-ai/glm-5.3": {
+    id: "z-ai/glm-5.3",
+    name: "Z.ai: GLM 5.3",
     api: "openai-completions",
     provider: "openrouter",
     baseUrl: "https://openrouter.ai/api/v1",
     reasoning: true,
-    // GLM 5.2 only accepts reasoning efforts "high" and "xhigh"; the Pi agent
-    // defaults to "medium", so clamp the lower levels up to "high" to avoid
-    // OpenRouter rejecting unsupported efforts.
+    // https://openrouter.ai/z-ai/glm-5.3 (verified 2026-09-23).
+    // Reasoning is mandatory and accepts only low/high/max. Map Pi's medium
+    // default to high and keep the mapping enabled through AI Gateway.
+    compat: { supportsReasoningEffort: true },
     thinkingLevelMap: {
-      minimal: "high",
-      low: "high",
+      off: null,
+      minimal: "low",
+      low: "low",
       medium: "high",
       high: "high",
-      xhigh: "xhigh",
+      xhigh: "max",
+      max: "max",
     },
     input: ["text"],
     cost: {
-      input: 1.2,
-      output: 4.1,
-      cacheRead: 0.2,
+      input: 0.84,
+      output: 2.64,
+      cacheRead: 0.156,
       cacheWrite: 0,
     },
     contextWindow: 1048576,

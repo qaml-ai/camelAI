@@ -29,7 +29,7 @@ const OPENAI_COMPATIBLE_MODELS = [
   "deepseek-v4-flash",
   "kimi-k2.7-code",
   "grok-4.5",
-  "glm-5.2",
+  "glm-5.3",
 ] as const;
 
 const ANTHROPIC_MODELS = [
@@ -52,7 +52,7 @@ const OPENROUTER_ONLY_MODELS = [
   "deepseek-v4-flash",
   "kimi-k2.7-code",
   "grok-4.5",
-  "glm-5.2",
+  "glm-5.3",
 ] as const;
 
 const OPENROUTER_OPENAI_COMPATIBLE_MODELS = [
@@ -66,7 +66,7 @@ const OPENROUTER_OPENAI_COMPATIBLE_MODELS = [
   "deepseek-v4-flash",
   "kimi-k2.7-code",
   "grok-4.5",
-  "glm-5.2",
+  "glm-5.3",
 ] as const;
 
 const PINNED_OPENROUTER_MODELS = [
@@ -165,6 +165,10 @@ describe("llm provider config helpers", () => {
     expect(normalizeLlmModel("fable-5")).toBe("fable-5");
     expect(normalizeLlmModel("kimi-k2.6")).toBe("kimi-k2.7-code");
     expect(normalizeLlmModel("kimi-latest")).toBe("kimi-k2.7-code");
+    expect(isLlmModel("glm-5.2")).toBe(false);
+    expect(normalizeLlmModel("glm-5.2")).toBe("glm-5.3");
+    expect(normalizeLlmModel("glm-5.2", "openrouter")).toBe("glm-5.3");
+    expect(normalizeLlmModel("glm-latest")).toBe("glm-5.3");
     expect(normalizeLlmModel("opus")).toBe("opus-5");
     expect(normalizeLlmModel("opus-4.7")).toBe("opus-5");
     expect(normalizeLlmModel("opus-4.8")).toBe("opus-5");

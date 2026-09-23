@@ -70,7 +70,7 @@ export const LLM_MODEL_TO_PRICING_KEY: Readonly<Record<LlmModel, string>> = {
   custom: "custom",
   "kimi-k2.7-code": "moonshotai/kimi-k2.7-code",
   "grok-4.5": "grok-4.5",
-  "glm-5.2": "z-ai/glm-5.2",
+  "glm-5.3": "z-ai/glm-5.3",
   "gemini-3.5-flash": "google/gemini-3.5-flash",
   "gemini-3-flash-preview": "google/gemini-3-flash-preview",
   "deepseek-v4-pro": "deepseek/deepseek-v4-pro",
@@ -259,9 +259,9 @@ export const MODEL_CATALOG: Readonly<Record<LlmModel, ModelCatalogEntry>> = {
     intelligence: 4,
     speed: 4.5,
   },
-  "glm-5.2": {
-    id: "glm-5.2",
-    label: "GLM 5.2",
+  "glm-5.3": {
+    id: "glm-5.3",
+    label: "GLM 5.3",
     providerLogo: "glm",
     providerOrder: 6,
     modelOrder: 0,

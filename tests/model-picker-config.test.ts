@@ -46,6 +46,23 @@ describe('model picker config parsing', () => {
     expect(parsed.default_model).toBeNull();
   });
 
+  it.each([parseOrgModelPickerConfig, parseWorkspaceModelPickerConfig])(
+    'upgrades saved GLM models and defaults without duplicating picker rows (%#)',
+    (parseConfig) => {
+      const parsed = parseConfig({
+        use_platform_defaults: false,
+        models: [
+          { id: 'glm-5.2', added_at: 10 },
+          { id: 'glm-5.3', added_at: 20 },
+        ],
+        default_model: 'glm-5.2',
+      });
+
+      expect(parsed.models).toEqual([{ id: 'glm-5.3', added_at: 10 }]);
+      expect(parsed.default_model).toBe('glm-5.3');
+    },
+  );
+
   it('allows an intentionally empty org picker', () => {
     expect(parseOrgModelPickerConfig({
       use_platform_defaults: true,

@@ -18,6 +18,8 @@ const STORED_LLM_MODEL_REPLACEMENTS: Readonly<Record<string, LlmModel>> = {
   "kimi-latest": "kimi-k2.7-code",
   "grok-4.3": "grok-4.5",
   "grok-latest": "grok-4.5",
+  "glm-5.2": "glm-5.3",
+  "glm-latest": "glm-5.3",
   opus: "opus-5",
   "opus-4.7": "opus-5",
   "opus-4.8": "opus-5",
@@ -114,8 +116,8 @@ export const OPENAI_COMPATIBLE_LLM_MODEL_OPTIONS: ReadonlyArray<{
     description: "OpenRouter/camelAI hosted model",
   },
   {
-    value: "glm-5.2",
-    label: "GLM 5.2",
+    value: "glm-5.3",
+    label: "GLM 5.3",
     description: "OpenRouter/camelAI hosted model",
   },
 ];
@@ -145,7 +147,7 @@ export const LLM_MODEL_OPTIONS: ReadonlyArray<{
 const OPENROUTER_ONLY_MODELS = new Set<LlmModel>([
   "kimi-k2.7-code",
   "grok-4.5",
-  "glm-5.2",
+  "glm-5.3",
   "gemini-3.5-flash",
   "gemini-3-flash-preview",
   "deepseek-v4-pro",

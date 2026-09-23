@@ -1,0 +1,28 @@
+[Unit]
+Description=camelAI agent runtime
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Restart=always
+RestartSec=5
+ExecStartPre=/opt/agent-runtime/refresh-config.sh
+ExecStartPre=-/usr/bin/docker rm -f agent-runtime
+ExecStartPre=-/usr/bin/docker network create agent-runtime
+ExecStart=/bin/sh -c 'exec /usr/bin/docker run --name agent-runtime \
+  --network agent-runtime \
+  --env-file /opt/agent-runtime/runtime.env \
+  --volume /opt/agent-runtime/data:/data \
+  --volume /opt/agent-runtime/tenants.json:/etc/agent-runtime/tenants.json:ro \
+  --memory 3g \
+  --log-opt max-size=50m --log-opt max-file=5 \
+  "$(cat /opt/agent-runtime/image)"'
+# Reload re-reads tenants without dropping connections or stopping agents.
+ExecReload=/opt/agent-runtime/refresh-config.sh
+ExecReload=/usr/bin/docker kill --signal HUP agent-runtime
+ExecStop=/usr/bin/docker stop --time 30 agent-runtime
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

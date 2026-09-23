@@ -1,0 +1,16 @@
+{
+  admin off
+  log {
+    output discard
+  }
+}
+
+RUNTIME_HOSTNAME {
+  log {
+    output discard
+  }
+  # SSE streams stay open for the life of a client connection; flush every event.
+  reverse_proxy agent-runtime:8790 {
+    flush_interval -1
+  }
+}

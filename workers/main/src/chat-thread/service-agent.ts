@@ -1,6 +1,6 @@
 import { Agent, type AgentOptions, type AgentEvent, type AgentMessage, type AgentState, type AgentToolResult } from '@earendil-works/pi-agent-core';
 import type { ImageContent, AssistantMessage } from '@earendil-works/pi-ai';
-import { AgentRuntime, type AgentClient, type Tools, type JournalStore, type SessionCredentials } from '../../../../services/agent-runtime/clients/typescript.ts';
+import { AgentRuntime, type AgentClient, type Tools, type JournalStore, type SessionCredentials } from '@qaml-ai/agent-runtime';
 
 export interface ServiceAgentOptions {
   url: string;

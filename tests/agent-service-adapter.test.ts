@@ -1,21 +1,52 @@
+// Runs chiridion's ChatThreadDO adapter (ServiceAgent) against a real agent
+// runtime over its HTTP protocol. The runtime is a separate repository
+// (qaml-ai/agent-runtime); point AGENT_RUNTIME_DIR at a checkout with its
+// dependencies installed. Without it these tests are skipped.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
 import { once } from "node:events";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { createInterface } from "node:readline";
 import { ServiceAgent } from "../workers/main/src/chat-thread/service-agent.ts";
-import { memoryJournalStore, type SessionCredentials } from "../services/agent-runtime/clients/typescript.ts";
-import { AgentSupervisor } from "../services/agent-runtime/src/supervisor.ts";
-import { ClientSessions, readJson } from "../services/agent-runtime/src/client-sessions.ts";
+import { memoryJournalStore, type SessionCredentials } from "@qaml-ai/agent-runtime";
 import type { Api, Model } from "@earendil-works/pi-ai";
+
+const runtimeDir = process.env.AGENT_RUNTIME_DIR ? resolve(process.env.AGENT_RUNTIME_DIR) : undefined;
+if (runtimeDir && !existsSync(join(runtimeDir, "src/server.ts"))) throw new Error(`AGENT_RUNTIME_DIR=${runtimeDir} is not an agent-runtime checkout`);
+const skip = runtimeDir ? false : "set AGENT_RUNTIME_DIR to a qaml-ai/agent-runtime checkout";
+const options = { timeout: 20000, skip };
+
+/** Start the runtime's own server entry point; resolves once it reports its listening address. */
+async function startRuntime(env: Record<string, string>) {
+  const child = spawn("node", ["--experimental-strip-types", "--disable-warning=ExperimentalWarning", join(runtimeDir!, "src/server.ts")], {
+    cwd: runtimeDir, env: { PATH: process.env.PATH ?? "", HOST: "127.0.0.1", PORT: "0", ...env }, stdio: ["ignore", "pipe", "inherit"],
+  });
+  const ready = Promise.withResolvers<string>();
+  child.on("error", ready.reject);
+  child.on("exit", code => ready.reject(new Error(`Runtime exited with ${code} before listening`)));
+  createInterface({ input: child.stdout! }).on("line", line => {
+    try { const event = JSON.parse(line); if (event.type === "listening") ready.resolve(`http://127.0.0.1:${event.address.port}`); } catch {}
+  });
+  const url = await ready.promise;
+  return { url, stop: () => stopProcess(child) };
+}
+
+async function stopProcess(child: ChildProcess) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, "exit");
+  child.kill("SIGTERM");
+  const timer = setTimeout(() => child.kill("SIGKILL"), 5000);
+  await exited; clearTimeout(timer);
+}
 
 async function fixture(t: any, reply: (body: any) => any) {
   const root = await mkdtemp(join(tmpdir(), "service-agent-test-"));
-  let supervisor = new AgentSupervisor(join(root, "agents"));
   const token = "test-service-agent-operator-key-long";
-  let sessions = new ClientSessions(supervisor, { root: join(root, "sessions"), secret: token, apiKey: "fixture", toolTimeoutMs: 5000 });
   const provider = createServer(async (req, res) => {
     let body = ""; for await (const chunk of req) body += chunk;
     const delta = await reply(JSON.parse(body));
@@ -24,24 +55,19 @@ async function fixture(t: any, reply: (body: any) => any) {
     res.write(`data: ${JSON.stringify({ id: "fixture", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: delta.tool_calls ? "tool_calls" : "stop" }] })}\n\n`);
     res.end("data: [DONE]\n\n");
   });
-  const server = createServer(async (req, res) => {
-    if (await sessions.handle(req, res)) return;
-    const body = await readJson(req);
-    try {
-      const result = await sessions.create(body.tools, { model: body.model, systemPrompt: body.systemPrompt, initialMessages: body.initialMessages }, req.headers["idempotency-key"] as string);
-      res.writeHead(201, { "Content-Type": "application/json" }).end(JSON.stringify(result));
-    } catch (error) { res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: String(error) })); }
-  });
-  for (const host of [server, provider]) { host.listen(0, "127.0.0.1"); await once(host, "listening"); }
+  provider.listen(0, "127.0.0.1"); await once(provider, "listening");
+  const baseUrl = `http://127.0.0.1:${(provider.address() as any).port}/v1`;
+  const env = { AGENT_RUNTIME_TOKEN: token, AGENT_API_KEY: "fixture", AGENT_ALLOWED_BASE_URLS: baseUrl, AGENT_TOOL_TIMEOUT_MS: "5000", AGENT_DATA_DIR: root };
+  let runtime = await startRuntime(env);
   const model = { id: "fixture", name: "Fixture", provider: "openai", api: "openai-completions", reasoning: false, input: ["text"], contextWindow: 32000, maxTokens: 1000,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, baseUrl: `http://127.0.0.1:${(provider.address() as any).port}/v1` } as Model<Api>;
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, baseUrl } as Model<Api>;
   const agents: ServiceAgent[] = [];
   let credentials: SessionCredentials | undefined;
   const store = memoryJournalStore();
   let requestId: string | undefined;
   const create = (tools: any[] = [], hooks: any = {}) => {
     const agent = new ServiceAgent({ initialState: { model, tools, systemPrompt: "Test agent", messages: [{ role: "user", content: "bootstrap", timestamp: 1 }] }, ...hooks }, {
-      url: `http://127.0.0.1:${(server.address() as any).port}`, token, id: "adapter-test", journalStore: store,
+      url: runtime.url, token, id: "adapter-test", journalStore: store,
       loadCredentials: () => credentials, saveCredentials: value => { credentials = value; },
       loadRequestId: () => requestId, saveRequestId: value => { requestId = value; },
       additionalTools: async () => ({}), authorize: async () => {},
@@ -50,18 +76,17 @@ async function fixture(t: any, reply: (body: any) => any) {
   };
   t.after(async () => {
     for (const agent of agents) await agent.closeService();
-    await sessions.close(); await supervisor.close();
-    for (const host of [server, provider]) { host.closeAllConnections(); await new Promise<void>(resolve => host.close(() => resolve())); }
+    await runtime.stop();
+    provider.closeAllConnections(); await new Promise<void>(resolve => provider.close(() => resolve()));
     await rm(root, { recursive: true, force: true });
   });
-  return { create, get supervisor() { return supervisor; }, async restartService() {
-    await sessions.close(); await supervisor.close();
-    supervisor = new AgentSupervisor(join(root, "agents"));
-    sessions = new ClientSessions(supervisor, { root: join(root, "sessions"), secret: token, apiKey: "fixture", toolTimeoutMs: 5000 });
-  }, get requestId() { return requestId; }, get credentials() { return credentials!; } };
+  return { create, async restartService() {
+    await runtime.stop();
+    runtime = await startRuntime(env);
+  }, get requestId() { return requestId; } };
 }
 
-test("application SDK adapter streams ordered native tool events, preserves history and reconnects", { timeout: 20000 }, async t => {
+test("application SDK adapter streams ordered native tool events, preserves history and reconnects", options, async t => {
   const bodies: any[] = [];
   const f = await fixture(t, body => {
     bodies.push(body);
@@ -82,14 +107,15 @@ test("application SDK adapter streams ordered native tool events, preserves hist
   assert.ok(bodies[1].messages.some((m: any) => m.role === "tool" && m.content === "native-content"));
   assert.deepEqual(agent.state.messages.map(m => m.role), ["user", "user", "assistant", "toolResult", "assistant"]);
   await agent.closeService();
-  await f.supervisor.stop(f.credentials.id);
+  // The agent's process goes away; its history must come back from durable state.
+  await f.restartService();
   const reconnected = f.create(); await reconnected.connectService();
   await reconnected.prompt("What happened?");
   assert.ok(bodies.at(-1).messages.some((m: any) => m.content === "completed"));
   assert.equal(reconnected.state.messages.filter(m => m.role === "user" && m.content === "bootstrap").length, 1);
 });
 
-test("application policy blocks native side effects and failures remain tool errors", { timeout: 20000 }, async t => {
+test("application policy blocks native side effects and failures remain tool errors", options, async t => {
   let requests = 0;
   const f = await fixture(t, () => {
     requests++;
@@ -114,7 +140,7 @@ test("application policy blocks native side effects and failures remain tool err
   assert.match(JSON.stringify(results[1].content), /simulated write failure/);
 });
 
-test("native follow-up queued from a running tool completes without blocking SSE events", { timeout: 20000 }, async t => {
+test("native follow-up queued from a running tool completes without blocking SSE events", options, async t => {
   const bodies: any[] = [];
   const f = await fixture(t, body => {
     bodies.push(body);
@@ -135,7 +161,7 @@ test("native follow-up queued from a running tool completes without blocking SSE
 });
 
 
-test("detaching during inference keeps the service run alive and resumes without another model call", { timeout: 20000 }, async t => {
+test("detaching during inference keeps the service run alive and resumes without another model call", options, async t => {
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   let calls = 0;
@@ -160,7 +186,7 @@ test("detaching during inference keeps the service run alive and resumes without
   assert.equal(await next.resumeServiceRun(), false);
 });
 
-test("completed detached request restores authoritative history without repeating tools", { timeout: 20000 }, async t => {
+test("completed detached request restores authoritative history without repeating tools", options, async t => {
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   let providerCalls = 0; let toolCalls = 0;
@@ -191,7 +217,7 @@ test("completed detached request restores authoritative history without repeatin
 });
 
 
-test("host restart surfaces interrupted execution without silently repeating the prompt", { timeout: 20000 }, async t => {
+test("host restart surfaces interrupted execution without silently repeating the prompt", options, async t => {
   const entered = Promise.withResolvers<void>(); const release = Promise.withResolvers<void>();
   let calls = 0;
   const f = await fixture(t, async () => {

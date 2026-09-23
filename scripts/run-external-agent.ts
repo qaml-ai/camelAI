@@ -1,11 +1,36 @@
-/** Start the real Cloudflare app with only its Pi loop moved to a local process. */
+/**
+ * Start the real Cloudflare app with only its Pi loop moved to a local process.
+ * The runtime comes from a checkout of qaml-ai/agent-runtime: AGENT_RUNTIME_DIR,
+ * default ../agent-runtime next to this repository (run `npm install` there once).
+ */
 import { spawn, type ChildProcess } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, resolve, join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { writeDurableJson } from '../shared/durable-json.ts';
-const root = resolve('.agent-runtime/application');
+import { fileURLToPath } from 'node:url';
+
+/** Local-disk commit, so a crash never leaves a truncated secrets file. */
+function writeDurableJson(path: string, value: unknown) {
+  const directory = dirname(path);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  const fd = openSync(temporary, 'wx', 0o600);
+  try { writeFileSync(fd, JSON.stringify(value)); fsyncSync(fd); }
+  finally { closeSync(fd); }
+  renameSync(temporary, path);
+  const parent = openSync(directory, 'r');
+  try { fsyncSync(parent); } finally { closeSync(parent); }
+}
+
+const repo = fileURLToPath(new URL('..', import.meta.url));
+const runtimeDir = resolve(repo, process.env.AGENT_RUNTIME_DIR ?? '../agent-runtime');
+const serverEntry = join(runtimeDir, 'src/server.ts');
+if (!existsSync(serverEntry)) {
+  console.error(`No agent runtime at ${runtimeDir}. Clone qaml-ai/agent-runtime there (and run npm install), or set AGENT_RUNTIME_DIR.`);
+  process.exit(1);
+}
+const root = resolve(repo, '.agent-runtime/application');
 mkdirSync(root, { recursive: true, mode: 0o700 });
 const path = join(root, 'secrets.json');
 const secrets = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : { operator: randomBytes(32).toString('hex'), signing: randomBytes(32).toString('hex') };
@@ -15,7 +40,7 @@ function stop() { if (stopping) return; stopping = true; for (const child of chi
 process.on('SIGINT', stop); process.on('SIGTERM', stop);
 process.on('exit', () => { for (const child of children) child.kill('SIGTERM'); });
 const key = process.env.SELFHOST_AI_API_KEY ?? process.env.OPENROUTER_API_KEY;
-const host = spawn(process.execPath, ['services/agent-runtime/src/server.ts'], { env: { ...process.env, HOST: '127.0.0.1', PORT: '0', AGENT_API_KEY: key, AGENT_TOOL_TIMEOUT_MS: '300000', AGENT_RUNTIME_TOKEN: secrets.operator, AGENT_DATA_DIR: join(root, 'runtime') }, stdio: ['ignore', 'pipe', 'inherit'] });
+const host = spawn('node', ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', serverEntry], { env: { ...process.env, HOST: '127.0.0.1', PORT: '0', AGENT_API_KEY: key, AGENT_TOOL_TIMEOUT_MS: '300000', AGENT_RUNTIME_TOKEN: secrets.operator, AGENT_DATA_DIR: join(root, 'runtime') }, stdio: ['ignore', 'pipe', 'inherit'] });
 children.add(host);
 const ready = Promise.withResolvers<string>();
 const timeout = setTimeout(() => ready.reject(new Error('Local runtime startup timed out')), 15000);

@@ -1,5 +1,13 @@
 {
-  "extends": "../services/agent-runtime/tsconfig.json",
-  "include": ["agent-service-adapter.test.ts"],
-  "exclude": []
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["agent-service-adapter.test.ts"]
 }

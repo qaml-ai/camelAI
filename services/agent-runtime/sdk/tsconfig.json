@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "declaration": true,
+    "outDir": "dist",
+    "rootDir": "..",
+    "rewriteRelativeImportExtensions": true,
+    "skipLibCheck": true,
+    "lib": ["ES2024", "DOM"],
+    "types": ["node"]
+  },
+  "files": ["../clients/typescript.ts", "../clients/node.ts"]
+}

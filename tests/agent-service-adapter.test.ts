@@ -1,7 +1,8 @@
 // Runs chiridion's ChatThreadDO adapter (ServiceAgent) against a real agent
 // runtime over its HTTP protocol. The runtime is a separate repository
 // (qaml-ai/agent-runtime); point AGENT_RUNTIME_DIR at a checkout with its
-// dependencies installed. Without it these tests are skipped.
+// dependencies installed, and AGENT_DATABASE_URL at a Postgres the runtime can use
+// (each fixture gets its own schema). Without AGENT_RUNTIME_DIR these tests are skipped.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -12,14 +13,39 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { createInterface } from "node:readline";
+import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import { ServiceAgent } from "../workers/main/src/chat-thread/service-agent.ts";
-import { memoryJournalStore, type SessionCredentials } from "@qaml-ai/agent-runtime";
+import { memoryJournalStore, type SessionCredentials } from "@camelai/agent-runtime";
 import type { Api, Model } from "@earendil-works/pi-ai";
 
 const runtimeDir = process.env.AGENT_RUNTIME_DIR ? resolve(process.env.AGENT_RUNTIME_DIR) : undefined;
 if (runtimeDir && !existsSync(join(runtimeDir, "src/server.ts"))) throw new Error(`AGENT_RUNTIME_DIR=${runtimeDir} is not an agent-runtime checkout`);
 const skip = runtimeDir ? false : "set AGENT_RUNTIME_DIR to a qaml-ai/agent-runtime checkout";
 const options = { timeout: 20000, skip };
+if (runtimeDir && !process.env.AGENT_DATABASE_URL) throw new Error("Set AGENT_DATABASE_URL: the agent runtime keeps its control plane in Postgres");
+
+/** A fresh schema for one runtime, so runs never see each other's agents. Uses the runtime checkout's own pg. */
+async function isolatedDatabase() {
+  type PgClient = { connect(): Promise<unknown>; query(sql: string): Promise<unknown>; end(): Promise<unknown> };
+  const pg = createRequire(join(runtimeDir!, "package.json"))("pg") as { Client: new (options: { connectionString?: string }) => PgClient };
+  const schema = `adapter_${randomUUID().replaceAll("-", "")}`;
+  const admin = new pg.Client({ connectionString: process.env.AGENT_DATABASE_URL });
+  await admin.connect();
+  await admin.query(`create schema ${schema}`);
+  await admin.end();
+  const url = new URL(process.env.AGENT_DATABASE_URL!);
+  url.searchParams.set("options", `-c search_path=${schema}`);
+  return {
+    url: url.toString(),
+    async drop() {
+      const client = new pg.Client({ connectionString: process.env.AGENT_DATABASE_URL });
+      await client.connect();
+      await client.query(`drop schema if exists ${schema} cascade`);
+      await client.end();
+    },
+  };
+}
 
 /** Start the runtime's own server entry point; resolves once it reports its listening address. */
 async function startRuntime(env: Record<string, string>) {
@@ -57,7 +83,8 @@ async function fixture(t: any, reply: (body: any) => any) {
   });
   provider.listen(0, "127.0.0.1"); await once(provider, "listening");
   const baseUrl = `http://127.0.0.1:${(provider.address() as any).port}/v1`;
-  const env = { AGENT_RUNTIME_TOKEN: token, AGENT_API_KEY: "fixture", AGENT_ALLOWED_BASE_URLS: baseUrl, AGENT_TOOL_TIMEOUT_MS: "5000", AGENT_DATA_DIR: root };
+  const database = await isolatedDatabase();
+  const env = { AGENT_RUNTIME_TOKEN: token, AGENT_API_KEY: "fixture", AGENT_ALLOWED_BASE_URLS: baseUrl, AGENT_TOOL_TIMEOUT_MS: "5000", AGENT_DATA_DIR: root, AGENT_DATABASE_URL: database.url };
   let runtime = await startRuntime(env);
   const model = { id: "fixture", name: "Fixture", provider: "openai", api: "openai-completions", reasoning: false, input: ["text"], contextWindow: 32000, maxTokens: 1000,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, baseUrl } as Model<Api>;
@@ -79,6 +106,7 @@ async function fixture(t: any, reply: (body: any) => any) {
     await runtime.stop();
     provider.closeAllConnections(); await new Promise<void>(resolve => provider.close(() => resolve()));
     await rm(root, { recursive: true, force: true });
+    await database.drop();
   });
   return { create, async restartService() {
     await runtime.stop();

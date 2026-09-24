@@ -6657,8 +6657,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
           if (requestId) this.ctx.storage.kv.put(`external_agent_request:${id}`, requestId);
           else this.ctx.storage.kv.delete(`external_agent_request:${id}`);
         },
-        loadCredentials: () => this.ctx.storage.kv.get<import("@qaml-ai/agent-runtime").SessionCredentials>(`external_agent_credentials:${id}`) ?? (id === context.threadId ? this.ctx.storage.kv.get<import("@qaml-ai/agent-runtime").SessionCredentials>("external_agent_credentials") : undefined),
-        saveCredentials: (value: import("@qaml-ai/agent-runtime").SessionCredentials) => { this.ctx.storage.kv.put(`external_agent_credentials:${id}`, value); },
+        loadCredentials: () => this.ctx.storage.kv.get<import("@camelai/agent-runtime").SessionCredentials>(`external_agent_credentials:${id}`) ?? (id === context.threadId ? this.ctx.storage.kv.get<import("@camelai/agent-runtime").SessionCredentials>("external_agent_credentials") : undefined),
+        saveCredentials: (value: import("@camelai/agent-runtime").SessionCredentials) => { this.ctx.storage.kv.put(`external_agent_credentials:${id}`, value); },
         journalStore: {
           load: async (id: string) => this.ctx.storage.kv.get<any>(`external_agent_sdk:${id}`),
           save: async (id: string, journal: any) => { this.ctx.storage.kv.put(`external_agent_sdk:${id}`, journal); },

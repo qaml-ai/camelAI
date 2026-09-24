@@ -6,6 +6,7 @@
       "name": "chiridion-app",
       "dependencies": {
         "@ai-sdk/react": "^3.0.204",
+        "@camelai/agent-runtime": "^0.3.0",
         "@cloudflare/ai-chat": "^0.9.4",
         "@cloudflare/dynamic-workflows": "^0.1.1",
         "@cloudflare/sandbox": "^0.12.0",
@@ -16,7 +17,6 @@
         "@earendil-works/pi-agent-core": "0.80.6",
         "@earendil-works/pi-ai": "0.80.6",
         "@modelcontextprotocol/sdk": "^1.25.2",
-        "@qaml-ai/agent-runtime": "^0.2.0",
         "@react-email/components": "^1.0.7",
         "@react-email/render": "^2.0.4",
         "@react-pdf/renderer": "^4.3.2",
@@ -240,6 +240,8 @@
     "@babel/traverse": ["@babel/traverse@7.29.7", "", { "dependencies": { "@babel/code-frame": "^7.29.7", "@babel/generator": "^7.29.7", "@babel/helper-globals": "^7.29.7", "@babel/parser": "^7.29.7", "@babel/template": "^7.29.7", "@babel/types": "^7.29.7", "debug": "^4.3.1" } }, "sha512-EhlfNQtZ+NK22w5BM61ciuiq1m58ed33Wr1Xan//ZRTy6hgjnwyCffRYwzsGXdASJSUJ1guZILsErh1eQcl+zw=="],
 
     "@babel/types": ["@babel/types@7.29.7", "", { "dependencies": { "@babel/helper-string-parser": "^7.29.7", "@babel/helper-validator-identifier": "^7.29.7" } }, "sha512-4zBIxpPzowiZpusoFkyGVwakdRJUyuH5PxQ/PrqghfdFWWasvnCdPfQXHrenDai+gyLARulZjZowCOj6fjT4pA=="],
+
+    "@camelai/agent-runtime": ["@camelai/agent-runtime@0.3.0", "", { "dependencies": { "typebox": "1.1.38" } }, "sha512-8N0InR58ZLQ+Kdx6vVXwRc3g4BC3845OshTRaz+ibkSrOC4Donsz6/Y3dvztgnf2Q5B0EmZ4EID5g2udSlDIbg=="],
 
     "@cfworker/json-schema": ["@cfworker/json-schema@4.1.1", "", {}, "sha512-gAmrUZSGtKc3AiBL71iNWxDsyUC5uMaKKGdvzYsBoTW/xi42JQHl7eKV2OYzCUqvc+D2RCcf7EXY2iCyFIk6og=="],
 
@@ -592,8 +594,6 @@
     "@protobufjs/utf8": ["@protobufjs/utf8@1.1.1", "", {}, "sha512-oOAWABowe8EAbMyWKM0tYDKi8Yaox52D+HWZhAIJqQXbqe0xI/GV7FhLWqlEKreMkfDjshR5FKgi3mnle0h6Eg=="],
 
     "@puppeteer/browsers": ["@puppeteer/browsers@2.2.4", "", { "dependencies": { "debug": "^4.3.5", "extract-zip": "^2.0.1", "progress": "^2.0.3", "proxy-agent": "^6.4.0", "semver": "^7.6.2", "tar-fs": "^3.0.6", "unbzip2-stream": "^1.4.3", "yargs": "^17.7.2" }, "bin": { "browsers": "lib/cjs/main-cli.js" } }, "sha512-BdG2qiI1dn89OTUUsx2GZSpUzW+DRffR1wlMJyKxVHYrhnKoELSDxDd+2XImUkuWPEKk76H5FcM/gPFrEK1Tfw=="],
-
-    "@qaml-ai/agent-runtime": ["@qaml-ai/agent-runtime@0.2.0", "https://npm.pkg.github.com/download/@qaml-ai/agent-runtime/0.2.0/12612e425a52b3f578a48c7ea93063a6eac5f929", { "dependencies": { "typebox": "1.1.38" } }, "sha512-0ljqsnx29rQD5yI98hLh2r7N5RfqcGc8Iuhp+nJSPjgcig9JzB/rPR/Ekv+7rTQLO4Pppi0GJeSEeeiMyn7s7w=="],
 
     "@radix-ui/number": ["@radix-ui/number@1.1.1", "", {}, "sha512-MkKCwxlXTgz6CFoJx3pCwn07GKp36+aZyu/u2Ln2VrA5DcdyCZkASEDBTd8x5whTQQL5CiYf4prXKLcgQdv29g=="],
 

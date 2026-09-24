@@ -118,7 +118,7 @@
 		"@earendil-works/pi-agent-core": "0.80.6",
 		"@earendil-works/pi-ai": "0.80.6",
 		"@modelcontextprotocol/sdk": "^1.25.2",
-		"@qaml-ai/agent-runtime": "^0.2.0",
+		"@camelai/agent-runtime": "^0.3.0",
 		"@react-email/components": "^1.0.7",
 		"@react-email/render": "^2.0.4",
 		"@react-pdf/renderer": "^4.3.2",

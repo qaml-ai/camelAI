@@ -19,7 +19,7 @@ import {
 } from '@/lib/openai-subscription.server';
 import type { LlmProvider, LlmProviderConfigPublic } from '@/types';
 
-const VALID_PROVIDERS: LlmProvider[] = ['anthropic', 'bedrock', 'custom', 'openai', 'openrouter'];
+const VALID_PROVIDERS: LlmProvider[] = ['anthropic', 'bedrock', 'custom', 'openai', 'openrouter', 'requesty'];
 export const ANTHROPIC_API_KEY_VALIDATION_MODEL = 'claude-sonnet-5';
 const VALID_CUSTOM_AUTH_TYPES = ['bearer', 'x-api-key'] as const;
 const VALID_CUSTOM_APIS = ['openai-completions', 'openai-responses', 'anthropic-messages'] as const;
@@ -354,7 +354,7 @@ export async function action({ request, context, params }: Route.ActionArgs) {
       return Response.json({ success: true, key_hint: keyHint(apiKey) });
     }
 
-    if (provider === 'openai' || provider === 'openrouter') {
+    if (provider === 'openai' || provider === 'openrouter' || provider === 'requesty') {
       const apiKey = (body.api_key as string)?.trim();
       if (!apiKey) {
         return Response.json({ error: 'API key is required' }, { status: 400 });
@@ -516,6 +516,37 @@ export async function action({ request, context, params }: Route.ActionArgs) {
           {
             success: false,
             message: `${record.provider === 'openrouter' ? 'OpenRouter' : 'OpenAI'} API returned ${resp.status}: ${errorBody.slice(0, 200)}`,
+          },
+          { status: 200 }
+        );
+      }
+
+      if (record.provider === 'requesty') {
+        const resp = await fetch('https://router.requesty.ai/v1/models', {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${creds.api_key}`,
+          },
+        });
+
+        if (resp.ok) {
+          return Response.json({ success: true, message: 'Requesty API key is valid' });
+        }
+
+        const errorBody = await resp.text();
+        if (resp.status === 401 || resp.status === 403) {
+          return Response.json(
+            {
+              success: false,
+              message: 'Invalid Requesty API key. Please check and try again.',
+            },
+            { status: 200 }
+          );
+        }
+        return Response.json(
+          {
+            success: false,
+            message: `Requesty API returned ${resp.status}: ${errorBody.slice(0, 200)}`,
           },
           { status: 200 }
         );

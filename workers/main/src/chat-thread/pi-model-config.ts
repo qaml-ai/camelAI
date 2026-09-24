@@ -575,6 +575,24 @@ export async function resolvePiRequestConfig(
         : "https://openrouter.ai/api/v1",
     };
   }
+  if (byokAllowed && byok?.provider === "requesty" && byok.apiKey) {
+    return {
+      apiKey: byok.apiKey,
+      billingSource: "byok",
+      creditChargeable: false,
+      usageProvider: "requesty",
+      requestModelId: deps.modelMapping.requestyModel(resolved.modelId),
+      headers: {
+        ...deps.modelMapping.requestyAttributionHeaders(),
+        ...(resolved.provider === "anthropic"
+          ? { Authorization: `Bearer ${byok.apiKey}` }
+          : {}),
+      },
+      baseUrl: resolved.provider === "anthropic"
+        ? "https://router.requesty.ai"
+        : "https://router.requesty.ai/v1",
+    };
+  }
   if (byokAllowed && byok?.provider === "bedrock" && byok.apiKey && resolved.provider === "anthropic") {
     return {
       apiKey: byok.apiKey,
@@ -801,6 +819,9 @@ export async function resolveCurrentByokCredentials(
   }
   if (record.provider === "openrouter" && creds.api_key) {
     return withSubscription({ provider: "openrouter", apiKey: creds.api_key });
+  }
+  if (record.provider === "requesty" && creds.api_key) {
+    return withSubscription({ provider: "requesty", apiKey: creds.api_key });
   }
   if (record.provider === "custom" && creds.api_key && config.custom_base_url && config.custom_api) {
     return withSubscription({

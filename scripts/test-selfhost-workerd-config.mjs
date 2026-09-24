@@ -287,6 +287,7 @@ description: Follow ACME runbooks. Use when shipping internal tools.
     { provider: 'anthropic' },
     { provider: 'openai' },
     { provider: 'openrouter' },
+    { provider: 'requesty' },
     {
       provider: 'custom',
       baseUrl: 'https://llm.example.test/v1',

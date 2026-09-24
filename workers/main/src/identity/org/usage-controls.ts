@@ -349,6 +349,7 @@ export function resolveStrictUsageCost(
   const model = input.model.toLowerCase();
   const builtinProviderCompatible =
     provider === "openrouter" ||
+    provider === "requesty" ||
     provider === "compat" ||
     (provider === "openai" && model.includes("gpt")) ||
     (provider === "anthropic" && model.includes("claude")) ||

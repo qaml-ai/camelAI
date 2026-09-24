@@ -81,6 +81,7 @@ function getByokProviderLabel(provider: LlmProvider): string {
     provider === "anthropic" ||
     provider === "openai" ||
     provider === "openrouter" ||
+    provider === "requesty" ||
     provider === "bedrock"
   ) {
     return BYOK_PROVIDERS[provider].label;

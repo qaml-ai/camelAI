@@ -110,6 +110,7 @@ function isOnboardingByokProvider(
     value === "anthropic" ||
     value === "openai" ||
     value === "bedrock" ||
+    value === "requesty" ||
     value === "custom"
   );
 }

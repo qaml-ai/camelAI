@@ -2,7 +2,7 @@ import type { LlmProvider } from "@/types";
 
 export type OnboardingByokProvider = Extract<
   LlmProvider,
-  "anthropic" | "bedrock" | "custom" | "openai" | "openrouter"
+  "anthropic" | "bedrock" | "custom" | "openai" | "openrouter" | "requesty"
 >;
 
 export interface ByokProviderMeta {
@@ -46,6 +46,27 @@ export const BYOK_PROVIDERS: Record<OnboardingByokProvider, ByokProviderMeta> =
       warning: {
         title: "Your API key needs credits to work",
         body: "OpenRouter lets you generate a key without adding a payment method, but it won't process messages until you add a card and purchase credits.",
+      },
+    },
+    requesty: {
+      value: "requesty",
+      label: "Requesty",
+      fieldLabel: "Requesty API key",
+      placeholder: "rqsty-...",
+      getKeyUrl: "https://app.requesty.ai/api-keys",
+      getKeyLinkLabel: "Get a key",
+      settingsLinkLabel: "Open Requesty API settings",
+      requiresRegion: false,
+      description:
+        "Requesty is an LLM gateway that gives you access to Claude, GPT, Gemini, Grok, and many open-source models through a single key.",
+      steps: [
+        "Create a Requesty account",
+        "Load credits onto your account",
+        "Generate an API key",
+      ],
+      warning: {
+        title: "Your API key needs credits to work",
+        body: "Requesty lets you generate a key before adding a payment method, but it won't process messages until your account has credits.",
       },
     },
     anthropic: {
@@ -131,6 +152,7 @@ export const BYOK_PROVIDER_ORDER: OnboardingByokProvider[] = [
   "anthropic",
   "openai",
   "bedrock",
+  "requesty",
   "custom",
 ];
 

@@ -90,6 +90,7 @@ describe("llm provider config helpers", () => {
     expect(getDefaultLlmModel("anthropic")).toBe(DEFAULT_LLM_MODEL);
     expect(getDefaultLlmModel("openai")).toBe(DEFAULT_OPENAI_MODEL);
     expect(getDefaultLlmModel("openrouter")).toBe(DEFAULT_OPENROUTER_MODEL);
+    expect(getDefaultLlmModel("requesty")).toBe(DEFAULT_OPENROUTER_MODEL);
     expect(
       getDefaultLlmModel("bedrock", { awsRegion: "us-east-2" }),
     ).toBe("gpt-5.6-terra-bedrock");
@@ -126,6 +127,10 @@ describe("llm provider config helpers", () => {
       CAMEL_CODE_MODEL,
     ]);
     expect(getLlmModelOptions("openrouter").map((option) => option.value)).toEqual([
+      ...ANTHROPIC_MODELS,
+      ...OPENROUTER_OPENAI_COMPATIBLE_MODELS,
+    ]);
+    expect(getLlmModelOptions("requesty").map((option) => option.value)).toEqual([
       ...ANTHROPIC_MODELS,
       ...OPENROUTER_OPENAI_COMPATIBLE_MODELS,
     ]);

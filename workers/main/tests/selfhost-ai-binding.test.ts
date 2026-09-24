@@ -252,6 +252,40 @@ describe("selfhost ai binding", () => {
     });
   });
 
+  it("uses a fast inexpensive model for Requesty auxiliary generation", async () => {
+    const fetchMock = vi.fn(async () =>
+      Response.json({
+        choices: [{ message: { content: "Generated Requesty title" } }],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const binding = makeBinding({
+      provider: "requesty",
+      apiKey: "requesty-test-key",
+    });
+
+    await expect(
+      binding.run(AUXILIARY_AI_MODEL, {
+        messages: [{ role: "user", content: "Build a chart" }],
+        max_tokens: 24,
+      }),
+    ).resolves.toEqual({ response: "Generated Requesty title" });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://router.requesty.ai/v1/chat/completions");
+    expect(init.headers).toMatchObject({
+      Authorization: "Bearer requesty-test-key",
+      "HTTP-Referer": "https://camelai.dev",
+      "X-Title": "camelAI",
+    });
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      model: "gpt-5.6-luna",
+      max_tokens: 24,
+      reasoning: { effort: "none" },
+    });
+  });
+
   it.each([429, 524, 529])(
     "retries a transient Anthropic %i failure before returning success",
     async (status) => {

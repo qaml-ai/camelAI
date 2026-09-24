@@ -50,6 +50,7 @@ const VALID_PROVIDERS = new Set<LlmProvider>([
   "custom",
   "openai",
   "openrouter",
+  "requesty",
 ]);
 const VALID_CUSTOM_APIS = new Set<CustomLlmProviderApi>([
   "openai-completions",
@@ -132,7 +133,7 @@ export function getSelfhostAiProviderStatus(
       configured: true,
       valid: false,
       message:
-        "SELFHOST_AI_PROVIDER must be one of anthropic, bedrock, custom, openai, or openrouter.",
+        "SELFHOST_AI_PROVIDER must be one of anthropic, bedrock, custom, openai, openrouter, or requesty.",
     };
   }
 

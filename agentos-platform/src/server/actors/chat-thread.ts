@@ -1,0 +1,465 @@
+import { actor, event } from "rivetkit";
+import {
+  EMPTY_THREAD_STATE,
+  type AnswerQuestionInput,
+  type ChatEvent,
+  isSlashCommand,
+  type SlashCommand,
+  type ThreadState,
+  type TurnStatus,
+  type UiMessage,
+} from "../../shared/index.ts";
+import {
+  createAgentRuntime,
+  type AgentRuntime,
+} from "../chat/runtime.ts";
+import {
+  assertCanStartHostedTurn,
+  chargeTurn,
+  CreditDeniedError,
+} from "../chat/credits-gate.ts";
+import { runChatTurn, type SendResult } from "../chat/turn.ts";
+import { recordError, recordEvent } from "../observability.ts";
+import { getPlatform, type Platform } from "../platform/index.ts";
+
+export type ChatThreadCreateInput = {
+  threadId: string;
+  workspaceId: string;
+  orgId: string;
+  projectId?: string;
+  title?: string;
+  model?: string;
+};
+
+export type ChatThreadConnParams = {
+  userId?: string;
+};
+
+export type ChatThreadState = {
+  threadId: string;
+  workspaceId: string;
+  orgId: string;
+  projectId: string;
+  title: string;
+  model: string;
+  messages: UiMessage[];
+  threadState: ThreadState;
+  turnStatus: TurnStatus;
+  clientMessageIds: string[];
+};
+
+type ChatThreadVars = {
+  activeRuntime: AgentRuntime | null;
+  abortController: AbortController | null;
+  platform: Platform;
+};
+
+function requireCreateInput(input: ChatThreadCreateInput): ChatThreadCreateInput {
+  if (!input?.threadId?.trim()) {
+    throw new Error("chatThread create input requires threadId");
+  }
+  if (!input.workspaceId?.trim()) {
+    throw new Error("chatThread create input requires workspaceId");
+  }
+  if (!input.orgId?.trim()) {
+    throw new Error("chatThread create input requires orgId");
+  }
+  return input;
+}
+
+function initialState(rawInput: ChatThreadCreateInput): ChatThreadState {
+  const input = requireCreateInput(rawInput);
+  const title = input.title?.trim() || "New chat";
+  const model = input.model?.trim() || "mock";
+  return {
+    threadId: input.threadId,
+    workspaceId: input.workspaceId,
+    orgId: input.orgId,
+    projectId: input.projectId?.trim() || input.workspaceId,
+    title,
+    model,
+    messages: [],
+    threadState: {
+      ...EMPTY_THREAD_STATE,
+      title,
+      model,
+      currentTodos: [],
+    },
+    turnStatus: "idle",
+    clientMessageIds: [],
+  };
+}
+
+function runtimeForEnvironment(): AgentRuntime {
+  // This actor intentionally remains deterministic. Live AgentOS sessions are
+  // exposed by the separate chatThreadAgentOs actor.
+  return createAgentRuntime({ mode: "mock" });
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function slashCommandReply(
+  command: SlashCommand,
+  state: ChatThreadState,
+  messageCount: number,
+): string {
+  switch (command) {
+    case "/compact":
+      return "Context compacted (stub).";
+    case "/context":
+      return `Context contains ${messageCount} messages.`;
+    case "/debug":
+      return JSON.stringify({
+        orgId: state.orgId,
+        workspaceId: state.workspaceId,
+        threadId: state.threadId,
+        projectId: state.projectId,
+      });
+    case "/insights":
+      return "Insights generated (stub).";
+    case "/security-review":
+      return "Security review requested (stub).";
+  }
+}
+
+export function createChatThreadActor() {
+  return actor({
+    events: {
+      chatEvent: event<ChatEvent>(),
+    },
+    createState: (_c, input: ChatThreadCreateInput): ChatThreadState =>
+      initialState(input),
+    createVars: (): ChatThreadVars => ({
+      activeRuntime: null,
+      abortController: null,
+      platform: getPlatform(),
+    }),
+    createConnState: (_c, _params: ChatThreadConnParams): undefined =>
+      undefined,
+    onCreate: (c, input) => {
+      // createState owns initialization; this validates the persisted identity
+      // against the create request before the actor becomes available.
+      const validInput = requireCreateInput(input);
+      if (c.state.threadId !== validInput.threadId) {
+        throw new Error("chatThread state did not initialize from create input");
+      }
+    },
+    actions: {
+      async sendMessage(
+        c,
+        content: string,
+        clientMessageId: string,
+      ): Promise<SendResult> {
+        if (!content?.trim()) {
+          throw new Error("sendMessage requires non-empty content");
+        }
+        if (!clientMessageId?.trim()) {
+          throw new Error("sendMessage requires clientMessageId");
+        }
+        if (c.state.clientMessageIds.includes(clientMessageId)) {
+          return { status: "duplicate", messageId: clientMessageId };
+        }
+        if (c.state.turnStatus === "streaming") {
+          return { status: "busy" };
+        }
+
+        c.state.clientMessageIds.push(clientMessageId);
+        const normalizedContent = content.trim();
+        if (normalizedContent.startsWith("/")) {
+          const now = Date.now();
+          const assistantMessageId = `assistant:${clientMessageId}`;
+          const userMessage: UiMessage = {
+            id: clientMessageId,
+            role: "user",
+            parts: [{ type: "text", text: content, state: "done" }],
+            createdAt: now,
+          };
+
+          if (isSlashCommand(normalizedContent)) {
+            const assistantMessage: UiMessage = {
+              id: assistantMessageId,
+              role: "assistant",
+              parts: [
+                {
+                  type: "text",
+                  text: slashCommandReply(
+                    normalizedContent,
+                    c.state,
+                    c.state.messages.length,
+                  ),
+                  state: "done",
+                },
+              ],
+              createdAt: now,
+            };
+            c.state.messages.push(userMessage, assistantMessage);
+            await c.broadcast("chatEvent", {
+              type: "messageUpsert",
+              message: cloneJson(userMessage),
+            } satisfies ChatEvent);
+            await c.broadcast("chatEvent", {
+              type: "messageUpsert",
+              message: cloneJson(assistantMessage),
+            } satisfies ChatEvent);
+            return { status: "completed", messageId: assistantMessageId };
+          }
+
+          const error = `Unknown slash command: ${normalizedContent}`;
+          const errorId = `error:${clientMessageId}`;
+          const assistantMessage: UiMessage = {
+            id: assistantMessageId,
+            role: "assistant",
+            parts: [
+              {
+                type: "data-error",
+                id: errorId,
+                data: { error },
+              },
+            ],
+            createdAt: now,
+          };
+          const lastError = { id: errorId, error };
+          c.state.messages.push(userMessage, assistantMessage);
+          c.state.threadState.lastError = lastError;
+          c.state.turnStatus = "error";
+          await c.broadcast("chatEvent", {
+            type: "messageUpsert",
+            message: cloneJson(userMessage),
+          } satisfies ChatEvent);
+          await c.broadcast("chatEvent", {
+            type: "messageUpsert",
+            message: cloneJson(assistantMessage),
+          } satisfies ChatEvent);
+          await c.broadcast("chatEvent", {
+            type: "state",
+            state: { lastError },
+          } satisfies ChatEvent);
+          await c.broadcast("chatEvent", {
+            type: "turnStatus",
+            status: "error",
+            errorMessage: error,
+          } satisfies ChatEvent);
+          return { status: "error", messageId: assistantMessageId, error };
+        }
+
+        const platform = c.vars.platform;
+        const bypassCredits =
+          process.env.AGENT_BYOK === "1" || c.state.model.startsWith("byok:");
+        try {
+          assertCanStartHostedTurn({
+            billing: platform.billing,
+            orgId: c.state.orgId,
+            bypass: bypassCredits,
+          });
+        } catch (error) {
+          if (!(error instanceof CreditDeniedError)) {
+            throw error;
+          }
+          const messageId = `assistant:${clientMessageId}`;
+          const lastError = {
+            id: `error:${clientMessageId}`,
+            error: error.message,
+            title: "Credits required",
+            status: error.status,
+            errorType: error.code,
+          };
+          c.state.threadState.lastError = lastError;
+          c.state.turnStatus = "error";
+          await c.broadcast("chatEvent", {
+            type: "state",
+            state: { lastError },
+          } satisfies ChatEvent);
+          await c.broadcast("chatEvent", {
+            type: "turnStatus",
+            status: "error",
+            errorMessage: error.message,
+          } satisfies ChatEvent);
+          recordEvent({
+            event: "turns_denied_credits",
+            severity: "warn",
+            component: "chat-thread",
+            operation: "sendMessage",
+            status: "denied",
+            threadId: c.state.threadId,
+            workspaceId: c.state.workspaceId,
+            orgId: c.state.orgId,
+          });
+          return { status: "error", messageId, error: error.message };
+        }
+
+        const startedAt = Date.now();
+        recordEvent({
+          event: "turns_started",
+          component: "chat-thread",
+          operation: "sendMessage",
+          status: "started",
+          threadId: c.state.threadId,
+          workspaceId: c.state.workspaceId,
+          orgId: c.state.orgId,
+          meta: { model: c.state.model, creditChargeable: !bypassCredits },
+        });
+        const runtime = runtimeForEnvironment();
+        const abortController = new AbortController();
+        c.vars.activeRuntime = runtime;
+        c.vars.abortController = abortController;
+
+        const turnPromise = runChatTurn({
+          messages: c.state.messages,
+          broadcast: (chatEvent) => c.broadcast("chatEvent", chatEvent),
+          updateState: (patch) => {
+            Object.assign(c.state.threadState, patch);
+          },
+          runtime,
+          content,
+          clientMessageId,
+          turnStatus: () => c.state.turnStatus,
+          updateTurnStatus: (status) => {
+            c.state.turnStatus = status;
+          },
+          signal: abortController.signal,
+        });
+
+        try {
+          const result = await c.keepAwake(turnPromise);
+          const durationMs = Date.now() - startedAt;
+          if (result.status === "completed") {
+            try {
+              chargeTurn(
+                platform.billing,
+                platform.usage,
+                {
+                  orgId: c.state.orgId,
+                  workspaceId: c.state.workspaceId,
+                  threadId: c.state.threadId,
+                  bypass: bypassCredits,
+                },
+                { cents: 1, durationMs, model: c.state.model },
+              );
+            } catch (error) {
+              recordError({
+                event: "turn_charge_failed",
+                component: "chat-thread",
+                operation: "chargeTurn",
+                threadId: c.state.threadId,
+                workspaceId: c.state.workspaceId,
+                orgId: c.state.orgId,
+                durationMs,
+                error,
+              });
+              throw error;
+            }
+            recordEvent({
+              event: "turns_completed",
+              component: "chat-thread",
+              operation: "sendMessage",
+              status: "completed",
+              threadId: c.state.threadId,
+              workspaceId: c.state.workspaceId,
+              orgId: c.state.orgId,
+              durationMs,
+            });
+          } else if (result.status === "error") {
+            recordError({
+              event: "turn_failed",
+              component: "chat-thread",
+              operation: "sendMessage",
+              threadId: c.state.threadId,
+              workspaceId: c.state.workspaceId,
+              orgId: c.state.orgId,
+              durationMs,
+              error: result.error,
+            });
+          }
+          return result;
+        } finally {
+          if (c.vars.activeRuntime === runtime) {
+            c.vars.activeRuntime = null;
+            c.vars.abortController = null;
+          }
+        }
+      },
+
+      getMessages(c): UiMessage[] {
+        return cloneJson(c.state.messages);
+      },
+
+      getThreadState(c): {
+        threadState: ThreadState;
+        turnStatus: TurnStatus;
+        title: string;
+        model: string;
+      } {
+        return {
+          threadState: cloneJson(c.state.threadState),
+          turnStatus: c.state.turnStatus,
+          title: c.state.title,
+          model: c.state.model,
+        };
+      },
+
+      answerQuestion(
+        c,
+        questionId: string,
+        answers: AnswerQuestionInput["answers"],
+      ): { status: "answered" | "not_found"; answers?: Record<string, string> } {
+        const pending = c.state.threadState.pendingQuestion;
+        if (!pending || pending.questionId !== questionId) {
+          return { status: "not_found" };
+        }
+        c.state.threadState.pendingQuestion = null;
+        c.broadcast("chatEvent", {
+          type: "state",
+          state: { pendingQuestion: null },
+        } satisfies ChatEvent);
+        return { status: "answered", answers };
+      },
+
+      async requestStop(c): Promise<{ status: "stopped" | "idle" }> {
+        const runtime = c.vars.activeRuntime;
+        if (!runtime) {
+          return { status: "idle" };
+        }
+        c.vars.abortController?.abort();
+        await runtime.cancel();
+        c.state.turnStatus = "idle";
+        c.broadcast("chatEvent", {
+          type: "turnStatus",
+          status: "idle",
+        } satisfies ChatEvent);
+        return { status: "stopped" };
+      },
+
+      setTitle(c, title: string): string {
+        const normalized = title?.trim();
+        if (!normalized) {
+          throw new Error("setTitle requires non-empty title");
+        }
+        c.state.title = normalized;
+        c.state.threadState.title = normalized;
+        c.broadcast("chatEvent", {
+          type: "state",
+          state: { title: normalized },
+        } satisfies ChatEvent);
+        return normalized;
+      },
+
+      setModel(c, model: string): string {
+        const normalized = model?.trim();
+        if (!normalized) {
+          throw new Error("setModel requires non-empty model");
+        }
+        c.state.model = normalized;
+        c.state.threadState.model = normalized;
+        c.broadcast("chatEvent", {
+          type: "state",
+          state: { model: normalized },
+        } satisfies ChatEvent);
+        return normalized;
+      },
+    },
+  });
+}
+
+export const chatThread = createChatThreadActor();

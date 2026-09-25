@@ -1,10 +1,5 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 
-interface LocalConnectionsEnv {
-	CAMELAI_CONNECTIONS_RPC_URL?: string;
-	CONNECTIONS_RPC_URL?: string;
-}
-
 export interface ConnectionSummary {
 	id: string;
 	type: string;
@@ -59,85 +54,46 @@ export interface ConnectionInvokeRequest {
 	input?: unknown;
 }
 
-type RpcResponse<T> = {
-	ok?: boolean;
-	result?: T;
-	error?: {
-		message?: unknown;
-		code?: unknown;
-		data?: unknown;
-	};
-};
-
 const LEGACY_CONNECTION_INVOKE_METHOD = ["_", "_", "invoke"].join("");
 
-function connectionsRpcUrl(env: LocalConnectionsEnv): string {
-	const explicit = (env.CAMELAI_CONNECTIONS_RPC_URL ?? env.CONNECTIONS_RPC_URL ?? "").trim();
-	if (explicit) return explicit.replace(/\/+$/, "");
-
-	throw new Error("CAMELAI_CONNECTIONS_RPC_URL is not configured for local CONNECTIONS service");
-}
-
-async function callConnectionsRpc<T>(
-	env: LocalConnectionsEnv,
-	action: string,
-	params: Record<string, unknown> = {},
-): Promise<T> {
-	const response = await fetch(connectionsRpcUrl(env), {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			Accept: "application/json",
-		},
-		body: JSON.stringify({ action, ...params }),
-	});
-
-	const body = await response.json().catch(() => null) as RpcResponse<T> | null;
-	if (!response.ok || body?.ok === false || body?.error) {
-		throw new Error(
-			typeof body?.error?.message === "string"
-				? body.error.message
-				: `Connections RPC request failed (${response.status})`
-		);
-	}
-	if (!body || !("result" in body)) {
-		throw new Error("Connections RPC returned an empty response");
-	}
-	return body.result as T;
+function localUnavailable(): never {
+	throw new Error(
+		"CONNECTIONS is only available in apps deployed on camelAI; local dev has no connections service. Deploy the app to use workspace connections.",
+	);
 }
 
 /**
- * Local CONNECTIONS shim used by the starter template.
- * It speaks the connections RPC protocol to `CAMELAI_CONNECTIONS_RPC_URL`.
+ * Local CONNECTIONS placeholder used by the starter template.
+ * Deploy pipeline rewrites this binding to the platform's internal ConnectionsService;
+ * locally every call throws an error explaining that.
  */
-export class LocalConnectionsService extends WorkerEntrypoint<LocalConnectionsEnv> {
+export class LocalConnectionsService extends WorkerEntrypoint {
 	async list(): Promise<ConnectionSummary[]> {
-		return callConnectionsRpc<ConnectionSummary[]>(this.env, "list");
+		return localUnavailable();
 	}
 
-	async get(connection: string): Promise<ConnectionSummary> {
-		return callConnectionsRpc<ConnectionSummary>(this.env, "get", { connection });
+	async get(_connection: string): Promise<ConnectionSummary> {
+		return localUnavailable();
 	}
 
-	async tools(connection: string): Promise<ConnectionToolSummary[]> {
-		return callConnectionsRpc<ConnectionToolSummary[]>(this.env, "tools", { connection });
+	async tools(_connection: string): Promise<ConnectionToolSummary[]> {
+		return localUnavailable();
 	}
 
 	async methods(): Promise<ConnectionMethodCatalogEntry[]> {
-		return callConnectionsRpc<ConnectionMethodCatalogEntry[]>(this.env, "methods");
+		return localUnavailable();
 	}
 
-	async find(query: ConnectionFindQuery): Promise<ConnectionMethodCatalogEntry> {
-		return callConnectionsRpc<ConnectionMethodCatalogEntry>(this.env, "find", { query });
+	async find(_query: ConnectionFindQuery): Promise<ConnectionMethodCatalogEntry> {
+		return localUnavailable();
 	}
 
-	test: WorkerEntrypoint<LocalConnectionsEnv>["test"] & ((query: ConnectionFindQuery) => Promise<unknown>) = ((
-		query: ConnectionFindQuery,
-	) => callConnectionsRpc<unknown>(this.env, "test", { query })) as WorkerEntrypoint<LocalConnectionsEnv>["test"] &
-		((query: ConnectionFindQuery) => Promise<unknown>);
+	test: WorkerEntrypoint["test"] & ((query: ConnectionFindQuery) => Promise<unknown>) = (async (
+		_query: ConnectionFindQuery,
+	) => localUnavailable()) as WorkerEntrypoint["test"] & ((query: ConnectionFindQuery) => Promise<unknown>);
 
-	async invoke<T = unknown>(invoke: ConnectionInvokeRequest): Promise<T> {
-		return callConnectionsRpc<T>(this.env, "invoke", invoke as unknown as Record<string, unknown>);
+	async invoke<T = unknown>(_invoke: ConnectionInvokeRequest): Promise<T> {
+		return localUnavailable();
 	}
 
 	async [LEGACY_CONNECTION_INVOKE_METHOD](invoke: ConnectionInvokeRequest): Promise<unknown> {

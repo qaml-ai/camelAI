@@ -161,7 +161,6 @@ export default defineConfig({
         find: '@smithy/core/config',
         replacement: smithyCoreConfigNodeEntry,
       },
-      { find: '../../../.open-next/worker.js', replacement: path.resolve(__dirname, 'workers/main/src/__mocks__/opennext-handler.ts') },
     ],
   },
   test: {

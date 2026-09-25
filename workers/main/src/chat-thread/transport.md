@@ -40,7 +40,7 @@ request deadline; this is not a WebSocket connection timer.
 All receive requests share Worker authorization, reserved-header stripping and
 user-scoped connection keys. Socket frames share the POST callable/resume
 allow-list. Old SSE clients continue to work during a rollout. Workspace status
-SSE and the log-tail WebSocket are separate and unchanged.
+SSE is separate and unchanged.
 
 Operational events: `chat_ws_open`, `chat_poll_open` (client), and
 `chat_poll_session_started` (server). Existing error event names remain for

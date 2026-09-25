@@ -48,7 +48,6 @@ import {
   handleDiscordOAuthStart,
 } from './routes/discord-integrations.js';
 import { handleWorkspaceStatusStream } from './routes/status-stream.js';
-import { handleLogsWebSocket } from './routes/logs-websocket.js';
 import { handleOAuthMetadata, handleResourceMetadata } from './routes/well-known.js';
 import { handleStripeWebhook } from './routes/billing.js';
 import { handleWorkerAuth } from './routes/worker-auth.js';
@@ -255,9 +254,6 @@ const routes: Route[] = [
 
   // Workspace thread-status SSE stream (replaces the status WebSocket).
   { method: 'GET', path: /^\/api\/workspaces\/([^/]+)\/status\/stream$/, handler: handleWorkspaceStatusStream },
-
-  // Log-tail WebSocket (session-authenticated).
-  { method: 'GET', path: /^\/ws\/logs$/, handler: handleLogsWebSocket, websocket: true },
 ];
 
 // =============================================================================
@@ -456,8 +452,8 @@ export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
     const method = req.method;
-    // Only explicitly marked routes accept upgrades: chat and log tail. Other
-    // upgrade paths, including retired workspace status sockets, remain 404s.
+    // Only explicitly marked routes accept upgrades: chat. Other upgrade paths,
+    // including retired workspace status and log-tail sockets, remain 404s.
     const isWebSocket = req.headers.get('Upgrade') === 'websocket';
 
     for (const route of routes) {

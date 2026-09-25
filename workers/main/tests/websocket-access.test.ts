@@ -8,7 +8,7 @@
  *
  * The legacy upgrade routes are gone entirely (2026-08-15), so the guard cases
  * below are joined by removal regressions: an upgrade attempt must 404 without
- * running authorization, and /ws/logs must keep working.
+ * running authorization (the /ws/logs log tail included).
  */
 
 import { describe, it, expect } from 'vitest';
@@ -266,11 +266,8 @@ describe('Chat transport access guard', () => {
     expect((removalEvents[0].blobs as string[])[7]).toBe('/ws/workspaces/ws-abc/status');
   });
 
-  it('keeps answering the /ws/logs upgrade route (log tail)', async () => {
-    // The one surviving WebSocket route. Unauthenticated, it must reject on its own terms
-    // (400 for the missing scriptName) rather than fall into the blanket 404 —
-    // proof the `websocket: true` route machinery is still wired up.
-    const response = await SELF.fetch('http://example/ws/logs', {
+  it('404s the removed /ws/logs log-tail WebSocket route', async () => {
+    const response = await SELF.fetch('http://example/ws/logs?scriptName=app', {
       headers: {
         Upgrade: 'websocket',
         Connection: 'Upgrade',
@@ -278,6 +275,6 @@ describe('Chat transport access guard', () => {
       },
     });
 
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(404);
   });
 });

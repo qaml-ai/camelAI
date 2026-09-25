@@ -6,8 +6,11 @@
  * surface, and durable row storage was dominating Durable Object SQLite
  * rows-read cost under high log volume.
  *
- * Tradeoff: buffer contents are lost when the DO is evicted/hibernates with no
- * remaining state. Live WebSocket tails and warm getLogs/getStats still work.
+ * Written by the user-logs-tail worker (ingestLogs) and read over RPC by the
+ * admin logs page and the get-logs code-mode tool (getLogs/getStats).
+ *
+ * Tradeoff: buffer contents are lost when the DO is evicted with no remaining
+ * state; warm getLogs/getStats still work.
  *
  * `EphemeralWorkerLogsDO` is kept as a thin alias so any older bindings that
  * still point at that class name keep working.
@@ -39,7 +42,6 @@ export interface GetLogsOptions {
 }
 
 const MAX_LOGS = 10000;
-const REPLAY_LIMIT = 100;
 const LOG_WRITE_WINDOW_MS = 5_000;
 const MAX_LOG_WRITES_PER_WINDOW = 200;
 const LOG_SAMPLING_WARNING_LEVEL = 'warn';
@@ -63,54 +65,21 @@ export class WorkerLogsDO extends DurableObject<Env> {
   private hasWrittenSamplingWarningInWindow = false;
 
   /**
-   * Handle WebSocket upgrades for real-time log streaming.
-   */
-  async fetch(request: Request): Promise<Response> {
-    if (request.headers.get('Upgrade') !== 'websocket') {
-      return new Response('Expected WebSocket', { status: 426 });
-    }
-
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-
-    this.ctx.acceptWebSocket(server);
-
-    // Replay recent logs on connect (only what is still warm in memory).
-    const recent = await this.getLogs({ limit: REPLAY_LIMIT });
-    server.send(JSON.stringify({ type: 'replay', logs: recent.reverse() }));
-
-    return new Response(null, { status: 101, webSocket: client });
-  }
-
-  /**
-   * Handle WebSocket close (hibernation API).
-   */
-  webSocketClose(_ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): void {
-    // Connection closed, nothing to clean up (hibernation handles it).
-  }
-
-  /**
-   * Handle WebSocket error (hibernation API).
-   */
-  webSocketError(_ws: WebSocket, error: unknown): void {
-    console.error('[WorkerLogsDO] WebSocket error:', error);
-  }
-
-  /**
    * Ingest logs from the tail worker. Called via RPC.
    */
   async ingestLogs(events: LogEvent[]): Promise<void> {
     if (events.length === 0) return;
 
     const now = Date.now();
-    const insertedLogs: LogEntry[] = [];
+    let inserted = false;
 
     this.rotateWriteWindow(now);
 
     for (const event of events) {
       if (!this.canWriteEventInWindow()) {
         if (!this.hasWrittenSamplingWarningInWindow && this.tryConsumeWriteSlot()) {
-          insertedLogs.push(this.insertLog(createLogSamplingWarning(now)));
+          this.insertLog(createLogSamplingWarning(now));
+          inserted = true;
           this.hasWrittenSamplingWarningInWindow = true;
         }
         continue;
@@ -118,16 +87,17 @@ export class WorkerLogsDO extends DurableObject<Env> {
 
       this.tryConsumeWriteSlot();
 
-      insertedLogs.push(this.insertLog({
+      this.insertLog({
         timestamp: event.timestamp ?? now,
         level: event.level ?? 'log',
         message: event.message ?? null,
         exception: event.exception ?? null,
         scriptVersion: event.scriptVersion ?? null,
-      }));
+      });
+      inserted = true;
     }
 
-    if (insertedLogs.length === 0) return;
+    if (!inserted) return;
 
     this.logs.sort((left, right) => {
       if (left.timestamp !== right.timestamp) {
@@ -136,19 +106,6 @@ export class WorkerLogsDO extends DurableObject<Env> {
       return left.id - right.id;
     });
     this.pruneOldLogs();
-
-    // Broadcast to connected WebSocket clients.
-    const sockets = this.ctx.getWebSockets();
-    if (sockets.length > 0) {
-      const payload = JSON.stringify({ type: 'logs', logs: insertedLogs });
-      for (const ws of sockets) {
-        try {
-          ws.send(payload);
-        } catch {
-          // Client disconnected, ignore.
-        }
-      }
-    }
   }
 
   private rotateWriteWindow(now: number): void {
@@ -170,7 +127,7 @@ export class WorkerLogsDO extends DurableObject<Env> {
     return true;
   }
 
-  private insertLog(event: LogEvent): LogEntry {
+  private insertLog(event: LogEvent): void {
     const entry: LogEntry = {
       id: this.nextId++,
       timestamp: event.timestamp,
@@ -182,7 +139,6 @@ export class WorkerLogsDO extends DurableObject<Env> {
 
     this.logs.push(entry);
     this.lastLogAt = this.lastLogAt === null ? entry.timestamp : Math.max(this.lastLogAt, entry.timestamp);
-    return entry;
   }
 
   /**

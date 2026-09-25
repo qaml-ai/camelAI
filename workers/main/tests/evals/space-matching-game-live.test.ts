@@ -1574,7 +1574,7 @@ describe("space matching game deploy agent eval", () => {
         message: [
           "Create a web app that is a space themed matching game with a leaderboard where users can enter their name with their high score.",
           "The deployed app must expose a leaderboard API: GET /api/leaderboard returns JSON { entries: [{ name, score }, ...] } and POST /api/leaderboard accepts JSON { name, score } and persists the entry so it survives across requests.",
-          "This eval runtime injects CLOUDFLARE_API_BASE_URL and CLOUDFLARE_API_TOKEN, so do not ask for login or real Cloudflare credentials.",
+          "Deploys go through the platform deploy_project tool, which already has Cloudflare access, so do not ask for login or Cloudflare credentials.",
         ].join(" "),
       });
       const finalProjects = await workspaceFs.listProjectsForMigrationReset();

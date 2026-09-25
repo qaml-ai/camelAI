@@ -1171,15 +1171,6 @@ export async function fetchConfiguredCreditPacks(
     });
 }
 
-export async function getBillingAccessSnapshot(
-  env: StripeBillingEnv,
-  orgId: string,
-): Promise<OrgBillingAccessSnapshot | null> {
-  const org = await getOrgStub(env, orgId).getInfo();
-  if (!org) return null;
-  return getBillingAccessSnapshotForOrg(org);
-}
-
 export function getBillingAccessSnapshotForOrg(
   org: Organization,
 ): OrgBillingAccessSnapshot {

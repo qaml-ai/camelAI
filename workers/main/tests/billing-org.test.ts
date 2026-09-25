@@ -4,7 +4,7 @@ import { createOrg, createUser, type TestEnv } from "./test-helpers";
 import {
   createSubscriptionCheckoutSession,
   deleteStripeTestCustomerForOrg,
-  getBillingAccessSnapshot,
+  getBillingAccessSnapshotForOrg,
   syncOrgSubscriptionFromStripe,
   type StripeBillingEnv,
   type StripeSubscription,
@@ -248,7 +248,7 @@ describe("OrgDO billing grant idempotency", () => {
       expect.any(Number),
     );
 
-    const snapshot = await getBillingAccessSnapshot(stripeBillingEnv(), org.id);
+    const snapshot = getBillingAccessSnapshotForOrg(synced!);
     expect(snapshot?.billing_status).toBe("trialing");
     expect(snapshot?.billing_plan).toBe("starter");
   });

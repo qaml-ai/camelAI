@@ -55,10 +55,7 @@ import {
 import { handleWorkspaceStatusStream } from './routes/status-stream.js';
 import { handleLogsWebSocket } from './routes/logs-websocket.js';
 import { handleOAuthMetadata, handleResourceMetadata } from './routes/well-known.js';
-import {
-  handleInternalBillingAccess,
-  handleStripeWebhook,
-} from './routes/billing.js';
+import { handleStripeWebhook } from './routes/billing.js';
 import { handleEmailSendProxy } from './routes/email-send-proxy.js';
 import { handleWorkerAuth } from './routes/worker-auth.js';
 import { requireChatWebSocketAccess } from './helpers/auth.js';
@@ -221,8 +218,7 @@ const routes: Route[] = [
   // CF API Proxy
   { method: 'ALL', path: /^\/client\/v4\//, handler: handleCfProxy },
 
-  // Billing
-  { method: 'GET', path: /^\/api\/internal\/billing\/access$/, handler: handleInternalBillingAccess },
+  // Stripe billing webhook
   { method: 'POST', path: /^\/api\/billing\/stripe\/webhook$/, handler: handleStripeWebhook },
 
   // Email sending proxy (for sandbox containers)

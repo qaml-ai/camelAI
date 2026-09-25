@@ -31,7 +31,6 @@ import {
 
 // Route handlers
 import { handleCfProxy } from './routes/cf-proxy.js';
-import { handleConnectionsRpc } from './routes/connections-rpc.js';
 import { handleAdminMcp } from './routes/admin-mcp.js';
 import { handleThreadPreview } from './routes/threads.js';
 import { handleOAuthStart, handleOAuthCallback } from './routes/oauth.js';
@@ -236,9 +235,6 @@ const routes: Route[] = [
 
   // Email sending proxy (for sandbox containers)
   { method: 'POST', path: /^\/api\/email\/send$/, handler: handleEmailSendProxy },
-
-  // Connections RPC (internal - sandbox/project-runtime tools)
-  { method: 'ALL', path: /^\/rpc\/connections$/, handler: handleConnectionsRpc },
 
   // OAuth discovery (well-known paths can't be React Router routes)
   { method: 'GET', path: /^\/\.well-known\/oauth-authorization-server(\/.*)?$/, handler: handleOAuthMetadata },

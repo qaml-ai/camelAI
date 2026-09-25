@@ -85,7 +85,6 @@
 		"test": "vitest",
 		"test:run": "vitest run",
 		"test:all": "bun run test:run && bun run test:workers && bun run test:discord-bridge",
-		"test:connections:rpc": "node scripts/test-connections-rpc.mjs",
 		"test:connections:local-db": "tsx scripts/test-local-database-mcp.ts",
 		"test:stripe": "RUN_STRIPE_INTEGRATION_TESTS=1 vitest run tests/stripe-integration.test.ts",
 		"eval:chat-group-icons:live": "bun scripts/evaluate-chat-group-icon-selection.mjs",

@@ -116,7 +116,6 @@ export interface ConnectionSummary {
       url: string;
       transport: ProviderMcpDefinition['transport'];
       authStrategy: string;
-      brokerPath: string;
       docsUrl?: string;
       notes?: string;
     };
@@ -819,7 +818,6 @@ function summarizeConnection(record: WorkspaceIntegrationRecord, context: Connec
                 ? 'connected_credentials_broker'
                 : nativeMcp.authStrategy
             ),
-            brokerPath: '/rpc/connections',
             docsUrl: nativeMcp.broker?.docsUrl ?? nativeMcp.docsUrl,
             notes: nativeMcp.broker?.notes,
           },

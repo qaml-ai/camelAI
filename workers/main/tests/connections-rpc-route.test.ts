@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { handleConnectionsRpc } from '../src/routes/connections-rpc.js';
+import { handleAuthenticatedConnectionsRpc } from '../src/routes/connections-rpc.js';
 import type { ConnectionsRuntimeEnv } from '../src/connections-runtime.js';
 import type { WorkspaceIntegrationRecord } from '../src/workspace.js';
 
@@ -26,9 +26,7 @@ function integration(overrides: Partial<WorkspaceIntegrationRecord>): WorkspaceI
   };
 }
 
-function envWith(records: WorkspaceIntegrationRecord[]): ConnectionsRuntimeEnv & {
-  SANDBOX_PROXY_SECRET: string;
-} {
+function envWith(records: WorkspaceIntegrationRecord[]): ConnectionsRuntimeEnv {
   const orgStub = {
     getWorkspaceIntegrations: async () => records,
     getWorkspaceIntegration: async (_workspaceId: string, integrationId: string) =>
@@ -39,7 +37,6 @@ function envWith(records: WorkspaceIntegrationRecord[]): ConnectionsRuntimeEnv &
 
   return {
     INTEGRATION_SECRET_KEY: 'test-secret',
-    SANDBOX_PROXY_SECRET: 'sandbox-secret',
     ORG: {
       idFromName: (name: string) => name,
       get: () => orgStub,
@@ -47,35 +44,20 @@ function envWith(records: WorkspaceIntegrationRecord[]): ConnectionsRuntimeEnv &
   };
 }
 
+const AUTH = { orgId: 'org_1', workspaceId: 'ws_1', userId: 'user_1', threadId: 'thread_1' };
+
 function rpcRequest(body: unknown): Request {
-  return new Request('https://worker.test/rpc/connections', {
+  return new Request('http://connections.internal/', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-sandbox-secret': 'sandbox-secret',
-      'x-chiridion-org-id': 'org_1',
-      'x-chiridion-workspace-id': 'ws_1',
-      'x-chiridion-user-id': 'user_1',
-      'x-chiridion-thread-id': 'thread_1',
       'cf-ray': 'ray_1',
     },
     body: JSON.stringify(body),
   });
 }
 
-function forgedSandboxRpcRequestWithoutSecret(body: unknown): Request {
-  return new Request('https://worker.test/rpc/connections', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-chiridion-org-id': 'org_forged',
-      'x-chiridion-workspace-id': 'ws_forged',
-    },
-    body: JSON.stringify(body),
-  });
-}
-
-describe('connections RPC route', () => {
+describe('connections RPC', () => {
   it('lists connection methods through the stateless RPC endpoint', async () => {
     const records = [
       integration({ id: 'pg_main', integration_type: 'postgres', name: 'main' }),
@@ -90,13 +72,7 @@ describe('connections RPC route', () => {
     ];
     const req = rpcRequest({ action: 'methods' });
 
-    const response = await handleConnectionsRpc({
-      req,
-      env: envWith(records) as never,
-      ctx: {} as ExecutionContext,
-      url: new URL(req.url),
-      match: [] as unknown as RegExpMatchArray,
-    });
+    const response = await handleAuthenticatedConnectionsRpc(req, envWith(records) as never, AUTH);
 
     const body = await response.json() as {
       result?: Array<{ alias: string; methods: Array<{ name: string; tool?: string }> }>;
@@ -127,13 +103,7 @@ describe('connections RPC route', () => {
     ];
     const req = rpcRequest({ action: 'list' });
 
-    const response = await handleConnectionsRpc({
-      req,
-      env: envWith(records) as never,
-      ctx: {} as ExecutionContext,
-      url: new URL(req.url),
-      match: [] as unknown as RegExpMatchArray,
-    });
+    const response = await handleAuthenticatedConnectionsRpc(req, envWith(records) as never, AUTH);
 
     const body = await response.json() as { result?: unknown };
     const connections = body.result;
@@ -159,13 +129,7 @@ describe('connections RPC route', () => {
     ];
     const req = rpcRequest({ action: 'verify', query: { id: 'custom_api' } });
 
-    const response = await handleConnectionsRpc({
-      req,
-      env: envWith(records) as never,
-      ctx: {} as ExecutionContext,
-      url: new URL(req.url),
-      match: [] as unknown as RegExpMatchArray,
-    });
+    const response = await handleAuthenticatedConnectionsRpc(req, envWith(records) as never, AUTH);
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
@@ -200,32 +164,12 @@ describe('connections RPC route', () => {
       method: 'missingMethod',
     });
 
-    const response = await handleConnectionsRpc({
-      req,
-      env: env as never,
-      ctx: {} as ExecutionContext,
-      url: new URL(req.url),
-      match: [] as unknown as RegExpMatchArray,
-    });
+    const response = await handleAuthenticatedConnectionsRpc(req, env as never, AUTH);
 
     expect(response.status).toBe(404);
     const point = observabilityWrite.mock.calls[0]![0] as { blobs: string[] };
     expect(point.blobs[8]).toBe('thread_1');
     expect(point.blobs[12]).toBe('ray_1');
     expect(point.blobs[13]).toBe('resend');
-  });
-
-  it('rejects RPC requests without a valid sandbox proxy secret', async () => {
-    const req = forgedSandboxRpcRequestWithoutSecret({ action: 'list' });
-
-    const response = await handleConnectionsRpc({
-      req,
-      env: envWith([]) as never,
-      ctx: {} as ExecutionContext,
-      url: new URL(req.url),
-      match: [] as unknown as RegExpMatchArray,
-    });
-
-    expect(response.status).toBe(401);
   });
 });

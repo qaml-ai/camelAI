@@ -108,7 +108,7 @@ async function callConnectionsRpc<T>(
 
 /**
  * Local CONNECTIONS shim used by the starter template.
- * It talks only to the unified `/rpc/connections` endpoint.
+ * It speaks the connections RPC protocol to `CAMELAI_CONNECTIONS_RPC_URL`.
  */
 export class LocalConnectionsService extends WorkerEntrypoint<LocalConnectionsEnv> {
 	async list(): Promise<ConnectionSummary[]> {

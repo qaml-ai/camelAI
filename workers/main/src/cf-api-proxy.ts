@@ -305,7 +305,6 @@ export interface CfApiProxyEnv {
   CHAT_THREAD: DurableObjectNamespace;
   WORKER_BASE_URL?: string;
   SANDBOX_PROXY_SECRET?: string;
-  PROJECT_RUNTIME_PROXY_SECRET?: string;
   CF_ZONE_ID?: string;
   CF_CUSTOM_HOSTNAME_FALLBACK?: string;
   CF_CUSTOM_HOSTNAME_CNAME_TARGET?: string;

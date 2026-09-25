@@ -67,10 +67,6 @@ function withLocalDevVars(config: WorkerConfig): Partial<WorkerConfig> | void {
   const localAppVanityDomain = process.env.LOCAL_APP_VANITY_DOMAIN;
   const localAppIframeDomain = process.env.LOCAL_APP_IFRAME_DOMAIN;
   const sandboxProxySecret = process.env.SANDBOX_PROXY_SECRET;
-  const projectRuntimeServiceUrl = process.env.PROJECT_RUNTIME_SERVICE_URL;
-  const projectRuntimeDockerProxyBaseUrl =
-    process.env.PROJECT_RUNTIME_DOCKER_PROXY_BASE_URL;
-  const projectRuntimeProxySecret = process.env.PROJECT_RUNTIME_PROXY_SECRET;
   // E2E deterministic LLM: route model calls to the local replay stub.
   const testLlmReplayUrl = process.env.TEST_LLM_REPLAY_URL;
 
@@ -87,9 +83,6 @@ function withLocalDevVars(config: WorkerConfig): Partial<WorkerConfig> | void {
     !localAppVanityDomain &&
     !localAppIframeDomain &&
     !sandboxProxySecret &&
-    !projectRuntimeServiceUrl &&
-    !projectRuntimeDockerProxyBaseUrl &&
-    !projectRuntimeProxySecret &&
     !testLlmReplayUrl
   ) {
     return;
@@ -119,15 +112,6 @@ function withLocalDevVars(config: WorkerConfig): Partial<WorkerConfig> | void {
       ...(localAppIframeDomain ? { LOCAL_APP_IFRAME_DOMAIN: localAppIframeDomain } : {}),
       ...(sandboxProxySecret
         ? { SANDBOX_PROXY_SECRET: sandboxProxySecret }
-        : {}),
-      ...(projectRuntimeServiceUrl
-        ? { PROJECT_RUNTIME_SERVICE_URL: projectRuntimeServiceUrl }
-        : {}),
-      ...(projectRuntimeDockerProxyBaseUrl
-        ? { PROJECT_RUNTIME_DOCKER_PROXY_BASE_URL: projectRuntimeDockerProxyBaseUrl }
-        : {}),
-      ...(projectRuntimeProxySecret
-        ? { PROJECT_RUNTIME_PROXY_SECRET: projectRuntimeProxySecret }
         : {}),
     },
   };

@@ -31,7 +31,6 @@ import {
 
 // Route handlers
 import { handleCfProxy } from './routes/cf-proxy.js';
-import { handleMcp } from './routes/mcp.js';
 import { handleConnectionsRpc } from './routes/connections-rpc.js';
 import { handleAdminMcp } from './routes/admin-mcp.js';
 import { handleThreadPreview } from './routes/threads.js';
@@ -75,7 +74,6 @@ import { text } from './helpers/response.js';
 import { normalizePathForObservability, recordObservabilityEvent } from './observability.js';
 
 // Re-exports for wrangler
-export { ChiridionMcp } from './mcp-handler.js';
 export {
   AdminJsExecDoBinding,
   AdminJsExecRuntimeBinding,
@@ -118,6 +116,13 @@ export { DbQuerySandbox } from './db-query-sandbox.js';
 // Compatibility shim for environments whose deployed migration history still
 // references the old AdminIndexDO class. The app uses the D1-backed index now.
 export class AdminIndexDO extends DurableObject<Env> {}
+
+// Compatibility shim for the retired /mcp server's Durable Object. Prod and
+// the dev configs delete the class with a deleted_classes migration, but
+// staging's migration list is squashed and never records the class being
+// created, so Wrangler refuses a deleted_classes step there. Staging keeps
+// the (unbound) class until its migration history can express the delete.
+export class ChiridionMcp extends DurableObject<Env> {}
 
 // Compatibility shim for deployed migration histories that contain the retired
 // Cloudflare Sandbox SDK experiment. Projects are DO+R2 backed now.
@@ -235,9 +240,6 @@ const routes: Route[] = [
 
   // Connections RPC (internal - sandbox/project-runtime tools)
   { method: 'ALL', path: /^\/rpc\/connections$/, handler: handleConnectionsRpc },
-
-  // MCP (internal - sandbox agent)
-  { method: 'ALL', path: /^\/mcp(\/|$)/, handler: handleMcp },
 
   // OAuth discovery (well-known paths can't be React Router routes)
   { method: 'GET', path: /^\/\.well-known\/oauth-authorization-server(\/.*)?$/, handler: handleOAuthMetadata },

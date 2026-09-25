@@ -162,9 +162,6 @@ export default defineConfig({
         replacement: smithyCoreConfigNodeEntry,
       },
       { find: '../../../.open-next/worker.js', replacement: path.resolve(__dirname, 'workers/main/src/__mocks__/opennext-handler.ts') },
-      // Mock MCP handler to avoid @modelcontextprotocol/sdk ajv compatibility issues in workers runtime
-      // Match any path ending in mcp-handler.js from the workers/main/src directory
-      { find: /.*\/mcp-handler\.js$/, replacement: path.resolve(__dirname, 'workers/main/src/__mocks__/mcp-handler.ts') },
     ],
   },
   test: {

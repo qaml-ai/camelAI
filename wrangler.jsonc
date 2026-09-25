@@ -197,7 +197,6 @@
 			{ "name": "SLACK_TEAM_REGISTRY", "class_name": "SlackTeamRegistryDO" },
 			{ "name": "WORKSPACE", "class_name": "WorkspaceDO" },
 			{ "name": "WORKSPACE_CRON", "class_name": "WorkspaceCronDO" },
-			{ "name": "MCP_OBJECT", "class_name": "ChiridionMcp" },
 				{ "name": "WORKER_LOGS", "class_name": "WorkerLogsDO" },
 				{ "name": "WORKSPACE_FS", "class_name": "WorkspaceFilesystemDO" },
 				{ "name": "ANALYSIS_SANDBOX", "class_name": "AnalysisSandbox" },
@@ -246,7 +245,8 @@
 		{ "tag": "v31", "new_sqlite_classes": ["AnalysisSandbox"] },
 		{ "tag": "v32", "deleted_classes": ["WarehouseSandbox"] },
 		{ "tag": "v33", "new_sqlite_classes": ["DbQuerySandbox"] },
-		{ "tag": "v34", "new_sqlite_classes": ["SignupDO"] }
+		{ "tag": "v34", "new_sqlite_classes": ["SignupDO"] },
+		{ "tag": "v35", "deleted_classes": ["ChiridionMcp"] }
 		],
 	"env": {
 		"prod": {
@@ -386,7 +386,6 @@
 			{ "name": "SLACK_TEAM_REGISTRY", "class_name": "SlackTeamRegistryDO" },
 					{ "name": "WORKSPACE", "class_name": "WorkspaceDO" },
 					{ "name": "WORKSPACE_CRON", "class_name": "WorkspaceCronDO" },
-					{ "name": "MCP_OBJECT", "class_name": "ChiridionMcp" },
 					{ "name": "WORKER_LOGS", "class_name": "WorkerLogsDO" },
 				]
 			}
@@ -529,7 +528,6 @@
 			{ "name": "SLACK_TEAM_REGISTRY", "class_name": "SlackTeamRegistryDO" },
 					{ "name": "WORKSPACE", "class_name": "WorkspaceDO" },
 					{ "name": "WORKSPACE_CRON", "class_name": "WorkspaceCronDO" },
-					{ "name": "MCP_OBJECT", "class_name": "ChiridionMcp" },
 					{ "name": "WORKER_LOGS", "class_name": "WorkerLogsDO" },
 				]
 			}
@@ -673,7 +671,6 @@
 			{ "name": "SLACK_TEAM_REGISTRY", "class_name": "SlackTeamRegistryDO" },
 					{ "name": "WORKSPACE", "class_name": "WorkspaceDO" },
 					{ "name": "WORKSPACE_CRON", "class_name": "WorkspaceCronDO" },
-					{ "name": "MCP_OBJECT", "class_name": "ChiridionMcp" },
 					{ "name": "WORKER_LOGS", "class_name": "WorkerLogsDO" },
 				]
 			}
@@ -817,7 +814,6 @@
 			{ "name": "SLACK_TEAM_REGISTRY", "class_name": "SlackTeamRegistryDO" },
 					{ "name": "WORKSPACE", "class_name": "WorkspaceDO" },
 					{ "name": "WORKSPACE_CRON", "class_name": "WorkspaceCronDO" },
-					{ "name": "MCP_OBJECT", "class_name": "ChiridionMcp" },
 					{ "name": "WORKER_LOGS", "class_name": "WorkerLogsDO" },
 				]
 			}

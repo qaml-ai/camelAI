@@ -108,7 +108,6 @@ export interface ChatEnv extends WorkspaceFilesystemEnv {
   DETERMINISTIC_AUTOMATION_WORKFLOWS?: Workflow;
   WORKER_LOGS?: DurableObjectNamespace<WorkerLogsDO>;
   PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<import("../project-build-sandbox.js").ProjectBuildSandbox>;
-  MCP_OBJECT: DurableObjectNamespace;
   APP_KV: KVNamespace;
   R2_BUCKET: R2Bucket;
   IMAGES?: ImagesBinding;

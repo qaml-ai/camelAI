@@ -25,7 +25,6 @@ export interface CloudflareEnv {
   WORKSPACE: DurableObjectNamespace<WorkspaceDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   WORKSPACE_CRON: DurableObjectNamespace<WorkspaceCronDO>;
-  MCP_OBJECT: DurableObjectNamespace;
   WORKER_LOGS: DurableObjectNamespace<WorkerLogsDO>;
   TELEGRAM_REGISTRY?: DurableObjectNamespace<TelegramRegistryDO>;
   SLACK_TEAM_REGISTRY?: DurableObjectNamespace<SlackTeamRegistryDO>;

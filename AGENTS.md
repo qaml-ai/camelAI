@@ -38,9 +38,9 @@ worker-side). There is no in-repo Go sandbox-host or data-proxy tree.
 - `src/routes.ts` - Imperative React Router route config. Add page/API routes here.
 - `src/routes/api/` - React Router API routes for most user-facing REST (billing checkout, workspaces, chat groups, etc.).
 - `src/components/ui/` - shadcn/ui components.
-- `workers/main/` - Main Cloudflare Worker, Durable Objects, HTTP/SSE transports (plus the log-tail WebSocket `/ws/logs`), MCP, admin APIs, proxies, container image Dockerfiles.
+- `workers/main/` - Main Cloudflare Worker, Durable Objects, HTTP/SSE transports (plus the log-tail WebSocket `/ws/logs`), admin MCP, admin APIs, proxies, container image Dockerfiles.
 - `workers/main/src/identity/` - `UserDO` / `OrgDO` and related identity helpers (`auth.ts` is a compatibility barrel).
-- `workers/main/src/routes/` - Worker-native HTTP (SSE streams, the log-tail WebSocket `/ws/logs`, Stripe webhook, data-proxy, MCP, most `/api/admin/*` on Hono). Prefer documenting new paths here vs `src/routes/api/` — see **API routing** below.
+- `workers/main/src/routes/` - Worker-native HTTP (SSE streams, the log-tail WebSocket `/ws/logs`, Stripe webhook, data-proxy, admin MCP, most `/api/admin/*` on Hono). Prefer documenting new paths here vs `src/routes/api/` — see **API routing** below.
 - `workers/dispatcher/` - Workers for Platforms dispatcher for deployed user apps.
 - `workers/app-usage-guard/` - Account-wide Durable Object SQLite usage monitor and reversible app quarantine Worker; see `docs/deployed-app-usage-guard-design.md`.
 - `workers/bedrock-provider/` - AI Gateway custom provider translating Anthropic-style requests to Bedrock.
@@ -65,7 +65,7 @@ Two HTTP surfaces share the main worker:
 | Surface | Location | Typical contents |
 | --- | --- | --- |
 | React Router | `src/routes/api/` | Session-cookie user REST (workspaces, billing checkout, uploads, chat groups) |
-| Worker-native | `workers/main/src/routes/` | SSE streams, log-tail WebSocket (`/ws/logs`), Stripe webhook, MCP, data-proxy, most bearer admin REST |
+| Worker-native | `workers/main/src/routes/` | SSE streams, log-tail WebSocket (`/ws/logs`), Stripe webhook, admin MCP, data-proxy, most bearer admin REST |
 
 `workers/main/src/index.ts` routes some paths (e.g. `/api/admin/*`) to worker modules before React Router SSR. When adding an API, match an existing neighbor; do not invent a third pattern.
 
@@ -117,7 +117,7 @@ in-process (identity via `trustedIdentity` from the per-container eval deploy co
 `eval-deploy-context.ts`). The deploy then publishes to the `chiridion-platform-evals`
 dispatch namespace and registers in OrgDO exactly like production — so `list_apps` /
 `set_preview` and `AgentEvalSessionResult.deployedApps` surface the app through the normal
-app path with no eval-specific branches in `mcp-handler`/`chat-thread-do`. The testing-grounds
+app path with no eval-specific branches in `chat-thread-do`. The testing-grounds
 host comes from the eval env's `WORKER_BASE_URL` / `LOCAL_APP_VANITY_DOMAIN`
 (`*.evals.camelai.app`), and virtual bindings resolve against the staging main worker
 (`CF_WORKER_NAME`); these are pinned in `wrangler.test.jsonc`. Real deploy is the default for
@@ -200,7 +200,6 @@ Important DOs and runtime classes live primarily in `workers/main/src/`:
 - `admin-index-do.ts` - `AdminIndexDO`, admin indexes and dashboard-style aggregates.
 - `org-slug-registry.ts` - `OrgSlugDO`, atomic org slug ownership.
 - `email-handle-registry.ts` - `EmailHandleDO`, email handle ownership.
-- `mcp-handler.ts` - Internal MCP agent/tools.
 - `*-mcp.ts` / `connections-runtime.ts` - Per-provider connection MCP wrappers and shared connection runtime (candidate for an `integrations/` folder).
 - `observability.ts` - Shared Cloudflare Analytics Engine event/error writer. New structured instrumentation should go through this helper instead of calling `writeDataPoint` directly.
 - `lake-streams.ts` + `chat-thread/transcript-lake.ts` - Transcript / tool-call export to Iceberg tables in R2 Data Catalog via Cloudflare Pipelines. Both bindings are optional and every helper no-ops without them, so dev/tests/self-host never export. Tool durations are measured live (Pi records no tool start timestamp) and stamped as `uiMetadata.toolDurationMs`. Design, setup commands, and the privacy posture: `config/pipelines/README.md`. Verify with `bun run test:workers -- transcript-lake`.

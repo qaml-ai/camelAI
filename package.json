@@ -115,7 +115,6 @@
 		"@conform-to/zod": "^1.15.1",
 		"@earendil-works/pi-agent-core": "0.80.6",
 		"@earendil-works/pi-ai": "0.80.6",
-		"@modelcontextprotocol/sdk": "^1.25.2",
 		"@react-email/components": "^1.0.7",
 		"@react-email/render": "^2.0.4",
 		"@react-pdf/renderer": "^4.3.2",

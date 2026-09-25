@@ -49,7 +49,7 @@ function getWorkflowId(args: Record<string, unknown>): string {
   return value.trim();
 }
 
-export function formatDeterministicAutomation(
+function formatDeterministicAutomation(
   automation: DeterministicAutomationRecord,
   includeSource = false,
 ): Record<string, unknown> {

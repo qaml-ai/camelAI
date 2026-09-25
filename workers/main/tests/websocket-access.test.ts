@@ -266,9 +266,8 @@ describe('Chat transport access guard', () => {
     expect((removalEvents[0].blobs as string[])[7]).toBe('/ws/workspaces/ws-abc/status');
   });
 
-  it('keeps answering the /ws/logs upgrade route (wrangler tail)', async () => {
-    // The one surviving WebSocket route: the CF API proxy hands this URL back
-    // as the tail endpoint. Unauthenticated, it must reject on its own terms
+  it('keeps answering the /ws/logs upgrade route (log tail)', async () => {
+    // The one surviving WebSocket route. Unauthenticated, it must reject on its own terms
     // (400 for the missing scriptName) rather than fall into the blanket 404 —
     // proof the `websocket: true` route machinery is still wired up.
     const response = await SELF.fetch('http://example/ws/logs', {

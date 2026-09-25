@@ -92,7 +92,6 @@ export { SecureFetchBinding } from './secure-fetch-service.js';
 export { AppScreenshotBinding } from './app-screenshot-binding.js';
 export { AppBrowserBinding } from './app-browser-binding.js';
 export { WorkspaceFilesystemDO } from './workspace-filesystem-do.js';
-export { EvalSandbox } from './eval-sandbox.js';
 export { AnalysisSandbox } from './analysis-sandbox.js';
 export { ProjectBuildSandbox } from './project-build-sandbox.js';
 export { DbQuerySandbox } from './db-query-sandbox.js';
@@ -257,7 +256,7 @@ const routes: Route[] = [
   // Workspace thread-status SSE stream (replaces the status WebSocket).
   { method: 'GET', path: /^\/api\/workspaces\/([^/]+)\/status\/stream$/, handler: handleWorkspaceStatusStream },
 
-  // Log-tail WebSocket (cf-api-proxy hands this URL back as the tail endpoint).
+  // Log-tail WebSocket (session-authenticated).
   { method: 'GET', path: /^\/ws\/logs$/, handler: handleLogsWebSocket, websocket: true },
 ];
 

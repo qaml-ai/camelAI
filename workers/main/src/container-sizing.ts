@@ -32,9 +32,6 @@ export const ANALYSIS_INSTANCE_TYPE = "standard-3";
 /** Trusted node SQL/export runner; no user code, bounded result buffers. */
 export const DB_QUERY_INSTANCE_TYPE = "standard-1";
 
-/** Eval harness only — tiny control plane, no real build/analysis load. */
-export const EVAL_INSTANCE_TYPE = "lite";
-
 /** Builds finish in seconds; no reason to bill 10m of idle memory/disk. */
 export const PROJECT_BUILD_SLEEP_AFTER = "2m";
 

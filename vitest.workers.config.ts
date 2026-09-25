@@ -137,7 +137,6 @@ export default defineConfig({
         compatibilityDate: '2026-03-24',
         compatibilityFlags: ['nodejs_compat'],
         durableObjects: {
-          EVAL_SANDBOX: sandboxDurableObject('EvalSandbox', 'camelai-eval-sandbox:latest'),
           PROJECT_BUILD_SANDBOX: sandboxDurableObject('ProjectBuildSandbox', 'camelai-eval-sandbox:latest'),
           ANALYSIS_SANDBOX: sandboxDurableObject('AnalysisSandbox', 'camelai-analysis-sandbox:latest'),
         },

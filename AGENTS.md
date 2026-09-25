@@ -110,22 +110,21 @@ bun run deploy:bedrock-provider:prod
 
 ### Real-deploy evals (testing grounds)
 
-Agent evals deploy apps for real to a dedicated testing-grounds namespace so they are
-actually usable. The eval sandbox runs inside Miniflare, so `eval-sandbox.ts` intercepts the
-container's Cloudflare API traffic and forwards it to the production `proxyCloudflareApi`
-in-process (identity via `trustedIdentity` from the per-container eval deploy context in
-`eval-deploy-context.ts`). The deploy then publishes to the `chiridion-platform-evals`
-dispatch namespace and registers in OrgDO exactly like production — so `list_apps` /
-`set_preview` and `AgentEvalSessionResult.deployedApps` surface the app through the normal
-app path with no eval-specific branches in `chat-thread-do`. The testing-grounds
-host comes from the eval env's `WORKER_BASE_URL` / `LOCAL_APP_VANITY_DOMAIN`
-(`*.evals.camelai.app`), and virtual bindings resolve against the staging main worker
-(`CF_WORKER_NAME`); these are pinned in `wrangler.test.jsonc`. Real deploy is the default for
-agent eval runs whenever `CF_API_TOKEN` is set; `EVAL_REAL_DEPLOY=0` disables it (deploy evals
-then skip). Served by the evals dispatcher (`workers/dispatcher/wrangler.evals.jsonc`); the
-namespace + DNS routes are created out-of-band. Eval apps are kept (no cleanup). Live-data
-bindings (`DATA_PROXY`/`CONNECTIONS`) won't resolve to the eval's local workspace;
-self-contained apps render fully.
+Agent evals deploy apps for real to a dedicated testing-grounds namespace so they are actually
+usable. The agent deploys with the normal `deploy_project` tool, which uploads via
+`deployWorkerModulesDirect` (`direct-dispatch-deploy.ts`) straight to the Cloudflare API from
+the worker, so nothing eval-specific sits in the deploy path. It publishes to the
+`chiridion-platform-evals` dispatch namespace and registers in OrgDO exactly like production —
+so `list_apps` / `set_preview` and `AgentEvalSessionResult.deployedApps` surface the app through
+the normal app path with no eval-specific branches in `chat-thread-do`. The testing-grounds host
+comes from the eval env's `WORKER_BASE_URL` / `LOCAL_APP_VANITY_DOMAIN` (`*.evals.camelai.app`),
+and virtual bindings resolve against the staging main worker (`CF_WORKER_NAME`); these are
+pinned in `wrangler.test.jsonc`. Real deploy is the default for agent eval runs whenever
+`CF_API_TOKEN` is set; `EVAL_REAL_DEPLOY=0` disables it (deploy evals then skip; the gate is
+`isRealEvalDeployEnabled` in `eval-deploy-context.ts`). Served by the evals dispatcher
+(`workers/dispatcher/wrangler.evals.jsonc`); the namespace + DNS routes are created out-of-band.
+Eval apps are kept (no cleanup). Live-data bindings (`DATA_PROXY`/`CONNECTIONS`) won't resolve
+to the eval's local workspace; self-contained apps render fully.
 
 ### Eval results viewer (`workers/eval-reports/`)
 
@@ -174,9 +173,9 @@ once cloudflare/workerd#6794 ships in a release.
 
 Separately, vitest-pool-workers leaves the eval container + sidecar running after each run
 (workers-sdk#14242); they accumulate and exhaust the host. `run-agent-eval.mjs` prunes leftover
-`EvalSandbox` containers before/after each run. The sweep is global, so it's only safe when one
-eval runs at a time (the normal local case); an orchestrator that runs evals concurrently must set
-`EVAL_MANAGED_CLEANUP=1` to skip it and own cleanup itself.
+`ProjectBuildSandbox` / `AnalysisSandbox` containers before/after each run. The sweep is global,
+so it's only safe when one eval runs at a time (the normal local case); an orchestrator that
+runs evals concurrently must set `EVAL_MANAGED_CLEANUP=1` to skip it and own cleanup itself.
 
 ## Frontend Conventions
 
@@ -275,7 +274,7 @@ if any of them drift apart.
 
 ## Proxies And Bindings
 
-- Sandbox containers do not get a generic Worker API proxy or any header-authenticated Worker routes (the sandbox-host proxy auth, `validateSandboxProxy`/`SANDBOX_PROXY_SECRET`, is gone). Container access to Worker services goes through DO-side outbound handlers that attach scope (for example the analysis sandbox's `connections.internal`), and deploys through `cf-api-proxy.ts` require an in-process `trustedIdentity`.
+- Sandbox containers do not get a generic Worker API proxy or any header-authenticated Worker routes (the sandbox-host proxy auth, `validateSandboxProxy`/`SANDBOX_PROXY_SECRET`, is gone). Container access to Worker services goes through DO-side outbound handlers that attach scope (for example the analysis sandbox's `connections.internal`), and deploys go through the platform's own deploy tools (`deployWorkerModulesDirect` in `direct-dispatch-deploy.ts`), not through the container.
 - BYOK credentials are scoped by org/thread and should not be placed into container environment variables.
 - User app deploys can rewrite internal service bindings such as the data proxy, virtual AI binding, and virtual R2 bucket. Relevant files include `workers/main/src/cf-api-proxy.ts`, `data-proxy-service.ts`, `ai-virtual-binding.ts`, and `r2-virtual-bucket.ts`.
 - Outbound database traffic egresses from the sandbox host VM IP `20.46.233.68` (surfaced in direct database connection setup UIs for firewall/VPC allowlisting; constant in `src/lib/sandbox-network.ts`).

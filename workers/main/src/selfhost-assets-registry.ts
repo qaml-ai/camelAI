@@ -1,4 +1,3 @@
-export const SELFHOST_ASSETS_SESSION_PREFIX = "selfhost:assets:session:";
 export const SELFHOST_ASSETS_PREFIX = "selfhost:assets:";
 export const SELFHOST_ASSET_OBJECT_PREFIX = "selfhost-assets";
 
@@ -13,20 +12,6 @@ export interface SelfhostAssetsRecord {
   appId: string;
   createdAt: string;
   manifest: Record<string, SelfhostAssetManifestEntry>;
-}
-
-export interface SelfhostAssetsUploadSession {
-  schemaVersion: 1;
-  token: string;
-  appId: string;
-  workspaceId: string;
-  orgId: string;
-  createdAt: string;
-  manifest: Record<string, { hash: string; size?: number }>;
-}
-
-export function selfhostAssetsSessionKey(token: string): string {
-  return `${SELFHOST_ASSETS_SESSION_PREFIX}${token}`;
 }
 
 export function selfhostAssetsKey(appId: string): string {

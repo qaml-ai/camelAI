@@ -25,48 +25,6 @@ export interface CreateApiTokenInput {
 }
 
 /**
- * Generate a secure token ID with tok_ prefix
- */
-function generateTokenId(): string {
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  const base64 = btoa(String.fromCharCode(...bytes))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=/g, '');
-  return `tok_${base64}`;
-}
-
-/**
- * Create an API token and store it in KV
- */
-export async function createApiToken(
-  kv: KVNamespace,
-  input: CreateApiTokenInput
-): Promise<{ tokenId: string; tokenData: ApiTokenData }> {
-  const tokenId = generateTokenId();
-  const tokenData: ApiTokenData = {
-    org_id: input.orgId,
-    user_id: input.userId,
-    integration_id: input.integrationId ?? null,
-    name: input.name,
-    scopes: input.scopes,
-    created_at: Date.now(),
-    expires_at: input.expiresAt ?? null,
-  };
-
-  const kvOptions: KVNamespacePutOptions = {};
-  if (input.expiresAt) {
-    // Set TTL in seconds
-    kvOptions.expirationTtl = Math.max(1, Math.floor((input.expiresAt - Date.now()) / 1000));
-  }
-
-  await kv.put(tokenId, JSON.stringify(tokenData), kvOptions);
-
-  return { tokenId, tokenData };
-}
-
-/**
  * Validate an API token from KV
  * Returns null if token doesn't exist or is expired
  */
@@ -86,11 +44,4 @@ export async function validateApiToken(
   }
 
   return tokenData;
-}
-
-/**
- * Delete an API token from KV
- */
-export async function deleteApiToken(kv: KVNamespace, tokenId: string): Promise<void> {
-  await kv.delete(tokenId);
 }

@@ -31,25 +31,6 @@ import {
 
 export { CLOUDFLARE_ACCESS_AUTH_SOURCE } from "../signed-session.js";
 
-export {
-  emailMatchesRequiredDomain,
-  firstString,
-  humanizeOrgName,
-  normalizeEmail,
-  resolveOrgCandidates,
-  ProxyAuthUnavailableError as CloudflareAccessUnavailableError,
-  verifyProxyJwt as verifyAccessJwt,
-} from "./proxy-auth-core.js";
-
-export type {
-  ProxyAuthConfig as AccessConfig,
-  ProxyAuthValidationEnv as AccessValidationEnv,
-  ProxyIdentity as AccessIdentity,
-  ProxyJwtPayload as AccessJwtPayload,
-  ProxyOrgCandidate as AccessOrgCandidate,
-  ProxySessionValidation as AccessSessionValidation,
-} from "./proxy-auth-core.js";
-
 export const ACCESS_JWT_HEADER = "Cf-Access-Jwt-Assertion";
 const ACCESS_COOKIE_NAME = "CF_Authorization";
 // KV namespaces for the org mapping. These literals are persisted in APP_KV and
@@ -194,24 +175,5 @@ export async function validateAccessBackedSignedSession(
     CLOUDFLARE_ACCESS_PROVIDER,
     session.user_email,
     session.org_id,
-  );
-}
-
-/**
- * Check that the request carries a valid Access assertion for `expectedEmail`
- * whose current org candidates map to `orgId`. Read-only.
- */
-export function validateAccessIdentityMapsToOrg(
-  request: Request,
-  env: ProxyAuthValidationEnv,
-  expectedEmail: string | null | undefined,
-  orgId: string | null | undefined,
-): Promise<ProxySessionValidation> {
-  return validateProxyIdentityMapsToOrg(
-    request,
-    env,
-    CLOUDFLARE_ACCESS_PROVIDER,
-    expectedEmail,
-    orgId,
   );
 }

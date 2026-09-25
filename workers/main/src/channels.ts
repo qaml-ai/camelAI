@@ -34,15 +34,6 @@ export interface ChannelAddress {
   connectionId?: string | null;
 }
 
-export interface ChannelAttachment {
-  path: string;
-  filename: string;
-  contentType: string;
-  size?: number;
-  source: ChannelKind;
-  remoteId?: string | null;
-}
-
 export interface ChannelThreadInput extends ChannelAddress {
   title: string;
   createdBy?: string | null;

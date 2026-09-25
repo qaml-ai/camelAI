@@ -225,29 +225,6 @@ export function isChatBillingOrCreditError(error: unknown): boolean {
   return isBillingOrCreditError(message.toLowerCase());
 }
 
-export function chatStartFailureStatus(
-  status: "busy" | "error" | string,
-  error: unknown,
-): number {
-  if (status === "busy") return 409;
-  if (isChatBillingOrCreditError(error)) return 402;
-  return 500;
-}
-
-export function chatBillingActionPayload(status: number):
-  | {
-      actionHref: string;
-      actionLabel: string;
-    }
-  | undefined {
-  return status === 402
-    ? {
-        actionHref: "/settings/organization/usage?action=topup",
-        actionLabel: "Top up credits",
-      }
-    : undefined;
-}
-
 function isCurrentTurnByok(context: ChatApiErrorContext): boolean {
   if (context.billingSource === "hosted") return false;
   if (context.billingSource === "byok") return true;

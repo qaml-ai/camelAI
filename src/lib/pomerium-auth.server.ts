@@ -18,14 +18,10 @@ import {
 } from "./proxy-auth.server";
 
 export {
-  POMERIUM_AUTH_SOURCE,
   getPomeriumLogoutUrl,
   isPomeriumConfigured,
-  validatePomeriumBackedSignedSession,
   type PomeriumEnv,
 } from "../../workers/main/src/helpers/pomerium-session";
-
-export type PomeriumSessionResult = ProxyAuthSessionResult;
 
 export function tryPomeriumSilentLogin(
   request: Request,

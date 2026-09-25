@@ -17,13 +17,9 @@ import {
   normalizedOptional,
   parseList,
   parseOrgMap,
-  validateProxyIdentityMapsToOrg,
   type ProxyAuthConfig,
   type ProxyAuthProvider,
-  type ProxyAuthValidationEnv,
   type ProxyIdentity,
-  type ProxyJwtPayload,
-  type ProxySessionValidation,
 } from "./proxy-auth-core.js";
 import { POMERIUM_AUTH_SOURCE } from "../signed-session.js";
 
@@ -119,29 +115,3 @@ export const POMERIUM_PROVIDER: ProxyAuthProvider = {
     Promise.resolve(payload as ProxyIdentity),
   getLogoutUrl: getPomeriumLogoutUrl,
 };
-
-/**
- * Validate a Pomerium-backed signed session cookie against the live assertion
- * on the request. Sessions from other auth sources are always "valid".
- * Read-only.
- */
-export async function validatePomeriumBackedSignedSession(
-  request: Request,
-  env: ProxyAuthValidationEnv & PomeriumEnv,
-  session: {
-    auth_source?: string | null;
-    user_email?: string | null;
-    org_id?: string | null;
-  },
-): Promise<ProxySessionValidation> {
-  if (session.auth_source !== POMERIUM_AUTH_SOURCE) return "valid";
-  return validateProxyIdentityMapsToOrg(
-    request,
-    env,
-    POMERIUM_PROVIDER,
-    session.user_email,
-    session.org_id,
-  );
-}
-
-export type { ProxyJwtPayload as PomeriumJwtPayload };

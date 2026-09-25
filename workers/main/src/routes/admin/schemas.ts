@@ -578,20 +578,6 @@ export const SpamOrgIdsResponseSchema = z.object({
   count: z.number().int(),
 });
 
-export const OrgUsageAnalyticsItemSchema = z.object({
-  org_id: z.string(),
-  total_cost_usd: z.number(),
-  total_requests: z.number().int(),
-  spend_7d: z.number(),
-  spend_30d: z.number(),
-  windows: z.array(WindowSpendSchema).optional(),
-});
-
-export const OrgUsageAnalyticsResponseSchema = z.object({
-  items: z.array(OrgUsageAnalyticsItemSchema),
-  count: z.number().int(),
-});
-
 export const AdminOrgListItemSchema = OrgSchema.extend({
   total_requests: z.number().int().optional(),
   total_cost_usd: z.number().optional(),

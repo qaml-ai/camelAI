@@ -152,10 +152,3 @@ export async function validateSignedToken(
     return null;
   }
 }
-
-/**
- * Check if a token string is a signed token (vs KV-stored token)
- */
-export function isSignedToken(token: string): boolean {
-  return token.startsWith(TOKEN_PREFIX);
-}

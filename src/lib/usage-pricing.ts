@@ -518,18 +518,3 @@ export function calculateEffectiveUsageCostUsd(usage: UsageTokens): number {
   }
   return calculateUsageCostUsd(usage);
 }
-
-export function hasBillableUsageTokens(usage: UsageTokens): boolean {
-  return (
-    usage.inputTokens > 0 ||
-    usage.outputTokens > 0 ||
-    usage.cacheCreationInputTokens > 0 ||
-    usage.cacheReadInputTokens > 0 ||
-    (usage.reportedCostUsd !== null &&
-      usage.reportedCostUsd !== undefined &&
-      usage.reportedCostUsd > 0) ||
-    (usage.upstreamInferenceCostUsd !== null &&
-      usage.upstreamInferenceCostUsd !== undefined &&
-      usage.upstreamInferenceCostUsd > 0)
-  );
-}

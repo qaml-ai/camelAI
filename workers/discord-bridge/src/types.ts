@@ -47,8 +47,6 @@ export interface DiscordGatewayHealthState {
   fatalReason: string | null;
 }
 
-export type DiscordQueueMessage = DiscordEventQueueMessage;
-
 export interface DiscordGatewayEnvelope {
   op: number;
   d?: unknown;
@@ -91,26 +89,10 @@ export interface DiscordGuildDeletePayload {
   unavailable?: boolean;
 }
 
-export interface DiscordChannelDeletePayload {
-  id?: string;
-  guild_id?: string;
-  parent_id?: string | null;
-  type?: number;
-}
-
 export type DiscordReducedMessageEvent = DiscordBridgeDeliveryMessage;
 export type DiscordReducedLifecycleEvent = DiscordBridgeDeliveryLifecycle;
 export type DiscordDeliveryPayload = DiscordBridgeDelivery;
 export type DiscordChannelBinding = DiscordBridgeBinding;
-
-export interface DiscordThreadBinding {
-  threadId: string;
-  guildId: string;
-  parentChannelId: string;
-  integrationId: string;
-  orgId: string;
-  workspaceId: string;
-}
 
 export interface DiscordRolePayload {
   id: string;

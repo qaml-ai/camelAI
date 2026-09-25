@@ -18,19 +18,11 @@ import {
   type ProxyAuthSessionResult,
 } from "./proxy-auth.server";
 
-export {
-  CLOUDFLARE_ACCESS_AUTH_SOURCE,
-  validateAccessBackedSignedSession,
-  validateAccessIdentityMapsToOrg,
-  type AccessValidationEnv,
-  type CloudflareAccessEnv,
-} from "../../workers/main/src/helpers/access-session";
+export type { CloudflareAccessEnv } from "../../workers/main/src/helpers/access-session";
 
 // Generic guard; dispatches by the session's auth source so it covers every
 // reverse-proxy provider, not just Cloudflare Access.
 export { requireProxyMappedOrg as requireAccessMappedOrg } from "./proxy-auth.server";
-
-export type CloudflareAccessSessionResult = ProxyAuthSessionResult;
 
 export function isCloudflareAccessConfigured(env: CloudflareAccessEnv): boolean {
   return Boolean(getAccessConfig(env));

@@ -1103,7 +1103,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   private projectActivityInstance?: ChatThreadProjectActivity;
   private automationRunInstance?: ChatThreadAutomationRun;
   private uiMirrorInstance?: ChatThreadUiMirror;
-  private legacyUiMessageHealingPromise: Promise<void> | null = null;
   /**
    * Revision-keyed LRU of derived render WINDOWS — one page each, never the whole
    * settled transcript (that cache is what made a 5,232-row thread fatal to load).

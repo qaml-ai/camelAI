@@ -112,16 +112,6 @@ export function createDeleteSessionCookie(request: Request): string {
   return buildCookie(getSessionCookieName(hostname), '', 0, isSecure(request), getCookieDomain(hostname));
 }
 
-export function withSessionCookies(headers: Headers, sessionId: string, request: Request): Headers {
-  headers.append('Set-Cookie', createSessionCookie(sessionId, request));
-  return headers;
-}
-
-export function withDeleteSessionCookies(headers: Headers, request: Request): Headers {
-  headers.append('Set-Cookie', createDeleteSessionCookie(request));
-  return headers;
-}
-
 // --- Signed session cookie ---
 
 export async function getSignedSessionFromRequest(

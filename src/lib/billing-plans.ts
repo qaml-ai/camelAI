@@ -316,8 +316,3 @@ export function getBillableTeamInviteSeatChange(
 ): BillableTeamInviteSeatChange | null {
   return getBillableTeamInviteSeatChangeForCount(org, occupiedSeatCount, 1);
 }
-
-export function formatLimitCount(value: number | null, noun: string): string {
-  if (value === null) return `unlimited ${noun}`;
-  return `${value.toLocaleString()} ${noun}`;
-}

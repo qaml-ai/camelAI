@@ -274,7 +274,7 @@ if any of them drift apart.
 
 ## Proxies And Bindings
 
-- Sandbox containers do not get a generic Worker API proxy or any header-authenticated Worker routes (the sandbox-host proxy auth, `validateSandboxProxy`/`SANDBOX_PROXY_SECRET`, is gone). Container access to Worker services goes through DO-side outbound handlers that attach scope (for example the analysis sandbox's `connections.internal`), and deploys go through the platform's own deploy tools (`deployWorkerModulesDirect` in `direct-dispatch-deploy.ts`), not through the container.
+- Sandbox containers do not get a generic Worker API proxy or any header-authenticated Worker routes. Container access to Worker services goes through DO-side outbound handlers that attach scope (for example the analysis sandbox's `connections.internal`), and deploys go through the platform's own deploy tools (`deployWorkerModulesDirect` in `direct-dispatch-deploy.ts`), not through the container.
 - BYOK credentials are scoped by org/thread and should not be placed into container environment variables.
 - User app deploys can rewrite internal service bindings such as the data proxy, virtual AI binding, and virtual R2 bucket. Relevant files include `workers/main/src/cf-api-proxy.ts`, `data-proxy-service.ts`, `ai-virtual-binding.ts`, and `r2-virtual-bucket.ts`.
 - Outbound database traffic egresses from the sandbox host VM IP `20.46.233.68` (surfaced in direct database connection setup UIs for firewall/VPC allowlisting; constant in `src/lib/sandbox-network.ts`).

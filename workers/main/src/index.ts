@@ -56,11 +56,6 @@ import { handleWorkspaceStatusStream } from './routes/status-stream.js';
 import { handleLogsWebSocket } from './routes/logs-websocket.js';
 import { handleOAuthMetadata, handleResourceMetadata } from './routes/well-known.js';
 import {
-  handleMssqlQuery,
-  handleMysqlQuery,
-  handlePostgresQuery,
-} from './routes/data-proxy.js';
-import {
   handleInternalBillingAccess,
   handleStripeWebhook,
 } from './routes/billing.js';
@@ -226,10 +221,7 @@ const routes: Route[] = [
   // CF API Proxy
   { method: 'ALL', path: /^\/client\/v4\//, handler: handleCfProxy },
 
-  // Data proxy (for sandbox containers)
-  { method: 'POST', path: /^\/api\/mssql\/query$/, handler: handleMssqlQuery },
-  { method: 'POST', path: /^\/api\/postgres\/query$/, handler: handlePostgresQuery },
-  { method: 'POST', path: /^\/api\/mysql\/query$/, handler: handleMysqlQuery },
+  // Billing
   { method: 'GET', path: /^\/api\/internal\/billing\/access$/, handler: handleInternalBillingAccess },
   { method: 'POST', path: /^\/api\/billing\/stripe\/webhook$/, handler: handleStripeWebhook },
 

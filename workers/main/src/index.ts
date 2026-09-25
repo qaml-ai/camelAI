@@ -3,13 +3,11 @@
  *
  * Routes:
  * - /client/v4/* → CF API proxy for wrangler deploys
- * - /mcp/* → MCP protocol
  * - /api/auth/:provider → User OAuth (Google, GitHub)
  * - /api/integrations/slack/* → Slack OAuth
  * - /api/integrations/slack/events → Slack Events API webhook
  * - /api/integrations/telegram/webhook → Telegram Bot API webhook
  * - email() → Workspace email ingress (Cloudflare Email Routing)
- * - /api/threads/:id/preview → Thread preview API
  * - /agents/chat-thread/:thread → ChatThreadDO WebSocket chat
  * - /agents/chat-thread/:thread/sse → HTTP polling fallback / legacy SSE
  * - /agents/chat-thread/:thread/call → ChatThreadDO chat frames (POST)
@@ -32,7 +30,6 @@ import {
 // Route handlers
 import { handleCfProxy } from './routes/cf-proxy.js';
 import { handleAdminMcp } from './routes/admin-mcp.js';
-import { handleThreadPreview } from './routes/threads.js';
 import { handleOAuthStart, handleOAuthCallback } from './routes/oauth.js';
 import {
   handleSlackOAuthStart,
@@ -227,9 +224,6 @@ const routes: Route[] = [
   // OAuth discovery (well-known paths can't be React Router routes)
   { method: 'GET', path: /^\/\.well-known\/oauth-authorization-server(\/.*)?$/, handler: handleOAuthMetadata },
   { method: 'GET', path: /^\/\.well-known\/oauth-protected-resource(\/.*)?$/, handler: handleResourceMetadata },
-
-  // Thread Preview API
-  { method: 'POST', path: /^\/api\/threads\/([^/]+)\/preview$/, handler: handleThreadPreview },
 
   // User OAuth
   { method: 'GET', path: /^\/api\/auth\/(google|github)$/, handler: handleOAuthStart },

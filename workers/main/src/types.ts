@@ -145,8 +145,6 @@ export interface Env
   CF_GATEWAY_TOKEN?: string;
   AI_GATEWAY_AUTH_TOKEN?: string;
   BEDROCK_REGION?: string;
-  // Sandbox proxy shared secret
-  SANDBOX_PROXY_SECRET?: string;
   LOCAL_ARTIFACTS_BASE_URL?: string;
   LOCAL_ARTIFACTS_SECRET?: string;
   LOCAL_APP_VANITY_DOMAIN?: string;

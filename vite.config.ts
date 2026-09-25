@@ -66,7 +66,6 @@ function withLocalDevVars(config: WorkerConfig): Partial<WorkerConfig> | void {
   const cfWorkerName = process.env.CF_WORKER_NAME;
   const localAppVanityDomain = process.env.LOCAL_APP_VANITY_DOMAIN;
   const localAppIframeDomain = process.env.LOCAL_APP_IFRAME_DOMAIN;
-  const sandboxProxySecret = process.env.SANDBOX_PROXY_SECRET;
   // E2E deterministic LLM: route model calls to the local replay stub.
   const testLlmReplayUrl = process.env.TEST_LLM_REPLAY_URL;
 
@@ -82,7 +81,6 @@ function withLocalDevVars(config: WorkerConfig): Partial<WorkerConfig> | void {
     !cfWorkerName &&
     !localAppVanityDomain &&
     !localAppIframeDomain &&
-    !sandboxProxySecret &&
     !testLlmReplayUrl
   ) {
     return;
@@ -110,9 +108,6 @@ function withLocalDevVars(config: WorkerConfig): Partial<WorkerConfig> | void {
       ...(cfWorkerName ? { CF_WORKER_NAME: cfWorkerName } : {}),
       ...(localAppVanityDomain ? { LOCAL_APP_VANITY_DOMAIN: localAppVanityDomain } : {}),
       ...(localAppIframeDomain ? { LOCAL_APP_IFRAME_DOMAIN: localAppIframeDomain } : {}),
-      ...(sandboxProxySecret
-        ? { SANDBOX_PROXY_SECRET: sandboxProxySecret }
-        : {}),
     },
   };
 }

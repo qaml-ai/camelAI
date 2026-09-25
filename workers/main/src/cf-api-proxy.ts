@@ -7,9 +7,6 @@
 
 import { waitUntil } from "cloudflare:workers";
 import { createSignedToken } from "./signed-tokens.js";
-import {
-  validateSandboxProxy,
-} from "./sandbox-auth.js";
 import type { OrgDO } from "./auth.js";
 import type { WorkspaceDO } from "./workspace.js";
 import { getBillingPlanLimits } from "../../../src/lib/billing-plans.js";
@@ -304,7 +301,6 @@ export interface CfApiProxyEnv {
   ORG: DurableObjectNamespace<OrgDO>;
   CHAT_THREAD: DurableObjectNamespace;
   WORKER_BASE_URL?: string;
-  SANDBOX_PROXY_SECRET?: string;
   CF_ZONE_ID?: string;
   CF_CUSTOM_HOSTNAME_FALLBACK?: string;
   CF_CUSTOM_HOSTNAME_CNAME_TARGET?: string;
@@ -491,15 +487,6 @@ function isUploadRequest(pathname: string, method: string): boolean {
     (m === "PUT" && DISPATCH_SCRIPT_CONTENT_UPLOAD.test(pathname)) ||
     (m === "POST" && ASSETS_UPLOAD.test(pathname))
   );
-}
-
-function stripInternalProxyHeaders(headers: Headers): void {
-  headers.delete("x-sandbox-secret");
-  headers.delete("x-chiridion-org-id");
-  headers.delete("x-chiridion-workspace-id");
-  headers.delete("x-chiridion-user-id");
-  headers.delete("x-chiridion-thread-id");
-  headers.delete("x-chiridion-project-id");
 }
 
 // Patterns for requests that may contain bindings in JSON body
@@ -1857,7 +1844,6 @@ export async function proxyCloudflareApi(
     // Keep the original Authorization header (Cloudflare JWT)
     headers.delete("cookie");
     headers.delete("host");
-    stripInternalProxyHeaders(headers);
 
     const resp = await fetch(upstreamUrl, {
       method: "POST",
@@ -1870,81 +1856,46 @@ export async function proxyCloudflareApi(
     });
   }
 
-  // Deploys must come from a trusted internal handler or an authenticated
-  // proxy that injects org/workspace/project identity headers.
-  let orgId: string;
-  let orgSlug: string | undefined;
-  let workspaceId: string;
-  let userId: string | undefined;
-  let threadId: string | undefined;
-  let projectId: string | undefined;
-
+  // Deploys must come from a trusted in-process caller that supplies the
+  // org/workspace/project identity.
   const trustedIdentity = options.trustedIdentity;
-  if (trustedIdentity) {
-    orgId = trustedIdentity.orgId;
-    orgSlug = trustedIdentity.orgSlug;
-    workspaceId = trustedIdentity.workspaceId;
-    userId = trustedIdentity.userId;
-    threadId = trustedIdentity.threadId;
-    projectId = trustedIdentity.projectId;
-
-    if (!orgSlug) {
-      const orgStub = env.ORG.get(
-        env.ORG.idFromName(orgId),
-      ) as DurableObjectStub<OrgDO>;
-      orgSlug = (await orgStub.getSlug()) ?? undefined;
-    }
-    if (!orgSlug) {
-      console.warn("[cf-api-proxy] trusted sandbox proxy: org has no slug", {
-        orgId,
-      });
-      return cfApiError(10003, "Authentication error: Org has no slug", 401);
-    }
-
-    console.log("[cf-api-proxy] authenticated via trusted sandbox outbound", {
-      orgId,
-      workspaceId,
-      orgSlug,
+  if (!trustedIdentity) {
+    console.warn("[cf-api-proxy] missing trusted deploy identity", {
+      method: request.method,
+      path: url.pathname,
+      hasAuthorizationHeader: !!request.headers.get("Authorization"),
     });
-  } else {
-    const proxyAuth = validateSandboxProxy(request, env);
-    if (proxyAuth.valid) {
-      orgId = proxyAuth.orgId;
-      workspaceId = proxyAuth.workspaceId;
-      userId = proxyAuth.userId;
-      threadId = proxyAuth.threadId;
-      projectId = proxyAuth.projectId;
-
-      // Look up org_slug from OrgDO (needed for script namespacing)
-      const orgStub = env.ORG.get(
-        env.ORG.idFromName(orgId),
-      ) as DurableObjectStub<OrgDO>;
-      orgSlug = (await orgStub.getSlug()) ?? undefined;
-      if (!orgSlug) {
-        console.warn("[cf-api-proxy] sandbox proxy: org has no slug", {
-          orgId,
-        });
-        return cfApiError(10003, "Authentication error: Org has no slug", 401);
-      }
-
-      console.log("[cf-api-proxy] authenticated via sandbox proxy", {
-        orgId,
-        workspaceId,
-        orgSlug,
-      });
-    } else {
-      console.warn("[cf-api-proxy] missing trusted deploy proxy identity", {
-        method: request.method,
-        path: url.pathname,
-        hasAuthorizationHeader: !!request.headers.get("Authorization"),
-      });
-      return cfApiError(
-        10001,
-        "Authentication error: Trusted deploy proxy identity required",
-        401,
-      );
-    }
+    return cfApiError(
+      10001,
+      "Authentication error: Trusted deploy identity required",
+      401,
+    );
   }
+  const orgId = trustedIdentity.orgId;
+  let orgSlug = trustedIdentity.orgSlug;
+  const workspaceId = trustedIdentity.workspaceId;
+  const userId = trustedIdentity.userId;
+  const threadId = trustedIdentity.threadId;
+  const projectId = trustedIdentity.projectId;
+
+  if (!orgSlug) {
+    const orgStub = env.ORG.get(
+      env.ORG.idFromName(orgId),
+    ) as DurableObjectStub<OrgDO>;
+    orgSlug = (await orgStub.getSlug()) ?? undefined;
+  }
+  if (!orgSlug) {
+    console.warn("[cf-api-proxy] trusted deploy identity: org has no slug", {
+      orgId,
+    });
+    return cfApiError(10003, "Authentication error: Org has no slug", 401);
+  }
+
+  console.log("[cf-api-proxy] authenticated via trusted deploy identity", {
+    orgId,
+    workspaceId,
+    orgSlug,
+  });
 
   let pathname = url.pathname;
 
@@ -2157,7 +2108,6 @@ export async function proxyCloudflareApi(
   }
   headers.delete("cookie");
   headers.delete("host");
-  stripInternalProxyHeaders(headers);
 
   const method = request.method.toUpperCase();
   let body: ArrayBuffer | undefined =

@@ -53,7 +53,6 @@ import { handleWorkspaceStatusStream } from './routes/status-stream.js';
 import { handleLogsWebSocket } from './routes/logs-websocket.js';
 import { handleOAuthMetadata, handleResourceMetadata } from './routes/well-known.js';
 import { handleStripeWebhook } from './routes/billing.js';
-import { handleEmailSendProxy } from './routes/email-send-proxy.js';
 import { handleWorkerAuth } from './routes/worker-auth.js';
 import { requireChatWebSocketAccess } from './helpers/auth.js';
 import { stripReservedTransportHeaders } from './chat-thread/transport-headers.js';
@@ -217,9 +216,6 @@ const routes: Route[] = [
 
   // Stripe billing webhook
   { method: 'POST', path: /^\/api\/billing\/stripe\/webhook$/, handler: handleStripeWebhook },
-
-  // Email sending proxy (for sandbox containers)
-  { method: 'POST', path: /^\/api\/email\/send$/, handler: handleEmailSendProxy },
 
   // OAuth discovery (well-known paths can't be React Router routes)
   { method: 'GET', path: /^\/\.well-known\/oauth-authorization-server(\/.*)?$/, handler: handleOAuthMetadata },

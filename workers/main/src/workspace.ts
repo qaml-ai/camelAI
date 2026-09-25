@@ -1135,41 +1135,6 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
     ).toArray() as unknown as Array<{ user_id: string; access_level: WorkspaceAccessLevel }>;
   }
 
-  // Rate limit for sandbox email sending proxy (atomic check + record in single DO call)
-  checkAndRecordEmailSendRateLimit(
-    count: number,
-    hourlyLimit: number,
-    dailyLimit: number
-  ): { allowed: boolean; reason?: string } {
-    const now = Date.now();
-    const key = 'email_send_proxy_rate_limit';
-    const ONE_HOUR_MS = 60 * 60 * 1000;
-    const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-
-    const window: { timestamps: number[] } =
-      (this.ctx.storage.kv.get(key) as { timestamps: number[] } | undefined) ?? { timestamps: [] };
-
-    // Prune entries older than 24h
-    window.timestamps = window.timestamps.filter((t) => now - t < ONE_DAY_MS);
-
-    const hourlyCount = window.timestamps.filter((t) => now - t < ONE_HOUR_MS).length;
-    const dailyCount = window.timestamps.length;
-
-    if (hourlyCount + count > hourlyLimit) {
-      return { allowed: false, reason: `Hourly email limit exceeded (${hourlyLimit}/hour)` };
-    }
-    if (dailyCount + count > dailyLimit) {
-      return { allowed: false, reason: `Daily email limit exceeded (${dailyLimit}/day)` };
-    }
-
-    // Record the sends
-    for (let i = 0; i < count; i++) {
-      window.timestamps.push(now);
-    }
-    this.ctx.storage.kv.put(key, window);
-    return { allowed: true };
-  }
-
   async validateChatThreadAccess(
     userId: string,
     expectedOrgId: string,

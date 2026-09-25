@@ -101,13 +101,6 @@ export { DbQuerySandbox } from './db-query-sandbox.js';
 // references the old AdminIndexDO class. The app uses the D1-backed index now.
 export class AdminIndexDO extends DurableObject<Env> {}
 
-// Compatibility shim for the retired /mcp server's Durable Object. Prod and
-// the dev configs delete the class with a deleted_classes migration, but
-// staging's migration list is squashed and never records the class being
-// created, so Wrangler refuses a deleted_classes step there. Staging keeps
-// the (unbound) class until its migration history can express the delete.
-export class ChiridionMcp extends DurableObject<Env> {}
-
 // Compatibility shim for deployed migration histories that contain the retired
 // Cloudflare Sandbox SDK experiment. Projects are DO+R2 backed now.
 export class CloudflareSandbox extends DurableObject<Env> {}

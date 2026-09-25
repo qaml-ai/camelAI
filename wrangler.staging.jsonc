@@ -192,7 +192,10 @@
     }
   ],
   "migrations": [
-    { "tag": "v27" },
+    // The squashed history below omits ChiridionMcp's creation; the deployed
+    // staging worker (at v37) already has the class. Recorded here so the
+    // v38 deleted_classes step validates locally.
+    { "tag": "v27", "new_sqlite_classes": ["ChiridionMcp"] },
     { "tag": "v28" },
     { "tag": "v29", "new_sqlite_classes": ["TelegramRegistryDO", "SlackTeamRegistryDO"] },
 	    { "tag": "v30", "new_sqlite_classes": ["WorkspaceFilesystemDO"] },
@@ -203,5 +206,6 @@
 	    { "tag": "v35", "deleted_classes": ["WarehouseSandbox"] },
 	    { "tag": "v36", "new_sqlite_classes": ["DbQuerySandbox"] },
 	    { "tag": "v37", "new_sqlite_classes": ["SignupDO"] },
+	    { "tag": "v38", "deleted_classes": ["ChiridionMcp"] },
 	  ],
 	}

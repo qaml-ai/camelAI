@@ -328,7 +328,7 @@ export interface DeploySideEffectsInfo {
  * Return a Cloudflare API-formatted error response.
  * Wrangler expects this format to parse errors correctly.
  */
-export function cfApiError(
+function cfApiError(
   code: number,
   message: string,
   status: number,

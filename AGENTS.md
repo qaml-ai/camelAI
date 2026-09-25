@@ -40,7 +40,7 @@ worker-side). There is no in-repo Go sandbox-host or data-proxy tree.
 - `src/components/ui/` - shadcn/ui components.
 - `workers/main/` - Main Cloudflare Worker, Durable Objects, HTTP/SSE transports (plus the log-tail WebSocket `/ws/logs`), admin MCP, admin APIs, proxies, container image Dockerfiles.
 - `workers/main/src/identity/` - `UserDO` / `OrgDO` and related identity helpers (`auth.ts` is a compatibility barrel).
-- `workers/main/src/routes/` - Worker-native HTTP (SSE streams, the log-tail WebSocket `/ws/logs`, Stripe webhook, data-proxy, admin MCP, most `/api/admin/*` on Hono). Prefer documenting new paths here vs `src/routes/api/` — see **API routing** below.
+- `workers/main/src/routes/` - Worker-native HTTP (SSE streams, the log-tail WebSocket `/ws/logs`, Stripe webhook, admin MCP, most `/api/admin/*` on Hono). Prefer documenting new paths here vs `src/routes/api/` — see **API routing** below.
 - `workers/dispatcher/` - Workers for Platforms dispatcher for deployed user apps.
 - `workers/app-usage-guard/` - Account-wide Durable Object SQLite usage monitor and reversible app quarantine Worker; see `docs/deployed-app-usage-guard-design.md`.
 - `workers/bedrock-provider/` - AI Gateway custom provider translating Anthropic-style requests to Bedrock.
@@ -65,7 +65,7 @@ Two HTTP surfaces share the main worker:
 | Surface | Location | Typical contents |
 | --- | --- | --- |
 | React Router | `src/routes/api/` | Session-cookie user REST (workspaces, billing checkout, uploads, chat groups) |
-| Worker-native | `workers/main/src/routes/` | SSE streams, log-tail WebSocket (`/ws/logs`), Stripe webhook, admin MCP, data-proxy, most bearer admin REST |
+| Worker-native | `workers/main/src/routes/` | SSE streams, log-tail WebSocket (`/ws/logs`), Stripe webhook, admin MCP, most bearer admin REST |
 
 `workers/main/src/index.ts` routes some paths (e.g. `/api/admin/*`) to worker modules before React Router SSR. When adding an API, match an existing neighbor; do not invent a third pattern.
 
@@ -275,11 +275,11 @@ if any of them drift apart.
 
 ## Proxies And Bindings
 
-- Sandbox containers do not get a generic Worker API proxy. File, shell, and runtime operations go through explicit project-runtime / host control-plane APIs.
+- Sandbox containers do not get a generic Worker API proxy or any header-authenticated Worker routes (the sandbox-host proxy auth, `validateSandboxProxy`/`SANDBOX_PROXY_SECRET`, is gone). Container access to Worker services goes through DO-side outbound handlers that attach scope (for example the analysis sandbox's `connections.internal`), and deploys through `cf-api-proxy.ts` require an in-process `trustedIdentity`.
 - BYOK credentials are scoped by org/thread and should not be placed into container environment variables.
 - User app deploys can rewrite internal service bindings such as the data proxy, virtual AI binding, and virtual R2 bucket. Relevant files include `workers/main/src/cf-api-proxy.ts`, `data-proxy-service.ts`, `ai-virtual-binding.ts`, and `r2-virtual-bucket.ts`.
 - Outbound database traffic egresses from the sandbox host VM IP `20.46.233.68` (surfaced in direct database connection setup UIs for firewall/VPC allowlisting; constant in `src/lib/sandbox-network.ts`).
-- `DbQuerySandbox` (Cloudflare sandbox container, no user code) is THE SQL query/export path — the connection MCP, the `DATA_PROXY` user-app binding, and the sandbox container routes all go through the legacy-contract surface in `workers/main/src/data-proxy.ts` → `db-query-compat.ts` → `db-query-service.ts`. It keeps the static-IP guarantee by dialing databases through a SOCKS relay on the sandbox host VM (`infra/db-egress-relay/`; design + smoke + decommission checklist in `docs/db-egress-relay.md`); with no relay configured it dials from the container's own IP. The query logic is shipped from the worker per call (not baked): the runner `workers/main/db-query-sandbox-assets/runner/db-query-runner.mjs` is embedded through the `virtual:db-query-runner-source` alias (Vite `?raw` for the main worker, Wrangler `Text` for dispatchers) and piped into node over stdin in one stateless exec; exports write Parquet straight into the workspace's mounted warehouse R2 prefix. Keep the SSRF denylists in that runner and `infra/db-egress-relay/gost.yaml.example` in sync.
+- `DbQuerySandbox` (Cloudflare sandbox container, no user code) is THE SQL query/export path — the connection MCP and the `DATA_PROXY` user-app binding both go through the legacy-contract surface in `workers/main/src/data-proxy.ts` → `db-query-compat.ts` → `db-query-service.ts`. It keeps the static-IP guarantee by dialing databases through a SOCKS relay on the sandbox host VM (`infra/db-egress-relay/`; design + smoke + decommission checklist in `docs/db-egress-relay.md`); with no relay configured it dials from the container's own IP. The query logic is shipped from the worker per call (not baked): the runner `workers/main/db-query-sandbox-assets/runner/db-query-runner.mjs` is embedded through the `virtual:db-query-runner-source` alias (Vite `?raw` for the main worker, Wrangler `Text` for dispatchers) and piped into node over stdin in one stateless exec; exports write Parquet straight into the workspace's mounted warehouse R2 prefix. Keep the SSRF denylists in that runner and `infra/db-egress-relay/gost.yaml.example` in sync.
 
 ## Stripe Billing And Credits
 

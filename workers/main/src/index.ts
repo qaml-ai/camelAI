@@ -2,7 +2,6 @@
  * Main camelAI Worker - Composition Root
  *
  * Routes:
- * - /client/v4/* → CF API proxy for wrangler deploys
  * - /api/auth/:provider → User OAuth (Google, GitHub)
  * - /api/integrations/slack/* → Slack OAuth
  * - /api/integrations/slack/events → Slack Events API webhook
@@ -28,7 +27,6 @@ import {
 } from './discord-events-queue.js';
 
 // Route handlers
-import { handleCfProxy } from './routes/cf-proxy.js';
 import { handleAdminMcp } from './routes/admin-mcp.js';
 import { handleOAuthStart, handleOAuthCallback } from './routes/oauth.js';
 import {
@@ -210,9 +208,6 @@ const routes: Route[] = [
     path: /^\/api\/admin\//,
     handler: async (context) => (await loadAdminApiModule()).handleAdminApi(context),
   },
-
-  // CF API Proxy
-  { method: 'ALL', path: /^\/client\/v4\//, handler: handleCfProxy },
 
   // Stripe billing webhook
   { method: 'POST', path: /^\/api\/billing\/stripe\/webhook$/, handler: handleStripeWebhook },

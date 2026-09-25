@@ -923,7 +923,7 @@ export function AdminAiUsageSpendCard({
             ) : null
           ) : (
             <p className="text-sm text-muted-foreground">
-              Sandbox host is not reachable or usage tracking is not enabled.
+              Usage data could not be loaded for this organization.
             </p>
           )}
 

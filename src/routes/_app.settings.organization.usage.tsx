@@ -219,7 +219,7 @@ export default function OrganizationUsagePage() {
         />
         <Separator />
         <p className="text-sm text-muted-foreground">
-          Usage tracking is not available. The sandbox host may be unreachable.
+          Usage data could not be loaded right now. Try refreshing the page.
         </p>
       </div>
     );

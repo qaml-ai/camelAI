@@ -527,8 +527,8 @@ export class RuntimeAgentSession {
 
   steer(message: AgentMessage): void {
     this.sentUserMessages.push(message);
-    const actor = this.options.actor();
-    void this.request("steer", { text: userText(message), ...(actor ? { actor } : {}) }).catch((error) => {
+    // A steered message joins the run in flight, which keeps its actor.
+    void this.request("steer", { text: userText(message) }).catch((error) => {
       console.error("[RuntimeAgentSession] steer failed", error);
     });
   }

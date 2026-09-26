@@ -7856,7 +7856,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
 
   /** Whether this thread's turns run on the hosted agent runtime. */
   private isRuntimeAgentThread(): boolean {
-    return this.ctx.storage.kv.get<string>(CHAT_AGENT_BACKEND_KEY) === "runtime";
+    return this.ctx?.storage?.kv?.get<string>(CHAT_AGENT_BACKEND_KEY) === "runtime";
   }
 
   /**
@@ -7865,12 +7865,17 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
    * conversation never moves between loops.
    */
   private async resolveAgentBackend(context: ChatContextState): Promise<"runtime" | "pi"> {
-    const pinned = this.ctx.storage.kv.get<string>(CHAT_AGENT_BACKEND_KEY);
+    const kv = this.ctx?.storage?.kv;
+    if (!kv || this.env?.AGENT_RUNTIME_ENABLED === undefined && kv.get(CHAT_AGENT_BACKEND_KEY) === undefined) {
+      // Runtime never configured here (and never pinned): the in-DO loop, without a write.
+      return "pi";
+    }
+    const pinned = kv.get<string>(CHAT_AGENT_BACKEND_KEY);
     if (pinned === "runtime" || pinned === "pi") return pinned;
     const backend = this.hasNoModelTranscript() && await runtimeEnabledForOrg(this.env, context.orgId)
       ? "runtime"
       : "pi";
-    this.ctx.storage.kv.put(CHAT_AGENT_BACKEND_KEY, backend);
+    kv.put(CHAT_AGENT_BACKEND_KEY, backend);
     this.recordChatThreadObservabilityEvent("agent_backend_pinned", {
       operation: "resolve_agent_backend",
       status: backend,

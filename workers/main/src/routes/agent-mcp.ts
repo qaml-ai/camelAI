@@ -182,7 +182,6 @@ export function agentMcpTools() {
       description: definition.description,
       // TypeBox schemas are JSON Schema; the round trip drops its symbol keys.
       inputSchema: JSON.parse(JSON.stringify(definition.parameters)) as Record<string, unknown>,
-      annotations: { readOnlyHint: !definition.sideEffect },
     }));
 }
 

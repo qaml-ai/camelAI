@@ -257,6 +257,7 @@ curl "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/analytics_eng
 - Thread records store provider/model state on org thread data. Verify current fields in `OrgDO` before changing related behavior.
 - Slash commands are allowlisted in `ChatThreadDO`; check `SLASH_COMMANDS` before adding or changing one.
 - Clarifying questions use the Pi `AskUserQuestion`/`ask_user_question` tools.
+- Hosted agent runtime migration (in progress, `plans/agent-runtime-migration.md`): `/mcp/agent` (`workers/main/src/routes/agent-mcp.ts`) serves `CodeModeToolsBinding` tools to runtime agents over stateless MCP, verifying the runtime's identity token with the SDK's `serveTools` and authorizing `act ?? sub` within `ctx {org, workspace, thread}` via OrgDO. Test: `bun run test:workers -- agent-mcp`.
 
 ### Adding a new chat model
 

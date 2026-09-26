@@ -44,12 +44,28 @@ browser ─WS/poll─ ChatThreadDO ──POST prompt/steer/abort──> runtime 
   - Object results become a JSON text block plus `structuredContent`.
   - The Pi file tools' own `{content:[text|image]}` blocks pass through
     unchanged, so an image read reaches the model as an image.
-- **Served so far** (`AGENT_MCP_TOOL_NAMES`):
-  - read-only: workspace_info, list_projects, list_commits, list_apps,
-    list_deploy_versions, get_latest_logs, list_scheduled_prompts,
-    connections_list, read_skill, ls, read, grep, find;
-  - one write path: `write` / `edit` on workspace or project files.
-  - Adding a stateless tool is one name in the set.
+  - A result with an `imageDataUrl` (browser_action screenshot,
+    take_screenshot) becomes an image block plus the rest as JSON.
+- **Served** (`AGENT_MCP_TOOL_NAMES`): every non-hidden
+  `CODE_MODE_TOOL_DEFINITIONS` entry minus `AGENT_MCP_EXCLUDED_TOOL_NAMES`:
+  - excluded: AskUserQuestion, prompt_connection_setup, delete_app,
+    delete_project, delete_connection (wait on the ask-user design, Q3);
+    WebSearch/WebFetch (runtime builtins); Agent/Explore/Research/Oracle
+    (subagents dropped); hidden warehouse_* aliases.
+  - UI-state tools (TodoWrite, set_preview, deploy_project's preview...)
+    reach the thread's DO by RPC with the signed threadId.
+  - js_exec's binding-only capabilities are registry tools (Q4, decided):
+    connections_query / connections_invoke (connections[alias]),
+    browser_launch / browser_action (env.BROWSER), generate_image /
+    transcribe_audio (env.CAMELAI; images saved to R2 outputs and returned
+    as image content), http_request (SECURE_FETCH's dispatcher route; only
+    this workspace's deployed apps, since the runtime's `web_fetch` is the
+    way to the web).
+  - Browser sessions opened over MCP are not closed when a run ends (js_exec
+    closed its own); they rely on browser_action close or the 5-minute
+    auto-close.
+  - report_automation_outcome is a binding tool calling
+    `ChatThreadDO.recordAutomationOutcome` (which validates the active run).
 - **Config** (`Env`):
   - `AGENT_RUNTIME_URL` (default `https://agents.camelai.dev`);
   - `AGENT_RUNTIME_TENANT`: when set, tokens for any other tenant are refused;

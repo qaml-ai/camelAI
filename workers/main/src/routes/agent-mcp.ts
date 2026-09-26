@@ -20,27 +20,34 @@ import { getOrgStub } from "../helpers/stubs.js";
 const DEFAULT_RUNTIME = "https://agents.camelai.dev";
 
 /**
- * Tools served so far: read-only workspace/project/app inspection plus the
- * workspace file write path. Anything needing the live chat UI (preview,
- * todos, questions, subagents) waits for the ChatThreadDO adapter.
+ * CodeModeToolsBinding tools the runtime does NOT get. Everything else that is
+ * not hidden (the warehouse_* compatibility aliases) is served; tools that
+ * touch the thread's UI state (TodoWrite, set_preview, deploy_project...)
+ * reach its ChatThreadDO by RPC with the threadId the runtime signs.
  */
-export const AGENT_MCP_TOOL_NAMES = new Set([
-  "workspace_info",
-  "list_projects",
-  "list_commits",
-  "list_apps",
-  "list_deploy_versions",
-  "get_latest_logs",
-  "list_scheduled_prompts",
-  "connections_list",
-  "read_skill",
-  "ls",
-  "read",
-  "grep",
-  "find",
-  "write",
-  "edit",
+export const AGENT_MCP_EXCLUDED_TOOL_NAMES: ReadonlySet<string> = new Set([
+  // Block on a human answer through AskUserQuestion / the chat UI; they wait
+  // for a runtime-wide ask-user design.
+  "AskUserQuestion",
+  "prompt_connection_setup",
+  "delete_app",
+  "delete_project",
+  "delete_connection",
+  // The runtime's own web builtins replace these.
+  "WebSearch",
+  "WebFetch",
+  // Subagents are not carried over to the runtime.
+  "Agent",
+  "Explore",
+  "Research",
+  "Oracle",
 ]);
+
+export const AGENT_MCP_TOOL_NAMES: ReadonlySet<string> = new Set(
+  CODE_MODE_TOOL_DEFINITIONS
+    .filter((definition) => !definition.hidden && !AGENT_MCP_EXCLUDED_TOOL_NAMES.has(definition.name))
+    .map((definition) => definition.name),
+);
 
 type ToolsBinding = {
   callToolEnvelope(
@@ -96,7 +103,7 @@ export async function authorizeRuntimeIdentity(
 
 export function agentMcpTools() {
   return CODE_MODE_TOOL_DEFINITIONS
-    .filter((definition) => AGENT_MCP_TOOL_NAMES.has(definition.name) && !definition.hidden)
+    .filter((definition) => AGENT_MCP_TOOL_NAMES.has(definition.name))
     .map((definition) => ({
       name: definition.name,
       description: definition.description,
@@ -123,10 +130,24 @@ export function toMcpResult(envelope: Awaited<ReturnType<ToolsBinding["callToolE
       ...(isRecord(data.details) ? { structuredContent: data.details } : {}),
     };
   }
+  // Screenshots (browser_action screenshot, take_screenshot with
+  // include_image_data_url) answer { imageDataUrl, ... }: show the image, not
+  // its base64 as JSON text.
+  const image = isRecord(data) ? imageDataUrlBlock(data.imageDataUrl) : null;
+  if (image && isRecord(data)) {
+    const { imageDataUrl: _imageDataUrl, ...rest } = data;
+    return { content: [{ type: "text", text: JSON.stringify(rest) }, image], structuredContent: rest };
+  }
   return {
     content: [{ type: "text", text: typeof data === "string" ? data : JSON.stringify(data ?? null) }],
     ...(isRecord(data) ? { structuredContent: data } : {}),
   };
+}
+
+function imageDataUrlBlock(value: unknown): { type: "image"; data: string; mimeType: string } | null {
+  if (typeof value !== "string") return null;
+  const match = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/is.exec(value);
+  return match ? { type: "image", data: match[2], mimeType: match[1].toLowerCase() } : null;
 }
 
 export function agentToolServer(env: Env, tools: ToolsFactory): ToolServer {

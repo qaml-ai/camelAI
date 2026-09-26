@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { testRuntime, type TestIdentity } from "@camelai/agent-runtime/testing";
 
-import { agentMcpHandler, type ToolsFactory } from "../src/routes/agent-mcp";
+import { AGENT_MCP_TOOL_NAMES, agentMcpHandler, type ToolsFactory } from "../src/routes/agent-mcp";
 import type { Env } from "../src/types";
 
 const MCP_URL = "https://camel.test/mcp/agent";
@@ -65,8 +65,20 @@ describe("agent MCP", () => {
     const response = await handler(await rt.request(MCP_URL, { jsonrpc: "2.0", id: 1, method: "tools/list" }, ALICE));
     const body = await response.json() as { result: { tools: Array<{ name: string; inputSchema: { type?: string } }> } };
     const names = body.result.tools.map((tool) => tool.name);
-    expect(names).toEqual(expect.arrayContaining(["list_projects", "list_apps", "read", "write"]));
-    expect(names).not.toContain("deploy_project");
+    expect(names).toEqual(expect.arrayContaining([
+      "list_projects", "list_apps", "read", "write",
+      // UI-state tools reach the thread's DO by RPC.
+      "TodoWrite", "set_preview", "set_app_visibility", "deploy_project", "run_notebook",
+      // js_exec's binding-only capabilities as tools.
+      "connections_query", "connections_invoke", "browser_launch", "browser_action",
+      "generate_image", "transcribe_audio", "http_request",
+    ]));
+    for (const excluded of [
+      "AskUserQuestion", "prompt_connection_setup", "delete_app", "delete_project", "delete_connection",
+      "WebSearch", "WebFetch", "Agent", "Explore", "warehouse_run_code", "warehouse_list_connections",
+    ]) expect(names).not.toContain(excluded);
+    expect(names).toEqual([...AGENT_MCP_TOOL_NAMES].filter((name) => names.includes(name)));
+    expect(new Set(names)).toEqual(AGENT_MCP_TOOL_NAMES);
     for (const tool of body.result.tools) expect(tool.inputSchema.type).toBe("object");
   });
 
@@ -112,9 +124,23 @@ describe("agent MCP", () => {
       .toEqual({ content: [{ type: "text", text: "File not found" }], isError: true });
   });
 
+  it("shows screenshot data URLs as image content", async () => {
+    const { handler } = setup({ result: { ok: true, data: { imageDataUrl: "data:image/png;base64,iVBORw0KGgo=", width: 800, height: 600 } } });
+    expect(await rt.callTool(handler, MCP_URL, "browser_action", { session_id: "s", script_name: "app", method: "screenshot" }, ALICE))
+      .toEqual({
+        content: [
+          { type: "text", text: '{"width":800,"height":600}' },
+          { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+        ],
+        structuredContent: { width: 800, height: 600 },
+      });
+  });
+
   it("refuses tools it does not serve", async () => {
     const { handler, tools } = setup();
-    await expect(rt.callTool(handler, MCP_URL, "deploy_project", {}, ALICE)).rejects.toThrow(/Unknown tool/);
+    for (const name of ["AskUserQuestion", "delete_project", "WebFetch", "Agent", "warehouse_run_code"]) {
+      await expect(rt.callTool(handler, MCP_URL, name, {}, ALICE)).rejects.toThrow(/Unknown tool/);
+    }
     expect(tools).not.toHaveBeenCalled();
   });
 });

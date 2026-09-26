@@ -545,6 +545,8 @@ class PiTurnAbsoluteTimeoutError extends Error {
 }
 
 const CHAT_CONTEXT_KEY = "chatContext";
+const AUTOMATION_OUTCOME_STATUSES = ["success", "failed", "partial", "needs_attention"] as const;
+type AutomationOutcomeStatus = (typeof AUTOMATION_OUTCOME_STATUSES)[number];
 // Which loop runs this thread: "runtime" (the hosted agent runtime) or "pi"
 // (in the DO). Pinned at the thread's first turn; a thread never switches.
 const CHAT_AGENT_BACKEND_KEY = "agentBackend";
@@ -9256,35 +9258,45 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         }),
         execute: async (_toolUseId, params, signal) => {
           if (signal?.aborted) throw new Error("Operation aborted");
-          const run = this.activeAutomationRun;
-          if (!run?.requiresExplicitOutcome) {
-            throw new Error("No scheduled automation run is active");
-          }
-          if (run.reportedOutcome) {
-            throw new Error("Automation outcome was already reported for this run");
-          }
-          const raw = params as {
-            status: "success" | "failed" | "partial" | "needs_attention";
-            summary: string;
-          };
-          const summary = raw.summary.trim();
-          if (!summary) throw new Error("Automation outcome summary is required");
-          this.automationRun.setActiveAutomationRun({
-            ...run,
-            reportedOutcome: { status: raw.status, summary },
-          });
+          const raw = params as { status: AutomationOutcomeStatus; summary: string };
+          const recorded = await this.recordAutomationOutcome(raw.status, raw.summary);
           return {
-            content: [{
-              type: "text" as const,
-              text: `Automation outcome recorded: ${raw.status}`,
-            }],
-            details: { status: raw.status },
+            content: [{ type: "text" as const, text: recorded.text }],
+            details: { status: recorded.status },
           };
         },
         executionMode: "sequential",
       });
     }
     return definitions;
+  }
+
+  /**
+   * The required final status of the scheduled automation run in progress,
+   * from the Pi tool or (for runtime threads) the report_automation_outcome
+   * tool of CodeModeToolsBinding.
+   */
+  async recordAutomationOutcome(
+    status: AutomationOutcomeStatus,
+    rawSummary: string,
+  ): Promise<{ status: AutomationOutcomeStatus; text: string }> {
+    const run = this.activeAutomationRun;
+    if (!run?.requiresExplicitOutcome) {
+      throw new Error("No scheduled automation run is active");
+    }
+    if (run.reportedOutcome) {
+      throw new Error("Automation outcome was already reported for this run");
+    }
+    if (!AUTOMATION_OUTCOME_STATUSES.includes(status)) {
+      throw new Error(`status must be one of ${AUTOMATION_OUTCOME_STATUSES.join(", ")}`);
+    }
+    const summary = typeof rawSummary === "string" ? rawSummary.trim() : "";
+    if (!summary) throw new Error("Automation outcome summary is required");
+    this.automationRun.setActiveAutomationRun({
+      ...run,
+      reportedOutcome: { status, summary },
+    });
+    return { status, text: `Automation outcome recorded: ${status}` };
   }
 
   private async runPiSubagentTool(

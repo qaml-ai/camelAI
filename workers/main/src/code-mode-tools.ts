@@ -5,6 +5,11 @@
 //
 // ChatThreadDO is imported as a type only (for the chat-thread DO stub
 // signature), so there is no runtime import cycle with ./chat-thread-do.
+import {
+  buildWorkspaceAppHostIndex,
+  isWorkspaceAppHostname,
+  type WorkspaceAppHostIndex,
+} from "./workspace-app-fetcher";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { getSandbox } from "@cloudflare/sandbox";
 import type { OrgDO, WorkerScript } from "./auth";
@@ -47,7 +52,7 @@ import { buildWorkspaceEmailAddress, getWorkspaceEmailDomain } from "../../../sr
 import { isSelfhostRuntime } from "../../../src/lib/selfhost-runtime";
 import { SELFHOST_OUTBOUND_EMAIL_DISABLED_MESSAGE } from "../../../src/lib/selfhost-capabilities";
 import { CodeModeCustomDomains } from "./code-mode-custom-domains";
-import { detectImageMimeType as detectSharedImageMimeType, getSupportedImageMimeTypeFromContentType, inlineImageMaxBase64Chars, prepareInlineImageFromStream, readImageSniffBytesAndReplayStream, type PreparedInlineImage, readStreamBytes } from "./image-tool-content";
+import { detectImageMimeType as detectSharedImageMimeType, getSupportedImageMimeTypeFromContentType, inlineImageMaxBase64Chars, prepareInlineImageFromBytes, prepareInlineImageFromStream, readImageSniffBytesAndReplayStream, type PreparedInlineImage, readStreamBytes } from "./image-tool-content";
 import { CodeModeScheduledPrompts } from "./code-mode-scheduled-prompts";
 import { CodeModeDeterministicAutomations } from "./code-mode-deterministic-automations";
 import { CodeModeIntegrations } from "./code-mode-integrations";
@@ -88,6 +93,8 @@ import {
 } from "./sandbox-exec-deadline";
 import type { ProjectScaffoldResult } from "./project-scaffold";
 import { connectAppBrowserSession, launchAppBrowserSession } from "./app-browser-binding";
+import { AUDIO_TRANSCRIPTION_MAX_BYTES, transcribeAudioBytes, type AudioTranscriptionAiBinding } from "./audio-transcription";
+import type { GenerateImageOptions, GenerateImageResult } from "./generate-image";
 import { deployWorkerModulesDirect, rollbackWorkerDeployFromArtifactCache, type DirectDispatchDeployResult } from "./direct-dispatch-deploy";
 import { handleDeploySideEffects } from "./services/deploy";
 import { editAutomationVirtualFile, listAutomationVirtualFiles, normalizeAutomationVirtualPath, readAutomationVirtualFile, writeAutomationVirtualFile } from "./deterministic-automation-virtual-files";
@@ -200,6 +207,8 @@ type CodeModeToolCategory =
   // "connections" so the primary data-analysis path is not filed under the
   // connection-management long tail.
   | "analysis"
+  // Image generation and audio transcription (the env.CAMELAI helpers).
+  | "ai_media"
   | "connections";
 
 interface CodeModeToolOptions {
@@ -558,6 +567,45 @@ const CODE_MODE_CONTAINER_TOOL_DEFINITIONS = CODE_MODE_CONTAINER_TOOL_NAMES.map(
     });
   },
 );
+
+const FILE_LOCATION_PARAMETER = Type.Union([
+  Type.Literal("workspace"),
+  Type.Literal("project"),
+  Type.Literal("r2"),
+], {
+  description: "Required filesystem location: workspace, project, or r2.",
+});
+
+/** Methods a browser_launch session answers; the env.BROWSER facade mirrors this list. */
+export const BROWSER_SESSION_METHODS = [
+  "goto",
+  "click",
+  "fill",
+  "type",
+  "press",
+  "select",
+  "hover",
+  "waitForSelector",
+  "waitForText",
+  "waitForFunction",
+  "waitForTimeout",
+  "evaluate",
+  "textContent",
+  "hasText",
+  "getAttribute",
+  "count",
+  "exists",
+  "content",
+  "url",
+  "title",
+  "screenshot",
+  "logs",
+  "close",
+] as const;
+
+export const HTTP_REQUEST_DEFAULT_MAX_CHARACTERS = CODE_MODE_DEFAULT_MAX_OUTPUT_CHARACTERS;
+/** Response bytes http_request reads before truncating (the body is buffered). */
+export const HTTP_REQUEST_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 
 const MOVE_ENDPOINT_PARAMETERS = Type.Object({
   location: Type.Union([
@@ -1394,6 +1442,126 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
       examples: [`await env.CONNECTIONS.verify("slack")`],
     },
   ),
+  // Tool forms of the js_exec-only runtime bindings (connections[alias],
+  // env.BROWSER, env.CAMELAI, env.SECURE_FETCH), so agents without the
+  // chiridion sandbox (the hosted runtime over MCP) reach the same
+  // implementations. connections_invoke and browser_* are also what the
+  // js_exec facades call under the hood.
+  codeModeTool(
+    "connections_query",
+    "Run a SQL query against a database/warehouse workspace connection (the connection's `query` method; read-only where the adapter enforces it). Find the connection name with connections_list or connections_find first. Arguments: { connection, query, ...extra method inputs }.",
+    Type.Object({
+      connection: Type.String({ description: "Connection alias, id, or name." }),
+      query: Type.String({ description: "SQL text in the connection's dialect." }),
+    }, { additionalProperties: true }),
+    {
+      category: "connections",
+      examples: [`await tools.connections_query({ connection: "clickhouse", query: "SELECT 1 AS ok" })`],
+    },
+  ),
+  codeModeTool(
+    "connections_invoke",
+    "Call one method of a workspace connection, exactly like connections[alias][method](input) in js_exec. List method names and input schemas with connections_find or connections_methods. Custom API connections expose `fetch`, which injects the stored credentials: input { input: '/path or URL', init: { method?, headers?, body? } }. Arguments: { connection, method, input? }.",
+    Type.Object({
+      connection: Type.String({ description: "Connection alias, id, or name." }),
+      method: Type.String({ description: "Method name from the connection's method catalog." }),
+      input: Type.Optional(Type.Object({}, {
+        additionalProperties: true,
+        description: "Method input matching the method's input schema.",
+      })),
+    }),
+    {
+      category: "connections",
+      sideEffect: true,
+      examples: [`await tools.connections_invoke({ connection: "github", method: "fetch", input: { input: "/user" } })`],
+    },
+  ),
+  codeModeTool(
+    "browser_launch",
+    "Open an interactive browser session on a deployed workspace app (including access-controlled apps), navigated to path. Opt-in: use it when the user or task calls for testing the running UI, not after every deploy. Returns { sessionId, scriptName }; drive it with browser_action and always close it (sessions auto-close after 5 minutes). Arguments: { script_name, path?, width?, height? }.",
+    Type.Object({
+      script_name: Type.String({ description: "Deployed app script name (see list_apps)." }),
+      path: Type.Optional(Type.String({ description: "Path to open. Defaults to /." })),
+      width: Type.Optional(Type.Number()),
+      height: Type.Optional(Type.Number()),
+    }),
+    { category: "apps" },
+  ),
+  codeModeTool(
+    "browser_action",
+    "Run one Playwright-style method on a browser_launch session. args is the method's positional argument list, e.g. click [\"button.submit\"], fill [\"#email\", \"a@b.com\"], waitForText [\"Saved\", { timeoutMs: 5000 }], evaluate [\"document.title\"], textContent [] (visible body text), content [{ selector?, maxChars? }], screenshot [{ fullPage? }], logs [] (console, page errors, failed requests). Call method close when done. Arguments: { session_id, script_name, method, args? }.",
+    Type.Object({
+      session_id: Type.String({ description: "sessionId returned by browser_launch." }),
+      script_name: Type.String({ description: "The script_name the session was launched with." }),
+      method: Type.Union(BROWSER_SESSION_METHODS.map((method) => Type.Literal(method))),
+      args: Type.Optional(Type.Array(Type.Unknown(), { description: "Positional arguments for the method." })),
+    }),
+    { category: "apps", sideEffect: true },
+  ),
+  codeModeTool(
+    "generate_image",
+    "Generate an image from a text prompt, optionally guided by a reference image for style consistency. Each image is saved to R2 (default outputs/generated-images/, downloadable by the user) and returned inline so you can see it. Arguments: { prompt, reference_image_url?, reference_image?: { location, path, project? }, output_path? }.",
+    Type.Object({
+      prompt: Type.String({ description: "What to draw." }),
+      reference_image_url: Type.Optional(Type.String({
+        description: "Reference image as an https URL or a data:image/... URL.",
+      })),
+      reference_image: Type.Optional(Type.Object({
+        location: FILE_LOCATION_PARAMETER,
+        path: Type.String(),
+        project: Type.Optional(Type.String({ description: "Required when location is project." })),
+      }, { description: "Reference image stored in the workspace, a project, or R2." })),
+      output_path: Type.Optional(Type.String({
+        description: "R2 path to save to, under outputs/ or tmp/, e.g. outputs/hero.png. Extra images get -2, -3 suffixes.",
+      })),
+    }),
+    { category: "ai_media", sideEffect: true },
+  ),
+  codeModeTool(
+    "transcribe_audio",
+    "Transcribe an audio file (mp3, wav, ogg, m4a, webm; max 25MB) to text with Whisper. Arguments: { location, path, project? } — e.g. { location: \"r2\", path: \"uploads/meeting.m4a\" }.",
+    Type.Object({
+      location: FILE_LOCATION_PARAMETER,
+      path: Type.String({ description: "File path at that location. R2 paths start with uploads/, outputs/, or tmp/." }),
+      project: Type.Optional(Type.String({ description: "Required when location is project." })),
+    }),
+    { category: "ai_media" },
+  ),
+  codeModeTool(
+    "report_automation_outcome",
+    "Required final status of the scheduled automation run in progress: call it exactly once before your final response. Report success only if the requested objective actually completed and was verified; otherwise failed, partial, or needs_attention. Arguments: { status, summary }.",
+    Type.Object({
+      status: Type.Union([
+        Type.Literal("success"),
+        Type.Literal("failed"),
+        Type.Literal("partial"),
+        Type.Literal("needs_attention"),
+      ]),
+      summary: Type.String({
+        minLength: 1,
+        maxLength: 2_000,
+        description: "Concise factual outcome, including the blocker when not successful.",
+      }),
+    }, { additionalProperties: false }),
+    { category: "schedules", sideEffect: true },
+  ),
+  codeModeTool(
+    "http_request",
+    "Make an HTTP request to one of this workspace's deployed apps (including access-controlled ones), routed to the app through the platform with workspace access. Other URLs are refused: use web_fetch for the web, and connections_invoke with method fetch to call a connected API with its stored credentials. Returns { status, statusText, url, headers, body, bodyBytes, truncated }. Arguments: { url, method?, headers?, body?, response_format?, max_characters? }.",
+    Type.Object({
+      url: Type.String({ description: "Absolute http(s) URL of a deployed app in this workspace." }),
+      method: Type.Optional(Type.String({ description: "HTTP method. Defaults to GET." })),
+      headers: Type.Optional(Type.Record(Type.String(), Type.String())),
+      body: Type.Optional(Type.String({ description: "Request body (send JSON as a string with a content-type header)." })),
+      response_format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("base64")], {
+        description: "text (default) decodes the body as UTF-8; base64 returns raw bytes for binary responses.",
+      })),
+      max_characters: Type.Optional(Type.Number({
+        description: `Body characters to return (default ${HTTP_REQUEST_DEFAULT_MAX_CHARACTERS}, max ${CODE_MODE_MAX_OUTPUT_CHARACTERS}).`,
+      })),
+    }),
+    { category: "apps", sideEffect: true },
+  ),
 ];
 
 export const CODE_MODE_TOOL_DEFINITIONS: CodeModeToolDefinition[] = CODE_MODE_TOOL_REGISTRY
@@ -1937,6 +2105,97 @@ function appFilterText(script: WorkerScriptListRow): string {
     .toLowerCase();
 }
 
+const GENERATE_IMAGE_MAX_REFERENCE_BYTES = 10 * 1024 * 1024;
+
+const IMAGE_EXTENSIONS: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/webp": "webp",
+  "image/gif": "gif",
+};
+
+/** Bytes and type of a generated image's `data:image/...;base64,` URL. */
+export function decodeImageDataUrl(dataUrl: string): { mimeType: string; base64: string; bytes: Uint8Array } {
+  const match = /^data:(image\/[a-z0-9.+-]+)(?:;[^,;]*)*;base64,(.*)$/is.exec(dataUrl.trim());
+  if (!match) throw new Error("Image generation returned an image that is not a base64 data URL");
+  const mimeType = match[1].toLowerCase() === "image/jpg" ? "image/jpeg" : match[1].toLowerCase();
+  const base64 = match[2].replace(/\s/g, "");
+  return { mimeType, base64, bytes: base64ToBytesForMove(base64) };
+}
+
+/**
+ * Where image `index` of a generation is saved: `base` with the image's own
+ * extension, and -2, -3... for the second and later images.
+ */
+export function generatedImagePath(base: string, index: number, mimeType: string): string {
+  const extension = IMAGE_EXTENSIONS[mimeType] ?? "png";
+  const slash = base.lastIndexOf("/");
+  const dot = base.lastIndexOf(".");
+  const stem = dot > slash + 1 ? base.slice(0, dot) : base;
+  return `${stem}${index > 0 ? `-${index + 1}` : ""}.${extension}`;
+}
+
+/**
+ * An HTTP response as a tool result: status, headers and a bounded body
+ * (buffered up to maxBytes, then truncated to maxCharacters of text or base64).
+ */
+export async function serializeHttpToolResponse(
+  response: Response,
+  options: { requestedUrl: string; format: "text" | "base64"; maxCharacters: number; maxBytes: number },
+): Promise<Record<string, unknown>> {
+  const chunks: Uint8Array[] = [];
+  let bodyBytes = 0;
+  let truncated = false;
+  if (response.body) {
+    const reader = response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const remaining = options.maxBytes - bodyBytes;
+      if (value.byteLength > remaining) {
+        chunks.push(value.subarray(0, remaining));
+        bodyBytes += remaining;
+        truncated = true;
+        await reader.cancel().catch(() => undefined);
+        break;
+      }
+      chunks.push(value);
+      bodyBytes += value.byteLength;
+    }
+  }
+  let bytes = new Uint8Array(bodyBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  let body: string;
+  if (options.format === "base64") {
+    const maxRawBytes = Math.floor(options.maxCharacters / 4) * 3;
+    if (bytes.byteLength > maxRawBytes) {
+      bytes = bytes.subarray(0, maxRawBytes);
+      truncated = true;
+    }
+    body = bytesToBase64ForMove(bytes);
+  } else {
+    body = new TextDecoder().decode(bytes);
+    if (body.length > options.maxCharacters) {
+      body = body.slice(0, options.maxCharacters);
+      truncated = true;
+    }
+  }
+  return {
+    status: response.status,
+    statusText: response.statusText,
+    url: response.url || options.requestedUrl,
+    headers: Object.fromEntries(response.headers.entries()),
+    encoding: options.format,
+    body,
+    bodyBytes,
+    truncated,
+  };
+}
+
 export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeToolsProps> {
   private static readonly TOOL_CALL_HANDLERS: Record<string, CodeModeToolCallHandler> = {
     AskUserQuestion: (binding, args) => binding.askUserQuestion(args),
@@ -2011,6 +2270,16 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       method: typeof args.method === "string" ? args.method : undefined,
       input: args.input,
     }),
+    connections_query: (binding, args) => {
+      const { connection, toolUseId: _toolUseId, ...input } = args;
+      if (typeof connection !== "string" || !connection.trim()) throw new Error("connection is required");
+      if (typeof input.query !== "string" || !input.query.trim()) throw new Error("query is required");
+      return invokeConnectionMethod(binding.env, binding.connectionsContext, { connection, method: "query", input });
+    },
+    generate_image: (binding, args) => binding.generateImageTool(args),
+    transcribe_audio: (binding, args) => binding.transcribeAudioTool(args),
+    http_request: (binding, args) => binding.httpRequest(args),
+    report_automation_outcome: (binding, args) => binding.reportAutomationOutcome(args),
   };
 
   private discordSendInvocationCount = 0;
@@ -2784,7 +3053,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
   }
 
-  private normalizeMoveEndpoint(value: unknown, label: "source" | "destination"): CodeModeMoveEndpoint {
+  private normalizeMoveEndpoint(value: unknown, label: string): CodeModeMoveEndpoint {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       throw new Error(`${label} must be an object`);
     }
@@ -4010,6 +4279,206 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     };
   }
 
+  /** CamelAiService (env.CAMELAI in js_exec) for this scope. Test seam. */
+  private camelAiService(): {
+    generateImage(input: string | GenerateImageOptions): Promise<GenerateImageResult>;
+  } {
+    return (this.ctx.exports as unknown as {
+      CamelAiService: (options: { props: AIVirtualBindingProps }) => {
+        generateImage(input: string | GenerateImageOptions): Promise<GenerateImageResult>;
+      };
+    }).CamelAiService({
+      props: {
+        orgId: this.ctx.props.orgId,
+        workspaceId: this.ctx.props.workspaceId,
+        userId: this.ctx.props.userId,
+      },
+    });
+  }
+
+  /** SecureFetchBinding (js_exec's global fetch) for this scope. Test seam. */
+  private secureFetchBinding(): { fetch(input: string, init?: RequestInit): Promise<Response> } {
+    return (this.ctx.exports as unknown as {
+      SecureFetchBinding: (options: { props: Pick<CodeModeToolsProps, "orgId" | "workspaceId"> }) => {
+        fetch(input: string, init?: RequestInit): Promise<Response>;
+      };
+    }).SecureFetchBinding({
+      props: {
+        orgId: this.ctx.props.orgId,
+        workspaceId: this.ctx.props.workspaceId,
+      },
+    });
+  }
+
+  /** One file's bytes from any location, refusing files over maxBytes before reading them. */
+  private async readSingleFileBytes(
+    endpoint: CodeModeMoveEndpoint,
+    maxBytes: number,
+  ): Promise<{ path: string; bytes: Uint8Array; contentType?: string }> {
+    let path: string;
+    let size: number | undefined;
+    if (endpoint.location === "r2") {
+      const target = this.resolveCodeModeR2Path(endpoint as unknown as Record<string, unknown>);
+      const head = await this.env.R2_BUCKET.head(target.key);
+      if (!head) throw new Error(`R2 object not found: ${target.path}`);
+      path = target.path;
+      size = head.size;
+    } else {
+      const store = endpoint.location === "workspace"
+        ? this.workspaceFs
+        : await this.projectFileStore(endpoint as unknown as Record<string, unknown>);
+      path = normalizeDurableWorkspacePath(endpoint.path);
+      const exists = await store.exists(path);
+      if (!exists.exists || !exists.isFile) throw new Error(`File not found: ${path}`);
+      size = exists.size;
+    }
+    if (typeof size === "number" && size > maxBytes) {
+      throw new Error(`${path} is too large (${size} bytes; max ${maxBytes})`);
+    }
+    const read = await this.readMoveSourceFile(endpoint, { path, relativePath: basenameForMove(path) });
+    if (read.bytes.byteLength > maxBytes) {
+      throw new Error(`${path} is too large (${read.bytes.byteLength} bytes; max ${maxBytes})`);
+    }
+    return { path, ...read };
+  }
+
+  /**
+   * generate_image: env.CAMELAI.generateImage (billed through the virtual AI
+   * binding), with every image saved to R2 so it outlives the turn, and
+   * returned as image content so the model sees what it made.
+   */
+  private async generateImageTool(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const prompt = typeof args.prompt === "string" ? args.prompt.trim() : "";
+    if (!prompt) throw new Error("prompt is required");
+    const outputPath = typeof args.output_path === "string" && args.output_path.trim()
+      ? args.output_path.trim()
+      : `outputs/generated-images/image-${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z")}-${crypto.randomUUID().slice(0, 6)}`;
+    // Validate where the images go before paying for them.
+    this.resolveCodeModeR2Path({ path: generatedImagePath(outputPath, 0, "image/png") }, { requireWritable: true });
+
+    let referenceImageUrl = typeof args.reference_image_url === "string" ? args.reference_image_url.trim() : "";
+    if (args.reference_image !== undefined && args.reference_image !== null) {
+      if (referenceImageUrl) throw new Error("Pass reference_image or reference_image_url, not both");
+      const endpoint = this.normalizeMoveEndpoint(args.reference_image, "reference_image");
+      const file = await this.readSingleFileBytes(endpoint, GENERATE_IMAGE_MAX_REFERENCE_BYTES);
+      const detected = detectSharedImageMimeType(file.bytes);
+      if (detected.kind !== "supported") {
+        throw new Error(`reference_image is not a supported image (png, jpeg, gif, webp): ${file.path}`);
+      }
+      referenceImageUrl = `data:${detected.mimeType};base64,${bytesToBase64ForMove(file.bytes)}`;
+    }
+
+    const result = await this.camelAiService().generateImage({
+      prompt,
+      ...(referenceImageUrl ? { referenceImageUrl } : {}),
+    });
+    if (!result.images.length) {
+      throw new Error(result.text ? `No image was generated: ${result.text}` : "No image was generated");
+    }
+
+    const saved: Array<Record<string, unknown>> = [];
+    const imageBlocks: Array<{ type: "image"; data: string; mimeType: string }> = [];
+    for (const [index, image] of result.images.entries()) {
+      const decoded = decodeImageDataUrl(image.dataUrl);
+      const path = generatedImagePath(outputPath, index, decoded.mimeType);
+      const target = this.resolveCodeModeR2Path({ path }, { requireWritable: true });
+      await this.writeMoveDestinationFile({ location: "r2", path }, path, decoded.bytes, decoded.mimeType);
+      saved.push({
+        location: "r2",
+        path: target.path,
+        publicUrl: this.r2PublicUrl(target),
+        mimeType: decoded.mimeType,
+        bytes: decoded.bytes.byteLength,
+      });
+      if (decoded.base64.length <= inlineImageMaxBase64Chars()) {
+        imageBlocks.push({ type: "image", data: decoded.base64, mimeType: decoded.mimeType });
+      } else if (this.env.IMAGES) {
+        const inline = await prepareInlineImageFromBytes(decoded.bytes, decoded.mimeType, this.env.IMAGES);
+        if (inline) imageBlocks.push({ type: "image", data: inline.data, mimeType: inline.mimeType });
+      }
+    }
+    const text = [
+      `Generated ${saved.length} image${saved.length === 1 ? "" : "s"}, saved to ${saved.map((image) => image.path).join(", ")}.`,
+      ...(result.text ? [`Model note: ${result.text}`] : []),
+    ].join("\n");
+    return {
+      text,
+      content: [{ type: "text", text }, ...imageBlocks],
+      details: { images: saved, modelText: result.text },
+    };
+  }
+
+  /** transcribe_audio: env.CAMELAI.transcribeAudio's Whisper path, reading from any file location. */
+  private async transcribeAudioTool(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const endpoint = this.normalizeMoveEndpoint(args, "audio");
+    const ai = this.env.AI as unknown as AudioTranscriptionAiBinding | undefined;
+    if (!ai) throw new Error("Audio transcription is not configured");
+    const file = await this.readSingleFileBytes(endpoint, AUDIO_TRANSCRIPTION_MAX_BYTES);
+    const buffer = file.bytes.buffer.slice(file.bytes.byteOffset, file.bytes.byteOffset + file.bytes.byteLength) as ArrayBuffer;
+    const result = await transcribeAudioBytes(ai, buffer);
+    return { text: result.text, location: endpoint.location, path: file.path, bytes: file.bytes.byteLength };
+  }
+
+  /** The thread's scheduled-run outcome, recorded on its ChatThreadDO (which validates it). */
+  private async reportAutomationOutcome(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (!this.ctx.props.threadId) throw new Error("report_automation_outcome requires chat thread scope");
+    const stub = this.chatThreadStub as unknown as {
+      recordAutomationOutcome(status: unknown, summary: unknown): Promise<{ status: string; text: string }>;
+    };
+    return await stub.recordAutomationOutcome(args.status, args.summary);
+  }
+
+  /** Hostnames of this workspace's deployed apps (http_request's only targets). Test seam. */
+  private workspaceAppHostIndex(): Promise<WorkspaceAppHostIndex> {
+    return buildWorkspaceAppHostIndex(this.env as never, {
+      orgId: this.ctx.props.orgId,
+      workspaceId: this.ctx.props.workspaceId,
+    });
+  }
+
+  /** http_request: one request to a workspace app through SecureFetchBinding (the dispatcher route). */
+  private async httpRequest(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const rawUrl = typeof args.url === "string" ? args.url.trim() : "";
+    let url: URL;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      throw new Error("url must be an absolute http(s) URL");
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      throw new Error("url must be an absolute http(s) URL");
+    }
+    if (!isWorkspaceAppHostname(await this.workspaceAppHostIndex(), url.hostname)) {
+      throw new Error(
+        `http_request only reaches this workspace's deployed apps; ${url.hostname} is not one. Use web_fetch for other URLs.`,
+      );
+    }
+    const method = typeof args.method === "string" && args.method.trim() ? args.method.trim().toUpperCase() : "GET";
+    const headers: Record<string, string> = {};
+    if (args.headers && typeof args.headers === "object" && !Array.isArray(args.headers)) {
+      for (const [key, value] of Object.entries(args.headers as Record<string, unknown>)) {
+        if (typeof value === "string") headers[key] = value;
+      }
+    }
+    const init: RequestInit = { method, headers };
+    if (typeof args.body === "string") {
+      if (method === "GET" || method === "HEAD") throw new Error(`${method} requests cannot have a body`);
+      init.body = args.body;
+    }
+    const response = await this.secureFetchBinding().fetch(url.toString(), init);
+    return serializeHttpToolResponse(response, {
+      requestedUrl: url.toString(),
+      format: args.response_format === "base64" ? "base64" : "text",
+      maxCharacters: clampCodeModeInteger(
+        args.max_characters,
+        HTTP_REQUEST_DEFAULT_MAX_CHARACTERS,
+        1,
+        CODE_MODE_MAX_OUTPUT_CHARACTERS,
+      ),
+      maxBytes: HTTP_REQUEST_MAX_RESPONSE_BYTES,
+    });
+  }
+
   /**
    * Raw AnalysisService binding. Test seam: fakes replace THIS, so every test
    * still exercises the deadline + error mapping that `analysisService()` adds.
@@ -4523,31 +4992,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private browserMethodAllowlist(): Set<string> {
-    return new Set([
-      "goto",
-      "click",
-      "fill",
-      "type",
-      "press",
-      "select",
-      "hover",
-      "waitForSelector",
-      "waitForText",
-      "waitForFunction",
-      "waitForTimeout",
-      "evaluate",
-      "textContent",
-      "hasText",
-      "getAttribute",
-      "count",
-      "exists",
-      "content",
-      "url",
-      "title",
-      "screenshot",
-      "logs",
-      "close",
-    ]);
+    return new Set<string>(BROWSER_SESSION_METHODS);
   }
 
   private async browserLaunch(args: Record<string, unknown>): Promise<unknown> {
@@ -4570,8 +5015,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async browserAction(args: Record<string, unknown>): Promise<unknown> {
-    const sessionId = typeof args.sessionId === "string" ? args.sessionId.trim() : "";
-    if (!sessionId) throw new Error("sessionId is required");
+    const rawSessionId = typeof args.sessionId === "string" ? args.sessionId : args.session_id;
+    const sessionId = typeof rawSessionId === "string" ? rawSessionId.trim() : "";
+    if (!sessionId) throw new Error("session_id is required");
     const scriptName = typeof args.scriptName === "string"
       ? args.scriptName
       : typeof args.script_name === "string"

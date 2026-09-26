@@ -81,6 +81,8 @@ export interface RuntimeAgentSessionOptions {
   identity: RuntimeAgentIdentity;
   /** Who is acting in the run being started: `act` in its tokens. */
   actor: () => string | null;
+  /** Instructions for the run being started, sent ahead of its message. */
+  runInstructions?: () => string | null;
   /** The committed transcript the DO loaded; runtime messages append to it. */
   initialState: Pick<AgentState, "systemPrompt" | "model" | "tools" | "messages" | "thinkingLevel">;
   /** The configuration applied once, right after the agent is created. */
@@ -326,7 +328,8 @@ export class RuntimeAgentSession {
         let message = localized.message as AgentMessage;
         if ((message as { role?: string }).role === "user") {
           // Keep the DO's stamped copy (render id, metadata) of what it sent.
-          const index = this.sentUserMessages.findIndex((sent) => userText(sent) === userText(message));
+          // Run instructions may precede the text the DO sent.
+          const index = this.sentUserMessages.findIndex((sent) => userText(message).endsWith(userText(sent)));
           if (index >= 0) [message] = this.sentUserMessages.splice(index, 1);
           localized.message = message;
         }
@@ -488,7 +491,9 @@ export class RuntimeAgentSession {
   prompt(message: AgentMessage): Promise<void> {
     const actor = this.options.actor();
     this.sentUserMessages.push(message);
-    const promise = this.run("prompt", { text: userText(message), ...(actor ? { actor } : {}) });
+    const instructions = this.options.runInstructions?.();
+    const text = instructions ? `${instructions}\n\n${userText(message)}` : userText(message);
+    const promise = this.run("prompt", { text, ...(actor ? { actor } : {}) });
     this.running = promise.catch(() => undefined);
     return promise;
   }

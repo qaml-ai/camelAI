@@ -7913,6 +7913,9 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         },
       },
       actor: () => this.getActiveTurnUserId(),
+      // The runtime agent's prompt is fixed at creation; per-run instructions
+      // (a scheduled run's outcome report) ride on the message instead.
+      runInstructions: () => this.automationOutcomeInstruction(),
       initialState: {
         systemPrompt: "",
         model: capPiMainRequestOutput(model),
@@ -8022,6 +8025,18 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     });
   }
 
+  /** Per-run instructions for a scheduled automation that must report its outcome. */
+  private automationOutcomeInstruction(): string | null {
+    return this.activeAutomationRun?.requiresExplicitOutcome
+      ? [
+          "## Scheduled Automation Outcome",
+          "Before your final response, you MUST call `report_automation_outcome` exactly once.",
+          "Use `success` only when the requested business objective was actually completed and verified. A clean turn, partial data extraction, or a decision not to deploy is not success.",
+          "Use `failed` when the objective was not completed, `partial` when only part completed, and `needs_attention` when operator action is required. Give a concise factual summary.",
+        ].join("\n")
+      : null;
+  }
+
   private createPiSystemPrompt(
     context: ChatContextState,
     _envVars?: Record<string, string>,
@@ -8037,15 +8052,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     const verifiedWorkState = formatVerifiedWorkStatePrompt(
       this.ctx?.storage?.kv?.get<unknown>(CHAT_VERIFIED_WORK_STATE_KEY),
     );
-    const automationOutcomeInstruction = this.activeAutomationRun?.requiresExplicitOutcome
-      ? [
-          "## Scheduled Automation Outcome",
-          "Before your final response, you MUST call `report_automation_outcome` exactly once.",
-          "Use `success` only when the requested business objective was actually completed and verified. A clean turn, partial data extraction, or a decision not to deploy is not success.",
-          "Use `failed` when the objective was not completed, `partial` when only part completed, and `needs_attention` when operator action is required. Give a concise factual summary.",
-        ].join("\n")
-      : null;
-    return [base, verifiedWorkState, automationOutcomeInstruction]
+    return [base, verifiedWorkState, this.automationOutcomeInstruction()]
       .filter((part): part is string => Boolean(part))
       .join("\n\n");
   }

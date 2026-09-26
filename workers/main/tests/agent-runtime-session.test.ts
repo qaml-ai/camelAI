@@ -128,6 +128,34 @@ describe("RuntimeAgentSession", () => {
     expect(store.data.agent?.model).toBe("chiridion/opus");
   });
 
+  it("sends run instructions ahead of the message and steers without an actor", async () => {
+    const runtime = fakeRuntime((requestId) => [
+      { type: "event", requestId, event: { type: "message_end", message: { role: "user", content: "## Outcome\n\nhello", timestamp: 9 } } },
+      { type: "event", requestId, event: { type: "agent_end", messages: [] } },
+      { type: "response", id: requestId, outcome: { result: {} } },
+    ]);
+    const store = memoryStore();
+    const agent = new RuntimeAgentSession({
+      env: { AGENT_RUNTIME_URL: "https://runtime.test", AGENT_RUNTIME_API_TOKEN: "operator", AGENT_RUNTIME_DEFINITION: "def_1", APP_KV: {} as KVNamespace },
+      store: store.store,
+      identity: { orgId: "org1", workspaceId: "ws1", threadId: "thread1", subject: "user1" },
+      actor: () => "user2",
+      runInstructions: () => "## Outcome",
+      initialState: { systemPrompt: "", model: MODEL, tools: [], messages: [], thinkingLevel: "medium" },
+      configuration: async () => ({ systemPromptAppend: "" }),
+      fetch: runtime.fetch,
+    });
+    await agent.prompt(userMessage);
+    const prompt = runtime.calls.find((call) => call.path === "/clients/client_1/requests")!;
+    expect(prompt.body).toMatchObject({ params: { text: "## Outcome\n\nhello" } });
+    expect(agent.state.messages[0]).toBe(userMessage);
+    agent.steer(userMessage);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const steer = runtime.calls.filter((call) => call.path === "/clients/client_1/requests").at(-1)!;
+    expect(steer.body).toMatchObject({ method: "steer", params: { text: "hello" } });
+    expect((steer.body as { params: Record<string, unknown> }).params.actor).toBeUndefined();
+  });
+
   it("closes the turn with an error when the runtime refuses the run", async () => {
     const runtime = fakeRuntime((requestId) => [{ type: "response", id: requestId, outcome: { error: "Payment required" } }]);
     const { agent, events } = session(runtime);

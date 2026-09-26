@@ -133,7 +133,6 @@
 			{ "name": "SLACK_TEAM_REGISTRY", "class_name": "SlackTeamRegistryDO" },
 			{ "name": "WORKSPACE", "class_name": "WorkspaceDO" },
 			{ "name": "WORKSPACE_CRON", "class_name": "WorkspaceCronDO" },
-			{ "name": "MCP_OBJECT", "class_name": "ChiridionMcp" },
 				{ "name": "WORKER_LOGS", "class_name": "WorkerLogsDO" },
 				{ "name": "WORKSPACE_FS", "class_name": "WorkspaceFilesystemDO" },
 				{ "name": "PROJECT_BUILD_SANDBOX", "class_name": "ProjectBuildSandbox" },
@@ -176,6 +175,7 @@
 			{ "tag": "v27", "new_sqlite_classes": ["MigrationPlanningAgent"] },
 			{ "tag": "v28", "new_sqlite_classes": ["ProjectBuildSandbox"] },
 			{ "tag": "v29", "new_sqlite_classes": ["DbQuerySandbox"] },
-			{ "tag": "v30", "new_sqlite_classes": ["SignupDO"] }
+			{ "tag": "v30", "new_sqlite_classes": ["SignupDO"] },
+			{ "tag": "v31", "deleted_classes": ["ChiridionMcp"] }
 	]
 }

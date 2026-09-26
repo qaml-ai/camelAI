@@ -1,26 +1,3 @@
-import type { ProjectBuildSandbox } from "./project-build-sandbox.js";
-
-export interface ProjectBuildEnv {
-  WORKSPACE_FS: DurableObjectNamespace;
-  R2_BUCKET: R2Bucket;
-  PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<ProjectBuildSandbox>;
-}
-
-export interface ProjectBuildProps {
-  orgId: string;
-}
-
-export interface ProjectBuildRequest {
-  projectId: string;
-  timeoutMs?: number;
-}
-
-export interface ProjectDependencyRequest {
-  projectId: string;
-  dependency: string;
-  dev?: boolean;
-}
-
 export interface ProjectBuildResult {
   success: boolean;
   projectId: string;
@@ -70,8 +47,4 @@ export interface ProjectBuildTimings {
   commandMs: number;
   persistMs: number;
   totalMs: number;
-}
-
-export interface ProjectBuildSandboxNamespaceEnv {
-  PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<ProjectBuildSandbox>;
 }

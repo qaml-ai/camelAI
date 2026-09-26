@@ -13,12 +13,6 @@
 	"browser": { "binding": "BROWSER" },
 	"containers": [
 		{
-			"class_name": "EvalSandbox",
-			"image": "./workers/main/eval-sandbox.Dockerfile",
-			"instance_type": "lite",
-			"max_instances": 1
-		},
-		{
 			"class_name": "ProjectBuildSandbox",
 			"image": "./workers/main/project-build-sandbox.Dockerfile",
 			"instance_type": "standard-3",
@@ -84,7 +78,6 @@
 	"durable_objects": {
 		"bindings": [
 			{ "name": "CHAT_THREAD", "class_name": "ChatThreadDO" },
-			{ "name": "EVAL_SANDBOX", "class_name": "EvalSandbox" },
 			{ "name": "USER", "class_name": "UserDO" },
 			{ "name": "SIGNUP", "class_name": "SignupDO" },
 			{ "name": "ORG", "class_name": "OrgDO" },
@@ -122,6 +115,7 @@
 			{ "tag": "v12", "new_sqlite_classes": ["ProjectBuildSandbox"] },
 			{ "tag": "v13", "new_sqlite_classes": ["AnalysisSandbox"] },
 			{ "tag": "v14", "new_sqlite_classes": ["SignupDO"] },
-			{ "tag": "v15", "new_sqlite_classes": ["WorkerLogsDO"] }
+			{ "tag": "v15", "new_sqlite_classes": ["WorkerLogsDO"] },
+			{ "tag": "v16", "deleted_classes": ["EvalSandbox"] }
 		]
 	}

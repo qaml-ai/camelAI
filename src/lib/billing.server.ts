@@ -6,7 +6,6 @@ import type {
   SubscriptionInvoiceGrantRow,
 } from "../../workers/main/src/auth";
 import {
-  type BillingPlanLimits,
   getBillingPlanLimits,
   getIncludedCreditCentsForPlan,
   getMinimumSeats,
@@ -383,13 +382,6 @@ export interface OrgBillingOverview extends OrgBillingAccessSnapshot {
   total_credit_limit_cents: number;
   trial_credit_allowance_cents: number;
   subscription_included_credit_cents: number;
-}
-
-export interface ConfiguredSubscriptionPlan {
-  plan: BillingPlan;
-  priceId: string;
-  price: StripePriceSummary | null;
-  limits: BillingPlanLimits;
 }
 
 function getOrgStub(env: Pick<StripeBillingEnv, "ORG">, orgId: string) {
@@ -983,49 +975,6 @@ export function getConfiguredSubscriptionPriceId(
   }
 }
 
-export function getConfiguredSubscriptionPlans(
-  env: Pick<
-    StripeBillingEnv,
-    | "STRIPE_SUBSCRIPTION_PRICE_ID"
-    | "STRIPE_STARTER_PRICE_ID"
-    | "STRIPE_PRO_PRICE_ID"
-    | "STRIPE_TEAM_PRICE_ID"
-  >,
-): Array<{
-  plan: SubscriptionBillingPlan;
-  priceId: string;
-  limits: BillingPlanLimits;
-}> {
-  return (["starter", "pro", "team"] as SubscriptionBillingPlan[])
-    .map((plan) => {
-      const priceId = getConfiguredSubscriptionPriceId(env, plan);
-      return priceId
-        ? { plan, priceId, limits: getBillingPlanLimits(plan) }
-        : null;
-    })
-    .filter(
-      (
-        plan,
-      ): plan is {
-        plan: SubscriptionBillingPlan;
-        priceId: string;
-        limits: BillingPlanLimits;
-      } => Boolean(plan),
-    );
-}
-
-export async function fetchConfiguredSubscriptionPlans(
-  env: StripeBillingEnv,
-): Promise<ConfiguredSubscriptionPlan[]> {
-  const plans = getConfiguredSubscriptionPlans(env);
-  return Promise.all(
-    plans.map(async (plan) => ({
-      ...plan,
-      price: await fetchStripePriceSummary(env, plan.priceId),
-    })),
-  );
-}
-
 export async function fetchStripePriceSummary(
   env: StripeBillingEnv,
   priceId: string | null | undefined,
@@ -1220,15 +1169,6 @@ export async function fetchConfiguredCreditPacks(
       const rightAmount = right.unit_amount ?? Number.MAX_SAFE_INTEGER;
       return leftAmount - rightAmount;
     });
-}
-
-export async function getBillingAccessSnapshot(
-  env: StripeBillingEnv,
-  orgId: string,
-): Promise<OrgBillingAccessSnapshot | null> {
-  const org = await getOrgStub(env, orgId).getInfo();
-  if (!org) return null;
-  return getBillingAccessSnapshotForOrg(org);
 }
 
 export function getBillingAccessSnapshotForOrg(
@@ -3463,14 +3403,6 @@ export async function reconcilePaidSubscriptionInvoice(
         : "recorded"
       : "not_recorded",
   };
-}
-
-export async function applySubscriptionIncludedCreditsFromInvoice(
-  env: StripeBillingEnv,
-  invoice: StripeInvoice,
-): Promise<Organization | null> {
-  const result = await processPaidSubscriptionInvoice(env, invoice.id);
-  return result.status === "ignored" ? null : result.org;
 }
 
 async function hasProcessedCreditCheckout(

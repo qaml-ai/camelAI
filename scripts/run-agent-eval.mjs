@@ -36,7 +36,7 @@ if (!process.env.MINIFLARE_CONTAINER_EGRESS_IMAGE) {
 // safe when this is the only eval on the host. A direct local run (`bun run test:eval:*`) is exactly
 // that. An orchestrator that runs evals concurrently would have a global sweep kill a sibling run's
 // container, so it sets EVAL_MANAGED_CLEANUP=1 to skip this and owns a concurrency-safe reaper instead.
-const EVAL_CONTAINER_CLASS_NAMES = ["EvalSandbox", "ProjectBuildSandbox", "AnalysisSandbox"];
+const EVAL_CONTAINER_CLASS_NAMES = ["ProjectBuildSandbox", "AnalysisSandbox"];
 const VITEST_CONTAINER_NAME_PREFIX = "workerd-vitest-pool-workers-runner--";
 const ANALYSIS_SANDBOX_IMAGE = "camelai-analysis-sandbox:latest";
 const ANALYSIS_SANDBOX_DOCKERFILE = "workers/main/analysis-sandbox.Dockerfile";

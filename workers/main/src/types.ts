@@ -11,7 +11,6 @@ import type { ChatEnv } from "./chat-thread-do.js";
 import type { DOEnv } from "./auth.js";
 import type { DataProxyEnv } from "./data-proxy.js";
 import type { CfApiProxyEnv } from "./cf-api-proxy.js";
-import type { McpEnv } from "./mcp-handler.js";
 import type { WorkspaceDO } from "./workspace.js";
 import type { WorkerLogsDO } from "./worker-logs-do.js";
 import type { EmailHandleDO } from "./email-handle-registry.js";
@@ -53,8 +52,7 @@ export interface Env
     ChatEnv,
     DOEnv,
     DataProxyEnv,
-    Omit<CfApiProxyEnv, "CHAT_THREAD">,
-    Omit<McpEnv, "CHAT_THREAD" | "MCP_OBJECT"> {
+    Omit<CfApiProxyEnv, "CHAT_THREAD"> {
   ASSETS: Fetcher;
   WORKSPACE: DurableObjectNamespace<WorkspaceDO>;
   WORKER_LOGS: DurableObjectNamespace<WorkerLogsDO>;
@@ -147,8 +145,6 @@ export interface Env
   CF_GATEWAY_TOKEN?: string;
   AI_GATEWAY_AUTH_TOKEN?: string;
   BEDROCK_REGION?: string;
-  // Sandbox proxy shared secret
-  SANDBOX_PROXY_SECRET?: string;
   LOCAL_ARTIFACTS_BASE_URL?: string;
   LOCAL_ARTIFACTS_SECRET?: string;
   LOCAL_APP_VANITY_DOMAIN?: string;

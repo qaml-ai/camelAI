@@ -19,15 +19,6 @@ export interface AppCustomDomainProvisioningState extends AppCustomDomainRefresh
   custom_domain_error: string | null;
 }
 
-export function hasExpectedCustomDomainHostname(
-  app: Pick<AppCustomDomainBaseState, 'script_name' | 'custom_domain_hostname'>,
-  orgCustomDomain: string | null | undefined
-): boolean {
-  void app;
-  void orgCustomDomain;
-  return true;
-}
-
 export function shouldRefreshAppCustomDomainState(
   app: AppCustomDomainRefreshState,
   orgCustomDomain: string | null | undefined,

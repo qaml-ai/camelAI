@@ -7,7 +7,6 @@ import {
   ANALYSIS_SLEEP_AFTER,
   DB_QUERY_INSTANCE_TYPE,
   DB_QUERY_SLEEP_AFTER,
-  EVAL_INSTANCE_TYPE,
   PROJECT_BUILD_ACTIVE_SESSION_MAX_WINDOW_MS,
   PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS,
   PROJECT_BUILD_INSTANCE_TYPE,
@@ -40,7 +39,6 @@ const EXPECTED = {
   ProjectBuildSandbox: PROJECT_BUILD_INSTANCE_TYPE,
   AnalysisSandbox: ANALYSIS_INSTANCE_TYPE,
   DbQuerySandbox: DB_QUERY_INSTANCE_TYPE,
-  EvalSandbox: EVAL_INSTANCE_TYPE,
 } as const;
 
 describe("container right-sizing", () => {
@@ -63,7 +61,7 @@ describe("container right-sizing", () => {
     ["wrangler.prod.jsonc", ["ProjectBuildSandbox", "AnalysisSandbox", "DbQuerySandbox"]],
     ["wrangler.staging.jsonc", ["ProjectBuildSandbox", "AnalysisSandbox", "DbQuerySandbox"]],
     ["wrangler.jsonc", ["ProjectBuildSandbox", "AnalysisSandbox", "DbQuerySandbox"]],
-    ["wrangler.test.jsonc", ["EvalSandbox", "ProjectBuildSandbox", "AnalysisSandbox"]],
+    ["wrangler.test.jsonc", ["ProjectBuildSandbox", "AnalysisSandbox"]],
     ["wrangler.dev-miguel.jsonc", ["ProjectBuildSandbox", "DbQuerySandbox"]],
     ["wrangler.dev-illiana.jsonc", ["ProjectBuildSandbox", "DbQuerySandbox"]],
   ] as const)("%s instance_type matches container-sizing.ts", (path, classes) => {

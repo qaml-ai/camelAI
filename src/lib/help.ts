@@ -77,5 +77,3 @@ export const getHelpFormSchema = z.object({
     )
     .optional(),
 });
-
-export type GetHelpFormValues = z.infer<typeof getHelpFormSchema>;

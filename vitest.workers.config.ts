@@ -137,7 +137,6 @@ export default defineConfig({
         compatibilityDate: '2026-03-24',
         compatibilityFlags: ['nodejs_compat'],
         durableObjects: {
-          EVAL_SANDBOX: sandboxDurableObject('EvalSandbox', 'camelai-eval-sandbox:latest'),
           PROJECT_BUILD_SANDBOX: sandboxDurableObject('ProjectBuildSandbox', 'camelai-eval-sandbox:latest'),
           ANALYSIS_SANDBOX: sandboxDurableObject('AnalysisSandbox', 'camelai-analysis-sandbox:latest'),
         },
@@ -161,10 +160,6 @@ export default defineConfig({
         find: '@smithy/core/config',
         replacement: smithyCoreConfigNodeEntry,
       },
-      { find: '../../../.open-next/worker.js', replacement: path.resolve(__dirname, 'workers/main/src/__mocks__/opennext-handler.ts') },
-      // Mock MCP handler to avoid @modelcontextprotocol/sdk ajv compatibility issues in workers runtime
-      // Match any path ending in mcp-handler.js from the workers/main/src directory
-      { find: /.*\/mcp-handler\.js$/, replacement: path.resolve(__dirname, 'workers/main/src/__mocks__/mcp-handler.ts') },
     ],
   },
   test: {

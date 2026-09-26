@@ -88,14 +88,6 @@ if (!BIGQUERY_PROVIDER_MCP) {
   throw new Error('BigQuery provider MCP definition is missing');
 }
 
-export const BIGQUERY_MCP_SERVER = {
-  ...BIGQUERY_PROVIDER_MCP,
-  server_name: BIGQUERY_PROVIDER_MCP.serverName,
-  direct_connect: BIGQUERY_PROVIDER_MCP.directConnect,
-  auth_strategy: BIGQUERY_PROVIDER_MCP.authStrategy,
-  docs_url: BIGQUERY_PROVIDER_MCP.docsUrl,
-};
-
 export function isBigQueryMcpIntegration(integrationType: string): boolean {
   return integrationType === 'bigquery';
 }

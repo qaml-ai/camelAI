@@ -2,14 +2,11 @@
  * Main camelAI Worker - Composition Root
  *
  * Routes:
- * - /client/v4/* → CF API proxy for wrangler deploys
- * - /mcp/* → MCP protocol
  * - /api/auth/:provider → User OAuth (Google, GitHub)
  * - /api/integrations/slack/* → Slack OAuth
  * - /api/integrations/slack/events → Slack Events API webhook
  * - /api/integrations/telegram/webhook → Telegram Bot API webhook
  * - email() → Workspace email ingress (Cloudflare Email Routing)
- * - /api/threads/:id/preview → Thread preview API
  * - /agents/chat-thread/:thread → ChatThreadDO WebSocket chat
  * - /agents/chat-thread/:thread/sse → HTTP polling fallback / legacy SSE
  * - /agents/chat-thread/:thread/call → ChatThreadDO chat frames (POST)
@@ -30,11 +27,7 @@ import {
 } from './discord-events-queue.js';
 
 // Route handlers
-import { handleCfProxy } from './routes/cf-proxy.js';
-import { handleMcp } from './routes/mcp.js';
-import { handleConnectionsRpc } from './routes/connections-rpc.js';
 import { handleAdminMcp } from './routes/admin-mcp.js';
-import { handleThreadPreview } from './routes/threads.js';
 import { handleOAuthStart, handleOAuthCallback } from './routes/oauth.js';
 import {
   handleSlackOAuthStart,
@@ -55,18 +48,8 @@ import {
   handleDiscordOAuthStart,
 } from './routes/discord-integrations.js';
 import { handleWorkspaceStatusStream } from './routes/status-stream.js';
-import { handleLogsWebSocket } from './routes/logs-websocket.js';
 import { handleOAuthMetadata, handleResourceMetadata } from './routes/well-known.js';
-import {
-  handleMssqlQuery,
-  handleMysqlQuery,
-  handlePostgresQuery,
-} from './routes/data-proxy.js';
-import {
-  handleInternalBillingAccess,
-  handleStripeWebhook,
-} from './routes/billing.js';
-import { handleEmailSendProxy } from './routes/email-send-proxy.js';
+import { handleStripeWebhook } from './routes/billing.js';
 import { handleWorkerAuth } from './routes/worker-auth.js';
 import { requireChatWebSocketAccess } from './helpers/auth.js';
 import { stripReservedTransportHeaders } from './chat-thread/transport-headers.js';
@@ -75,7 +58,6 @@ import { text } from './helpers/response.js';
 import { normalizePathForObservability, recordObservabilityEvent } from './observability.js';
 
 // Re-exports for wrangler
-export { ChiridionMcp } from './mcp-handler.js';
 export {
   AdminJsExecDoBinding,
   AdminJsExecRuntimeBinding,
@@ -98,7 +80,6 @@ export { AssetsVirtualBinding } from './assets-virtual-binding.js';
 export { DataProxyService } from './data-proxy-service.js';
 export { WarehouseService } from './warehouse-service.js';
 export { AnalysisService, AnalysisAppService } from './analysis-service.js';
-export { ProjectBuildService } from './project-build-service.js';
 export { AIVirtualBinding } from './ai-virtual-binding.js';
 export { ConnectionsService } from './connections-service.js';
 export {
@@ -110,7 +91,6 @@ export { SecureFetchBinding } from './secure-fetch-service.js';
 export { AppScreenshotBinding } from './app-screenshot-binding.js';
 export { AppBrowserBinding } from './app-browser-binding.js';
 export { WorkspaceFilesystemDO } from './workspace-filesystem-do.js';
-export { EvalSandbox } from './eval-sandbox.js';
 export { AnalysisSandbox } from './analysis-sandbox.js';
 export { ProjectBuildSandbox } from './project-build-sandbox.js';
 export { DbQuerySandbox } from './db-query-sandbox.js';
@@ -220,31 +200,12 @@ const routes: Route[] = [
     handler: async (context) => (await loadAdminApiModule()).handleAdminApi(context),
   },
 
-  // CF API Proxy
-  { method: 'ALL', path: /^\/client\/v4\//, handler: handleCfProxy },
-
-  // Data proxy (for sandbox containers)
-  { method: 'POST', path: /^\/api\/mssql\/query$/, handler: handleMssqlQuery },
-  { method: 'POST', path: /^\/api\/postgres\/query$/, handler: handlePostgresQuery },
-  { method: 'POST', path: /^\/api\/mysql\/query$/, handler: handleMysqlQuery },
-  { method: 'GET', path: /^\/api\/internal\/billing\/access$/, handler: handleInternalBillingAccess },
+  // Stripe billing webhook
   { method: 'POST', path: /^\/api\/billing\/stripe\/webhook$/, handler: handleStripeWebhook },
-
-  // Email sending proxy (for sandbox containers)
-  { method: 'POST', path: /^\/api\/email\/send$/, handler: handleEmailSendProxy },
-
-  // Connections RPC (internal - sandbox/project-runtime tools)
-  { method: 'ALL', path: /^\/rpc\/connections$/, handler: handleConnectionsRpc },
-
-  // MCP (internal - sandbox agent)
-  { method: 'ALL', path: /^\/mcp(\/|$)/, handler: handleMcp },
 
   // OAuth discovery (well-known paths can't be React Router routes)
   { method: 'GET', path: /^\/\.well-known\/oauth-authorization-server(\/.*)?$/, handler: handleOAuthMetadata },
   { method: 'GET', path: /^\/\.well-known\/oauth-protected-resource(\/.*)?$/, handler: handleResourceMetadata },
-
-  // Thread Preview API
-  { method: 'POST', path: /^\/api\/threads\/([^/]+)\/preview$/, handler: handleThreadPreview },
 
   // User OAuth
   { method: 'GET', path: /^\/api\/auth\/(google|github)$/, handler: handleOAuthStart },
@@ -293,9 +254,6 @@ const routes: Route[] = [
 
   // Workspace thread-status SSE stream (replaces the status WebSocket).
   { method: 'GET', path: /^\/api\/workspaces\/([^/]+)\/status\/stream$/, handler: handleWorkspaceStatusStream },
-
-  // Log-tail WebSocket (cf-api-proxy hands this URL back as the tail endpoint).
-  { method: 'GET', path: /^\/ws\/logs$/, handler: handleLogsWebSocket, websocket: true },
 ];
 
 // =============================================================================
@@ -494,8 +452,8 @@ export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
     const method = req.method;
-    // Only explicitly marked routes accept upgrades: chat and log tail. Other
-    // upgrade paths, including retired workspace status sockets, remain 404s.
+    // Only explicitly marked routes accept upgrades: chat. Other upgrade paths,
+    // including retired workspace status and log-tail sockets, remain 404s.
     const isWebSocket = req.headers.get('Upgrade') === 'websocket';
 
     for (const route of routes) {

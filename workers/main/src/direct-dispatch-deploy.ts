@@ -323,9 +323,8 @@ export async function deployWorkerModulesDirect(
       dispatchScriptName,
     ),
     // Attach the tail worker so deployed app logs/exceptions flow into
-    // WorkerLogsDO. The legacy wrangler-deploy path set this via a separate
-    // settings PATCH in cf-api-proxy; the direct-dispatch path owns the upload
-    // PUT, so we set tail_consumers inline on every deploy (incl. redeploys).
+    // WorkerLogsDO. The direct-dispatch path owns the upload PUT, so we set
+    // tail_consumers inline on every deploy (incl. redeploys).
     // Merge into (not replace) any consumers the project already declares so a
     // project-configured tail consumer is preserved alongside the platform one.
     ...(tailWorkerName

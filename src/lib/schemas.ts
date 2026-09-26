@@ -42,28 +42,13 @@ export const createWorkspaceFormSchema = z.object({
   description: z.string().max(200, 'Description must be 200 characters or less').optional(),
 });
 
-// Create workspace - full submission
-export const createWorkspaceSchema = createWorkspaceFormSchema.extend({
-  intent: z.literal('createWorkspace'),
-});
-
 // Create org - form fields only
 export const createOrgFormSchema = z.object({
   name: z.string().min(1, 'Organization name is required').max(100, 'Organization name must be 100 characters or less'),
-});
-
-// Create org - full submission
-export const createOrgSchema = createOrgFormSchema.extend({
-  intent: z.literal('createOrg'),
 });
 
 // Invite member - form fields only
 export const inviteMemberFormSchema = z.object({
   emails: z.array(inviteEmailSchema).min(1, 'At least one email is required').max(MAX_INVITE_EMAILS, `Invite up to ${MAX_INVITE_EMAILS} people at a time`),
   role: z.enum(['admin', 'member', 'viewer']).default('member'),
-});
-
-// Invite member - full submission (uses createInvitation intent)
-export const inviteMemberSchema = inviteMemberFormSchema.extend({
-  intent: z.literal('createInvitation'),
 });

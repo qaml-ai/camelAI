@@ -21,7 +21,4 @@ export function redirect(url: string, sessionId?: string, secure = true, hostnam
   return new Response(null, { status: 302, headers });
 }
 
-export const json = (data: unknown, status = 200) =>
-  new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
-
 export const text = (body: string, status = 200) => new Response(body, { status });

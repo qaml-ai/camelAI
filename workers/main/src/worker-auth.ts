@@ -331,26 +331,5 @@ export function isWorkerAuthCallbackOriginValid(
   }
 }
 
-/**
- * Validate that a return URL is safe (points to allowed domain).
- * Prevents open redirect attacks.
- */
-export function isValidReturnUrl(url: string, allowedDomainPattern: RegExp): boolean {
-  try {
-    const parsed = new URL(url);
-    // Must be HTTPS in production
-    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-      return false;
-    }
-    // Must match allowed domain pattern
-    return allowedDomainPattern.test(parsed.hostname);
-  } catch {
-    return false;
-  }
-}
-
-// Default pattern for worker domains (*.chiridion.run)
-export const WORKER_DOMAIN_PATTERN = /^[a-zA-Z0-9-]+\.chiridion\.run$/;
-
 // Cookie name for dispatcher sessions
 export const DISPATCHER_SESSION_COOKIE = 'chiridion_run_session';

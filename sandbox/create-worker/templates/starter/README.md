@@ -49,7 +49,7 @@ export async function loader({ context }: Route.LoaderArgs) {
 
 The starter includes a `DATA_PROXY` service binding.
 
-- Local dev: binding points to `LocalDataProxyService` (`workers/data-proxy.ts`), which forwards to `DATA_PROXY_URL` when set
+- Local dev: binding points to `LocalDataProxyService` (`workers/data-proxy.ts`), which returns an error for every query (there is no local database proxy)
 - camelAI deploy: platform rewrites `DATA_PROXY` to its internal service binding
 
 ```typescript
@@ -74,7 +74,7 @@ export async function loader({ context }: Route.LoaderArgs) {
 
 ### Connections Service Binding
 
-The starter includes a `CONNECTIONS` service binding for workspace connections. Local dev binds to `LocalConnectionsService`, which talks to the unified RPC endpoint configured by `CAMELAI_CONNECTIONS_RPC_URL`. camelAI deploys rewrite the binding to the internal `ConnectionsService`.
+The starter includes a `CONNECTIONS` service binding for workspace connections. Local dev binds to `LocalConnectionsService`, which throws on every call (connections only work in deployed apps). camelAI deploys rewrite the binding to the internal `ConnectionsService`.
 
 Use `CONNECTIONS.find()` for the shortest path to a connection, or `CONNECTIONS.methods()` to inspect all available aliases, method names, input schemas, and examples. Use `createConnections()` for method-style calls:
 

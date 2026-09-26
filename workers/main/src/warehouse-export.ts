@@ -57,14 +57,6 @@ export function warehouseExportKey(
   return `${warehouseWorkspacePrefix(workspaceId)}/${slug(connectionId)}/${fnv1a(sql)}.${format}`;
 }
 
-/**
- * Where an export's `r2_key` is readable inside the sealed container. The bucket
- * is mounted at `/${prefix}`, so the object lands at exactly `/${r2_key}`.
- */
-export function warehouseContainerPath(r2Key: string): string {
-  return `/${r2Key}`;
-}
-
 const EXPORT_CONTENT_TYPE: Record<WarehouseExportFormat, string> = {
   parquet: 'application/vnd.apache.parquet',
   ndjson: 'application/x-ndjson',

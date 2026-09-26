@@ -38,9 +38,9 @@ worker-side). There is no in-repo Go sandbox-host or data-proxy tree.
 - `src/routes.ts` - Imperative React Router route config. Add page/API routes here.
 - `src/routes/api/` - React Router API routes for most user-facing REST (billing checkout, workspaces, chat groups, etc.).
 - `src/components/ui/` - shadcn/ui components.
-- `workers/main/` - Main Cloudflare Worker, Durable Objects, HTTP/SSE transports (plus the log-tail WebSocket `/ws/logs`), MCP, admin APIs, proxies, container image Dockerfiles.
+- `workers/main/` - Main Cloudflare Worker, Durable Objects, HTTP/SSE transports, admin MCP, admin APIs, proxies, container image Dockerfiles.
 - `workers/main/src/identity/` - `UserDO` / `OrgDO` and related identity helpers (`auth.ts` is a compatibility barrel).
-- `workers/main/src/routes/` - Worker-native HTTP (SSE streams, the log-tail WebSocket `/ws/logs`, Stripe webhook, data-proxy, MCP, most `/api/admin/*` on Hono). Prefer documenting new paths here vs `src/routes/api/` — see **API routing** below.
+- `workers/main/src/routes/` - Worker-native HTTP (SSE streams, Stripe webhook, admin MCP, most `/api/admin/*` on Hono). Prefer documenting new paths here vs `src/routes/api/` — see **API routing** below.
 - `workers/dispatcher/` - Workers for Platforms dispatcher for deployed user apps.
 - `workers/app-usage-guard/` - Account-wide Durable Object SQLite usage monitor and reversible app quarantine Worker; see `docs/deployed-app-usage-guard-design.md`.
 - `workers/bedrock-provider/` - AI Gateway custom provider translating Anthropic-style requests to Bedrock.
@@ -65,7 +65,7 @@ Two HTTP surfaces share the main worker:
 | Surface | Location | Typical contents |
 | --- | --- | --- |
 | React Router | `src/routes/api/` | Session-cookie user REST (workspaces, billing checkout, uploads, chat groups) |
-| Worker-native | `workers/main/src/routes/` | SSE streams, log-tail WebSocket (`/ws/logs`), Stripe webhook, MCP, data-proxy, most bearer admin REST |
+| Worker-native | `workers/main/src/routes/` | SSE streams, Stripe webhook, admin MCP, most bearer admin REST |
 
 `workers/main/src/index.ts` routes some paths (e.g. `/api/admin/*`) to worker modules before React Router SSR. When adding an API, match an existing neighbor; do not invent a third pattern.
 
@@ -110,22 +110,21 @@ bun run deploy:bedrock-provider:prod
 
 ### Real-deploy evals (testing grounds)
 
-Agent evals deploy apps for real to a dedicated testing-grounds namespace so they are
-actually usable. The eval sandbox runs inside Miniflare, so `eval-sandbox.ts` intercepts the
-container's Cloudflare API traffic and forwards it to the production `proxyCloudflareApi`
-in-process (identity via `trustedIdentity` from the per-container eval deploy context in
-`eval-deploy-context.ts`). The deploy then publishes to the `chiridion-platform-evals`
-dispatch namespace and registers in OrgDO exactly like production — so `list_apps` /
-`set_preview` and `AgentEvalSessionResult.deployedApps` surface the app through the normal
-app path with no eval-specific branches in `mcp-handler`/`chat-thread-do`. The testing-grounds
-host comes from the eval env's `WORKER_BASE_URL` / `LOCAL_APP_VANITY_DOMAIN`
-(`*.evals.camelai.app`), and virtual bindings resolve against the staging main worker
-(`CF_WORKER_NAME`); these are pinned in `wrangler.test.jsonc`. Real deploy is the default for
-agent eval runs whenever `CF_API_TOKEN` is set; `EVAL_REAL_DEPLOY=0` disables it (deploy evals
-then skip). Served by the evals dispatcher (`workers/dispatcher/wrangler.evals.jsonc`); the
-namespace + DNS routes are created out-of-band. Eval apps are kept (no cleanup). Live-data
-bindings (`DATA_PROXY`/`CONNECTIONS`) won't resolve to the eval's local workspace;
-self-contained apps render fully.
+Agent evals deploy apps for real to a dedicated testing-grounds namespace so they are actually
+usable. The agent deploys with the normal `deploy_project` tool, which uploads via
+`deployWorkerModulesDirect` (`direct-dispatch-deploy.ts`) straight to the Cloudflare API from
+the worker, so nothing eval-specific sits in the deploy path. It publishes to the
+`chiridion-platform-evals` dispatch namespace and registers in OrgDO exactly like production —
+so `list_apps` / `set_preview` and `AgentEvalSessionResult.deployedApps` surface the app through
+the normal app path with no eval-specific branches in `chat-thread-do`. The testing-grounds host
+comes from the eval env's `WORKER_BASE_URL` / `LOCAL_APP_VANITY_DOMAIN` (`*.evals.camelai.app`),
+and virtual bindings resolve against the staging main worker (`CF_WORKER_NAME`); these are
+pinned in `wrangler.test.jsonc`. Real deploy is the default for agent eval runs whenever
+`CF_API_TOKEN` is set; `EVAL_REAL_DEPLOY=0` disables it (deploy evals then skip; the gate is
+`isRealEvalDeployEnabled` in `eval-deploy-context.ts`). Served by the evals dispatcher
+(`workers/dispatcher/wrangler.evals.jsonc`); the namespace + DNS routes are created out-of-band.
+Eval apps are kept (no cleanup). Live-data bindings (`DATA_PROXY`/`CONNECTIONS`) won't resolve
+to the eval's local workspace; self-contained apps render fully.
 
 ### Eval results viewer (`workers/eval-reports/`)
 
@@ -174,9 +173,9 @@ once cloudflare/workerd#6794 ships in a release.
 
 Separately, vitest-pool-workers leaves the eval container + sidecar running after each run
 (workers-sdk#14242); they accumulate and exhaust the host. `run-agent-eval.mjs` prunes leftover
-`EvalSandbox` containers before/after each run. The sweep is global, so it's only safe when one
-eval runs at a time (the normal local case); an orchestrator that runs evals concurrently must set
-`EVAL_MANAGED_CLEANUP=1` to skip it and own cleanup itself.
+`ProjectBuildSandbox` / `AnalysisSandbox` containers before/after each run. The sweep is global,
+so it's only safe when one eval runs at a time (the normal local case); an orchestrator that
+runs evals concurrently must set `EVAL_MANAGED_CLEANUP=1` to skip it and own cleanup itself.
 
 ## Frontend Conventions
 
@@ -196,11 +195,10 @@ Important DOs and runtime classes live primarily in `workers/main/src/`:
 - `workspace.ts` - `WorkspaceDO`, workspace metadata, integration state, token refresh alarms.
 - `chat-thread-do.ts` - `ChatThreadDO` compatibility façade and chat transport/turn orchestration (the shared connection bridge is `chat-thread/sse-connection.ts`, with WebSocket and HTTP polling sinks). Focused collaborators live in `chat-thread/` (Pi persistence, model/tool setup, UI mirroring, recovery journals, verified completion evidence, metadata, preview/access/automation, and streaming activity); verify this surface with `bun run test:workers -- chat-thread`.
 - `workspace-cron.ts` - `WorkspaceCronDO`, scheduled prompt storage and dispatch.
-- `worker-logs-do.ts` - `WorkerLogsDO`, deployed app log tail/streaming (in-memory ring buffer; not SQLite-persisted).
+- `worker-logs-do.ts` - `WorkerLogsDO`, recent deployed-app logs written by the tail worker and read over RPC (in-memory ring buffer; not SQLite-persisted).
 - `admin-index-do.ts` - `AdminIndexDO`, admin indexes and dashboard-style aggregates.
 - `org-slug-registry.ts` - `OrgSlugDO`, atomic org slug ownership.
 - `email-handle-registry.ts` - `EmailHandleDO`, email handle ownership.
-- `mcp-handler.ts` - Internal MCP agent/tools.
 - `*-mcp.ts` / `connections-runtime.ts` - Per-provider connection MCP wrappers and shared connection runtime (candidate for an `integrations/` folder).
 - `observability.ts` - Shared Cloudflare Analytics Engine event/error writer. New structured instrumentation should go through this helper instead of calling `writeDataPoint` directly.
 - `lake-streams.ts` + `chat-thread/transcript-lake.ts` - Transcript / tool-call export to Iceberg tables in R2 Data Catalog via Cloudflare Pipelines. Both bindings are optional and every helper no-ops without them, so dev/tests/self-host never export. Tool durations are measured live (Pi records no tool start timestamp) and stamped as `uiMetadata.toolDurationMs`. Design, setup commands, and the privacy posture: `config/pipelines/README.md`. Verify with `bun run test:workers -- transcript-lake`.
@@ -248,7 +246,7 @@ curl "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/analytics_eng
 
 - Chat uses native WebSockets with immediate HTTP polling fallback on socket errors or unexpected closes (including open-then-close). There is no added WebSocket connection timeout. Protocol, limits and tests: `workers/main/src/chat-thread/transport.md`.
 
-- Browser chat transport is native WebSocket at `/agents/chat-thread/:threadId`, including RPCs and resume frames. A socket error or unexpected close immediately switches that view to completed HTTP polling responses at `GET /agents/chat-thread/:threadId/sse?transport=poll`; sends then use `POST /agents/chat-thread/:threadId/call`. The old SSE receive mode remains server-side for already-open older bundles. `SseAgentClient` / `useSseAgent` retain their historical export names but new browser connections use WebSockets. Explicit policy denials stay terminal; unmounts do not trigger fallback. Workspace status remains SSE at `/api/workspaces/:id/status/stream`; the old workspace socket remains removed. Log tail still uses `/ws/logs`. Client opens are `chat_ws_open` or `chat_poll_open`; existing error telemetry names remain for continuity.
+- Browser chat transport is native WebSocket at `/agents/chat-thread/:threadId`, including RPCs and resume frames. A socket error or unexpected close immediately switches that view to completed HTTP polling responses at `GET /agents/chat-thread/:threadId/sse?transport=poll`; sends then use `POST /agents/chat-thread/:threadId/call`. The old SSE receive mode remains server-side for already-open older bundles. `SseAgentClient` / `useSseAgent` retain their historical export names but new browser connections use WebSockets. Explicit policy denials stay terminal; unmounts do not trigger fallback. Workspace status remains SSE at `/api/workspaces/:id/status/stream`; the old workspace socket remains removed. Client opens are `chat_ws_open` or `chat_poll_open`; existing error telemetry names remain for continuity.
 - The main worker validates access (`authorizeChatTransportRequest`) and routes to `ChatThreadDO`, which bridges WebSocket and HTTP receive sessions into the partyserver connection model via a synthetic `SseConnection` (`workers/main/src/chat-thread/sse-connection.ts`) — the wrapped `onConnect`/`onMessage`/`onClose` chains and the resume handshake run unchanged. Design + invariants: `plans/sse-migration/DESIGN.md` (untracked, kept in the repo checkout).
 - `ChatThreadDO` runs the Pi coding agent in the Durable Object. Project file operations go to `WorkspaceFilesystemDO` + R2 (`do-r2` backend); builds/deploys/analysis run in Cloudflare sandbox containers. There is no shell/`bash` tool — the agent uses the DO-backed file tools plus `deploy_project`/`add_dependency` and `js_exec`. `deploy_project` builds, publishes, returns the live URL, and opens preview; no manual `set_preview` is needed, though the tool remains available for explicit preview switches. `run_notebook` likewise opens a clean successful notebook run in preview automatically and leaves preview unchanged on failure. `dry_run: true` validates a deploy without publishing.
 - Transport + render history are owned by `@cloudflare/ai-chat` (`ChatThreadDO extends AIChatAgent`). A turn is a resumable UIMessage stream: `onChatMessage` runs the Pi prompt (or the recovery/resume branch) and relays Pi runtime events through the encoder as native UIMessage chunks; `chatRecovery` owns bounded re-drives of an interrupted turn and `chatStreamStallTimeoutMs` bounds a stalled turn (its stream-cancel disposes the hung Pi session and routes the turn into recovery). `chatRecovery`'s budget is PROGRESS-GATED, so a turn that journals a checkpoint and then kills the isolate every pass renews it forever: the `piActiveTurn` marker additionally carries progress-independent re-drive counters that abandon such a turn — commit the journal tail, teardown, durable terminal — instead of resuming it. They are split by cause: `isolateDeathResumeAttempts` (`PI_TURN_RESUME_BUDGET`, charged only when nothing in-process observed the interruption), `voluntaryResumeAttempts` (`PI_TURN_VOLUNTARY_RESUME_BUDGET`, for transient-provider-retry / config-change re-drives) and a loose total (`PI_TURN_TOTAL_RESUME_BUDGET`), so ordinary deploy resets and provider 529s cannot abandon a healthy turn. The isolate-death count also picks a RECOVERY LADDER rung (`piTurnResumeRung`), each cheaper in memory than the last: deaths 1-2 resume normally, the 3rd resumes DEGRADED (eager compaction + a hard image-hydration budget, applied per provider request via `transformPiProviderContext`; the compaction is EPHEMERAL — no `pi_core_compaction` row — and floored at `PI_DEGRADED_COMPACTION_FLOOR_FRACTION` of the real threshold, so a recovery can never permanently truncate a thread), the 4th skips the provider entirely and SALVAGES the journal (settled work + an "ask me to continue" note committed as the final assistant message, turn closed out normally), and anything past that is the terminal abandonment. The client renders from `useAgentChat` (`resume: true`); no bespoke websocket transcript fan-out.
@@ -276,11 +274,11 @@ if any of them drift apart.
 
 ## Proxies And Bindings
 
-- Sandbox containers do not get a generic Worker API proxy. File, shell, and runtime operations go through explicit project-runtime / host control-plane APIs.
+- Sandbox containers do not get a generic Worker API proxy or any header-authenticated Worker routes. Container access to Worker services goes through DO-side outbound handlers that attach scope (for example the analysis sandbox's `connections.internal`), and deploys go through the platform's own deploy tools (`deployWorkerModulesDirect` in `direct-dispatch-deploy.ts`), not through the container.
 - BYOK credentials are scoped by org/thread and should not be placed into container environment variables.
 - User app deploys can rewrite internal service bindings such as the data proxy, virtual AI binding, and virtual R2 bucket. Relevant files include `workers/main/src/cf-api-proxy.ts`, `data-proxy-service.ts`, `ai-virtual-binding.ts`, and `r2-virtual-bucket.ts`.
 - Outbound database traffic egresses from the sandbox host VM IP `20.46.233.68` (surfaced in direct database connection setup UIs for firewall/VPC allowlisting; constant in `src/lib/sandbox-network.ts`).
-- `DbQuerySandbox` (Cloudflare sandbox container, no user code) is THE SQL query/export path — the connection MCP, the `DATA_PROXY` user-app binding, and the sandbox container routes all go through the legacy-contract surface in `workers/main/src/data-proxy.ts` → `db-query-compat.ts` → `db-query-service.ts`. It keeps the static-IP guarantee by dialing databases through a SOCKS relay on the sandbox host VM (`infra/db-egress-relay/`; design + smoke + decommission checklist in `docs/db-egress-relay.md`); with no relay configured it dials from the container's own IP. The query logic is shipped from the worker per call (not baked): the runner `workers/main/db-query-sandbox-assets/runner/db-query-runner.mjs` is embedded through the `virtual:db-query-runner-source` alias (Vite `?raw` for the main worker, Wrangler `Text` for dispatchers) and piped into node over stdin in one stateless exec; exports write Parquet straight into the workspace's mounted warehouse R2 prefix. Keep the SSRF denylists in that runner and `infra/db-egress-relay/gost.yaml.example` in sync.
+- `DbQuerySandbox` (Cloudflare sandbox container, no user code) is THE SQL query/export path — the connection MCP and the `DATA_PROXY` user-app binding both go through the legacy-contract surface in `workers/main/src/data-proxy.ts` → `db-query-compat.ts` → `db-query-service.ts`. It keeps the static-IP guarantee by dialing databases through a SOCKS relay on the sandbox host VM (`infra/db-egress-relay/`; design + smoke + decommission checklist in `docs/db-egress-relay.md`); with no relay configured it dials from the container's own IP. The query logic is shipped from the worker per call (not baked): the runner `workers/main/db-query-sandbox-assets/runner/db-query-runner.mjs` is embedded through the `virtual:db-query-runner-source` alias (Vite `?raw` for the main worker, Wrangler `Text` for dispatchers) and piped into node over stdin in one stateless exec; exports write Parquet straight into the workspace's mounted warehouse R2 prefix. Keep the SSRF denylists in that runner and `infra/db-egress-relay/gost.yaml.example` in sync.
 
 ## Stripe Billing And Credits
 
@@ -320,7 +318,7 @@ if any of them drift apart.
 ## Project Runtime
 
 - Projects are DO+R2 backed (`backend: "do-r2"`): metadata and source files live in `WorkspaceFilesystemDO` (`ProjectFilesystemClient` for per-project files), with Cloudflare Artifacts git history.
-- Builds/deploys run in `ProjectBuildSandbox` (`project-build-service.ts`); notebook analysis in `AnalysisSandbox`; SQL in `DbQuerySandbox`.
+- Builds/deploys run in `ProjectBuildSandbox` (`project-build-commands.ts`); notebook analysis in `AnalysisSandbox`; SQL in `DbQuerySandbox`.
 - The build container sleeps when idle and takes 30-120s to wake, far longer than the deploy retry ladder. `deploy_project`/`add_dependency` therefore run `ensureBuildSandboxReady` (`project-build-readiness.ts`) before their first sandbox call — one `exec("true")` probe when warm, a budgeted re-probe loop when cold — and the existing 5-attempt ladder stays as the guard for post-readiness blips (it re-arms the gate between attempts, under one shared budget). The gate and the ladder live in `project-build-readiness.ts`; the admin `project-build-verify` route drives the same pair through `runWithProjectBuildReadiness`, so an operator repro cannot fail on a container the user-facing path would have waited for.
 - The probe MUST run through the session/shell layer. A ZOMBIE container (sandbox server up, shell dead) answers `exists` while every `exec` fails `SessionTerminatedError`, so the old `exists` probe concluded "ready" instantly and the build died in ~15s of ladder. Session death is a transient readiness cause (`session_death`); after `SANDBOX_ZOMBIE_PROBE_THRESHOLD` CONSECUTIVE session-death probes the gate asks the DO to `restartZombieContainer`. The probe runs through `ProjectBuildSandbox.probeShell`, NOT `exec`, precisely so that threshold means something: `exec` self-heals on the first session death INSIDE the DO, before the rejection crosses back to the worker, which would destroy the container before the gate could count a second probe (and leave `probe_session_death` a dead telemetry dimension). `ProjectBuildSandbox`/`AnalysisSandbox` still self-heal from their own `exec` (`sandbox-zombie-recovery.ts`): the build container on the first session death (its ladder has no session recovery of its own), the analysis container on the SECOND consecutive one (`SANDBOX_ZOMBIE_EXEC_DEATH_THRESHOLD`), so `AnalysisService`'s cheap one-shot `resetSession`+retry against the still-warm container runs first and only a death that survives a fresh session handshake is treated as a zombie. The heal destroys the container so the next call boots clean; it fires ONLY on the session-death signature (never on timeouts, transports or 503s, so a healthy slow boot can never trigger it) and at most once per `SANDBOX_ZOMBIE_RESTART_COOLDOWN_MS` per container, stamped in DO storage BEFORE the destroy so a broken image cannot restart-loop. `destroy()` does not synchronously run `onStop`, so the heal notifies the DO itself (`onContainerDestroyed`) to drop mount bookkeeping and the cached session — otherwise the next run short-circuits `ensureMounted` against a container that no longer exists. A teardown that never settles is remembered per DO instance: the SDK coalesces every later `destroy()` onto that same hung promise, so the next heal evicts the instance (`ctx.abort()`) instead of waiting again. Every forced restart emits `build_sandbox_zombie_restart`; suppressed ones deliberately do not.
 - `PROJECT_BUILD_COLD_START_BUDGET_MS` must stay above the sandbox SDK's own per-call retry budget (`computeRetryTimeoutMs()`, ~150s with default container timeouts) or the first probe eats the whole budget; every probe also carries its own deadline (`PROJECT_BUILD_PROBE_TIMEOUT_MS`) because capnweb calls have no client-side timeout. Re-check both when `@cloudflare/sandbox` is upgraded.

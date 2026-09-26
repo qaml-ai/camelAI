@@ -1,11 +1,5 @@
 import type { BillingStatus, Organization } from "@/types";
 
-export const BILLING_ACTIVE_STATUSES: BillingStatus[] = [
-  "trialing",
-  "active",
-  "enterprise",
-];
-
 export function isBillingActive(
   status: BillingStatus | null | undefined,
 ): boolean {

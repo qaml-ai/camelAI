@@ -508,7 +508,3 @@ export function serializePiMessageForSqlStorageDetailed(message: AgentMessage): 
   stats.storedChars = payload.length;
   return { payload, stats };
 }
-
-export function serializePiMessageForSqlStorage(message: AgentMessage): string {
-  return serializePiMessageForSqlStorageDetailed(message).payload;
-}

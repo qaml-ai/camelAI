@@ -81,16 +81,6 @@ export const TYPE_COPY = {
     "A connection gives the agent tools it can call. @-mention it in any chat to put its data and actions to work.",
 } as const;
 
-export const CAPABILITY_LABEL: Record<Capability, string> = {
-  query_database: "Query database",
-  mcp_tools: "MCP tools",
-  typed_operations: "Typed API operations",
-  authenticated_fetch: "Authenticated API calls",
-  channel_send: "Channel send",
-  slack_api: "Slack API",
-  project_credentials: "Project credentials",
-};
-
 export interface DetailField {
   label: string;
   keys: string[];

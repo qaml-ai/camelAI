@@ -108,7 +108,6 @@ export interface ChatEnv extends WorkspaceFilesystemEnv {
   DETERMINISTIC_AUTOMATION_WORKFLOWS?: Workflow;
   WORKER_LOGS?: DurableObjectNamespace<WorkerLogsDO>;
   PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<import("../project-build-sandbox.js").ProjectBuildSandbox>;
-  MCP_OBJECT: DurableObjectNamespace;
   APP_KV: KVNamespace;
   R2_BUCKET: R2Bucket;
   IMAGES?: ImagesBinding;
@@ -145,8 +144,6 @@ export interface ChatEnv extends WorkspaceFilesystemEnv {
   EMAIL_TO_USER: KVNamespace;
   SESSIONS?: KVNamespace;
   PLATFORM_SCRIPT_TOKENS?: KVNamespace;
-  SANDBOX_PROXY_SECRET?: string;
-  SANDBOX_DOCKER_PROXY_BASE_URL?: string;
   CODE_MODE_LOADER?: WorkerLoader;
   OBSERVABILITY_EVENTS?: AnalyticsEngineDataset;
   ERROR_ANALYTICS?: AnalyticsEngineDataset;

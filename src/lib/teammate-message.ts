@@ -16,10 +16,3 @@ export function parseTeammateMessage(rawContent: string): ParsedTeammateMessage 
     content: (match[2] ?? '').trim(),
   };
 }
-
-export function stripTeammateMessageTags(text: string): string {
-  return text
-    .replace(/<teammate-message\s+teammate_id="[^"]*">\n?/g, '')
-    .replace(/<\/teammate-message>/g, '')
-    .trim();
-}

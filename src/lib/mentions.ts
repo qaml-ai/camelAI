@@ -8,8 +8,6 @@ import { getIntegrationDefinition } from './integration-registry';
  * (server-side mention expansion).
  */
 
-export type MentionKind = 'connection' | 'project';
-
 export interface MentionableConnection {
   kind: 'connection';
   id: string;

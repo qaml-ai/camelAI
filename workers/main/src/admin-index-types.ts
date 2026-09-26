@@ -212,26 +212,6 @@ export interface AdminChatErrorEventRow {
   message_normalized: string;
 }
 
-export interface AdminChatErrorsResponse {
-  query: {
-    from: number;
-    to: number;
-    range: string | null;
-    filters: AdminChatErrorFilters;
-    limit: number;
-    offset: number;
-    threads_limit: number;
-    threads_offset: number;
-    events_limit: number;
-    events_offset: number;
-  };
-  summary: AdminChatErrorSummary;
-  groups: AdminChatErrorGroupRow[];
-  breakdowns?: AdminChatErrorBreakdowns;
-  threads?: AdminChatErrorThreadRow[];
-  events?: AdminChatErrorEventRow[];
-}
-
 export interface AdminAppListRow {
   app_id: string;
   script_name: string;

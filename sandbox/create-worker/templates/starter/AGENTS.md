@@ -154,7 +154,7 @@ Multiple buckets with any names are supported — just add more entries to the a
 
 The template includes a `DATA_PROXY` service binding by default.
 
-- Local dev: `DATA_PROXY` resolves to `LocalDataProxyService` in `workers/data-proxy.ts`
+- Local dev: `DATA_PROXY` resolves to `LocalDataProxyService` in `workers/data-proxy.ts`, which returns an error for every query (there is no local database proxy)
 - camelAI deploy: platform rewrites this binding to the internal `DataProxyService`
 
 Example in a loader/action:
@@ -174,11 +174,9 @@ if (!result.ok) throw new Error(result.error.message);
 return { rows: result.data.recordset ?? [] };
 ```
 
-For local fallback over HTTP, set `DATA_PROXY_URL` in `wrangler.jsonc` vars or `.dev.vars`.
-
 ### Connections Binding (`CONNECTIONS`)
 
-The starter includes a `CONNECTIONS` service binding for workspace connections. Local dev binds to `LocalConnectionsService`, which talks to the unified RPC endpoint configured by `CAMELAI_CONNECTIONS_RPC_URL`. camelAI deploys rewrite the binding to the internal `ConnectionsService`.
+The starter includes a `CONNECTIONS` service binding for workspace connections. Local dev binds to `LocalConnectionsService`, which throws on every call (connections only work in deployed apps). camelAI deploys rewrite the binding to the internal `ConnectionsService`.
 
 Use `CONNECTIONS.find()` for the shortest path to a connection, or `CONNECTIONS.methods()` to inspect all available aliases, method names, input schemas, and examples. Use `createConnections()` for method-style calls:
 

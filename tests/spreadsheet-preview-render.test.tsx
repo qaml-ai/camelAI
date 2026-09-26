@@ -11,7 +11,7 @@ import {
   extractEmbeddedChartsFromWorkbookFiles,
   parseSpreadsheetWorkbook,
   SpreadsheetPreview,
-} from '@/components/chat-file-preview/spreadsheet-preview';
+} from '@/components/chat-file-preview/spreadsheet';
 import { parseWorkbookSheet } from '@/components/chat-file-preview/spreadsheet/parse-excel';
 import { createInitialColumnWidths } from '@/components/chat-file-preview/spreadsheet/utils';
 

@@ -45,15 +45,6 @@ export interface ChatGroup {
   updated_at: number;
 }
 
-export interface ChatGroupMember {
-  group_id: string;
-  thread_id: string;
-  is_open: boolean;
-  position: number;
-  closed_at: number | null;
-  added_at: number;
-}
-
 export interface ChatGroupSummary extends ChatGroup {
   open_thread_ids: string[];
   closed_thread_ids: string[];
@@ -566,19 +557,6 @@ export interface Integration {
 
 export type AtMentionConnection = Integration & { kind: "connection" };
 export type AtMentionEntity = AtMentionConnection | MentionableProject;
-
-export interface CreateIntegrationInput {
-  integration_type: string;
-  name: string;
-  config: Record<string, unknown>;
-  credentials: Record<string, unknown>;
-}
-
-export interface UpdateIntegrationInput {
-  name?: string;
-  config?: Record<string, unknown>;
-  credentials?: Record<string, unknown>;
-}
 
 // API Token types
 export interface CreateApiTokenInput {

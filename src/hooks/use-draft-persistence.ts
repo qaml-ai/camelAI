@@ -81,10 +81,6 @@ export function serializeAttachments(attachments: Attachment[]): SerializedAttac
     }));
 }
 
-export function hasPersistableDraft(text: string, attachments: Attachment[]): boolean {
-  return text.trim().length > 0 || serializeAttachments(attachments).length > 0;
-}
-
 function parseSerializedAttachment(value: unknown): SerializedAttachment | null {
   if (!value || typeof value !== 'object') {
     return null;

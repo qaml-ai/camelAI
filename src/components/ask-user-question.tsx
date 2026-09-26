@@ -5,7 +5,6 @@ import { cn } from "@/lib/utils";
 import {
   normalizeAskUserQuestions,
   type NormalizedAskUserQuestion,
-  type NormalizedAskUserQuestionOption,
 } from "@/lib/ask-user-question-normalization";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -23,8 +22,6 @@ import {
   ChevronDown,
   ChevronRight,
 } from "lucide-react";
-
-export type QuestionOption = NormalizedAskUserQuestionOption;
 
 export type Question = Omit<NormalizedAskUserQuestion, "allowOther"> & {
   allowOther?: boolean;

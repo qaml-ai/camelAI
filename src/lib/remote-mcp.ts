@@ -1,13 +1,3 @@
-export interface RemoteMcpConfig {
-  server_url: string;
-  auth_type?: 'none' | 'bearer' | 'custom_header' | 'oauth';
-  auth_header?: string;
-}
-
-export interface RemoteMcpCredentials {
-  token?: string;
-  access_token?: string;
-}
 
 export const REMOTE_MCP_AUTH_TYPES = ['none', 'bearer', 'custom_header', 'oauth'] as const;
 

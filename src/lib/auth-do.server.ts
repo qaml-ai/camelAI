@@ -1830,21 +1830,6 @@ export interface StartAdminBanAndPurgeOptions {
   actorId?: string;
 }
 
-export async function getBanPurgeJobById(
-  context: AppLoadContext,
-  jobId: string,
-): Promise<BanPurgeJobRecord | null> {
-  return getBanPurgeJobByIdWithEnv(getEnv(context), jobId);
-}
-
-export async function getBanPurgeJobByIdWithEnv(
-  env: CloudflareEnv,
-  jobId: string,
-): Promise<BanPurgeJobRecord | null> {
-  const raw = await env.APP_KV.get(getBanPurgeJobKey(jobId));
-  return raw ? (JSON.parse(raw) as BanPurgeJobRecord) : null;
-}
-
 export async function startAdminOrgBanAndPurgeWithEnv(
   env: CloudflareEnv,
   orgId: string,
@@ -2097,17 +2082,4 @@ export async function addAdminOrgMember(
   // Use a system actor ID for admin operations
   const actorId = "system-admin";
   await authDO.adminAddOrgMember(authEnv, orgId, userId, role, actorId);
-}
-
-export async function updateAdminOrgMemberRole(
-  context: AppLoadContext,
-  orgId: string,
-  userId: string,
-  role: OrgRole,
-): Promise<void> {
-  const env = getEnv(context);
-  const authEnv = getAuthEnv(env);
-  // Use a system actor ID for admin operations
-  const actorId = "system-admin";
-  await authDO.updateOrgMemberRole(authEnv, orgId, userId, role, actorId);
 }

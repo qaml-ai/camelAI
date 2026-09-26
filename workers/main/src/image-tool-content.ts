@@ -30,15 +30,6 @@ export function isSupportedImageMimeType(mimeType: string): boolean {
   return ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(normalizeImageMimeType(mimeType));
 }
 
-export function base64EncodeImageBytes(bytes: Uint8Array): string {
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
-  }
-  return btoa(binary);
-}
-
 function bytesStartWith(bytes: Uint8Array, signature: readonly number[]): boolean {
   if (bytes.length < signature.length) return false;
   return signature.every((byte, index) => bytes[index] === byte);

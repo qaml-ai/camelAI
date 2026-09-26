@@ -1,16 +1,13 @@
 /**
- * Stateless workspace connections RPC endpoint.
+ * Stateless workspace connections RPC.
  *
- * This endpoint is scoped by sandbox/project-runtime proxy identity and exposes
- * workspace connection methods without exposing raw credential material.
+ * Served to the analysis sandbox's `connections.internal` outbound handler,
+ * which establishes the workspace/org scope DO-side, and exposes workspace
+ * connection methods without exposing raw credential material.
  */
 
 import type { RouteContext } from '../types.js';
 import { createRequestObservabilityContext } from '../observability.js';
-import {
-  validateSandboxProxy,
-  type SandboxProxyAuthEnv,
-} from '../sandbox-auth.js';
 import {
   findConnectionMethodEntry,
   getConnection,
@@ -31,12 +28,6 @@ interface ConnectionsRpcRequest {
   input?: unknown;
   query?: unknown;
 }
-
-type ResolvedConnectionsContext = ConnectionsContext & {
-  valid: true;
-  threadId?: string;
-  projectId?: string;
-};
 
 const ACTIONS = ['list', 'get', 'find', 'tools', 'methods', 'test', 'verify', 'invoke'] as const;
 
@@ -84,22 +75,6 @@ function requireFindQuery(value: unknown): ConnectionFindQuery {
     }
   }
   throw Object.assign(new Error('query is required'), { status: 400 });
-}
-
-async function resolveConnectionsContext(
-  req: Request,
-  env: RouteContext['env'],
-): Promise<ResolvedConnectionsContext | null> {
-  const sandboxAuth = validateSandboxProxy(req, sandboxOnlyAuthEnv(env));
-  if (sandboxAuth.valid) return sandboxAuth;
-
-  return null;
-}
-
-function sandboxOnlyAuthEnv(env: RouteContext['env']): SandboxProxyAuthEnv {
-  return {
-    SANDBOX_PROXY_SECRET: env.SANDBOX_PROXY_SECRET,
-  };
 }
 
 async function handleRpcAction(
@@ -158,35 +133,14 @@ function errorData(error: unknown): Record<string, unknown> | undefined {
   return Object.keys(data).length > 0 ? data : undefined;
 }
 
-export async function handleConnectionsRpc({ req, env }: RouteContext): Promise<Response> {
-  if (req.method === 'GET') {
-    return jsonResponse({
-      ok: true,
-      endpoint: '/rpc/connections',
-      actions: ACTIONS,
-    });
-  }
-
-  if (req.method !== 'POST') {
-    return rpcError('Method not allowed', 405);
-  }
-
-  const auth = await resolveConnectionsContext(req, env);
-  if (!auth) {
-    return rpcError('Unauthorized', 401);
-  }
-
-  return handleAuthenticatedConnectionsRpc(req, env, auth);
-}
-
 /**
  * Serve a connections RPC request whose identity is ALREADY established by the
  * caller — the auth context is trusted as-is, no header validation happens here.
  *
- * Two callers: the HTTP route above (after proxy-identity validation) and the
- * analysis sandbox's `connections.internal` outbound handler, where the
- * workspace/org scope is attached DO-side via outbound-handler params
- * (unforgeable by container code — see analysis-sandbox.ts).
+ * The caller is the analysis sandbox's `connections.internal` outbound
+ * handler, where the workspace/org scope is attached DO-side via
+ * outbound-handler params (unforgeable by container code — see
+ * analysis-sandbox.ts).
  */
 export async function handleAuthenticatedConnectionsRpc(
   req: Request,

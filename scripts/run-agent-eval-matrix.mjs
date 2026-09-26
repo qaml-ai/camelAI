@@ -261,7 +261,7 @@ function sweepEvalContainers(reason) {
     encoding: "utf8",
   });
   if (list.status !== 0) return;
-  const classNames = ["EvalSandbox", "ProjectBuildSandbox", "AnalysisSandbox"];
+  const classNames = ["ProjectBuildSandbox", "AnalysisSandbox"];
   const ids = (list.stdout || "").split("\n").flatMap((line) => {
     const [id, name = ""] = line.split("\t");
     return name.startsWith("workerd-vitest-pool-workers-runner--") &&

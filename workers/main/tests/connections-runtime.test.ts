@@ -155,7 +155,6 @@ describe('connections runtime', () => {
           preferredMode: 'brokered',
           broker: {
             url: 'https://mcp.stripe.com',
-            brokerPath: '/rpc/connections',
             authStrategy: 'connected_credentials_broker',
           },
         },
@@ -501,7 +500,6 @@ describe('connections runtime', () => {
           preferredMode: 'brokered',
           broker: {
             url: 'https://mcp.deepwiki.com/mcp',
-            brokerPath: '/rpc/connections',
             authStrategy: 'remote_mcp_config',
           },
         },
@@ -2084,7 +2082,6 @@ describe('connections runtime', () => {
           authStrategy: 'connected_credentials_broker',
           preferredMode: 'brokered',
           broker: {
-            brokerPath: '/rpc/connections',
           },
         },
       },
@@ -2261,7 +2258,6 @@ describe('connections runtime', () => {
           preferredMode: 'brokered',
           broker: {
             url: 'https://mcp.intercom.com/mcp',
-            brokerPath: '/rpc/connections',
             authStrategy: 'connected_credentials_broker',
           },
         },
@@ -2393,7 +2389,6 @@ describe('connections runtime', () => {
           preferredMode: 'brokered',
           broker: {
             url: 'https://api.typeform.com/mcp',
-            brokerPath: '/rpc/connections',
             authStrategy: 'connected_credentials_broker',
           },
         },

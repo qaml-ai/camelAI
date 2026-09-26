@@ -145,12 +145,6 @@ export function resolveEffectivePickerConfig(
   };
 }
 
-export function hasModelPickerDefault(
-  config: Pick<OrgModelPickerConfig, "default_model">,
-): boolean {
-  return config.default_model !== null;
-}
-
 export function resolveDefaultModelForChat(args: {
   effectiveDefaultModel: LlmModel | null;
   visibleCatalog: ReadonlyArray<ModelIdEntry>;

@@ -1553,11 +1553,6 @@ export function getIntegrationsByCategory(
   );
 }
 
-export function getAllCategories(): IntegrationCategory[] {
-  const categories = new Set(Object.values(INTEGRATION_REGISTRY).map((def) => def.category));
-  return [...categories];
-}
-
 export function getAllIntegrations(
   options: IntegrationCatalogOptions = {},
 ): IntegrationDefinition[] {

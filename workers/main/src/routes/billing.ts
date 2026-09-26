@@ -1,9 +1,7 @@
 import type { RouteContext } from "../types.js";
 import { text } from "../helpers/response.js";
-import { validateSandboxProxy } from "../sandbox-auth.js";
 import {
   applyCreditsCheckoutCompleted,
-  getBillingAccessSnapshot,
   processPaidSubscriptionInvoice,
   syncOrgSubscriptionFromStripe,
   verifyStripeWebhookSignature,
@@ -18,27 +16,6 @@ function jsonResponse(payload: unknown, status = 200): Response {
     status,
     headers: { "Content-Type": "application/json" },
   });
-}
-
-export async function handleInternalBillingAccess({
-  req,
-  env,
-}: RouteContext): Promise<Response> {
-  if (req.method !== "GET") {
-    return text("Method not allowed", 405);
-  }
-
-  const auth = validateSandboxProxy(req, env);
-  if (!auth.valid) {
-    return text("Unauthorized", 401);
-  }
-
-  const snapshot = await getBillingAccessSnapshot(env, auth.orgId);
-  if (!snapshot) {
-    return text("Organization not found", 404);
-  }
-
-  return jsonResponse(snapshot);
 }
 
 export async function handleStripeWebhook({

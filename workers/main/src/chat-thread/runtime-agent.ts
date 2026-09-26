@@ -219,7 +219,7 @@ export class RuntimeAgentSession {
     const created = await this.call("/v1/agents", {
       method: "POST",
       token: env.AGENT_RUNTIME_API_TOKEN ?? "",
-      headers: { "Idempotency-Key": `thread:${identity.threadId}` },
+      headers: { "Idempotency-Key": `thread_${identity.threadId}` },
       body: {
         definition: env.AGENT_RUNTIME_DEFINITION,
         name: identity.threadId,
@@ -239,7 +239,7 @@ export class RuntimeAgentSession {
     await this.call(`/v1/agents/${record.id}/configuration`, {
       method: "PATCH",
       token: env.AGENT_RUNTIME_API_TOKEN ?? "",
-      body: { requestId: `configure:${identity.threadId}`, systemPrompt },
+      body: { requestId: `configure_${identity.threadId}`, systemPrompt },
     });
     this.options.store.saveAgent(record);
     return record;
@@ -487,6 +487,11 @@ export class RuntimeAgentSession {
       console.error("[RuntimeAgentSession] abort failed", error);
       this.streamAbort?.abort();
     });
+  }
+
+  /** Whether a run was started and not seen to its end (the DO may have restarted during it). */
+  hasRunInFlight(): boolean {
+    return this.options.store.run() !== null;
   }
 
   async waitForIdle(): Promise<void> {

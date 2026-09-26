@@ -93,7 +93,7 @@ describe("RuntimeAgentSession", () => {
     await agent.prompt(userMessage);
 
     const create = runtime.calls.find((call) => call.path === "/v1/agents")!;
-    expect(create.headers.get("Idempotency-Key")).toBe("thread:thread1");
+    expect(create.headers.get("Idempotency-Key")).toBe("thread_thread1");
     expect(create.body).toMatchObject({ definition: "def_1", ttlSeconds: null, subject: "user1", context: { org: "org1", workspace: "ws1", thread: "thread1" } });
     expect(runtime.calls.find((call) => call.method === "PATCH")!.body).toMatchObject({ systemPrompt: "camel prompt" });
     const prompt = runtime.calls.find((call) => call.path === "/clients/client_1/requests")!;

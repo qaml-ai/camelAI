@@ -5637,13 +5637,31 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   private async resumeActivePiTurn(
     options: { cause?: PiTurnResumeCause } = {},
   ): Promise<void> {
-    if (this.isRuntimeAgentThread()) {
+    if (this.chatContext && await this.resolveAgentBackend(this.chatContext) === "runtime") {
       // The runtime kept running the turn (or finished it): relay its events
       // again from the run's start. Nothing is re-prompted, so no resume budget.
       await this.ensurePiSessionReady();
       const session = this.piSession as unknown as RuntimeAgentSession | null;
       if (!session) throw new Error("Runtime agent session was not available to resume the turn");
-      await session.continue();
+      if (session.hasRunInFlight()) {
+        await session.continue();
+        return;
+      }
+      // A turn admitted while the session was cold: its user messages were
+      // committed (or journaled) after the model's last answer.
+      const committed = session.state.messages;
+      const lastAnswer = committed.findLastIndex((message) => message.role === "assistant");
+      const unanswered = committed.slice(lastAnswer + 1).filter((message) => message.role === "user");
+      const [first, ...rest] = unanswered.length > 0
+        ? unanswered
+        : (await this.loadPiTurnJournalTail()).filter((message) => message.role === "user");
+      if (!first) {
+        await session.continue();
+        return;
+      }
+      const prompted = session.prompt(first);
+      for (const message of rest) session.steer(message);
+      await prompted;
       return;
     }
     // FIRST thing, before ensurePiSessionReady or any other awaitable work: the
@@ -7708,7 +7726,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     const persistedMessages = loaded.messages;
     this.recordPiSessionLoadWindow(loaded.window);
     this.piMainBaselineIndex = persistedMessages.length;
-    if (await this.resolveAgentBackend(context, persistedMessages.length === 0) === "runtime") {
+    if (await this.resolveAgentBackend(context) === "runtime") {
       const session = this.createRuntimeAgentSession(context, envVars, modelConfig.model, persistedMessages);
       this.subscribePiSession(session as unknown as PiCoreAgent);
       return session as unknown as PiCoreAgent;
@@ -7818,6 +7836,24 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     });
   }
 
+  /**
+   * Whether the model has never answered in this thread: its transcript holds
+   * user messages only (the first one is committed before the turn starts).
+   * One indexed-by-rowid probe, without loading the transcript.
+   */
+  private hasNoModelTranscript(): boolean {
+    try {
+      const sql = this.ctx.storage.sql;
+      if (sql.exec("SELECT 1 FROM pi_core_compaction LIMIT 1").toArray().length > 0) return false;
+      return sql.exec(
+        "SELECT 1 FROM pi_core_messages WHERE NOT (json_valid(payload) AND json_extract(payload, '$.role') = 'user') LIMIT 1",
+      ).toArray().length === 0;
+    } catch {
+      // No pi_core tables yet: nothing has been written.
+      return true;
+    }
+  }
+
   /** Whether this thread's turns run on the hosted agent runtime. */
   private isRuntimeAgentThread(): boolean {
     return this.ctx.storage.kv.get<string>(CHAT_AGENT_BACKEND_KEY) === "runtime";
@@ -7828,14 +7864,17 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
    * thread with no transcript yet can start on the runtime, so an existing
    * conversation never moves between loops.
    */
-  private async resolveAgentBackend(
-    context: ChatContextState,
-    newThread: boolean,
-  ): Promise<"runtime" | "pi"> {
+  private async resolveAgentBackend(context: ChatContextState): Promise<"runtime" | "pi"> {
     const pinned = this.ctx.storage.kv.get<string>(CHAT_AGENT_BACKEND_KEY);
     if (pinned === "runtime" || pinned === "pi") return pinned;
-    const backend = newThread && await runtimeEnabledForOrg(this.env, context.orgId) ? "runtime" : "pi";
+    const backend = this.hasNoModelTranscript() && await runtimeEnabledForOrg(this.env, context.orgId)
+      ? "runtime"
+      : "pi";
     this.ctx.storage.kv.put(CHAT_AGENT_BACKEND_KEY, backend);
+    this.recordChatThreadObservabilityEvent("agent_backend_pinned", {
+      operation: "resolve_agent_backend",
+      status: backend,
+    });
     return backend;
   }
 

@@ -373,6 +373,7 @@ import {
 // broadcast) stays on this DO.
 import { ChatThreadErrors } from "./chat-thread/errors";
 import {
+  RUNTIME_PROMPT_PREAMBLE,
   RuntimeAgentSession,
   runtimeEnabledForOrg,
   type RuntimeAgentRecord,
@@ -7919,7 +7920,9 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         messages: persistedMessages,
         thinkingLevel: primaryPiThinkingLevel(envVars.CHIRIDION_MODEL ?? this.currentThreadModel),
       },
-      configuration: async () => ({ systemPrompt: this.createPiSystemPrompt(context, envVars) }),
+      configuration: async () => ({
+        systemPromptAppend: `${RUNTIME_PROMPT_PREAMBLE}\n\n${this.createPiSystemPrompt(context, envVars)}`,
+      }),
       onActivity: () => {
         this.touchPiTurnProgress();
         this.writePiStreamHeartbeat();

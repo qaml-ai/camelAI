@@ -12,7 +12,7 @@
  */
 import { serveTools, type RuntimeIdentity } from "@camelai/agent-runtime/server";
 import type { CallToolResult, ToolServer } from "@camelai/agent-runtime";
-import { CODE_MODE_TOOL_DEFINITIONS } from "../code-mode-tools.js";
+import { CODE_MODE_PI_PASSTHROUGH_TOOL_DEFINITIONS, CODE_MODE_TOOL_DEFINITIONS } from "../code-mode-tools.js";
 import type { CodeModeToolsProps } from "../code-mode-tools.js";
 import type { Env, RouteContext } from "../types.js";
 import { getOrgStub } from "../helpers/stubs.js";
@@ -101,10 +101,24 @@ export async function authorizeRuntimeIdentity(
   return { orgId, workspaceId, threadId, userId, allowWebTools: false };
 }
 
+/**
+ * The runtime declares at most 64 of a source's tools to the model directly
+ * (the rest are reached from js_exec), in list order; js_exec runs are capped
+ * at 120 s, so long tools must be among them. List the ones chiridion's own
+ * loop gives the model directly first: the file tools, then the Pi passthrough
+ * tools (deploy_project, run_notebook, set_preview, ...).
+ */
+const DIRECT_FIRST = new Set([
+  "read", "write", "edit", "ls", "delete",
+  ...CODE_MODE_PI_PASSTHROUGH_TOOL_DEFINITIONS.map((definition) => definition.name),
+]);
+
 export function agentMcpTools() {
-  return CODE_MODE_TOOL_DEFINITIONS
-    .filter((definition) => AGENT_MCP_TOOL_NAMES.has(definition.name))
-    .map((definition) => ({
+  const served = CODE_MODE_TOOL_DEFINITIONS.filter((definition) => AGENT_MCP_TOOL_NAMES.has(definition.name));
+  return [
+    ...served.filter((definition) => DIRECT_FIRST.has(definition.name)),
+    ...served.filter((definition) => !DIRECT_FIRST.has(definition.name)),
+  ].map((definition) => ({
       name: definition.name,
       description: definition.description,
       // TypeBox schemas are JSON Schema; the round trip drops its symbol keys.
@@ -159,7 +173,11 @@ export function agentToolServer(env: Env, tools: ToolsFactory): ToolServer {
       if (!context.identity) return toolError("Forbidden: no runtime identity");
       const props = await authorizeRuntimeIdentity(env, context.identity);
       if ("error" in props) return toolError(props.error);
-      return toMcpResult(await tools(props).callToolEnvelope(name, args));
+      // The model's tool call (the js_exec call, for calls from code): the
+      // binding streams build progress and records artifacts under it, into
+      // the thread's live UI, as it does for js_exec's calls in chiridion.
+      const parentToolUseId = context.toolCallId;
+      return toMcpResult(await tools(parentToolUseId ? { ...props, parentToolUseId } : props).callToolEnvelope(name, args));
     },
   };
 }

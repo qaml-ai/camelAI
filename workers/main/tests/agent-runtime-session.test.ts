@@ -66,7 +66,7 @@ function session(runtime: ReturnType<typeof fakeRuntime>, store = memoryStore())
     identity: { orgId: "org1", workspaceId: "ws1", threadId: "thread1", subject: "user1" },
     actor: () => "user2",
     initialState: { systemPrompt: "", model: MODEL, tools: [], messages: [], thinkingLevel: "medium" },
-    configuration: async () => ({ systemPrompt: "camel prompt" }),
+    configuration: async () => ({ systemPromptAppend: "camel prompt" }),
     onActivity: () => { activity += 1; },
     fetch: runtime.fetch,
   });
@@ -94,8 +94,17 @@ describe("RuntimeAgentSession", () => {
 
     const create = runtime.calls.find((call) => call.path === "/v1/agents")!;
     expect(create.headers.get("Idempotency-Key")).toBe("thread_thread1");
-    expect(create.body).toMatchObject({ definition: "def_1", ttlSeconds: null, subject: "user1", context: { org: "org1", workspace: "ws1", thread: "thread1" } });
-    expect(runtime.calls.find((call) => call.method === "PATCH")!.body).toMatchObject({ systemPrompt: "camel prompt" });
+    expect(create.body).toMatchObject({
+      definition: "def_1",
+      model: "chiridion/sonnet",
+      thinkingLevel: "medium",
+      systemPromptAppend: "camel prompt",
+      fileTools: false,
+      ttlSeconds: null,
+      subject: "user1",
+      context: { org: "org1", workspace: "ws1", thread: "thread1" },
+    });
+    expect(runtime.calls.some((call) => call.method === "PATCH")).toBe(false);
     const prompt = runtime.calls.find((call) => call.path === "/clients/client_1/requests")!;
     expect(prompt.body).toMatchObject({ method: "prompt", params: { text: "hello", actor: "user2" } });
     expect(prompt.headers.get("Authorization")).toBe("Bearer agent-token");
@@ -106,14 +115,17 @@ describe("RuntimeAgentSession", () => {
     expect(agent.state.messages[0]).toBe(userMessage);
     expect(agent.state.messages[1]).toMatchObject({ content: [{ name: "list_apps" }] });
     expect(agent.state.isStreaming).toBe(false);
-    expect(store.data.agent).toEqual({ id: "client_1", token: "agent-token" });
+    expect(store.data.agent).toEqual({ id: "client_1", token: "agent-token", model: "chiridion/sonnet" });
     expect(store.data.cursor).toBe(12);
     expect(store.data.run).toBeNull();
     expect(activity()).toBeGreaterThan(0);
 
-    // A second run reuses the agent and starts from the saved cursor.
+    // A second run reuses the agent; a changed thread model is configured before it.
+    agent.state.model = { ...agent.state.model, id: "opus" };
     await agent.prompt(userMessage);
     expect(runtime.calls.filter((call) => call.path === "/v1/agents")).toHaveLength(1);
+    expect(runtime.calls.find((call) => call.method === "PATCH")!.body).toMatchObject({ model: "chiridion/opus" });
+    expect(store.data.agent?.model).toBe("chiridion/opus");
   });
 
   it("closes the turn with an error when the runtime refuses the run", async () => {

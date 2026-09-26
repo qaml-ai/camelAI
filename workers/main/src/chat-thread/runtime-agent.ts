@@ -20,7 +20,22 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 /** The MCP server name chiridion's tools are served under in the runtime definition. */
 export const RUNTIME_TOOL_SERVER = "camel";
 const TOOL_PREFIX = `${RUNTIME_TOOL_SERVER}__`;
+/** The tenant's model endpoint (the inference proxy) and its declared fallback model. */
+export const RUNTIME_MODEL_ENDPOINT = "chiridion";
+export const RUNTIME_DEFAULT_MODEL = "default";
 const FRAME_LIMIT_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Leads chiridion's system prompt when it is appended to the runtime's: the
+ * prompt was written for the in-DO tool surface, whose names and js_exec
+ * bindings differ here.
+ */
+export const RUNTIME_PROMPT_PREAMBLE = [
+  "# camelAI tools on this runtime",
+  `camelAI's tools are named ${TOOL_PREFIX}<tool> (for example ${TOOL_PREFIX}read, ${TOOL_PREFIX}deploy_project, ${TOOL_PREFIX}set_preview). Where the instructions below name a tool, use its ${TOOL_PREFIX} form; in js_exec call it as tools.${TOOL_PREFIX}<tool>(args).`,
+  `js_exec has no env bindings, connections object or network here: query or call a connection with ${TOOL_PREFIX}connections_query / ${TOOL_PREFIX}connections_invoke, drive a browser with ${TOOL_PREFIX}browser_launch / ${TOOL_PREFIX}browser_action, generate images or transcribe audio with ${TOOL_PREFIX}generate_image / ${TOOL_PREFIX}transcribe_audio, call a deployed app with ${TOOL_PREFIX}http_request, and read the web with web_fetch / web_search.`,
+  `Workspace, project and uploaded files live in camelAI: use the ${TOOL_PREFIX} file tools with an explicit location, not fs.`,
+].join("\n\n");
 
 export interface RuntimeAgentEnv {
   AGENT_RUNTIME_ENABLED?: string;
@@ -33,6 +48,8 @@ export interface RuntimeAgentEnv {
 export interface RuntimeAgentRecord {
   id: string;
   token: string;
+  /** The runtime model last configured (`chiridion/<id>`). */
+  model?: string;
 }
 
 export interface RuntimeRunRecord {
@@ -67,7 +84,7 @@ export interface RuntimeAgentSessionOptions {
   /** The committed transcript the DO loaded; runtime messages append to it. */
   initialState: Pick<AgentState, "systemPrompt" | "model" | "tools" | "messages" | "thinkingLevel">;
   /** The configuration applied once, right after the agent is created. */
-  configuration: () => Promise<{ systemPrompt: string }>;
+  configuration: () => Promise<{ systemPromptAppend: string }>;
   /** Called for the runtime's heartbeats, so the DO's stall watchdog sees a long tool call as alive. */
   onActivity?: () => void;
   fetch?: typeof globalThis.fetch;
@@ -212,11 +229,23 @@ export class RuntimeAgentSession {
   }
 
   /** The thread's runtime agent, created (idempotently, per thread) on first use. */
+  /**
+   * The runtime model this thread's calls go under: chiridion's endpoint
+   * (`chiridion/…`, the inference proxy) with the thread model's catalog id,
+   * so the runtime knows its context window and inputs. The proxy routes each
+   * call to the thread's current model whatever the id says.
+   */
+  private runtimeModel(): string {
+    return `${RUNTIME_MODEL_ENDPOINT}/${this.state.model.id}`;
+  }
+
+  /** The thread's runtime agent, created (idempotently, per thread) on first use. */
   private async agent(): Promise<RuntimeAgentRecord> {
     const stored = this.options.store.agent();
     if (stored) return stored;
     const { env, identity } = this.options;
-    const created = await this.call("/v1/agents", {
+    const { systemPromptAppend } = await this.options.configuration();
+    const create = (model: string) => this.call("/v1/agents", {
       method: "POST",
       token: env.AGENT_RUNTIME_API_TOKEN ?? "",
       headers: { "Idempotency-Key": `thread_${identity.threadId}` },
@@ -225,24 +254,47 @@ export class RuntimeAgentSession {
         name: identity.threadId,
         type: "camelai-thread",
         ttlSeconds: null,
-        subject: identity.subject,
+        model,
+        thinkingLevel: this.state.thinkingLevel,
+        systemPromptAppend,
+        fileTools: false,
+        ...(identity.subject ? { subject: identity.subject } : {}),
         context: { org: identity.orgId, workspace: identity.workspaceId, thread: identity.threadId },
       },
-    }) as { id?: unknown; token?: unknown };
+    }) as Promise<{ id?: unknown; token?: unknown }>;
+    let model = this.runtimeModel();
+    let created: { id?: unknown; token?: unknown };
+    try {
+      created = await create(model);
+    } catch (error) {
+      // A model the runtime's catalog does not know: the endpoint's declared default.
+      if (!(error instanceof RuntimeAgentError && error.status === 400 && /model/i.test(error.message))) throw error;
+      model = `${RUNTIME_MODEL_ENDPOINT}/${RUNTIME_DEFAULT_MODEL}`;
+      created = await create(model);
+    }
     if (typeof created.id !== "string" || typeof created.token !== "string") {
       throw new RuntimeAgentError("Agent runtime returned no agent id or token");
     }
-    const record = { id: created.id, token: created.token };
-    // Until the runtime takes a prompt alongside a definition at creation (R1),
-    // configure it before the first run; it is queued ahead of that run.
-    const { systemPrompt } = await this.options.configuration();
-    await this.call(`/v1/agents/${record.id}/configuration`, {
-      method: "PATCH",
-      token: env.AGENT_RUNTIME_API_TOKEN ?? "",
-      body: { requestId: `configure_${identity.threadId}`, systemPrompt },
-    });
+    const record = { id: created.id, token: created.token, model };
     this.options.store.saveAgent(record);
     return record;
+  }
+
+  /** Follow the thread's model: the runtime takes a change before the next run. */
+  private async syncModel(agent: RuntimeAgentRecord): Promise<void> {
+    const model = this.runtimeModel();
+    if (agent.model === model) return;
+    try {
+      await this.call(`/v1/agents/${agent.id}/configuration`, {
+        method: "PATCH",
+        token: this.options.env.AGENT_RUNTIME_API_TOKEN ?? "",
+        body: { requestId: `model_${crypto.randomUUID()}`, model, thinkingLevel: this.state.thinkingLevel },
+      });
+    } catch (error) {
+      if (!(error instanceof RuntimeAgentError && error.status === 400)) throw error;
+      // Unknown to the catalog: keep the model the agent has; the proxy routes by thread anyway.
+    }
+    this.options.store.saveAgent({ ...agent, model });
   }
 
   private async request(method: string, params: Record<string, unknown>, id: string = crypto.randomUUID()) {
@@ -417,6 +469,7 @@ export class RuntimeAgentSession {
 
   private async run(method: "prompt" | "continue", params: Record<string, unknown>) {
     const agent = await this.agent();
+    await this.syncModel(agent);
     const cursor = await this.currentCursor(agent);
     const requestId = crypto.randomUUID();
     this.options.store.saveRun({ requestId, cursor });

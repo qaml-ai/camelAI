@@ -77,7 +77,11 @@ describe("agent MCP", () => {
       "AskUserQuestion", "prompt_connection_setup", "delete_app", "delete_project", "delete_connection",
       "WebSearch", "WebFetch", "Agent", "Explore", "warehouse_run_code", "warehouse_list_connections",
     ]) expect(names).not.toContain(excluded);
-    expect(names).toEqual([...AGENT_MCP_TOOL_NAMES].filter((name) => names.includes(name)));
+    // The tools chiridion's own loop gives the model directly come first (the
+    // runtime declares a source's first 64 directly).
+    expect(new Set(names.slice(0, 5))).toEqual(new Set(["read", "write", "edit", "ls", "delete"]));
+    expect(names.indexOf("deploy_project")).toBeLessThan(64);
+    expect(names.indexOf("run_notebook")).toBeLessThan(64);
     expect(new Set(names)).toEqual(AGENT_MCP_TOOL_NAMES);
     for (const tool of body.result.tools) expect(tool.inputSchema.type).toBe("object");
   });

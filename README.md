@@ -53,8 +53,8 @@ cp .dev.vars.example .dev.vars
 
 Replace the placeholder signing and encryption secrets in `.dev.vars`. For
 hosted model access, also add a development Cloudflare AI Gateway token. You can
-instead configure an Anthropic, OpenAI, OpenRouter, Bedrock, or custom provider
-from the organization settings after the app starts.
+instead configure an Anthropic, OpenAI, OpenRouter, Requesty, Bedrock, or custom
+provider from the organization settings after the app starts.
 
 Start the app with local authentication:
 
@@ -102,8 +102,8 @@ deploy_project: project files -> build sandbox -> Workers for Platforms
 
 The agent is camelAI's own harness, built from pi's lower-level agent loop and
 state-management libraries. It is not Claude Code or Codex. Anthropic, OpenAI,
-OpenRouter, Bedrock, and custom endpoints can provide the underlying model, but
-they do not provide the agent harness.
+OpenRouter, Requesty, Bedrock, and custom endpoints can provide the underlying
+model, but they do not provide the agent harness.
 
 `ChatThreadDO` owns the agent loop and persistent chat state. The agent uses
 native file tools and writes JavaScript instead of bash; Code Mode runs that

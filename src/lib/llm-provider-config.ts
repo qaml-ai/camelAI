@@ -243,6 +243,7 @@ export function getDefaultLlmModel(
 ): LlmModel {
   if (orgProvider === "openai") return DEFAULT_OPENAI_MODEL;
   if (orgProvider === "openrouter") return DEFAULT_OPENROUTER_MODEL;
+  if (orgProvider === "requesty") return DEFAULT_OPENROUTER_MODEL;
   if (
     orgProvider === "bedrock" &&
     isBedrockOpenAiModelAllowedInRegion(
@@ -431,6 +432,7 @@ export function isLlmModelCoveredByByokProvider(
   if (!provider) return false;
   if (!model) return true;
   if (provider === "openrouter") return true;
+  if (provider === "requesty") return true;
   if (provider === "anthropic") {
     return isAnthropicLlmModel(model);
   }
@@ -614,6 +616,7 @@ export async function buildPublicLlmProviderConfig(
       record.provider === "anthropic" ||
       record.provider === "openai" ||
       record.provider === "openrouter" ||
+      record.provider === "requesty" ||
       record.provider === "custom"
         ? creds.api_key
         : creds.bearer_token;

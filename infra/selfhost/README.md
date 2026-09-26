@@ -27,7 +27,7 @@ manifest.
 | Capability | Single-node release |
 | --- | --- |
 | Web application and reverse-proxy SSO | Supported |
-| Bedrock, Anthropic, OpenAI, OpenRouter, or custom key-backed chat | Supported |
+| Bedrock, Anthropic, OpenAI, OpenRouter, Requesty, or custom key-backed chat | Supported |
 | Custom agent skills + prompt append via `.selfhost/agent/` | Supported (additive; see `SELF_HOSTING.md`) |
 | Durable Objects, KV, R2, D1, queues, and workflows | Supported by local `workerd` services |
 | Workspace/project source and local git history | Supported |
@@ -344,7 +344,7 @@ model access and regional availability still apply.
 The standalone default is the supported Bedrock model configured by the model
 catalog.
 
-Anthropic, OpenAI, and OpenRouter use the same key fields:
+Anthropic, OpenAI, OpenRouter, and Requesty use the same key fields:
 
 ```dotenv
 SELFHOST_AI_PROVIDER=openrouter

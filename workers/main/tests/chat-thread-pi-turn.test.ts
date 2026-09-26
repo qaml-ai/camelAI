@@ -3292,6 +3292,133 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(fake.checkHostedPiModelAccess).not.toHaveBeenCalled();
   });
 
+  it('uses Requesty BYOK with managed model ids for Claude Pi models', async () => {
+    const fake = Object.create(ChatThreadDO.prototype) as any;
+    fake.env = {};
+    fake.resolveCurrentByokCredentials = vi.fn(async () => ({
+      provider: 'requesty',
+      apiKey: 'rqsty-test',
+    }));
+    fake.checkHostedPiModelAccess = vi.fn(async () => {
+      throw new Error('hosted billing should not be checked for BYOK');
+    });
+
+    const model = await ChatThreadDO.prototype['resolvePiModel'].call(
+      fake,
+      { orgId: 'org1', workspaceId: 'workspace1', threadId: 'thread1' },
+      { CHIRIDION_MODEL: 'haiku' },
+      vi.fn(() => ({
+        id: 'claude-haiku-4-5-20251001',
+        provider: 'anthropic',
+        api: 'anthropic-messages',
+        baseUrl: 'https://api.anthropic.com',
+      })),
+    );
+
+    expect(model.model).toMatchObject({
+      id: 'claude-haiku-4-5',
+      provider: 'anthropic',
+      api: 'anthropic-messages',
+      baseUrl: 'https://router.requesty.ai',
+      headers: {
+        Authorization: 'Bearer rqsty-test',
+        'HTTP-Referer': 'https://camelai.dev',
+        'X-Title': 'camelAI',
+      },
+    });
+    expect(model.apiKey).toBe('rqsty-test');
+    expect(model.billingSource).toBe('byok');
+    expect(model.creditChargeable).toBe(false);
+    expect(model.usageProvider).toBe('requesty');
+    expect(fake.checkHostedPiModelAccess).not.toHaveBeenCalled();
+  });
+
+  it('uses Requesty BYOK for OpenAI and OpenRouter catalog Pi models', async () => {
+    const fake = Object.create(ChatThreadDO.prototype) as any;
+    fake.env = {};
+    fake.resolveCurrentByokCredentials = vi.fn(async () => ({
+      provider: 'requesty',
+      apiKey: 'rqsty-test',
+    }));
+    fake.checkHostedPiModelAccess = vi.fn(async () => {
+      throw new Error('hosted billing should not be checked for BYOK');
+    });
+    const getModel = vi.fn((provider, modelId) => ({
+      id: modelId,
+      provider,
+      api: provider === 'openai' ? 'openai-responses' : 'openai-completions',
+      baseUrl: 'https://api.example.test/v1',
+    }));
+
+    const openAiModel = await ChatThreadDO.prototype['resolvePiModel'].call(
+      fake,
+      { orgId: 'org1', workspaceId: 'workspace1', threadId: 'thread1' },
+      { CHIRIDION_MODEL: 'gpt-5.5' },
+      getModel,
+    );
+    expect(openAiModel.model).toMatchObject({
+      id: 'gpt-5.6-terra',
+      provider: 'openai',
+      api: 'openai-responses',
+      baseUrl: 'https://router.requesty.ai/v1',
+    });
+    expect(openAiModel.model.headers).not.toHaveProperty('Authorization');
+
+    const kimiModel = await ChatThreadDO.prototype['resolvePiModel'].call(
+      fake,
+      { orgId: 'org1', workspaceId: 'workspace1', threadId: 'thread1' },
+      { CHIRIDION_MODEL: 'kimi-k2.7-code' },
+      getModel,
+    );
+    expect(kimiModel.model).toMatchObject({
+      id: 'kimi-k2.7-code',
+      provider: 'openrouter',
+      api: 'openai-completions',
+      baseUrl: 'https://router.requesty.ai/v1',
+    });
+    expect(kimiModel.apiKey).toBe('rqsty-test');
+    expect(kimiModel.usageProvider).toBe('requesty');
+    expect(fake.checkHostedPiModelAccess).not.toHaveBeenCalled();
+  });
+
+  it('uses self-host Requesty env credentials before org BYOK or hosted gateway', async () => {
+    const fake = Object.create(ChatThreadDO.prototype) as any;
+    fake.env = {
+      CF_ACCOUNT_ID: 'selfhost',
+      SELFHOST_AI_PROVIDER: 'requesty',
+      SELFHOST_AI_API_KEY: 'rqsty-selfhost',
+    };
+    fake.resolveCurrentByokCredentials = vi.fn(async () => ({
+      provider: 'anthropic',
+      apiKey: 'sk-ant-org',
+    }));
+    fake.checkHostedPiModelAccess = vi.fn(async () => {
+      throw new Error('hosted billing should not be checked for self-host env provider');
+    });
+
+    const model = await ChatThreadDO.prototype['resolvePiModel'].call(
+      fake,
+      { orgId: 'org1', workspaceId: 'workspace1', threadId: 'thread1' },
+      { CHIRIDION_MODEL: 'deepseek-v4-flash' },
+      vi.fn((provider, modelId) => ({
+        id: modelId,
+        provider,
+        api: 'openai-completions',
+        baseUrl: 'https://openrouter.ai/api/v1',
+      })),
+    );
+
+    expect(model.model).toMatchObject({
+      id: 'deepseek-v4-flash',
+      baseUrl: 'https://router.requesty.ai/v1',
+    });
+    expect(model.apiKey).toBe('rqsty-selfhost');
+    expect(model.billingSource).toBe('byok');
+    expect(model.usageProvider).toBe('requesty');
+    expect(fake.resolveCurrentByokCredentials).not.toHaveBeenCalled();
+    expect(fake.checkHostedPiModelAccess).not.toHaveBeenCalled();
+  });
+
   it('suppresses OpenAI SDK bearer auth for custom OpenAI-compatible x-api-key providers', async () => {
     const fake = Object.create(ChatThreadDO.prototype) as any;
     fake.env = {};

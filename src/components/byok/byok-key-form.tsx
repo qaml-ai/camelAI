@@ -104,7 +104,7 @@ export function ByokKeyForm({
           }}
           variant="outline"
           size="lg"
-          className="!grid grid-cols-2 gap-2 sm:grid-cols-5"
+          className="!grid grid-cols-2 gap-2 sm:grid-cols-3"
         >
           {BYOK_PROVIDER_ORDER.map((key) => (
             <ToggleGroupItem

@@ -176,6 +176,13 @@ export class PiModelMapping {
     };
   }
 
+  requestyAttributionHeaders(): Record<string, string> {
+    return {
+      "HTTP-Referer": "https://camelai.dev",
+      "X-Title": "camelAI",
+    };
+  }
+
   customProviderAuthHeaders(
     api: "openai-completions" | "openai-responses" | "anthropic-messages",
     authType: "bearer" | "x-api-key",
@@ -285,6 +292,29 @@ export class PiModelMapping {
       return trimmed;
     }
     return `${trimmed}:nitro`;
+  }
+
+  // Requesty serves the catalog models under its managed model ids. Anything
+  // without a managed id (for example raw vendor/model ids) passes through.
+  requestyModel(modelId: string): string {
+    switch (modelId.trim().toLowerCase()) {
+      case "claude-haiku-4-5-20251001":
+        return "claude-haiku-4-5";
+      case "moonshotai/kimi-k2.7-code":
+        return "kimi-k2.7-code";
+      case "x-ai/grok-4.5":
+        return "grok-4.5";
+      case "z-ai/glm-5.3":
+        return "glm-5.3";
+      case "google/gemini-3.5-flash":
+        return "gemini-3.5-flash";
+      case "deepseek/deepseek-v4-pro":
+        return "deepseek-v4-pro";
+      case "deepseek/deepseek-v4-flash":
+        return "deepseek-v4-flash";
+      default:
+        return modelId.trim();
+    }
   }
 
   bedrockClaudeModel(modelId: string): string {

@@ -11,6 +11,7 @@ const AUXILIARY_MODELS = {
   bedrock: "openai.gpt-5.6-luna",
   openai: "gpt-5.6-luna",
   openrouter: "deepseek/deepseek-v4-flash",
+  requesty: "gpt-5.6-luna",
 };
 
 const BEDROCK_OPENAI_MODEL_REGIONS = {
@@ -31,6 +32,7 @@ const SUPPORTED_PROVIDERS = new Set([
   "custom",
   "openai",
   "openrouter",
+  "requesty",
 ]);
 
 const SUPPORTED_CUSTOM_APIS = new Set([
@@ -279,6 +281,18 @@ class SelfhostAiBinding {
             "HTTP-Referer": "https://camelai.dev",
             "X-OpenRouter-Title": "camelAI",
             "X-OpenRouter-Categories": "cloud-agent,programming-app",
+          },
+          { disableReasoning: true },
+        );
+      case "requesty":
+        return this.runOpenAiCompletions(
+          providerModel,
+          inputs,
+          "https://router.requesty.ai/v1",
+          {
+            Authorization: `Bearer ${this.apiKey}`,
+            "HTTP-Referer": "https://camelai.dev",
+            "X-Title": "camelAI",
           },
           { disableReasoning: true },
         );

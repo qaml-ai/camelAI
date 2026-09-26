@@ -243,6 +243,7 @@ await check("AI provider", async () => {
     "custom",
     "openai",
     "openrouter",
+    "requesty",
   ]);
   if (provider) {
     if (!supported.has(provider)) {

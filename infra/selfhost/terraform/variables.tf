@@ -294,12 +294,12 @@ variable "pomerium_audience" {
 }
 
 variable "selfhost_ai_provider" {
-  description = "Key-backed AI provider: bedrock, anthropic, openai, openrouter, or custom."
+  description = "Key-backed AI provider: bedrock, anthropic, openai, openrouter, requesty, or custom."
   type        = string
   default     = "bedrock"
   validation {
-    condition     = contains(["bedrock", "anthropic", "openai", "openrouter", "custom"], var.selfhost_ai_provider)
-    error_message = "selfhost_ai_provider must be bedrock, anthropic, openai, openrouter, or custom."
+    condition     = contains(["bedrock", "anthropic", "openai", "openrouter", "requesty", "custom"], var.selfhost_ai_provider)
+    error_message = "selfhost_ai_provider must be bedrock, anthropic, openai, openrouter, requesty, or custom."
   }
 }
 

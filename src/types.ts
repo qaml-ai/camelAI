@@ -602,7 +602,7 @@ export interface WorkerScriptWithCreator extends WorkerScript {
 }
 
 // LLM Provider BYOK types
-export type LlmProvider = "anthropic" | "bedrock" | "custom" | "openai" | "openrouter";
+export type LlmProvider = "anthropic" | "bedrock" | "custom" | "openai" | "openrouter" | "requesty";
 export type LlmModel =
   | "haiku"
   | "sonnet"

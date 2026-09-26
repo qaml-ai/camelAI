@@ -259,7 +259,7 @@ export function UnlockPremiumModal({
               <div className="min-w-0 space-y-1">
                 <p className="text-sm font-medium">Use your own API key</p>
                 <p className="text-sm text-muted-foreground">
-                  Anthropic, OpenAI, OpenRouter, Bedrock, or a custom endpoint.
+                  Anthropic, OpenAI, OpenRouter, Requesty, Bedrock, or a custom endpoint.
                 </p>
               </div>
               <AdminAction

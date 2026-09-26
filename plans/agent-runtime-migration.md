@@ -1,7 +1,8 @@
 # Moving the agent loop to the hosted agent runtime
 
-Status: phase 1 (MCP server) built and tested end to end locally. Phases 2+
-wait for Miguel's answers to the open questions below.
+Status: phase 2 built and tested end to end locally: the MCP server, the
+ChatThreadDO adapter (behind a flag, new threads only) and the inference proxy.
+Human input (ask-user tools, confirmations) waits for the runtime's v1.
 
 Today `ChatThreadDO` runs the Pi agent in the Durable Object: model calls,
 retries, compaction, transcript durability, isolate-death recovery, tools. The
@@ -13,14 +14,18 @@ the move chiridion is:
    (`workers/main/src/routes/agent-mcp.ts`, built).
 2. **A client** that creates one runtime agent per thread, sends prompts, and
    streams the agent's events into the existing chat UI (the ChatThreadDO
-   adapter, not built).
+   adapter, `workers/main/src/chat-thread/runtime-agent.ts`).
+3. **An inference proxy** the runtime sends every model call to
+   (`workers/main/src/routes/agent-runtime-llm.ts`), so chiridion keeps its
+   model routing, BYOK, credit and user-limit gates and usage metering.
 
 ```text
 browser ─WS/poll─ ChatThreadDO ──POST prompt/steer/abort──> runtime (AWS us-west-2)
                      ^  └──── SSE /clients/:id/events <──┘      │
                      │                                           │ tools/call + identity JWT
                      └── UI state RPCs (preview, todos) ── /mcp/agent (Worker) ── CodeModeToolsBinding
-                                                                   └─ OrgDO, WorkspaceFilesystemDO, sandboxes, R2
+                     │                                             └─ OrgDO, WorkspaceFilesystemDO, sandboxes, R2
+                     └── runtimeChatCompletion ── /agent-runtime/llm/v1/chat/completions <── model calls (same JWT)
 ```
 
 ## 1. The MCP server (built)
@@ -69,7 +74,10 @@ browser ─WS/poll─ ChatThreadDO ──POST prompt/steer/abort──> runtime 
 - **Config** (`Env`):
   - `AGENT_RUNTIME_URL` (default `https://agents.camelai.dev`);
   - `AGENT_RUNTIME_TENANT`: when set, tokens for any other tenant are refused;
-  - `AGENT_RUNTIME_MCP_AUDIENCE`: only needed behind a proxy.
+  - `AGENT_RUNTIME_MCP_AUDIENCE` / `AGENT_RUNTIME_LLM_AUDIENCE`: only needed
+    behind a proxy;
+  - adapter: `AGENT_RUNTIME_ENABLED`, `AGENT_RUNTIME_API_TOKEN` (operator
+    token, a secret), `AGENT_RUNTIME_DEFINITION`.
 - **SDK dependency.** `serveTools` and `testRuntime` are not on npm yet
   (npm has 0.4.0 without `./server`). The SDK is vendored as
   `vendor/camelai-agent-runtime-0.4.0-9bb8ecd.tgz`, built from agent-runtime
@@ -156,71 +164,67 @@ but only if the runtime tells it which model tool call it is serving (R2).
 - Direct top-level deploys get no build progress (no `parentToolUseId`,
   `chat-thread-do.ts:8930`).
 
-## 4. ChatThreadDO adapter (design only)
+## 4. ChatThreadDO adapter (built)
 
-One runtime agent per thread, created lazily on the thread's first
-runtime-backed turn:
+`RuntimeAgentSession` (`chat-thread/runtime-agent.ts`) stands where the
+in-process Pi `Agent` stands, with the members the DO uses (`state`,
+`subscribe`, `prompt`, `steer`, `abort`, `continue`, `waitForIdle`). The
+runtime's event stream carries native Pi `AgentEvent`s, so
+`handlePiSessionEvent` → `PiChunkEncoder` → ai-chat → the browser, and the
+`pi_core_*` render mirror, run unchanged. `camel__` tool names are mapped back
+(`camel__list_apps` → `list_apps`) so the UI's tool renderers apply.
 
-- **Create.** `POST /v1/agents` with the operator key and:
-  - `definition`: the environment's definition (camel MCP server, builtins
-    `web_search`/`web_fetch`);
-  - `subject`, `context` (section 2);
-  - `ttlSeconds: null` (the default TTL is one day);
-  - `idempotencyKey: "thread:<threadId>"`, so a retried create returns the
-    same agent.
-- **Store** in DO KV: `runtime_agent = {id, token}`, `runtime_cursor`,
-  `runtime_request` (the in-flight request id = the turn id).
-- **Model and system prompt.** A definition supplies model and system prompt,
-  and creating an agent from one refuses both (`definitions.ts:176`).
-  - Until R1: create, then `PATCH /v1/agents/:id/configuration {model, systemPrompt}`
-    before the first prompt. It is queued ahead of it.
-  - The model is chiridion's per-thread choice mapped to a runtime
-    `provider/model`.
-  - The system prompt is `createPiSystemPrompt` (~3.4K tokens; only ids and
-    skills vary). The per-turn parts (verified-work state, the automation
-    outcome block) move into the prompt text.
+- **Backend pin.** `resolveAgentBackend` pins `agentBackend` in DO KV the
+  first time a thread is asked: `runtime` only for a thread the model has
+  never answered (one probe of `pi_core_messages`), in an allowlisted org,
+  with `AGENT_RUNTIME_ENABLED=true`. Everything else is `pi`; with the flag
+  unset nothing is written.
+- **Create** (lazily, first run): `POST /v1/agents` with the operator token
+  (`AGENT_RUNTIME_API_TOKEN`), `Idempotency-Key: thread_<id>`,
+  `definition: AGENT_RUNTIME_DEFINITION`, `model: chiridion/<thread model id>`
+  (falling back to `chiridion/default` for ids the catalog lacks),
+  `thinkingLevel`, `systemPromptAppend` (a preamble mapping tool names and
+  js_exec bindings to this surface, then `createPiSystemPrompt`),
+  `fileTools: false`, `ttlSeconds: null`, `subject` (the thread creator) and
+  `context {org, workspace, thread}`.
+- **DO KV.** `runtimeAgent {id, token, model}`, `runtimeAgentCursor` (the event
+  cursor at the last run boundary), `runtimeAgentRun {requestId, cursor}` (the
+  run in flight and where it began).
+- **Run.** `POST /clients/:id/requests {method: prompt, params: {text, actor}}`
+  with the agent token, then `GET /clients/:id/events` from the start cursor
+  until the run's `response` frame. A thread model change is configured
+  (`PATCH …/configuration {model}`) before the next run. A scheduled run's
+  outcome instructions go ahead of its message (the prompt is fixed at
+  creation). Runtime heartbeats keep the DO's stall watchdog quiet during
+  long tool calls. A run the runtime refuses (402, spend limit) is closed with
+  an error message and `agent_end`, so the turn ends normally.
+- **Steer / stop.** A message sent while a run streams becomes a `steer`
+  request (no actor: it joins the run's). Stop sends an `abort` request; the
+  runtime's `agent_end` and `response` close the turn as usual.
+- **DO restart.** `resumeActivePiTurn` relays the run in flight again from its
+  start cursor (the runtime buffers the run's events), without prompting
+  again. A turn admitted while the session was cold goes through the same
+  branch and prompts its unanswered user messages. A run the runtime never
+  took is closed with "did not reach the agent". A replay gap (409) recovers
+  the run's messages from `/history`.
+- **Unchanged / dead for runtime threads.** Usage is not metered from
+  `turn_end` (the proxy meters each call); the transient-retry deferral, the
+  journal resume ladder, compaction and provider streaming are not used;
+  `disposePiSession` stops relaying without aborting the remote run.
+  Deleting that code waits for the rollout.
+- **Other ingress** (Slack, email, Telegram, Discord, cron) enters through
+  `startInitialUserMessage` and follows the thread's pin. The eval runner calls
+  `piSession.prompt` directly and is not ported.
 
-**Turn.** `sendRunnerCommand` keeps its shape, but instead of `piSession.prompt`:
-1. Run the existing gates (ban list, org credits, user limits) before
-   submitting.
-2. `POST /v1/agents/:id/prompt {text, actor, requestId: turnId}`. Messages
-   during a turn go to `steer`.
-3. Hold `GET /clients/:id/events` (agent token, `Last-Event-ID: cursor`) open
-   while a turn runs.
-4. Each frame's `event` is a native Pi `AgentEvent`, so it goes into the
-   existing `handlePiSessionEvent` → `PiChunkEncoder` path unchanged. This is
-   what makes the adapter small: the encoder, UIMessage parts, ai-chat
-   resumable stream and client all stay.
-5. `message_end` rows are still appended to `pi_core_*`. They are now a render
-   mirror, not the model's context, so `derived-render-page` keeps working.
-6. The `response` frame for our request id ends the turn (finish chunk,
-   metadata, usage). Usage is recorded from `message_end.usage` as today.
-7. Persist the cursor after non-delta frames only, as the SDK does.
-
-**Reconnect / DO restart.**
-- On wake with `runtime_request` set, reopen the stream from the cursor and
-  let ai-chat's resumable stream rebuild the UI.
-- On 409 (REPLAY_GAP), fetch `GET /v1/agents/:id/history` and the request
-  outcome, re-derive the render window, and broadcast `CHAT_MESSAGES`.
-- Never re-prompt to reconstruct a stream. The runtime resumes a turn itself
-  if its node dies (`turn_resumed`/`turn_recovered` become a `data-pi-turn-notice`).
-
-**Abort.** `requestStop` sends `POST /v1/agents/:id/abort` and ends the local
-stream. The runtime cancels in-flight MCP calls: the request's signal aborts.
-
-**What becomes dead code** (behind the flag first, deleted after rollout):
-- Pi session lifecycle, `streamPiModel`/pi-stream-retry, pi-compaction.
-- The turn journal, resume ladder, salvage, transient retry, the stall
-  watchdog's session disposal, and most OOM guards.
-- In-DO subagents.
-
-That is roughly `chat-thread-do.ts` 4675-4790, 5484-6116, 7633-8627,
-8865-8950 and 10513-11190.
-
-**Other ingress** (Slack, email, Telegram, Discord, cron, evals) all enters
-through `startInitialUserMessage`/`enqueueRunnerUserMessage`, so they switch
-with the thread. Evals call `piSession.prompt` directly and need their own
-small change.
+Verified locally (runtime from agent-runtime main, chiridion `bun run
+dev:local-auth`): a new thread's first message created the runtime agent,
+the runtime called `camel__list_apps` and `camel__read` in parallel through
+MCP, every model call went through the proxy (reasoning included; the tool
+continuation after thinking worked, so signatures round-trip), the UI stream
+got ListApps/Read tool parts and text, the render history reloads, a second
+turn kept context, steer and stop worked, and `usage_log` rows carry the
+acting user and cache reads. Not exercised live: a DO restart mid-run (unit
+tested), and 402/429 from the proxy ending a runtime turn.
 
 ## 5. Files
 
@@ -239,9 +243,9 @@ small change.
     outputs.
   - A `file_presented` event (with its signed URL) can be shown in chat as a
     download.
-- **Name clash.** The runtime's own `read/write/edit/ls/glob/grep` over
-  `/workspace` sit next to `camel__read` etc. Two file systems with the same
-  verbs will confuse the model (R3).
+- **No name clash.** Runtime agents are created with `fileTools: false`, so
+  the runtime's own `read/write/...` are gone; `fs`, `present_file` and
+  attachments stay.
 
 ## 6. Rollout flag
 
@@ -249,8 +253,9 @@ There is no generic flag system. Use the pattern of the KV ban list, which is
 already checked where messages are accepted (`isOrgBanned`, CTD:6433):
 
 - `AGENT_RUNTIME_ENABLED` (env kill switch), plus a KV allowlist
-  `agent_runtime_org:<orgId>`, managed through an admin route.
-- The decision is pinned per thread at its first turn (`runtime_backend`
+  `agent_runtime_org:<orgId>` in `APP_KV`, managed with
+  `GET/PUT/DELETE /api/admin/orgs/:id/agent-runtime`.
+- The decision is pinned per thread at its first turn (`agentBackend`
   in DO KV) and never flips. Existing threads keep the in-DO loop, and new
   threads in allowlisted orgs use the runtime. Transcripts are not migrated.
   Importing history later is possible with `initialMessages`.
@@ -282,75 +287,83 @@ already checked where messages are accepted (`isOrgBanned`, CTD:6433):
   module-level map (five minutes). That is a mutable module cache, which
   AGENTS.md discourages, but it holds only public keys.
 
-## 8. Open questions for Miguel
+## 8. Decisions (Miguel) and what is left
 
-1. **Tenant and billing.** One chiridion tenant per environment with
-   `billing: "none"` and camelAI's provider keys?
-   - Then per-org credits, user limits and the free-model fallback stay in
-     chiridion. They can be checked before each prompt, but not before each
-     model call mid-turn: a long turn can overdraw.
-   - Acceptable, or do we need R6?
-2. **BYOK and provider routing.** Orgs with their own keys (Anthropic,
-   OpenAI, OpenRouter, Bedrock, Codex subscription) and AI Gateway metadata
-   cannot be served by one tenant's keys.
-   - Options: keep those orgs on the in-DO loop, or R6.
-3. **AskUserQuestion and confirmations.** Should they block inside the tool
-   call (needs the MCP timeout ≥ the user's think time), or end the turn with
-   the question and take the answer as the next message? The latter is simpler
-   and stateless. It also covers delete_* confirmations and
-   prompt_connection_setup.
-4. **js_exec capabilities.** Today's js_exec has env.CONNECTIONS, AI (image
-   gen, transcription), BROWSER, SECURE_FETCH, WORKSPACE/PROJECTS and
-   `connections[alias]`. The runtime's has `tools.*` and `fs` only. Expose the
-   missing ones as MCP tools (connections_invoke, generate_image,
-   browser_action, …), accepting that scripts change shape?
-5. **Subagents.** Explore/Research as child runtime agents (a definition each,
-   deleted after use), or drop them in favour of js_exec + web tools?
-6. **Model catalog.** Map chiridion's picker to the runtime's `/v1/models`;
-   what happens to models it lacks (deepseek free tier, Bedrock)?
-7. **Rollout order.** Staff orgs → free tier → paid? Evals first?
+1. **Billing and routing: an inference proxy in chiridion** (built, section
+   10). The runtime tenant bills nothing for these calls; chiridion keeps
+   per-call gates, BYOK/Bedrock/Codex/self-host routing and metering.
+2. **Ask-user tools** (AskUserQuestion, prompt_connection_setup, delete
+   confirmations): the runtime's human-input v1 (`ctx.confirm/ask/requireUrl`
+   in serveTools, the `ask_user` built-in, `POST /v1/agents/:id/inputs/:id`).
+   Not built here until v1 lands; the tools are not served meanwhile.
+3. **Subagents:** dropped for launch.
+4. **js_exec capabilities:** exposed as tools (section 1).
 
-## 9. Runtime changes needed (for the lead)
+Left: human input (2); porting the eval runner; an actor for automation
+threads without a user (`subject` falls back to the thread creator); a
+browser-session cleanup at run end; measuring tool-call latency from us-west-2
+in staging; per-tool `exposure` for remote MCP servers (R7) instead of relying
+on list order for the 64 direct tools.
 
-- **R1.** Allow `model` and `systemPrompt` (ideally `systemPromptAppend`)
-  alongside `definition` at creation (`src/definitions.ts:176` rejects them).
-  Chiridion threads choose their model, and the prompt carries thread ids.
-  Workaround: `PATCH /configuration` right after create.
-- **R2.** Send the model's tool call id to remote MCP servers. `_meta` for
-  definition sources carries only `agent-runtime/origin`
-  (`src/tool-sources.ts:359`); attached servers also get `callId`,
-  `toolCallId` and `actor` (`src/client-sessions.ts:1348`). Chiridion needs
-  `toolCallId` (the js_exec call's id for calls from code) to key tool
-  progress and preview updates to the UI's tool part. Better still: relay MCP
-  `notifications/progress` as `tool_execution_update` events.
-- **R3.** A definition option to leave out the runtime's file tools (keep
-  the `/workspace` mount for attachments and tool outputs), or to let a
-  definition source's `read/write/...` take precedence. Otherwise the model
-  sees two file systems.
-- **R4.** MCP `timeoutMs` is capped at 600 s (`src/tool-sources.ts:136`).
-  deploy_project and run_notebook can run up to chiridion's 20-minute tool
-  limit (cold container plus build). Raise the cap to 1,200 s, or reset the
-  timeout on progress notifications.
+## 9. Runtime changes
+
+Landed on agent-runtime main: R1 (`model`, `thinkingLevel`,
+`systemPromptAppend`, `fileTools` alongside a definition), R2 (`_meta`
+`agent-runtime/toolCallId`/`innerCallId`/`actor`, MCP progress relayed as
+`tool_execution_update`), R3 (`fileTools: false`), R4 (1,200 s MCP tool
+timeouts, reset by progress; js_exec itself still caps at 120 s, hence the
+direct-first tool order), R6 (a tenant's `modelEndpoints`, identity-token
+authenticated). Still needed:
+
 - **R5.** Publish `@camelai/agent-runtime` with `./server` and `./testing`,
   so chiridion can drop the vendored tarball.
-- **R6** (depends on Q1/Q2). A per-agent provider key or base URL (a
-  chiridion inference proxy that applies BYOK and credit gates per model
-  call), or a per-agent spend limit.
+- **R7.** Per-tool `exposure` for remote MCP servers (today only attached
+  servers read `_meta["agent-runtime/exposure"]`), so chiridion can pick its
+  direct tools instead of relying on list order.
+- Human-input v1 (decision 2).
 
-## 10. Local end-to-end recipe
+## 10. Inference proxy (built)
+
+`POST /agent-runtime/llm/v1/chat/completions` (`routes/agent-runtime-llm.ts`):
+verifies the runtime identity token (SDK `verifyRuntimeToken`, audience = the
+base URL or the endpoint, or `AGENT_RUNTIME_LLM_AUDIENCE`), authorizes
+`act ?? sub` in `ctx` like the MCP server, then calls the thread's
+`ChatThreadDO.runtimeChatCompletion`. That converts the OpenAI request to a
+Pi context (`agent-runtime/openai-bridge.ts`), resolves the thread's current
+model (`piModelResolver`: picker, BYOK, Bedrock, Codex, credit fallback),
+applies the user-limit gate as the acting user, streams through
+`streamPiModel` (provider retries, Bedrock region fallback, prompt caching
+keyed by thread) and streams chat-completion chunks back; the final message is
+metered with `recordPiAssistantUsage`. Gate refusals are 429 (user limit) or
+402 (credits) before any stream. The request's `model` is informational.
+Thinking/thought signatures ride as `reasoning_details` keyed by tool call id
+and are restored on the way back in.
+
+## 11. Local end-to-end recipe
 
 ```sh
-# runtime (from ~/agent-runtime), own database
-docker exec agent-runtime-pg psql -U postgres -c "create database chiridion_mcp"
+# runtime (from ~/agent-runtime main), own database; tenants file entry:
+#   "chiridion": {"tokenSha256": …, "modelEndpoints": {"chiridion": {
+#     "baseUrl": "http://127.0.0.1:3001/agent-runtime/llm/v1",
+#     "models": {"default": {"contextWindow": 200000, "maxTokens": 16000, "reasoning": true, "input": ["text", "image"]}},
+#     "compat": {"maxTokensField": "max_tokens"}}}}
+docker exec agent-runtime-pg psql -U postgres -c "create database chiridion_r6"
 AGENT_TENANTS_FILE=… AGENT_SECRETS_KEY=<64 hex> AGENT_SESSION_SECRET=… \
-AGENT_DATABASE_URL=postgres://postgres:test@127.0.0.1:55432/chiridion_mcp \
+AGENT_DATABASE_URL=postgres://postgres:test@127.0.0.1:55432/chiridion_r6 \
 AGENT_PUBLIC_URL=http://127.0.0.1:8795 PORT=8795 \
 AGENT_OUTBOUND_ALLOW_HTTP=true AGENT_OUTBOUND_ALLOW_CIDRS=127.0.0.1/32 \
 node --experimental-strip-types src/server.ts
 
-# chiridion: .dev.vars gets AGENT_RUNTIME_URL=http://127.0.0.1:8795 and AGENT_RUNTIME_TENANT=chiridion
+# definition
+POST /v1/definitions {"name": "camelai-thread", "model": "chiridion/default",
+  "builtins": ["web_fetch", "web_search"], "fileTools": false,
+  "mcpServers": [{"name": "camel", "url": "http://127.0.0.1:3001/mcp/agent",
+    "auth": {"type": "runtime"}, "exposure": "both", "timeoutMs": 1200000}]}
+
+# chiridion .dev.vars: AGENT_RUNTIME_URL=http://127.0.0.1:8795
+#   AGENT_RUNTIME_TENANT=chiridion AGENT_RUNTIME_ENABLED=true
+#   AGENT_RUNTIME_API_TOKEN=<operator token> AGENT_RUNTIME_DEFINITION=def_…
+npx wrangler kv key put --local --binding APP_KV --persist-to .wrangler/state agent_runtime_org:local-dev-org 1
 E2E_LOCAL=1 bun run dev:local-auth
-# POST /v1/definitions {mcpServers:[{name:"camel",url:"http://127.0.0.1:3001/mcp/agent",auth:{type:"runtime"}}]}
-# POST /v1/agents {definition, subject:<user>, context:{org,workspace,thread}}
-# POST /v1/agents/:id/prompt {text, actor}
+# then start a new chat thread in the UI
 ```

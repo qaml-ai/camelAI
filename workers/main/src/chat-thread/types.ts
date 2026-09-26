@@ -109,6 +109,13 @@ export interface ChatEnv extends WorkspaceFilesystemEnv {
   WORKER_LOGS?: DurableObjectNamespace<WorkerLogsDO>;
   PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<import("../project-build-sandbox.js").ProjectBuildSandbox>;
   APP_KV: KVNamespace;
+  // Hosted agent runtime (plans/agent-runtime-migration.md): "true" lets new
+  // threads of allowlisted orgs (APP_KV agent_runtime_org:<orgId>) run there,
+  // as agents of AGENT_RUNTIME_DEFINITION made with the operator token.
+  AGENT_RUNTIME_ENABLED?: string;
+  AGENT_RUNTIME_URL?: string;
+  AGENT_RUNTIME_API_TOKEN?: string;
+  AGENT_RUNTIME_DEFINITION?: string;
   R2_BUCKET: R2Bucket;
   IMAGES?: ImagesBinding;
   AI: Ai;

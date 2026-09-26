@@ -287,6 +287,7 @@ import {
   type LlmProviderConfigRecord,
   isPiImageBlindModel,
   primaryPiThinkingLevel,
+  HostedModelFallbackRequiredError,
 } from "./chat-thread/pi-model-config";
 import { FREE_VLLM_PRIORITY } from "./hosted-vllm-priority";
 import {
@@ -371,6 +372,17 @@ import {
 // deduplicated OrgDO thread-error recorder. Event delivery (pushChatEvent /
 // broadcast) stays on this DO.
 import { ChatThreadErrors } from "./chat-thread/errors";
+import {
+  RuntimeAgentSession,
+  runtimeEnabledForOrg,
+  type RuntimeAgentRecord,
+  type RuntimeRunRecord,
+} from "./chat-thread/runtime-agent";
+import {
+  OpenAiRequestError,
+  openAiRequestToPiContext,
+  piEventsToOpenAiSse,
+} from "./agent-runtime/openai-bridge";
 
 // Pi tool-definition surface (executor-style tool list + Agent/Explore
 // subagent runner + subagent system prompt).
@@ -533,6 +545,12 @@ class PiTurnAbsoluteTimeoutError extends Error {
 }
 
 const CHAT_CONTEXT_KEY = "chatContext";
+// Which loop runs this thread: "runtime" (the hosted agent runtime) or "pi"
+// (in the DO). Pinned at the thread's first turn; a thread never switches.
+const CHAT_AGENT_BACKEND_KEY = "agentBackend";
+const RUNTIME_AGENT_KEY = "runtimeAgent";
+const RUNTIME_AGENT_CURSOR_KEY = "runtimeAgentCursor";
+const RUNTIME_AGENT_RUN_KEY = "runtimeAgentRun";
 // Durable resume of an interrupted Pi turn (e.g. the DO is evicted mid-turn by a
 // deploy). ai-chat's `chatRecovery` owns recovery now: a turn runs through
 // saveMessages -> _runProgrammaticChatTurn -> onChatMessage, wrapped by ai-chat's
@@ -4763,7 +4781,10 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     this.piModelResolver = null;
     this.clearPiToolKeepAliveInterval();
     try {
-      this.piSession?.abort();
+      // A runtime run carries on without this DO; only stop relaying it.
+      const session: unknown = this.piSession;
+      if (session instanceof RuntimeAgentSession) session.dispose();
+      else this.piSession?.abort();
     } catch {
       // Best effort: the session may already be idle or torn down.
     }
@@ -5616,6 +5637,15 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   private async resumeActivePiTurn(
     options: { cause?: PiTurnResumeCause } = {},
   ): Promise<void> {
+    if (this.isRuntimeAgentThread()) {
+      // The runtime kept running the turn (or finished it): relay its events
+      // again from the run's start. Nothing is re-prompted, so no resume budget.
+      await this.ensurePiSessionReady();
+      const session = this.piSession as unknown as RuntimeAgentSession | null;
+      if (!session) throw new Error("Runtime agent session was not available to resume the turn");
+      await session.continue();
+      return;
+    }
     // FIRST thing, before ensurePiSessionReady or any other awaitable work: the
     // increment only bounds the loop if it survives an isolate that dies inside
     // this very re-drive. Absent marker (null) = nothing to bound; the resume
@@ -7677,8 +7707,13 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     );
     const persistedMessages = loaded.messages;
     this.recordPiSessionLoadWindow(loaded.window);
-    let initialMessages = [...persistedMessages];
     this.piMainBaselineIndex = persistedMessages.length;
+    if (await this.resolveAgentBackend(context, persistedMessages.length === 0) === "runtime") {
+      const session = this.createRuntimeAgentSession(context, envVars, modelConfig.model, persistedMessages);
+      this.subscribePiSession(session as unknown as PiCoreAgent);
+      return session as unknown as PiCoreAgent;
+    }
+    let initialMessages = [...persistedMessages];
     // Resume an interrupted turn: fold the journaled in-flight tail back in and
     // reconcile (synthesize interrupted results for dispatched-but-unfinished
     // tools; reorder reasoning ahead of tool calls). The synthesized/reordered
@@ -7764,7 +7799,11 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       sessionId: context.threadId,
       toolExecution: "parallel",
     });
+    this.subscribePiSession(session);
+    return session;
+  }
 
+  private subscribePiSession(session: PiCoreAgent): void {
     this.piUnsubscribe = session.subscribe((event) => {
       const handled = this.piEventHandlerChain
         .catch(() => undefined)
@@ -7777,7 +7816,161 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       );
       return handled;
     });
-    return session;
+  }
+
+  /** Whether this thread's turns run on the hosted agent runtime. */
+  private isRuntimeAgentThread(): boolean {
+    return this.ctx.storage.kv.get<string>(CHAT_AGENT_BACKEND_KEY) === "runtime";
+  }
+
+  /**
+   * The loop this thread runs on, pinned the first time it is asked. Only a
+   * thread with no transcript yet can start on the runtime, so an existing
+   * conversation never moves between loops.
+   */
+  private async resolveAgentBackend(
+    context: ChatContextState,
+    newThread: boolean,
+  ): Promise<"runtime" | "pi"> {
+    const pinned = this.ctx.storage.kv.get<string>(CHAT_AGENT_BACKEND_KEY);
+    if (pinned === "runtime" || pinned === "pi") return pinned;
+    const backend = newThread && await runtimeEnabledForOrg(this.env, context.orgId) ? "runtime" : "pi";
+    this.ctx.storage.kv.put(CHAT_AGENT_BACKEND_KEY, backend);
+    return backend;
+  }
+
+  private createRuntimeAgentSession(
+    context: ChatContextState,
+    envVars: Record<string, string>,
+    model: Model<any>,
+    persistedMessages: AgentMessage[],
+  ): RuntimeAgentSession {
+    const kv = this.ctx.storage.kv;
+    return new RuntimeAgentSession({
+      env: this.env,
+      identity: {
+        orgId: context.orgId,
+        workspaceId: context.workspaceId,
+        threadId: context.threadId,
+        subject: context.userId ?? "",
+      },
+      store: {
+        agent: () => kv.get<RuntimeAgentRecord>(RUNTIME_AGENT_KEY) ?? null,
+        saveAgent: (agent) => kv.put(RUNTIME_AGENT_KEY, agent),
+        cursor: () => kv.get<number>(RUNTIME_AGENT_CURSOR_KEY) ?? null,
+        saveCursor: (cursor) => kv.put(RUNTIME_AGENT_CURSOR_KEY, cursor),
+        run: () => kv.get<RuntimeRunRecord>(RUNTIME_AGENT_RUN_KEY) ?? null,
+        saveRun: (run) => {
+          if (run) kv.put(RUNTIME_AGENT_RUN_KEY, run);
+          else kv.delete(RUNTIME_AGENT_RUN_KEY);
+        },
+      },
+      actor: () => this.getActiveTurnUserId(),
+      initialState: {
+        systemPrompt: "",
+        model: capPiMainRequestOutput(model),
+        tools: [],
+        messages: persistedMessages,
+        thinkingLevel: primaryPiThinkingLevel(envVars.CHIRIDION_MODEL ?? this.currentThreadModel),
+      },
+      configuration: async () => ({ systemPrompt: this.createPiSystemPrompt(context, envVars) }),
+      onActivity: () => {
+        this.touchPiTurnProgress();
+        this.writePiStreamHeartbeat();
+      },
+    });
+  }
+
+  /**
+   * One model call of this thread's runtime agent, from the inference proxy
+   * (routes/agent-runtime-llm.ts): an OpenAI chat-completions request in, a
+   * streamed chat-completions response out. The call goes through the same
+   * model routing, credit and user-limit gates, provider retries and usage
+   * metering as an in-DO Pi turn, as the user the runtime says is acting.
+   */
+  async runtimeChatCompletion(
+    body: unknown,
+    caller: { orgId: string; workspaceId: string; threadId: string; userId: string },
+  ): Promise<Response> {
+    const fail = (status: number, message: string, code: string) =>
+      Response.json({ error: { message, type: code, code } }, { status });
+    const context = this.chatContext;
+    if (
+      !context ||
+      context.threadId !== caller.threadId ||
+      context.workspaceId !== caller.workspaceId ||
+      context.orgId !== caller.orgId
+    ) {
+      return fail(403, "The token is not for this thread", "forbidden");
+    }
+    if (!this.isRuntimeAgentThread()) {
+      return fail(403, "This thread does not run on the agent runtime", "forbidden");
+    }
+    let request: ReturnType<typeof openAiRequestToPiContext>;
+    try {
+      request = openAiRequestToPiContext(body);
+    } catch (error) {
+      if (error instanceof OpenAiRequestError) return fail(400, error.message, "invalid_request_error");
+      throw error;
+    }
+    await this.ensurePiSessionReady();
+    const resolveModel = this.piModelResolver;
+    if (!resolveModel) return fail(503, "The thread's model is not available", "unavailable");
+    let modelConfig: PiResolvedModelConfig;
+    try {
+      modelConfig = await resolveModel();
+      await this.assertPiUserLlmUsageAccess(context, modelConfig, caller.userId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof UserLlmUsageLimitError) return fail(429, message, "usage_limit");
+      if (error instanceof HostedModelFallbackRequiredError) return fail(402, message, "insufficient_credits");
+      throw error;
+    }
+    const { streamSimple } = await import("@earendil-works/pi-ai/compat");
+    const model = capPiMainRequestOutput(modelConfig.model);
+
+    const billing = {
+      source: this.piCurrentBillingSource,
+      chargeable: this.piCurrentCreditChargeable,
+      provider: this.piCurrentUsageProvider,
+    };
+    const startedAtMs = Date.now();
+    const events = this.streamPiModel(
+      model,
+      { systemPrompt: request.systemPrompt, messages: request.messages, tools: request.tools },
+      {
+        apiKey: modelConfig.apiKey,
+        sessionId: context.threadId,
+        reasoning: primaryPiThinkingLevel(this.currentThreadModel),
+      },
+      streamSimple,
+    );
+    const stream = piEventsToOpenAiSse(events, {
+      id: `chatcmpl-${crypto.randomUUID()}`,
+      model: model.id,
+      onFinal: (message) => {
+        this.ctx.waitUntil(
+          this.recordPiAssistantUsage(
+            message as AgentMessage,
+            Date.now() - startedAtMs,
+            billing.source,
+            billing.chargeable,
+            billing.provider,
+            {
+              userId: caller.userId,
+              model: message.model || model.id,
+              usageSurface: "agent",
+              sourceScope: this.piRuntimeThreadId(),
+            },
+          ).catch((error) => {
+            console.error("[ChatThreadDO] failed to record runtime model usage", error);
+          }),
+        );
+      },
+    });
+    return new Response(stream, {
+      headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+    });
   }
 
   private createPiSystemPrompt(
@@ -9208,7 +9401,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       const creditChargeable = this.piCurrentCreditChargeable;
       const usageProvider = this.piCurrentUsageProvider;
       const usageUserId = this.getActiveTurnUserId();
-      this.ctx.waitUntil(
+      // A runtime thread's model calls are metered by the inference proxy.
+      if (!this.isRuntimeAgentThread()) this.ctx.waitUntil(
         this.recordPiAssistantUsage(
           event.message,
           durationMs,
@@ -10006,7 +10200,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     context: ChatContextState,
     envVars?: Record<string, string>,
   ): void {
-    if (!this.piSession) return;
+    // A runtime agent's prompt and tools live in the runtime.
+    if (!this.piSession || (this.piSession as unknown) instanceof RuntimeAgentSession) return;
     this.piSession.state.systemPrompt = this.createPiSystemPrompt(context, envVars);
     this.piSession.state.tools = this.createPiToolDefinitions(context);
   }
@@ -10512,6 +10707,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
    */
   private maybeDeferPiTurnForTransientRetry(messages: AgentMessage[]): boolean {
     if (!this.activePiStreamTurnId) return false;
+    // The runtime (and the inference proxy under it) retries transient errors itself.
+    if (this.isRuntimeAgentThread()) return false;
     if (this.piTurnTransientRetryAttempts >= PI_TURN_TRANSIENT_RETRY_ATTEMPTS) {
       return false;
     }

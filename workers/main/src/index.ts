@@ -29,6 +29,7 @@ import {
 // Route handlers
 import { handleAdminMcp } from './routes/admin-mcp.js';
 import { handleAgentMcp } from './routes/agent-mcp.js';
+import { handleAgentRuntimeLlm } from './routes/agent-runtime-llm.js';
 import { handleOAuthStart, handleOAuthCallback } from './routes/oauth.js';
 import {
   handleSlackOAuthStart,
@@ -203,6 +204,8 @@ const routes: Route[] = [
 
   // MCP tools for the hosted agent runtime (runtime identity-token auth)
   { method: 'ALL', path: /^\/mcp\/agent$/, handler: handleAgentMcp },
+  // Inference proxy for the hosted agent runtime's model calls (same token)
+  { method: 'POST', path: /^\/agent-runtime\/llm\/v1\/chat\/completions$/, handler: handleAgentRuntimeLlm },
 
   // Stripe billing webhook
   { method: 'POST', path: /^\/api\/billing\/stripe\/webhook$/, handler: handleStripeWebhook },

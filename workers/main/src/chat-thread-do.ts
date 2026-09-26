@@ -287,6 +287,7 @@ import {
   type LlmProviderConfigRecord,
   isPiImageBlindModel,
   primaryPiThinkingLevel,
+  HostedModelFallbackRequiredError,
 } from "./chat-thread/pi-model-config";
 import { FREE_VLLM_PRIORITY } from "./hosted-vllm-priority";
 import {
@@ -371,6 +372,18 @@ import {
 // deduplicated OrgDO thread-error recorder. Event delivery (pushChatEvent /
 // broadcast) stays on this DO.
 import { ChatThreadErrors } from "./chat-thread/errors";
+import {
+  RUNTIME_PROMPT_PREAMBLE,
+  RuntimeAgentSession,
+  runtimeEnabledForOrg,
+  type RuntimeAgentRecord,
+  type RuntimeRunRecord,
+} from "./chat-thread/runtime-agent";
+import {
+  OpenAiRequestError,
+  openAiRequestToPiContext,
+  piEventsToOpenAiSse,
+} from "./agent-runtime/openai-bridge";
 
 // Pi tool-definition surface (executor-style tool list + Agent/Explore
 // subagent runner + subagent system prompt).
@@ -533,6 +546,14 @@ class PiTurnAbsoluteTimeoutError extends Error {
 }
 
 const CHAT_CONTEXT_KEY = "chatContext";
+const AUTOMATION_OUTCOME_STATUSES = ["success", "failed", "partial", "needs_attention"] as const;
+type AutomationOutcomeStatus = (typeof AUTOMATION_OUTCOME_STATUSES)[number];
+// Which loop runs this thread: "runtime" (the hosted agent runtime) or "pi"
+// (in the DO). Pinned at the thread's first turn; a thread never switches.
+const CHAT_AGENT_BACKEND_KEY = "agentBackend";
+const RUNTIME_AGENT_KEY = "runtimeAgent";
+const RUNTIME_AGENT_CURSOR_KEY = "runtimeAgentCursor";
+const RUNTIME_AGENT_RUN_KEY = "runtimeAgentRun";
 // Durable resume of an interrupted Pi turn (e.g. the DO is evicted mid-turn by a
 // deploy). ai-chat's `chatRecovery` owns recovery now: a turn runs through
 // saveMessages -> _runProgrammaticChatTurn -> onChatMessage, wrapped by ai-chat's
@@ -4763,7 +4784,10 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     this.piModelResolver = null;
     this.clearPiToolKeepAliveInterval();
     try {
-      this.piSession?.abort();
+      // A runtime run carries on without this DO; only stop relaying it.
+      const session: unknown = this.piSession;
+      if (session instanceof RuntimeAgentSession) session.dispose();
+      else this.piSession?.abort();
     } catch {
       // Best effort: the session may already be idle or torn down.
     }
@@ -5616,6 +5640,33 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   private async resumeActivePiTurn(
     options: { cause?: PiTurnResumeCause } = {},
   ): Promise<void> {
+    if (this.chatContext && await this.resolveAgentBackend(this.chatContext) === "runtime") {
+      // The runtime kept running the turn (or finished it): relay its events
+      // again from the run's start. Nothing is re-prompted, so no resume budget.
+      await this.ensurePiSessionReady();
+      const session = this.piSession as unknown as RuntimeAgentSession | null;
+      if (!session) throw new Error("Runtime agent session was not available to resume the turn");
+      if (session.hasRunInFlight()) {
+        await session.continue();
+        return;
+      }
+      // A turn admitted while the session was cold: its user messages were
+      // committed (or journaled) after the model's last answer.
+      const committed = session.state.messages;
+      const lastAnswer = committed.findLastIndex((message) => message.role === "assistant");
+      const unanswered = committed.slice(lastAnswer + 1).filter((message) => message.role === "user");
+      const [first, ...rest] = unanswered.length > 0
+        ? unanswered
+        : (await this.loadPiTurnJournalTail()).filter((message) => message.role === "user");
+      if (!first) {
+        await session.continue();
+        return;
+      }
+      const prompted = session.prompt(first);
+      for (const message of rest) session.steer(message);
+      await prompted;
+      return;
+    }
     // FIRST thing, before ensurePiSessionReady or any other awaitable work: the
     // increment only bounds the loop if it survives an isolate that dies inside
     // this very re-drive. Absent marker (null) = nothing to bound; the resume
@@ -7677,8 +7728,13 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     );
     const persistedMessages = loaded.messages;
     this.recordPiSessionLoadWindow(loaded.window);
-    let initialMessages = [...persistedMessages];
     this.piMainBaselineIndex = persistedMessages.length;
+    if (await this.resolveAgentBackend(context) === "runtime") {
+      const session = this.createRuntimeAgentSession(context, envVars, modelConfig.model, persistedMessages);
+      this.subscribePiSession(session as unknown as PiCoreAgent);
+      return session as unknown as PiCoreAgent;
+    }
+    let initialMessages = [...persistedMessages];
     // Resume an interrupted turn: fold the journaled in-flight tail back in and
     // reconcile (synthesize interrupted results for dispatched-but-unfinished
     // tools; reorder reasoning ahead of tool calls). The synthesized/reordered
@@ -7764,7 +7820,11 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       sessionId: context.threadId,
       toolExecution: "parallel",
     });
+    this.subscribePiSession(session);
+    return session;
+  }
 
+  private subscribePiSession(session: PiCoreAgent): void {
     this.piUnsubscribe = session.subscribe((event) => {
       const handled = this.piEventHandlerChain
         .catch(() => undefined)
@@ -7777,7 +7837,204 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       );
       return handled;
     });
-    return session;
+  }
+
+  /**
+   * Whether the model has never answered in this thread: its transcript holds
+   * user messages only (the first one is committed before the turn starts).
+   * One indexed-by-rowid probe, without loading the transcript.
+   */
+  private hasNoModelTranscript(): boolean {
+    try {
+      const sql = this.ctx.storage.sql;
+      if (sql.exec("SELECT 1 FROM pi_core_compaction LIMIT 1").toArray().length > 0) return false;
+      return sql.exec(
+        "SELECT 1 FROM pi_core_messages WHERE NOT (json_valid(payload) AND json_extract(payload, '$.role') = 'user') LIMIT 1",
+      ).toArray().length === 0;
+    } catch {
+      // No pi_core tables yet: nothing has been written.
+      return true;
+    }
+  }
+
+  /** Whether this thread's turns run on the hosted agent runtime. */
+  private isRuntimeAgentThread(): boolean {
+    return this.ctx?.storage?.kv?.get<string>(CHAT_AGENT_BACKEND_KEY) === "runtime";
+  }
+
+  /**
+   * The loop this thread runs on, pinned the first time it is asked. Only a
+   * thread with no transcript yet can start on the runtime, so an existing
+   * conversation never moves between loops.
+   */
+  private async resolveAgentBackend(context: ChatContextState): Promise<"runtime" | "pi"> {
+    const kv = this.ctx?.storage?.kv;
+    if (!kv || this.env?.AGENT_RUNTIME_ENABLED === undefined && kv.get(CHAT_AGENT_BACKEND_KEY) === undefined) {
+      // Runtime never configured here (and never pinned): the in-DO loop, without a write.
+      return "pi";
+    }
+    const pinned = kv.get<string>(CHAT_AGENT_BACKEND_KEY);
+    if (pinned === "runtime" || pinned === "pi") return pinned;
+    const backend = this.hasNoModelTranscript() && await runtimeEnabledForOrg(this.env, context.orgId)
+      ? "runtime"
+      : "pi";
+    kv.put(CHAT_AGENT_BACKEND_KEY, backend);
+    this.recordChatThreadObservabilityEvent("agent_backend_pinned", {
+      operation: "resolve_agent_backend",
+      status: backend,
+    });
+    return backend;
+  }
+
+  private createRuntimeAgentSession(
+    context: ChatContextState,
+    envVars: Record<string, string>,
+    model: Model<any>,
+    persistedMessages: AgentMessage[],
+  ): RuntimeAgentSession {
+    const kv = this.ctx.storage.kv;
+    return new RuntimeAgentSession({
+      env: this.env,
+      identity: {
+        orgId: context.orgId,
+        workspaceId: context.workspaceId,
+        threadId: context.threadId,
+        subject: context.userId ?? "",
+      },
+      store: {
+        agent: () => kv.get<RuntimeAgentRecord>(RUNTIME_AGENT_KEY) ?? null,
+        saveAgent: (agent) => kv.put(RUNTIME_AGENT_KEY, agent),
+        cursor: () => kv.get<number>(RUNTIME_AGENT_CURSOR_KEY) ?? null,
+        saveCursor: (cursor) => kv.put(RUNTIME_AGENT_CURSOR_KEY, cursor),
+        run: () => kv.get<RuntimeRunRecord>(RUNTIME_AGENT_RUN_KEY) ?? null,
+        saveRun: (run) => {
+          if (run) kv.put(RUNTIME_AGENT_RUN_KEY, run);
+          else kv.delete(RUNTIME_AGENT_RUN_KEY);
+        },
+      },
+      actor: () => this.getActiveTurnUserId(),
+      // The runtime agent's prompt is fixed at creation; per-run instructions
+      // (a scheduled run's outcome report) ride on the message instead.
+      runInstructions: () => this.automationOutcomeInstruction(),
+      initialState: {
+        systemPrompt: "",
+        model: capPiMainRequestOutput(model),
+        tools: [],
+        messages: persistedMessages,
+        thinkingLevel: primaryPiThinkingLevel(envVars.CHIRIDION_MODEL ?? this.currentThreadModel),
+      },
+      configuration: async () => ({
+        systemPromptAppend: `${RUNTIME_PROMPT_PREAMBLE}\n\n${this.createPiSystemPrompt(context, envVars)}`,
+      }),
+      onActivity: () => {
+        this.touchPiTurnProgress();
+        this.writePiStreamHeartbeat();
+      },
+    });
+  }
+
+  /**
+   * One model call of this thread's runtime agent, from the inference proxy
+   * (routes/agent-runtime-llm.ts): an OpenAI chat-completions request in, a
+   * streamed chat-completions response out. The call goes through the same
+   * model routing, credit and user-limit gates, provider retries and usage
+   * metering as an in-DO Pi turn, as the user the runtime says is acting.
+   */
+  async runtimeChatCompletion(
+    body: unknown,
+    caller: { orgId: string; workspaceId: string; threadId: string; userId: string },
+  ): Promise<Response> {
+    const fail = (status: number, message: string, code: string) =>
+      Response.json({ error: { message, type: code, code } }, { status });
+    const context = this.chatContext;
+    if (
+      !context ||
+      context.threadId !== caller.threadId ||
+      context.workspaceId !== caller.workspaceId ||
+      context.orgId !== caller.orgId
+    ) {
+      return fail(403, "The token is not for this thread", "forbidden");
+    }
+    if (!this.isRuntimeAgentThread()) {
+      return fail(403, "This thread does not run on the agent runtime", "forbidden");
+    }
+    let request: ReturnType<typeof openAiRequestToPiContext>;
+    try {
+      request = openAiRequestToPiContext(body);
+    } catch (error) {
+      if (error instanceof OpenAiRequestError) return fail(400, error.message, "invalid_request_error");
+      throw error;
+    }
+    await this.ensurePiSessionReady();
+    const resolveModel = this.piModelResolver;
+    if (!resolveModel) return fail(503, "The thread's model is not available", "unavailable");
+    let modelConfig: PiResolvedModelConfig;
+    try {
+      modelConfig = await resolveModel();
+      await this.assertPiUserLlmUsageAccess(context, modelConfig, caller.userId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof UserLlmUsageLimitError) return fail(429, message, "usage_limit");
+      if (error instanceof HostedModelFallbackRequiredError) return fail(402, message, "insufficient_credits");
+      throw error;
+    }
+    const { streamSimple } = await import("@earendil-works/pi-ai/compat");
+    const model = capPiMainRequestOutput(modelConfig.model);
+
+    const billing = {
+      source: this.piCurrentBillingSource,
+      chargeable: this.piCurrentCreditChargeable,
+      provider: this.piCurrentUsageProvider,
+    };
+    const startedAtMs = Date.now();
+    const events = this.streamPiModel(
+      model,
+      { systemPrompt: request.systemPrompt, messages: request.messages, tools: request.tools },
+      {
+        apiKey: modelConfig.apiKey,
+        sessionId: context.threadId,
+        reasoning: primaryPiThinkingLevel(this.currentThreadModel),
+      },
+      streamSimple,
+    );
+    const stream = piEventsToOpenAiSse(events, {
+      id: `chatcmpl-${crypto.randomUUID()}`,
+      model: model.id,
+      onFinal: (message) => {
+        this.ctx.waitUntil(
+          this.recordPiAssistantUsage(
+            message as AgentMessage,
+            Date.now() - startedAtMs,
+            billing.source,
+            billing.chargeable,
+            billing.provider,
+            {
+              userId: caller.userId,
+              model: message.model || model.id,
+              usageSurface: "agent",
+              sourceScope: this.piRuntimeThreadId(),
+            },
+          ).catch((error) => {
+            console.error("[ChatThreadDO] failed to record runtime model usage", error);
+          }),
+        );
+      },
+    });
+    return new Response(stream, {
+      headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+    });
+  }
+
+  /** Per-run instructions for a scheduled automation that must report its outcome. */
+  private automationOutcomeInstruction(): string | null {
+    return this.activeAutomationRun?.requiresExplicitOutcome
+      ? [
+          "## Scheduled Automation Outcome",
+          "Before your final response, you MUST call `report_automation_outcome` exactly once.",
+          "Use `success` only when the requested business objective was actually completed and verified. A clean turn, partial data extraction, or a decision not to deploy is not success.",
+          "Use `failed` when the objective was not completed, `partial` when only part completed, and `needs_attention` when operator action is required. Give a concise factual summary.",
+        ].join("\n")
+      : null;
   }
 
   private createPiSystemPrompt(
@@ -7795,15 +8052,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     const verifiedWorkState = formatVerifiedWorkStatePrompt(
       this.ctx?.storage?.kv?.get<unknown>(CHAT_VERIFIED_WORK_STATE_KEY),
     );
-    const automationOutcomeInstruction = this.activeAutomationRun?.requiresExplicitOutcome
-      ? [
-          "## Scheduled Automation Outcome",
-          "Before your final response, you MUST call `report_automation_outcome` exactly once.",
-          "Use `success` only when the requested business objective was actually completed and verified. A clean turn, partial data extraction, or a decision not to deploy is not success.",
-          "Use `failed` when the objective was not completed, `partial` when only part completed, and `needs_attention` when operator action is required. Give a concise factual summary.",
-        ].join("\n")
-      : null;
-    return [base, verifiedWorkState, automationOutcomeInstruction]
+    return [base, verifiedWorkState, this.automationOutcomeInstruction()]
       .filter((part): part is string => Boolean(part))
       .join("\n\n");
   }
@@ -9019,35 +9268,45 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
         }),
         execute: async (_toolUseId, params, signal) => {
           if (signal?.aborted) throw new Error("Operation aborted");
-          const run = this.activeAutomationRun;
-          if (!run?.requiresExplicitOutcome) {
-            throw new Error("No scheduled automation run is active");
-          }
-          if (run.reportedOutcome) {
-            throw new Error("Automation outcome was already reported for this run");
-          }
-          const raw = params as {
-            status: "success" | "failed" | "partial" | "needs_attention";
-            summary: string;
-          };
-          const summary = raw.summary.trim();
-          if (!summary) throw new Error("Automation outcome summary is required");
-          this.automationRun.setActiveAutomationRun({
-            ...run,
-            reportedOutcome: { status: raw.status, summary },
-          });
+          const raw = params as { status: AutomationOutcomeStatus; summary: string };
+          const recorded = await this.recordAutomationOutcome(raw.status, raw.summary);
           return {
-            content: [{
-              type: "text" as const,
-              text: `Automation outcome recorded: ${raw.status}`,
-            }],
-            details: { status: raw.status },
+            content: [{ type: "text" as const, text: recorded.text }],
+            details: { status: recorded.status },
           };
         },
         executionMode: "sequential",
       });
     }
     return definitions;
+  }
+
+  /**
+   * The required final status of the scheduled automation run in progress,
+   * from the Pi tool or (for runtime threads) the report_automation_outcome
+   * tool of CodeModeToolsBinding.
+   */
+  async recordAutomationOutcome(
+    status: AutomationOutcomeStatus,
+    rawSummary: string,
+  ): Promise<{ status: AutomationOutcomeStatus; text: string }> {
+    const run = this.activeAutomationRun;
+    if (!run?.requiresExplicitOutcome) {
+      throw new Error("No scheduled automation run is active");
+    }
+    if (run.reportedOutcome) {
+      throw new Error("Automation outcome was already reported for this run");
+    }
+    if (!AUTOMATION_OUTCOME_STATUSES.includes(status)) {
+      throw new Error(`status must be one of ${AUTOMATION_OUTCOME_STATUSES.join(", ")}`);
+    }
+    const summary = typeof rawSummary === "string" ? rawSummary.trim() : "";
+    if (!summary) throw new Error("Automation outcome summary is required");
+    this.automationRun.setActiveAutomationRun({
+      ...run,
+      reportedOutcome: { status, summary },
+    });
+    return { status, text: `Automation outcome recorded: ${status}` };
   }
 
   private async runPiSubagentTool(
@@ -9208,7 +9467,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       const creditChargeable = this.piCurrentCreditChargeable;
       const usageProvider = this.piCurrentUsageProvider;
       const usageUserId = this.getActiveTurnUserId();
-      this.ctx.waitUntil(
+      // A runtime thread's model calls are metered by the inference proxy.
+      if (!this.isRuntimeAgentThread()) this.ctx.waitUntil(
         this.recordPiAssistantUsage(
           event.message,
           durationMs,
@@ -10006,7 +10266,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     context: ChatContextState,
     envVars?: Record<string, string>,
   ): void {
-    if (!this.piSession) return;
+    // A runtime agent's prompt and tools live in the runtime.
+    if (!this.piSession || (this.piSession as unknown) instanceof RuntimeAgentSession) return;
     this.piSession.state.systemPrompt = this.createPiSystemPrompt(context, envVars);
     this.piSession.state.tools = this.createPiToolDefinitions(context);
   }
@@ -10512,6 +10773,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
    */
   private maybeDeferPiTurnForTransientRetry(messages: AgentMessage[]): boolean {
     if (!this.activePiStreamTurnId) return false;
+    // The runtime (and the inference proxy under it) retries transient errors itself.
+    if (this.isRuntimeAgentThread()) return false;
     if (this.piTurnTransientRetryAttempts >= PI_TURN_TRANSIENT_RETRY_ATTEMPTS) {
       return false;
     }

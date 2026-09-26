@@ -257,6 +257,7 @@ curl "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/analytics_eng
 - Thread records store provider/model state on org thread data. Verify current fields in `OrgDO` before changing related behavior.
 - Slash commands are allowlisted in `ChatThreadDO`; check `SLASH_COMMANDS` before adding or changing one.
 - Clarifying questions use the Pi `AskUserQuestion`/`ask_user_question` tools.
+- Hosted agent runtime migration (in progress, `plans/agent-runtime-migration.md`): new threads of allowlisted orgs (`AGENT_RUNTIME_ENABLED` + APP_KV `agent_runtime_org:<orgId>`, admin `/api/admin/orgs/:id/agent-runtime`) run on the hosted runtime. `chat-thread/runtime-agent.ts` stands in for the Pi Agent and relays the runtime's Pi events; `/mcp/agent` (`routes/agent-mcp.ts`) serves `CodeModeToolsBinding` tools; `/agent-runtime/llm/v1/chat/completions` (`routes/agent-runtime-llm.ts` → `ChatThreadDO.runtimeChatCompletion`) is the inference proxy keeping chiridion's routing, gates and metering. Tests: `bun run test:workers -- agent-mcp agent-runtime code-mode-capability-tools`.
 
 ### Adding a new chat model
 

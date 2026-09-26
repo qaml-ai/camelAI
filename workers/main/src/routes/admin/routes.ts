@@ -145,6 +145,7 @@ import {
   getOrgBanById,
   getUserBanById,
 } from "../../ban-list.js";
+import { runtimeOrgAllowKey } from "../../chat-thread/runtime-agent.js";
 import { ProjectFilesystemClient, WorkspaceFilesystemClient } from "../../workspace-filesystem-do.js";
 import { recordObservabilityEvent } from "../../observability.js";
 import { getSandbox } from "@cloudflare/sandbox";
@@ -1488,6 +1489,50 @@ routes.post(
         message === "Organization not found" ? 404 : 400,
       );
     }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Hosted agent runtime allowlist (plans/agent-runtime-migration.md): new
+// threads of an allowlisted org run on the runtime when AGENT_RUNTIME_ENABLED.
+// ---------------------------------------------------------------------------
+
+routes.get(
+  "/orgs/:id/agent-runtime",
+  openApi({
+    summary: "Whether the org's new threads run on the hosted agent runtime",
+    responses: { 200: z.object({ org_id: z.string(), allowed: z.boolean(), enabled: z.boolean() }) },
+  }),
+  async (c) => {
+    const orgId = c.req.param("id");
+    const allowed = (await c.env.APP_KV.get(runtimeOrgAllowKey(orgId))) !== null;
+    return c.json({ org_id: orgId, allowed, enabled: c.env.AGENT_RUNTIME_ENABLED === "true" });
+  },
+);
+
+routes.put(
+  "/orgs/:id/agent-runtime",
+  openApi({
+    summary: "Allow the org's new threads onto the hosted agent runtime",
+    responses: { 200: z.object({ org_id: z.string(), allowed: z.boolean() }) },
+  }),
+  async (c) => {
+    const orgId = c.req.param("id");
+    await c.env.APP_KV.put(runtimeOrgAllowKey(orgId), new Date().toISOString());
+    return c.json({ org_id: orgId, allowed: true });
+  },
+);
+
+routes.delete(
+  "/orgs/:id/agent-runtime",
+  openApi({
+    summary: "Stop starting the org's new threads on the hosted agent runtime (existing ones stay)",
+    responses: { 200: z.object({ org_id: z.string(), allowed: z.boolean() }) },
+  }),
+  async (c) => {
+    const orgId = c.req.param("id");
+    await c.env.APP_KV.delete(runtimeOrgAllowKey(orgId));
+    return c.json({ org_id: orgId, allowed: false });
   },
 );
 

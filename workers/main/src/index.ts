@@ -28,6 +28,7 @@ import {
 
 // Route handlers
 import { handleAdminMcp } from './routes/admin-mcp.js';
+import { handleAgentMcp } from './routes/agent-mcp.js';
 import { handleOAuthStart, handleOAuthCallback } from './routes/oauth.js';
 import {
   handleSlackOAuthStart,
@@ -199,6 +200,9 @@ const routes: Route[] = [
     path: /^\/api\/admin\//,
     handler: async (context) => (await loadAdminApiModule()).handleAdminApi(context),
   },
+
+  // MCP tools for the hosted agent runtime (runtime identity-token auth)
+  { method: 'ALL', path: /^\/mcp\/agent$/, handler: handleAgentMcp },
 
   // Stripe billing webhook
   { method: 'POST', path: /^\/api\/billing\/stripe\/webhook$/, handler: handleStripeWebhook },

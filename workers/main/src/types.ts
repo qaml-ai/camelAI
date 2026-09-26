@@ -110,6 +110,13 @@ export interface Env
   SALESFORCE_CLIENT_ID?: string;
   SALESFORCE_CLIENT_SECRET?: string;
   INTEGRATION_SECRET_KEY: string;
+  // Hosted agent runtime (routes/agent-mcp.ts): the issuer and JWKS its identity
+  // tokens are checked against (default https://agents.camelai.dev), the tenant
+  // they must name, and the audience when this endpoint sits behind a proxy.
+  AGENT_RUNTIME_ISSUER?: string;
+  AGENT_RUNTIME_JWKS_URL?: string;
+  AGENT_RUNTIME_TENANT?: string;
+  AGENT_RUNTIME_MCP_AUDIENCE?: string;
   WORKSPACE_EMAIL_DOMAIN?: string;
   EMAIL_FROM_ADDRESS?: string;
   EMAIL?: ChatEnv["EMAIL"];

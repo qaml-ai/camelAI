@@ -206,6 +206,22 @@ describe("agent MCP protocol", () => {
     });
   });
 
+  it("passes Pi file tool content blocks through, images included", async () => {
+    serveJwks();
+    const { env } = makeEnv(allowed);
+    const content = [
+      { type: "text", text: "Read image file [image/png]" },
+      { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+    ];
+    const { factory } = toolsSpy({ ok: true, data: { text: "Read image file [image/png]", content, details: { image: true } } });
+    const response = await handleAgentMcpRequest(
+      rpc({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "read", arguments: { location: "workspace", path: "a.png" } } }, await token()),
+      env,
+      factory,
+    );
+    expect(await response.json()).toMatchObject({ result: { content, structuredContent: { image: true } } });
+  });
+
   it("returns tool failures as isError results", async () => {
     serveJwks();
     const { env } = makeEnv(allowed);

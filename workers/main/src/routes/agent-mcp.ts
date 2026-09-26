@@ -186,12 +186,26 @@ export function agentMcpTools() {
     }));
 }
 
+function isContentBlock(block: unknown): boolean {
+  if (!isRecord(block)) return false;
+  if (block.type === "text") return typeof block.text === "string";
+  return block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string";
+}
+
 /** An MCP tools/call result from the code-mode envelope. */
 export function toMcpResult(envelope: Awaited<ReturnType<ToolsBinding["callToolEnvelope"]>>) {
   if (!envelope.ok) {
     return { content: [{ type: "text", text: envelope.error.message }], isError: true };
   }
   const { data } = envelope;
+  // The Pi file tools already answer in MCP content blocks (text, and images
+  // the model should see natively): pass them through.
+  if (isRecord(data) && Array.isArray(data.content) && data.content.length > 0 && data.content.every(isContentBlock)) {
+    return {
+      content: data.content,
+      ...(isRecord(data.details) ? { structuredContent: data.details } : {}),
+    };
+  }
   const text = typeof data === "string" ? data : JSON.stringify(data ?? null);
   return {
     content: [{ type: "text", text }],

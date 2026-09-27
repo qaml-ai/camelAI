@@ -8651,7 +8651,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       limit: 5,
     });
 
-    expect(projectStub.projectListSourceSnapshots).toHaveBeenCalledWith(5);
+    expect(projectStub.projectListSourceSnapshots).toHaveBeenCalledWith(6, 0);
     expect(result).toMatchObject({
       project: 'Demo App',
       backend: 'do-r2',
@@ -8908,7 +8908,7 @@ describe('ChatThreadDO Pi turn handling', () => {
         config_path: 'wrangler.jsonc',
       }],
     });
-    expect(fake.orgStub.listWorkerScriptDeployVersions).toHaveBeenCalledWith('demo-app', 'workspace1', 5);
+    expect(fake.orgStub.listWorkerScriptDeployVersions).toHaveBeenCalledWith('demo-app', 'workspace1', 6, 0);
   });
 
   it('builds and directly deploys a DO-backed project through the deploy action', async () => {

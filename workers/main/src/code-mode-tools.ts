@@ -336,6 +336,14 @@ export function clampCodeModeInteger(value: unknown, fallback: number, min: numb
   return Math.min(max, Math.max(min, parsed));
 }
 
+/** A newest-first list's page: `limit` (default 20, at most 100) from `offset`. */
+function listPage(args: Record<string, unknown>): { limit: number; offset: number } {
+  return {
+    limit: clampCodeModeInteger(args.limit, 20, 1, 100),
+    offset: clampCodeModeInteger(args.offset, 0, 0, Number.MAX_SAFE_INTEGER),
+  };
+}
+
 export function truncateCodeModeText(value: unknown, maxCharacters: number): string {
   const text = String(value ?? "");
   if (text.length <= maxCharacters) return text;
@@ -888,10 +896,11 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   ),
   codeModeTool(
     "list_commits",
-    "List source snapshots for a DO-backed project, newest first. These snapshot ids are the current platform source-version keys and can be passed to revert_project. Arguments: { project, limit? }.",
+    "List source snapshots for a DO-backed project, newest first, a page at a time: limit (default 20, at most 100) from offset; next_offset is where the next page starts, null on the last. These snapshot ids are the current platform source-version keys and can be passed to revert_project. Arguments: { project, limit?, offset? }.",
     Type.Object({
       project: Type.String(),
-      limit: Type.Optional(Type.Number()),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Snapshots per page (default 20, at most 100)." })),
+      offset: Type.Optional(Type.Integer({ minimum: 0, description: "Snapshots to skip: a previous page's next_offset." })),
     }, { additionalProperties: false }),
     { category: "workspace" },
   ),
@@ -925,10 +934,11 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   ),
   codeModeTool(
     "list_deploy_versions",
-    "List cached deploy versions for an app, newest first. Use artifact_cache_key values with rollback_deploy to restore a version without rebuilding. Arguments: { script_name, limit? }.",
+    "List cached deploy versions for an app, newest first, a page at a time: limit (default 20, at most 100) from offset; next_offset is where the next page starts, null on the last. Use artifact_cache_key values with rollback_deploy to restore a version without rebuilding. Arguments: { script_name, limit?, offset? }.",
     Type.Object({
       script_name: Type.String(),
-      limit: Type.Optional(Type.Number()),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Versions per page (default 20, at most 100)." })),
+      offset: Type.Optional(Type.Integer({ minimum: 0, description: "Versions to skip: a previous page's next_offset." })),
     }, { additionalProperties: false }),
     { category: "apps" },
   ),
@@ -1009,12 +1019,19 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   ),
   codeModePassthroughTool(
     "list_apps",
-    "List previously deployed apps for discovery or inspection. deploy_project already returns the new app URL and confirms successful publishing, so list_apps is not needed merely to verify a successful deploy. Optional filters keep output small: name matches app/custom-domain names, project matches project_id or app name, limit caps results, and sort defaults to updated_desc. Arguments: { name?, project?, limit?, sort? }.",
+    "List previously deployed apps for discovery or inspection. deploy_project already returns the new app URL and confirms successful publishing, so list_apps is not needed merely to verify a successful deploy. Without limit it returns every matching app; total counts them all. Optional: name matches app/custom-domain names, project matches project_id or app name, sort (default updated_desc), limit and offset page through (next_offset is where the next page starts, null on the last), and fields: \"summary\" gives only name, url, preview_status and updated_at per app, for long lists. Arguments: { name?, project?, sort?, limit?, offset?, fields? }.",
     Type.Object({
-      name: Type.Optional(Type.String()),
-      project: Type.Optional(Type.String()),
-      limit: Type.Optional(Type.Number()),
-      sort: Type.Optional(Type.Union([Type.Literal("updated_desc"), Type.Literal("updated_asc"), Type.Literal("name_asc")])),
+      name: Type.Optional(Type.String({ description: "Substring of the app or custom-domain name." })),
+      project: Type.Optional(Type.String({ description: "Substring of the project id or app name." })),
+      sort: Type.Optional(Type.Union([
+        Type.Literal("updated_desc"),
+        Type.Literal("updated_asc"),
+        Type.Literal("name_asc"),
+        Type.Literal("name_desc"),
+      ], { description: "Order (default updated_desc)." })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000, description: "Apps per page; omit for all." })),
+      offset: Type.Optional(Type.Integer({ minimum: 0, description: "Apps to skip: a previous page's next_offset." })),
+      fields: Type.Optional(Type.Union([Type.Literal("full"), Type.Literal("summary")], { description: "full (default) or summary: name, url, preview_status, updated_at." })),
     }, { additionalProperties: false }),
     {
       category: "apps",
@@ -4139,10 +4156,12 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   private async listApps(args: Record<string, unknown> = {}): Promise<unknown> {
     const nameFilter = typeof args.name === "string" ? args.name.trim().toLowerCase() : "";
     const projectFilter = typeof args.project === "string" ? args.project.trim().toLowerCase() : "";
-    const sort = args.sort === "updated_asc" || args.sort === "name_asc" ? args.sort : "updated_desc";
+    const sort = args.sort === "updated_asc" || args.sort === "name_asc" || args.sort === "name_desc" ? args.sort : "updated_desc";
     const limit = typeof args.limit === "number" && Number.isFinite(args.limit)
-      ? Math.max(0, Math.min(100, Math.floor(args.limit)))
+      ? clampCodeModeInteger(args.limit, 1000, 1, 1000)
       : undefined;
+    const offset = clampCodeModeInteger(args.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    const summary = args.fields === "summary";
     let scripts: WorkerScriptListRow[] = [...await this.orgStub.listWorkerScriptsByWorkspace(this.ctx.props.workspaceId)];
     if (nameFilter) {
       scripts = scripts.filter((script) => appFilterText(script).includes(nameFilter));
@@ -4156,20 +4175,30 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     scripts = scripts.sort((a, b) => {
       if (sort === "updated_asc") return a.updated_at - b.updated_at;
       if (sort === "name_asc") return a.script_name.localeCompare(b.script_name);
+      if (sort === "name_desc") return b.script_name.localeCompare(a.script_name);
       return b.updated_at - a.updated_at;
     });
     const total = scripts.length;
-    if (limit !== undefined) scripts = scripts.slice(0, limit);
+    scripts = scripts.slice(offset, limit === undefined ? undefined : offset + limit);
+    const end = offset + scripts.length;
     return {
       total,
       count: scripts.length,
+      offset,
+      next_offset: end < total ? end : null,
       filters: {
         ...(nameFilter ? { name: args.name } : {}),
         ...(projectFilter ? { project: args.project } : {}),
         ...(limit !== undefined ? { limit } : {}),
+        ...(summary ? { fields: "summary" } : {}),
         sort,
       },
-      apps: await Promise.all(scripts.map(async (script) => ({
+      apps: await Promise.all(scripts.map(async (script) => summary ? {
+        name: script.script_name,
+        url: await this.getAppUrl(script),
+        preview_status: script.preview_status,
+        updated_at: new Date(script.updated_at).toISOString(),
+      } : ({
         name: script.script_name,
         url: await this.getAppUrl(script),
         is_public: script.is_public,
@@ -5122,12 +5151,15 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
 
   private async listCommits(args: Record<string, unknown>): Promise<unknown> {
     const project = await this.resolveDoBackedProjectForAction(args, "list_commits");
-    const limit = typeof args.limit === "number" ? args.limit : 20;
-    const snapshots = await new ProjectFilesystemClient(this.env, project.id).listSourceSnapshots(limit);
+    const { limit, offset } = listPage(args);
+    const page = await new ProjectFilesystemClient(this.env, project.id).listSourceSnapshots(limit + 1, offset);
+    const snapshots = page.slice(0, limit);
     return {
       project: project.name,
       backend: "do-r2",
       count: snapshots.length,
+      offset,
+      next_offset: page.length > limit ? offset + limit : null,
       commits: snapshots.map((snapshot) => ({
         snapshot_id: snapshot.id,
         id: snapshot.id,
@@ -5506,11 +5538,14 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (script.workspace_id !== this.ctx.props.workspaceId) {
       throw new Error(`App '${scriptName}' belongs to a different workspace`);
     }
-    const limit = typeof args.limit === "number" ? args.limit : 20;
-    const versions = await this.orgStub.listWorkerScriptDeployVersions(scriptName, this.ctx.props.workspaceId, limit);
+    const { limit, offset } = listPage(args);
+    const page = await this.orgStub.listWorkerScriptDeployVersions(scriptName, this.ctx.props.workspaceId, limit + 1, offset);
+    const versions = page.slice(0, limit);
     return {
       app: scriptName,
       count: versions.length,
+      offset,
+      next_offset: page.length > limit ? offset + limit : null,
       versions: versions.map((version) => ({
         id: version.id,
         created_at: new Date(version.created_at).toISOString(),

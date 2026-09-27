@@ -5802,18 +5802,21 @@ export class OrgDO extends DurableObject<DOEnv> {
     );
   }
 
-  async listWorkerScriptDeployVersions(scriptName: string, workspaceId: string, limit = 20): Promise<WorkerScriptDeployVersion[]> {
+  async listWorkerScriptDeployVersions(scriptName: string, workspaceId: string, limit = 20, offset = 0): Promise<WorkerScriptDeployVersion[]> {
     this.ensureWorkerScriptDeploysSchema();
-    const safeLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+    // A page of up to 100, plus one to tell whether another page follows.
+    const safeLimit = Math.max(1, Math.min(101, Math.floor(limit)));
+    const safeOffset = Math.max(0, Math.floor(offset) || 0);
     return this.sql.exec<WorkerScriptDeployVersion>(
       `SELECT id, script_name, workspace_id, created_at, created_by, config_path, project_id, commit_sha, artifact_cache_key
        FROM worker_script_deploys
        WHERE script_name = ? AND workspace_id = ?
-       ORDER BY created_at DESC
-       LIMIT ?`,
+       ORDER BY created_at DESC, id DESC
+       LIMIT ? OFFSET ?`,
       scriptName,
       workspaceId,
       safeLimit,
+      safeOffset,
     ).toArray();
   }
 

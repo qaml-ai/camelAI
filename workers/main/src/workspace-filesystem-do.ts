@@ -903,11 +903,13 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
     return snapshot;
   }
 
-  async projectListSourceSnapshots(limit = 20): Promise<ProjectSourceSnapshot[]> {
-    const safeLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+  async projectListSourceSnapshots(limit = 20, offset = 0): Promise<ProjectSourceSnapshot[]> {
+    // A page of up to 100, plus one to tell whether another page follows.
+    const safeLimit = Math.max(1, Math.min(101, Math.floor(limit)));
+    const start = Math.max(0, Math.floor(offset) || 0);
     const index = await this.ctx.storage.kv.get<string[]>(PROJECT_SNAPSHOT_INDEX_KEY) ?? [];
     const snapshots: ProjectSourceSnapshot[] = [];
-    for (const id of index.slice(0, safeLimit)) {
+    for (const id of index.slice(start, start + safeLimit)) {
       const snapshot = await this.ctx.storage.kv.get<ProjectSourceSnapshot>(`${PROJECT_SNAPSHOT_PREFIX}${id}`);
       if (snapshot) snapshots.push(snapshot);
     }
@@ -1423,8 +1425,8 @@ export class ProjectFilesystemClient implements WorkspaceFileStoreLike {
     return this.stub.projectRestoreSourceSnapshot(snapshotId);
   }
 
-  listSourceSnapshots(limit?: number): Promise<ProjectSourceSnapshot[]> {
-    return this.stub.projectListSourceSnapshots(limit);
+  listSourceSnapshots(limit?: number, offset?: number): Promise<ProjectSourceSnapshot[]> {
+    return this.stub.projectListSourceSnapshots(limit, offset);
   }
 
   deleteSourceSnapshots(): Promise<{ snapshotsDeleted: number; blobsDeleted: number }> {

@@ -35,7 +35,12 @@ function fakeBinding(versions: number[] = []) {
 describe("list_apps pages", () => {
   it("returns every app without a limit, and pages with limit and offset", async () => {
     const all = await listApps.call(fakeBinding(), {});
-    expect(all).toMatchObject({ total: 125, count: 125, offset: 0, next_offset: null });
+    expect(all).toMatchObject({ total: 125, count: 125, offset: 0, next_offset: null, status_counts: { ready: 125 }, filters: { fields: "summary" } });
+    // Over 50 apps: names and links unless full rows are asked for.
+    expect(Object.keys(all.apps[0])).toEqual(["name", "url", "preview_status", "updated_at"]);
+    const full = await listApps.call(fakeBinding(), { fields: "full", limit: 1 });
+    expect(full.apps[0]).toHaveProperty("project_id");
+    expect((await listApps.call(fakeBinding(), { limit: 10 })).apps[0]).toHaveProperty("commit_sha");
 
     const first = await listApps.call(fakeBinding(), { limit: 100, sort: "name_asc" });
     expect(first).toMatchObject({ total: 125, count: 100, next_offset: 100 });

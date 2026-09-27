@@ -52,7 +52,7 @@ describe("ProjectFilesystemClient", () => {
     expect(stub.projectListFiles).toHaveBeenCalledWith("/", { recursive: true });
     expect(stub.projectCreateSourceSnapshot).toHaveBeenCalledWith({ message: "deploy" });
     expect(stub.projectRestoreSourceSnapshot).toHaveBeenCalledWith("snapshot-1");
-    expect(stub.projectListSourceSnapshots).toHaveBeenCalledWith(5);
+    expect(stub.projectListSourceSnapshots).toHaveBeenCalledWith(5, undefined);
     expect(stub.projectDeleteSourceSnapshots).toHaveBeenCalled();
     expect(stub).not.toHaveProperty("writeFile.mock");
   });

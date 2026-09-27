@@ -1019,7 +1019,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
   ),
   codeModePassthroughTool(
     "list_apps",
-    "List previously deployed apps for discovery or inspection. deploy_project already returns the new app URL and confirms successful publishing, so list_apps is not needed merely to verify a successful deploy. Without limit it returns every matching app; total counts them all. Optional: name matches app/custom-domain names, project matches project_id or app name, sort (default updated_desc), limit and offset page through (next_offset is where the next page starts, null on the last), and fields: \"summary\" gives only name, url, preview_status and updated_at per app, for long lists. Arguments: { name?, project?, sort?, limit?, offset?, fields? }.",
+    "List previously deployed apps for discovery or inspection. deploy_project already returns the new app URL and confirms successful publishing, so list_apps is not needed merely to verify a successful deploy. Without limit it returns every matching app; total and status_counts (apps per preview_status) count them all. Optional: name matches app/custom-domain names, project matches project_id or app name, sort (default updated_desc), limit and offset page through (next_offset is where the next page starts, null on the last). fields: \"summary\" gives only name, url, preview_status and updated_at per app, and is the default when more than 50 apps come back; \"full\" adds creator, dates, project and deploy ids. Arguments: { name?, project?, sort?, limit?, offset?, fields? }.",
     Type.Object({
       name: Type.Optional(Type.String({ description: "Substring of the app or custom-domain name." })),
       project: Type.Optional(Type.String({ description: "Substring of the project id or app name." })),
@@ -1031,7 +1031,7 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
       ], { description: "Order (default updated_desc)." })),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000, description: "Apps per page; omit for all." })),
       offset: Type.Optional(Type.Integer({ minimum: 0, description: "Apps to skip: a previous page's next_offset." })),
-      fields: Type.Optional(Type.Union([Type.Literal("full"), Type.Literal("summary")], { description: "full (default) or summary: name, url, preview_status, updated_at." })),
+      fields: Type.Optional(Type.Union([Type.Literal("full"), Type.Literal("summary")], { description: "summary (name, url, preview_status, updated_at; the default above 50 apps) or full." })),
     }, { additionalProperties: false }),
     {
       category: "apps",
@@ -4161,7 +4161,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       ? clampCodeModeInteger(args.limit, 1000, 1, 1000)
       : undefined;
     const offset = clampCodeModeInteger(args.offset, 0, 0, Number.MAX_SAFE_INTEGER);
-    const summary = args.fields === "summary";
+    const requestedFields = args.fields === "summary" || args.fields === "full" ? args.fields : undefined;
     let scripts: WorkerScriptListRow[] = [...await this.orgStub.listWorkerScriptsByWorkspace(this.ctx.props.workspaceId)];
     if (nameFilter) {
       scripts = scripts.filter((script) => appFilterText(script).includes(nameFilter));
@@ -4179,18 +4179,27 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       return b.updated_at - a.updated_at;
     });
     const total = scripts.length;
+    const statusCounts: Record<string, number> = {};
+    for (const script of scripts) {
+      const status = script.preview_status ?? "unknown";
+      statusCounts[status] = (statusCounts[status] ?? 0) + 1;
+    }
     scripts = scripts.slice(offset, limit === undefined ? undefined : offset + limit);
     const end = offset + scripts.length;
+    // A long list is names and links unless full rows are asked for.
+    const summary = (requestedFields ?? (scripts.length > 50 ? "summary" : "full")) === "summary";
     return {
       total,
       count: scripts.length,
       offset,
       next_offset: end < total ? end : null,
+      // Over all matching apps, not only this page.
+      status_counts: statusCounts,
       filters: {
         ...(nameFilter ? { name: args.name } : {}),
         ...(projectFilter ? { project: args.project } : {}),
         ...(limit !== undefined ? { limit } : {}),
-        ...(summary ? { fields: "summary" } : {}),
+        fields: summary ? "summary" : "full",
         sort,
       },
       apps: await Promise.all(scripts.map(async (script) => summary ? {

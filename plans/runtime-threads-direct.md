@@ -185,7 +185,7 @@ A Pi message is closer to `Message` than `UIMessage` is:
 - Pi `ToolResultMessage {toolCallId, content, details, isError}` is `tool_result {tool_use_id, content, details, is_error}`.
 - Pi `thinking` is `thinking`.
 
-The leaf components (tool views, file previews, thinking, markdown, question and connection cards) therefore stay. The layers above them are what change: the stream hook, the adapters, and the grouping of blocks into turns.
+Nothing below Chat.tsx reads `UIMessage`, so the whole renderer stays. What changes is the stream hook and the adapters above it.
 
 §5.3 has the per-component table.
 
@@ -210,33 +210,43 @@ The leaf components (tool views, file previews, thinking, markdown, question and
 
 ### 5.3 Component mapping
 
-Sizes are line counts on `main`. "Pi props" means the component's props change from `ToolUseBlock` / `ToolResultBlock` to Pi `ToolCall` / `ToolResultMessage`. That is a mechanical rename: `input` → `arguments`, `tool_use_id` → `toolCallId`, `is_error` → `isError`, `artifacts` → `details.artifacts`, and `content` is always an array.
+Nothing below `Chat.tsx` reads `UIMessage`. `ChatMessagesView`, `MessageBubble` (its `ContentBlockRenderer` dispatch), `turn-utils`, the tool card and all tool views take `Message` / `ToolUseBlock` / `ToolResultBlock`. No component reads UIMessage tool states (`input-streaming`, `output-available`, …).
+
+So the Pi path works in two stages:
+- **Phase 2: a pure Pi → view projection.** `src/lib/pi-render.ts` (~300 lines) turns `AgentMessage[]` plus the streaming partial and tool progress into the `Message[]` view model that the existing components draw.
+  - It is computed per render and memoized. It is never stored or sent, and it replaces `ui-message-adapter` + `pi-chunk-encoder` + `pi-tool-builders` + the render-history plumbing.
+  - Mapping: each assistant message plus its following toolResults become one assistant `Message`, with each result placed after its `tool_use`. `toolCall` → `tool_use`. `toolResult` → `tool_result` with `details` and images kept. `thinking` → `thinking`. `stopReason: "aborted"` → the "Stopped by user" block. `errorMessage` → `ErrorBlock`. `from.name` → `authorDisplayName`; `meta.source` → `messageSource`; `meta.clientMessageId` → `clientMessageId`.
+  - It also fixes three losses in today's settled path: `pi-message-export.ts:214` drops `ToolResultMessage.details` (the Edit diff and Task activities vanish after reload), images are dropped, and tool names differ between the live and settled paths.
+- **Phase 6 (optional): retype the leaves.** Once old threads are gone, the leaf props can take Pi `ToolCall` / `ToolResultMessage` directly and the legacy block types can be deleted. It is a mechanical rename (`input` → `arguments`, `tool_use_id` → `toolCallId`, `is_error` → `isError`, `artifacts` → `details.artifacts`), not needed for the cut-over.
 
 | Component | Lines | Renders | Verdict |
 |---|---|---|---|
-| `components/Chat.tsx` | 5,112 | Page: stream wiring, RPCs, send recovery, optimistic bubbles, preview, composer | **Rewire.** Replace `usePiChatStream` / `agent.call(...)` / `onStateUpdate` with `useRuntimeThread` plus fetches. ~1,000 lines touched; the net change is a deletion. Layout, composer and preview stay. |
-| `lib/use-pi-chat-stream.ts` | 386 | ai-chat → `Message[]` | **Replace** with `use-runtime-thread.ts` (~250). |
-| `lib/ui-message-adapter.ts` | 581 | `UIMessage` ⇄ `Message` | **Delete** (kept frozen for old threads until Phase 6). |
-| `lib/pi-chunk-encoder.ts` | 686 | Pi → UI chunks | **Delete** (as above). |
-| `hooks/use-chat-transcript.ts`, `lib/chat-render-history.ts`, `lib/derive-ui-messages-from-pi-core.ts`, `lib/steer-split.ts` | 217 + 400 + 414 + 201 | Render-history plumbing | **Delete** for runtime threads. The Pi grouping below replaces them. |
-| `components/chat-messages-view.tsx` | 484 | Message list, virtualized turns, paging trigger | **Rewrite the data half** (~200): it walks `turns` instead of `Message[]`. The virtualization and scroll code stays. |
-| `components/message-bubble.tsx` | 922 | Block dispatch, turn layout, copy-as-text | **Rewrite** as `pi-turn.tsx` (~600). It iterates Pi content parts and looks up results by `toolCallId`. Copy-as-text, the stop notice and the error notice move over. |
-| `lib/turn-utils.ts` | 246 | Grouping into turns, "agent continued" | **Rewrite** as `pi-turns.ts` (~200). A turn is a user message plus the assistant and toolResult messages that follow it. |
-| `tool-call/tool-call.tsx`, `tool-status.ts`, `tool-details.tsx`, `tool-utils.ts`, `mcp-utils.ts`, `tool-summary.ts` | 193 + 68 + 136 + 97 + 58 + 5 | Tool card shell, status, per-tool dispatch by name | **Pi props.** Status becomes: result present → complete / error (`isError`); else running while the turn runs; else complete. The name dispatch stays, fed through `localToolName` (`camel__x` → `x`). |
-| `tool-call/details/*` (javascript, bash, read, write, edit, search, web, todo, task, skill, notebook, mcp, ask-user-question, team-create, generic, shared) | 1,833 | Per-tool bodies | **Pi props.** Each reads the call's arguments and the result's text / `details`. `JavaScriptDetails` reads `details.output` / `details.truncated` / artifacts; `EditDetails` reads the diff from `details`. |
-| `tool-call/thinking-block.tsx` | 194 | Thinking / plan | **Reuse.** Feed it Pi `thinking` (and `redacted`). |
-| `tool-call/file-link.tsx`, `app-link.tsx`, `file-card.tsx`, `chat-file-preview/*` | 163 + 73 + 162 + ~2,450 | present_file / artifact / attachment previews | **Reuse.** Their inputs are paths and URLs, which come from `details.artifacts` or the tool's arguments. |
-| `tool-call/task-notification.tsx`, `teammate-message.tsx` | 89 + 98 | Sub-agent notices | **Pi props.** Live sub-agent progress is `tool_execution_update` on the Task call, not a fake `tool_result` (`isTaskUpdate`). |
-| `ask-user-question.tsx` | 791 | Question card | **Reuse.** It is fed `runtimeInputQuestions(input)` for a pending `question` input. It answers through the inputs route. |
-| `connection-setup-prompt.tsx` | 612 | Connection setup card | **Reuse**, fed a `url` / `form` input (open question 8). |
-| `floating-todo/*` | 259 | Todo panel | **Reuse**, fed the latest todo tool call's arguments. |
-| `context-indicator.tsx`, `compact-summary-card.tsx`, `turn-summary-bar.tsx`, `model-fallback-banner.tsx`, `chat-error-notice.tsx`, `collapsible-user-message.tsx`, `chat/channel-logo.tsx` | 75 + 89 + 110 + … | Context %, compaction, turn duration, errors, user bubble, source | **Reuse.** Their inputs change source (§5.4, §5.5). |
-| `preview-panel/*`, `chat-preview/*` | ~860 + … | Preview tabs | **Reuse.** State comes from the loader (`thread_ui_state`) and from preview tool results. |
-| `markdown-renderer.tsx` | — | Text | **Reuse.** |
+| `components/Chat.tsx` | 5,112 | Page: stream wiring, RPCs, send recovery, optimistic bubbles, agent state, composer | **Rewire the stream / history slice** (~400–600 lines: 905–1000, 1300–1360, 1772–1854, `handleAgentStateUpdate` 3231–3371, the `agent.call` sites). Replace `usePiChatStream` / `agent.call(...)` / `onStateUpdate` with `useRuntimeThread` plus fetches. The rest stays. |
+| `lib/use-pi-chat-stream.ts` | 386 | ai-chat → `Message[]`, stall clamp, live tool output | **Replace** with `use-runtime-thread.ts` (~250). Keep the stall clamp; tool progress comes from `tool_execution_update`. |
+| `lib/ui-message-adapter.ts` | 581 | `UIMessage` ⇄ `Message` | **Replaced by `pi-render.ts`** (~300). Kept frozen for old threads until Phase 6. |
+| `lib/pi-chunk-encoder.ts`, `lib/pi-tool-builders.ts` | 686 + 555 | Runtime events → UI chunks, tool renaming | **Delete** after Phase 6. Keep the todo helpers and one tool-name map. |
+| `lib/derive-ui-messages-from-pi-core.ts`, `lib/steer-split.ts`, `lib/chat-render-history.ts` | 414 + 201 + 400 | Derivation, steer split, `dp:`/`d:` paging | **Delete** for runtime threads. Paging is `historyPage({before})`. A steer is a user message inside the turn, so no split markers are needed. |
+| `hooks/use-chat-transcript.ts` | 217 | Merge of archived, live, optimistic; normalizers | **Reuse with the input swapped** to `pi-render` output. |
+| `lib/streaming.ts` | 489 | Old Claude-SDK normalizers (teammate / task XML) | **Mostly delete.** The runtime never produces them. |
+| `components/chat-messages-view.tsx` | 484 | Turn grouping, summary bars, indicators | **Reuse as-is.** |
+| `components/message-bubble.tsx` | 922 | Bubble, `ContentBlockRenderer`, copy, fork | **Reuse as-is.** Fork uses the history `index` as its entry id. |
+| `lib/turn-utils.ts` | 246 | Trace / final split, step counts | **Reuse as-is.** |
+| `tool-call/*` core (tool-call, tool-details, tool-status, tool-utils, mcp-utils, links) | ~690 | Tool row, status, dispatch | **Reuse.** Status needs only "result present" plus "turn running", which it already reads. |
+| `tool-call/details/*` | 1,811 | Per-tool views (JavaScript, Bash, Read, Write, Edit, Glob/Grep, Task, Web, Todo, AskUserQuestion, MCP, Skill, …) | **Reuse as-is.** `JavaScriptDetails` reads artifacts, `EditDetails` the diff, `TaskDetails` `details.toolActivities`. The projection now keeps all of these. |
+| `lib/tool-activity-summary.ts` | 761 | Summary line wording, preview-target parsing | **Reuse.** Merge its name map with `tool-details`' normalizer and `localToolName` into one. |
+| `thinking-block`, `markdown-renderer`, `turn-summary-bar`, `collapsible-user-message`, `chat/channel-logo`, `compact-summary-card` | 194 / 630 / 110 / 74 / 73 / 89 | Leaf UI | **Reuse as-is.** |
+| `file-link`, `app-link`, `file-card`, `chat-file-preview/*` | 163 / 73 / 162 / ~2,450 | present_file, artifacts, attachments | **Reuse as-is.** Attachments come from the message's structured files (runtime item 5) instead of upload refs parsed from text. Pi `ImageContent`, not rendered anywhere today, becomes image tiles. |
+| `ask-user-question`, `connection-setup-prompt`, `floating-todo/*`, `context-indicator`, `model-fallback-banner`, `chat-error-notice` + `chat-api-error-notice` | 791 / 612 / 259 / 75 / 176 / 117 | Agent-state panels | **Reuse as-is.** Only their inputs change source (§5.5). |
+| `chat-preview/*`, `preview-panel/*` | 730 / 855 | Preview panel | **Reuse as-is.** The panel is driven by agent state, not by messages. State comes from the loader (`thread_ui_state`) and preview tool results. |
+| `routes/_app.chat.$id.tsx`, `lib/chat-do.server.ts` | 1,395 / 1,108 | Loader, DO RPC | **Small rewrite:** mint the token and read the first page for runtime threads. The DO branch stays for old threads. |
+| `lib/chat-thread-display.ts`, `hooks/use-chat-thread-snapshots.tsx` | 58 / 83 | Tab-switch snapshots | **Small edit:** store Pi messages. |
 
-Size: about **1,500 new lines** (hook, grouping, turn view, derivations) and **about 1,500 changed** (Pi props across ~35 files, Chat.tsx rewiring). This replaces about **4,000 lines** on the runtime path (adapters, encoder, stream hook, render-history plumbing, bubble, turn utils). The old path's copies are deleted in Phase 6.
+Other consumers:
+- The admin read-only thread view (`_app.chat.$id.tsx`, `readOnly`) reads `chatDO.getMessages` today. It uses runtime history for runtime threads.
+- `condensed-transcript.ts` and worker `agent-eval.ts` already use Pi messages, so they switch source only.
+- There is no public or shared transcript renderer.
 
-During the transition, the frozen old-thread view still produces `Message` blocks. To keep one prop type on the leaves, it converts `ToolUseBlock` / `ToolResultBlock` to Pi shapes in a ~80-line shim at its boundary. The shim goes away with the old view.
+**Size:** about **600–800 new lines** (`use-runtime-thread`, `pi-render`, §5.5 derivations) and **about 600 changed** (Chat.tsx slice, loader, snapshots). About **7–8k lines of UI are reused unchanged.** After Phase 6, about 5k lines of `UIMessage` plumbing (~3.2k client, ~2.1k worker mirror) are deleted.
 
 ### 5.4 Rendering Pi messages
 
@@ -278,13 +288,13 @@ They are not migrated. The backend is chosen per thread: a thread with a `thread
 **The minimum to keep them viewable (Phase 4):**
 - The loader already reads the first page with `getUiMessagePage` over DO RPC. Keep that.
 - Older pages: a plain `GET /api/threads/:id/legacy-messages?cursor=` that calls the DO's `getOlderUiMessages` over RPC. No WS and no ai-chat client.
-- They render through the existing `UIMessage` → `Message` adapter and the frozen renderer, via the Pi-props shim (§5.3). The composer is replaced by "This conversation is read-only. Start a new chat."
+- They render through the existing `UIMessage` → `Message` adapter into the same renderer (§5.3), so no second renderer is kept. The composer is replaced by "This conversation is read-only. Start a new chat."
 - The Worker refuses `sendMessage` and every other write RPC for old threads. Their DO never starts a loop again, so the Pi loop, stream retry, compaction and transport are dead code for them.
 - Automations and channels attached to an old thread get a new runtime thread on their next run.
 
 **End state (Phase 6).** Old threads age out, either by retention or because users delete them. There are two options:
 - **(A) Retention cutoff.** Announce a date. Old threads become unavailable after it. Delete the `CHAT_THREAD` class with a deletion migration.
-- **(B) Freeze to R2**, if old threads must be kept. A one-off job reads each old thread's `pi_core` rows, which are already Pi `AgentMessage`s (`pi-core-store.ts`), and writes them to R2 as JSON pages. The viewer renders them with the **new** Pi renderer, read-only. Threads without `pi_core` rows (pre-Pi) are either exported once through the `Message` adapter or dropped. Then the DO class is deleted.
+- **(B) Freeze to R2**, if old threads must be kept. A one-off job reads each old thread's `pi_core` rows, which are already Pi `AgentMessage`s (`pi-core-store.ts`), and writes them to R2 as JSON pages. The viewer renders them through `pi-render.ts`, read-only. Threads without `pi_core` rows (pre-Pi) are either exported once through the `Message` adapter or dropped. Then the DO class is deleted.
 
 Recommendation: (B) if product wants history kept (it costs one job plus a ~100-line R2 page reader), otherwise (A).
 
@@ -292,7 +302,7 @@ Either way, the end state deletes:
 - `ChatThreadDO` (`chat-thread-do.ts`, 11,965) and `chat-thread/*` (12,134): the in-DO Pi loop, `pi-core-store.ts`, `ui-mirror.ts`, `derived-render-page.ts`, `render-archive-preserve.ts`, `pi-turn-journal.ts`, `pi-compaction.ts`, `pi-stream-retry.ts` and `runtime-agent.ts`;
 - `workers/main/src/pi-*.ts` and `bedrock-pi-*` (~3,000), if Bedrock serves only the runtime path by then;
 - the chat WS / poll / SSE transport: `sse-agent-client.ts`, `use-sse-agent.ts`, `chat-thread/*-connection.ts`, `transport-headers.ts`, `transport.md`;
-- the `UIMessage` layer: `pi-chunk-encoder.ts`, `use-pi-chat-stream.ts`, `ui-message-adapter.ts`, `derive-ui-messages-from-pi-core.ts`, `chat-render-history.ts`, `use-chat-transcript.ts`, `chat-do.server.ts`, the legacy `Message` block types and the Pi-props shim;
+- the `UIMessage` layer: `pi-chunk-encoder.ts`, `use-pi-chat-stream.ts`, `ui-message-adapter.ts`, `derive-ui-messages-from-pi-core.ts`, `chat-render-history.ts`, `use-chat-transcript.ts`, `chat-do.server.ts`, and, optionally, the legacy `Message` block types (§5.3);
 - the `@cloudflare/ai-chat` and `agents` packages, and `ai` if only the chat used it;
 - the `CHAT_THREAD` binding, via a deletion migration.
 
@@ -304,11 +314,11 @@ That is roughly 30,000 lines.
 |---|---|---|
 | **0. Prep** | Move pure helpers to `src/lib`: `runtimeInputQuestions`, `localToolName`, `readableProviderError`. OrgDO tables `thread_runtime` and `thread_ui_state`. Runtime config: tenant CORS origins, lifecycle webhook URL. Add the SDK dependency. | S: ~300 lines, 2–3 days |
 | **1. Server** | `startRuntimeTurn()` and `run-gates.ts` (moved from DO:8018 and DO:6384); the routes in §4.1; token minting; the lifecycle receiver; the tool side-effect switch (§4.4); the Codex forwarder off the DO; the transcript readers (condensed transcript, admin jsonl, fork, eval, lake) moved to runtime history. Tests against a local runtime. | M–L: ~1,500–2,000 lines, 1.5–2 weeks |
-| **2. UI** | `useRuntimeThread`; Pi grouping and turn view; Pi props on the leaves plus the old-view shim; §5.5 derivations; Chat.tsx rewiring, chosen per thread from the loader's `backend`. Fixture tests from recorded runtime traces (the staging trace is a good start). | L: ~1,500 new plus ~1,500 changed, 2–3 weeks |
+| **2. UI** | `useRuntimeThread`; the `pi-render` projection; §5.5 derivations; Chat.tsx rewiring, chosen per thread from the loader's `backend`. Fixture tests from recorded runtime traces (the staging trace is a good start). | M: ~600–800 new plus ~600 changed, 1.5–2 weeks |
 | **3. Cut over** | New threads pin to direct runtime (`thread_runtime` row at creation). Then automations and channels via `startRuntimeTurn()`, once the lifecycle webhook is live. Dogfood on staging: multi-tab, multi-user, ask_user, stop, model switch, reconnect on a throttled network, the poll fallback, a corporate-proxy network. | S: ~200 lines plus dogfooding, 1 week |
 | **4. Freeze old threads** | Read-only view, refusal of writes, the legacy page route, the composer bar. | S: ~300 lines, 2–3 days |
 | **5. Delete the runtime-in-DO path** | `RuntimeAgentSession` and every runtime branch in the DO (`resolveAgentBackend`, `resumeRuntimeTurn`, `answerRuntimeInput`, `prepareRuntimeRun`, `runtimeProviderRequest`, `createRuntimeAgentSession`). | S: net −2,000 lines |
-| **6. End state** | Retention or the R2 export (§6); delete the DO, the in-DO loop, the transport, the `UIMessage` layer and ai-chat. | M: one job plus deletions, net about −30,000 lines |
+| **6. End state** | Retention or the R2 export (§6); delete the DO, the in-DO loop, the transport, the `UIMessage` layer and ai-chat. Optionally retype the leaf props to Pi shapes and delete the legacy block types (§5.3). | M: one job plus deletions, net about −30,000 lines |
 
 Phases 0–1 can start before the runtime work lands, against `feat/runtime-threads` and a stub token endpoint. Phase 2 needs runtime items 2 and 4.
 

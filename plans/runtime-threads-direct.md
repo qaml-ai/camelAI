@@ -1,259 +1,391 @@
-# Runtime threads without ChatThreadDO
+# Runtime threads, browser-direct
 
-Status: design, not started. Base: chiridion `main` d4753d950, agent-runtime `main` (2026-09-27).
+Status: design, not started. Base: chiridion `main` 1021a9bb9; agent-runtime `feat/runtime-threads` (2026-09-27).
+Replaces the "runtime threads without ChatThreadDO" design (Worker stream proxy, browser-side chunk encoder, history cache, lazy migration).
 
-**Goal:** a thread that runs on the hosted agent runtime has no per-thread Durable Object. The runtime is the only store of the transcript. Chiridion serves these threads from stateless Worker routes, with thread metadata in `OrgDO`. `ChatThreadDO` stays for old (in-DO Pi) threads until they are migrated, then goes away.
+**Goal:**
+- A thread that runs on the hosted agent runtime has no per-thread Durable Object and no chiridion copy of its transcript. The runtime is the only store.
+- The browser reads the thread directly from the runtime with the runtime's TypeScript SDK: live stream, reconnect with a turn snapshot, long-poll fallback, older pages. It uses a short-lived, read-only token for one agent, which chiridion mints.
+- Every write (send, steer, answer, stop, model change) still goes through a chiridion Worker route. The route checks access, quotas and billing, then calls the runtime with the tenant token.
+- The UI renders Pi messages (`user` / `assistant` / `toolResult`) as they are. There is no `UIMessage`, no chunk encoder and no `@cloudflare/ai-chat` on this path.
+- Old DO-backed threads are not migrated. They stay viewable, read-only, on the existing path until they are deleted. Then `ChatThreadDO`, the in-DO loop, the WS/poll transport and ai-chat are deleted.
 
 **Why:**
-- A DO is billed wall-clock for every streamed turn it relays.
-- `ChatThreadDO` is where every production memory incident lived: the render history, stream buffers and wake spirals.
-- Runtime threads keep two copies of history today: the `pi_core` mirror plus the ai-chat archive, and the runtime's own transcript.
+- A DO is billed wall-clock for every streamed turn it relays. `ChatThreadDO` is also where every production memory incident lived: render history, stream buffers, wake spirals.
+- The previous design's Worker proxy removed the DO but kept a hop: a Worker invocation per stream and per poll, re-encoding of every frame, plus a history cache and KV snapshot to hide the extra round trip. The runtime now has everything a browser needs: watchers, deltas with a turn snapshot on reconnect, a JSON long-poll, and paged turn-aligned history.
+- Runtime threads today keep two copies of history (the `pi_core` mirror plus the ai-chat archive, and the runtime's transcript). They also translate every message three times: Pi → PiRuntimeEvent → UIMessage chunks → the legacy `Message` the renderer actually draws.
 
 ---
 
-## 1. What ChatThreadDO does for a runtime thread today
+## 1. Architecture
 
-File: `workers/main/src/chat-thread-do.ts` (11,965 lines; referred to below as DO), plus `workers/main/src/chat-thread/*`.
+```
+                 reads: SSE / long-poll / history pages
+ Browser ──────────────────────────────────────────────────►  Runtime (agents.camelai.dev)
+   │   SDK watcher, browser token (read-only, one agent, ~15 min)   ▲   ▲
+   │                                                                 │   │ tenant token, /v1/agents/:id/*
+   │   writes                                                        │   │
+   └── POST /api/threads/:id/{messages,inputs,stop,token}, PATCH model ──► chiridion Worker routes
+                                                                     │     (access, bans, quotas, billing,
+                                                                     │      attribution, gates)
+ Runtime ──► chiridion /mcp/agent              tools; stateless, runtime-signed identity (exists)
+         ──► chiridion /agent-runtime/usage    usage webhook, billing (exists)
+         ──► chiridion /agent-runtime/events   lifecycle webhook (new)
+```
 
-| Job | Where | Notes |
+- **Per-thread state in chiridion** is one `OrgDO` row: agent id, model, key scope, preview state. There is no DO, no KV entry and no stored agent token.
+- **The browser holds only a browser token.** It is read-only, for one agent, short-lived, and can be limited to an allow-list of event types. It cannot prompt, answer, abort or configure. Chiridion mints it after the same access check as every thread request.
+- **Every turn starts server-side.** The send route, automations and channels all call one `startRuntimeTurn()` in the Worker. No turn needs a browser attached. End-of-turn work runs from the lifecycle webhook.
+
+## 2. What ChatThreadDO does for a runtime thread today, and where each job goes
+
+File: `workers/main/src/chat-thread-do.ts` (11,965 lines; "DO" below), plus `workers/main/src/chat-thread/*` (12,134 lines). Line numbers are against `main` 1021a9bb9.
+
+| Job today | Where | New home |
 |---|---|---|
-| Choose the backend and pin it per thread | DO:7905–7940 (`isRuntimeAgentThread`, `mayRunOnRuntime`, `resolveAgentBackend`); KV `CHAT_AGENT_BACKEND_KEY` | New threads pin to `runtime` when `runtimeConfigured()` holds and the model has a runtime route. |
-| Create the agent and store its id, token and cursors | `chat-thread/runtime-agent.ts:371` (`agent()`, `POST /v1/agents` with Idempotency-Key `thread_<id>`); DO:7943 `createRuntimeAgentSession`; KV `runtimeAgent`, `runtimeAgentCursor`, `runtimeAgentRun` (DO:566–568) | The agent token is a bearer secret held in DO KV. |
-| Gates before each run | DO:8018 `prepareRuntimeRun` → runtime-agent.ts:411 `configureRun` (`PATCH /v1/agents/:id/configuration`) | Covers credits, per-user limits, the route (model and key scope), `ensureHostedKeyScope`, `syncOrgKeyScope`, the spend limit and model headers. |
-| Send, steer and abort | DO:3780 `sendMessage` → 6384 `handleClientUserMessage` → 6477 `enqueueRunnerUserMessage`; runtime-agent.ts:685 `run`, 746 `steer`, 754 `abort` (`POST /clients/:id/requests`); DO:3740 `requestStop` | See the list below. |
-| Relay the runtime's event stream | runtime-agent.ts:501 `relay` (`GET /clients/:id/events`, Last-Event-ID, a 409 replay gap leads to `recoverFromHistory` at :656); runtime-agent.ts:443 `emit` (tool name localizing, input-placeholder filtering, held `agent_end`) | |
-| Translate Pi `AgentEvent` into "PiRuntimeEvent" (codex-style `item/*`) | DO:9535 `handlePiSessionEvent` (to about 9995) | Runs inside the DO; it is not a pure module. |
-| Encode for the UI | DO:10514 `writePiStreamChunks` → `PiChunkEncoder` (`src/lib/pi-chunk-encoder.ts:251`, shared code) | |
-| Transport to the browser | ai-chat `AIChatAgent` (DO:1080) `cf_agent_*` frames over a native WS with HTTP-poll fallback | `chat-thread/{websocket,poll,sse}-connection.ts`, `transport.md`. The browser side is `src/lib/sse-agent-client.ts` (1,122 lines) and `use-sse-agent.ts`. |
-| Render history: the pi_core mirror plus the ai-chat archive | `chat-thread/pi-core-store.ts`, `ui-mirror.ts`, `derived-render-page.ts`, `render-archive-preserve.ts`; DO:2543 `persistMessages`; DO:11639 `getOlderUiMessages` | This is the duplicate copy. |
-| Agent state pushed to the UI | DO:1463 `syncAgentState`; payload in `src/lib/chat-agent-state.ts:50` | Fields: preview tabs, todos, context %, pending question, connection-setup prompt, title, model, fallback notice, `lastError`. |
-| Human input | runtime-agent.ts:593 `answerInputs`; DO:8133 `answerRuntimeInput` | The DO turns a runtime input into an AskUserQuestion card and waits in memory for `answerQuestion` (DO:3745). |
-| Model change | DO:3776 `refreshModel`, DO:3889 `setModel`; `configureRun` applies it on the next run | |
-| Tool side effects from `/mcp/agent` | `code-mode-tools.ts` `chatThreadStub` RPCs, listed below | |
-| Codex forwarder | DO:8078 `runtimeProviderRequest`, called from `routes/agent-runtime-llm.ts:56` | Per-user gate, subscription credentials. |
-| Turn bookkeeping | `threadMetadata.updateThreadMetadataForUserMessage` (DO:6546), streaming status in WorkspaceDO `thread_streaming_status` (`workspace.ts:356`), title and avatar generation (`chat-thread/metadata.ts`), error counts in `OrgDO.threads` | |
-| Restart recovery | DO:5655–5668 `resumeRuntimeTurn` (relays the in-flight run from its start cursor) | |
+| Choose the backend and pin it per thread | DO:7905–7940 (`isRuntimeAgentThread`, `mayRunOnRuntime`, `resolveAgentBackend`); KV `CHAT_AGENT_BACKEND_KEY` | The `OrgDO.thread_runtime` row. A thread with a row is a direct runtime thread. Any other thread is old. |
+| Create the agent; store its id, token and cursors | `runtime-agent.ts:371` (`POST /v1/agents`, Idempotency-Key `thread_<id>`); DO KV `runtimeAgent`, `runtimeAgentCursor`, `runtimeAgentRun` | `startRuntimeTurn()` creates the agent with the same idempotency key and stores only its id. There is no agent token and no cursor. |
+| Gates before each run | DO:8018 `prepareRuntimeRun` → `runtime-agent.ts:411` `configureRun` | Moved unchanged to `workers/main/src/agent-runtime/run-gates.ts`, called by `startRuntimeTurn()`. |
+| Send, steer, abort | DO:3780 `sendMessage` → 6384 `handleClientUserMessage` → 6477 `enqueueRunnerUserMessage`; `runtime-agent.ts:685/746/754` | Worker routes (§4). |
+| Relay the event stream | `runtime-agent.ts:501` `relay`, `:443` `emit` | **Gone.** The browser watches the runtime itself. |
+| Pi `AgentEvent` → PiRuntimeEvent → UI chunks | DO:9535 `handlePiSessionEvent`; `writePiStreamChunks` → `PiChunkEncoder` (`src/lib/pi-chunk-encoder.ts`, 686) | **Gone.** The SDK folds Pi events into Pi messages (§5.2). |
+| WS / poll transport, `cf_agent_*` frames | ai-chat `AIChatAgent`; `chat-thread/{websocket,poll,sse}-connection.ts`; `src/lib/sse-agent-client.ts` (1,122), `use-sse-agent.ts` | **Gone** for runtime threads. The SDK watcher does SSE, then long-poll. |
+| Render history: the `pi_core` mirror plus the ai-chat archive | `pi-core-store.ts`, `ui-mirror.ts`, `derived-render-page.ts`, `render-archive-preserve.ts`; DO:2543 `persistMessages`; DO:11639 `getOlderUiMessages` | **Gone.** The runtime's paged history, which the browser reads itself. The loader reads the first page server-side for first paint. |
+| Agent state pushed to the UI | DO:1463 `syncAgentState`; `src/lib/chat-agent-state.ts` | Derived in the browser from messages and events, or read from `OrgDO` by the loader (§5.5). |
+| Human input | `runtime-agent.ts:593` `answerInputs`, `:154` `runtimeInputQuestions`; DO:8133 `answerRuntimeInput` | The browser sees `input_required` / `input_resolved` on the stream and pending inputs at connect. It answers through a Worker route. `runtimeInputQuestions` moves to `src/lib`. |
+| Model change | DO:3776 `refreshModel`, DO:3889 `setModel` | `PATCH /api/threads/:id/model` writes OrgDO. The next send's configure applies it. |
+| Tool side effects from `/mcp/agent` | `code-mode-tools.ts` `chatThreadStub` RPCs | See §4.4. |
+| Codex forwarder | DO:8078 `runtimeProviderRequest`, called from `routes/agent-runtime-llm.ts:56` | Moves into the route and reads the thread from OrgDO. |
+| Turn bookkeeping: streaming status, last message, title, error counts | DO:6546 `updateThreadMetadataForUserMessage`; WorkspaceDO `thread_streaming_status`; `chat-thread/metadata.ts` | The send route at the start, the lifecycle webhook at the end (§4.5). |
+| Restart recovery | DO:5655–5668 `resumeRuntimeTurn` | **Gone.** Nothing in chiridion holds a run open. |
 
-`handleClientUserMessage` does several things before the runtime call:
-- clientMessageId dedupe (`chatAccess`);
-- the ban check;
-- mention expansion and the file-safety preamble;
-- `formatAttributedUserMessage` (author and source);
-- the thread metadata update;
-- the "running" activity;
-- choosing steer or prompt according to `isThreadStreaming()`.
-
-The `chatThreadStub` RPCs in `code-mode-tools.ts`:
-- `setTodoState` :4004
-- `setPreviewTarget` :4043, :4085
-- `setPreviewAppVisibility` :4202
-- `streamToolProgress` :2412 (build progress)
-- `recordCodeModeArtifact` :3846
-- `recordVerifiedWorkEvidence` :3730
-- `recordProjectActivity` :3788
-- `recordAutomationOutcome` :4437
-- `promptConnectionSetup` :4876
-- `askUserQuestion` :3978 (excluded over MCP)
-- `runCodeModeSubagent` :3985 (excluded over MCP)
-
-Other readers of the DO transcript also need a new source:
-- the thread page loader: `src/routes/_app.chat.$id.tsx:523` `getUiMessagePage`;
+Other readers of the DO transcript read the runtime's history server-side with the tenant token instead:
+- the thread loader;
 - `api/threads.$id.condensed-transcript.ts`;
 - `api/admin.threads.$id.jsonl.ts`;
-- the fork route: `api/workspaces.$id.chat.$threadId.fork.ts`;
-- agent-eval and the transcript lake (`chat-thread/transcript-lake.ts`);
-- automations (`chat-thread/automation-run.ts`, `src/lib/automations.server.ts`);
-- channel ingress and replies (`chat-channels.ts`, `channels.ts`).
+- the fork route;
+- agent-eval and the transcript lake;
+- automations;
+- channel replies.
 
-## 2. The chat UI today, and what changes
+## 3. The browser token (runtime, new)
 
-**Today:**
-- `Chat.tsx:918` calls `usePiChatStream` (`src/lib/use-pi-chat-stream.ts`). That wraps `useAgentChat` from `@cloudflare/ai-chat/react` over `SseAgentClient` (a WS that falls back to polling).
-- It returns `PiChatStream` (use-pi-chat-stream.ts:52): `messages`, `uiMessages`, `status`, `isStreaming`, `isStallClamped`, `streamingMessageId` and `setUiMessages`.
-- Agent state arrives via `onStateUpdate` (Chat.tsx:893, 3383).
-- RPCs:
-  - `sendMessage(content, clientMessageId)` (Chat.tsx:2958);
-  - `requestStop` (:4298);
-  - `answerQuestion` (:4313);
-  - `refreshModel` (:3979);
-  - `setPreviewTabsState` (:2692);
-  - `getOlderUiMessages(cursor)` (:1780).
-- Send recovery retries with the same clientMessageId (Chat.tsx:2946–3000).
+`POST /v1/agents/:id/browser-tokens` with the tenant token:
 
-**Why not the AI SDK's `useChat` with its default HTTP transport:**
-- `useChat` scopes a stream to the request that started it.
-- Threads have turns that start elsewhere: another tab, another org member (shared threads), automations, channels, and resume after an `ask_user` answered from another device.
-- ai-chat covered this with DO broadcast. The replacement must be a thread-level subscription, not a request-scoped one.
+```json
+{ "ttlSeconds": 900,
+  "scopes": ["events", "state", "history", "inputs"],
+  "events": ["agent_start", "agent_end", "turn_opened", "message_start", "message_update", "message_end",
+             "tool_execution_start", "tool_execution_update", "tool_execution_end",
+             "input_required", "input_resolved", "compaction_start", "compaction_end",
+             "auto_retry_start", "auto_retry_end"],
+  "subject": "user_123" }
+→ 201 { "token": "…", "expiresAt": 1790000900000, "url": "https://agents.camelai.dev" }
+```
 
-**Proposed: a second implementation behind the same `PiChatStream` interface.** Chat.tsx picks it per thread from the loader's `backend` field, so the renderer, send recovery, optimistic bubbles and adapter (`ui-message-adapter.ts`) stay as they are.
+- **It is stateless and signed.** The runtime already signs Ed25519 identity tokens for tool servers; this is the same machinery. The claims are tenant, agent, scopes, event allow-list, subject and expiry. The runtime stores nothing and revokes nothing: the short TTL is the revocation. Chiridion stores nothing either.
+- **What it allows:**
+  - `GET /v1/agents/:id/events`: always a watcher, with `deltas=1` forced, and `?poll=1&wait=N`;
+  - `GET /v1/agents/:id/state`;
+  - `GET /v1/agents/:id/history?limit&before`;
+  - `GET /v1/agents/:id/inputs?state=pending`.
 
-- **`useRuntimeThread(threadId)`** (new, `src/lib/use-runtime-thread.ts`):
-  - It keeps one `fetch()` stream to `GET /api/threads/:id/events`, a long-lived SSE resumed by `Last-Event-ID`, with backoff and a visibility pause.
-  - Why not `EventSource`: we need headers, and fetch lets us fall back to the same route with `?poll=1`, which returns a JSON batch and a cursor. That is the fallback that exists today for users whose WS or SSE fails (see `transport.md`).
-  - Runtime frames are folded into `UIMessage[]` by `src/lib/runtime-event-fold.ts`. That is:
-    - a pure Pi `AgentEvent` → PiRuntimeEvent translator, extracted from DO:9535, so it is shared;
-    - then the existing `PiChunkEncoder`;
-    - then AI SDK `readUIMessageStream`, or the same chunk reducer ai-chat uses.
-  - Encoding runs in the browser. The Worker is a byte pipe that does no parsing and uses almost no CPU.
-  - History seeds from the loader page, and older pages come from `GET /api/threads/:id/history?before=`.
-- **Sends:** `POST /api/threads/:id/messages {content, clientMessageId}`. It returns `{status:"accepted"|"busy"|"error"}`, the same `SendMessageResult` shape (Chat.tsx:270), so the retry logic is unchanged.
-- **Other RPCs become `fetch` calls:** stop, answer, preview, model.
-- **Agent-state fields are rebuilt without DO push:**
-  - `currentTodos`: from `TodoWrite` tool calls in the stream (the encoder already emits `data-pi-todos`). The last call in history seeds page load.
-  - `contextUsedPercent`: from the latest assistant `usage` and the model's context window.
-  - `pendingQuestion`: from the runtime's pending inputs, read at load via `GET …/inputs` and live from the response frame whose `stopped:"input_required"`. The `runtimeInputQuestions` card mapping (runtime-agent.ts:154) moves to `src/lib`.
-  - `lastError`: from the response outcome and error events.
-  - `previewTabs`/`activeTabId`: the durable copy in OrgDO comes with the loader. Live updates come from `set_preview`/deploy tool results in the stream: the client applies the target from the tool's structured result.
-  - `title`, `model`, `modelFallbackNotice`: OrgDO `threads` in the loader. A live title rides the existing workspace status channel (sidebar), or the page revalidates the thread on turn finish.
-  - `connectionSetupPrompt`: becomes a runtime human input (see §4, open question 4).
-- **What goes, for runtime threads:** `SseAgentClient`/`useSseAgent`/`useAgentChat` and `onStateUpdate`. Old threads keep all of them until §5 step 5.
+  Every other route, and every other agent, is 403 or 404.
+- **The event allow-list** filters `event` frames by their inner Pi event type.
+  - Runtime-internal frames are always dropped: `mcp`, `ready.connection`, `codemode`, `compaction_usage`, and `spend_limit_reached` unless listed.
+  - `response` frames are reduced to `{id, outcome: {stopped, error}}`, with no result payload.
+  - Snapshots pass: they contain only messages.
+- **Field redaction** is a later option: `redact: ["toolCall.arguments", "toolResult.details", "usage.cost"]` for tenants whose end users must not see tool internals or costs. Chiridion needs at most `usage.cost` at launch (open question 3); thread viewers already see tool arguments and results today.
+- **CORS** comes from per-tenant configured origins: `PUT /v1/cors-origins ["https://camelai.dev", "https://staging.camelai.dev", "https://*.camelai.dev"]`.
+  - Only requests with a browser token get CORS headers. Operator and API tokens keep today's `Origin` rejection (`server.ts:447`, `client-sessions.ts:1420`).
+  - Preflight allows `Authorization`, `Last-Event-ID` and `Accept`, with `Access-Control-Max-Age: 86400`, so a tab pays for one preflight.
+- **The token travels in a header, never in the URL,** so it stays out of ALB and proxy logs. The SDK uses `fetch`, not `EventSource`, so this works.
+- **Capacity:** browser watchers count against the watcher limits: 32 per agent, and per node 1,024 per tenant and 4,096 in total. Every open runtime-thread tab is one watcher (or one waiting poll), so chiridion alone would pass 1,024 per node. The limits must be per-tenant configurable, and an idle agent's watchers must be cheap (runtime item 3).
 
-## 3. Target design (chiridion)
+## 4. Chiridion server: stateless Worker routes
 
-### Worker routes (`workers/main/src/routes/runtime-threads.ts`, all stateless)
+Every request is authorized by one `OrgDO.validateChatWebSocketAccess(userId, workspaceId, threadId)` call (already used by `agent-mcp.ts:105`). The call also returns the thread's `thread_runtime` row. Runtime calls use the tenant token on `/v1/agents/:id/*`.
 
-Authorization is one `OrgDO.validateChatWebSocketAccess(userId, workspaceId, threadId)` call per request (already used by `agent-mcp.ts:105`), and it returns the thread's runtime record too (below).
+### 4.1 Routes
 
 | Route | Does |
 |---|---|
-| `POST /api/threads/:id/messages` | Runs the send pipeline taken out of the DO: ban check, mentions, file safety, attribution, the gates of `prepareRuntimeRun` (moved to `agent-runtime/run-gates.ts`), agent creation if missing (idempotent, as today), configure if the model, scope or limit changed, then `POST /clients/:id/requests {id: clientMessageId, method:"prompt", params:{text, from, meta, actor, whileRunning:"steer"}}`. The runtime's request idempotency (a retried id returns the committed record) replaces `chatAccess` dedupe. It then updates `OrgDO.threads` (last_user_message, updated_at) via `waitUntil`. |
-| `GET /api/threads/:id/events` | Proxies the runtime's thread event stream (§4 "watch"), passing `Last-Event-ID` through. Sends a `: keepalive` every 25 s. `?poll=1` returns buffered frames plus a cursor as JSON (the fallback). |
-| `GET /api/threads/:id/history?before=&limit=` | Proxies the paged, turn-aligned runtime history (§4), with caching below. The thread loader calls the same helper server-side for the first page. |
-| `POST /api/threads/:id/inputs/:inputId` | Answers a runtime input (`POST /clients/:id/inputs/:input`). The runtime resumes the run, and every tab sees it on its stream. |
-| `POST /api/threads/:id/stop` | `abort` request. |
-| `PATCH /api/threads/:id/model` | Writes `OrgDO.threads` model and history (existing `updateThreadModel`). The runtime configuration is applied lazily by the next send's configure, as `configureRun` does today, so a model change never races a running turn. |
-| `PUT /api/threads/:id/preview` | `setPreviewTabsState` → OrgDO. |
-| `POST /agent-runtime/llm/openai-codex/*` | Unchanged externally. The body moves from DO:8078 into the route, reading the thread's backend and model from OrgDO instead of DO KV. |
+| `POST /api/threads/:id/token` | Access check, then `POST /v1/agents/:id/browser-tokens` with the scopes above and `subject` = the user id. Returns `{token, expiresAt, url, agentId}`. The loader calls the same helper, in parallel with the first history page, so first paint needs no extra round trip. Minting is one signature, so no caching is needed. |
+| `POST /api/threads/:id/messages` | `startRuntimeTurn()` (§4.2). Returns `{status: "accepted" \| "busy" \| "error", requestId}`, the same `SendMessageResult` shape Chat.tsx uses today, so send recovery keeps working. |
+| `POST /api/threads/:id/inputs/:inputId` | Access check, then `POST /v1/agents/:id/inputs/:inputId` with `{action, content, actor: userId}`. The runtime checks that the actor may answer. |
+| `POST /api/threads/:id/stop` | `POST /v1/agents/:id/abort`. |
+| `PATCH /api/threads/:id/model` | Writes the OrgDO model and model history (existing `updateThreadModel`). The next send's configure applies it, as `configureRun` does today, so a model change never races a running turn. |
+| `PUT /api/threads/:id/preview` | Writes preview tabs to `OrgDO.thread_ui_state`. |
+| `POST /agent-runtime/events` | The lifecycle webhook receiver (§4.5). |
+| `POST /agent-runtime/llm/openai-codex/*` | Unchanged externally. Its body moves from DO:8078 into the route. |
 
-### Thread metadata: OrgDO, not D1
+### 4.2 `startRuntimeTurn(thread, sender, text, files, clientMessageId, source)`
 
-Recommendation: new OrgDO tables:
-- `thread_runtime (thread_id PK, agent_id, backend, model, key_scope, created_at)`;
+This is the send half of `handleClientUserMessage`, moved out of the DO. The send route, automations (`automation-run.ts`, `automations.server.ts`) and channel ingress (`chat-channels.ts`) all call it:
+
+1. Ban check, mention expansion, file-safety preamble.
+2. Run gates (`run-gates.ts`, from DO:8018): credits, per-user limits, the model route and key scope, `ensureHostedKeyScope`, `syncOrgKeyScope`, the spend limit, model headers.
+3. If the row has no agent yet, create one: `POST /v1/agents` with Idempotency-Key `thread_<id>`, chiridion's definition, and `context: {org, workspace, thread}`. Write the row.
+4. `PATCH …/configuration` if the model, key scope or spend limit changed since the row's last configure.
+5. `POST /v1/agents/:id/prompt {text, from: {id: userId, name}, actor: initiatorId, requestId: clientMessageId, files, meta, whileRunning: "steer"}`.
+   - `requestId` = `clientMessageId` makes retries idempotent. This replaces the `chatAccess` dedupe.
+   - `from` replaces `formatAttributedUserMessage`. The runtime stores the sender on the message as data and shows it to the model in a block only the runtime can write. The user's text stays exactly what they typed, and the UI shows `from.name`.
+   - `meta` (runtime item 5) carries what the model must not see: `{source: "web" | "slack" | "automation" | …, clientMessageId}`.
+   - `whileRunning: "steer"` (runtime item 6) joins a running turn if there is one, and starts one otherwise. Until it ships: `prompt`, and on a busy answer, `steer`.
+6. Via `waitUntil`: `OrgDO.threads` last_user_message and updated_at; WorkspaceDO streaming status "running".
+
+### 4.3 Thread metadata in OrgDO
+
+Two new OrgDO tables, kept from the previous design:
+- `thread_runtime (thread_id PK, agent_id, model, key_scope, configured_json, created_at)`;
 - `thread_ui_state (thread_id PK, preview_json, preview_version, updated_at)`.
 
-Why OrgDO:
-- `threads` (org-do.ts:1166) and the access check already live there, so authorization and the runtime lookup are one RPC, which every chat request already pays.
-- Writes are small and per turn or per tool call. That is well within one org's DO.
-- D1 would be a second store plus a migration, and staleness between it and `OrgDO.threads`.
+Why OrgDO and not D1: `threads` (org-do.ts:1166) and the access check already live there. Authorization and the agent lookup are then one RPC, which every chat request already pays. The writes are small and happen once per turn or per preview change.
 
-The agent token is not stored if the runtime grants the tenant token read access (§4). Until then `thread_runtime.agent_token` is kept, as DO KV does today.
+### 4.4 Tool side effects (`code-mode-tools.ts`, when `threadId` is a runtime thread)
 
-### Tool side effects (`code-mode-tools.ts`, when `threadId` belongs to a runtime thread)
+The tools are already served statelessly from `/mcp/agent` with the runtime-signed identity. Only their `chatThreadStub` calls need new homes:
 
-- `setTodoState`: nothing. The UI derives todos from `TodoWrite` calls.
-- `setPreviewTarget`/`setPreviewAppVisibility`: write `thread_ui_state` in OrgDO. The tool result carries the target, and the UI applies it live.
-- `streamToolProgress`: becomes an MCP `notifications/progress` from `/mcp/agent`. The runtime already turns these into `tool_execution_update` events on the model's tool call (agent-runtime `client-sessions.ts:669`).
-- `recordCodeModeArtifact`, `recordVerifiedWorkEvidence`, `recordProjectActivity`: artifacts go into the structured tool result, which is rendered from the stream and history. Evidence and project activity move to WorkspaceDO or OrgDO calls; they never needed the thread DO.
-- `recordAutomationOutcome`: becomes an OrgDO or automation-store write keyed by thread and run.
-- `promptConnectionSetup`: a runtime human input of kind `url`/`form` (`ctx.requireUrl`/`ctx.ask`). See open question 4.
+| RPC | New behavior |
+|---|---|
+| `setTodoState` :4004 | Nothing. The UI reads todos from the latest todo tool call. |
+| `setPreviewTarget` :4043/:4085, `setPreviewAppVisibility` :4202 | Write `thread_ui_state`. The tool result's `structuredContent` (the toolResult's `details`) carries the target, and the UI applies it live. |
+| `streamToolProgress` :2412 | An MCP `notifications/progress`. The runtime turns it into a `tool_execution_update` (at most one per 250 ms) on the model's tool call. |
+| `recordCodeModeArtifact` :3846 | Artifacts go into the tool result's `structuredContent`, which the runtime keeps as the toolResult's `details`. |
+| `recordVerifiedWorkEvidence` :3730, `recordProjectActivity` :3788 | WorkspaceDO / OrgDO calls. They never needed the thread DO. |
+| `recordAutomationOutcome` :4437 | An automation-store write keyed by thread and request. |
+| `promptConnectionSetup` :4876 | A runtime human input of kind `url` (`ctx.requireUrl`) or `form` (`ctx.ask`). The OAuth completion (`connection-setup-completion.ts`) answers it through the inputs route instead of calling the DO. See open question 8. |
+| `askUserQuestion`, `runCodeModeSubagent` | Already excluded over MCP. `ask_user` is the runtime builtin. |
 
-### History caching
+### 4.5 Lifecycle webhook
 
-- A settled turn never changes. Compaction keeps the full log.
-- Cache pages in the Workers Cache API under `history:<agentId>:<epoch>:<before>:<limit>`, with `epoch` = the runtime's history epoch, which changes only on a log `reset`.
-- The newest page (`before` absent) is not cached. It is small and must include the running turn.
-- **Optional:** a KV snapshot of the last page per thread, written on the turn-finished webhook, so a thread still renders read-only during a runtime outage.
+No browser need be connected, so end-of-turn work cannot depend on one. The runtime posts lifecycle events to `POST /agent-runtime/events`. It uses the usage webhook's outbox, Standard Webhooks signing and at-least-once delivery. The route needs the same Cloudflare Access bypass as `/agent-runtime/usage`.
+- `run.started {agent, request, actor, meta}` → WorkspaceDO streaming status "running". This covers turns chiridion did not start itself, such as a resume after an answer.
+- `run.finished {agent, request, stopped, error, usage}` → streaming status idle. Also: `OrgDO.threads` last_assistant_completed_at, summary and error counts; title and avatar generation (`chat-thread/metadata.ts`, reading the newest history page); automation completion; the channel reply.
+- `input.requested {agent, input}` → "waiting for you" notifications and channel prompts.
 
-### Auth toward the runtime
+Deliveries are idempotent by `(agent, request, type)`: a redelivery writes the same values again.
 
-- Server-side only: the browser never holds a runtime token, and the runtime rejects requests with an `Origin` header anyway (`client-sessions.ts:1083`).
-- Target: the tenant token over `/registry/:id/*` (§4). An interim option is the per-agent token from `thread_runtime`.
+The usage webhook (`/agent-runtime/usage`) stays as it is for billing.
 
-### Multiple tabs and users
+## 5. The UI
 
-- Each tab opens its own `/events` proxy, so the runtime fans out.
-- Sends from anyone land in the one request queue, and every subscriber sees every frame in the same order.
-- Ids are the runtime's event cursor, so order is total per agent.
+### 5.1 Today
 
-### Turn lifecycle without a stream attached
+The renderer does not draw `UIMessage`s. It draws the legacy Anthropic-style `Message` (`src/types.ts:255`), with blocks `text`, `thinking`, `tool_use`, `tool_result`, `error`, `teammate_message` and `task_notification`. `UIMessage` is only the transport shape between ai-chat and the renderer:
 
-No browser may be connected. Streaming status, `last_assistant_completed_at`/summary, error counts, title generation, automation completion and channel replies are driven by a **runtime lifecycle webhook** (§4) delivered to `POST /agent-runtime/events`, next to `/agent-runtime/usage`, with the same Standard Webhooks verification. It writes OrgDO and WorkspaceDO and triggers the channel reply. The route also needs a Cloudflare Access bypass path (see the Access app `e14c1349…`).
+```
+runtime Pi events ─► DO: PiRuntimeEvent ─► PiChunkEncoder ─► ai-chat UIMessage ─► useAgentChat
+   ─► usePiChatStream (386) ─► uiMessageToMessage (ui-message-adapter.ts, 581) ─► Message[]
+   ─► ChatMessagesView (484) ─► MessageBubble (922) ─► ToolCall / tool-details/* / ThinkingBlock / …
+```
 
-## 4. Runtime additions (read against agent-runtime `main`)
+A Pi message is closer to `Message` than `UIMessage` is:
+- Pi `toolCall {id, name, arguments}` is `tool_use {id, name, input}`.
+- Pi `ToolResultMessage {toolCallId, content, details, isError}` is `tool_result {tool_use_id, content, details, is_error}`.
+- Pi `thinking` is `thinking`.
 
-What exists already:
-- `GET /clients/:id/events`: SSE with cursor replay; the buffer is 512 events or 2 MB (`client-sessions.ts:153, 477`); a gap returns 409.
-- `GET /clients/:id/history`: the full transcript, reading the whole log every call (`supervisor.ts:56`, `agent-host.ts:459`).
-- `GET /clients/:id/state`, `GET|POST /clients/:id/inputs[/:input]`.
-- Idempotent `POST /clients/:id/requests` with prompt, steer, followUp, abort and configure (`client-sessions.ts:1228`).
-- The operator bridge `POST /registry/:id/requests` (tenant token; requests only, `server.ts:455`).
-- Usage webhook (usage only).
-- MCP progress → `tool_execution_update`.
+The leaf components (tool views, file previews, thinking, markdown, question and connection cards) therefore stay. The layers above them are what change: the stream hook, the adapters, and the grouping of blocks into turns.
 
-Needed, in priority order:
+§5.3 has the per-component table.
 
-1. **Multi-subscriber event stream.**
-   - Today a new `/events` connection ends the previous one (`client-sessions.ts:1114`), because the stream doubles as the attached-MCP channel. Two tabs would evict each other in a loop.
-   - Add read-only watchers (`GET …/events?watch=1`): no attached server, never replaces or is replaced, and the same cursor and replay semantics.
-2. **Tenant-token reads:** `GET /registry/:id/{events,history,state,inputs}` and `POST /registry/:id/inputs/:input`, like the existing requests bridge. Chiridion then stores no per-agent tokens.
-3. **Delta streaming, plus a snapshot on subscribe.**
-   - Today every `message_update` carries the whole partial message (backlog "Streaming efficiency", `plans/agent-runtime-service.md:330`), which makes browser traffic quadratic.
-   - A long turn also overruns the 512-event replay buffer, so a reconnect mid-turn gets a 409.
-   - Send deltas (text, thinking and tool-arg deltas), and on subscribe or replay-gap send one `message_snapshot` of the in-progress assistant message plus the committed messages of the running turn. With that, a reconnect never needs a separate history read and a 409 becomes rare.
-   - Throttle MCP progress at the same time.
-4. **Paged, turn-aligned history:**
-   - Shape: `GET …/history?before=<index>&limit=<messages>` → `{ entries: [{ index, requestId, turn, message, meta }], next: <index>|null, epoch }`.
-   - Pages never cut a turn.
-   - It must not read the whole log per page. Keep a per-turn offset index (Postgres, or log segment boundaries) when writing `turn` records.
-5. **Request attribution on messages:**
-   - Record `requestId` on each transcript `message` record, plus an opaque `meta` (≤2 KB, never sent to the model) on user messages from `prompt`/`steer` params.
-   - Return both in history and on `message_end` events.
-   - Chiridion puts `{renderText, authorDisplayName, messageSource}` in `meta`, because the model sees the attributed text.
-   - The render ids become `user:<requestId>` and `turn:<requestId>`, replacing the DO's `renderMessageId` stamping.
-6. **Atomic steer-or-prompt:** `prompt` with `whileRunning: "steer"` joins the in-flight run if there is one, otherwise starts a run. This removes the race behind the DO's `isThreadStreaming()` choice. If `steer` with no active run already fails cleanly, the route can retry as `prompt`; this is the fallback if (6) slips.
-7. **Lifecycle webhook** (extend the usage-webhook outbox; the same receiver, signing and at-least-once delivery):
-   - `run.started {agent, request, actor}`;
-   - `run.finished {agent, request, stopped, error, usage}`;
-   - `input.requested {agent, input}`.
-8. **History epoch:** a counter bumped on log `reset`, for cache keys.
+### 5.2 Data flow
 
-## 5. Rollout and coexistence
+- **`useRuntimeThread(threadId, initial)`** is new (`src/lib/use-runtime-thread.ts`, ~250 lines). It wraps the SDK watcher:
+  - It seeds from the loader: `{token, url, agentId, page}`, where `page` is the newest history page read server-side.
+  - It opens `watchAgent({url, agentId, token, getToken, deltas: true})`. The SDK streams SSE and falls back to `?poll=1&wait=25` when a stream fails or stalls. It reconnects with backoff, pauses while the tab is hidden, and after a gap restarts from the snapshot.
+  - It exposes `{messages: AgentMessage[], partial: AssistantMessage | null, progress: Map<toolCallId, update>, running, pendingInputs, lastOutcome, loadOlder()}`.
+  - For token refresh, the SDK's `getToken()` calls `POST /api/threads/:id/token` on a 401, or 60 s before expiry.
+- **Folding happens in the SDK**, not in chiridion, so every tenant gets it:
+  - `message_start` opens a message.
+  - A delta `message_update` appends text, thinking or tool-argument JSON at `contentIndex`. Tool arguments are parsed as partial JSON, as pi-ai does, so a `js_exec` card shows its code while it streams.
+  - `message_end` replaces the message with the final one.
+  - A `snapshot` replaces the running turn from `turn.start`, with `turn.messages` plus `turn.partial`. On `truncated: true` the SDK reads that turn from history instead.
+- **History:** the loader's page first, then `loadOlder()` → `historyPage({before: next})` straight from the runtime on scroll-up. Settled pages never change, so the browser keeps them in memory. There is no server cache and no history epoch.
+- **Sends and the other writes** are `fetch` calls to the routes in §4.1.
+  - The optimistic user bubble is keyed by `clientMessageId`.
+  - It is replaced when a user `message_end` arrives with a matching `requestId` / `meta.clientMessageId` (runtime item 5).
+  - Send recovery (Chat.tsx:2946–3000) keeps retrying with the same id. The runtime's request idempotency makes this safe.
+- **Multiple tabs and users:** each tab is its own watcher. The runtime fans out, and orders everything by one cursor per agent. Sends from anyone land in one queue. A `BroadcastChannel` that shares one watcher across a user's tabs on the same thread is an optional later saving.
 
-The backend is chosen per thread, as today:
-- `OrgDO.thread_runtime.backend` is `runtime` for new threads.
-- Threads without a row are old DO threads.
-- The loader returns `backend`, and Chat.tsx mounts `useRuntimeThread` or `usePiChatStream`.
-- Nothing changes for DO threads.
+### 5.3 Component mapping
 
-1. **Runtime:** items 1–3 (watchers, registry reads, deltas plus snapshot), then 4–5 (paged history, attribution), then 6–8. Each ships behind the existing API; the SDKs pick up the history paging.
-2. **Chiridion, shared code:** extract the AgentEvent → PiRuntimeEvent translator (DO:9535) and `runtimeInputQuestions` into `src/lib`. Add `runtime-event-fold.ts` with tests replaying recorded runtime traces (the staging trace `staging-trace.json` is a good fixture).
-3. **Chiridion, server:**
-   - the routes in §3, the OrgDO tables, `run-gates.ts` (moved from DO:8018) and the lifecycle receiver;
-   - move the Codex forwarder off the DO;
-   - switch the tool side effects for runtime threads;
-   - switch the other transcript readers (condensed transcript, admin jsonl, fork, eval, lake) to runtime history for runtime threads.
-4. **Chiridion, UI:** `useRuntimeThread` behind `PiChatStream`, plus the fetch-based RPCs. Ship on staging, and dogfood multi-tab, multi-user, ask_user, stop, model switch and reconnect under a throttled network.
-5. **Cut over:**
-   - New threads pin to `thread_runtime` instead of DO KV. The DO path for runtime threads stays only for threads already pinned in DO KV; those are staging-only today, and a one-off copy can move them.
-   - Automations and channels move when the lifecycle webhook is live. Until then they create DO threads.
-6. **Old threads:**
-   - Lazily migrate on open: import `pi_core` into a new runtime agent (`POST /v1/agents` with initial `messages`; the runtime validates them, `history.ts:5`), write `thread_runtime`, and serve from then on.
-   - Threads that fail import stay read-only from the DO until they age out.
+Sizes are line counts on `main`. "Pi props" means the component's props change from `ToolUseBlock` / `ToolResultBlock` to Pi `ToolCall` / `ToolResultMessage`. That is a mechanical rename: `input` → `arguments`, `tool_use_id` → `toolCallId`, `is_error` → `isError`, `artifacts` → `details.artifacts`, and `content` is always an array.
 
-**What gets deleted once step 5 is done:**
-- `chat-thread/runtime-agent.ts`'s `RuntimeAgentSession`, and every runtime branch in the DO (`resolveAgentBackend`, `resumeRuntimeTurn`, `answerRuntimeInput`, `prepareRuntimeRun`, `runtimeProviderRequest`, `createRuntimeAgentSession`);
-- the pi_core and archive writes for runtime threads.
+| Component | Lines | Renders | Verdict |
+|---|---|---|---|
+| `components/Chat.tsx` | 5,112 | Page: stream wiring, RPCs, send recovery, optimistic bubbles, preview, composer | **Rewire.** Replace `usePiChatStream` / `agent.call(...)` / `onStateUpdate` with `useRuntimeThread` plus fetches. ~1,000 lines touched; the net change is a deletion. Layout, composer and preview stay. |
+| `lib/use-pi-chat-stream.ts` | 386 | ai-chat → `Message[]` | **Replace** with `use-runtime-thread.ts` (~250). |
+| `lib/ui-message-adapter.ts` | 581 | `UIMessage` ⇄ `Message` | **Delete** (kept frozen for old threads until Phase 6). |
+| `lib/pi-chunk-encoder.ts` | 686 | Pi → UI chunks | **Delete** (as above). |
+| `hooks/use-chat-transcript.ts`, `lib/chat-render-history.ts`, `lib/derive-ui-messages-from-pi-core.ts`, `lib/steer-split.ts` | 217 + 400 + 414 + 201 | Render-history plumbing | **Delete** for runtime threads. The Pi grouping below replaces them. |
+| `components/chat-messages-view.tsx` | 484 | Message list, virtualized turns, paging trigger | **Rewrite the data half** (~200): it walks `turns` instead of `Message[]`. The virtualization and scroll code stays. |
+| `components/message-bubble.tsx` | 922 | Block dispatch, turn layout, copy-as-text | **Rewrite** as `pi-turn.tsx` (~600). It iterates Pi content parts and looks up results by `toolCallId`. Copy-as-text, the stop notice and the error notice move over. |
+| `lib/turn-utils.ts` | 246 | Grouping into turns, "agent continued" | **Rewrite** as `pi-turns.ts` (~200). A turn is a user message plus the assistant and toolResult messages that follow it. |
+| `tool-call/tool-call.tsx`, `tool-status.ts`, `tool-details.tsx`, `tool-utils.ts`, `mcp-utils.ts`, `tool-summary.ts` | 193 + 68 + 136 + 97 + 58 + 5 | Tool card shell, status, per-tool dispatch by name | **Pi props.** Status becomes: result present → complete / error (`isError`); else running while the turn runs; else complete. The name dispatch stays, fed through `localToolName` (`camel__x` → `x`). |
+| `tool-call/details/*` (javascript, bash, read, write, edit, search, web, todo, task, skill, notebook, mcp, ask-user-question, team-create, generic, shared) | 1,833 | Per-tool bodies | **Pi props.** Each reads the call's arguments and the result's text / `details`. `JavaScriptDetails` reads `details.output` / `details.truncated` / artifacts; `EditDetails` reads the diff from `details`. |
+| `tool-call/thinking-block.tsx` | 194 | Thinking / plan | **Reuse.** Feed it Pi `thinking` (and `redacted`). |
+| `tool-call/file-link.tsx`, `app-link.tsx`, `file-card.tsx`, `chat-file-preview/*` | 163 + 73 + 162 + ~2,450 | present_file / artifact / attachment previews | **Reuse.** Their inputs are paths and URLs, which come from `details.artifacts` or the tool's arguments. |
+| `tool-call/task-notification.tsx`, `teammate-message.tsx` | 89 + 98 | Sub-agent notices | **Pi props.** Live sub-agent progress is `tool_execution_update` on the Task call, not a fake `tool_result` (`isTaskUpdate`). |
+| `ask-user-question.tsx` | 791 | Question card | **Reuse.** It is fed `runtimeInputQuestions(input)` for a pending `question` input. It answers through the inputs route. |
+| `connection-setup-prompt.tsx` | 612 | Connection setup card | **Reuse**, fed a `url` / `form` input (open question 8). |
+| `floating-todo/*` | 259 | Todo panel | **Reuse**, fed the latest todo tool call's arguments. |
+| `context-indicator.tsx`, `compact-summary-card.tsx`, `turn-summary-bar.tsx`, `model-fallback-banner.tsx`, `chat-error-notice.tsx`, `collapsible-user-message.tsx`, `chat/channel-logo.tsx` | 75 + 89 + 110 + … | Context %, compaction, turn duration, errors, user bubble, source | **Reuse.** Their inputs change source (§5.4, §5.5). |
+| `preview-panel/*`, `chat-preview/*` | ~860 + … | Preview tabs | **Reuse.** State comes from the loader (`thread_ui_state`) and from preview tool results. |
+| `markdown-renderer.tsx` | — | Text | **Reuse.** |
 
-**Deleted after step 6:**
-- `ChatThreadDO` and its in-DO Pi loop: `pi-*.ts`, `ui-mirror.ts`, `derived-render-page.ts`, `render-archive-preserve.ts`, `pi-turn-journal.ts`, `pi-compaction.ts`, `pi-stream-retry.ts`;
-- the chat WS, poll and SSE transport (`sse-agent-client.ts`, `use-sse-agent.ts`, `chat-thread/*-connection.ts`, `transport.md`);
-- `@cloudflare/ai-chat`;
-- `bedrock-pi-*`, if Bedrock only serves the runtime path by then;
+Size: about **1,500 new lines** (hook, grouping, turn view, derivations) and **about 1,500 changed** (Pi props across ~35 files, Chat.tsx rewiring). This replaces about **4,000 lines** on the runtime path (adapters, encoder, stream hook, render-history plumbing, bubble, turn utils). The old path's copies are deleted in Phase 6.
+
+During the transition, the frozen old-thread view still produces `Message` blocks. To keep one prop type on the leaves, it converts `ToolUseBlock` / `ToolResultBlock` to Pi shapes in a ~80-line shim at its boundary. The shim goes away with the old view.
+
+### 5.4 Rendering Pi messages
+
+| Pi shape | Renders as |
+|---|---|
+| `user`, `content: string \| (text \| image)[]` | User bubble (`collapsible-user-message`). Images are image tiles. The author is `from.name`, which the runtime stores on the message (not in its text). The source (Slack, automation, …) comes from `meta.source` as a channel logo. Attachments sent as `files` are saved under `uploads/<requestId>/` and named in the message; they render as file chips. The runtime should return them structured on the message too (runtime item 5). |
+| `assistant` `text` | Markdown. |
+| `assistant` `thinking` | Thinking block; `redacted` shows as "Thinking (redacted)". |
+| `assistant` `toolCall` | Tool card, keyed by `id`. While streaming, arguments are partial JSON. |
+| `toolResult` | Joined to its call by `toolCallId`: `content` (text / image), `details` (structured: diffs, artifacts, js_exec output), `isError`. Never rendered on its own. |
+| `toolResult` with `details.inputRequired` | The placeholder for a call waiting on a person. The card shows "waiting for your answer" until the real result replaces it. |
+| `assistant` `stopReason: "aborted"` | "Stopped by user" (replaces `data-pi-user-stop`). |
+| `assistant` `stopReason: "error"` + `errorMessage` | Error notice via `readableProviderError` (moved to `src/lib`). Billing and quota errors keep their CTA by matching error type. |
+| `assistant` `usage` | Context % (latest input + cache tokens over the model's window); turn duration from timestamps. |
+| Compaction | The runtime's history keeps the full log and has no summary message, so the transcript shows none. `compaction_end` (live) can show `compact-summary-card` as a transient notice. If the marker should persist, the runtime needs to mark where compaction happened in history (small; not on the priority list). |
+| `tool_execution_update` (live only) | Progress text / partial result on the running card (build progress, sub-agent activity). |
+| `auto_retry_start` / `_end` | "Retrying…" notice on the running turn. |
+| `compaction_start` / `_end` | Compacting indicator. |
+
+Custom message kinds that exist only in the DO path (`teammate_message`, `turnNotice`) are not produced by the runtime. They survive only in the frozen old-thread view.
+
+### 5.5 Agent-state fields without a DO push
+
+| Field (`chat-agent-state.ts`) | Source |
+|---|---|
+| `currentTodos` | The latest todo tool call in the messages; history seeds it. |
+| `contextUsedPercent` | The latest assistant `usage` over the model's context window. |
+| `pendingQuestion` | Pending inputs: `GET inputs` at connect, then `input_required` / `input_resolved` live. Mapped by `runtimeInputQuestions`. |
+| `lastError` | Assistant `stopReason: "error"`, and `response` outcomes with an `error`. |
+| `previewTabs`, `activeTabId` | `thread_ui_state` from the loader; live from preview and deploy tool results' `details`. |
+| `title`, `model`, `modelFallbackNotice` | `OrgDO.threads` in the loader. A live title rides the workspace status channel (the sidebar), or the page revalidates on `agent_end`. |
+| `connectionSetupPrompt` | A `url` / `form` input, rendered by the connection-setup card. |
+| isStreaming / the working indicator | The snapshot's `turn != null` at connect, then `agent_start` / `agent_end` and `response` outcomes. |
+
+## 6. Old DO-backed threads
+
+They are not migrated. The backend is chosen per thread: a thread with a `thread_runtime` row is a direct runtime thread; every other thread is old. That includes runtime threads that were started through the DO and are pinned in DO KV (see open question 11).
+
+**The minimum to keep them viewable (Phase 4):**
+- The loader already reads the first page with `getUiMessagePage` over DO RPC. Keep that.
+- Older pages: a plain `GET /api/threads/:id/legacy-messages?cursor=` that calls the DO's `getOlderUiMessages` over RPC. No WS and no ai-chat client.
+- They render through the existing `UIMessage` → `Message` adapter and the frozen renderer, via the Pi-props shim (§5.3). The composer is replaced by "This conversation is read-only. Start a new chat."
+- The Worker refuses `sendMessage` and every other write RPC for old threads. Their DO never starts a loop again, so the Pi loop, stream retry, compaction and transport are dead code for them.
+- Automations and channels attached to an old thread get a new runtime thread on their next run.
+
+**End state (Phase 6).** Old threads age out, either by retention or because users delete them. There are two options:
+- **(A) Retention cutoff.** Announce a date. Old threads become unavailable after it. Delete the `CHAT_THREAD` class with a deletion migration.
+- **(B) Freeze to R2**, if old threads must be kept. A one-off job reads each old thread's `pi_core` rows, which are already Pi `AgentMessage`s (`pi-core-store.ts`), and writes them to R2 as JSON pages. The viewer renders them with the **new** Pi renderer, read-only. Threads without `pi_core` rows (pre-Pi) are either exported once through the `Message` adapter or dropped. Then the DO class is deleted.
+
+Recommendation: (B) if product wants history kept (it costs one job plus a ~100-line R2 page reader), otherwise (A).
+
+Either way, the end state deletes:
+- `ChatThreadDO` (`chat-thread-do.ts`, 11,965) and `chat-thread/*` (12,134): the in-DO Pi loop, `pi-core-store.ts`, `ui-mirror.ts`, `derived-render-page.ts`, `render-archive-preserve.ts`, `pi-turn-journal.ts`, `pi-compaction.ts`, `pi-stream-retry.ts` and `runtime-agent.ts`;
+- `workers/main/src/pi-*.ts` and `bedrock-pi-*` (~3,000), if Bedrock serves only the runtime path by then;
+- the chat WS / poll / SSE transport: `sse-agent-client.ts`, `use-sse-agent.ts`, `chat-thread/*-connection.ts`, `transport-headers.ts`, `transport.md`;
+- the `UIMessage` layer: `pi-chunk-encoder.ts`, `use-pi-chat-stream.ts`, `ui-message-adapter.ts`, `derive-ui-messages-from-pi-core.ts`, `chat-render-history.ts`, `use-chat-transcript.ts`, `chat-do.server.ts`, the legacy `Message` block types and the Pi-props shim;
+- the `@cloudflare/ai-chat` and `agents` packages, and `ai` if only the chat used it;
 - the `CHAT_THREAD` binding, via a deletion migration.
 
-## 6. Risks and open questions
+That is roughly 30,000 lines.
 
-1. **Latency to us-west-2:**
-   - A send or history call is one Worker → runtime round trip (~150–250 ms from Europe), versus a local DO today.
-   - Mitigations: settled history pages are cached; the first paint comes from the loader, which is server-side and cached; streaming latency is dominated by the model.
-   - Measure the time to first chunk on staging before cutting over.
-2. **Runtime outage:** runtime threads cannot send, and without the KV snapshot they cannot load. Today they cannot send either; a DO would still render. Decide whether the read-only snapshot is worth building (recommend yes, small).
-3. **Ordering and reconnect:**
-   - The runtime cursor is the only order. Sends are idempotent by clientMessageId.
-   - A reconnect resumes at the cursor, or takes the snapshot on a gap (runtime item 3).
-   - Until item 3 ships, a gap means re-reading the newest history page and continuing from `/state`'s cursor, with the partial message lost until its `message_end`. That is acceptable only on staging.
-4. **Connection setup and other interactive tools:** check that `prompt_connection_setup` over MCP can be expressed as a runtime `url`/`form` input without the DO. It uses `promptConnectionSetup` on the DO now (code-mode-tools.ts:4876), and its OAuth completion (`connection-setup-completion.ts`) calls the DO.
-5. **Poll fallback cost:** users on the poll fallback (~50% day one, see the SSE-migration notes) poll the Worker, and each poll becomes a runtime `/events` connect and read with a cursor. The runtime must answer a short-lived watcher cheaply, e.g. `?poll=1` returns buffered frames and closes. Add this to runtime item 1.
-6. **Private data in the stream:** events include tool args and results, which the thread's viewers already see. The proxy must still drop the runtime's `ready.connection` id and any runtime-internal frames. Keep an allow-list of frame types.
-7. **Thread-level features that assumed DO state need a home:** verified-work state, streaming activity for sidebars and the `thread_streaming_status` writer. The lifecycle webhook covers start and finish. Mid-turn "activity text" in the sidebar would come from WorkspaceDO being updated on `run.started`, or be dropped. Decide.
-8. **Billing attribution for steers from another user:** today steering keeps the initiator's `actor` (DO:6541). The runtime keeps the run's actor for steers (runtime-agent.ts:748), and `whileRunning:"steer"` must preserve that.
+## 7. Chiridion work, in phases
+
+| Phase | Work | Size |
+|---|---|---|
+| **0. Prep** | Move pure helpers to `src/lib`: `runtimeInputQuestions`, `localToolName`, `readableProviderError`. OrgDO tables `thread_runtime` and `thread_ui_state`. Runtime config: tenant CORS origins, lifecycle webhook URL. Add the SDK dependency. | S: ~300 lines, 2–3 days |
+| **1. Server** | `startRuntimeTurn()` and `run-gates.ts` (moved from DO:8018 and DO:6384); the routes in §4.1; token minting; the lifecycle receiver; the tool side-effect switch (§4.4); the Codex forwarder off the DO; the transcript readers (condensed transcript, admin jsonl, fork, eval, lake) moved to runtime history. Tests against a local runtime. | M–L: ~1,500–2,000 lines, 1.5–2 weeks |
+| **2. UI** | `useRuntimeThread`; Pi grouping and turn view; Pi props on the leaves plus the old-view shim; §5.5 derivations; Chat.tsx rewiring, chosen per thread from the loader's `backend`. Fixture tests from recorded runtime traces (the staging trace is a good start). | L: ~1,500 new plus ~1,500 changed, 2–3 weeks |
+| **3. Cut over** | New threads pin to direct runtime (`thread_runtime` row at creation). Then automations and channels via `startRuntimeTurn()`, once the lifecycle webhook is live. Dogfood on staging: multi-tab, multi-user, ask_user, stop, model switch, reconnect on a throttled network, the poll fallback, a corporate-proxy network. | S: ~200 lines plus dogfooding, 1 week |
+| **4. Freeze old threads** | Read-only view, refusal of writes, the legacy page route, the composer bar. | S: ~300 lines, 2–3 days |
+| **5. Delete the runtime-in-DO path** | `RuntimeAgentSession` and every runtime branch in the DO (`resolveAgentBackend`, `resumeRuntimeTurn`, `answerRuntimeInput`, `prepareRuntimeRun`, `runtimeProviderRequest`, `createRuntimeAgentSession`). | S: net −2,000 lines |
+| **6. End state** | Retention or the R2 export (§6); delete the DO, the in-DO loop, the transport, the `UIMessage` layer and ai-chat. | M: one job plus deletions, net about −30,000 lines |
+
+Phases 0–1 can start before the runtime work lands, against `feat/runtime-threads` and a stub token endpoint. Phase 2 needs runtime items 2 and 4.
+
+## 8. Runtime work, in priority order
+
+Already on `feat/runtime-threads`, to merge first:
+- read-only watchers (`?watch=1`);
+- tenant-token reads at `/v1/agents/:id/{events,state,history,inputs}`;
+- delta `message_update`s with a turn snapshot on connect, and `turn_opened`;
+- paged turn-aligned history `?limit&before`;
+- the JSON long-poll `?poll=1&wait=N`;
+- coalesced tool progress.
+
+The previous design's KV snapshot, history cache, history epoch and lazy migration are no longer needed.
+
+1. **Browser tokens and CORS (§3).**
+   - `POST /v1/agents/:id/browser-tokens`: signed, scoped to one agent and to read routes, with an event allow-list and `response` reduction;
+   - per-tenant CORS origins;
+   - browser-token auth on the four read routes;
+   - the stream closes at token expiry, so the SDK reconnects with a fresh token and access changes apply within the TTL.
+   - Size M.
+2. **SDK browser watcher**, as `@camelai/agent-runtime/watch`, a browser-safe entry with no typebox and no Node APIs:
+   - `watchAgent({url, agentId, token, getToken, deltas})`: SSE, then long-poll, with backoff, a stall watchdog and a visibility pause;
+   - it folds deltas into Pi messages, including partial-JSON tool arguments;
+   - it applies snapshots (and `truncated` → a history read), keeps tool progress per call, tracks pending inputs, and exposes `historyPage`;
+   - tested in a real browser.
+   - Today's `AgentClient` is an application connection: it owns tool calls, a journal and `typebox`. It is not a watcher.
+   - Size M.
+3. **Watcher capacity for browsers.**
+   - A per-tenant configurable watcher limit, instead of the fixed 1,024 per tenant per node.
+   - Watching an idle, unloaded agent must not load its session: a waiting poll or stream on an idle agent should cost a registration, woken by the agent's next event. Today an idle agent's watchers are ended, and a tab's reconnect loop would otherwise keep reloading it.
+   - Size M.
+4. **Attribution and source on messages:**
+   - Record `requestId` on each transcript message, and an opaque `meta` (≤2 KB, never sent to the model) on user messages from `prompt` / `steer`.
+   - Return both in history, snapshots and `message_end`.
+   - Return attached `files` structured on the user message.
+   - Size S–M.
+5. **Atomic steer-or-prompt:** `prompt` with `whileRunning: "steer"`. This removes the race behind the DO's `isThreadStreaming()` choice. Size S.
+6. **Lifecycle webhook** (§4.5): `run.started`, `run.finished`, `input.requested`, on the usage-webhook outbox. Size M.
+7. **Provider error text safe for browsers:** assistant `errorMessage` is now visible to the browser. The runtime should strip gateway URLs, account ids and key-scope names, as chiridion's `readableProviderError` does today server-side. Size S.
+8. **Custom domain**, for tenants whose users' networks block `agents.camelai.dev`: a host alias per tenant (ACM certificate plus an ALB rule), or Cloudflare in front of the ALB. Infra. Size S–M.
+9. **Field redaction in browser tokens** (`redact: [...]`). This is for other tenants; chiridion needs at most `usage.cost`. Size S.
+
+## 9. Risks and open questions
+
+1. **Third-party domain blocked by firewalls or ad blockers.**
+   - `agents.camelai.dev` is on the same registrable domain as the app (`camelai.dev`). Ad blockers and third-party-cookie rules treat it as first-party, and it carries no cookies anyway.
+   - The risk is corporate allow-lists that name hosts, and TLS-inspecting proxies that buffer SSE. The long-poll fallback covers buffering.
+   - For allow-lists: (a) tell customers to allow `agents.camelai.dev`; (b) a custom domain (runtime item 8); (c) as a last resort, a per-org switch that sends the SDK through a byte-for-byte Worker pass-through (`/api/runtime/*` → the runtime, no parsing). (c) brings back the Worker cost only for those orgs.
+   - Self-hosted chiridion deployments need a configurable runtime URL and their own CORS origin.
+   - Decide whether (c) is built up front or only on demand.
+2. **What the browser can see.** Everything a thread viewer sees today: tool arguments and results, assistant errors, usage. It cannot see the system prompt, the `context` claims, MCP traffic or other agents.
+   - Open: should assistant `usage.cost` (the provider's raw cost) be hidden from hosted-key users? If so, add `usage.cost` to the token's redaction list (runtime item 9).
+   - Provider errors need runtime-side cleaning (runtime item 7).
+3. **Token refresh and revocation.**
+   - A 15-minute TTL; the SDK refreshes through chiridion before expiry and on a 401. The runtime ends a stream at expiry.
+   - A user removed from an org or thread can keep reading that one thread for up to the TTL.
+   - Shared-thread and public-share viewers get tokens under the share's own access check.
+   - Decide the TTL: shorter means faster revocation, longer means fewer mint calls.
+4. **Latency.**
+   - Streams go browser → us-west-2 directly: one hop, where today the path is DO → runtime → DO → browser. Time to first token should improve outside the US West.
+   - Writes are browser → Worker → runtime: ~150–250 ms from Europe for the Worker → runtime leg, as today.
+   - First paint: the loader mints the token and reads the newest page in parallel, one runtime round trip.
+   - Measure on staging from EU and APAC before cutover.
+5. **Runtime outage.**
+   - Runtime threads can neither load nor send; old DO threads, the thread list and the rest of the app keep working. Today runtime threads cannot send during an outage either, but they still render from the DO.
+   - The UI shows "Can't reach the agent service" with retry.
+   - The previous design's KV snapshot is dropped. Decide whether a read-only fallback is needed; if so, the lifecycle webhook could write the newest page to R2 on `run.finished`.
+6. **Multiple tabs.**
+   - Each tab is a watcher; the runtime orders every event by one cursor, and all tabs see sends from anyone.
+   - The capacity limit is per agent (32) and per tenant per node (runtime item 3).
+   - Hidden tabs pause after a grace period, and on return they resume at the cursor or from the snapshot.
+7. **Automations and channels starting turns.**
+   - They call `startRuntimeTurn()` server-side, with `from` / `actor` / `meta.source` set. Open tabs see those turns live, because a watcher sees every event.
+   - End-of-turn work (the automation outcome, the channel reply) runs from `run.finished`, so it must not ship before the lifecycle webhook.
+   - Billing: a steer from another user keeps the run's `actor`, and `whileRunning: "steer"` must preserve that.
+8. **Connection setup and other interactive tools.** Check that `prompt_connection_setup` over MCP can be a runtime `url` / `form` input. Its OAuth completion (`connection-setup-completion.ts`) would answer the input through the inputs route; today it calls the DO.
+9. **Tool-result fidelity.** The UI depends on chiridion tools returning `structuredContent` (preview targets, artifacts, diffs), which the runtime keeps as `details`. Audit every `code-mode-tools.ts` tool whose card reads more than its text result.
+10. **Sidebar activity text.** Mid-turn "activity text" in the sidebar came from DO state. With the lifecycle webhook, the sidebar gets running / idle only. Decide whether to drop the text or have the browser that is watching report it (not recommended).
+11. **Runtime threads already pinned in DO KV.** Their agents already live on the runtime, so adopting them is cheap: write a `thread_runtime` row with the stored agent id. This is not a transcript migration. It is optional and outside "no migration". Decide adopt or freeze; freezing is the default in this design.

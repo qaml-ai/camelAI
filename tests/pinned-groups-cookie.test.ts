@@ -89,3 +89,19 @@ describe("pinned group count cookie", () => {
     ]);
   });
 });
+
+describe("getCookie", () => {
+  it("returns the URI-decoded value the pinned-groups hint is written with", async () => {
+    const { getCookie } = await import("@/lib/cookies.server");
+    const value = JSON.stringify({ workspace_1: 3 });
+    const request = new Request("https://camelai.dev/", {
+      headers: {
+        Cookie: `sidebar_state=false; ${PINNED_GROUPS_COOKIE_NAME}=${encodeURIComponent(value)}; bad=%E0%A4%A`,
+      },
+    });
+    expect(getCookie(request, PINNED_GROUPS_COOKIE_NAME)).toBe(value);
+    expect(getCookie(request, "sidebar_state")).toBe("false");
+    expect(getCookie(request, "bad")).toBe("%E0%A4%A");
+    expect(getCookie(request, "missing")).toBeNull();
+  });
+});

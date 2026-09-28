@@ -5,14 +5,20 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { startRuntimeTurnMock, directEnabledMock } = vi.hoisted(() => ({
+const { startRuntimeTurnMock, directEnabledMock, migrateOnSendMock } = vi.hoisted(() => ({
   startRuntimeTurnMock: vi.fn(),
+  migrateOnSendMock: vi.fn(async () => null),
   directEnabledMock: vi.fn(() => true),
 }));
 
 vi.mock("../src/agent-runtime/thread-runtime.js", () => ({
   startRuntimeTurn: startRuntimeTurnMock,
   runtimeDirectThreadsEnabled: directEnabledMock,
+}));
+
+vi.mock("../src/agent-runtime/thread-migration.js", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  migrateThreadOnSend: migrateOnSendMock,
 }));
 
 import {
@@ -109,10 +115,22 @@ describe("startChannelRuntimeTurn", () => {
     expect(setThreadRuntimeAgent).not.toHaveBeenCalled();
   });
 
-  it("leaves a thread on ChatThreadDO's own loop there", async () => {
+  it("leaves a thread on ChatThreadDO's own loop there when it does not move", async () => {
     const { env } = fakeEnv({ row: null, relay: null });
     expect(await startChannelRuntimeTurn(env, request())).toBeNull();
+    expect(migrateOnSendMock).toHaveBeenCalledWith(env, expect.objectContaining({ threadId: "t1", userId: "owner-1", userName: "Ada" }));
     expect(startRuntimeTurnMock).not.toHaveBeenCalled();
+  });
+
+  it("moves a thread on ChatThreadDO's own loop to the runtime, then runs the message there", async () => {
+    migrateOnSendMock.mockResolvedValueOnce({ ...ROW, agentId: "agt_moved" } as never);
+    expect(await startChannelRuntimeTurn(fakeEnv({ row: null, relay: null }).env, request())).toEqual({ status: "accepted" });
+    expect(startRuntimeTurnMock.mock.calls[0][1].row.agentId).toBe("agt_moved");
+  });
+
+  it("does not move a thread with no member to act for its message", async () => {
+    expect(await startChannelRuntimeTurn(fakeEnv({ row: null, relay: null }).env, request({ userId: null }))).toBeNull();
+    expect(migrateOnSendMock).not.toHaveBeenCalled();
   });
 
   it("puts queued channel history in the next prompt, once", async () => {

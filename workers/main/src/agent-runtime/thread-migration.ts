@@ -19,9 +19,11 @@ import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import type { ThreadRuntimeRecord } from "../identity/org-do.js";
 import type { PreviewTarget } from "../../../../src/types.js";
 import { RuntimeApiError, runtimeApi, runtimeUrl } from "./runtime-api.js";
-import { directRuntimeRow } from "./channel-turns.js";
+import type { RelayRuntimeAgent } from "./channel-turns.js";
 import { resolveThreadRuntimeRoute, runtimeSystemPromptAppend } from "./run-gates.js";
 import { runtimeDirectThreadsEnabled } from "./thread-runtime.js";
+import { recordRuntimeMigration } from "./runtime-thread-telemetry.js";
+import { runtimeThreadMigrationEnabled } from "../../../../src/lib/agent-runtime-shared.js";
 
 /** What a DO hands over when a move begins. */
 export type RuntimeMigrationExport =
@@ -228,6 +230,29 @@ function orgStub(env: ChatEnv, orgId: string) {
   };
 }
 
+/**
+ * The thread's runtime row: its own, or one adopted from the runtime agent
+ * ChatThreadDO relays it to (null while that agent's turn runs, or when the
+ * thread has none). The adopted row carries no configuration, so the first
+ * direct turn configures the agent for the direct path.
+ */
+export async function directRuntimeRow(
+  env: ChatEnv,
+  orgId: string,
+  threadId: string,
+  options: { adopt: boolean },
+): Promise<ThreadRuntimeRecord | null> {
+  const org = orgStub(env, orgId);
+  const row = await org.getThreadRuntime(threadId);
+  if (row || !options.adopt) return row;
+  const relay = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId)) as unknown as {
+    relayRuntimeAgent(): Promise<RelayRuntimeAgent | null>;
+  };
+  const agent = await relay.relayRuntimeAgent();
+  if (!agent) return null;
+  return await org.setThreadRuntimeAgent(threadId, { ...agent, configured: null });
+}
+
 function doStub(env: ChatEnv, threadId: string) {
   return env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId)) as unknown as {
     beginRuntimeMigration(): Promise<RuntimeMigrationExport>;
@@ -339,4 +364,32 @@ export async function migrateThreadToRuntime(
     await dostub.abortRuntimeMigration(leaseId).catch(() => false);
     return { status: "failed", error: message };
   }
+}
+
+/** How long a message waits for a move another request is making (someone opened the thread). */
+const MOVING_WAIT_MS = 10_000;
+const MOVING_POLL_MS = 500;
+
+/**
+ * The runtime row for a message on a thread that may still be on
+ * ChatThreadDO: moved first where AGENT_RUNTIME_MIGRATE_DO_THREADS is on.
+ * Null when it stays on the DO for now (busy there, no runtime route, or the
+ * move failed), and the DO runs the message.
+ */
+export async function migrateThreadOnSend(env: ChatEnv, context: ChatContextState): Promise<ThreadRuntimeRecord | null> {
+  if (!runtimeThreadMigrationEnabled(env)) return null;
+  const result = await migrateThreadToRuntime(env, context).catch((error: unknown): RuntimeMigrationResult => ({
+    status: "failed",
+    error: error instanceof Error ? error.message : String(error),
+  }));
+  recordRuntimeMigration(env, context, result);
+  if ("row" in result) return result.row;
+  if (result.status !== "busy" || result.reason !== "moving") return null;
+  const org = orgStub(env, context.orgId);
+  for (let waited = 0; waited < MOVING_WAIT_MS; waited += MOVING_POLL_MS) {
+    await new Promise((resolve) => setTimeout(resolve, MOVING_POLL_MS));
+    const row = await org.getThreadRuntime(context.threadId);
+    if (row) return row;
+  }
+  return null;
 }

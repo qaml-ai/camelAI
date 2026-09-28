@@ -12,10 +12,10 @@
  * member (email), else the member who connected the channel.
  */
 import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
-import type { ThreadRuntimeRecord } from "../identity/org-do.js";
 import { formatAttributedUserMessage } from "../chat-author-attribution.js";
 import { RUNTIME_REQUEST_ID } from "../../../../src/lib/agent-runtime-shared.js";
 import { runtimeDirectThreadsEnabled, startRuntimeTurn } from "./thread-runtime.js";
+import { directRuntimeRow, migrateThreadOnSend } from "./thread-migration.js";
 
 export interface ChannelTurnRequest {
   threadId: string;
@@ -108,41 +108,6 @@ export function channelRequestId(clientMessageId: string | null | undefined): st
   return safe && RUNTIME_REQUEST_ID.test(safe) ? safe : crypto.randomUUID();
 }
 
-function orgStub(env: ChatEnv, orgId: string) {
-  return env.ORG.get(env.ORG.idFromName(orgId)) as unknown as {
-    getThreadRuntime(threadId: string): Promise<ThreadRuntimeRecord | null>;
-    setThreadRuntimeAgent(threadId: string, update: {
-      agentId: string;
-      model: string | null;
-      keyScope: string | null;
-      configured?: Record<string, unknown> | null;
-    }): Promise<ThreadRuntimeRecord | null>;
-  };
-}
-
-/**
- * The thread's runtime row: its own, or one adopted from the runtime agent
- * ChatThreadDO relays it to (null while that agent's turn runs, or when the
- * thread has none). The adopted row carries no configuration, so the first
- * direct turn configures the agent for the direct path.
- */
-export async function directRuntimeRow(
-  env: ChatEnv,
-  orgId: string,
-  threadId: string,
-  options: { adopt: boolean },
-): Promise<ThreadRuntimeRecord | null> {
-  const org = orgStub(env, orgId);
-  const row = await org.getThreadRuntime(threadId);
-  if (row || !options.adopt) return row;
-  const relay = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId)) as unknown as {
-    relayRuntimeAgent(): Promise<RelayRuntimeAgent | null>;
-  };
-  const agent = await relay.relayRuntimeAgent();
-  if (!agent) return null;
-  return await org.setThreadRuntimeAgent(threadId, { ...agent, configured: null });
-}
-
 /**
  * Start a channel message's turn on the direct path; null when the thread is
  * not a direct runtime thread (it stays on ChatThreadDO).
@@ -152,17 +117,21 @@ export async function startChannelRuntimeTurn(env: ChatEnv, request: ChannelTurn
   // A relay thread is adopted only with a member to act for it; without
   // one it stays on ChatThreadDO, and a direct thread cannot run the turn
   // (every tool call, the reply's included, is authorized as a member).
-  const row = await directRuntimeRow(env, request.orgId, request.threadId, { adopt: Boolean(request.userId) });
+  const context: ChatContextState | null = request.userId
+    ? {
+      orgId: request.orgId,
+      workspaceId: request.workspaceId,
+      threadId: request.threadId,
+      userId: request.userId,
+      userName: request.userName ?? null,
+      userEmail: request.userEmail ?? null,
+    }
+    : null;
+  // A thread on the DO's own loop moves to the runtime first, where that is on.
+  const row = await directRuntimeRow(env, request.orgId, request.threadId, { adopt: Boolean(context) })
+    ?? (context ? await migrateThreadOnSend(env, context) : null);
   if (!row) return null;
-  if (!request.userId) return { status: "error", error: "No workspace member to act for this channel message" };
-  const context: ChatContextState = {
-    orgId: request.orgId,
-    workspaceId: request.workspaceId,
-    threadId: request.threadId,
-    userId: request.userId,
-    userName: request.userName ?? null,
-    userEmail: request.userEmail ?? null,
-  };
+  if (!context || !request.userId) return { status: "error", error: "No workspace member to act for this channel message" };
   const notes = await takeChannelHistoryNotes(env, request.threadId);
   // As ChatThreadDO words a channel message: its system context, then the
   // sender and channel ("[slack message from …]: …").

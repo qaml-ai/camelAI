@@ -5,11 +5,10 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { runtimeApiMock, directEnabledMock, directRowMock, routeMock } = vi.hoisted(() => ({
+const { runtimeApiMock, directEnabledMock, routeMock } = vi.hoisted(() => ({
   runtimeApiMock: vi.fn(),
   routeMock: vi.fn(),
   directEnabledMock: vi.fn(() => true),
-  directRowMock: vi.fn(),
 }));
 
 vi.mock("../src/agent-runtime/runtime-api.js", async (importOriginal) => ({
@@ -24,10 +23,6 @@ vi.mock("../src/agent-runtime/thread-runtime.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   runtimeDirectThreadsEnabled: directEnabledMock,
 }));
-vi.mock("../src/agent-runtime/channel-turns.js", async (importOriginal) => ({
-  ...(await importOriginal<object>()),
-  directRuntimeRow: directRowMock,
-}));
 
 import {
   ARCHIVE_PATH,
@@ -35,6 +30,7 @@ import {
   MAX_TOOL_RESULT_CHARS,
   convertTranscript,
   importNote,
+  migrateThreadOnSend,
   migrateThreadToRuntime,
   type RuntimeMigrationExport,
 } from "../src/agent-runtime/thread-migration";
@@ -132,8 +128,9 @@ describe("migrateThreadToRuntime", () => {
   const context = { orgId: "org1", workspaceId: "ws1", threadId: "t1", userId: "u1", userName: "Ada", userEmail: null };
   const ROW = { threadId: "t1", agentId: "agt_new", model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
 
-  function fakeEnv(handover: RuntimeMigrationExport, options: { row?: typeof ROW | null; setRow?: typeof ROW | null } = {}) {
+  function fakeEnv(handover: RuntimeMigrationExport, options: { row?: typeof ROW | null; setRow?: typeof ROW | null; relay?: object | null; flags?: Record<string, string> } = {}) {
     const doStub = {
+      relayRuntimeAgent: vi.fn(async () => options.relay ?? null),
       beginRuntimeMigration: vi.fn(async () => handover),
       abortRuntimeMigration: vi.fn(async () => true),
       completeRuntimeMigration: vi.fn(async () => true),
@@ -145,6 +142,7 @@ describe("migrateThreadToRuntime", () => {
       setThreadUiState: vi.fn(async () => ({})),
     };
     const env = {
+      ...options.flags,
       AGENT_RUNTIME_DEFINITION: "def_1",
       AGENT_RUNTIME_URL: "https://runtime.test",
       AGENT_RUNTIME_API_TOKEN: "operator",
@@ -219,8 +217,9 @@ describe("migrateThreadToRuntime", () => {
   });
 
   it("adopts a relay thread, and waits out a busy one", async () => {
-    directRowMock.mockResolvedValue(ROW);
-    expect(await migrateThreadToRuntime(fakeEnv({ status: "relay" }).env, context)).toMatchObject({ status: "adopted", row: ROW });
+    const relay = fakeEnv({ status: "relay" }, { relay: { agentId: "agt_relay", model: "m", keyScope: "hosted" } });
+    expect(await migrateThreadToRuntime(relay.env, context)).toMatchObject({ status: "adopted", row: ROW });
+    expect(relay.org.setThreadRuntimeAgent).toHaveBeenCalledWith("t1", { agentId: "agt_relay", model: "m", keyScope: "hosted", configured: null });
     expect(await migrateThreadToRuntime(fakeEnv({ status: "busy", reason: "running" }).env, context)).toEqual({ status: "busy", reason: "running" });
   });
 
@@ -241,5 +240,54 @@ describe("migrateThreadToRuntime", () => {
     expect(onRuntime.doStub.beginRuntimeMigration).not.toHaveBeenCalled();
     directEnabledMock.mockReturnValue(false);
     expect(await migrateThreadToRuntime(fakeEnv(ok([])).env, context)).toMatchObject({ status: "skipped" });
+  });
+});
+
+describe("migrateThreadOnSend", () => {
+  const context = { orgId: "org1", workspaceId: "ws1", threadId: "t1", userId: "u1", userName: "Ada", userEmail: null };
+  const ROW = { threadId: "t1", agentId: "agt_new", model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
+  const FLAGS = { AGENT_RUNTIME_API_TOKEN: "operator", AGENT_RUNTIME_TENANT: "chiridion", AGENT_RUNTIME_DIRECT_THREADS: "1", AGENT_RUNTIME_MIGRATE_DO_THREADS: "1" };
+
+  function fakeEnv(handover: RuntimeMigrationExport, rows: Array<typeof ROW | null>, flags: Record<string, string> = FLAGS) {
+    const getThreadRuntime = vi.fn(async () => rows.shift() ?? null);
+    const org = { getThread: vi.fn(async () => ({ created_by: "u1" })), getThreadRuntime, setThreadRuntimeAgent: vi.fn(async () => ROW), setThreadUiState: vi.fn(async () => ({})) };
+    const thread = {
+      beginRuntimeMigration: vi.fn(async () => handover),
+      abortRuntimeMigration: vi.fn(async () => true),
+      completeRuntimeMigration: vi.fn(async () => true),
+      relayRuntimeAgent: vi.fn(async () => null),
+    };
+    return {
+      env: { ...flags, AGENT_RUNTIME_DEFINITION: "def_1", AGENT_RUNTIME_URL: "https://runtime.test", ORG: { idFromName: (n: string) => n, get: () => org }, CHAT_THREAD: { idFromName: (n: string) => n, get: () => thread } } as unknown as ChatEnv,
+      getThreadRuntime,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useRealTimers();
+    directEnabledMock.mockReturnValue(true);
+    routeMock.mockResolvedValue({ route: { provider: "openrouter" } });
+    runtimeApiMock.mockResolvedValue({ id: "agt_new" });
+  });
+
+  it("moves the thread and answers its new row", async () => {
+    const { env } = fakeEnv({ status: "ok", leaseId: "l", messages: [user("hi")] as never, previewTabs: [], previewActiveTabId: null }, [null]);
+    expect(await migrateThreadOnSend(env, context)).toEqual(ROW);
+  });
+
+  it("waits for a move another request is making", async () => {
+    vi.useFakeTimers();
+    const { env } = fakeEnv({ status: "busy", reason: "moving" }, [null, null, ROW]);
+    const row = migrateThreadOnSend(env, context);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(await row).toEqual(ROW);
+  });
+
+  it("leaves the thread on ChatThreadDO when it is busy there, or the flag is off", async () => {
+    expect(await migrateThreadOnSend(fakeEnv({ status: "busy", reason: "running" }, [null]).env, context)).toBeNull();
+    const off = fakeEnv({ status: "moved" }, [null], { ...FLAGS, AGENT_RUNTIME_MIGRATE_DO_THREADS: "" });
+    expect(await migrateThreadOnSend(off.env, context)).toBeNull();
+    expect(off.getThreadRuntime).not.toHaveBeenCalled();
   });
 });

@@ -19,7 +19,6 @@ import {
   pinNewThreadToRuntime,
   runtimeAgentThreadKey,
   threadScratchVolume,
-  spendLimitHolds,
   startRuntimeTurn,
 } from "../src/agent-runtime/thread-runtime";
 import { createOrg, createUser, type TestEnv } from "./test-helpers";
@@ -261,7 +260,7 @@ describe("pinNewThreadToRuntime", () => {
   });
 });
 
-describe("spend limits and retries on an existing agent", () => {
+describe("an existing agent's spend limit, and retries", () => {
   async function withLimit(limit: number | null) {
     const setup = await runtimeThread();
     fakeRuntime();
@@ -271,24 +270,13 @@ describe("spend limits and retries on an existing agent", () => {
     return setup;
   }
 
-  it("sets the spend limit while the agent is idle", async () => {
+  it("removes a spend limit an earlier release set on the agent itself", async () => {
     const setup = await withLimit(5);
     const calls = fakeRuntime();
     await send(setup, "next", "cm_idle");
     const configure = calls.find((call) => call.path.endsWith("/configuration"));
     expect(configure?.body).toMatchObject({ spendLimit: null });
-    expect(await setup.orgStub.getThreadRuntime(setup.threadId)).toMatchObject({ configured: { spendLimitUsd: null } });
-  });
-
-  it("leaves a running turn's budget alone when someone sends during it", async () => {
-    const setup = await withLimit(5);
-    const calls = fakeRuntime({
-      "GET /v1/agents/agt_1/state": () => Response.json({ cursor: 3, requests: [{ id: "r1", method: "prompt", state: "running" }] }),
-    });
-    expect(await send(setup, "during", "cm_during")).toMatchObject({ status: "accepted" });
-    expect(calls.some((call) => call.path.endsWith("/configuration"))).toBe(false);
-    expect(calls.some((call) => call.path.endsWith("/prompt"))).toBe(true);
-    expect(await setup.orgStub.getThreadRuntime(setup.threadId)).toMatchObject({ configured: { spendLimitUsd: 5 } });
+    expect((await setup.orgStub.getThreadRuntime(setup.threadId))!.configured).not.toHaveProperty("spendLimitUsd");
   });
 
   it("changes nothing for a retried request", async () => {
@@ -359,14 +347,13 @@ describe("the usual send", () => {
     expect(await runningRows(setup)).toEqual([expect.objectContaining({ threadId: setup.threadId, startedAt: otherStart })]);
   });
 
-  it("keeps the spend limit while only this thread spent, and sets it again when the budget moved otherwise", async () => {
+  it("sends each run the budget left now, and never reconfigures the agent for it", async () => {
     const setup = await runtimeThread();
     await setup.orgStub.setUserLlmUsageLimits(setup.sender.userId, [{ window_hours: 24, limit_usd: 5 }]);
     let calls = fakeRuntime();
     await send(setup, "first", "cm_s1");
-    expect(calls.find((call) => call.path === "/v1/agents")!.body.spendLimit).toEqual({ usd: 5 });
-    const created = (await setup.orgStub.getThreadRuntime(setup.threadId))!;
-    expect(created.configured).toMatchObject({ spendLimitUsd: 5, spendLimitSetAt: expect.any(Number) });
+    expect(calls.find((call) => call.path === "/v1/agents")!.body).not.toHaveProperty("spendLimit");
+    expect(calls.find((call) => call.path.endsWith("/prompt"))!.body.spendLimit).toEqual({ usd: 5 });
 
     const usage = (threadId: string, id: string) => setup.orgStub.recordUsage({
       workspace_id: setup.context.workspaceId,
@@ -381,36 +368,17 @@ describe("the usual send", () => {
       source: "agent_runtime",
       source_id: id,
     });
-    // This thread's agent spent $1: the runtime counted it against the $5 too.
+    // This thread spent $1, then another thread $1 of the user's budget: each next run gets what is left.
     await usage(setup.threadId, "evt_own");
     calls = fakeRuntime();
     await send(setup, "second", "cm_s2");
     expect(calls.map((call) => call.path)).toEqual(["/v1/agents/agt_1/prompt"]);
-
-    // Another thread spent $1 of the user's budget: $3 left, not the $4 the agent counts.
+    expect(calls[0].body.spendLimit).toEqual({ usd: 4 });
     await usage(crypto.randomUUID(), "evt_other");
     calls = fakeRuntime();
     await send(setup, "third", "cm_s3");
-    const configure = calls.find((call) => call.path.endsWith("/configuration"))!;
-    expect(configure.body).toEqual({ requestId: expect.any(String), spendLimit: { usd: 3 } });
-    const updated = (await setup.orgStub.getThreadRuntime(setup.threadId))!;
-    expect(updated.configured).toMatchObject({ spendLimitUsd: 3 });
-    expect(updated.configured!.spendLimitSetAt as number).toBeGreaterThan(created.configured!.spendLimitSetAt as number);
-  });
-});
-
-describe("spendLimitHolds", () => {
-  it("holds a budget the thread's own spend explains, within a cent", () => {
-    expect(spendLimitHolds(null, null, null)).toBe(true);
-    expect(spendLimitHolds(5, null, null)).toBe(false);
-    expect(spendLimitHolds(null, 5, 0)).toBe(false);
-    expect(spendLimitHolds(5, 5, null)).toBe(false);
-    expect(spendLimitHolds(4, 5, 1)).toBe(true);
-    expect(spendLimitHolds(4.004, 5, 1)).toBe(true);
-    expect(spendLimitHolds(3, 5, 1)).toBe(false);
-    expect(spendLimitHolds(6, 5, 0)).toBe(false);
-    // Spent past the limit: none left on either side.
-    expect(spendLimitHolds(0, 5, 7)).toBe(true);
+    expect(calls.map((call) => call.path)).toEqual(["/v1/agents/agt_1/prompt"]);
+    expect(calls[0].body.spendLimit).toEqual({ usd: 3 });
   });
 });
 

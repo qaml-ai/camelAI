@@ -101,7 +101,6 @@ function orgStub(env: ChatEnv, orgId: string) {
   return env.ORG.get(env.ORG.idFromName(orgId)) as unknown as {
     getThread(id: string): Promise<{ created_by?: string | null } | null>;
     getThreadRuntime(threadId: string): Promise<ThreadRuntimeRecord | null>;
-    getThreadRuntimeSpendSince(threadId: string, fromMs: number): Promise<number>;
     pinThreadRuntime(threadId: string): Promise<boolean>;
     setThreadRuntimeAgent(threadId: string, update: {
       agentId: string;
@@ -236,7 +235,6 @@ async function createThreadAgent(
       ttlSeconds: null,
       model: run.model,
       ...(run.keyScope ? { keyScope: run.keyScope } : {}),
-      ...(run.spendLimitUsd !== null ? { spendLimit: { usd: run.spendLimitUsd } } : {}),
       ...(run.modelHeaders ? { modelHeaders: run.modelHeaders } : {}),
       thinkingLevel: run.thinkingLevel,
       systemPromptAppend: runtimeSystemPromptAppend(env, context),
@@ -260,66 +258,20 @@ async function createThreadAgent(
   }
 }
 
-/** Whether the agent is running a turn now, and whether it already has `requestId` (a retried send). */
-async function agentActivity(env: ChatEnv, agentId: string, requestId: string): Promise<{ running: boolean; retried: boolean }> {
-  const base = `/v1/agents/${encodeURIComponent(agentId)}`;
-  const [state, retried] = await Promise.all([
-    runtimeApi(env, "GET", `${base}/state`) as Promise<{ requests?: Array<{ state?: string; method?: string }> }>,
-    runtimeApi(env, "GET", `${base}/requests/${encodeURIComponent(requestId)}`).then(() => true, (error) => {
-      if (error instanceof RuntimeApiError && error.status === 404) return false;
-      throw error;
-    }),
-  ]);
-  const running = (state?.requests ?? []).some((request) =>
-    request.state === "running" && ["prompt", "continue", "resume"].includes(request.method ?? ""));
-  return { running, retried };
-}
-
-/** How far apart two spend limits may be and still count as the same budget. */
-const SPEND_LIMIT_TOLERANCE_USD = 0.01;
-
-/**
- * Whether the agent's spend limit already holds the budget `next`: the limit
- * last set (`last`) less what the thread's agent spent since, as chiridion
- * recorded it. The runtime counts that same spend against the limit, so when
- * the two agree nothing outside this thread changed the budget (another
- * thread's spend, a credit purchase, a new window of a user's limit) and a
- * PATCH would only restart the count. Spend not yet recorded is missing from
- * both sides alike. Unknown spend (null): it does not hold.
- */
-export function spendLimitHolds(next: number | null, last: number | null, spentSince: number | null): boolean {
-  if (next === null || last === null) return next === last;
-  if (spentSince === null) return false;
-  return Math.abs(Math.max(0, last - spentSince) - next) < SPEND_LIMIT_TOLERANCE_USD;
-}
-
-/** What the thread's agent spent since its spend limit was set; null without a limit or its time. */
-async function spentSinceLimit(
-  env: ChatEnv,
-  context: ChatContextState,
-  row: ThreadRuntimeRecord,
-  timings: SendTimings,
-): Promise<number | null> {
-  const setAt = row.configured?.spendLimitSetAt;
-  if (!row.agentId || typeof setAt !== "number" || typeof row.configured?.spendLimitUsd !== "number") return null;
-  return await timed(timings, "spent", () => orgStub(env, context.orgId).getThreadRuntimeSpendSince(context.threadId, setAt))
-    .catch((error: unknown) => {
-      console.warn("[runtime-thread] could not read the thread's spend; its spend limit is set again", error);
-      return null;
-    });
+/** Whether the agent already has `requestId`: a retried send, which changes nothing. */
+async function retriedRequest(env: ChatEnv, agentId: string, requestId: string): Promise<boolean> {
+  return await runtimeApi(env, "GET", `/v1/agents/${encodeURIComponent(agentId)}/requests/${encodeURIComponent(requestId)}`).then(() => true, (error) => {
+    if (error instanceof RuntimeApiError && error.status === 404) return false;
+    throw error;
+  });
 }
 
 /**
  * The thread's agent, created (or adopted) on first use and configured for
- * this send where the model, key scope, instructions or budget changed. The
- * usual send changes none of them and makes no runtime call here.
- *
- * A spend limit is a budget from now: the runtime resets what was spent and
- * applies it at once, to a running turn too. So it is set only when the
- * budget changed beyond the thread's own spend (spendLimitHolds), and only
- * while the agent is idle; a send during a turn (another member's, or a
- * retry) leaves the running turn's budget alone, and a retried request
- * changes nothing.
+ * this send where the model, key scope or instructions changed. The usual
+ * send changes none of them and makes no runtime call here. The budget is not
+ * the agent's: each prompt carries its run's own spend limit. An agent given a
+ * limit of its own by an earlier release has it removed.
  */
 async function ensureConfiguredAgent(
   env: ChatEnv,
@@ -327,7 +279,6 @@ async function ensureConfiguredAgent(
   row: ThreadRuntimeRecord,
   run: PreparedRuntimeRun,
   requestId: string,
-  spentSince: number | null,
   timings: SendTimings,
 ): Promise<string> {
   const org = orgStub(env, context.orgId);
@@ -335,7 +286,6 @@ async function ensureConfiguredAgent(
   /** An agent made under an earlier configuration (adopted): bring all of it up to date. */
   let stale = false;
   if (!agentId) {
-    const limitSetAt = Date.now();
     const made = await createThreadAgent(env, context, run);
     agentId = made.agentId;
     if (!made.adopted) {
@@ -345,8 +295,6 @@ async function ensureConfiguredAgent(
         keyScope: run.keyScope,
         configured: {
           thinkingLevel: run.thinkingLevel,
-          spendLimitUsd: run.spendLimitUsd,
-          spendLimitSetAt: limitSetAt,
           promptVersion: RUNTIME_PROMPT_VERSION,
         },
       });
@@ -357,19 +305,16 @@ async function ensureConfiguredAgent(
   const id = agentId;
   const modelChanged = stale || row.model !== run.model;
   const scopeChanged = stale || (row.keyScope ?? null) !== run.keyScope;
-  const lastLimit = (row.configured?.spendLimitUsd as number | null | undefined) ?? null;
-  const limitChanged = stale || !spendLimitHolds(run.spendLimitUsd, lastLimit, spentSince);
+  const { spendLimitUsd: agentLimit, spendLimitSetAt: _setAt, ...configured } = row.configured ?? {};
+  // A limit an earlier release set on the agent itself (each run carries its own now).
+  const limitLeft = stale || (agentLimit !== undefined && agentLimit !== null);
   // Instructions from an earlier version (or none recorded): send the current ones.
   const promptChanged = stale || row.configured?.promptVersion !== RUNTIME_PROMPT_VERSION;
-  if (!modelChanged && !scopeChanged && !limitChanged && !promptChanged) return id;
-  const { running, retried } = await timed(timings, "activity", () => agentActivity(env, id, requestId));
-  if (retried) return id;
-  const setLimit = limitChanged && !running;
-  if (!modelChanged && !scopeChanged && !setLimit && !promptChanged) return id;
-  const limitSetAt = Date.now();
+  if (!modelChanged && !scopeChanged && !limitLeft && !promptChanged) return id;
+  if (await timed(timings, "activity", () => retriedRequest(env, id, requestId))) return id;
   await timed(timings, "patch", () => runtimeApi(env, "PATCH", `/v1/agents/${encodeURIComponent(id)}/configuration`, {
     requestId: `run_${crypto.randomUUID()}`,
-    ...(setLimit ? { spendLimit: run.spendLimitUsd === null ? null : { usd: run.spendLimitUsd } } : {}),
+    ...(limitLeft ? { spendLimit: null } : {}),
     ...(modelChanged ? { model: run.model, thinkingLevel: run.thinkingLevel } : {}),
     ...(scopeChanged ? { keyScope: run.keyScope, modelHeaders: run.modelHeaders } : {}),
     ...(promptChanged ? { systemPromptAppend: runtimeSystemPromptAppend(env, context) } : {}),
@@ -379,10 +324,8 @@ async function ensureConfiguredAgent(
     model: run.model,
     keyScope: run.keyScope,
     configured: {
-      ...row.configured,
+      ...configured,
       thinkingLevel: modelChanged ? run.thinkingLevel : row.configured?.thinkingLevel ?? run.thinkingLevel,
-      spendLimitUsd: setLimit ? run.spendLimitUsd : lastLimit,
-      spendLimitSetAt: setLimit ? limitSetAt : row.configured?.spendLimitSetAt ?? null,
       promptVersion: RUNTIME_PROMPT_VERSION,
     },
   });
@@ -456,7 +399,7 @@ async function sendRuntimeTurn(
   const { context, sender } = input;
   const text = input.text.trim();
   if (!text) return { status: "error", error: "Empty message" };
-  const [banned, prepared, spentSince] = await Promise.all([
+  const [banned, prepared] = await Promise.all([
     timed(timings, "ban", () => isOrgBanned(env.APP_KV, { orgId: context.orgId })),
     timed(timings, "prepare", () => prepareThreadRuntimeRun(env, context, sender.userId, timings)).then(
       (run) => ({ run }),
@@ -465,7 +408,6 @@ async function sendRuntimeTurn(
         throw error;
       },
     ),
-    spentSinceLimit(env, context, input.row, timings),
   ]);
   if (banned) return { status: "error", error: "Organization is blocked" };
   if ("refused" in prepared) return { status: "error", error: prepared.refused.message, code: prepared.refused.code };
@@ -478,7 +420,7 @@ async function sendRuntimeTurn(
   let request: { id?: unknown; state?: unknown };
   try {
     const configured = timed(timings, "configure", () =>
-      ensureConfiguredAgent(env, context, input.row, run, input.clientMessageId, spentSince, timings));
+      ensureConfiguredAgent(env, context, input.row, run, input.clientMessageId, timings));
     // The message's uploads, attached as runtime files too (native images and
     // PDFs); alongside the configuration when the agent already exists.
     const files = (input.row.agentId ? Promise.resolve(input.row.agentId) : configured)
@@ -490,6 +432,9 @@ async function sendRuntimeTurn(
       ...(attached.length > 0 ? { files: attached } : {}),
       from: { id: sender.userId, ...(name ? { name: name.slice(0, 200) } : {}) },
       actor: sender.userId,
+      // The run's budget: what the org's and the user's limits leave now. It ends the run that
+      // spends it; a message that joins a running turn leaves that turn's budget as it was.
+      ...(run.spendLimitUsd !== null ? { spendLimit: { usd: run.spendLimitUsd } } : {}),
       // Echoed on the user message: the page matches its optimistic bubble by it.
       requestId: input.clientMessageId,
       // A message sent while a turn runs joins it, as in the DO's chat; with

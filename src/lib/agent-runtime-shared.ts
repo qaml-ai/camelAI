@@ -121,7 +121,8 @@ export interface RuntimeInput {
   id: string;
   kind: "question" | "approval" | "form" | "url";
   message: string;
-  detail: Record<string, unknown>;
+  /** What it asks, by kind (the runtime's InputDetail); read defensively, as it arrives as JSON. */
+  detail: unknown;
   expiresAt?: number;
 }
 

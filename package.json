@@ -106,7 +106,7 @@
 	},
 	"dependencies": {
 		"@ai-sdk/react": "^3.0.204",
-		"@camelai/agent-runtime": "0.9.0",
+		"@camelai/agent-runtime": "0.10.0",
 		"@cloudflare/ai-chat": "^0.9.4",
 		"@cloudflare/dynamic-workflows": "^0.1.1",
 		"@cloudflare/sandbox": "^0.12.0",

@@ -5,6 +5,7 @@
  *   POST /api/admin/d1-mirror/backfill            {"action": "start" | "step" | "reset"}
  *   GET  /api/admin/d1-mirror/outbox?org_id=|user_id=   one DO's outbox stats
  *   POST /api/admin/d1-mirror/resync              {"org_id"} | {"user_id"}: re-mirror one DO
+ *   POST /api/admin/d1-mirror/reconcile           {"sample"?}: run the drift reconciler now
  */
 
 import { Hono } from "hono";
@@ -17,6 +18,7 @@ import {
   runMirrorBackfillStep,
   startMirrorBackfill,
 } from "../../admin-index-bootstrap.js";
+import { runMirrorReconcile } from "../../d1-mirror-reconcile.js";
 import { getOrgStub, getUserStub } from "./helpers.js";
 import { ErrorSchema } from "./schemas.js";
 
@@ -53,6 +55,21 @@ d1MirrorRoutes.post(
     if (action === "start") return c.json(await startMirrorBackfill(c.env));
     if (action === "reset") return c.json(await resetMirrorBackfill(c.env));
     return c.json(await runMirrorBackfillStep(c.env));
+  },
+);
+
+d1MirrorRoutes.post(
+  "/d1-mirror/reconcile",
+  openApi({
+    summary:
+      "Run the D1 drift reconciler now over a sample of orgs and users (same as the hourly cron; emits d1_drift / d1_reconcile_ok)",
+    request: { json: z.object({ sample: z.number().int().min(1).max(500).optional() }) },
+    responses: { 200: ObjectSchema },
+  }),
+  async (c) => {
+    const { sample } = c.req.valid("json");
+    const result = await runMirrorReconcile(c.env, { sample: sample ?? 10 });
+    return c.json({ compared: result.compared, drift_count: result.drift.length, drift: result.drift.slice(0, 200) });
   },
 );
 

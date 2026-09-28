@@ -1158,6 +1158,41 @@ export class OrgDO extends DurableObject<DOEnv> {
     return { queued };
   }
 
+  /**
+   * Reconciler: current mirrored state of the org and every child row it owns
+   * (threads: the requested ids plus a random sample), keyed like the outbox,
+   * plus the outbox keys still in flight. `orgId` is null for a hard-deleted org.
+   */
+  async getMirrorReconcileSnapshot(
+    options: { threadIds?: string[]; threadSample?: number } = {},
+  ): Promise<{ orgId: string | null; entities: Array<{ key: string; events: AdminEventType[] }>; pending: string[] }> {
+    const info = this.getInfoSync();
+    if (!info) return { orgId: null, entities: [], pending: [] };
+    const entities: Array<{ key: string; events: AdminEventType[] }> = [];
+    const add = (kind: MirrorKind, id: string) =>
+      entities.push({ key: `${kind}:${id}`, events: this.mirrorSnapshot(kind, id) });
+    const ids = (query: string) =>
+      this.sql.exec<{ id: string }>(query).toArray().map((row) => row.id);
+
+    add("org", "");
+    for (const id of ids("SELECT user_id AS id FROM members")) add("org_membership", id);
+    for (const id of ids("SELECT id FROM invitations")) add("invitation", id);
+    for (const id of ids("SELECT id FROM workspaces")) add("workspace", id);
+    for (const id of ids(
+      "SELECT workspace_id || ':' || user_id AS id FROM workspace_memberships",
+    )) {
+      add("workspace_member", id);
+    }
+    for (const id of ids("SELECT script_name AS id FROM worker_scripts")) add("app", id);
+    const threadIds = new Set(options.threadIds ?? []);
+    const sample = Math.max(0, Math.min(200, Math.floor(options.threadSample ?? 20)));
+    if (sample > 0) {
+      for (const id of ids(`SELECT id FROM threads ORDER BY RANDOM() LIMIT ${sample}`)) threadIds.add(id);
+    }
+    for (const id of threadIds) add("thread", id);
+    return { orgId: info.id, entities, pending: this.mirror.pendingKeys() };
+  }
+
   async getMirrorOutboxStats() {
     return this.mirror.stats();
   }

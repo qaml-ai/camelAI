@@ -369,6 +369,11 @@ export class UserDO extends DurableObject<DOEnv> {
     this.markMirrorDirty();
   }
 
+  /** Reconciler: this user's current mirrored state, plus what is still in flight. */
+  async getMirrorReconcileSnapshot(): Promise<{ events: AdminEventType[]; pending: string[] }> {
+    return { events: this.mirrorSnapshot(), pending: this.mirror.pendingKeys() };
+  }
+
   async getMirrorOutboxStats() {
     return this.mirror.stats();
   }

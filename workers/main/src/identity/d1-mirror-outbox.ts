@@ -161,6 +161,14 @@ export class D1MirrorOutbox {
     return typeof row?.due === "number" ? row.due : null;
   }
 
+  /** Outbox keys (`kind:id`) still waiting to reach D1: in flight, not drift. */
+  pendingKeys(): string[] {
+    return this.sql
+      .exec<{ key: string }>("SELECT key FROM d1_mirror_outbox WHERE kind != 'event'")
+      .toArray()
+      .map((row) => row.key);
+  }
+
   pendingCount(): number {
     const row = this.sql
       .exec<{ count: number }>("SELECT COUNT(*) AS count FROM d1_mirror_outbox")

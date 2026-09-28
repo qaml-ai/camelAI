@@ -161,6 +161,11 @@ export class D1MirrorOutbox {
     return typeof row?.due === "number" ? row.due : null;
   }
 
+  /** Drop everything queued (the owning entity was hard-deleted). */
+  clear(): void {
+    this.sql.exec("DELETE FROM d1_mirror_outbox");
+  }
+
   /** Outbox keys (`kind:id`) still waiting to reach D1: in flight, not drift. */
   pendingKeys(): string[] {
     return this.sql

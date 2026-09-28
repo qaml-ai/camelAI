@@ -1193,6 +1193,11 @@ export class OrgDO extends DurableObject<DOEnv> {
     return { orgId: info.id, entities, pending: this.mirror.pendingKeys() };
   }
 
+  /** Orphan cleanup: whether this OrgDO still holds an org (read-only). */
+  mirrorOrgExists(): boolean {
+    return this.getInfoSync() !== null;
+  }
+
   async getMirrorOutboxStats() {
     return this.mirror.stats();
   }
@@ -7728,6 +7733,18 @@ export class OrgDO extends DurableObject<DOEnv> {
     this.sql.exec("DELETE FROM thread_ui_state");
     this.sql.exec("DELETE FROM proxy_usage");
     this.sql.exec("DELETE FROM openai_subscription");
+    // Nothing left to mirror: drop queued rows, then purge (and tombstone) the
+    // org's D1 rows. If this fails, the backfill's orphan phase and the
+    // reconciler (org.do_missing) purge them later.
+    this.mirror.clear();
+    try {
+      await getAppIndexDatabase(this.env)?.purgeMirroredOrg(info.id);
+    } catch (error) {
+      console.error("[OrgDO] failed to purge hard-deleted org from D1", {
+        orgId: info.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
 
     console.log("[OrgDO] hard deleted org", {
       orgId: info.id,

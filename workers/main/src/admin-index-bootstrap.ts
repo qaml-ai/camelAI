@@ -218,7 +218,7 @@ export async function ensureAdminIndexReady(
 const MIRROR_BACKFILL_STATE_KEY = 'd1_mirror_backfill';
 const MIRROR_BACKFILL_PAGE_SIZE = 25;
 
-export type MirrorBackfillPhase = 'users' | 'orgs' | 'done';
+export type MirrorBackfillPhase = 'users' | 'orgs' | 'orphan_orgs' | 'orphan_users' | 'done';
 
 export interface MirrorBackfillState {
   status: 'idle' | 'running' | 'done';
@@ -226,6 +226,9 @@ export interface MirrorBackfillState {
   cursor: string | null;
   users_queued: number;
   orgs_queued: number;
+  /** D1 orgs/users whose owning DO no longer exists, purged from D1. */
+  orphan_orgs_purged: number;
+  orphan_users_purged: number;
   errors: number;
   last_error: string | null;
   started_at: number | null;
@@ -239,6 +242,8 @@ const IDLE_BACKFILL_STATE: MirrorBackfillState = {
   cursor: null,
   users_queued: 0,
   orgs_queued: 0,
+  orphan_orgs_purged: 0,
+  orphan_users_purged: 0,
   errors: 0,
   last_error: null,
   started_at: null,
@@ -269,11 +274,16 @@ async function saveMirrorBackfillState(env: MirrorBackfillEnv, state: MirrorBack
 }
 
 /** Start (or restart from the beginning) the backfill. */
-export async function startMirrorBackfill(env: MirrorBackfillEnv): Promise<MirrorBackfillState> {
+export async function startMirrorBackfill(
+  env: MirrorBackfillEnv,
+  options: { orphansOnly?: boolean } = {},
+): Promise<MirrorBackfillState> {
   const now = Date.now();
   const state: MirrorBackfillState = {
     ...IDLE_BACKFILL_STATE,
     status: 'running',
+    // The orphan cleanup alone skips the resync walk.
+    phase: options.orphansOnly ? 'orphan_orgs' : 'users',
     started_at: now,
     updated_at: now,
   };
@@ -350,10 +360,54 @@ export async function runMirrorBackfillStep(
       }),
     );
     if (page.list_complete || !page.cursor) {
-      state.phase = 'done';
+      state.phase = 'orphan_orgs';
       state.cursor = null;
     } else {
       state.cursor = page.cursor;
+    }
+  } else if (state.phase === 'orphan_orgs') {
+    // D1 rows of orgs whose OrgDO is gone (hard-deleted before the purge
+    // existed): purge them so they do not show up as permanent drift.
+    const appIndex = requireAppIndex(env);
+    const orgIds = await appIndex.listMirroredOrgIds(state.cursor ?? '', pageSize);
+    await Promise.all(
+      orgIds.map(async (orgId) => {
+        try {
+          if (!(await env.ORG.get(env.ORG.idFromName(orgId)).mirrorOrgExists())) {
+            await appIndex.purgeMirroredOrg(orgId);
+            state.orphan_orgs_purged += 1;
+          }
+        } catch (error) {
+          recordError(error);
+        }
+      }),
+    );
+    if (orgIds.length < pageSize) {
+      state.phase = 'orphan_users';
+      state.cursor = null;
+    } else {
+      state.cursor = orgIds[orgIds.length - 1]!;
+    }
+  } else if (state.phase === 'orphan_users') {
+    const appIndex = requireAppIndex(env);
+    const userIds = await appIndex.listMirroredUserIds(state.cursor ?? '', pageSize);
+    await Promise.all(
+      userIds.map(async (userId) => {
+        try {
+          if (!(await env.USER.get(env.USER.idFromName(userId)).mirrorUserExists())) {
+            await appIndex.applyAdminEvent({ type: 'user_delete', payload: { id: userId } });
+            state.orphan_users_purged += 1;
+          }
+        } catch (error) {
+          recordError(error);
+        }
+      }),
+    );
+    if (userIds.length < pageSize) {
+      state.phase = 'done';
+      state.cursor = null;
+    } else {
+      state.cursor = userIds[userIds.length - 1]!;
     }
   }
 

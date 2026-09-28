@@ -374,6 +374,11 @@ export class UserDO extends DurableObject<DOEnv> {
     return { events: this.mirrorSnapshot(), pending: this.mirror.pendingKeys() };
   }
 
+  /** Orphan cleanup: whether this UserDO still holds a profile (read-only). */
+  mirrorUserExists(): boolean {
+    return this.sql.exec("SELECT 1 FROM profile WHERE key = ?", "data").toArray().length > 0;
+  }
+
   async getMirrorOutboxStats() {
     return this.mirror.stats();
   }
@@ -2195,6 +2200,8 @@ export class UserDO extends DurableObject<DOEnv> {
     this.sql.exec("DELETE FROM profile");
     this.sql.exec("DELETE FROM orgs");
     this.sql.exec("DELETE FROM oauth_providers");
+    // The caller removes the D1 row (user_delete, tombstoned by deleted_users).
+    this.mirror.clear();
   }
 
   // Test helper RPC: simulate constructor migration path on an existing DO.

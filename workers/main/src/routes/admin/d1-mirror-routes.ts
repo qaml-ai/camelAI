@@ -2,7 +2,9 @@
  * Admin API: DO -> D1 identity mirror operations.
  *
  *   GET  /api/admin/d1-mirror/backfill            backfill job state
- *   POST /api/admin/d1-mirror/backfill            {"action": "start" | "step" | "reset"}
+ *   POST /api/admin/d1-mirror/backfill            {"action": "start" | "purge_orphans" | "step" | "reset"}
+ *        start = resync every DO, then purge D1 rows of DOs that no longer
+ *        exist; purge_orphans = only the purge
  *   GET  /api/admin/d1-mirror/outbox?org_id=|user_id=   one DO's outbox stats
  *   POST /api/admin/d1-mirror/resync              {"org_id"} | {"user_id"}: re-mirror one DO
  *   POST /api/admin/d1-mirror/reconcile           {"sample"?}: run the drift reconciler now
@@ -47,12 +49,15 @@ d1MirrorRoutes.post(
   openApi({
     summary:
       "Start, advance one page of, or reset the resumable D1 mirror backfill (the cron advances a running job on its own)",
-    request: { json: z.object({ action: z.enum(["start", "step", "reset"]) }) },
+    request: { json: z.object({ action: z.enum(["start", "purge_orphans", "step", "reset"]) }) },
     responses: { 200: ObjectSchema },
   }),
   async (c) => {
     const { action } = c.req.valid("json");
     if (action === "start") return c.json(await startMirrorBackfill(c.env));
+    if (action === "purge_orphans") {
+      return c.json(await startMirrorBackfill(c.env, { orphansOnly: true }));
+    }
     if (action === "reset") return c.json(await resetMirrorBackfill(c.env));
     return c.json(await runMirrorBackfillStep(c.env));
   },

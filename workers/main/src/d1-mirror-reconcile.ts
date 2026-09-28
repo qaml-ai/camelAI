@@ -11,7 +11,8 @@
 //                     blob11/12 = org/user id, index1 = "<entity>.<field>"
 //   d1_reconcile_ok   one per entity row that matched; operation = entity
 //   d1_reconcile_run  one per run; count = rows compared, size = drifted rows
-// A DO with drift is asked to resync, so drift self-heals but is still counted.
+// A DO with drift is asked to resync, and D1 rows of a DO that no longer exists
+// (do_missing) are purged, so drift self-heals but is still counted.
 // Phase-2 gate: zero d1_drift for 7 days.
 
 import type { AdminEventType } from "./admin-index-types";
@@ -338,10 +339,23 @@ export async function runMirrorReconcile(
       sampleIndex: `${finding.entity}.${finding.field}`,
     });
   }
-  // Self-heal: queue a full re-mirror of every DO that drifted.
+  // Self-heal: purge D1 rows whose owning DO is gone (hard-deleted), and queue
+  // a full re-mirror of every other DO that drifted.
+  const goneOrgs = new Set(
+    total.drift.filter((f) => f.entity === "org" && f.field === "do_missing").map((f) => f.orgId!),
+  );
+  const goneUsers = new Set(
+    total.drift.filter((f) => f.entity === "user" && f.field === "do_missing").map((f) => f.userId!),
+  );
   await Promise.allSettled([
-    ...[...driftedOrgs].map((id) => env.ORG.get(env.ORG.idFromName(id)).requestMirrorResync()),
-    ...[...driftedUsers].map((id) => env.USER.get(env.USER.idFromName(id)).requestMirrorResync()),
+    ...[...goneOrgs].map((id) => appIndex.purgeMirroredOrg(id)),
+    ...[...goneUsers].map((id) => appIndex.applyAdminEvent({ type: "user_delete", payload: { id } })),
+    ...[...driftedOrgs]
+      .filter((id) => !goneOrgs.has(id))
+      .map((id) => env.ORG.get(env.ORG.idFromName(id)).requestMirrorResync()),
+    ...[...driftedUsers]
+      .filter((id) => !goneUsers.has(id))
+      .map((id) => env.USER.get(env.USER.idFromName(id)).requestMirrorResync()),
   ]);
   recordObservabilityEvent(env, {
     event: "d1_reconcile_run",

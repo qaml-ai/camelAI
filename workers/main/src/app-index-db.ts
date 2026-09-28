@@ -1436,6 +1436,69 @@ export class AppIndexDatabase {
     }
   }
 
+  /**
+   * Remove every mirrored row of a hard-deleted org and tombstone the org row
+   * permanently, so a late drain cannot resurrect it. Idempotent.
+   */
+  async purgeMirroredOrg(orgId: string): Promise<void> {
+    await this.ensureSchema();
+    await this.db.batch([
+      this.db
+        .prepare(`
+          INSERT INTO mirror_rows (entity, entity_key, version, deleted, updated_at)
+          VALUES ('org', ?, ?, 1, ?)
+          ON CONFLICT(entity, entity_key) DO UPDATE SET
+            version = excluded.version, deleted = 1, updated_at = excluded.updated_at
+        `)
+        .bind(orgId, Number.MAX_SAFE_INTEGER, Date.now()),
+      this.db.prepare('DELETE FROM workspace_members WHERE org_id = ?').bind(orgId),
+      this.db.prepare('DELETE FROM org_memberships WHERE org_id = ?').bind(orgId),
+      this.db.prepare('DELETE FROM invitations WHERE org_id = ?').bind(orgId),
+      this.db.prepare('DELETE FROM apps WHERE org_id = ?').bind(orgId),
+      this.db.prepare('DELETE FROM threads WHERE org_id = ?').bind(orgId),
+      this.db.prepare('DELETE FROM chat_error_events WHERE org_id = ?').bind(orgId),
+      this.db.prepare('DELETE FROM workspaces WHERE org_id = ?').bind(orgId),
+      this.db.prepare('DELETE FROM orgs WHERE id = ?').bind(orgId),
+    ]);
+  }
+
+  /**
+   * Org ids D1 holds any row for (the org row or an orphaned child), after
+   * `afterId`, in id order: the orphan-cleanup walk.
+   */
+  async listMirroredOrgIds(afterId: string, limit: number): Promise<string[]> {
+    // One query per table (D1 caps compound SELECT terms); the smallest
+    // `limit` ids of the union are the next page.
+    const sources: Array<[string, string]> = [
+      ['orgs', 'id'],
+      ['workspaces', 'org_id'],
+      ['org_memberships', 'org_id'],
+      ['threads', 'org_id'],
+      ['apps', 'org_id'],
+      ['invitations', 'org_id'],
+    ];
+    const pages = await Promise.all(
+      sources.map(([table, column]) =>
+        this.all<{ org_id: string }>(
+          `SELECT DISTINCT ${column} AS org_id FROM ${table} WHERE ${column} > ? ORDER BY ${column} LIMIT ?`,
+          afterId,
+          limit,
+        ),
+      ),
+    );
+    const ids = new Set(pages.flat().map((row) => row.org_id).filter((id): id is string => Boolean(id)));
+    return [...ids].sort().slice(0, limit);
+  }
+
+  async listMirroredUserIds(afterId: string, limit: number): Promise<string[]> {
+    const rows = await this.all<{ id: string }>(
+      'SELECT id FROM users WHERE id > ? ORDER BY id LIMIT ?',
+      afterId,
+      limit,
+    );
+    return rows.map((row) => row.id);
+  }
+
   async handleEvent(event: VersionedAdminEvent): Promise<void> {
     await this.applyAdminEvent(event);
   }

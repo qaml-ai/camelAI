@@ -40,11 +40,20 @@ async function delivery(event: Record<string, unknown>, signature?: string) {
 
 const email = () => `rt-evt-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`;
 
-async function setup() {
+async function setup(options: { source?: "channel" | "scheduled" } = {}) {
   const { userId } = await createUser(testEnv, email(), "password123", "Evt User");
   const { org, defaultWorkspaceId } = await createOrg(testEnv, "Evt Org", userId);
   const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
-  const thread = await orgStub.createThread(defaultWorkspaceId as string, "Runtime thread", userId);
+  const thread = await orgStub.createThread(
+    defaultWorkspaceId as string,
+    "Runtime thread",
+    userId,
+    undefined,
+    undefined,
+    options.source === "channel"
+      ? { source: "channel", channelKind: "slack", channelConnectionId: "int-1", channelConversationId: "T1:C1:1" }
+      : options.source === "scheduled" ? { source: "scheduled" } : {},
+  );
   const agentId = `client_${crypto.randomUUID().replaceAll("-", "")}`;
   await orgStub.setThreadRuntimeAgent(thread.id, { agentId, model: "m", keyScope: null });
   const streaming = vi.fn(async () => {});
@@ -69,6 +78,57 @@ async function deliver(runEnv: Env, event: Record<string, unknown>, signature?: 
 const eventId = () => `evt_${crypto.randomUUID().replaceAll("-", "").slice(0, 24)}`;
 
 afterEach(() => vi.restoreAllMocks());
+
+/** The runtime's input routes, as the webhook handler calls them with the tenant token. */
+function fakeInputs(input: Record<string, unknown>) {
+  const answers: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const original = globalThis.fetch;
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (request: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(request instanceof Request ? request.url : String(request));
+    if (url.origin !== RUNTIME) return original(request, init);
+    if ((init?.method ?? "GET") === "GET") return Response.json(input);
+    answers.push({ path: url.pathname, body: JSON.parse(String(init?.body ?? "{}")) });
+    return Response.json({ input: { ...input, state: "cancelled" } });
+  });
+  return answers;
+}
+
+describe("input.requested on POST /agent-runtime/events", () => {
+  const inputEvent = (agentId: string) => ({
+    id: eventId(), type: "input.requested", created: Math.floor(Date.now() / 1000),
+    data: { agentId, requestId: "r1", inputId: "in_1", toolCallId: "tc_1", kind: "question", expiresAt: Date.now() + 60_000 },
+  });
+
+  it.each(["channel", "scheduled"] as const)(
+    "cancels a %s thread's input: nobody is at a computer to answer it",
+    async (source) => {
+      const { runEnv, agentId, metadata } = await setup({ source });
+      await testEnv.APP_KV.put(runtimeAgentThreadKey(agentId), JSON.stringify({ org: metadata.org, workspace: metadata.workspace, thread: metadata.thread }));
+      const answers = fakeInputs({ id: "in_1", state: "pending", responders: { audience: ["owner-1"] } });
+      expect((await deliver(runEnv, inputEvent(agentId))).status).toBe(204);
+      expect(answers).toEqual([{
+        path: `/v1/agents/${agentId}/inputs/in_1`,
+        body: expect.objectContaining({ action: "cancel", actor: "owner-1" }),
+      }]);
+    },
+  );
+
+  it("leaves a web thread's input to the person watching it", async () => {
+    const { runEnv, agentId, metadata } = await setup();
+    await testEnv.APP_KV.put(runtimeAgentThreadKey(agentId), JSON.stringify({ org: metadata.org, workspace: metadata.workspace, thread: metadata.thread }));
+    const answers = fakeInputs({ id: "in_1", state: "pending", responders: {} });
+    expect((await deliver(runEnv, inputEvent(agentId))).status).toBe(204);
+    expect(answers).toEqual([]);
+  });
+
+  it("does not answer an input that already settled", async () => {
+    const { runEnv, agentId, metadata } = await setup({ source: "channel" });
+    await testEnv.APP_KV.put(runtimeAgentThreadKey(agentId), JSON.stringify({ org: metadata.org, workspace: metadata.workspace, thread: metadata.thread }));
+    const answers = fakeInputs({ id: "in_1", state: "answered", responders: {} });
+    expect((await deliver(runEnv, inputEvent(agentId))).status).toBe(204);
+    expect(answers).toEqual([]);
+  });
+});
 
 describe("POST /agent-runtime/events", () => {
   it("refuses unsigned or wrongly signed deliveries, and answers 503 without a secret", async () => {

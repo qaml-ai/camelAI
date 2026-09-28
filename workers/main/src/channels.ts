@@ -345,13 +345,39 @@ type InitialUserMessageRpc = {
 type ChannelInitialUserMessageRequest = InitialUserMessageRequest & {
   threadId: string;
   channelKind: ChannelKind;
+  /** The channel's integration, whose creator acts for senders who are no member. */
+  connectionId?: string;
 };
 
+/**
+ * The member who connected the channel. Discord, Slack and Telegram senders
+ * are no org members, and a turn needs one to act as: the runtime authorizes
+ * each tool call (the reply's send tool included) as its acting member.
+ */
+async function channelConnectionOwner(
+  env: Pick<Env, "WORKSPACE">,
+  workspaceId: string | undefined,
+  connectionId: string | undefined,
+): Promise<string | null> {
+  if (!workspaceId || !connectionId || !env.WORKSPACE) return null;
+  try {
+    const integration = await env.WORKSPACE.get(env.WORKSPACE.idFromName(workspaceId)).getIntegration(connectionId);
+    return integration?.created_by?.trim() || null;
+  } catch (error) {
+    console.warn("[channels] could not read the channel connection's owner", error);
+    return null;
+  }
+}
+
 export async function enqueueChannelMessage(
-  env: Pick<Env, "CHAT_THREAD">,
+  env: Pick<Env, "CHAT_THREAD" | "WORKSPACE">,
   request: ChannelInitialUserMessageRequest,
 ): Promise<InitialUserMessageResult> {
-  const { channelKind, ...messageRequest } = request;
+  const { channelKind, connectionId, ...messageRequest } = request;
+  if (!messageRequest.userId) {
+    const owner = await channelConnectionOwner(env, messageRequest.workspaceId, connectionId);
+    if (owner) messageRequest.userId = owner;
+  }
   const stub = env.CHAT_THREAD.get(
     env.CHAT_THREAD.idFromName(request.threadId),
   ) as unknown as InitialUserMessageRpc;

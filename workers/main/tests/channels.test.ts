@@ -359,6 +359,49 @@ describe("channels", () => {
     );
   });
 
+  it("acts as the member who connected the channel when the sender is no member", async () => {
+    startInitialUserMessageMock.mockResolvedValue({ status: "accepted" });
+    const getIntegration = vi.fn(async (id: string) => (id === "int-1" ? { id, created_by: "owner-1" } : null));
+    const env = {
+      CHAT_THREAD: {
+        idFromName: (threadId: string) => threadId,
+        get: () => ({ startInitialUserMessage: startInitialUserMessageMock }),
+      },
+      WORKSPACE: {
+        idFromName: (workspaceId: string) => workspaceId,
+        get: () => ({ getIntegration }),
+      },
+    } as never;
+
+    await enqueueChannelMessage(env, {
+      channelKind: "discord",
+      threadId: "thread-1",
+      workspaceId: "workspace-1",
+      orgId: "org-1",
+      connectionId: "int-1",
+      userName: "discord-author",
+      message: "hi",
+    });
+    expect(getIntegration).toHaveBeenCalledWith("int-1");
+    expect(startInitialUserMessageMock.mock.calls.at(-1)?.[0]).toMatchObject({
+      userId: "owner-1",
+      userName: "discord-author",
+    });
+    expect(startInitialUserMessageMock.mock.calls.at(-1)?.[0]).not.toHaveProperty("connectionId");
+
+    // A sender who is a member (email) keeps acting as themself.
+    await enqueueChannelMessage(env, {
+      channelKind: "email",
+      threadId: "thread-1",
+      workspaceId: "workspace-1",
+      orgId: "org-1",
+      connectionId: "int-1",
+      userId: "member-9",
+      message: "hi",
+    });
+    expect(startInitialUserMessageMock.mock.calls.at(-1)?.[0]).toMatchObject({ userId: "member-9" });
+  });
+
   it("enqueues channel messages through the normal initial message path", async () => {
     startInitialUserMessageMock.mockResolvedValue({ status: "accepted" });
 

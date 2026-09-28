@@ -503,6 +503,7 @@ async function processClaimedDelivery(
       threadId: channelThread.threadId,
       workspaceId: payload.workspaceId,
       orgId: payload.orgId,
+      connectionId: payload.integrationId,
       userName: discordAuthorName(payload),
       userEmail: null,
       message: userMessage,

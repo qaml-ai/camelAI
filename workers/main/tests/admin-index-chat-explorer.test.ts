@@ -6,8 +6,10 @@ import type { TestEnv } from './test-helpers';
 
 const testEnv = env as unknown as TestEnv;
 
+// Searches use it as a LIKE pattern (`%…%`), and D1 refuses patterns over 50
+// bytes ("LIKE or GLOB pattern too complex"): keep it short and fixed-length.
 function unique(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8).padEnd(6, "0")}`;
 }
 
 async function upsertUser(id: string, email: string, name = 'Explorer User') {

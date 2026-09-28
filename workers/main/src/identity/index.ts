@@ -6,7 +6,6 @@ export type {
   ApplySubscriptionInvoiceGrantResult,
   SubscriptionInvoiceGrantRow,
 } from "./org-do";
-export { dispatchAdminEvent } from "./admin-events";
 export type { OrgRole, BillingStatus } from "../../../../src/types";
 export type {
   UserOrg,

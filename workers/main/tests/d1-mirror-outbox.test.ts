@@ -3,7 +3,7 @@ import { env, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test'
 import { getAppIndexDatabase, type AppIndexDatabase } from '../src/app-index-db';
 import type { VersionedAdminEvent } from '../src/admin-index-types';
 import { D1MirrorOutbox, mirrorRetryDelayMs } from '../src/identity/d1-mirror-outbox';
-import { createUser, type TestEnv } from './test-helpers';
+import { createOrg, createUser, flushD1Mirror, type TestEnv } from './test-helpers';
 
 const testEnv = env as unknown as TestEnv;
 
@@ -213,5 +213,78 @@ describe('D1 mirror outbox (UserDO)', () => {
   it('caps retry delay growth', () => {
     expect(mirrorRetryDelayMs(1)).toBeLessThanOrEqual(6_000);
     expect(mirrorRetryDelayMs(50)).toBeLessThanOrEqual(60 * 60 * 1000 * 1.2);
+  });
+});
+
+describe('D1 mirror outbox (OrgDO)', () => {
+  async function setupOrg() {
+    await appIndex();
+    const { userId } = await createUser(testEnv, `${uid('owner')}@example.com`, 'password123', 'Owner');
+    const { org, defaultWorkspaceId } = await createOrg(testEnv, 'Mirror Org', userId);
+    const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
+    return { userId, org, defaultWorkspaceId, orgStub };
+  }
+
+  it('mirrors org, membership, workspace and thread state on the alarm', async () => {
+    const { userId, org, defaultWorkspaceId, orgStub } = await setupOrg();
+    const { userId: memberId } = await createUser(testEnv, `${uid('member')}@example.com`, 'password123', 'Member');
+    await orgStub.addMember(memberId, 'member', userId);
+    const thread = await orgStub.createThread(defaultWorkspaceId, 'Mirrored thread', userId);
+    await flushD1Mirror(orgStub);
+
+    const db = testEnv.APP_DB!;
+    expect(await db.prepare('SELECT name, member_count FROM orgs WHERE id = ?').bind(org.id).first())
+      .toMatchObject({ name: 'Mirror Org', member_count: 2 });
+    expect(await membershipExists(org.id, memberId)).toBe(true);
+    expect(await db.prepare('SELECT org_id FROM workspaces WHERE id = ?').bind(defaultWorkspaceId).first())
+      .toMatchObject({ org_id: org.id });
+    expect(await db.prepare('SELECT title FROM threads WHERE id = ?').bind(thread.id).first())
+      .toMatchObject({ title: 'Mirrored thread' });
+
+    await orgStub.removeMember(memberId, userId);
+    await orgStub.deleteThread(thread.id, userId);
+    await flushD1Mirror(orgStub);
+    expect(await membershipExists(org.id, memberId)).toBe(false);
+    expect(await db.prepare('SELECT member_count FROM orgs WHERE id = ?').bind(org.id).first())
+      .toMatchObject({ member_count: 1 });
+    expect(await db.prepare('SELECT 1 FROM threads WHERE id = ?').bind(thread.id).first()).toBeNull();
+    expect(
+      await db
+        .prepare("SELECT deleted FROM mirror_rows WHERE entity = 'thread' AND entity_key = ?")
+        .bind(thread.id)
+        .first(),
+    ).toMatchObject({ deleted: 1 });
+  });
+
+  it('keeps the outbox alarm armed when token-refresh scheduling runs', async () => {
+    const { orgStub } = await setupOrg();
+    await runInDurableObject(orgStub, async (instance, state) => {
+      state.storage.sql.exec('DELETE FROM d1_mirror_outbox');
+      await state.storage.deleteAlarm();
+      const internals = instance as unknown as {
+        markMirrorDirty(kind: string, id: string): void;
+        scheduleNextTokenRefresh(): Promise<void>;
+      };
+      internals.markMirrorDirty('org', '');
+      // No integration has a token expiry, which used to delete the alarm outright.
+      await internals.scheduleNextTokenRefresh();
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
+  });
+
+  it('re-mirrors everything an org owns on requestMirrorResync', async () => {
+    const { org, defaultWorkspaceId, orgStub, userId } = await setupOrg();
+    await orgStub.createThread(defaultWorkspaceId, 'Resync thread', userId);
+    await flushD1Mirror(orgStub);
+    await testEnv.APP_DB!.batch([
+      testEnv.APP_DB!.prepare('DELETE FROM orgs WHERE id = ?').bind(org.id),
+      testEnv.APP_DB!.prepare('DELETE FROM org_memberships WHERE org_id = ?').bind(org.id),
+    ]);
+
+    const { queued } = await orgStub.requestMirrorResync();
+    expect(queued).toBeGreaterThanOrEqual(4); // org, owner, workspace, thread
+    await flushD1Mirror(orgStub);
+    expect(await orgName(org.id)).toBe('Mirror Org');
+    expect(await membershipExists(org.id, userId)).toBe(true);
   });
 });

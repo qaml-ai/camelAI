@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   CHAT_LAST_TERMINAL_KEY,
   CHAT_RECOVERING_KEY,
@@ -519,6 +519,13 @@ function createProjectToolFake({
 }
 
 describe('ChatThreadDO Pi turn handling', () => {
+  // The fakes here carry no KV; no thread in them is moving to the runtime.
+  let migrationState: { mockRestore(): void };
+  beforeEach(() => {
+    migrationState = vi.spyOn(ChatThreadDO.prototype as never, 'runtimeMigrationState' as never).mockReturnValue(null as never);
+  });
+  afterEach(() => migrationState.mockRestore());
+
   it('routes GPT-6 product models to OpenAI, keeping Luna off nitro', () => {
     const mapping = new PiModelMapping();
     expect(mapping.resolvePiModelReference('gpt-6-sol')).toEqual({

@@ -121,6 +121,9 @@ export interface ChatEnv extends WorkspaceFilesystemEnv {
   // "1": new web threads run directly on the runtime, with no ChatThreadDO
   // (plans/runtime-threads-direct.md). Needs the runtime settings above.
   AGENT_RUNTIME_DIRECT_THREADS?: string;
+  // "1": threads still on ChatThreadDO move to the runtime when next opened
+  // (agent-runtime/thread-migration.ts). Needs AGENT_RUNTIME_DIRECT_THREADS.
+  AGENT_RUNTIME_MIGRATE_DO_THREADS?: string;
   R2_BUCKET: R2Bucket;
   IMAGES?: ImagesBinding;
   AI: Ai;

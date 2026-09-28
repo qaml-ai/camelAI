@@ -8,6 +8,7 @@ import { recordErrorEvent, recordObservabilityEvent, type ObservabilityEnv } fro
 import { RuntimeApiError } from "./runtime-api.js";
 import type { RuntimeTurnResult } from "./thread-runtime.js";
 import type { SendTimings } from "./run-gates.js";
+import type { RuntimeMigrationResult } from "./thread-migration.js";
 
 export interface RuntimeThreadTelemetryContext {
   orgId: string;
@@ -112,4 +113,37 @@ export function recordRuntimeTokenMintFailure(
   }
   const failure = classifyRuntimeFailure(outcome.error);
   recordErrorEvent(env, { ...base, status: failure.status, statusCode: failure.statusCode, error: outcome.error });
+}
+
+/**
+ * `runtime_thread_migration`: one per attempt to move a ChatThreadDO thread to
+ * the runtime (agent-runtime/thread-migration.ts). Status is the result
+ * (migrated, adopted, runtime, busy, skipped, failed, dry_run); errorName the
+ * busy or skipped reason; errorMessage a failure's message. Counts:
+ * double4 = transcript messages, double5 = imported bytes (dry runs),
+ * double6 = messages imported, double7 = dropped roles, double8 = shortened
+ * results, double9 = omitted images, double10 = 1 when only the latest
+ * context was imported, double11 = 1 when the original was archived.
+ */
+export function recordRuntimeMigration(
+  env: ObservabilityEnv | undefined,
+  context: RuntimeThreadTelemetryContext,
+  result: RuntimeMigrationResult,
+): void {
+  const stats = "stats" in result ? result.stats : null;
+  recordObservabilityEvent(env, {
+    event: "runtime_thread_migration",
+    severity: result.status === "failed" ? "warn" : "info",
+    component: "runtime_thread",
+    operation: "migrate",
+    ...ids(context),
+    status: result.status,
+    errorName: "reason" in result ? result.reason : null,
+    errorMessage: result.status === "failed" ? result.error : null,
+    count: stats?.total ?? 0,
+    size: result.status === "dry_run" ? result.bytes : 0,
+    extraCounts: stats
+      ? [stats.imported, stats.droppedRoles, stats.shortenedResults, stats.omittedImages, stats.tail ? 1 : 0, "archived" in result && result.archived ? 1 : 0]
+      : [],
+  });
 }

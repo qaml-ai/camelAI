@@ -385,6 +385,7 @@ import {
   type RuntimeRunRecord,
 } from "./chat-thread/runtime-agent";
 import { formatChannelHistoryNote, type RelayRuntimeAgent } from "./agent-runtime/channel-turns";
+import type { RuntimeMigrationExport, RuntimeMigrationRecord } from "./agent-runtime/thread-migration";
 import {
   codexError,
   codexRoute,
@@ -567,6 +568,10 @@ type AutomationOutcomeStatus = (typeof AUTOMATION_OUTCOME_STATUSES)[number];
 const CHAT_AGENT_BACKEND_KEY = "agentBackend";
 const RUNTIME_AGENT_KEY = "runtimeAgent";
 const RUNTIME_AGENT_RUN_KEY = "runtimeAgentRun";
+/** A move of this thread to the runtime (agent-runtime/thread-migration.ts): in progress, or done. */
+const RUNTIME_MIGRATION_KEY = "runtimeMigration";
+/** How long a begun move holds the thread before it counts as abandoned. */
+const RUNTIME_MIGRATION_LEASE_MS = 2 * 60_000;
 // Durable resume of an interrupted Pi turn (e.g. the DO is evicted mid-turn by a
 // deploy). ai-chat's `chatRecovery` owns recovery now: a turn runs through
 // saveMessages -> _runProgrammaticChatTurn -> onChatMessage, wrapped by ai-chat's
@@ -4322,6 +4327,65 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     });
   }
 
+  /** Whether this thread is being moved to the runtime, or was. */
+  private runtimeMigrationState(): "moving" | "moved" | null {
+    const record = this.ctx.storage.kv.get<RuntimeMigrationRecord>(RUNTIME_MIGRATION_KEY);
+    if (!record) return null;
+    if (record.movedAt) return "moved";
+    return record.expiresAt > Date.now() ? "moving" : null;
+  }
+
+  /**
+   * Begin moving this thread to the runtime (agent-runtime/thread-migration.ts):
+   * hand over its whole transcript and UI state, and hold the thread (no new
+   * turns here) until the move completes or aborts, or its lease runs out.
+   * Busy while a turn runs, an automation run is active or a question waits.
+   */
+  async beginRuntimeMigration(): Promise<RuntimeMigrationExport> {
+    const state = this.runtimeMigrationState();
+    if (state === "moved") return { status: "moved" };
+    if (state === "moving") return { status: "busy", reason: "moving" };
+    if (this.isThreadStreaming()) return { status: "busy", reason: "running" };
+    if (this.activeAutomationRun) return { status: "busy", reason: "automation" };
+    if (this.browserPrompts.pendingQuestionCount > 0) return { status: "busy", reason: "question" };
+    if (this.ctx.storage.kv.get(RUNTIME_AGENT_KEY)) return { status: "relay" };
+    const leaseId = crypto.randomUUID();
+    this.ctx.storage.kv.put(RUNTIME_MIGRATION_KEY, {
+      leaseId,
+      startedAt: Date.now(),
+      expiresAt: Date.now() + RUNTIME_MIGRATION_LEASE_MS,
+    } satisfies RuntimeMigrationRecord);
+    try {
+      const messages = await this.loadFullPiCoreTranscriptUnbounded({ imagePolicy: "reference" });
+      return {
+        status: "ok",
+        leaseId,
+        messages: cloneDurableState(messages),
+        previewTabs: cloneDurableState(this.previewTabs),
+        previewActiveTabId: this.previewActiveTabId,
+      };
+    } catch (error) {
+      this.ctx.storage.kv.delete(RUNTIME_MIGRATION_KEY);
+      throw error;
+    }
+  }
+
+  /** Release a move that did not happen: the thread keeps running here. */
+  abortRuntimeMigration(leaseId: string): boolean {
+    const record = this.ctx.storage.kv.get<RuntimeMigrationRecord>(RUNTIME_MIGRATION_KEY);
+    if (!record || record.leaseId !== leaseId || record.movedAt) return false;
+    this.ctx.storage.kv.delete(RUNTIME_MIGRATION_KEY);
+    return true;
+  }
+
+  /** The thread now runs on the runtime (its thread_runtime row is written): no more turns here. */
+  completeRuntimeMigration(leaseId: string, agentId: string): boolean {
+    const record = this.ctx.storage.kv.get<RuntimeMigrationRecord>(RUNTIME_MIGRATION_KEY);
+    if (!record || record.leaseId !== leaseId) return false;
+    this.ctx.storage.kv.put(RUNTIME_MIGRATION_KEY, { ...record, movedAt: Date.now(), agentId } satisfies RuntimeMigrationRecord);
+    return true;
+  }
+
   /**
    * The runtime agent this thread relays to, for the direct path to adopt
    * (agent-runtime/channel-turns.ts). Null when the thread has none, or while
@@ -6500,6 +6564,13 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       typeof data.content === "string" ? data.content.trim() : "";
     if (!rawContent) {
       return { status: "error", error: "Empty message" };
+    }
+    const migration = this.runtimeMigrationState();
+    if (migration === "moved") {
+      return { status: "error", error: "This conversation moved; reload the page to continue it." };
+    }
+    if (migration === "moving") {
+      return { status: "busy", error: "This conversation is moving; try again in a moment." };
     }
 
     const orgBan = await isOrgBanned(this.env.APP_KV, {

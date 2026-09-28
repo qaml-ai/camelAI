@@ -54,7 +54,9 @@ vi.mock('@/lib/chat-do.server', () => ({
 
 vi.mock('@/lib/runtime-threads.server', () => ({
   loadRuntimeThreadSeed: loadRuntimeThreadSeedMock,
+  migrateThreadOnOpen: vi.fn(async () => null),
 }));
+vi.mock('@/lib/wait-until', () => ({ waitUntil: vi.fn() }));
 
 vi.mock('@/lib/auth-do', () => ({
   getOrg: getOrgMock,

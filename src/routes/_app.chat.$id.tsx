@@ -1,3 +1,4 @@
+import { waitUntil } from "@/lib/wait-until";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   redirect,
@@ -810,7 +811,22 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
     .catch((error: unknown) => {
       console.error("Failed to read the thread's runtime row:", error);
       return null;
-    });
+    })
+    // A thread still on ChatThreadDO moves to the runtime as it is opened,
+    // where AGENT_RUNTIME_MIGRATE_DO_THREADS is on; otherwise it shows from the DO.
+    .then(async (row) => row ?? await (await import("@/lib/runtime-threads.server"))
+      .migrateThreadOnOpen(context, {
+        orgId: authContext.currentOrg.id,
+        workspaceId,
+        threadId: params.id,
+        userId: authContext.user?.id ?? null,
+        userName: authContext.user?.name ?? null,
+        userEmail: authContext.user?.email ?? null,
+      }, waitUntil)
+      .catch((error: unknown) => {
+        console.error("Failed to move the thread to the runtime:", error);
+        return null;
+      }));
   const pickerStatePromise = chatDO
     .getWorkspaceModelPickerState(context, workspaceId, {
       orgId: authContext.currentOrg.id,

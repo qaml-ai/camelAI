@@ -19,9 +19,10 @@ import {
   type RuntimeTurnResult,
 } from "../../workers/main/src/agent-runtime/thread-runtime";
 import type { RuntimeThreadSeed } from "@/lib/use-runtime-thread";
-import { recordRuntimeSendFailure, recordRuntimeTokenMintFailure } from "../../workers/main/src/agent-runtime/runtime-thread-telemetry";
+import { recordRuntimeMigration, recordRuntimeSendFailure, recordRuntimeTokenMintFailure } from "../../workers/main/src/agent-runtime/runtime-thread-telemetry";
+import { migrateThreadToRuntime } from "../../workers/main/src/agent-runtime/thread-migration";
 import { normalizePreviewTabs } from "../../workers/main/src/chat-thread/preview-state";
-import { initialRuntimeRequestId, requireSameOriginJson, startErrorStillCurrent } from "@/lib/agent-runtime-shared";
+import { initialRuntimeRequestId, requireSameOriginJson, runtimeThreadMigrationEnabled, startErrorStillCurrent } from "@/lib/agent-runtime-shared";
 
 export interface RuntimeThreadAccess {
   env: ChatEnv;
@@ -162,6 +163,39 @@ async function runtimeStartError(
   if (!message) return null;
   const at = thread?.last_chat_error_at ?? 0;
   return { id: `rt-start:${at}`, error: message, at };
+}
+
+/** How long opening a thread waits for its move to the runtime before showing it from ChatThreadDO. */
+const MIGRATE_ON_OPEN_WAIT_MS = 8_000;
+
+/**
+ * A thread still on ChatThreadDO, moved to the runtime as it is opened
+ * (AGENT_RUNTIME_MIGRATE_DO_THREADS). Null when it stays on the DO for now:
+ * the move was refused, failed, or is still going after a few seconds (it
+ * finishes in the background, and the next open finds the thread moved).
+ */
+export async function migrateThreadOnOpen(
+  loadContext: AppLoadContext,
+  context: ChatContextState,
+  waitUntil: (promise: Promise<unknown>) => void,
+): Promise<ThreadRuntimeRecord | null> {
+  const env = getEnv(loadContext) as unknown as ChatEnv;
+  if (!runtimeThreadMigrationEnabled(env)) return null;
+  const move = migrateThreadToRuntime(env, context).then((result) => {
+    recordRuntimeMigration(env, context, result);
+    return "row" in result ? result.row : null;
+  }, (error: unknown) => {
+    recordRuntimeMigration(env, context, { status: "failed", error: error instanceof Error ? error.message : String(error) });
+    return null;
+  });
+  waitUntil(move);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const wait = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), MIGRATE_ON_OPEN_WAIT_MS); });
+  try {
+    return await Promise.race([move, wait]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**

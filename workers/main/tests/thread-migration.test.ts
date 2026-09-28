@@ -229,6 +229,8 @@ describe("migrateThreadToRuntime", () => {
     const unrouted = fakeEnv(ok([user("hi")]));
     expect(await migrateThreadToRuntime(unrouted.env, context)).toEqual({ status: "skipped", reason: "no runtime route for its model" });
     expect(unrouted.doStub.beginRuntimeMigration).not.toHaveBeenCalled();
+    // Checking the route must not move the thread to the free model (the DO does that at its next run).
+    expect(routeMock).toHaveBeenCalledWith(unrouted.env, context, { persistFallback: false });
     routeMock.mockRejectedValueOnce(new Error("unknown model"));
     expect(await migrateThreadToRuntime(fakeEnv(ok([])).env, context)).toEqual({ status: "skipped", reason: "its model did not resolve: unknown model" });
   });

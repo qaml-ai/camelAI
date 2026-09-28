@@ -269,7 +269,7 @@ export async function migrateThreadToRuntime(
   if (existing) return { status: "runtime", row: existing };
   // A model the runtime cannot run yet (a custom endpoint, Bedrock's OpenAI models) stays here.
   try {
-    const { route } = await resolveThreadRuntimeRoute(env, context);
+    const { route } = await resolveThreadRuntimeRoute(env, context, { persistFallback: false });
     if (!route) return { status: "skipped", reason: "no runtime route for its model" };
   } catch (error) {
     return { status: "skipped", reason: `its model did not resolve: ${error instanceof Error ? error.message : String(error)}` };

@@ -129,9 +129,14 @@ function orgStub(env: ChatEnv, orgId: string): OrgStub {
 /**
  * The model a thread resolves to now and how it runs on the runtime (null
  * route: it cannot). A thread whose hosted access ran out is moved to the free
- * model in OrgDO, as the DO does, unless someone changed its model meanwhile.
+ * model in OrgDO, as the DO does, unless someone changed its model meanwhile;
+ * `persistFallback: false` only asks (the route is then the fallback's).
  */
-export async function resolveThreadRuntimeRoute(env: ChatEnv, context: ChatContextState): Promise<ThreadRuntimeRoute> {
+export async function resolveThreadRuntimeRoute(
+  env: ChatEnv,
+  context: ChatContextState,
+  options: { persistFallback?: boolean } = {},
+): Promise<ThreadRuntimeRoute> {
   const org = orgStub(env, context.orgId);
   const [thread, llmProviderRecord, orgInfo] = await Promise.all([
     org.getThread(context.threadId),
@@ -163,6 +168,7 @@ export async function resolveThreadRuntimeRoute(env: ChatEnv, context: ChatConte
       onBillingResolved: () => {},
       onHostedModelFallback: async (requestedModel, fallbackModel, reason) => {
         ranOn = fallbackModel;
+        if (options.persistFallback === false) return;
         const updated = await org.updateThreadModel(
           context.threadId,
           fallbackModel as LlmModel,

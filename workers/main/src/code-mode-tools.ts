@@ -16,7 +16,7 @@ import type { OrgDO, WorkerScript } from "./auth";
 import { Type, type TSchema } from "typebox";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { WorkspaceDO } from "./workspace";
-import type { WorkspaceCronDO } from "./workspace-cron";
+import type { ScheduledRunOutcomeStatus, WorkspaceCronDO } from "./workspace-cron";
 import { ProjectFilesystemClient, WorkspaceFilesystemClient, normalizeWorkspacePath as normalizeDurableWorkspacePath, type WorkspaceFileStoreLike, type WorkspaceProject, type WorkspaceProjectCloneSummary, projectNameKey } from "./workspace-filesystem-do";
 import type { RuntimeCallArtifact, RuntimeCallArtifactKind } from "../../../src/lib/runtime-artifacts";
 import { getPreferredAppUrl } from "../../../src/lib/app-url";
@@ -4577,7 +4577,16 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   /** The thread's scheduled-run outcome, recorded on its ChatThreadDO (which validates it). */
   private async reportAutomationOutcome(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (!this.ctx.props.threadId) throw new Error("report_automation_outcome requires chat thread scope");
-    if (this.directRuntime) throw new Error("report_automation_outcome is only for scheduled automation runs");
+    if (this.directRuntime) {
+      // A direct runtime thread's run is kept on its WorkspaceCronDO run.
+      const recorded = await this.cronStub.reportScheduledRunOutcome({
+        workspaceId: this.ctx.props.workspaceId,
+        threadId: this.ctx.props.threadId,
+        status: args.status as ScheduledRunOutcomeStatus,
+        summary: typeof args.summary === "string" ? args.summary : "",
+      });
+      return { status: recorded.status, text: recorded.text };
+    }
     const stub = this.chatThreadStub as unknown as {
       recordAutomationOutcome(status: unknown, summary: unknown): Promise<{ status: string; text: string }>;
     };

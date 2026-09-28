@@ -385,6 +385,7 @@ import {
   type RuntimeRunRecord,
 } from "./chat-thread/runtime-agent";
 import { formatChannelHistoryNote, type RelayRuntimeAgent } from "./agent-runtime/channel-turns";
+import { AUTOMATION_OUTCOME_INSTRUCTION } from "./agent-runtime/scheduled-turns";
 import {
   codexError,
   codexRoute,
@@ -8100,14 +8101,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
 
   /** Per-run instructions for a scheduled automation that must report its outcome. */
   private automationOutcomeInstruction(): string | null {
-    return this.activeAutomationRun?.requiresExplicitOutcome
-      ? [
-          "## Scheduled Automation Outcome",
-          "Before your final response, you MUST call `report_automation_outcome` exactly once.",
-          "Use `success` only when the requested business objective was actually completed and verified. A clean turn, partial data extraction, or a decision not to deploy is not success.",
-          "Use `failed` when the objective was not completed, `partial` when only part completed, and `needs_attention` when operator action is required. Give a concise factual summary.",
-        ].join("\n")
-      : null;
+    return this.activeAutomationRun?.requiresExplicitOutcome ? AUTOMATION_OUTCOME_INSTRUCTION : null;
   }
 
   private createPiSystemPrompt(

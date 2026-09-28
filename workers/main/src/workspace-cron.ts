@@ -33,6 +33,9 @@ import {
   type BillingPlanLimits,
 } from "../../../src/lib/billing-plans";
 import type { LlmModel } from "../../../src/types";
+import type { ChatEnv } from "./chat-thread/types";
+import { startScheduledRuntimeTurn } from "./agent-runtime/scheduled-turns";
+import { pinNewThreadToRuntime } from "./agent-runtime/thread-runtime";
 import {
   readOrgModelPickerConfig,
   readWorkspaceModelPickerConfig,
@@ -139,6 +142,8 @@ interface AutomationRunRow {
   thread_id: string | null;
   instance_id: string | null;
   created_at: number;
+  reported_status?: string | null;
+  reported_summary?: string | null;
 }
 
 interface WorkspaceInfo {
@@ -192,6 +197,23 @@ export interface RecordScheduledPromptRunResultInput {
   runId: string;
   status: "success" | "error" | "question" | "busy";
   message?: string | null;
+  completedAt?: number | null;
+}
+
+export type ScheduledRunOutcomeStatus = "success" | "failed" | "partial" | "needs_attention";
+
+export interface ReportScheduledRunOutcomeInput {
+  workspaceId: string;
+  threadId: string;
+  status: ScheduledRunOutcomeStatus;
+  summary: string;
+}
+
+export interface FinishScheduledRunInput {
+  workspaceId: string;
+  runId: string;
+  /** The run's error when it failed; null when it completed. */
+  error?: string | null;
   completedAt?: number | null;
 }
 
@@ -473,6 +495,14 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
         "ALTER TABLE scheduled_prompts ADD COLUMN last_run_id TEXT",
       );
       this.ctx.storage.kv.put("schemaVersion", 6);
+    }
+
+    // The outcome a direct runtime thread's run reports
+    // (report_automation_outcome), where ChatThreadDO kept its own.
+    if (version < 7) {
+      this.sql.exec("ALTER TABLE automation_runs ADD COLUMN reported_status TEXT");
+      this.sql.exec("ALTER TABLE automation_runs ADD COLUMN reported_summary TEXT");
+      this.ctx.storage.kv.put("schemaVersion", 7);
     }
   }
 
@@ -1103,7 +1133,20 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       model,
       { source: "scheduled" },
     )) as OrgThread;
+    await this.pinScheduledThread(workspace, created.id);
     return created.id;
+  }
+
+  /** A new prompt thread runs directly on the runtime where new threads do. */
+  private async pinScheduledThread(workspace: WorkspaceInfo, threadId: string): Promise<void> {
+    await pinNewThreadToRuntime(this.env as unknown as ChatEnv, {
+      orgId: workspace.org_id,
+      workspaceId: workspace.id,
+      threadId,
+      userId: null,
+      userName: null,
+      userEmail: null,
+    }).catch((error) => console.warn("[WorkspaceCronDO] new prompt thread stays on ChatThreadDO", error));
   }
 
   private async ensureRunnableThread(
@@ -1127,6 +1170,7 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       model,
       { source: "scheduled" },
     )) as OrgThread;
+    await this.pinScheduledThread(workspace, created.id);
 
     this.sql.exec(
       "UPDATE scheduled_prompts SET thread_id = ?, updated_at = ? WHERE id = ?",
@@ -1166,6 +1210,29 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       startedAt: scheduledForMs,
       threadId,
     });
+    const creator = prompt.created_by?.trim();
+    if (creator && creator !== "system") {
+      try {
+        const direct = await startScheduledRuntimeTurn(this.env as unknown as ChatEnv, {
+          orgId: workspace.org_id,
+          workspaceId: workspace.id,
+          threadId,
+          userId: creator,
+          runId,
+          message: this.buildScheduledMessage(prompt, scheduledForMs),
+        });
+        if (direct) {
+          if (direct.status === "accepted") return { status: "success", threadId, accepted: true };
+          return {
+            status: direct.status,
+            error: direct.error ?? (direct.status === "busy" ? "Thread is busy with another run" : "Unknown chat error"),
+            threadId,
+          };
+        }
+      } catch (error) {
+        return { status: "error", error: error instanceof Error ? error.message : String(error), threadId };
+      }
+    }
     if (!this.env.CHAT_THREAD) {
       return {
         status: "error",
@@ -2113,6 +2180,72 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
         error: dispatch.error,
       },
     };
+  }
+
+  /**
+   * The outcome a direct runtime thread's scheduled run reports
+   * (report_automation_outcome), kept on the thread's run in progress until
+   * its run.completed / run.failed webhook finishes it (finishScheduledRun).
+   */
+  async reportScheduledRunOutcome(input: ReportScheduledRunOutcomeInput): Promise<{ status: ScheduledRunOutcomeStatus; text: string }> {
+    this.assertWorkspaceIdentity(input.workspaceId);
+    if (!["success", "failed", "partial", "needs_attention"].includes(input.status)) {
+      throw new Error("status must be one of success, failed, partial, needs_attention");
+    }
+    const summary = typeof input.summary === "string" ? input.summary.trim() : "";
+    if (!summary) throw new Error("Automation outcome summary is required");
+    const run = (this.sql
+      .exec(
+        `SELECT * FROM automation_runs
+         WHERE kind = 'scheduled_prompt' AND thread_id = ? AND status = 'started'
+         ORDER BY started_at DESC, id DESC LIMIT 1`,
+        input.threadId,
+      )
+      .toArray() as unknown as AutomationRunRow[])[0];
+    if (!run) throw new Error("No scheduled automation run is active");
+    if (run.reported_status) throw new Error("Automation outcome was already reported for this run");
+    this.sql.exec(
+      "UPDATE automation_runs SET reported_status = ?, reported_summary = ? WHERE id = ?",
+      input.status,
+      summary,
+      run.id,
+    );
+    return { status: input.status, text: `Automation outcome recorded: ${input.status}` };
+  }
+
+  /**
+   * Finish a direct runtime thread's scheduled run from its run.completed /
+   * run.failed webhook, as ChatThreadDO finishes one at its turn's end:
+   * success only when the run reported success. False when `runId` is no
+   * scheduled run in progress (another message's run on the thread).
+   */
+  async finishScheduledRun(input: FinishScheduledRunInput): Promise<boolean> {
+    this.assertWorkspaceIdentity(input.workspaceId);
+    const run = (this.sql
+      .exec(
+        "SELECT * FROM automation_runs WHERE id = ? AND kind = 'scheduled_prompt' AND status = 'started'",
+        input.runId,
+      )
+      .toArray() as unknown as AutomationRunRow[])[0];
+    if (!run) return false;
+    const reported = run.reported_status && run.reported_summary
+      ? { status: run.reported_status, summary: run.reported_summary }
+      : null;
+    const failure = input.error?.trim() || null;
+    const status = !failure && reported?.status === "success" ? "success" : "error";
+    const message = failure
+      ? failure
+      : reported
+        ? reported.status === "success" ? reported.summary : `[${reported.status}] ${reported.summary}`
+        : "Automation completed without explicitly reporting an outcome";
+    return await this.recordScheduledPromptRunResult({
+      workspaceId: input.workspaceId,
+      promptId: run.automation_id,
+      runId: run.id,
+      status,
+      message,
+      completedAt: input.completedAt ?? Date.now(),
+    });
   }
 
   async recordScheduledPromptRunResult(

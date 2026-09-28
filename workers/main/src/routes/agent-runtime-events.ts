@@ -14,6 +14,8 @@
  *   such a thread's questions the same way). A web thread's page reads its
  *   inputs live.
  * - input.resolved: nothing.
+ * - run.completed / run.failed of a scheduled prompt's run also finish that
+ *   run in WorkspaceCronDO (agent-runtime/scheduled-turns.ts).
  * - usage.recorded: a model response's usage, recorded in the org's usage_log
  *   (agent-runtime/usage.ts).
  *
@@ -102,6 +104,9 @@ async function replyText(env: Env, agentId: string, replyIndex: unknown): Promis
   }
 }
 
+/** The `source` a scheduled prompt's messages carry in their metadata. */
+const SCHEDULED_RUN_SOURCE = "scheduled prompt";
+
 /** Threads nobody watches from a browser: their inputs are cancelled. */
 const UNATTENDED_THREAD_SOURCES = new Set(["channel", "scheduled"]);
 
@@ -181,6 +186,17 @@ export async function handleRuntimeEvent(
       message: text(data.error) || "The agent run failed",
       source: "agent_runtime",
       errorKind: "run_failed",
+    });
+  }
+  // A scheduled prompt's run (its request id is the run's): finish the run as
+  // its outcome report and this end say (WorkspaceCronDO.finishScheduledRun).
+  if (data.metadata?.source === SCHEDULED_RUN_SOURCE && env.WORKSPACE_CRON) {
+    const cron = env.WORKSPACE_CRON.get(env.WORKSPACE_CRON.idFromName(ref.workspace));
+    await cron.finishScheduledRun({
+      workspaceId: ref.workspace,
+      runId: text(data.requestId),
+      error: event.type === "run.failed" ? text(data.error) || "The agent run failed" : null,
+      completedAt,
     });
   }
   const summarySource = event.type === "run.completed" ? await replyText(env, agentId, data.replyIndex) : null;

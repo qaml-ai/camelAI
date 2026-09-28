@@ -58,7 +58,7 @@ import { requireChatWebSocketAccess } from './helpers/auth.js';
 import { stripReservedTransportHeaders } from './chat-thread/transport-headers.js';
 import { getThreadStub } from './helpers/stubs.js';
 import { text } from './helpers/response.js';
-import { normalizePathForObservability, recordObservabilityEvent } from './observability.js';
+import { recordObservabilityEvent } from './observability.js';
 
 // Re-exports for wrangler
 export {
@@ -479,25 +479,6 @@ export default {
     }
 
     if (isWebSocket) {
-      // A stale bundle reaching for a retired transport lands here. A non-101
-      // answer is NOT a terminal signal to a browser client: the handshake
-      // failure surfaces as close code 1006, which every reconnecting client we
-      // ship (partysocket, the Agents SDK's `isTerminalCloseEvent`) classifies
-      // as retryable, so those tabs re-attempt on backoff until a reload or a
-      // version-skew check heals them. Name the event so that population is
-      // visible in the observability stream instead of only as raw 404 volume.
-      const upgradePath = normalizePathForObservability(url.pathname);
-      recordObservabilityEvent(env, {
-        event: 'ws_upgrade_route_removed',
-        severity: 'warn',
-        component: 'main-worker',
-        operation: 'websocketUpgrade',
-        status: 'not_found',
-        method,
-        path: upgradePath,
-        statusCode: 404,
-        sampleIndex: upgradePath,
-      });
       return new Response('Not Found', { status: 404 });
     }
 

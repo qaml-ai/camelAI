@@ -13,12 +13,9 @@ export default [
     route("forgot-password", "routes/_auth.forgot-password.tsx"),
     route("reset-password", "routes/_auth.reset-password.tsx"),
   ]),
-  route("signup.", "routes/signup-dot.ts"),
   route("banned", "routes/banned.tsx"),
   // Per-organization direct OIDC authorization entry point.
   route("sso/:slug", "routes/sso.$slug.ts"),
-  route("dev/billing-paywall", "routes/dev.billing-paywall.tsx"),
-  route("dev/chat-credit-states", "routes/dev.chat-credit-states.tsx"),
 
   // Public invitation page (loader fetches optional auth state)
   layout("routes/_invite.tsx", [
@@ -46,7 +43,6 @@ export default [
     // Settings nested layout
     layout("routes/_app.settings.tsx", [
       route("settings/profile", "routes/_app.settings.profile.tsx"),
-      route("settings/integrations", "routes/_app.settings.integrations.tsx"),
       route("settings/organizations", "routes/_app.settings.organizations.tsx"),
 
       // Organization settings nested layout
@@ -308,14 +304,4 @@ export default [
     "api/invitations/:orgId/:invitationId",
     "routes/api/invitations.$orgId.$invitationId.ts",
   ),
-
-  // API resource routes (to be created)
-  // route('api/orgs/:id', 'routes/api/orgs.$id.ts'),
-  // route('api/orgs/:id/members', 'routes/api/orgs.$id.members.ts'),
-  // route('api/orgs/:id/integrations', 'routes/api/orgs.$id.integrations.ts'),
-  // route('api/orgs/:id/integrations/:integrationId', 'routes/api/orgs.$id.integrations.$integrationId.ts'),
-  // route('api/integrations/types', 'routes/api/integrations.types.ts'),
-  // route('api/threads', 'routes/api/threads.ts'),
-  // route('api/threads/:id', 'routes/api/threads.$id.ts'),
-  // route('api/threads/:id/messages', 'routes/api/threads.$id.messages.ts'),
 ] satisfies RouteConfig;

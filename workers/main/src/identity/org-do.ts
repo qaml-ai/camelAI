@@ -940,16 +940,6 @@ export class OrgDO extends DurableObject<DOEnv> {
   private sql: SqlStorage;
   private usageControlsInstance?: OrgUsageControls;
   private workerScriptsHasPreviewColumns = true;
-  private static readonly LEGACY_HOST_USAGE_BACKFILL_STATUS_KEY =
-    "legacyHostUsageBackfillStatus";
-  private static readonly LEGACY_HOST_USAGE_BACKFILL_STARTED_AT_KEY =
-    "legacyHostUsageBackfillStartedAt";
-  private static readonly LEGACY_HOST_USAGE_BACKFILL_COMPLETED_AT_KEY =
-    "legacyHostUsageBackfillCompletedAt";
-  private static readonly LEGACY_HOST_USAGE_BACKFILL_RESULT_KEY =
-    "legacyHostUsageBackfillResult";
-  private static readonly LEGACY_HOST_USAGE_BACKFILL_ERROR_KEY =
-    "legacyHostUsageBackfillError";
   private static readonly ACCESS_MAPPED_ORG_ID_KEY = "accessMappedOrgId";
   private static readonly WORKSPACE_ACCESS_MIGRATION_PREFIX =
     "workspaceTenantDataMigrated:access:";
@@ -2851,58 +2841,6 @@ export class OrgDO extends DurableObject<DOEnv> {
       await this.setInfo(info);
     }
     return info;
-  }
-
-  claimLegacyHostUsageBackfill(): "claimed" | "complete" | "running" {
-    const status = this.ctx.storage.kv.get<string>(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_STATUS_KEY,
-    );
-    if (status === "complete") return "complete";
-    const startedAt =
-      this.ctx.storage.kv.get<number>(
-        OrgDO.LEGACY_HOST_USAGE_BACKFILL_STARTED_AT_KEY,
-      ) ?? 0;
-    if (status === "running" && Date.now() - startedAt < 15 * 60 * 1000) {
-      return "running";
-    }
-    this.ctx.storage.kv.put(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_STATUS_KEY,
-      "running",
-    );
-    this.ctx.storage.kv.put(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_STARTED_AT_KEY,
-      Date.now(),
-    );
-    this.ctx.storage.kv.delete(OrgDO.LEGACY_HOST_USAGE_BACKFILL_ERROR_KEY);
-    return "claimed";
-  }
-
-  completeLegacyHostUsageBackfill(result: unknown): void {
-    const now = Date.now();
-    this.ctx.storage.kv.put(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_STATUS_KEY,
-      "complete",
-    );
-    this.ctx.storage.kv.put(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_COMPLETED_AT_KEY,
-      now,
-    );
-    this.ctx.storage.kv.put(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_RESULT_KEY,
-      result,
-    );
-    this.ctx.storage.kv.delete(OrgDO.LEGACY_HOST_USAGE_BACKFILL_ERROR_KEY);
-  }
-
-  failLegacyHostUsageBackfill(error: string): void {
-    this.ctx.storage.kv.put(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_STATUS_KEY,
-      "failed",
-    );
-    this.ctx.storage.kv.put(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_ERROR_KEY,
-      error,
-    );
   }
 
   /**

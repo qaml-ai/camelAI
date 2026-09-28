@@ -695,8 +695,8 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
    * Nothing writes to it any more, so leaving it OPEN would strand a stale tab
    * with frozen indicators and no close event to react to — a silent failure,
    * strictly worse than the visible reconnect path. Close it instead: the
-   * client's reconnect attempt gets the plain 404 the route table now returns,
-   * which is telemetered (`ws_upgrade_route_removed`) and heals on reload.
+   * client's reconnect attempt gets the plain 404 the route table now returns
+   * and heals on reload.
    *
    * Deliberately unguarded: `getWebSockets` is O(0) once the sweep has run (a
    * closing socket is skipped by the readyState check and drops out of the tag

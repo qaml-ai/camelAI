@@ -912,6 +912,22 @@ export async function generateThreadTitle(
         .renameEmptySingleThreadGroupForThread(threadId, title);
     }
 
+    // A runtime thread has no ChatThreadDO to tell (its page reads the title
+    // from OrgDO); its group avatar is made outside the DO.
+    if (await orgStub.getThreadRuntime(threadId)) {
+      if (userId) {
+        const { generateRuntimeThreadGroupAvatar } = await import("../../workers/main/src/agent-runtime/thread-metadata");
+        await generateRuntimeThreadGroupAvatar(env, {
+          threadId,
+          workspaceId,
+          orgId: wsInfo.org_id,
+          userId,
+          userName: null,
+          userEmail: null,
+        });
+      }
+      return;
+    }
     const threadStub = env.CHAT_THREAD.get(
       env.CHAT_THREAD.idFromName(threadId),
     );

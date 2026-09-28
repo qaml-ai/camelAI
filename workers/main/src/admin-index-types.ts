@@ -264,9 +264,27 @@ export type AdminEventType =
   | { type: 'user_org_delta'; payload: { user_id: string; delta: number } }
   | {
       type: 'org_membership_upsert';
-      payload: { org_id: string; user_id: string; role: string; joined_at: number };
+      payload: {
+        org_id: string;
+        user_id: string;
+        role: string;
+        joined_at: number;
+        workspace_access_default?: string | null;
+      };
     }
-  | { type: 'org_membership_delete'; payload: { org_id: string; user_id: string } };
+  | { type: 'org_membership_delete'; payload: { org_id: string; user_id: string } }
+  | {
+      type: 'workspace_member_upsert';
+      payload: {
+        org_id: string;
+        workspace_id: string;
+        user_id: string;
+        access_level: string;
+        granted_by: string | null;
+        granted_at: number;
+      };
+    }
+  | { type: 'workspace_member_delete'; payload: { workspace_id: string; user_id: string } };
 
 /**
  * An admin event as the D1 mirror applies it. `version` is stamped by the

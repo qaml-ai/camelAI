@@ -91,19 +91,6 @@ async function collectOrgIdsFromOrgIndex(
   return orgIds;
 }
 
-async function getWorkspaceIntegrationCount(
-  env: AdminIndexBootstrapEnv,
-  orgId: string,
-  workspaceId: string,
-): Promise<number> {
-  try {
-    const orgStub = env.ORG.get(env.ORG.idFromName(orgId));
-    return (await orgStub.getWorkspaceIntegrations(workspaceId)).length;
-  } catch {
-    return 0;
-  }
-}
-
 async function waitForAdminIndexBootstrap(
   appIndex: AppIndexDatabase,
   options: AdminIndexBootstrapOptions = {},
@@ -119,6 +106,25 @@ async function waitForAdminIndexBootstrap(
   }
 }
 
+/**
+ * Mirror one Durable Object's facts into D1 through its own outbox: queue a
+ * full resync and drain it now. The DO stamps every row with its mirror
+ * version, so this can never overwrite a newer write the way a direct walk of
+ * DO reads could.
+ */
+async function resyncDurableObjectNow(stub: {
+  requestMirrorResync(): Promise<unknown>;
+  drainMirrorNow(): Promise<{ failed: number; remaining: number }>;
+}): Promise<void> {
+  await stub.requestMirrorResync();
+  const result = await stub.drainMirrorNow();
+  if (result.failed > 0 || result.remaining > 0) {
+    throw new Error(
+      `D1 mirror drain incomplete (failed=${result.failed}, remaining=${result.remaining})`,
+    );
+  }
+}
+
 async function bootstrapAdminIndexFromDurableObjects(
   env: AdminIndexBootstrapEnv,
   appIndex: AppIndexDatabase,
@@ -126,20 +132,7 @@ async function bootstrapAdminIndexFromDurableObjects(
   const userIds = await collectAllUserIds(env);
 
   for (const userId of userIds) {
-    const userStub = env.USER.get(env.USER.idFromName(userId));
-    const profile = await userStub.getProfile();
-    if (!profile) {
-      continue;
-    }
-
-    const orgs = await userStub.getOrgs();
-    await appIndex.applyAdminEvent({
-      type: 'user_upsert',
-      payload: {
-        ...profile,
-        org_count: orgs.length,
-      },
-    });
+    await resyncDurableObjectNow(env.USER.get(env.USER.idFromName(userId)));
   }
 
   const [membershipOrgIds, indexedOrgIds] = await Promise.all([
@@ -149,85 +142,7 @@ async function bootstrapAdminIndexFromDurableObjects(
   const orgIds = new Set([...membershipOrgIds, ...indexedOrgIds]);
 
   for (const orgId of orgIds) {
-    const orgStub = env.ORG.get(env.ORG.idFromName(orgId));
-    const [info, members, workspaces, scripts, threads, invitations] =
-      await Promise.all([
-        orgStub.getInfo(),
-        orgStub.getMembers(),
-        orgStub.getWorkspaceInfos(true),
-        orgStub.listWorkerScripts(),
-        orgStub.getThreads(),
-        orgStub.getInvitations(),
-      ]);
-
-    if (!info) {
-      continue;
-    }
-
-    await appIndex.applyAdminEvent({
-      type: 'org_upsert',
-      payload: {
-        ...info,
-        member_count: members.length,
-        workspace_count: workspaces.length,
-      },
-    });
-
-    for (const member of members) {
-      await appIndex.applyAdminEvent({
-        type: 'org_membership_upsert',
-        payload: {
-          org_id: orgId,
-          user_id: member.user_id,
-          role: member.role,
-          joined_at: member.joined_at,
-        },
-      });
-    }
-
-    const integrationCounts = new Map(
-      await Promise.all(
-        workspaces.map(
-          async (workspace) =>
-            [
-              workspace.id,
-              await getWorkspaceIntegrationCount(env, orgId, workspace.id),
-            ] as const,
-        ),
-      ),
-    );
-
-    for (const workspace of workspaces) {
-      await appIndex.applyAdminEvent({
-        type: 'workspace_upsert',
-        payload: {
-          ...workspace,
-          integration_count: integrationCounts.get(workspace.id) ?? 0,
-        },
-      });
-    }
-
-    for (const script of scripts) {
-      await appIndex.applyAdminEvent({
-        type: 'app_upsert',
-        payload: { ...script, org_id: orgId },
-      });
-    }
-
-    for (const thread of threads) {
-      const { user_ask_log: _omitted, ...adminThread } = thread;
-      await appIndex.applyAdminEvent({
-        type: 'thread_upsert',
-        payload: { ...adminThread, org_id: orgId },
-      });
-    }
-
-    for (const invitation of invitations) {
-      await appIndex.applyAdminEvent({
-        type: 'invitation_upsert',
-        payload: { ...invitation, org_id: orgId },
-      });
-    }
+    await resyncDurableObjectNow(env.ORG.get(env.ORG.idFromName(orgId)));
   }
 
   await appIndex.markBootstrapComplete();
@@ -287,4 +202,177 @@ export async function ensureAdminIndexReady(
   } finally {
     await env.APP_KV.delete(APP_INDEX_BOOTSTRAP_LOCK_KEY);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Resumable D1 mirror backfill
+// ---------------------------------------------------------------------------
+//
+// Walks every UserDO (EMAIL_TO_USER) and then every OrgDO (org_index: in
+// APP_KV) and asks each to re-queue everything it owns in its D1 mirror
+// outbox; each DO's alarm then drains it with versioned upserts. The walk
+// cursor lives in app_index_metadata, so the job survives restarts and is
+// advanced by the cron trigger (or by POST /api/admin/d1-mirror/backfill
+// {"action":"step"} where there is no cron, e.g. self-host).
+
+const MIRROR_BACKFILL_STATE_KEY = 'd1_mirror_backfill';
+const MIRROR_BACKFILL_PAGE_SIZE = 25;
+
+export type MirrorBackfillPhase = 'users' | 'orgs' | 'done';
+
+export interface MirrorBackfillState {
+  status: 'idle' | 'running' | 'done';
+  phase: MirrorBackfillPhase;
+  cursor: string | null;
+  users_queued: number;
+  orgs_queued: number;
+  errors: number;
+  last_error: string | null;
+  started_at: number | null;
+  updated_at: number | null;
+  finished_at: number | null;
+}
+
+const IDLE_BACKFILL_STATE: MirrorBackfillState = {
+  status: 'idle',
+  phase: 'users',
+  cursor: null,
+  users_queued: 0,
+  orgs_queued: 0,
+  errors: 0,
+  last_error: null,
+  started_at: null,
+  updated_at: null,
+  finished_at: null,
+};
+
+type MirrorBackfillEnv = Pick<AdminIndexBootstrapEnv, 'APP_DB' | 'APP_KV' | 'EMAIL_TO_USER' | 'USER' | 'ORG'>;
+
+function requireAppIndex(env: MirrorBackfillEnv): AppIndexDatabase {
+  const appIndex = getAppIndexDatabase(env);
+  if (!appIndex) throw new Error('APP_DB binding is not configured');
+  return appIndex;
+}
+
+export async function getMirrorBackfillState(env: MirrorBackfillEnv): Promise<MirrorBackfillState> {
+  const raw = await requireAppIndex(env).getMetadata(MIRROR_BACKFILL_STATE_KEY);
+  if (!raw) return { ...IDLE_BACKFILL_STATE };
+  try {
+    return { ...IDLE_BACKFILL_STATE, ...(JSON.parse(raw) as Partial<MirrorBackfillState>) };
+  } catch {
+    return { ...IDLE_BACKFILL_STATE };
+  }
+}
+
+async function saveMirrorBackfillState(env: MirrorBackfillEnv, state: MirrorBackfillState): Promise<void> {
+  await requireAppIndex(env).setMetadata(MIRROR_BACKFILL_STATE_KEY, JSON.stringify(state));
+}
+
+/** Start (or restart from the beginning) the backfill. */
+export async function startMirrorBackfill(env: MirrorBackfillEnv): Promise<MirrorBackfillState> {
+  const now = Date.now();
+  const state: MirrorBackfillState = {
+    ...IDLE_BACKFILL_STATE,
+    status: 'running',
+    started_at: now,
+    updated_at: now,
+  };
+  await saveMirrorBackfillState(env, state);
+  return state;
+}
+
+export async function resetMirrorBackfill(env: MirrorBackfillEnv): Promise<MirrorBackfillState> {
+  const state = { ...IDLE_BACKFILL_STATE };
+  await saveMirrorBackfillState(env, state);
+  return state;
+}
+
+/**
+ * Advance a running backfill by one page of DOs. Per-DO failures are counted
+ * and skipped (the reconciler catches whatever they left behind); the cursor
+ * only moves forward once the page has been attempted.
+ */
+export async function runMirrorBackfillStep(
+  env: MirrorBackfillEnv,
+  pageSize = MIRROR_BACKFILL_PAGE_SIZE,
+): Promise<MirrorBackfillState> {
+  const state = await getMirrorBackfillState(env);
+  if (state.status !== 'running') return state;
+
+  const recordError = (error: unknown) => {
+    state.errors += 1;
+    state.last_error = error instanceof Error ? error.message : String(error);
+  };
+
+  if (state.phase === 'users') {
+    const page = await env.EMAIL_TO_USER.list({
+      prefix: 'email:',
+      cursor: state.cursor ?? undefined,
+      limit: pageSize,
+    });
+    const userIds = new Set(
+      (await Promise.all(page.keys.map((key) => env.EMAIL_TO_USER.get(key.name)))).filter(
+        (id): id is string => id !== null && !id.startsWith('{'),
+      ),
+    );
+    await Promise.all(
+      [...userIds].map(async (userId) => {
+        try {
+          await env.USER.get(env.USER.idFromName(userId)).requestMirrorResync();
+          state.users_queued += 1;
+        } catch (error) {
+          recordError(error);
+        }
+      }),
+    );
+    if (page.list_complete || !page.cursor) {
+      state.phase = 'orgs';
+      state.cursor = null;
+    } else {
+      state.cursor = page.cursor;
+    }
+  } else if (state.phase === 'orgs') {
+    const page = await env.APP_KV.list({
+      prefix: ORG_INDEX_PREFIX,
+      cursor: state.cursor ?? undefined,
+      limit: pageSize,
+    });
+    await Promise.all(
+      page.keys.map(async (key) => {
+        const orgId = key.name.slice(ORG_INDEX_PREFIX.length);
+        if (!orgId) return;
+        try {
+          await env.ORG.get(env.ORG.idFromName(orgId)).requestMirrorResync();
+          state.orgs_queued += 1;
+        } catch (error) {
+          recordError(error);
+        }
+      }),
+    );
+    if (page.list_complete || !page.cursor) {
+      state.phase = 'done';
+      state.cursor = null;
+    } else {
+      state.cursor = page.cursor;
+    }
+  }
+
+  const now = Date.now();
+  state.updated_at = now;
+  if (state.phase === 'done') {
+    state.status = 'done';
+    state.finished_at = now;
+  }
+  await saveMirrorBackfillState(env, state);
+  return state;
+}
+
+/** Advance a running backfill for up to `budgetMs` (cron). */
+export async function runMirrorBackfillFor(env: MirrorBackfillEnv, budgetMs: number): Promise<MirrorBackfillState> {
+  const deadline = Date.now() + budgetMs;
+  let state = await getMirrorBackfillState(env);
+  while (state.status === 'running' && Date.now() < deadline) {
+    state = await runMirrorBackfillStep(env);
+  }
+  return state;
 }

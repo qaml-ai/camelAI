@@ -54,6 +54,8 @@
  *   POST  /api/admin/workspaces/:id/archive; GET /api/admin/workspaces/:id/audit-log
  *   GET   /api/admin/invitations, /api/admin/chat-explorer
  *   POST  /api/admin/email/test
+ *   GET|POST /api/admin/d1-mirror/backfill, GET /api/admin/d1-mirror/outbox,
+ *   POST  /api/admin/d1-mirror/resync (DO -> D1 identity mirror ops)
  */
 
 import { Hono } from 'hono';
@@ -61,6 +63,7 @@ import { createOpenApiDocument } from 'hono-zod-openapi';
 import type { Env, RouteContext } from '../../types.js';
 import { routes } from './routes.js';
 import { managementRoutes } from './management-routes.js';
+import { d1MirrorRoutes } from './d1-mirror-routes.js';
 
 // ---------------------------------------------------------------------------
 // Hono app
@@ -73,6 +76,7 @@ const app = new Hono<HonoEnv>().basePath('/api/admin');
 // All admin routes (each has openApi() middleware for spec generation)
 app.route('/', routes);
 app.route('/', managementRoutes);
+app.route('/', d1MirrorRoutes);
 
 // Auto-generate and serve OpenAPI spec from route middleware declarations
 createOpenApiDocument(app, {

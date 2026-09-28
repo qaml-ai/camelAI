@@ -28,7 +28,8 @@ export type MirrorKind =
   | "thread"
   | "app"
   | "invitation"
-  | "org_membership";
+  | "org_membership"
+  | "workspace_member";
 
 /**
  * Reads one dirty entity's current state as the events that mirror it: an
@@ -40,6 +41,8 @@ export type MirrorSnapshot = (kind: MirrorKind, id: string) => AdminEventType[];
 
 export interface MirrorDrainOptions {
   maxRows?: number;
+  /** Drain rows still inside their coalescing or retry delay too (backfill/bootstrap). */
+  ignoreSchedule?: boolean;
   budgetMs?: number;
   observability?: ObservabilityEnv;
   component?: string;
@@ -227,7 +230,7 @@ export class D1MirrorOutbox {
           WHERE next_attempt_at <= ?
           ORDER BY next_attempt_at ASC, enqueued_at ASC
           LIMIT ?`,
-        startedAt,
+        options.ignoreSchedule ? Number.MAX_SAFE_INTEGER : startedAt,
         options.maxRows ?? DEFAULT_MAX_ROWS,
       )
       .toArray();
@@ -291,6 +294,27 @@ export class D1MirrorOutbox {
     }
 
     return { applied, failed, remaining: this.pendingCount() };
+  }
+
+  /**
+   * Drain everything queued, ignoring coalescing and backoff delays, until the
+   * outbox is empty or a pass fails (bootstrap, backfill and tests).
+   */
+  async drainAll(
+    db: AppIndexDatabase | null,
+    snapshot: MirrorSnapshot,
+    options: MirrorDrainOptions = {},
+    maxPasses = 50,
+  ): Promise<MirrorDrainResult> {
+    const total: MirrorDrainResult = { applied: 0, failed: 0, remaining: this.pendingCount() };
+    for (let pass = 0; pass < maxPasses && total.remaining > 0; pass += 1) {
+      const step = await this.drain(db, snapshot, { ...options, ignoreSchedule: true });
+      total.applied += step.applied;
+      total.failed += step.failed;
+      total.remaining = step.remaining;
+      if (step.failed > 0 || step.applied === 0) break;
+    }
+    return total;
   }
 
   private arm(dueAt: number): void {

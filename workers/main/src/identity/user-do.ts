@@ -373,6 +373,14 @@ export class UserDO extends DurableObject<DOEnv> {
     return this.mirror.stats();
   }
 
+  /** Apply everything queued for D1 now (bootstrap/backfill). */
+  async drainMirrorNow() {
+    return this.mirror.drainAll(getAppIndexDatabase(this.env), this.mirrorSnapshot, {
+      observability: this.env,
+      component: "UserDO",
+    });
+  }
+
   private getSchemaVersionValue(): number {
     const storedVersion = this.ctx.storage.kv.get<number>("schemaVersion");
     if (typeof storedVersion === "number") {

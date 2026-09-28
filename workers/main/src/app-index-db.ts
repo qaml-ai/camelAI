@@ -346,7 +346,31 @@ export type MirrorEntity =
   | 'thread'
   | 'app'
   | 'invitation'
-  | 'org_membership';
+  | 'org_membership'
+  | 'workspace_member';
+
+const MIRROR_FANOUT_COLUMN_STATEMENTS = [
+  'ALTER TABLE users ADD COLUMN email_verified_at INTEGER',
+  'ALTER TABLE users ADD COLUMN orphaned_at INTEGER',
+  'ALTER TABLE org_memberships ADD COLUMN workspace_access_default TEXT',
+  'ALTER TABLE workspaces ADD COLUMN email_handle TEXT',
+  // Thread-list projection: previews truncated exactly like the list mapper.
+  'ALTER TABLE threads ADD COLUMN first_user_message_preview TEXT',
+  'ALTER TABLE threads ADD COLUMN last_user_message_preview TEXT',
+  'ALTER TABLE threads ADD COLUMN last_assistant_completed_at INTEGER',
+  'ALTER TABLE threads ADD COLUMN last_assistant_summary TEXT',
+  'ALTER TABLE threads ADD COLUMN last_assistant_summary_status TEXT',
+  'ALTER TABLE threads ADD COLUMN channel_connection_id TEXT',
+  'ALTER TABLE threads ADD COLUMN channel_conversation_id TEXT',
+  'ALTER TABLE threads ADD COLUMN channel_message_id TEXT',
+];
+
+/** Thread list previews: the same limit `toThreadListPreview` applies. */
+export const THREAD_LIST_PREVIEW_LENGTH = 500;
+
+export function workspaceMemberMirrorKey(workspaceId: string, userId: string): string {
+  return `${workspaceId}:${userId}`;
+}
 
 const MIRROR_ROW_CLAIM_SQL = `
   INSERT INTO mirror_rows (entity, entity_key, version, deleted, updated_at)
@@ -539,6 +563,17 @@ export class AppIndexDatabase {
         PRIMARY KEY (entity, entity_key)
       );
       CREATE INDEX IF NOT EXISTS idx_mirror_rows_deleted_updated_at ON mirror_rows(deleted, updated_at);
+      CREATE TABLE IF NOT EXISTS workspace_members (
+        workspace_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        org_id TEXT NOT NULL,
+        access_level TEXT NOT NULL,
+        granted_by TEXT,
+        granted_at INTEGER NOT NULL,
+        PRIMARY KEY (workspace_id, user_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_id, org_id);
+      CREATE INDEX IF NOT EXISTS idx_workspace_members_org ON workspace_members(org_id);
       CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
       CREATE INDEX IF NOT EXISTS idx_orgs_created_at ON orgs(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_orgs_llm_provider_created_at ON orgs(llm_provider, created_at DESC);
@@ -616,6 +651,15 @@ export class AppIndexDatabase {
         try {
           await this.db.prepare("ALTER TABLE threads ADD COLUMN last_model_changed_at INTEGER").run();
         } catch {}
+        // Columns the fan-out reads (org members, user orgs, thread lists,
+        // workspace switcher) need to be served from D1. Added here rather than
+        // in migrations/ because SQLite has no ADD COLUMN IF NOT EXISTS and this
+        // runtime path may already have run against a database.
+        for (const statement of MIRROR_FANOUT_COLUMN_STATEMENTS) {
+          try {
+            await this.db.prepare(statement).run();
+          } catch {}
+        }
         await this.db
           .prepare("CREATE INDEX IF NOT EXISTS idx_apps_project_updated_at ON apps(project_id, updated_at DESC)")
           .run();
@@ -678,6 +722,22 @@ export class AppIndexDatabase {
       `),
     );
     return row?.value === '1';
+  }
+
+  async getMetadata(key: string): Promise<string | null> {
+    await this.ensureSchema();
+    const row = await first<{ value: string }>(
+      this.db.prepare('SELECT value FROM app_index_metadata WHERE key = ? LIMIT 1').bind(key),
+    );
+    return row?.value ?? null;
+  }
+
+  async setMetadata(key: string, value: string): Promise<void> {
+    await this.ensureSchema();
+    await this.db
+      .prepare('INSERT OR REPLACE INTO app_index_metadata (key, value, updated_at) VALUES (?, ?, ?)')
+      .bind(key, value, Date.now())
+      .run();
   }
 
   async markBootstrapComplete(): Promise<void> {
@@ -779,8 +839,8 @@ export class AppIndexDatabase {
           ...this.claimMirrorVersion('user', u.id, version, false),
           this.db
             .prepare(`
-              INSERT INTO users (id, email, name, avatar_color, avatar_content, created_at, is_superuser, is_orphaned, org_count, signup_ip)
-              SELECT ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, COALESCE((SELECT org_count FROM users WHERE id = ?), 0)), COALESCE(?, (SELECT signup_ip FROM users WHERE id = ?))
+              INSERT INTO users (id, email, name, avatar_color, avatar_content, created_at, is_superuser, is_orphaned, org_count, signup_ip, email_verified_at, orphaned_at)
+              SELECT ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, COALESCE((SELECT org_count FROM users WHERE id = ?), 0)), COALESCE(?, (SELECT signup_ip FROM users WHERE id = ?)), ?, ?
               WHERE ${guard.sql}
               ON CONFLICT(id) DO UPDATE SET
                 email=excluded.email,
@@ -790,9 +850,17 @@ export class AppIndexDatabase {
                 is_superuser=excluded.is_superuser,
                 is_orphaned=excluded.is_orphaned,
                 org_count=COALESCE(excluded.org_count, users.org_count),
-                signup_ip=COALESCE(excluded.signup_ip, users.signup_ip)
+                signup_ip=COALESCE(excluded.signup_ip, users.signup_ip),
+                email_verified_at=CASE WHEN ? THEN excluded.email_verified_at ELSE users.email_verified_at END,
+                orphaned_at=CASE WHEN ? THEN excluded.orphaned_at ELSE users.orphaned_at END
             `)
-            .bind(u.id, u.email ?? '', u.name ?? null, u.avatar?.color ?? '', u.avatar?.content ?? '', u.created_at ?? Date.now(), u.is_superuser ? 1 : 0, u.is_orphaned ? 1 : 0, orgCount, u.id, signupIp, u.id, ...guard.binds),
+            .bind(
+              u.id, u.email ?? '', u.name ?? null, u.avatar?.color ?? '', u.avatar?.content ?? '', u.created_at ?? Date.now(), u.is_superuser ? 1 : 0, u.is_orphaned ? 1 : 0, orgCount, u.id, signupIp, u.id,
+              normalizeNullableNumber(u.email_verified_at), normalizeNullableNumber(u.orphaned_at),
+              ...guard.binds,
+              hasOwnField(u, 'email_verified_at') ? 1 : 0,
+              hasOwnField(u, 'orphaned_at') ? 1 : 0,
+            ),
         ]);
         break;
       }
@@ -847,8 +915,8 @@ export class AppIndexDatabase {
           ...this.claimMirrorVersion('workspace', w.id, version, false),
           this.db
             .prepare(`
-              INSERT INTO workspaces (id, name, org_id, description, avatar_color, avatar_content, created_at, created_by, archived, archived_at, archived_by, compute_tier, thread_count, integration_count)
-              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT thread_count FROM workspaces WHERE id = ?), 0), COALESCE(?, COALESCE((SELECT integration_count FROM workspaces WHERE id = ?), 0))
+              INSERT INTO workspaces (id, name, org_id, description, avatar_color, avatar_content, created_at, created_by, archived, archived_at, archived_by, compute_tier, thread_count, integration_count, email_handle)
+              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT thread_count FROM workspaces WHERE id = ?), 0), COALESCE(?, COALESCE((SELECT integration_count FROM workspaces WHERE id = ?), 0)), ?
               WHERE ${guard.sql}
               ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name,
@@ -862,9 +930,15 @@ export class AppIndexDatabase {
                 archived_at=excluded.archived_at,
                 archived_by=excluded.archived_by,
                 compute_tier=COALESCE(excluded.compute_tier, 'standard'),
-                integration_count=COALESCE(excluded.integration_count, integration_count)
+                integration_count=COALESCE(excluded.integration_count, integration_count),
+                email_handle=CASE WHEN ? THEN excluded.email_handle ELSE workspaces.email_handle END
             `)
-            .bind(w.id, w.name, w.org_id, w.description ?? null, w.avatar?.color ?? null, w.avatar?.content ?? null, w.created_at ?? Date.now(), w.created_by ?? null, w.archived ? 1 : 0, w.archived_at ?? null, w.archived_by ?? null, w.compute_tier ?? 'standard', w.id, integrationCount, w.id, ...guard.binds),
+            .bind(
+              w.id, w.name, w.org_id, w.description ?? null, w.avatar?.color ?? null, w.avatar?.content ?? null, w.created_at ?? Date.now(), w.created_by ?? null, w.archived ? 1 : 0, w.archived_at ?? null, w.archived_by ?? null, w.compute_tier ?? 'standard', w.id, integrationCount, w.id,
+              typeof w.email_handle === 'string' ? w.email_handle : null,
+              ...guard.binds,
+              hasOwnField(w, 'email_handle') ? 1 : 0,
+            ),
           this.db.prepare('UPDATE orgs SET workspace_count = (SELECT COUNT(*) FROM workspaces WHERE org_id = ?) WHERE id = ?').bind(w.org_id, w.org_id),
         ]);
         break;
@@ -950,9 +1024,17 @@ export class AppIndexDatabase {
                 last_chat_error_provider,
                 last_chat_error_model,
                 model_history,
-                last_model_changed_at
+                last_model_changed_at,
+                first_user_message_preview,
+                last_user_message_preview,
+                last_assistant_completed_at,
+                last_assistant_summary,
+                last_assistant_summary_status,
+                channel_connection_id,
+                channel_conversation_id,
+                channel_message_id
               )
-              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
               WHERE ${guard.sql}
               ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title,
@@ -973,7 +1055,15 @@ export class AppIndexDatabase {
                 last_chat_error_provider=excluded.last_chat_error_provider,
                 last_chat_error_model=excluded.last_chat_error_model,
                 model_history=excluded.model_history,
-                last_model_changed_at=excluded.last_model_changed_at
+                last_model_changed_at=excluded.last_model_changed_at,
+                first_user_message_preview=CASE WHEN ? THEN excluded.first_user_message_preview ELSE threads.first_user_message_preview END,
+                last_user_message_preview=CASE WHEN ? THEN excluded.last_user_message_preview ELSE threads.last_user_message_preview END,
+                last_assistant_completed_at=CASE WHEN ? THEN excluded.last_assistant_completed_at ELSE threads.last_assistant_completed_at END,
+                last_assistant_summary=CASE WHEN ? THEN excluded.last_assistant_summary ELSE threads.last_assistant_summary END,
+                last_assistant_summary_status=CASE WHEN ? THEN excluded.last_assistant_summary_status ELSE threads.last_assistant_summary_status END,
+                channel_connection_id=CASE WHEN ? THEN excluded.channel_connection_id ELSE threads.channel_connection_id END,
+                channel_conversation_id=CASE WHEN ? THEN excluded.channel_conversation_id ELSE threads.channel_conversation_id END,
+                channel_message_id=CASE WHEN ? THEN excluded.channel_message_id ELSE threads.channel_message_id END
             `)
             .bind(
               t.id,
@@ -1009,7 +1099,34 @@ export class AppIndexDatabase {
                 : existingThreadMetadata?.last_chat_error_model ?? null,
               modelHistory,
               lastModelChangedAt,
+              truncateThreadPreviewText(
+                typeof t.first_user_message === 'string' ? t.first_user_message : null,
+                THREAD_LIST_PREVIEW_LENGTH,
+              ),
+              truncateThreadPreviewText(
+                typeof t.last_user_message === 'string' ? t.last_user_message : null,
+                THREAD_LIST_PREVIEW_LENGTH,
+              ),
+              normalizeNullableNumber(t.last_assistant_completed_at),
+              typeof t.last_assistant_summary === 'string' ? t.last_assistant_summary : null,
+              typeof t.last_assistant_summary_status === 'string' ? t.last_assistant_summary_status : null,
+              t.channel_connection_id ?? null,
+              t.channel_conversation_id ?? null,
+              t.channel_message_id ?? null,
               ...guard.binds,
+              // The list projection is owned by the DO snapshot: unversioned
+              // (legacy/repair) writes, which may carry admin-truncated text,
+              // leave it alone, as do snapshots that omit a field.
+              ...[
+                'first_user_message',
+                'last_user_message',
+                'last_assistant_completed_at',
+                'last_assistant_summary',
+                'last_assistant_summary_status',
+                'channel_connection_id',
+                'channel_conversation_id',
+                'channel_message_id',
+              ].map((field) => (version !== undefined && hasOwnField(t, field) ? 1 : 0)),
             ),
           this.db.prepare('UPDATE workspaces SET thread_count = (SELECT COUNT(*) FROM threads WHERE workspace_id = ?) WHERE id = ?').bind(t.workspace_id, t.workspace_id),
         ]);
@@ -1193,12 +1310,24 @@ export class AppIndexDatabase {
           ...this.claimMirrorVersion('org_membership', key, version, false),
           this.db
             .prepare(`
-              INSERT INTO org_memberships (org_id, user_id, role, joined_at)
-              SELECT ?, ?, ?, ?
+              INSERT INTO org_memberships (org_id, user_id, role, joined_at, workspace_access_default)
+              SELECT ?, ?, ?, ?, ?
               WHERE ${guard.sql}
-              ON CONFLICT(org_id, user_id) DO UPDATE SET role = excluded.role, joined_at = COALESCE(org_memberships.joined_at, excluded.joined_at)
+              ON CONFLICT(org_id, user_id) DO UPDATE SET
+                role = excluded.role,
+                joined_at = CASE WHEN ? THEN excluded.joined_at ELSE COALESCE(org_memberships.joined_at, excluded.joined_at) END,
+                workspace_access_default = COALESCE(excluded.workspace_access_default, org_memberships.workspace_access_default)
             `)
-            .bind(event.payload.org_id, event.payload.user_id, event.payload.role, event.payload.joined_at, ...guard.binds),
+            .bind(
+              event.payload.org_id,
+              event.payload.user_id,
+              event.payload.role,
+              event.payload.joined_at,
+              event.payload.workspace_access_default ?? null,
+              ...guard.binds,
+              // A versioned snapshot is the DO's current row: take its joined_at.
+              version === undefined ? 0 : 1,
+            ),
         ]);
         break;
       }
@@ -1210,6 +1339,38 @@ export class AppIndexDatabase {
           this.db
             .prepare(`DELETE FROM org_memberships WHERE org_id = ? AND user_id = ? AND ${guard.sql}`)
             .bind(event.payload.org_id, event.payload.user_id, ...guard.binds),
+        ]);
+        break;
+      }
+      case 'workspace_member_upsert': {
+        const m = event.payload;
+        const key = workspaceMemberMirrorKey(m.workspace_id, m.user_id);
+        const guard = mirrorUpsertGuard('workspace_member', key, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('workspace_member', key, version, false),
+          this.db
+            .prepare(`
+              INSERT INTO workspace_members (workspace_id, user_id, org_id, access_level, granted_by, granted_at)
+              SELECT ?, ?, ?, ?, ?, ?
+              WHERE ${guard.sql}
+              ON CONFLICT(workspace_id, user_id) DO UPDATE SET
+                org_id = excluded.org_id,
+                access_level = excluded.access_level,
+                granted_by = excluded.granted_by,
+                granted_at = excluded.granted_at
+            `)
+            .bind(m.workspace_id, m.user_id, m.org_id, m.access_level, m.granted_by ?? null, m.granted_at, ...guard.binds),
+        ]);
+        break;
+      }
+      case 'workspace_member_delete': {
+        const key = workspaceMemberMirrorKey(event.payload.workspace_id, event.payload.user_id);
+        const guard = mirrorDeleteGuard('workspace_member', key, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('workspace_member', key, version, true),
+          this.db
+            .prepare(`DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND ${guard.sql}`)
+            .bind(event.payload.workspace_id, event.payload.user_id, ...guard.binds),
         ]);
         break;
       }

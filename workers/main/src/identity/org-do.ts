@@ -75,7 +75,7 @@ import {
   type HostedCapability,
 } from "../../../../src/lib/capability-allowances";
 import type { AdminEventType } from "../admin-index-types";
-import { getAppIndexDatabase } from "../app-index-db";
+import { getAppIndexDatabase, workspaceMemberMirrorKey } from "../app-index-db";
 import {
   D1MirrorOutbox,
   scheduleEarliestAlarm,
@@ -1004,8 +1004,8 @@ export class OrgDO extends DurableObject<DOEnv> {
       }
       case "org_membership": {
         const member = this.sql
-          .exec<{ role: string; joined_at: number }>(
-            "SELECT role, joined_at FROM members WHERE user_id = ?",
+          .exec<{ role: string; joined_at: number; workspace_access_default: string | null }>(
+            "SELECT role, joined_at, workspace_access_default FROM members WHERE user_id = ?",
             id,
           )
           .toArray()[0];
@@ -1013,10 +1013,43 @@ export class OrgDO extends DurableObject<DOEnv> {
           ? [
               {
                 type: "org_membership_upsert",
-                payload: { org_id: orgId, user_id: id, role: member.role, joined_at: member.joined_at },
+                payload: {
+                  org_id: orgId,
+                  user_id: id,
+                  role: member.role,
+                  joined_at: member.joined_at,
+                  workspace_access_default: member.workspace_access_default === "none" ? "none" : "full",
+                },
               },
             ]
           : [{ type: "org_membership_delete", payload: { org_id: orgId, user_id: id } }];
+      }
+      case "workspace_member": {
+        const separator = id.indexOf(":");
+        const workspaceId = id.slice(0, separator);
+        const userId = id.slice(separator + 1);
+        const row = this.sql
+          .exec<{ access_level: string; granted_by: string | null; granted_at: number }>(
+            "SELECT access_level, granted_by, granted_at FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?",
+            workspaceId,
+            userId,
+          )
+          .toArray()[0];
+        return row
+          ? [
+              {
+                type: "workspace_member_upsert",
+                payload: {
+                  org_id: orgId,
+                  workspace_id: workspaceId,
+                  user_id: userId,
+                  access_level: this.normalizeWorkspaceAccess(row.access_level),
+                  granted_by: row.granted_by ?? null,
+                  granted_at: row.granted_at,
+                },
+              },
+            ]
+          : [{ type: "workspace_member_delete", payload: { workspace_id: workspaceId, user_id: userId } }];
       }
       case "invitation": {
         const invitation = this.sql
@@ -1106,6 +1139,13 @@ export class OrgDO extends DurableObject<DOEnv> {
       for (const { id } of this.sql.exec<{ id: string }>("SELECT id FROM workspaces").toArray()) {
         mark("workspace", id);
       }
+      for (const row of this.sql
+        .exec<{ workspace_id: string; user_id: string }>(
+          "SELECT workspace_id, user_id FROM workspace_memberships",
+        )
+        .toArray()) {
+        mark("workspace_member", workspaceMemberMirrorKey(row.workspace_id, row.user_id));
+      }
       for (const { script_name } of this.sql
         .exec<{ script_name: string }>("SELECT script_name FROM worker_scripts")
         .toArray()) {
@@ -1120,6 +1160,14 @@ export class OrgDO extends DurableObject<DOEnv> {
 
   async getMirrorOutboxStats() {
     return this.mirror.stats();
+  }
+
+  /** Apply everything queued for D1 now (bootstrap/backfill). */
+  async drainMirrorNow() {
+    return this.mirror.drainAll(getAppIndexDatabase(this.env), this.mirrorSnapshot, {
+      observability: this.env,
+      component: "OrgDO",
+    });
   }
 
   private get usageControls(): OrgUsageControls {
@@ -3504,6 +3552,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         now,
         workspaceAccessDefault,
       );
+      this.markWorkspaceMembershipsDirty(claimedIdentity.userId);
       this.sql.exec(
         "DELETE FROM workspace_memberships WHERE user_id = ?",
         claimedIdentity.userId,
@@ -3536,8 +3585,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       );
       this.sql.exec("DELETE FROM invitations WHERE id = ?", invitationRow.id);
       this.markMirrorDirty("invitation", invitationRow.id);
-      this.markMirrorDirty("org_membership", claimedIdentity.userId);
-      this.markMirrorDirty("org", "");
+      this.markMembershipDirty(claimedIdentity.userId);
 
       return { ...claimedIdentity, membershipRevoked: false };
     });
@@ -4336,6 +4384,19 @@ export class OrgDO extends DurableObject<DOEnv> {
   private markMembershipDirty(userId: string): void {
     this.markMirrorDirty("org_membership", userId);
     this.markMirrorDirty("org", "");
+    this.markWorkspaceMembershipsDirty(userId);
+  }
+
+  /** Mark every workspace access override `userId` currently has (call before deleting them too). */
+  private markWorkspaceMembershipsDirty(userId: string): void {
+    for (const { workspace_id } of this.sql
+      .exec<{ workspace_id: string }>(
+        "SELECT workspace_id FROM workspace_memberships WHERE user_id = ?",
+        userId,
+      )
+      .toArray()) {
+      this.markMirrorDirty("workspace_member", workspaceMemberMirrorKey(workspace_id, userId));
+    }
   }
 
   async addMember(
@@ -4400,6 +4461,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         );
       }
       if (options.workspaceAccessRows) {
+        this.markWorkspaceMembershipsDirty(userId);
         this.sql.exec(
           "DELETE FROM workspace_memberships WHERE user_id = ?",
           userId,
@@ -4501,6 +4563,7 @@ export class OrgDO extends DurableObject<DOEnv> {
     }
     this.ctx.storage.transactionSync(() => {
       this.sql.exec("DELETE FROM members WHERE user_id = ?", userId);
+      this.markWorkspaceMembershipsDirty(userId);
       this.sql.exec("DELETE FROM workspace_memberships WHERE user_id = ?", userId);
       this.sql.exec("DELETE FROM user_llm_usage_limits WHERE user_id = ?", userId);
       this.sql.exec(
@@ -7090,6 +7153,7 @@ export class OrgDO extends DurableObject<DOEnv> {
           member.granted_by || "system",
           Number.isFinite(member.granted_at) ? member.granted_at : Date.now(),
         );
+        this.markMirrorDirty("workspace_member", workspaceMemberMirrorKey(workspaceId, member.user_id));
       }
     } catch (error) {
       console.warn("[OrgDO] failed to hydrate workspace restrictions", {
@@ -7146,6 +7210,7 @@ export class OrgDO extends DurableObject<DOEnv> {
           workspaceId,
           userId,
         );
+        this.markMirrorDirty("workspace_member", workspaceMemberMirrorKey(workspaceId, userId));
         this.log("workspace_access_changed", actorId, userId, {
           workspace_id: workspaceId,
           access_level: "full",
@@ -7174,6 +7239,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       actorId,
       now,
     );
+    this.markMirrorDirty("workspace_member", workspaceMemberMirrorKey(workspaceId, userId));
     this.log("workspace_access_changed", actorId, userId, {
       workspace_id: workspaceId,
       access_level: normalizedAccess,

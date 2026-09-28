@@ -488,6 +488,11 @@ export default {
     await (await loadEmailIngressModule()).handleWorkspaceEmailIngress(message, env);
   },
 
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
+    const { handleD1MirrorCron } = await import('./d1-mirror-cron.js');
+    await handleD1MirrorCron(env, controller.scheduledTime);
+  },
+
   async queue(
     batch: MessageBatch<AppScreenshotJob | SlackEventQueueMessage | DiscordEventQueueMessage>,
     env: Env,

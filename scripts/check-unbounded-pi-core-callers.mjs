@@ -88,10 +88,11 @@ export const ALLOWLIST = {
       why: "admin thread inspector: a stub type, a capability probe, and the call.",
     },
   },
-  "src/lib/chat-do.server.ts": {
+  "workers/main/src/agent-runtime/thread-transcript.ts": {
     getPiCoreParsedMessages: {
       count: 2,
-      why: "server-side admin/export loader: a stub type and the call.",
+      why: "the whole-thread reader for admin views, JSONL export and condensed transcripts " +
+        "(a DO thread's side; a runtime thread's is the runtime's history): a stub type and the call.",
     },
   },
 };

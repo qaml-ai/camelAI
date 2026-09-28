@@ -4,7 +4,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { normalizePiUiMetadata } from "../../../src/lib/runtime-artifacts";
 import type { ToolResultBlock } from "../../../src/types";
-import type { AdminExplorerThreadSummary } from "./chat-thread/types";
+import type { AdminExplorerThreadSummary, AgentEvalParsedMessage } from "./chat-thread/types";
 import { getPiAssistantErrorMessage } from "./chat-thread/pi-message-helpers";
 import { normalizeModelHistoryValue } from "./chat-error-metadata";
 
@@ -379,4 +379,22 @@ export function summarizeAdminExplorerThread(
     lastErrorMessage,
     models,
   };
+}
+
+/**
+ * A whole transcript's Pi messages as parsed chat messages, each tool result
+ * folded into its call's message: ChatThreadDO's pi_core and a runtime agent's
+ * history alike.
+ */
+export function piMessagesToParsedMessages(messages: AgentMessage[], threadId: string): AgentEvalParsedMessage[] {
+  const parsed: AgentEvalParsedMessage[] = [];
+  messages.forEach((message, index) => {
+    const record = message as unknown as Record<string, unknown>;
+    if (record.role === "toolResult") {
+      attachPiToolResultToParsedMessages(parsed, record);
+      return;
+    }
+    parsed.push(...piCoreMessageToParsedChatMessage(message, index, threadId));
+  });
+  return parsed;
 }

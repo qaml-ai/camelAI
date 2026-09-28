@@ -1,7 +1,7 @@
 import type { Route } from './+types/admin.threads.$id.jsonl';
 import { requireSuperuser, getAuthEnv } from '@/lib/auth.server';
 import { getEnv } from '@/lib/cloudflare.server';
-import { getPiCoreMessages } from '@/lib/chat-do.server';
+import { getThreadTranscript } from '@/lib/chat-do.server';
 
 function sanitizeFilename(value: string): string {
   const sanitized = value.replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -52,7 +52,7 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
       'X-Content-Type-Options': 'nosniff',
     };
 
-    const piMessages = await getPiCoreMessages(context, threadId);
+    const piMessages = await getThreadTranscript(context, { orgId, threadId });
     if (piMessages.length > 0) {
       return new Response(messagesToJsonl(piMessages), { headers });
     }

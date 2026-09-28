@@ -207,6 +207,7 @@ import {
   piCoreForkMessageIds,
   piCoreMessageToParsedChatMessage,
   attachPiToolResultToParsedMessages,
+  piMessagesToParsedMessages,
   summarizeAdminExplorerThread,
 } from "./pi-message-export";
 
@@ -4049,23 +4050,13 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     threadId: string,
   ): Promise<AgentEvalParsedMessage[]> {
     const normalizedThreadId = threadId.trim() || this.chatContext?.threadId || "";
-    const parsed: AgentEvalParsedMessage[] = [];
-
     // The browser rebuilds live assistant/tool content from the replay buffer,
     // so only canonical persisted history is returned here.
     const storedMessages = await this.loadFullPiCoreTranscriptUnbounded({
       includeUiMetadata: true,
       imagePolicy: "render",
     });
-    storedMessages.forEach((message, index) => {
-      const record = message as unknown as Record<string, unknown>;
-      if (record.role === "toolResult") {
-        attachPiToolResultToParsedMessages(parsed, record);
-        return;
-      }
-      parsed.push(...piCoreMessageToParsedChatMessage(message, index, normalizedThreadId));
-    });
-    return parsed;
+    return piMessagesToParsedMessages(storedMessages, normalizedThreadId);
   }
 
   /**

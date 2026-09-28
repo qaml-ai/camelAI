@@ -25,7 +25,7 @@ import { getEnv, type CloudflareEnv } from "./cloudflare.server";
 import { getAuthEnv } from "./auth-helpers";
 import * as authDO from "./auth-do";
 import {
-  getMessages as getThreadMessages,
+  getThreadTranscript,
   normalizeStoredThreadModel,
   getThreadPreviewTarget,
 } from "./chat-do.server";
@@ -699,8 +699,8 @@ async function hydrateMissingChatExplorerThreadMetadata(
     stillMissing.map(async (row) => {
       try {
         if (!('CHAT_THREAD' in env) || !env.CHAT_THREAD) return;
-        const chatThread = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(row.id));
-        const summary = await chatThread.getAdminExplorerSummary({
+        const { threadExplorerSummary } = await import("../../workers/main/src/agent-runtime/thread-transcript");
+        const summary = await threadExplorerSummary(env as never, row.org_id, row.id, {
           userMessageCap: CHAT_EXPLORER_MESSAGE_COUNT_DISPLAY_CAP,
         });
         const modelHistory = summary.models.length > 0
@@ -1007,9 +1007,13 @@ export async function adminGetThreadWithMessages(
   const { model } = normalizeStoredThreadModel(thread.model);
 
   const [messages, preview_target] = await Promise.all([
-    getThreadMessages(context, threadId, thread.workspace_id, {
-      skipBanCheck: true,
-    }),
+    getThreadTranscript(context, { orgId, threadId }).then(
+      (messages) => messages as unknown as Message[],
+      (error: unknown) => {
+        console.error("[adminGetThread] failed to read the transcript", error);
+        return [] as Message[];
+      },
+    ),
     getThreadPreviewTarget(context, threadId),
   ]);
 

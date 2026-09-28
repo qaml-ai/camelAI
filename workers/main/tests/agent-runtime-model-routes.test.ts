@@ -66,7 +66,9 @@ describe("runtimeModelRoute", () => {
     expect(runtimeModelRoute(config({ usageProvider: "openrouter", model: { provider: "anthropic", id: "anthropic/claude-sonnet-5.5:nitro", baseUrl: "https://openrouter.ai/api" } }), org))
       .toEqual({ kind: "scope", model: "openrouter/anthropic/claude-sonnet-5.5:nitro", keyScope: scope });
     expect(runtimeModelRoute(config({ usageProvider: "bedrock", model: { provider: "custom", api: "anthropic-messages", id: "anthropic.claude-sonnet-5-5", baseUrl: "https://bedrock-mantle.eu-west-1.api.aws/anthropic" } }), org))
-      .toEqual({ kind: "scope", model: "amazon-bedrock/eu.anthropic.claude-sonnet-5-5", keyScope: scope });
+      .toEqual({ kind: "scope", model: "amazon-bedrock/global.anthropic.claude-sonnet-5-5", keyScope: scope });
+    expect(runtimeModelRoute(config({ usageProvider: "bedrock", model: { provider: "custom", api: "anthropic-messages", id: "anthropic.claude-opus-5-5", baseUrl: "https://bedrock-mantle.eu-west-1.api.aws/anthropic" } }), org))
+      .toEqual({ kind: "scope", model: "amazon-bedrock/eu.anthropic.claude-opus-5-5", keyScope: scope });
   });
 
   it("sends the ChatGPT subscription through chiridion's Codex forwarder", () => {

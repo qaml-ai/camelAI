@@ -12,6 +12,7 @@
  */
 import { serveTools, type RuntimeIdentity } from "@camelai/agent-runtime/server";
 import { InputRequired, type CallToolResult, type ToolContext, type ToolServer } from "@camelai/agent-runtime";
+import { errorToObservabilityFields, recordObservabilityEvent } from "../observability.js";
 import { CODE_MODE_PI_PASSTHROUGH_TOOL_DEFINITIONS, CODE_MODE_TOOL_DEFINITIONS } from "../code-mode-tools.js";
 import type { CodeModeToolsProps } from "../code-mode-tools.js";
 import type { Env, RouteContext } from "../types.js";
@@ -291,7 +292,7 @@ export function agentMcpHandler(env: Env, tools: ToolsFactory, options: AgentMcp
   if (!tenant) {
     return async (_req: Request) => Response.json({ error: "The agent runtime is not configured" }, { status: 503 });
   }
-  return serveTools(agentToolServer(env, tools), {
+  const serve = serveTools(observedToolServer(env, agentToolServer(env, tools)), {
     tenant,
     runtime: env.AGENT_RUNTIME_URL || DEFAULT_RUNTIME,
     ...(env.AGENT_RUNTIME_MCP_AUDIENCE ? { audience: env.AGENT_RUNTIME_MCP_AUDIENCE } : {}),
@@ -299,6 +300,64 @@ export function agentMcpHandler(env: Env, tools: ToolsFactory, options: AgentMcp
     metadata: false,
     serverInfo: { name: "camelai", version: "1.0.0" },
   });
+  return async (req: Request) => {
+    const response = await serve(req);
+    // The SDK refuses a missing, expired, misaddressed or foreign token before any tool runs.
+    if (response.status === 401) {
+      recordObservabilityEvent(env, {
+        event: "agent_mcp_auth_failed",
+        severity: "warn",
+        component: "agent_mcp",
+        status: req.headers.get("Authorization") ? "invalid_token" : "no_token",
+        statusCode: 401,
+      });
+    }
+    return response;
+  };
+}
+
+/** A tool result's outcome for telemetry: refused by authorization, failed, waiting on a person, or ok. */
+function callOutcome(result: CallToolResult): string {
+  if ((result as { resultType?: unknown }).resultType === "input_required") return "input_required";
+  if (!result.isError) return "ok";
+  const first = result.content?.[0];
+  return first?.type === "text" && first.text.startsWith("Forbidden") ? "forbidden" : "error";
+}
+
+/**
+ * Record each tool call (agent_mcp_call): the tool, its outcome and duration,
+ * and the thread it ran for. Only ids and the tool's name; never its arguments
+ * or output.
+ */
+export function observedToolServer(env: Env, server: ToolServer): ToolServer {
+  return {
+    ...server,
+    async callTool(name, args, context) {
+      const started = Date.now();
+      const scope = context.identity?.context ?? {};
+      const record = (status: string, error?: unknown) => recordObservabilityEvent(env, {
+        event: "agent_mcp_call",
+        severity: status === "ok" || status === "input_required" ? "info" : "warn",
+        component: "agent_mcp",
+        operation: name,
+        status,
+        threadId: text(scope.thread) || null,
+        workspaceId: text(scope.workspace) || null,
+        orgId: text(scope.org) || null,
+        userId: text(context.identity?.user) || null,
+        durationMs: Date.now() - started,
+        ...(error === undefined ? {} : { errorName: errorToObservabilityFields(error).errorName }),
+      });
+      try {
+        const result = await server.callTool(name, args, context);
+        record(callOutcome(result));
+        return result;
+      } catch (error) {
+        record(error instanceof InputRequired ? "input_required" : "exception", error instanceof InputRequired ? undefined : error);
+        throw error;
+      }
+    },
+  };
 }
 
 export async function handleAgentMcp({ req, env, ctx }: RouteContext): Promise<Response> {

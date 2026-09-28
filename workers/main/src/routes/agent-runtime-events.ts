@@ -9,7 +9,11 @@
  * - run.completed / run.failed: it goes idle, its completion (and a failure's
  *   error) is recorded on the thread, and its summary generated, as
  *   ChatThreadDO does at a turn's end.
- * - input.requested / input.resolved: nothing yet (the page reads inputs live).
+ * - input.requested: on a channel or scheduled thread, where nobody is at a
+ *   computer to answer, the input is cancelled at once (ChatThreadDO answers
+ *   such a thread's questions the same way). A web thread's page reads its
+ *   inputs live.
+ * - input.resolved: nothing.
  * - usage.recorded: a model response's usage, recorded in the org's usage_log
  *   (agent-runtime/usage.ts).
  *
@@ -22,6 +26,7 @@ import type { ThreadRuntimeRecord } from "../identity/org-do.js";
 import { ChatThreadMetadata, type ChatThreadMetadataEnv } from "../chat-thread/metadata.js";
 import { recordWorkspaceThreadStreaming } from "../thread-status.js";
 import { runtimeAgentThreadKey, runtimeHistoryPage } from "../agent-runtime/thread-runtime.js";
+import { RuntimeApiError, runtimeApi } from "../agent-runtime/runtime-api.js";
 import { verifyStandardWebhook } from "../agent-runtime/webhooks.js";
 import { recordRuntimeUsage, type RuntimeUsageRecorded } from "../agent-runtime/usage.js";
 import { extractThreadCompletionSummarySource } from "../../../../src/lib/thread-completion-summary-generation.server";
@@ -97,6 +102,28 @@ async function replyText(env: Env, agentId: string, replyIndex: unknown): Promis
   }
 }
 
+/** Threads nobody watches from a browser: their inputs are cancelled. */
+const UNATTENDED_THREAD_SOURCES = new Set(["channel", "scheduled"]);
+
+/**
+ * Cancel an input of an unattended thread's agent. The answer names the
+ * person it was for (the run's actor), as the runtime requires; an input
+ * already settled is left as it is.
+ */
+async function cancelUnattendedInput(env: Env, agentId: string, inputId: string): Promise<void> {
+  const base = `/v1/agents/${encodeURIComponent(agentId)}/inputs/${encodeURIComponent(inputId)}`;
+  const input = await runtimeApi(env, "GET", base) as { state?: unknown; responders?: { audience?: unknown } } | null;
+  if (input?.state !== "pending") return;
+  const audience = Array.isArray(input.responders?.audience) ? input.responders.audience : [];
+  const actor = typeof audience[0] === "string" ? audience[0] : null;
+  try {
+    await runtimeApi(env, "POST", base, { action: "cancel", ...(actor ? { actor } : {}) });
+  } catch (error) {
+    // Someone (or the input's expiry) settled it first.
+    if (!(error instanceof RuntimeApiError && error.status === 409)) throw error;
+  }
+}
+
 /** Handle one event; false when it is not for a thread chiridion knows (acknowledged all the same). */
 export async function handleRuntimeEvent(
   env: Env,
@@ -107,17 +134,26 @@ export async function handleRuntimeEvent(
   if (event.type === "usage.recorded") {
     return recordRuntimeUsage(env, event.id, data as unknown as RuntimeUsageRecorded);
   }
-  if (!event.type.startsWith("run.")) return true;
+  if (!event.type.startsWith("run.") && event.type !== "input.requested") return true;
   const agentId = text(data.agentId);
   const ref = await threadOf(env, data);
   if (!agentId || !ref) return false;
   const org = env.ORG.get(env.ORG.idFromName(ref.org)) as unknown as {
     getThreadRuntime(threadId: string): Promise<ThreadRuntimeRecord | null>;
+    getThread(threadId: string): Promise<{ source?: string | null } | null>;
     recordThreadError(threadId: string, input: { message: string; source?: string; errorKind?: string }): Promise<unknown>;
   };
   // Only a runtime thread whose agent this is (not a deleted or re-pinned one).
   const row = await org.getThreadRuntime(ref.thread);
   if (row?.agentId !== agentId) return false;
+  if (event.type === "input.requested") {
+    const inputId = text(data.inputId);
+    const thread = await org.getThread(ref.thread);
+    if (inputId && UNATTENDED_THREAD_SOURCES.has(text(thread?.source))) {
+      await cancelUnattendedInput(env, agentId, inputId);
+    }
+    return true;
+  }
   const context: ChatContextState = {
     orgId: ref.org,
     workspaceId: ref.workspace,

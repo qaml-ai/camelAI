@@ -578,7 +578,7 @@ export function reportChatStreamStallClamped(
 export function trackRuntimeWatchError(
   threadId: string,
   error: unknown,
-  phase: "start" | "watch",
+  phase: "start" | "watch" | "rewatch",
 ): void {
   const record = error && typeof error === "object" ? (error as { status?: unknown; name?: unknown }) : null;
   const statusCode =

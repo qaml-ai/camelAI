@@ -1,25 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { env } from 'cloudflare:test';
-import { hardDeleteAdminUser } from '../../../src/lib/auth-do.server';
+import { hardDeleteAdminUserWithEnv } from '../../../src/lib/auth-do.server';
 import { createUser, type TestEnv } from './test-helpers';
 import { getAppIndexDatabase } from '../src/app-index-db';
 
 const testEnv = env as unknown as TestEnv;
 
-function makeContext() {
-  return {
-    cloudflare: {
-      env: testEnv as never,
-    },
-  } as never;
-}
-
 async function waitForAdminIndexUserPresence(userId: string, present: boolean): Promise<void> {
   const adminIndex = getAppIndexDatabase(testEnv)!;
 
   for (let attempt = 0; attempt < 50; attempt += 1) {
-    const overview = await adminIndex.getOverview();
-    const exists = overview.users.some((user: { id: string }) => user.id === userId);
+    const exists = (await adminIndex.getUsersByIds([userId])).length > 0;
     if (exists === present) {
       return;
     }
@@ -29,14 +20,14 @@ async function waitForAdminIndexUserPresence(userId: string, present: boolean): 
   throw new Error(`Timed out waiting for user ${userId} presence=${present} in D1 app index`);
 }
 
-describe('hardDeleteAdminUser', () => {
+describe('hardDeleteAdminUserWithEnv', () => {
   it('removes deleted users from D1 app index user list', async () => {
     const email = `hard-delete-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`;
     const { userId } = await createUser(testEnv, email, 'password123', 'Delete Me');
 
     await waitForAdminIndexUserPresence(userId, true);
 
-    const result = await hardDeleteAdminUser(makeContext(), userId, 'system-admin');
+    const result = await hardDeleteAdminUserWithEnv(testEnv as never, userId, 'system-admin');
     expect(result.removed_org_memberships).toBe(0);
 
     const profile = await testEnv.USER.get(testEnv.USER.idFromName(userId)).getProfile();
@@ -52,7 +43,7 @@ describe('hardDeleteAdminUser', () => {
 
     await waitForAdminIndexUserPresence(userId, true);
 
-    await hardDeleteAdminUser(makeContext(), userId, 'system-admin');
+    await hardDeleteAdminUserWithEnv(testEnv as never, userId, 'system-admin');
     await waitForAdminIndexUserPresence(userId, false);
 
     // Simulate out-of-order delivery: stale upsert arrives after delete.
@@ -91,7 +82,7 @@ describe('hardDeleteAdminUser', () => {
 
     expect(await testEnv.EMAIL_TO_USER.get(`email:${email}`)).toBe(globalUserId);
 
-    await hardDeleteAdminUser(makeContext(), tenantUserId, 'system-admin');
+    await hardDeleteAdminUserWithEnv(testEnv as never, tenantUserId, 'system-admin');
 
     expect(await testEnv.EMAIL_TO_USER.get(`email:${email}`)).toBe(globalUserId);
     expect(

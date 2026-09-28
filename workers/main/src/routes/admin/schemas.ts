@@ -41,7 +41,7 @@ export const ParsedChatMessageSchema = z.object({
  * z.coerce.boolean() is broken for query strings — Boolean("false") === true.
  * This accepts "true"/"1" → true, "false"/"0" → false, and rejects anything else.
  */
-const booleanQueryParam = z
+export const booleanQueryParam = z
   .enum(["true", "false", "1", "0"])
   .transform((v) => v === "true" || v === "1")
   .optional();

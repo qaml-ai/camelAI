@@ -28,10 +28,10 @@ function uniqueDomain(prefix: string) {
 
 async function buildExcludedDomains(allowedDomain: string): Promise<string> {
   const adminIndex = getAppIndexReadDatabase(testEnv)!;
-  const overview = await adminIndex.getOverview();
+  const allUsers = await adminIndex.getUsersPaginated(0, 100_000);
   const domains = new Set<string>(['camelai.com']);
 
-  for (const user of overview.users as Array<{ email?: string | null }>) {
+  for (const user of allUsers.items as Array<{ email?: string | null }>) {
     const email = user.email ?? null;
     const atIndex = email?.lastIndexOf('@') ?? -1;
     if (atIndex >= 0 && atIndex < (email?.length ?? 0) - 1) {
@@ -501,31 +501,22 @@ function createIsolatedAdminApiEnv(
 }
 
 describe('admin API metrics routes', () => {
-  it('serves stats without materializing the full user overview', async () => {
-    const getOverview = vi
-      .spyOn(AppIndexDatabase.prototype, 'getOverview')
-      .mockRejectedValue(new Error('stats must not load every user'));
+  it('serves aggregate stats', async () => {
+    const response = await callAdminApi(
+      new Request('http://example/api/admin/stats', {
+        headers: { Authorization: 'Bearer test-admin-api-key' },
+      }),
+      vi.fn(async () => Response.json({})),
+    );
 
-    try {
-      const response = await callAdminApi(
-        new Request('http://example/api/admin/stats', {
-          headers: { Authorization: 'Bearer test-admin-api-key' },
-        }),
-        vi.fn(async () => Response.json({})),
-      );
-
-      expect(response?.status).toBe(200);
-      await expect(response!.json()).resolves.toEqual(
-        expect.objectContaining({
-          total_users: expect.any(Number),
-          total_orgs: expect.any(Number),
-          total_workspaces: expect.any(Number),
-        }),
-      );
-      expect(getOverview).not.toHaveBeenCalled();
-    } finally {
-      getOverview.mockRestore();
-    }
+    expect(response?.status).toBe(200);
+    await expect(response!.json()).resolves.toEqual(
+      expect.objectContaining({
+        total_users: expect.any(Number),
+        total_orgs: expect.any(Number),
+        total_workspaces: expect.any(Number),
+      }),
+    );
   });
 
   it('ranks top orgs without loading and discarding every org member', async () => {

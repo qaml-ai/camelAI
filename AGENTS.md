@@ -70,7 +70,7 @@ Two HTTP surfaces share the main worker:
 
 ### Internal vs product names
 
-Product name is **camelAI**. Internal Cloudflare resources, DO/MCP class names, headers, and Analytics Engine datasets often still use legacy internal codenames (for example the `/qaml-backdoor` superuser UI and the `*_observability_*` / `*_errors_*` dataset prefixes). Prefer the existing name in code; do not rename bindings or exported DO classes casually.
+Product name is **camelAI**. Internal Cloudflare resources, DO/MCP class names, headers, and Analytics Engine datasets often still use legacy internal codenames (for example the `*_observability_*` / `*_errors_*` dataset prefixes). Prefer the existing name in code; do not rename bindings or exported DO classes casually.
 
 ## Development Commands
 
@@ -304,8 +304,8 @@ if any of them drift apart.
 - Self-host agent customization (additive skills + prompt append/prepend) loads from `.selfhost/agent/` at workerd-config generation; see `SELF_HOSTING.md` and `scripts/selfhost-agent-pack.mjs`. Verify with `bun run test:workers -- selfhost-agent-pack` and `bun run test:run -- selfhost-agent-pack-loader`.
 - Password auth, OAuth account creation, email verification, onboarding, bans, and blocked signup policies all have tests in `workers/main/tests/`; update or add focused tests when touching these flows.
 - First-touch marketing attribution and the durable first-accepted-message definition of `new_camel_activation` are documented in `MARKETING_ATTRIBUTION.md`.
-- Superuser UI routes live under `/qaml-backdoor`.
-- Bearer-auth admin APIs live under `/api/admin/*`; implementation is in `workers/main/src/routes/admin/` and related route modules in `src/routes/api/`.
+- There is no superuser web UI; admin work goes through the admin REST API and admin MCP below.
+- Bearer-auth admin APIs live under `/api/admin/*`; implementation is in `workers/main/src/routes/admin/` (entity detail/management endpoints in `management-routes.ts`); the spec is served at `/api/admin/openapi.json`.
 - Admin MCP is served at `/api/admin/mcp` (`https://staging.camelai.dev/api/admin/mcp` in staging) and uses OAuth scope `admin:mcp`. Staging is also behind Cloudflare Access; pass `CF-Access-Token: $(cloudflared access token -app=https://staging.camelai.dev)` when connecting with `mcporter`. If an MCP client opens an authorize URL with `scope=openid+email+profile`, the flow will fail with `invalid_scope`; force `admin:mcp` with `oauthScope` or a pre-registered static OAuth client.
 - `admin_js_exec` is the generic superuser remote Worker console for staging/production (binding RPC/fetch, Durable Objects, admin/self/outbound HTTP, assertions, and checked-in smoke suites). See `docs/admin-js-exec.md`; primitive env values and secrets are intentionally non-readable.
 - A reliable staging smoke path for admin MCP is: register or provide an OAuth client for the chosen localhost callback with `scope: "admin:mcp"`, set `ACCESS_TOKEN=$(cloudflared access token -app=https://staging.camelai.dev)`, then add a private `mcporter` config entry with `baseUrl: "https://staging.camelai.dev/api/admin/mcp"`, `auth: "oauth"`, `oauthScope: "admin:mcp"`, and `headers: { "CF-Access-Token": "$env:ACCESS_TOKEN" }`. Run `npx mcporter auth <server-name>` followed by `npx mcporter list <server-name> --json`. The browser session must be a camelAI superuser, otherwise authorization fails with `Admin access required`.

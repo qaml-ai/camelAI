@@ -1198,18 +1198,6 @@ export class AppIndexDatabase {
     };
   }
 
-  async getOverview() {
-    const [stats, users] = await Promise.all([
-      this.getStats(),
-      this.all<any>('SELECT * FROM users'),
-    ]);
-    return {
-      users: users.map((u) => ({ ...u, avatar: { color: u.avatar_color || '#666', content: u.avatar_content || 'U' }, is_superuser: u.is_superuser === 1, is_orphaned: u.is_orphaned === 1, signup_ip: u.signup_ip ?? null })),
-      ...stats,
-      superusers: users.filter((u) => u.is_superuser === 1).map((u) => ({ ...u, avatar: { color: u.avatar_color || '#666', content: u.avatar_content || 'U' }, is_superuser: true, is_orphaned: u.is_orphaned === 1 })),
-    };
-  }
-
   async computeDashboardSummary(options: DashboardSummaryOptions): Promise<DashboardSummaryResponse> {
     const snapshot = await this.loadFilteredEntitySnapshot(options);
     return computeDashboardSummaryFromSnapshot(snapshot, options);
@@ -1680,20 +1668,6 @@ export class AppIndexDatabase {
     }));
   }
 
-  async getAllThreads() {
-    return this.all<AdminThreadListRow>(`
-      SELECT t.*, o.name as org_name, w.name as workspace_name
-      FROM threads t
-      LEFT JOIN orgs o ON t.org_id = o.id
-      LEFT JOIN workspaces w ON t.workspace_id = w.id
-      ORDER BY t.updated_at DESC
-    `);
-  }
-
-  async getAppCount() {
-    return toNumber((await first<{ count: number }>(this.db.prepare('SELECT COUNT(*) AS count FROM apps')))?.count);
-  }
-
   async getOrgsPaginated(offset: number, limit: number, search?: string, filters?: OrgFilters) {
     const conditions: string[] = [];
     const params: unknown[] = [];
@@ -1796,17 +1770,6 @@ export class AppIndexDatabase {
     const rows = await this.all<any>(`SELECT w.*, o.name as org_name FROM workspaces w LEFT JOIN orgs o ON w.org_id = o.id${where} ORDER BY ${sortCol} ${sortDir} LIMIT ? OFFSET ?`, ...params, limit, offset);
     const total = toNumber((await first<{ count: number }>(this.db.prepare(`SELECT COUNT(*) AS count FROM workspaces w LEFT JOIN orgs o ON w.org_id = o.id${where}`).bind(...params)))?.count);
     return { items: rows.map(normalizeWorkspaceRow), total, offset, limit, hasMore: offset + rows.length < total };
-  }
-
-  async getWorkspacesByOrg(orgId: string) {
-    const rows = await this.all<any>(`
-      SELECT w.*, o.name as org_name
-      FROM workspaces w
-      LEFT JOIN orgs o ON w.org_id = o.id
-      WHERE w.org_id = ?
-      ORDER BY w.created_at DESC
-    `, orgId);
-    return rows.map(normalizeWorkspaceRow);
   }
 
   async getWorkspaceOrgId(workspaceId: string): Promise<string | null> {

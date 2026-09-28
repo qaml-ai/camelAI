@@ -2,8 +2,8 @@
  * Admin REST API — Hono-based
  *
  * All endpoints require Bearer token auth via ADMIN_API_KEY secret.
- * If no Bearer token is present, returns null to fall through to
- * React Router (for session-auth admin routes like /api/admin/threads/:id/jsonl).
+ * If no Bearer token is present, returns null so the request falls through to
+ * the rest of the worker (e.g. the OAuth-protected admin MCP).
  *
  * The OpenAPI 3.1 spec is auto-generated from the openApi() middleware
  * on each route via createOpenApiDocument(). No separate spec file needed.
@@ -39,12 +39,28 @@
  *   GET   /api/admin/r2                    — List R2 objects
  *   GET   /api/admin/r2/:key+             — R2 object metadata
  *   POST  /api/admin/apps/:name/cost-controls — Re-apply user-app cost controls (backfill)
+ *
+ * Detail + management (management-routes.ts):
+ *   GET/PATCH/DELETE /api/admin/users/:id  — Detail / edit / hard delete
+ *   POST  /api/admin/users/:id/force-orphan, /reset-onboarding
+ *   PATCH/DELETE /api/admin/orgs/:id       — Edit name+billing status / hard delete
+ *   POST  /api/admin/orgs/:id/archive, /transfer-ownership
+ *   GET   /api/admin/orgs/:id/members, /invitations, /audit-log
+ *   PATCH /api/admin/orgs/:id/members/:userId — Change member role
+ *   DELETE /api/admin/orgs/:id/invitations/:invitationId
+ *   PATCH/DELETE /api/admin/orgs/:id/apps/:scriptName — Public flag / delete app
+ *   GET   /api/admin/orgs/:id/apps/:scriptName/logs
+ *   GET/PATCH /api/admin/workspaces/:id    — Detail / edit
+ *   POST  /api/admin/workspaces/:id/archive; GET /api/admin/workspaces/:id/audit-log
+ *   GET   /api/admin/invitations, /api/admin/chat-explorer
+ *   POST  /api/admin/email/test
  */
 
 import { Hono } from 'hono';
 import { createOpenApiDocument } from 'hono-zod-openapi';
 import type { Env, RouteContext } from '../../types.js';
 import { routes } from './routes.js';
+import { managementRoutes } from './management-routes.js';
 
 // ---------------------------------------------------------------------------
 // Hono app
@@ -56,6 +72,7 @@ const app = new Hono<HonoEnv>().basePath('/api/admin');
 
 // All admin routes (each has openApi() middleware for spec generation)
 app.route('/', routes);
+app.route('/', managementRoutes);
 
 // Auto-generate and serve OpenAPI spec from route middleware declarations
 createOpenApiDocument(app, {

@@ -107,36 +107,6 @@ export default [
     ]),
   ]),
 
-  // Admin routes (superuser only)
-  layout("routes/_admin.tsx", [
-    route("qaml-backdoor", "routes/_admin._index.tsx"),
-    route("qaml-backdoor/errors", "routes/_admin.errors.tsx"),
-    route("qaml-backdoor/users", "routes/_admin.users.tsx"),
-    route("qaml-backdoor/users/:id", "routes/_admin.users.$id.tsx"),
-    route("qaml-backdoor/orgs", "routes/_admin.orgs.tsx"),
-    route("qaml-backdoor/orgs/:id", "routes/_admin.orgs.$id.tsx"),
-    route(
-      "qaml-backdoor/orgs/:id/audit-log",
-      "routes/_admin.orgs.$id.audit-log.tsx",
-    ),
-    route("qaml-backdoor/threads", "routes/_admin.threads.tsx"),
-    route("qaml-backdoor/chat-explorer", "routes/_admin.chat-explorer.tsx"),
-    route("qaml-backdoor/threads/:id", "routes/_admin.threads.$id.tsx"),
-    route("qaml-backdoor/workspaces", "routes/_admin.workspaces.tsx"),
-    route("qaml-backdoor/workspaces/:id", "routes/_admin.workspaces.$id.tsx"),
-    route(
-      "qaml-backdoor/workspaces/:id/audit-log",
-      "routes/_admin.workspaces.$id.audit-log.tsx",
-    ),
-    route("qaml-backdoor/apps", "routes/_admin.apps.tsx"),
-    route(
-      "qaml-backdoor/apps/:scriptName",
-      "routes/_admin.apps.$scriptName.tsx",
-    ),
-    route("qaml-backdoor/logs", "routes/_admin.logs.tsx"),
-    route("qaml-backdoor/invitations", "routes/_admin.invitations.tsx"),
-  ]),
-
   // Auth API routes
   route("api/auth/login", "routes/api/auth.login.ts"),
   route("api/auth/signup", "routes/api/auth.signup.ts"),
@@ -230,11 +200,6 @@ export default [
   route("api/admin/oauth/authorize", "routes/api/admin.oauth.authorize.tsx"),
   route("api/admin/oauth/token", "routes/api/admin.oauth.token.ts"),
   route("api/admin/oauth/revoke", "routes/api/admin.oauth.revoke.ts"),
-  route(
-    "api/admin/threads/:id/messages",
-    "routes/api/admin.threads.$id.messages.ts",
-  ),
-  route("api/admin/threads/:id/jsonl", "routes/api/admin.threads.$id.jsonl.ts"),
 
   // Workspace filesystem API routes
   route(

@@ -20,6 +20,15 @@ export function runtimeUrl(env: RuntimeApiEnv): string {
   return (env.AGENT_RUNTIME_URL || "https://agents.camelai.dev").replace(/\/+$/, "");
 }
 
+/** Pauses before retrying a 503 (a runtime node shutting down or draining), each capped by Retry-After at 1 s. */
+const UNAVAILABLE_RETRY_MS = [300, 700];
+
+/**
+ * One call to the runtime. A 503 is the runtime's "retry" (a node shutting down
+ * in a rollout refuses before doing anything): it is tried twice more after a
+ * short pause, so a deploy reaches no sender. Calls that change something are
+ * idempotent (a prompt's requestId, Idempotency-Key, PUT/PATCH/DELETE).
+ */
 export async function runtimeApi(
   env: RuntimeApiEnv,
   method: string,
@@ -28,7 +37,7 @@ export async function runtimeApi(
   headers: Record<string, string> = {},
   fetcher: typeof globalThis.fetch = globalThis.fetch.bind(globalThis),
 ): Promise<unknown> {
-  const response = await fetcher(`${runtimeUrl(env)}${path}`, {
+  const call = () => fetcher(`${runtimeUrl(env)}${path}`, {
     method,
     headers: {
       Authorization: `Bearer ${env.AGENT_RUNTIME_API_TOKEN ?? ""}`,
@@ -37,6 +46,14 @@ export async function runtimeApi(
     },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
+  let response = await call();
+  for (const pause of UNAVAILABLE_RETRY_MS) {
+    if (response.status !== 503) break;
+    await response.body?.cancel();
+    const retryAfter = Number(response.headers.get("Retry-After")) * 1000;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : pause, 1_000)));
+    response = await call();
+  }
   const text = await response.text();
   let parsed: unknown = null;
   try {

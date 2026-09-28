@@ -198,8 +198,11 @@ export function runtimeAgentThreadKey(agentId: string): string {
   return `agent-runtime:thread-of:${agentId}`;
 }
 
+/** Remember the agent's thread once: an agent keeps its thread, and a key takes one write a second. */
 async function rememberAgentThread(env: ChatEnv, agentId: string, context: ChatContextState): Promise<void> {
-  await env.APP_KV.put(runtimeAgentThreadKey(agentId), JSON.stringify({
+  const key = runtimeAgentThreadKey(agentId);
+  if (await env.APP_KV.get(key).catch(() => null)) return;
+  await env.APP_KV.put(key, JSON.stringify({
     org: context.orgId,
     workspace: context.workspaceId,
     thread: context.threadId,

@@ -501,3 +501,51 @@ describe("uploads attached to the runtime message", () => {
     expect(prompt.body).not.toHaveProperty("files");
   });
 });
+
+describe("sends while the runtime rolls its tasks", () => {
+  it("retries a prompt a shutting-down node refused, then accepts it", async () => {
+    const setup = await runtimeThread();
+    let refusals = 0;
+    const calls = fakeRuntime({
+      "POST /v1/agents/agt_1/prompt": (call) => refusals++ < 2
+        ? Response.json({ error: "This node is shutting down; retry", code: "UNAVAILABLE" }, { status: 503, headers: { "Retry-After": "1" } })
+        : Response.json({ id: call.body.requestId, method: "prompt", state: "running", fingerprint: "f" }, { status: 202 }),
+    });
+    const result = await send(setup, "Hello during a deploy", "cm_deploy");
+    expect(result).toMatchObject({ status: "accepted", requestId: "cm_deploy" });
+    expect(calls.filter((call) => call.path === "/v1/agents/agt_1/prompt")).toHaveLength(3);
+  });
+
+  it("gives up after three refusals, so the browser gets its 503", async () => {
+    const setup = await runtimeThread();
+    const calls = fakeRuntime({
+      "POST /v1/agents/agt_1/prompt": () => Response.json({ error: "This node is shutting down; retry", code: "UNAVAILABLE" }, { status: 503 }),
+    });
+    await expect(send(setup, "Hello", "cm_down")).rejects.toMatchObject({ status: 503 });
+    expect(calls.filter((call) => call.path === "/v1/agents/agt_1/prompt")).toHaveLength(3);
+  });
+
+  it("does not retry other errors", async () => {
+    const setup = await runtimeThread();
+    const calls = fakeRuntime({
+      "POST /v1/agents/agt_1/prompt": () => Response.json({ error: "boom", code: "INTERNAL" }, { status: 500 }),
+    });
+    await expect(send(setup, "Hello", "cm_500")).rejects.toMatchObject({ status: 500 });
+    expect(calls.filter((call) => call.path === "/v1/agents/agt_1/prompt")).toHaveLength(1);
+  });
+
+  it("remembers an agent's thread once, not on every send", async () => {
+    const setup = await runtimeThread();
+    const agentId = `agt_${crypto.randomUUID()}`;
+    fakeRuntime({
+      "POST /v1/agents": () => Response.json({ id: agentId, token: "agent-token" }, { status: 201 }),
+      [`POST /v1/agents/${agentId}/prompt`]: (call) => Response.json({ id: call.body.requestId, method: "prompt", state: "running", fingerprint: "f" }, { status: 202 }),
+    });
+    const puts = vi.spyOn(runtimeEnv.APP_KV, "put");
+    await send(setup, "one", "cm_a");
+    await send(setup, "two", "cm_b");
+    await send(setup, "two", "cm_b");
+    expect(puts.mock.calls.filter(([key]) => key === runtimeAgentThreadKey(agentId))).toHaveLength(1);
+    expect(await testEnv.APP_KV.get(runtimeAgentThreadKey(agentId), "json")).toMatchObject({ thread: setup.threadId });
+  });
+});

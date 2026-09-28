@@ -4843,6 +4843,14 @@ export default function Chat({
                     {noModelsMessage}
                   </p>
                 ) : null}
+                {runtimeBackend && runtimeThread.reconnecting ? (
+                  <p
+                    role="status"
+                    className="mb-2 shrink-0 text-xs text-muted-foreground"
+                  >
+                    Reconnecting…
+                  </p>
+                ) : null}
                 <ModelFallbackBanner
                   notice={modelFallbackNotice}
                   activeModel={selectedThreadModel}

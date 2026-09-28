@@ -152,6 +152,25 @@ describe("useRuntimeThread", () => {
     expect(watchers[0].options).toMatchObject({ token: "abt_late" });
   });
 
+  it("says it is reconnecting while the watcher stays down, and not after a short drop", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(watchers).toHaveLength(1));
+    expect(result.current.reconnecting).toBe(false);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      act(() => watchers[0].emit({ connected: false }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+      expect(result.current.reconnecting).toBe(false);
+      await act(async () => { await vi.advanceTimersByTimeAsync(4_000); });
+      expect(result.current.reconnecting).toBe(true);
+      act(() => watchers[0].emit({ connected: true }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+      expect(result.current.reconnecting).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("sends through the route, and matches the message that comes back to the client's id", async () => {
     responses["/api/threads/t1/messages"] = { status: "accepted", requestId: "cm_1", agentId: "agt_1", fallback: null };
     const { result } = mount();

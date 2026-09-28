@@ -16,7 +16,7 @@ import { AVATAR_COLORS, isEmoji, normalizeAvatarColor } from "@/lib/avatar"
 import { cn } from "@/lib/utils"
 
 const LazyEmojiPicker = lazy(() =>
-  import("@/components/ui/emoji-picker").then((module) => ({
+  import("@/components/ui/emoji-picker.client").then((module) => ({
     default: module.EmojiPicker,
   })),
 )

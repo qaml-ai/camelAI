@@ -1,7 +1,7 @@
 
 import { getFileExtension } from '../file-type-utils';
 import { parseDelimitedWorkbook } from './parse-delimited';
-import { parseExcelWorkbook } from './parse-excel';
+import { parseExcelWorkbook } from './parse-excel.client';
 import type { SpreadsheetWorkbook } from './types';
 
 export function parseSpreadsheetWorkbook(

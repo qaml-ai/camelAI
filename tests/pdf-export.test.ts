@@ -55,7 +55,7 @@ describe('pdf export', () => {
     renderPlotlyPngForPdf.mockRejectedValueOnce(new Error('chart failed'));
 
     const { prepareNotebookPdfBlocks } = await import(
-      '@/components/chat-file-preview/notebook-preview/pdf-export'
+      '@/components/chat-file-preview/notebook-preview/pdf-export.client'
     );
 
     const blocks = await prepareNotebookPdfBlocks([
@@ -81,7 +81,7 @@ describe('pdf export', () => {
 
   it('exports a notebook PDF with a .pdf filename', async () => {
     const { exportNotebookReportAsPdf } = await import(
-      '@/components/chat-file-preview/notebook-preview/pdf-export'
+      '@/components/chat-file-preview/notebook-preview/pdf-export.client'
     );
 
     await exportNotebookReportAsPdf({
@@ -113,7 +113,7 @@ describe('pdf export', () => {
 
   it('registers PDF fonts once across repeated exports', async () => {
     const { exportNotebookReportAsPdf } = await import(
-      '@/components/chat-file-preview/notebook-preview/pdf-export'
+      '@/components/chat-file-preview/notebook-preview/pdf-export.client'
     );
 
     const notebook = {
@@ -141,7 +141,7 @@ describe('pdf export', () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('fetch failed')));
 
     const { exportNotebookReportAsPdf } = await import(
-      '@/components/chat-file-preview/notebook-preview/pdf-export'
+      '@/components/chat-file-preview/notebook-preview/pdf-export.client'
     );
 
     await exportNotebookReportAsPdf({
@@ -178,7 +178,7 @@ describe('pdf export', () => {
     );
 
     const { exportNotebookReportAsPdf } = await import(
-      '@/components/chat-file-preview/notebook-preview/pdf-export'
+      '@/components/chat-file-preview/notebook-preview/pdf-export.client'
     );
 
     const exportPromise = exportNotebookReportAsPdf({

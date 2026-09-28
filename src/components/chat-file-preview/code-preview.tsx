@@ -3,7 +3,7 @@
 import { useCallback, useLayoutEffect, useMemo, useState, type CSSProperties } from 'react';
 import { Check, Copy } from 'lucide-react';
 import { PREVIEW_INITIAL_MAX_LINES } from '@/lib/file-preview-limits';
-import { codeToHtml, SHIKI_DEFAULT_THEMES, SUPPORTED_LANGUAGES } from '@/lib/shiki-config';
+import { codeToHtml, SHIKI_DEFAULT_THEMES, SUPPORTED_LANGUAGES } from '@/lib/shiki-config.client';
 import { cn } from '@/lib/utils';
 import { getShikiLanguage } from './file-type-utils';
 import { PreviewTruncationFooter } from './preview-truncation-footer';

@@ -589,13 +589,17 @@ export function trackRuntimeWatchError(
       : typeof record?.name === "string" && record.name
         ? record.name
         : "unknown";
+  // The watcher stops on 401/403/404 (and says so); anything else it retries
+  // itself, resuming where the stream left off (a runtime rollout closes streams).
+  const message = error instanceof Error ? error.message : "";
+  const stops = statusCode === 401 || statusCode === 403 || statusCode === 404 || /watcher stopped/.test(message);
   reportClientEvent({
     source: "runtime_watch",
     event: "runtime_watch_error",
     severity: phase === "start" ? "error" : "warn",
     status,
     statusCode,
-    message: `Runtime thread watcher error (${phase}, ${status}).`,
+    message: `Runtime thread watcher error (${phase}, ${status}${phase === "watch" ? `, ${stops ? "stopped" : "reconnecting"}` : ""}).`,
     threadId,
     details: { ...connectionContext(), phase },
     error,

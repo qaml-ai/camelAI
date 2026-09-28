@@ -294,6 +294,38 @@ describe("useRuntimeThread", () => {
     await expect(result.current.client.call("sendMessage", ["hi", "cm_fail"])).rejects.toThrow("socket hang up");
   });
 
+  it("opens again once for reconnects asked together, and backs off while sends keep failing", async () => {
+    responses["/api/threads/t1/messages"] = { error: "This node is shutting down; retry", retryable: true };
+    statuses["/api/threads/t1/messages"] = 503;
+    const { result, callbacks } = mount();
+    await waitFor(() => expect(callbacks.current.onOpen).toHaveBeenCalledTimes(1));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      // Several failures at once (a queue of sends, a watcher's own reopen): one pending reopen.
+      for (const id of ["cm_1", "cm_2"]) await expect(result.current.client.call("sendMessage", ["hi", id])).rejects.toThrow();
+      result.current.client.reconnect();
+      result.current.client.reconnect();
+      result.current.client.reconnect();
+      // Two sends failed in a row: 1 s doubled twice.
+      await act(async () => { vi.advanceTimersByTime(3_999); });
+      expect(callbacks.current.onOpen).toHaveBeenCalledTimes(1);
+      await act(async () => { vi.advanceTimersByTime(1); });
+      expect(callbacks.current.onOpen).toHaveBeenCalledTimes(2);
+      await act(async () => { vi.advanceTimersByTime(60_000); });
+      expect(callbacks.current.onOpen).toHaveBeenCalledTimes(2);
+
+      // An accepted send ends the backoff.
+      statuses["/api/threads/t1/messages"] = 200;
+      responses["/api/threads/t1/messages"] = { status: "accepted", requestId: "cm_3", agentId: "agt_1" };
+      await result.current.client.call("sendMessage", ["hi", "cm_3"]);
+      result.current.client.reconnect();
+      await act(async () => { vi.advanceTimersByTime(1_000); });
+      expect(callbacks.current.onOpen).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("says why an answer was refused", async () => {
     const { result, callbacks } = mount();
     await waitFor(() => expect(watchers).toHaveLength(1));

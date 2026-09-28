@@ -536,7 +536,7 @@ describe("executeVirtualAiRun", () => {
         headers: { "Content-Type": "application/json" },
       }),
     );
-    const getUsageLogSum = vi.fn(async () => ({ total_cost_usd: 0 }));
+    const getCreditChargeableSpendUsd = vi.fn(async () => 0);
     const recordUsage = vi.fn(async () => undefined);
     const checkUserLlmUsageAccess = vi.fn(async () => ({
       allowed: true,
@@ -564,7 +564,7 @@ describe("executeVirtualAiRun", () => {
                   billing_credit_purchase_total_cents: 0,
                   billing_credit_grant_total_cents: 0,
                 })),
-                getUsageLogSum,
+                getCreditChargeableSpendUsd,
                 checkUserLlmUsageAccess,
                 recordUsage,
               })),
@@ -587,7 +587,7 @@ describe("executeVirtualAiRun", () => {
       expect(headers.get("X-Chiridion-VLLM-Priority")).toBeNull();
       const body = JSON.parse(String(init.body)) as { model: string };
       expect(body.model).toBe("openai/gpt-5.6-luna");
-      expect(getUsageLogSum).not.toHaveBeenCalled();
+      expect(getCreditChargeableSpendUsd).not.toHaveBeenCalled();
       expect(checkUserLlmUsageAccess).toHaveBeenCalledOnce();
       await Promise.all(backgroundTasks);
       expect(recordUsage).toHaveBeenCalledWith(

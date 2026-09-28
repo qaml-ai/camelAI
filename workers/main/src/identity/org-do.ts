@@ -2273,6 +2273,24 @@ export class OrgDO extends DurableObject<DOEnv> {
       `);
     }
 
+    // usage_spend.chargeable_cost_usd is the O(1) running total the credit
+    // gates read instead of scanning usage_log. Keyed on the column rather
+    // than the schema version: adding it backfills it from the ledger once.
+    const usageSpendColumns = this.sql
+      .exec<{ name: string }>("PRAGMA table_info(usage_spend)")
+      .toArray();
+    if (!usageSpendColumns.some((column) => column.name === "chargeable_cost_usd")) {
+      this.sql.exec(
+        "ALTER TABLE usage_spend ADD COLUMN chargeable_cost_usd REAL NOT NULL DEFAULT 0",
+      );
+      this.sql.exec("INSERT OR IGNORE INTO usage_spend (id) VALUES (1)");
+      this.sql.exec(
+        `UPDATE usage_spend SET chargeable_cost_usd = (
+           SELECT COALESCE(SUM(cost_usd), 0) FROM usage_log WHERE credit_chargeable = 1
+         ) WHERE id = 1`,
+      );
+    }
+
     const CURRENT_SCHEMA_VERSION = 53;
     if (version < CURRENT_SCHEMA_VERSION) {
       this.ctx.storage.kv.put("schemaVersion", CURRENT_SCHEMA_VERSION);
@@ -9692,11 +9710,13 @@ export class OrgDO extends DurableObject<DOEnv> {
           total_cache_creation_tokens,
           total_cache_read_tokens,
           total_requests,
+          chargeable_cost_usd,
           updated_at_ms
         )
-        VALUES (1, ?, ?, ?, ?, ?, 1, ?)
+        VALUES (1, ?, ?, ?, ?, ?, 1, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           total_cost_usd = total_cost_usd + excluded.total_cost_usd,
+          chargeable_cost_usd = chargeable_cost_usd + excluded.chargeable_cost_usd,
           total_input_tokens = total_input_tokens + excluded.total_input_tokens,
           total_output_tokens = total_output_tokens + excluded.total_output_tokens,
           total_cache_creation_tokens = total_cache_creation_tokens + excluded.total_cache_creation_tokens,
@@ -9709,6 +9729,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         outputTokens,
         cacheCreationTokens,
         cacheReadTokens,
+        creditChargeable ? costUsd : 0,
         now,
       );
       const row = this.sql
@@ -9759,6 +9780,20 @@ export class OrgDO extends DurableObject<DOEnv> {
       total_cache_read_input_tokens: Number(row?.total_cache_read_tokens ?? 0),
       windows: [],
     };
+  }
+
+  /**
+   * All-time credit-chargeable spend in USD: what
+   * getUsageLogSum(0, now, true).total_cost_usd returns, kept as a running
+   * total so per-request credit gates stay O(1).
+   */
+  getCreditChargeableSpendUsd(): number {
+    const row = this.sql
+      .exec<{ chargeable_cost_usd: number }>(
+        "SELECT chargeable_cost_usd FROM usage_spend WHERE id = 1",
+      )
+      .toArray()[0];
+    return Number(row?.chargeable_cost_usd ?? 0);
   }
 
   getUsageLog(query: UsageLogQuery = {}): UsageLogPage {

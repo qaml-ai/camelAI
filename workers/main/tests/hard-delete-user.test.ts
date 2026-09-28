@@ -1,13 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { env } from 'cloudflare:test';
 import { hardDeleteAdminUserWithEnv } from '../../../src/lib/auth-do.server';
-import { createUser, type TestEnv } from './test-helpers';
+import { createUser, flushD1Mirror, type TestEnv } from './test-helpers';
 import { getAppIndexDatabase } from '../src/app-index-db';
 
 const testEnv = env as unknown as TestEnv;
 
 async function waitForAdminIndexUserPresence(userId: string, present: boolean): Promise<void> {
   const adminIndex = getAppIndexDatabase(testEnv)!;
+  await adminIndex.ensureSchema();
+  if (present) {
+    await flushD1Mirror(testEnv.USER.get(testEnv.USER.idFromName(userId)));
+  }
 
   for (let attempt = 0; attempt < 50; attempt += 1) {
     const exists = (await adminIndex.getUsersByIds([userId])).length > 0;

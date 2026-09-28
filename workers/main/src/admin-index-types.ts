@@ -267,3 +267,13 @@ export type AdminEventType =
       payload: { org_id: string; user_id: string; role: string; joined_at: number };
     }
   | { type: 'org_membership_delete'; payload: { org_id: string; user_id: string } };
+
+/**
+ * An admin event as the D1 mirror applies it. `version` is stamped by the
+ * owning Durable Object's mirror outbox (monotonic per DO, so per entity row:
+ * every mirrored row has exactly one owning DO). A versioned write only lands
+ * when it is at least as new as the row's recorded version, so a late or
+ * retried drain cannot regress D1. Unversioned events are legacy/repair writes:
+ * they apply as before, but never resurrect a row a versioned delete removed.
+ */
+export type VersionedAdminEvent = AdminEventType & { version?: number };

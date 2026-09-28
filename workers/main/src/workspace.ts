@@ -6,7 +6,6 @@ import type {
   WorkspaceModelPickerConfig,
 } from '../../../src/types';
 import type { OrgDO } from './auth';
-import { dispatchAdminEvent } from './auth';
 import { decryptCredentials, encryptCredentials } from '../../../src/lib/integration-crypto';
 import { mintBigQueryAccessTokenFromServiceAccount } from './google-service-account';
 import type { WorkspaceCronDO } from './workspace-cron';
@@ -862,27 +861,6 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
     );
   }
 
-  private getActiveIntegrationCount(): number {
-    try {
-      const rawCount = this.sql.exec('SELECT COUNT(*) as count FROM integrations WHERE deleted_at IS NULL').next().value?.count;
-      const count = typeof rawCount === 'number' ? rawCount : Number(rawCount ?? 0);
-      return Number.isFinite(count) ? count : 0;
-    } catch {
-      // integrations table may not be available during early migration paths.
-      return 0;
-    }
-  }
-
-  private dispatchWorkspaceUpsert(info: Workspace): void {
-    dispatchAdminEvent(this.ctx as any, this.env as any, {
-      type: 'workspace_upsert',
-      payload: {
-        ...info,
-        integration_count: this.getActiveIntegrationCount(),
-      },
-    });
-  }
-
   private async disableScheduledPromptsForWorkspace(workspaceId: string, reason: string): Promise<void> {
     if (!this.env.WORKSPACE_CRON) return;
     try {
@@ -960,8 +938,8 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
     const orgStub = this.env.ORG.get(
       this.env.ORG.idFromName(info.org_id)
     ) as unknown as OrgDO;
+    // OrgDO owns the mirrored D1 workspaces row; upsertWorkspaceInfo mirrors it.
     await orgStub.upsertWorkspaceInfo(info);
-    this.dispatchWorkspaceUpsert(info);
   }
 
   async syncWorkspaceInfoFromOrg(info: Workspace): Promise<void> {
@@ -1388,11 +1366,6 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
     if (resolvedTokenExpiresAt) {
       await this.scheduleNextAlarm();
     }
-
-    const info = await this.getInfo();
-    if (info) {
-      this.dispatchWorkspaceUpsert(info);
-    }
   }
 
   async updateIntegration(
@@ -1500,11 +1473,6 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
     const now = Date.now();
     this.sql.exec('UPDATE integrations SET deleted_at = ?, updated_at = ? WHERE id = ?', now, now, id);
     this.log('integration_deleted', actorId, id);
-
-    const info = await this.getInfo();
-    if (info) {
-      this.dispatchWorkspaceUpsert(info);
-    }
   }
 
   async getAuditLog(limit = 100, offset = 0): Promise<WorkspaceAuditLogEntry[]> {

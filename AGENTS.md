@@ -195,7 +195,6 @@ Important DOs and runtime classes live primarily in `workers/main/src/`:
 - `workspace-cron.ts` - `WorkspaceCronDO`, scheduled prompt storage and dispatch.
 - `worker-logs-do.ts` - `WorkerLogsDO`, recent deployed-app logs written by the tail worker and read over RPC (in-memory ring buffer; not SQLite-persisted).
 - `admin-index-do.ts` - `AdminIndexDO`, admin indexes and dashboard-style aggregates.
-- `org-slug-registry.ts` - `OrgSlugDO`, atomic org slug ownership.
 - `email-handle-registry.ts` - `EmailHandleDO`, email handle ownership.
 - `*-mcp.ts` / `connections-runtime.ts` - Per-provider connection MCP wrappers and shared connection runtime (candidate for an `integrations/` folder).
 - `observability.ts` - Shared Cloudflare Analytics Engine event/error writer. New structured instrumentation should go through this helper instead of calling `writeDataPoint` directly.

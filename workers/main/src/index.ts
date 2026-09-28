@@ -67,7 +67,6 @@ export {
 } from './routes/admin-mcp.js';
 export { ChatThreadDO, CodeModeToolsBinding } from './chat-thread-do.js';
 export { UserDO, OrgDO } from './auth.js';
-export { OrgSlugDO } from './org-slug-registry.js';
 export { EmailHandleDO } from './email-handle-registry.js';
 export { SignupDO } from './signup-do.js';
 export {

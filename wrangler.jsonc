@@ -191,7 +191,6 @@
 			{ "name": "USER", "class_name": "UserDO" },
 			{ "name": "SIGNUP", "class_name": "SignupDO" },
 			{ "name": "ORG", "class_name": "OrgDO" },
-			{ "name": "ORG_SLUG", "class_name": "OrgSlugDO" },
 			{ "name": "EMAIL_HANDLE", "class_name": "EmailHandleDO" },
 			{ "name": "TELEGRAM_REGISTRY", "class_name": "TelegramRegistryDO" },
 			{ "name": "SLACK_TEAM_REGISTRY", "class_name": "SlackTeamRegistryDO" },
@@ -246,6 +245,7 @@
 		{ "tag": "v32", "deleted_classes": ["WarehouseSandbox"] },
 		{ "tag": "v33", "new_sqlite_classes": ["DbQuerySandbox"] },
 		{ "tag": "v34", "new_sqlite_classes": ["SignupDO"] },
-		{ "tag": "v35", "deleted_classes": ["ChiridionMcp"] }
+		{ "tag": "v35", "deleted_classes": ["ChiridionMcp"] },
+		{ "tag": "v36", "deleted_classes": ["OrgSlugDO"] }
 		]
 }

@@ -186,7 +186,6 @@
       { "name": "USER", "class_name": "UserDO" },
       { "name": "SIGNUP", "class_name": "SignupDO" },
       { "name": "ORG", "class_name": "OrgDO" },
-      { "name": "ORG_SLUG", "class_name": "OrgSlugDO" },
       { "name": "EMAIL_HANDLE", "class_name": "EmailHandleDO" },
       { "name": "TELEGRAM_REGISTRY", "class_name": "TelegramRegistryDO" },
       { "name": "SLACK_TEAM_REGISTRY", "class_name": "SlackTeamRegistryDO" },
@@ -207,10 +206,10 @@
     }
   ],
   "migrations": [
-    // The squashed history below omits ChiridionMcp's creation; the deployed
-    // staging worker (at v37) already has the class. Recorded here so the
-    // v38 deleted_classes step validates locally.
-    { "tag": "v27", "new_sqlite_classes": ["ChiridionMcp"] },
+    // The squashed history below omits the creation of ChiridionMcp and
+    // OrgSlugDO; the deployed staging worker already has both classes.
+    // Recorded here so the v38 and v39 deleted_classes steps validate locally.
+    { "tag": "v27", "new_sqlite_classes": ["ChiridionMcp", "OrgSlugDO"] },
     { "tag": "v28" },
     { "tag": "v29", "new_sqlite_classes": ["TelegramRegistryDO", "SlackTeamRegistryDO"] },
 	    { "tag": "v30", "new_sqlite_classes": ["WorkspaceFilesystemDO"] },
@@ -222,5 +221,6 @@
 	    { "tag": "v36", "new_sqlite_classes": ["DbQuerySandbox"] },
 	    { "tag": "v37", "new_sqlite_classes": ["SignupDO"] },
 	    { "tag": "v38", "deleted_classes": ["ChiridionMcp"] },
+	    { "tag": "v39", "deleted_classes": ["OrgSlugDO"] },
 	  ],
 	}

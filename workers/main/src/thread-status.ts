@@ -31,6 +31,17 @@ export interface WorkspaceThreadStreamingOptions {
    * forward after the terminal transition was first observed.
    */
   clearRunningStartedAtOrBefore?: number | null;
+  /**
+   * Clear only the running row that started at exactly this time: a sender
+   * taking back the row it created (its send failed), never another turn's.
+   */
+  clearRunningStartedAt?: number;
+  /**
+   * When the turn started, for a row this call creates (a sender marks the
+   * thread running with the time it took the message, before the runtime's
+   * run.started arrives). An existing row keeps its own start.
+   */
+  startedAt?: number;
 }
 
 export function recordWorkspaceThreadStreaming(

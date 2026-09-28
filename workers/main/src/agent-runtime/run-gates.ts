@@ -196,16 +196,38 @@ export interface PreparedRuntimeRun extends RuntimeRunConfig {
   fallback: ThreadModelFallback | null;
 }
 
+/** Milliseconds per step of one send, for its timing event (runtime-thread-telemetry). */
+export type SendTimings = Partial<Record<
+  "ban" | "prepare" | "route" | "access" | "keyScope" | "credit" | "limits" | "spent"
+  | "configure" | "activity" | "patch" | "uploads" | "prompt",
+  number
+>>;
+
+/** Run `step` and add how long it took to `timings` under `name`. */
+export async function timed<T>(timings: SendTimings | undefined, name: keyof SendTimings, step: () => Promise<T>): Promise<T> {
+  const started = Date.now();
+  try {
+    return await step();
+  } finally {
+    if (timings) timings[name] = (timings[name] ?? 0) + Date.now() - started;
+  }
+}
+
 /**
  * Before a run, as `userId` (null: nobody's limits apply): the thread's route,
- * the per-user gates, the key scope synced, and the spend limit the run may
- * use, the least of the org's hosted credit left and the user's headroom.
- * Throws RuntimeRunRefused when the run may not start.
+ * then at once the per-user gates, the key scope synced, and the spend limit
+ * the run may use, the least of the org's hosted credit left and the user's
+ * headroom. Throws RuntimeRunRefused when the run may not start.
  */
-export async function prepareThreadRuntimeRun(env: ChatEnv, context: ChatContextState, userId: string | null): Promise<PreparedRuntimeRun> {
+export async function prepareThreadRuntimeRun(
+  env: ChatEnv,
+  context: ChatContextState,
+  userId: string | null,
+  timings?: SendTimings,
+): Promise<PreparedRuntimeRun> {
   let resolved: ThreadRuntimeRoute;
   try {
-    resolved = await resolveThreadRuntimeRoute(env, context);
+    resolved = await timed(timings, "route", () => resolveThreadRuntimeRoute(env, context));
   } catch (error) {
     if (error instanceof HostedModelFallbackRequiredError) throw new RuntimeRunRefused(error.message, "hosted_access");
     throw error;
@@ -213,7 +235,8 @@ export async function prepareThreadRuntimeRun(env: ChatEnv, context: ChatContext
   const { route, config, threadModel, fallback } = resolved;
   if (!route) throw new RuntimeRunRefused("This thread's model cannot run on the agent runtime; switch models to continue.", "no_route");
   const org = orgStub(env, context.orgId);
-  if (userId) {
+  const access = async () => {
+    if (!userId) return;
     // Limits are checked against the model the runtime will call (the free
     // tier's runtime model is not the in-DO loop's dynamic route).
     const gated = route.kind === "scope" && route.model === FREE_TIER_RUNTIME_MODEL
@@ -232,23 +255,29 @@ export async function prepareThreadRuntimeRun(env: ChatEnv, context: ChatContext
       if (error instanceof UserLlmUsageLimitError) throw new RuntimeRunRefused(error.message, "usage_limit");
       throw error;
     }
-  }
-  if (route.kind === "scope") {
+  };
+  const keyScope = async () => {
+    if (route.kind !== "scope") return;
     if (route.keyScope === HOSTED_KEY_SCOPE) {
       if (!await ensureHostedKeyScope(env)) throw new RuntimeRunRefused("Hosted models are not configured for the agent runtime.", "not_configured");
     } else {
       await syncOrgKeyScope(env, context.orgId, resolved.llmProviderRecord);
     }
-  }
-  const budgets: number[] = [];
-  if (config.billingSource === "hosted" && config.creditChargeable) {
-    const credit = await hostedCreditRemainingUsd(org);
-    if (credit !== null) budgets.push(credit);
-  }
-  if (userId) {
-    const { status } = await org.getUserLlmUsageLimits(userId);
-    for (const limit of status.limits ?? []) budgets.push(limit.remaining_usd);
-  }
+  };
+  const credit = async () => config.billingSource === "hosted" && config.creditChargeable
+    ? await hostedCreditRemainingUsd(org)
+    : null;
+  const limits = async () => userId
+    ? ((await org.getUserLlmUsageLimits(userId)).status.limits ?? []).map((limit) => limit.remaining_usd)
+    : [];
+  // None depends on another: one round of RPCs, not four.
+  const [, , creditLeft, userHeadroom] = await Promise.all([
+    timed(timings, "access", access),
+    timed(timings, "keyScope", keyScope),
+    timed(timings, "credit", credit),
+    timed(timings, "limits", limits),
+  ]);
+  const budgets = [...(creditLeft !== null ? [creditLeft] : []), ...userHeadroom];
   return {
     model: route.model,
     keyScope: route.kind === "scope" ? route.keyScope : null,
@@ -260,11 +289,14 @@ export async function prepareThreadRuntimeRun(env: ChatEnv, context: ChatContext
   };
 }
 
-/** The org's hosted credit left, in USD (checkHostedPiModelAccess's arithmetic); null when unmetered. */
+/**
+ * The org's hosted credit left, in USD (checkHostedPiModelAccess's
+ * arithmetic); null when unmetered. The usage sum is all-time: it walks every
+ * chargeable usage row of the org (by index, but row by row).
+ */
 async function hostedCreditRemainingUsd(org: OrgStub): Promise<number | null> {
-  const info = await org.getInfo();
+  const [info, usage] = await Promise.all([org.getInfo(), org.getUsageLogSum(0, Date.now(), true)]);
   if (!info || info.billing_status === "enterprise") return null;
-  const usage = await org.getUsageLogSum(0, Date.now(), true);
   const spentCents = Math.round(Number(usage.total_cost_usd ?? 0) * 100);
   const totalCents = Number(info.billing_credit_purchase_total_cents ?? 0) + Number(info.billing_credit_grant_total_cents ?? 0);
   return Math.max(0, totalCents - spentCents) / 100;

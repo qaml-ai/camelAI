@@ -137,15 +137,23 @@ function getOverlayMetadata(
   return value;
 }
 
-function mergeThreadMetadata(
+export function mergeThreadMetadata(
   previous: LiveThreadMetadata | undefined,
   metadata: LiveThreadMetadata,
 ): LiveThreadMetadata {
-  return {
-    ...previous,
-    ...metadata,
-    status: metadata.status,
-  };
+  const merged = { ...previous, ...metadata, status: metadata.status };
+  // Running on and on is one turn: it started at the earliest start either
+  // side saw. The page marks it at the click; the server's row can start a
+  // little later, and must not send the turn's timer back to zero.
+  if (
+    previous?.status === "running" &&
+    metadata.status === "running" &&
+    typeof previous.runningStartedAt === "number" &&
+    typeof metadata.runningStartedAt === "number"
+  ) {
+    merged.runningStartedAt = Math.min(previous.runningStartedAt, metadata.runningStartedAt);
+  }
+  return merged;
 }
 
 export interface WorkspaceStatusStreamOptions {

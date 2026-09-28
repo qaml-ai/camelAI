@@ -19,6 +19,7 @@ import {
   pinNewThreadToRuntime,
   runtimeAgentThreadKey,
   threadScratchVolume,
+  spendLimitHolds,
   startRuntimeTurn,
 } from "../src/agent-runtime/thread-runtime";
 import { createOrg, createUser, type TestEnv } from "./test-helpers";
@@ -35,7 +36,7 @@ const runtimeEnv = {
 
 type Call = { method: string; path: string; body: any; raw?: string; headers: Headers };
 
-function fakeRuntime(responses: Record<string, (call: Call) => Response> = {}) {
+function fakeRuntime(responses: Record<string, (call: Call) => Response | Promise<Response>> = {}) {
   const calls: Call[] = [];
   const original = globalThis.fetch;
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -298,6 +299,118 @@ describe("spend limits and retries on an existing agent", () => {
     });
     expect(await send(setup, "again", "cm_retry")).toMatchObject({ status: "accepted", requestId: "cm_retry" });
     expect(calls.some((call) => call.path.endsWith("/configuration"))).toBe(false);
+  });
+});
+
+describe("the usual send", () => {
+  const runningRows = (setup: Awaited<ReturnType<typeof runtimeThread>>) =>
+    testEnv.WORKSPACE.get(testEnv.WORKSPACE.idFromName(setup.context.workspaceId)).listStreamingThreadStatuses();
+
+  it("makes one runtime call, the prompt, to an agent configured as the send needs", async () => {
+    const setup = await runtimeThread();
+    fakeRuntime();
+    await send(setup, "first", "cm_u1");
+    const calls = fakeRuntime();
+    expect(await send(setup, "second", "cm_u2")).toMatchObject({ status: "accepted" });
+    expect(calls.map((call) => `${call.method} ${call.path}`)).toEqual(["POST /v1/agents/agt_1/prompt"]);
+  });
+
+  it("marks the thread running from when the message was taken, before the prompt", async () => {
+    const setup = await runtimeThread();
+    fakeRuntime();
+    await send(setup, "first", "cm_m1");
+    // The first turn ended.
+    await testEnv.WORKSPACE.get(testEnv.WORKSPACE.idFromName(setup.context.workspaceId)).recordThreadStreaming(setup.threadId, false);
+    let atPrompt: Awaited<ReturnType<typeof runningRows>> = [];
+    fakeRuntime({
+      "POST /v1/agents/agt_1/prompt": async (call) => {
+        atPrompt = await runningRows(setup);
+        return Response.json({ id: call.body.requestId, method: "prompt", state: "running", fingerprint: "f" }, { status: 202 });
+      },
+    });
+    const before = Date.now();
+    await send(setup, "second", "cm_m2");
+    const row = atPrompt.find((status) => status.threadId === setup.threadId);
+    expect(row?.startedAt).toBeGreaterThanOrEqual(before);
+    expect(row?.startedAt).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("takes its mark back when the prompt fails, and leaves another turn's", async () => {
+    const setup = await runtimeThread();
+    fakeRuntime();
+    await send(setup, "first", "cm_f1");
+    const workspace = testEnv.WORKSPACE.get(testEnv.WORKSPACE.idFromName(setup.context.workspaceId));
+    await workspace.recordThreadStreaming(setup.threadId, false);
+
+    fakeRuntime({ "POST /v1/agents/agt_1/prompt": () => Response.json({ error: "down" }, { status: 502 }) });
+    await expect(send(setup, "fails", "cm_f2")).rejects.toThrow(/HTTP 502/);
+    expect((await runningRows(setup)).some((status) => status.threadId === setup.threadId)).toBe(false);
+
+    // A retried request that had already finished starts no run to end the mark.
+    fakeRuntime({ "POST /v1/agents/agt_1/prompt": (call) => Response.json({ id: call.body.requestId, method: "prompt", state: "completed", fingerprint: "f" }, { status: 202 }) });
+    expect(await send(setup, "again", "cm_f1")).toMatchObject({ status: "accepted" });
+    expect((await runningRows(setup)).some((status) => status.threadId === setup.threadId)).toBe(false);
+
+    // Busy while another turn runs: that turn stays running, from its own start.
+    const otherStart = Date.now() - 10_000;
+    await workspace.recordThreadStreaming(setup.threadId, true, { startedAt: otherStart });
+    fakeRuntime({ "POST /v1/agents/agt_1/prompt": () => Response.json({ error: "Too many requests queued" }, { status: 429 }) });
+    expect(await send(setup, "busy", "cm_f3")).toMatchObject({ status: "busy" });
+    expect(await runningRows(setup)).toEqual([expect.objectContaining({ threadId: setup.threadId, startedAt: otherStart })]);
+  });
+
+  it("keeps the spend limit while only this thread spent, and sets it again when the budget moved otherwise", async () => {
+    const setup = await runtimeThread();
+    await setup.orgStub.setUserLlmUsageLimits(setup.sender.userId, [{ window_hours: 24, limit_usd: 5 }]);
+    let calls = fakeRuntime();
+    await send(setup, "first", "cm_s1");
+    expect(calls.find((call) => call.path === "/v1/agents")!.body.spendLimit).toEqual({ usd: 5 });
+    const created = (await setup.orgStub.getThreadRuntime(setup.threadId))!;
+    expect(created.configured).toMatchObject({ spendLimitUsd: 5, spendLimitSetAt: expect.any(Number) });
+
+    const usage = (threadId: string, id: string) => setup.orgStub.recordUsage({
+      workspace_id: setup.context.workspaceId,
+      user_id: setup.sender.userId,
+      thread_id: threadId,
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+      billing_source: "byok",
+      usage_kind: "llm",
+      usage_surface: "agent",
+      reported_cost_usd: 1,
+      source: "agent_runtime",
+      source_id: id,
+    });
+    // This thread's agent spent $1: the runtime counted it against the $5 too.
+    await usage(setup.threadId, "evt_own");
+    calls = fakeRuntime();
+    await send(setup, "second", "cm_s2");
+    expect(calls.map((call) => call.path)).toEqual(["/v1/agents/agt_1/prompt"]);
+
+    // Another thread spent $1 of the user's budget: $3 left, not the $4 the agent counts.
+    await usage(crypto.randomUUID(), "evt_other");
+    calls = fakeRuntime();
+    await send(setup, "third", "cm_s3");
+    const configure = calls.find((call) => call.path.endsWith("/configuration"))!;
+    expect(configure.body).toEqual({ requestId: expect.any(String), spendLimit: { usd: 3 } });
+    const updated = (await setup.orgStub.getThreadRuntime(setup.threadId))!;
+    expect(updated.configured).toMatchObject({ spendLimitUsd: 3 });
+    expect(updated.configured!.spendLimitSetAt as number).toBeGreaterThan(created.configured!.spendLimitSetAt as number);
+  });
+});
+
+describe("spendLimitHolds", () => {
+  it("holds a budget the thread's own spend explains, within a cent", () => {
+    expect(spendLimitHolds(null, null, null)).toBe(true);
+    expect(spendLimitHolds(5, null, null)).toBe(false);
+    expect(spendLimitHolds(null, 5, 0)).toBe(false);
+    expect(spendLimitHolds(5, 5, null)).toBe(false);
+    expect(spendLimitHolds(4, 5, 1)).toBe(true);
+    expect(spendLimitHolds(4.004, 5, 1)).toBe(true);
+    expect(spendLimitHolds(3, 5, 1)).toBe(false);
+    expect(spendLimitHolds(6, 5, 0)).toBe(false);
+    // Spent past the limit: none left on either side.
+    expect(spendLimitHolds(0, 5, 7)).toBe(true);
   });
 });
 

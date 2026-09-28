@@ -39,12 +39,12 @@ export interface ObservabilityEvent {
    * `count`/`size`. Appended AFTER the fixed doubles, so `double1`-`double5`
    * keep meaning what every existing query assumes; these land on `double6`
    * onward and each emitting event documents its own order. Capped so one event
-   * cannot push the row past the dataset's limits.
+   * cannot push the row past the dataset's limit of 20 doubles.
    */
   extraCounts?: (number | null | undefined)[];
 }
 
-const MAX_EXTRA_COUNTS = 5;
+const MAX_EXTRA_COUNTS = 15;
 
 export function createRequestObservabilityContext(req: Request): RequestObservabilityContext {
   const cf = (req as Request & { cf?: { colo?: unknown; country?: unknown } }).cf;

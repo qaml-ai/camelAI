@@ -9886,6 +9886,23 @@ export class OrgDO extends DurableObject<DOEnv> {
     };
   }
 
+  /**
+   * What a runtime thread's agent spent since `fromMs`, as its usage.recorded
+   * events were logged: the spend its runtime spend limit counts, when that
+   * limit was set at `fromMs` (agent-runtime/thread-runtime.ts).
+   */
+  getThreadRuntimeSpendSince(threadId: string, fromMs: number): number {
+    const row = this.sql
+      .exec<{ total: number }>(
+        `SELECT COALESCE(SUM(cost_usd), 0) AS total FROM usage_log
+         WHERE created_at_ms >= ? AND thread_id = ? AND source = 'agent_runtime'`,
+        usageInteger(fromMs),
+        threadId,
+      )
+      .one();
+    return Number(row?.total ?? 0);
+  }
+
   getUsageLogSum(
     fromMs = 0,
     toMs = Date.now(),

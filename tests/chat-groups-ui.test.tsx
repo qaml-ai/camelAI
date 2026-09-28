@@ -28,6 +28,7 @@ import {
   getGroupLandingHref,
   hasPendingCompletionSummaries,
   mergeLiveAndLocalThreadStatuses,
+  mergeThreadMetadata,
   mergeActiveChatGroup,
   LOCAL_GROUP_AVATAR_PENDING_TIMEOUT_MS,
   PENDING_GROUP_AVATAR_REVALIDATE_MAX_MS,
@@ -1994,6 +1995,30 @@ describe("mergeLiveAndLocalThreadStatuses", () => {
     );
 
     expect(merged.get("thread_1")?.status).toBe("idle");
+  });
+
+  it("keeps the earlier start of a turn both sides see running", () => {
+    // The page marked the turn at the click; the server's row started later.
+    const merged = mergeLiveAndLocalThreadStatuses(
+      new Map([["thread_1", { status: "running", runningStartedAt: 5_000 }]]),
+      new Map([["thread_1", { status: "running", runningStartedAt: 3_000 }]]),
+    );
+    expect(merged.get("thread_1")?.runningStartedAt).toBe(3_000);
+
+    // A server frame for the same turn does not move the local start either.
+    expect(
+      mergeThreadMetadata(
+        { status: "running", runningStartedAt: 3_000 },
+        { status: "running", runningStartedAt: 5_000 },
+      ).runningStartedAt,
+    ).toBe(3_000);
+    // A new turn after an idle starts at its own time.
+    expect(
+      mergeThreadMetadata(
+        { status: "idle", runningStartedAt: 3_000 },
+        { status: "running", runningStartedAt: 5_000 },
+      ).runningStartedAt,
+    ).toBe(5_000);
   });
 
   it("lets a local idle without timestamps beat an unstamped live running entry", () => {

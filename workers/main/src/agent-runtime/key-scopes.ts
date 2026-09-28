@@ -3,7 +3,8 @@
  * key scopes: `hosted` (camelAI's AI Gateway, shared by every hosted thread)
  * and `org_<orgId>` (an org's BYOK key). Synced lazily: before a runtime run,
  * and when an org's AI provider settings change. What was last synced is
- * remembered in APP_KV by fingerprint, so an unchanged scope costs one KV read.
+ * remembered in APP_KV by fingerprint, and in this isolate once seen, so an
+ * unchanged scope costs nothing after its isolate's first send.
  */
 import { decryptCredentials } from "../../../../src/lib/integration-crypto";
 import { parseStoredLlmProviderConfig } from "../../../../src/lib/llm-provider-config";
@@ -113,6 +114,26 @@ async function fingerprint(providers: Providers): Promise<string> {
 const syncedKey = (scope: string) => `agent_runtime_key_scope:${scope}`;
 
 /**
+ * Fingerprints this isolate saw synced, by scope, for a few minutes. A change
+ * to a scope's providers changes its fingerprint, which misses here and goes
+ * to KV (and the runtime) as before; the expiry bounds how long a scope
+ * changed behind KV's back (a failed sync elsewhere) goes unrepaired.
+ */
+const syncedHere = new Map<string, { print: string; at: number }>();
+const SYNCED_HERE_TTL_MS = 5 * 60_000;
+const SYNCED_HERE_MAX = 1000;
+
+function syncedRecently(scope: string, print: string): boolean {
+  const seen = syncedHere.get(scope);
+  return seen?.print === print && Date.now() - seen.at < SYNCED_HERE_TTL_MS;
+}
+
+function rememberSynced(scope: string, print: string): void {
+  if (syncedHere.size >= SYNCED_HERE_MAX) syncedHere.clear();
+  syncedHere.set(scope, { print, at: Date.now() });
+}
+
+/**
  * Make the runtime's scope hold exactly `providers`: put changed entries, then
  * drop ones no longer configured (so a rotation never leaves the scope empty
  * in between). An empty set deletes the scope.
@@ -124,12 +145,17 @@ export async function syncKeyScope(
   fetcher?: typeof globalThis.fetch,
 ): Promise<void> {
   const print = await fingerprint(providers);
+  if (syncedRecently(scope, print)) return;
   const synced = await env.APP_KV.get<{ fingerprint: string; providers: string[] }>(syncedKey(scope), "json");
-  if (synced?.fingerprint === print) return;
+  if (synced?.fingerprint === print) {
+    rememberSynced(scope, print);
+    return;
+  }
   const names = Object.keys(providers);
   if (names.length === 0) {
     if (synced) await deleteKeyScope(env, scope, fetcher);
     await env.APP_KV.delete(syncedKey(scope));
+    rememberSynced(scope, print);
     return;
   }
   for (const name of names) await putKeyScopeProvider(env, scope, name, providers[name], fetcher);
@@ -140,6 +166,7 @@ export async function syncKeyScope(
     }
   }
   await env.APP_KV.put(syncedKey(scope), JSON.stringify({ fingerprint: print, providers: names }));
+  rememberSynced(scope, print);
 }
 
 type ProviderRecord = { provider: string; credentials_encrypted: string; config: string } | null;

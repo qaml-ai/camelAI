@@ -1,12 +1,13 @@
 /**
  * Analytics Engine events for threads that run directly on the hosted agent
- * runtime: a send the runtime did not take, and a browser token that could not
- * be minted. Component `runtime_thread`; ids, classes and status codes only,
+ * runtime: where a send's time went, a send the runtime did not take, and a
+ * browser token that could not be minted. Component `runtime_thread`; ids, classes and status codes only,
  * never message text.
  */
 import { recordErrorEvent, recordObservabilityEvent, type ObservabilityEnv } from "../observability.js";
 import { RuntimeApiError } from "./runtime-api.js";
 import type { RuntimeTurnResult } from "./thread-runtime.js";
+import type { SendTimings } from "./run-gates.js";
 
 export interface RuntimeThreadTelemetryContext {
   orgId: string;
@@ -32,6 +33,38 @@ function ids(context: RuntimeThreadTelemetryContext) {
     threadId: context.threadId,
     userId: context.userId ?? null,
   };
+}
+
+/** The steps of a send, in the order they land on double6 onward of `runtime_thread_send_timing`. */
+export const SEND_TIMING_STEPS = [
+  "ban", "prepare", "route", "access", "keyScope", "credit", "limits", "spent",
+  "configure", "activity", "patch", "uploads", "prompt",
+] as const satisfies ReadonlyArray<keyof SendTimings>;
+
+/**
+ * `runtime_thread_send_timing`: one per send, however it ended. durationMs is
+ * the send's time up to the runtime's answer to the prompt; double6 onward are
+ * the milliseconds of each step in SEND_TIMING_STEPS (0: it did not run).
+ * Steps overlap: ban, prepare and spent run at once, and so do access,
+ * keyScope, credit and limits within prepare, and configure and uploads.
+ * Status is the result (accepted, busy, error) or `exception`; operation says
+ * whether the thread's agent existed before (`send`) or not (`first_send`).
+ */
+export function recordRuntimeSendTiming(
+  env: ObservabilityEnv | undefined,
+  context: RuntimeThreadTelemetryContext,
+  send: { firstSend: boolean; status: string; code?: string | null; durationMs: number; timings: SendTimings },
+): void {
+  recordObservabilityEvent(env, {
+    event: "runtime_thread_send_timing",
+    component: "runtime_thread",
+    operation: send.firstSend ? "first_send" : "send",
+    ...ids(context),
+    status: send.status,
+    errorName: send.code ?? null,
+    durationMs: send.durationMs,
+    extraCounts: SEND_TIMING_STEPS.map((step) => send.timings[step] ?? 0),
+  });
 }
 
 /**

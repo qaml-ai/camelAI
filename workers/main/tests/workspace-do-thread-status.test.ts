@@ -29,6 +29,8 @@ type WorkspaceStatusStub = DurableObjectStub<{
       activityAt?: number | null;
       clearOnlyIfRunning?: boolean;
       clearRunningStartedAtOrBefore?: number | null;
+      clearRunningStartedAt?: number;
+      startedAt?: number;
     },
   ): Promise<void>;
   listStreamingThreadIds(): Promise<string[]>;
@@ -289,6 +291,41 @@ describe("WorkspaceDO thread status", () => {
     await expect(workspaceStub.listStreamingThreadStatuses()).resolves.toEqual([
       runningStatus,
     ]);
+  });
+
+  it("starts a new running row at the sender's startedAt, and an existing row keeps its own", async () => {
+    const workspaceStub = await createWorkspaceStatusStub();
+    const threadId = crypto.randomUUID();
+    const clickedAt = Date.now() - 3_000;
+
+    await workspaceStub.recordThreadStreaming(threadId, true, { startedAt: clickedAt });
+    // The run's run.started lands later, without a start of its own.
+    await workspaceStub.recordThreadStreaming(threadId, true);
+    await workspaceStub.recordThreadStreaming(threadId, true, { startedAt: clickedAt + 2_000 });
+
+    const [running] = await workspaceStub.listStreamingThreadStatuses();
+    expect(running).toMatchObject({ threadId, startedAt: clickedAt });
+    expect(running.updatedAt).toBeGreaterThan(clickedAt);
+  });
+
+  it("clears by exact start only the running row that start made", async () => {
+    const workspaceStub = await createWorkspaceStatusStub();
+    const threadId = crypto.randomUUID();
+    const startedAt = Date.now() - 5_000;
+    await workspaceStub.recordThreadStreaming(threadId, true, { startedAt });
+
+    // Another send's failure (its own start) leaves this turn running.
+    await workspaceStub.recordThreadStreaming(threadId, false, {
+      clearOnlyIfRunning: true,
+      clearRunningStartedAt: startedAt + 1_000,
+    });
+    await expect(workspaceStub.listStreamingThreadIds()).resolves.toEqual([threadId]);
+
+    await workspaceStub.recordThreadStreaming(threadId, false, {
+      clearOnlyIfRunning: true,
+      clearRunningStartedAt: startedAt,
+    });
+    await expect(workspaceStub.listStreamingThreadIds()).resolves.toEqual([]);
   });
 
   it("does not clear a running turn for a delayed summary-only update", async () => {

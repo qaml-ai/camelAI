@@ -29,9 +29,13 @@ import {
   resolveThreadRuntimeRoute,
   RuntimeRunRefused,
   runtimeSystemPromptAppend,
+  timed,
   type PreparedRuntimeRun,
+  type SendTimings,
   type ThreadModelFallback,
 } from "./run-gates";
+import { recordRuntimeSendTiming } from "./runtime-thread-telemetry";
+import { recordWorkspaceThreadStreaming } from "../thread-status";
 
 /** How long a browser token lives; the watcher renews it a minute before. */
 export const BROWSER_TOKEN_TTL_SECONDS = 900;
@@ -97,6 +101,7 @@ function orgStub(env: ChatEnv, orgId: string) {
   return env.ORG.get(env.ORG.idFromName(orgId)) as unknown as {
     getThread(id: string): Promise<{ created_by?: string | null } | null>;
     getThreadRuntime(threadId: string): Promise<ThreadRuntimeRecord | null>;
+    getThreadRuntimeSpendSince(threadId: string, fromMs: number): Promise<number>;
     pinThreadRuntime(threadId: string): Promise<boolean>;
     setThreadRuntimeAgent(threadId: string, update: {
       agentId: string;
@@ -270,14 +275,51 @@ async function agentActivity(env: ChatEnv, agentId: string, requestId: string): 
   return { running, retried };
 }
 
+/** How far apart two spend limits may be and still count as the same budget. */
+const SPEND_LIMIT_TOLERANCE_USD = 0.01;
+
+/**
+ * Whether the agent's spend limit already holds the budget `next`: the limit
+ * last set (`last`) less what the thread's agent spent since, as chiridion
+ * recorded it. The runtime counts that same spend against the limit, so when
+ * the two agree nothing outside this thread changed the budget (another
+ * thread's spend, a credit purchase, a new window of a user's limit) and a
+ * PATCH would only restart the count. Spend not yet recorded is missing from
+ * both sides alike. Unknown spend (null): it does not hold.
+ */
+export function spendLimitHolds(next: number | null, last: number | null, spentSince: number | null): boolean {
+  if (next === null || last === null) return next === last;
+  if (spentSince === null) return false;
+  return Math.abs(Math.max(0, last - spentSince) - next) < SPEND_LIMIT_TOLERANCE_USD;
+}
+
+/** What the thread's agent spent since its spend limit was set; null without a limit or its time. */
+async function spentSinceLimit(
+  env: ChatEnv,
+  context: ChatContextState,
+  row: ThreadRuntimeRecord,
+  timings: SendTimings,
+): Promise<number | null> {
+  const setAt = row.configured?.spendLimitSetAt;
+  if (!row.agentId || typeof setAt !== "number" || typeof row.configured?.spendLimitUsd !== "number") return null;
+  return await timed(timings, "spent", () => orgStub(env, context.orgId).getThreadRuntimeSpendSince(context.threadId, setAt))
+    .catch((error: unknown) => {
+      console.warn("[runtime-thread] could not read the thread's spend; its spend limit is set again", error);
+      return null;
+    });
+}
+
 /**
  * The thread's agent, created (or adopted) on first use and configured for
- * this send where the model, key scope or spend limit changed.
+ * this send where the model, key scope, instructions or budget changed. The
+ * usual send changes none of them and makes no runtime call here.
  *
  * A spend limit is a budget from now: the runtime resets what was spent and
- * applies it at once, to a running turn too. So it is set only while the
- * agent is idle; a send during a turn (another member's, or a retry) leaves
- * the running turn's budget alone, and a retried request changes nothing.
+ * applies it at once, to a running turn too. So it is set only when the
+ * budget changed beyond the thread's own spend (spendLimitHolds), and only
+ * while the agent is idle; a send during a turn (another member's, or a
+ * retry) leaves the running turn's budget alone, and a retried request
+ * changes nothing.
  */
 async function ensureConfiguredAgent(
   env: ChatEnv,
@@ -285,12 +327,15 @@ async function ensureConfiguredAgent(
   row: ThreadRuntimeRecord,
   run: PreparedRuntimeRun,
   requestId: string,
+  spentSince: number | null,
+  timings: SendTimings,
 ): Promise<string> {
   const org = orgStub(env, context.orgId);
   let agentId = row.agentId;
   /** An agent made under an earlier configuration (adopted): bring all of it up to date. */
   let stale = false;
   if (!agentId) {
+    const limitSetAt = Date.now();
     const made = await createThreadAgent(env, context, run);
     agentId = made.agentId;
     if (!made.adopted) {
@@ -298,83 +343,151 @@ async function ensureConfiguredAgent(
         agentId,
         model: run.model,
         keyScope: run.keyScope,
-        configured: { thinkingLevel: run.thinkingLevel, spendLimitUsd: run.spendLimitUsd, promptVersion: RUNTIME_PROMPT_VERSION },
+        configured: {
+          thinkingLevel: run.thinkingLevel,
+          spendLimitUsd: run.spendLimitUsd,
+          spendLimitSetAt: limitSetAt,
+          promptVersion: RUNTIME_PROMPT_VERSION,
+        },
       });
       return agentId;
     }
     stale = true;
   }
-  const { running, retried } = await agentActivity(env, agentId, requestId);
-  if (retried) return agentId;
+  const id = agentId;
   const modelChanged = stale || row.model !== run.model;
   const scopeChanged = stale || (row.keyScope ?? null) !== run.keyScope;
   const lastLimit = (row.configured?.spendLimitUsd as number | null | undefined) ?? null;
-  const setLimit = !running && (stale || run.spendLimitUsd !== null || lastLimit !== null);
+  const limitChanged = stale || !spendLimitHolds(run.spendLimitUsd, lastLimit, spentSince);
   // Instructions from an earlier version (or none recorded): send the current ones.
   const promptChanged = stale || row.configured?.promptVersion !== RUNTIME_PROMPT_VERSION;
-  if (!modelChanged && !scopeChanged && !setLimit && !promptChanged) return agentId;
-  await runtimeApi(env, "PATCH", `/v1/agents/${encodeURIComponent(agentId)}/configuration`, {
+  if (!modelChanged && !scopeChanged && !limitChanged && !promptChanged) return id;
+  const { running, retried } = await timed(timings, "activity", () => agentActivity(env, id, requestId));
+  if (retried) return id;
+  const setLimit = limitChanged && !running;
+  if (!modelChanged && !scopeChanged && !setLimit && !promptChanged) return id;
+  const limitSetAt = Date.now();
+  await timed(timings, "patch", () => runtimeApi(env, "PATCH", `/v1/agents/${encodeURIComponent(id)}/configuration`, {
     requestId: `run_${crypto.randomUUID()}`,
     ...(setLimit ? { spendLimit: run.spendLimitUsd === null ? null : { usd: run.spendLimitUsd } } : {}),
     ...(modelChanged ? { model: run.model, thinkingLevel: run.thinkingLevel } : {}),
     ...(scopeChanged ? { keyScope: run.keyScope, modelHeaders: run.modelHeaders } : {}),
     ...(promptChanged ? { systemPromptAppend: runtimeSystemPromptAppend(env, context) } : {}),
-  });
+  }));
   await org.setThreadRuntimeAgent(context.threadId, {
-    agentId,
+    agentId: id,
     model: run.model,
     keyScope: run.keyScope,
     configured: {
+      ...row.configured,
       thinkingLevel: modelChanged ? run.thinkingLevel : row.configured?.thinkingLevel ?? run.thinkingLevel,
       spendLimitUsd: setLimit ? run.spendLimitUsd : lastLimit,
+      spendLimitSetAt: setLimit ? limitSetAt : row.configured?.spendLimitSetAt ?? null,
       promptVersion: RUNTIME_PROMPT_VERSION,
     },
   });
-  return agentId;
+  return id;
 }
 
 /**
- * Send a user's message to a runtime thread (plans/runtime-threads-direct.md
- * §4.2): the ban check, the run gates as the sender, the agent created or
- * configured, then `prompt` with `requestId` = the client's message id, so a
- * retry is the same request. A message sent while a turn runs is queued as
- * the next turn. Thread bookkeeping (last message, title) runs after, in
- * `waitUntil`.
+ * Show the thread running from `startedAt`, when the message was taken, ahead
+ * of the run's run.started (which keeps this start). True when marked, so a
+ * send that fails can take the mark back.
  */
-export async function startRuntimeTurn(
+async function markThreadRunning(env: ChatEnv, context: ChatContextState, startedAt: number): Promise<boolean> {
+  return await recordWorkspaceThreadStreaming(env, context.workspaceId, context.threadId, true, { startedAt })
+    .then(() => true, (error: unknown) => {
+      console.warn("[runtime-thread] could not mark the thread running", error);
+      return false;
+    });
+}
+
+/** Take back the running mark this send made, and never another turn's. */
+async function unmarkThreadRunning(env: ChatEnv, context: ChatContextState, startedAt: number): Promise<void> {
+  await recordWorkspaceThreadStreaming(env, context.workspaceId, context.threadId, false, {
+    clearOnlyIfRunning: true,
+    clearRunningStartedAt: startedAt,
+  }).catch((error: unknown) => console.warn("[runtime-thread] could not clear the thread's running mark", error));
+}
+
+type RuntimeTurnInput = {
+  context: ChatContextState;
+  row: ThreadRuntimeRecord;
+  sender: RuntimeThreadSender;
+  text: string;
+  clientMessageId: string;
+  source?: string;
+  waitUntil(promise: Promise<unknown>): void;
+};
+
+/**
+ * Send a user's message to a runtime thread (plans/runtime-threads-direct.md
+ * §4.2): the ban check and the run gates as the sender, at once; the thread
+ * marked running while the agent is created or configured; then `prompt`
+ * with `requestId` = the client's message id, so a retry is the same
+ * request. A message sent while a turn runs is queued as the next turn.
+ * Thread bookkeeping (last message, title) runs after, in `waitUntil`. Every
+ * send records where its time went (runtime_thread_send_timing).
+ */
+export async function startRuntimeTurn(env: ChatEnv, input: RuntimeTurnInput): Promise<RuntimeTurnResult> {
+  const startedAt = Date.now();
+  const timings: SendTimings = {};
+  let result: RuntimeTurnResult | undefined;
+  try {
+    result = await sendRuntimeTurn(env, input, startedAt, timings);
+    return result;
+  } finally {
+    recordRuntimeSendTiming(env, input.context, {
+      firstSend: !input.row.agentId,
+      status: result?.status ?? "exception",
+      code: result && result.status !== "accepted" ? result.code : null,
+      durationMs: Date.now() - startedAt,
+      timings,
+    });
+  }
+}
+
+async function sendRuntimeTurn(
   env: ChatEnv,
-  input: {
-    context: ChatContextState;
-    row: ThreadRuntimeRecord;
-    sender: RuntimeThreadSender;
-    text: string;
-    clientMessageId: string;
-    source?: string;
-    waitUntil(promise: Promise<unknown>): void;
-  },
+  input: RuntimeTurnInput,
+  startedAt: number,
+  timings: SendTimings,
 ): Promise<RuntimeTurnResult> {
   const { context, sender } = input;
   const text = input.text.trim();
   if (!text) return { status: "error", error: "Empty message" };
-  if (await isOrgBanned(env.APP_KV, { orgId: context.orgId })) {
-    return { status: "error", error: "Organization is blocked" };
-  }
-  let run: PreparedRuntimeRun;
-  try {
-    run = await prepareThreadRuntimeRun(env, context, sender.userId);
-  } catch (error) {
-    if (error instanceof RuntimeRunRefused) return { status: "error", error: error.message, code: error.code };
-    throw error;
-  }
-  const agentId = await ensureConfiguredAgent(env, context, input.row, run, input.clientMessageId);
+  const [banned, prepared, spentSince] = await Promise.all([
+    timed(timings, "ban", () => isOrgBanned(env.APP_KV, { orgId: context.orgId })),
+    timed(timings, "prepare", () => prepareThreadRuntimeRun(env, context, sender.userId, timings)).then(
+      (run) => ({ run }),
+      (error: unknown) => {
+        if (error instanceof RuntimeRunRefused) return { refused: error };
+        throw error;
+      },
+    ),
+    spentSinceLimit(env, context, input.row, timings),
+  ]);
+  if (banned) return { status: "error", error: "Organization is blocked" };
+  if ("refused" in prepared) return { status: "error", error: prepared.refused.message, code: prepared.refused.code };
+  const { run } = prepared;
   const name = resolveMessageAuthorDisplayName(sender.userName, sender.userEmail);
-  // The message's uploads, attached as runtime files too (native images and PDFs).
-  const files = await attachUploads(env, context, agentId, input.clientMessageId, text);
-  let request: { id?: unknown };
+  // Running from when the message was taken, and before the prompt, so the
+  // run's own events can end the mark but a quick run never finds it after.
+  const marked = markThreadRunning(env, context, startedAt);
+  let agentId: string;
+  let request: { id?: unknown; state?: unknown };
   try {
-    request = await runtimeApi(env, "POST", `/v1/agents/${encodeURIComponent(agentId)}/prompt`, {
-      text: await modelText(env, context, text),
-      ...(files.length > 0 ? { files } : {}),
+    const configured = timed(timings, "configure", () =>
+      ensureConfiguredAgent(env, context, input.row, run, input.clientMessageId, spentSince, timings));
+    // The message's uploads, attached as runtime files too (native images and
+    // PDFs); alongside the configuration when the agent already exists.
+    const files = (input.row.agentId ? Promise.resolve(input.row.agentId) : configured)
+      .then((id) => timed(timings, "uploads", () => attachUploads(env, context, id, input.clientMessageId, text)));
+    const [id, attached, promptText] = await Promise.all([configured, files, modelText(env, context, text), marked]);
+    agentId = id;
+    request = await timed(timings, "prompt", () => runtimeApi(env, "POST", `/v1/agents/${encodeURIComponent(id)}/prompt`, {
+      text: promptText,
+      ...(attached.length > 0 ? { files: attached } : {}),
       from: { id: sender.userId, ...(name ? { name: name.slice(0, 200) } : {}) },
       actor: sender.userId,
       // Echoed on the user message: the page matches its optimistic bubble by it.
@@ -384,13 +497,17 @@ export async function startRuntimeTurn(
       whileRunning: "steer",
       // On the message and on the run's webhook events (routes/agent-runtime-events.ts).
       metadata: runtimeMessageMetadata(context, input.source ?? "web"),
-    }) as { id?: unknown };
+    })) as { id?: unknown; state?: unknown };
   } catch (error) {
+    if (await marked) await unmarkThreadRunning(env, context, startedAt);
     if (error instanceof RuntimeApiError && error.status === 429) {
       return { status: "busy", error: "The agent has too many messages queued; try again when it finishes." };
     }
     throw error;
   }
+  // A retry of a request that already finished starts no run, whose events
+  // would end the mark.
+  if (request?.state === "completed" && await marked) await unmarkThreadRunning(env, context, startedAt);
   // Running/idle in the sidebar and end-of-turn work come from the runtime's
   // run events (routes/agent-runtime-events.ts), for every run however started;
   // runs no message of ours started (a resume after an input) find the thread here.

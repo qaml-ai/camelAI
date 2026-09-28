@@ -100,6 +100,27 @@ describe("syncKeyScope", () => {
     expect(runtime.calls.at(-1)).toMatchObject({ method: "DELETE", path: "/v1/key-scopes/org_1" });
   });
 
+  it("skips KV for a scope this isolate just synced, until its providers change", async () => {
+    const { kv, data } = memoryKv();
+    const runtime = fakeRuntime();
+    const e = env(kv);
+    let reads = 0;
+    const get = kv.get.bind(kv);
+    (kv as { get: unknown }).get = (...args: Parameters<typeof get>) => { reads += 1; return get(...args); };
+
+    await syncKeyScope(e, "org_memo", { anthropic: { apiKey: "sk-1" } }, runtime.fetch);
+    expect(reads).toBe(1);
+    await syncKeyScope(e, "org_memo", { anthropic: { apiKey: "sk-1" } }, runtime.fetch);
+    expect(reads).toBe(1);
+    expect(runtime.calls).toHaveLength(1);
+
+    // A changed key misses the isolate's memory and syncs as before.
+    await syncKeyScope(e, "org_memo", { anthropic: { apiKey: "sk-2" } }, runtime.fetch);
+    expect(reads).toBe(2);
+    expect(runtime.calls).toHaveLength(2);
+    expect(JSON.parse(data.get("agent_runtime_key_scope:org_memo")!)).toMatchObject({ providers: ["anthropic"] });
+  });
+
   it("syncs an org scope from the record OrgDO hands it", async () => {
     const { kv } = memoryKv();
     const runtime = fakeRuntime();

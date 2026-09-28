@@ -8,7 +8,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   classifyRuntimeFailure,
   recordRuntimeSendFailure,
+  recordRuntimeSendTiming,
   recordRuntimeTokenMintFailure,
+  SEND_TIMING_STEPS,
 } from "../src/agent-runtime/runtime-thread-telemetry";
 import { RuntimeApiError } from "../src/agent-runtime/runtime-api";
 
@@ -34,6 +36,25 @@ describe("classifyRuntimeFailure", () => {
     expect(classifyRuntimeFailure(new RuntimeApiError("bad", 409))).toEqual({ status: "runtime_4xx", statusCode: 409 });
     expect(classifyRuntimeFailure(new RuntimeApiError("down", 502))).toEqual({ status: "runtime_5xx", statusCode: 502 });
     expect(classifyRuntimeFailure(new TypeError("fetch failed"))).toEqual({ status: "exception", statusCode: null });
+  });
+});
+
+describe("recordRuntimeSendTiming", () => {
+  it("records one event per send, each step's milliseconds on double6 onward", () => {
+    const { env, events } = datasets();
+    recordRuntimeSendTiming(env, context, {
+      firstSend: false,
+      status: "accepted",
+      durationMs: 420,
+      timings: { ban: 3, prepare: 120, route: 40, prompt: 250 },
+    });
+    expect(events.writeDataPoint).toHaveBeenCalledTimes(1);
+    expect(point(events)).toMatchObject({ event: "runtime_thread_send_timing", operation: "send", status: "accepted", thread: "thread1" });
+    const [{ doubles }] = events.writeDataPoint.mock.calls[0] as [{ doubles: number[] }];
+    expect(doubles[1]).toBe(420);
+    expect(doubles).toHaveLength(5 + SEND_TIMING_STEPS.length);
+    const steps = Object.fromEntries(SEND_TIMING_STEPS.map((step, index) => [step, doubles[5 + index]]));
+    expect(steps).toMatchObject({ ban: 3, prepare: 120, route: 40, patch: 0, prompt: 250 });
   });
 });
 

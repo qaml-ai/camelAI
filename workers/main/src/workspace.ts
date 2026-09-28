@@ -436,6 +436,8 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
       source?: string;
       clearOnlyIfRunning?: boolean;
       clearRunningStartedAtOrBefore?: number | null;
+      clearRunningStartedAt?: number;
+      startedAt?: number;
     },
   ): Promise<void> {
     const normalizedThreadId = threadId.trim();
@@ -537,7 +539,10 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
            VALUES (?, ?, ?, NULL, NULL)
            ON CONFLICT(thread_id) DO UPDATE SET updated_at = excluded.updated_at`,
           normalizedThreadId,
-          now,
+          // A new row starts when the sender took the message, when it says.
+          typeof options?.startedAt === 'number' && Number.isFinite(options.startedAt)
+            ? Math.floor(options.startedAt)
+            : now,
           now,
         );
         // A running row now exists; make sure the lease-sweep alarm is armed
@@ -553,6 +558,12 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
         )
         .toArray()[0] ?? null;
       if (options?.clearOnlyIfRunning === true && currentRunning === null) {
+        return;
+      }
+      if (
+        options?.clearRunningStartedAt !== undefined &&
+        currentRunning?.started_at !== options.clearRunningStartedAt
+      ) {
         return;
       }
       // Metadata-only completion/summary update. It may refresh unread details

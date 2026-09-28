@@ -326,11 +326,12 @@ describe('observability numeric dimensions', () => {
         event: 'pi_context_budget',
         component: 'chat_thread_do',
         timestamp: 111,
-        extraCounts: [1, 2, 3, 4, 5, 6, 7, undefined as never],
+        extraCounts: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, undefined as never],
       },
     );
+    // Five fixed doubles and at most fifteen extra: Analytics Engine's 20.
     expect(writeDataPoint.mock.calls[0][0].doubles).toEqual([
-      111, 0, 0, 0, 0, 1, 2, 3, 4, 5,
+      111, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
     ]);
   });
 

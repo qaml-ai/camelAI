@@ -33,6 +33,7 @@ export function AppLoadingOverlay() {
   return (
     <div
       aria-hidden="true"
+      data-app-loading-overlay=""
       className={cn(
         "pointer-events-none fixed inset-0 z-[100] flex items-center justify-center bg-background",
         "transition-opacity duration-200",

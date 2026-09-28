@@ -476,7 +476,7 @@ export function stringifyPiMessageForTokenCount(message: AgentMessage): string {
  * The number: `prepareInlineImage*` (`image-tool-content.ts`) downscales every
  * inline image to a 2000px long edge before it enters the transcript, so the
  * realistic worst case is 2000x2000 = 4 MP, which the high-resolution tier of
- * the models this catalog serves (claude-sonnet-5 / fable-5 / opus-5) clamps to
+ * the models this catalog serves (claude-sonnet-5-5 / fable-5 / opus-5) clamps to
  * ~3.75 MP ≈ 5_000 tokens. A 16:9 full-page capture at the same ceiling is
  * 2000x1125 = 2.25 MP ≈ 3_000 tokens, which is the shape that actually
  * dominates screenshot threads, so that is the charge. The residual is bounded

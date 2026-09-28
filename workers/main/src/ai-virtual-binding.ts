@@ -59,22 +59,22 @@ const TIER_MODELS: Readonly<Record<ProviderKind, Readonly<Record<TierName, strin
     smart: "gpt-6-sol",
   },
   anthropic: {
-    cheap: "claude-sonnet-5",
-    fast: "claude-sonnet-5",
-    auto: "claude-sonnet-5",
+    cheap: "claude-sonnet-5-5",
+    fast: "claude-sonnet-5-5",
+    auto: "claude-sonnet-5-5",
     smart: "claude-opus-5-5",
   },
   bedrock: {
-    cheap: "anthropic.claude-sonnet-5",
-    fast: "anthropic.claude-sonnet-5",
-    auto: "anthropic.claude-sonnet-5",
+    cheap: "anthropic.claude-sonnet-5-5",
+    fast: "anthropic.claude-sonnet-5-5",
+    auto: "anthropic.claude-sonnet-5-5",
     smart: "anthropic.claude-opus-5-5",
   },
   openrouter: {
     cheap: "openai/gpt-6-luna",
     fast: "openai/gpt-6-luna",
     auto: "openai/gpt-6-luna",
-    smart: "anthropic/claude-sonnet-5",
+    smart: "anthropic/claude-sonnet-5.5",
   },
 };
 

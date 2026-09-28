@@ -42,8 +42,21 @@ describe("calculateUsageCostUsd", () => {
     );
     expect(lookupPricingOrNull("operator/private-model-v9")).toBeNull();
     expect(lookupPricing("operator/private-model-v9")).toBe(
-      lookupPricing("claude-sonnet-5"),
+      lookupPricing("claude-sonnet-5-5"),
     );
+  });
+
+  it("prices Sonnet 5.5 on every provider id, like Sonnet 5", () => {
+    for (const id of [
+      "claude-sonnet-5-5",
+      "anthropic/claude-sonnet-5.5",
+      "anthropic/claude-sonnet-5.5:nitro",
+      "anthropic.claude-sonnet-5-5",
+      "us.anthropic.claude-sonnet-5-5",
+    ]) {
+      expect(lookupPricingOrNull(id)).toEqual(lookupPricing("claude-sonnet-5-5"));
+    }
+    expect(lookupPricing("claude-sonnet-5-5")).toEqual(lookupPricing("claude-sonnet-5"));
   });
 
   it("prices GLM 5.3 aliases while retaining historical GLM 5.2 pricing", () => {

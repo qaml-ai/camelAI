@@ -174,9 +174,11 @@ function hostedDeepseekStickyKey(
 }
 
 const PI_MODEL_CATALOG_FALLBACKS: Record<string, Model<any>> = {
-  "anthropic/claude-sonnet-5": {
-    id: "claude-sonnet-5",
-    name: "Claude Sonnet 5",
+  // Pi's catalog (0.87.1, the agent runtime's too) predates Sonnet 5.5; Anthropic
+  // prices it like Sonnet 5 (2026-09-28).
+  "anthropic/claude-sonnet-5-5": {
+    id: "claude-sonnet-5-5",
+    name: "Claude Sonnet 5.5",
     api: "anthropic-messages",
     provider: "anthropic",
     baseUrl: "https://api.anthropic.com",

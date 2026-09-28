@@ -60,7 +60,7 @@ export interface ModelCatalogEntry {
 export const LLM_MODEL_TO_PRICING_KEY: Readonly<Record<LlmModel, string>> = {
   "opus-5.5": "claude-opus-5-5",
   "fable-5.1": "claude-fable-5-1",
-  sonnet: "claude-sonnet-5",
+  sonnet: "claude-sonnet-5-5",
   "gpt-6-sol": "gpt-6-sol",
   "gpt-6-luna": "gpt-6-luna",
   "gpt-5.6-terra-bedrock": "gpt-5.6-terra",
@@ -107,7 +107,7 @@ export const MODEL_CATALOG: Readonly<Record<LlmModel, ModelCatalogEntry>> = {
   },
   sonnet: {
     id: "sonnet",
-    label: "Sonnet 5",
+    label: "Sonnet 5.5",
     providerLogo: "claude",
     providerOrder: 0,
     modelOrder: 2,

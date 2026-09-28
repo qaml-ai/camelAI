@@ -20,7 +20,7 @@ import {
 import type { LlmProvider, LlmProviderConfigPublic } from '@/types';
 
 const VALID_PROVIDERS: LlmProvider[] = ['anthropic', 'bedrock', 'custom', 'openai', 'openrouter'];
-export const ANTHROPIC_API_KEY_VALIDATION_MODEL = 'claude-sonnet-5';
+export const ANTHROPIC_API_KEY_VALIDATION_MODEL = 'claude-sonnet-5-5';
 const VALID_CUSTOM_AUTH_TYPES = ['bearer', 'x-api-key'] as const;
 const VALID_CUSTOM_APIS = ['openai-completions', 'openai-responses', 'anthropic-messages'] as const;
 const VALID_AWS_REGIONS = [
@@ -551,7 +551,7 @@ export async function action({ request, context, params }: Route.ActionArgs) {
           ...(config.custom_api === 'anthropic-messages'
             ? {
                 body: JSON.stringify({
-                  model: config.custom_model_id || 'claude-sonnet-5',
+                  model: config.custom_model_id || 'claude-sonnet-5-5',
                   messages: [{ role: 'user', content: 'test' }],
                 }),
               }

@@ -723,13 +723,13 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(mapping.resolvePiModelReference('opus')).toEqual(expected);
   });
 
-  it('keeps Sonnet 5 on its hosted nitro route and runs retired Haiku threads on it', () => {
+  it('keeps Sonnet 5.5 on its hosted nitro route and runs retired Haiku threads on it', () => {
     const mapping = new PiModelMapping();
     const sonnet = {
       provider: 'anthropic',
-      modelId: 'claude-sonnet-5',
+      modelId: 'claude-sonnet-5-5',
       hostedGatewayProvider: 'openrouter',
-      hostedModelId: 'anthropic/claude-sonnet-5:nitro',
+      hostedModelId: 'anthropic/claude-sonnet-5.5:nitro',
     };
     expect(mapping.resolvePiModelReference('sonnet')).toEqual(sonnet);
     expect(mapping.resolvePiModelReference('haiku')).toEqual(sonnet);
@@ -741,7 +741,9 @@ describe('ChatThreadDO Pi turn handling', () => {
     expect(mapping.bedrockClaudeModel('claude-fable-5-1')).toBe('anthropic.claude-fable-5-1');
     expect(mapping.bedrockClaudeModel('claude-opus-5')).toBe('anthropic.claude-opus-5-5');
     expect(mapping.bedrockClaudeModel('claude-fable-5')).toBe('anthropic.claude-fable-5-1');
-    expect(mapping.bedrockClaudeModel('claude-sonnet-5')).toBe('anthropic.claude-sonnet-5');
+    expect(mapping.bedrockClaudeModel('claude-sonnet-5-5')).toBe('anthropic.claude-sonnet-5-5');
+    expect(mapping.bedrockClaudeModel('claude-sonnet-5')).toBe('anthropic.claude-sonnet-5-5');
+    expect(mapping.openRouterClaudeModel('claude-sonnet-5')).toBe('anthropic/claude-sonnet-5.5');
   });
 
   it('preserves sentDuringStreaming metadata on parsed Pi user messages', () => {
@@ -1066,7 +1068,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       { orgId: 'org1', workspaceId: 'workspace1', threadId: 'thread1' },
       { CHIRIDION_MODEL: 'sonnet' },
       vi.fn(() => ({
-        id: 'claude-sonnet-5',
+        id: 'claude-sonnet-5-5',
         provider: 'anthropic',
         api: 'anthropic-messages',
         baseUrl: 'https://api.anthropic.com',
@@ -1074,7 +1076,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     );
 
     expect(model.model).toMatchObject({
-      id: 'anthropic/claude-sonnet-5:nitro',
+      id: 'anthropic/claude-sonnet-5.5:nitro',
       provider: 'cloudflare-ai-gateway',
       api: 'anthropic-messages',
       baseUrl: 'https://gateway.ai.cloudflare.com/v1/acct_1/gateway_1/openrouter',
@@ -2783,7 +2785,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       { orgId: 'org1', workspaceId: 'workspace1', threadId: 'thread1' },
       { CHIRIDION_MODEL: 'sonnet' },
       vi.fn(() => ({
-        id: 'claude-sonnet-5',
+        id: 'claude-sonnet-5-5',
         provider: 'anthropic',
         api: 'anthropic-messages',
         baseUrl: 'https://api.anthropic.com',
@@ -2791,7 +2793,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     );
 
     expect(model.model).toMatchObject({
-      id: 'anthropic/claude-sonnet-5:nitro',
+      id: 'anthropic/claude-sonnet-5.5:nitro',
       provider: 'anthropic',
       api: 'anthropic-messages',
       baseUrl: 'https://openrouter.ai/api',
@@ -2859,7 +2861,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       { orgId: 'org1', workspaceId: 'workspace1', threadId: 'thread1' },
       { CHIRIDION_MODEL: 'sonnet' },
       vi.fn(() => ({
-        id: 'claude-sonnet-5',
+        id: 'claude-sonnet-5-5',
         provider: 'anthropic',
         api: 'anthropic-messages',
         baseUrl: 'https://api.anthropic.com',
@@ -2867,7 +2869,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     );
 
     expect(model.model).toMatchObject({
-      id: 'anthropic/claude-sonnet-5:nitro',
+      id: 'anthropic/claude-sonnet-5.5:nitro',
       provider: 'anthropic',
       api: 'anthropic-messages',
       baseUrl: 'https://openrouter.ai/api',
@@ -2896,7 +2898,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       { orgId: 'org1', workspaceId: 'workspace1', threadId: 'thread1' },
       { CHIRIDION_MODEL: 'sonnet' },
       vi.fn(() => ({
-        id: 'claude-sonnet-5',
+        id: 'claude-sonnet-5-5',
         provider: 'anthropic',
         api: 'anthropic-messages',
         baseUrl: 'https://api.anthropic.com',
@@ -2904,7 +2906,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     );
 
     expect(model.model).toMatchObject({
-      id: 'claude-sonnet-5',
+      id: 'claude-sonnet-5-5',
       provider: 'anthropic',
       api: 'anthropic-messages',
       baseUrl: 'https://api.anthropic.com',
@@ -3330,7 +3332,7 @@ describe('ChatThreadDO Pi turn handling', () => {
       { orgId: 'org1', workspaceId: 'workspace1', threadId: 'thread1' },
       { CHIRIDION_MODEL: 'sonnet' },
       vi.fn(() => ({
-        id: 'claude-sonnet-5',
+        id: 'claude-sonnet-5-5',
         provider: 'anthropic',
         api: 'anthropic-messages',
         baseUrl: 'https://api.anthropic.com',
@@ -3338,7 +3340,7 @@ describe('ChatThreadDO Pi turn handling', () => {
     );
 
     expect(model.model).toMatchObject({
-      id: 'claude-sonnet-5',
+      id: 'claude-sonnet-5-5',
       provider: 'custom',
       api: 'anthropic-messages',
       baseUrl: 'https://custom.example',
@@ -3461,9 +3463,9 @@ describe('ChatThreadDO Pi turn handling', () => {
       getModel,
     );
 
-    expect(getModel).toHaveBeenCalledWith('anthropic', 'claude-sonnet-5');
+    expect(getModel).toHaveBeenCalledWith('anthropic', 'claude-sonnet-5-5');
     expect(model.model).toMatchObject({
-      id: 'claude-sonnet-5',
+      id: 'claude-sonnet-5-5',
       provider: 'custom',
       api: 'anthropic-messages',
       baseUrl: 'https://custom.example',
@@ -3496,9 +3498,9 @@ describe('ChatThreadDO Pi turn handling', () => {
       getModel,
     );
 
-    expect(getModel).toHaveBeenCalledWith('anthropic', 'claude-sonnet-5');
+    expect(getModel).toHaveBeenCalledWith('anthropic', 'claude-sonnet-5-5');
     expect(model.model).toMatchObject({
-      id: 'anthropic.claude-sonnet-5',
+      id: 'anthropic.claude-sonnet-5-5',
       provider: 'custom',
       api: 'anthropic-messages',
       baseUrl: 'https://bedrock-mantle.us-west-2.api.aws/anthropic',
@@ -4086,11 +4088,11 @@ describe('ChatThreadDO Pi turn handling', () => {
     ];
     const fake = Object.create(ChatThreadDO.prototype) as any;
     fake.piModelResolver = vi.fn(async () => ({
-      model: { contextWindow: 1_000_000, id: 'anthropic.claude-sonnet-5' },
+      model: { contextWindow: 1_000_000, id: 'anthropic.claude-sonnet-5-5' },
       apiKey: 'bedrock-token',
       provider: 'bedrock',
       usageProvider: 'bedrock',
-      modelId: 'claude-sonnet-5',
+      modelId: 'claude-sonnet-5-5',
     }));
     fake.piSession = {
       state: {

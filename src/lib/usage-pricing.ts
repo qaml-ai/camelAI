@@ -24,7 +24,7 @@ export interface UsageTokens {
   upstreamInferenceCostUsd?: number | null;
 }
 
-const SONNET_FALLBACK_MODEL = "claude-sonnet-5";
+const SONNET_FALLBACK_MODEL = "claude-sonnet-5-5";
 
 const modelPricingTable: Record<string, ModelPricing> = {
   // OpenRouter /api/v1/models and runtime catalog pricing, 2026-09-28.
@@ -87,6 +87,30 @@ const modelPricingTable: Record<string, ModelPricing> = {
     outputPerToken: 0.00005,
     cacheCreationPerToken: 0.0000125,
     cacheReadPerToken: 0.000001,
+  },
+  "claude-sonnet-5-5": {
+    inputPerToken: 0.000002,
+    outputPerToken: 0.00001,
+    cacheCreationPerToken: 0.0000025,
+    cacheReadPerToken: 0.0000002,
+  },
+  "anthropic/claude-sonnet-5.5": {
+    inputPerToken: 0.000002,
+    outputPerToken: 0.00001,
+    cacheCreationPerToken: 0.0000025,
+    cacheReadPerToken: 0.0000002,
+  },
+  "anthropic/claude-sonnet-5-5": {
+    inputPerToken: 0.000002,
+    outputPerToken: 0.00001,
+    cacheCreationPerToken: 0.0000025,
+    cacheReadPerToken: 0.0000002,
+  },
+  "anthropic.claude-sonnet-5-5": {
+    inputPerToken: 0.000002,
+    outputPerToken: 0.00001,
+    cacheCreationPerToken: 0.0000025,
+    cacheReadPerToken: 0.0000002,
   },
   "claude-sonnet-5": {
     inputPerToken: 0.000002,
@@ -566,6 +590,12 @@ export function lookupPricingOrNull(model: string): ModelPricing | null {
   }
   if (normalized.includes("claude-fable-5")) {
     return modelPricingTable["claude-fable-5"];
+  }
+  if (
+    normalized.includes("claude-sonnet-5.5") ||
+    normalized.includes("claude-sonnet-5-5")
+  ) {
+    return modelPricingTable["claude-sonnet-5-5"];
   }
   if (normalized.includes("claude-sonnet-5")) {
     return modelPricingTable["claude-sonnet-5"];

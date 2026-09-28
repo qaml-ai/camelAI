@@ -45,9 +45,9 @@ const bedrockModels: BedrockModelMetadata[] = [
     maxTokens: 128_000,
   },
   {
-    id: 'claude-sonnet-5',
-    bedrockModelId: 'anthropic.claude-sonnet-5',
-    name: 'Claude Sonnet 5',
+    id: 'claude-sonnet-5-5',
+    bedrockModelId: 'anthropic.claude-sonnet-5-5',
+    name: 'Claude Sonnet 5.5',
     reasoning: true,
     input: ['text', 'image'],
     cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
@@ -95,7 +95,7 @@ const bedrockModels: BedrockModelMetadata[] = [
 const bedrockModelMap: Record<string, string> = {
   ...Object.fromEntries(bedrockModels.map((model) => [model.id, model.bedrockModelId])),
   ...Object.fromEntries(bedrockModels.map((model) => [model.bedrockModelId, model.bedrockModelId])),
-  sonnet: 'anthropic.claude-sonnet-5',
+  sonnet: 'anthropic.claude-sonnet-5-5',
   'fable-5': 'anthropic.claude-fable-5-1',
   'fable-5.1': 'anthropic.claude-fable-5-1',
   'anthropic/claude-fable-5': 'anthropic.claude-fable-5-1',
@@ -103,8 +103,12 @@ const bedrockModelMap: Record<string, string> = {
   'global.anthropic.claude-fable-5': 'anthropic.claude-fable-5-1',
   'global.anthropic.claude-fable-5-1': 'anthropic.claude-fable-5-1',
   'anthropic.claude-fable-5': 'anthropic.claude-fable-5-1',
-  'anthropic/claude-sonnet-5': 'anthropic.claude-sonnet-5',
-  'global.anthropic.claude-sonnet-5': 'anthropic.claude-sonnet-5',
+  'claude-sonnet-5': 'anthropic.claude-sonnet-5-5',
+  'anthropic.claude-sonnet-5': 'anthropic.claude-sonnet-5-5',
+  'anthropic/claude-sonnet-5': 'anthropic.claude-sonnet-5-5',
+  'anthropic/claude-sonnet-5.5': 'anthropic.claude-sonnet-5-5',
+  'global.anthropic.claude-sonnet-5': 'anthropic.claude-sonnet-5-5',
+  'global.anthropic.claude-sonnet-5-5': 'anthropic.claude-sonnet-5-5',
   opus: 'anthropic.claude-opus-5-5',
   'opus-4.7': 'anthropic.claude-opus-5-5',
   'opus-4.8': 'anthropic.claude-opus-5-5',
@@ -262,7 +266,7 @@ function mapToBedrockModel(model: string): string {
 
   const normalized = model.toLowerCase();
   if (normalized.includes('fable-5')) return 'anthropic.claude-fable-5-1';
-  if (normalized.includes('sonnet-5')) return 'anthropic.claude-sonnet-5';
+  if (normalized.includes('sonnet-5')) return 'anthropic.claude-sonnet-5-5';
   if (
     normalized.includes('opus-5') ||
     normalized.includes('opus-4-8') ||

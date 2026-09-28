@@ -26,15 +26,15 @@ describe("runtimeModelRoute", () => {
   it("runs hosted models with the hosted key scope and their OpenRouter id", () => {
     expect(runtimeModelRoute(config({
       billingSource: "hosted", usageProvider: "openrouter",
-      model: { provider: "cloudflare-ai-gateway", id: "anthropic/claude-sonnet-5:nitro", baseUrl: `${GATEWAY}/openrouter` },
-    }), org)).toEqual({ kind: "scope", model: "openrouter/anthropic/claude-sonnet-5:nitro", keyScope: "hosted" });
+      model: { provider: "cloudflare-ai-gateway", id: "anthropic/claude-sonnet-5.5:nitro", baseUrl: `${GATEWAY}/openrouter` },
+    }), org)).toEqual({ kind: "scope", model: "openrouter/anthropic/claude-sonnet-5.5:nitro", keyScope: "hosted" });
   });
 
   it.each([
-    ["sonnet", "openrouter/anthropic/claude-sonnet-5:nitro"],
+    ["sonnet", "openrouter/anthropic/claude-sonnet-5.5:nitro"],
     ["opus-5.5", "openrouter/anthropic/claude-opus-5.5"],
     ["fable-5.1", "openrouter/anthropic/claude-fable-5.1:nitro"],
-    ["haiku", "openrouter/anthropic/claude-sonnet-5:nitro"],
+    ["haiku", "openrouter/anthropic/claude-sonnet-5.5:nitro"],
     ["gpt-6-sol", "openrouter/openai/gpt-6-sol:nitro"],
     ["gpt-6-luna", "openrouter/openai/gpt-6-luna"],
     ["gemini-3.8-flash", "openrouter/google/gemini-3.8-flash"],
@@ -63,10 +63,10 @@ describe("runtimeModelRoute", () => {
       .toEqual({ kind: "scope", model: "anthropic/claude-opus-5-5", keyScope: scope });
     expect(runtimeModelRoute(config({ usageProvider: "openai", model: { provider: "openai", id: "gpt-6-sol", baseUrl: "https://api.openai.com/v1" } }), org))
       .toEqual({ kind: "scope", model: "openai/gpt-6-sol", keyScope: scope });
-    expect(runtimeModelRoute(config({ usageProvider: "openrouter", model: { provider: "anthropic", id: "anthropic/claude-sonnet-5:nitro", baseUrl: "https://openrouter.ai/api" } }), org))
-      .toEqual({ kind: "scope", model: "openrouter/anthropic/claude-sonnet-5:nitro", keyScope: scope });
-    expect(runtimeModelRoute(config({ usageProvider: "bedrock", model: { provider: "custom", api: "anthropic-messages", id: "anthropic.claude-sonnet-5", baseUrl: "https://bedrock-mantle.eu-west-1.api.aws/anthropic" } }), org))
-      .toEqual({ kind: "scope", model: "amazon-bedrock/eu.anthropic.claude-sonnet-5", keyScope: scope });
+    expect(runtimeModelRoute(config({ usageProvider: "openrouter", model: { provider: "anthropic", id: "anthropic/claude-sonnet-5.5:nitro", baseUrl: "https://openrouter.ai/api" } }), org))
+      .toEqual({ kind: "scope", model: "openrouter/anthropic/claude-sonnet-5.5:nitro", keyScope: scope });
+    expect(runtimeModelRoute(config({ usageProvider: "bedrock", model: { provider: "custom", api: "anthropic-messages", id: "anthropic.claude-sonnet-5-5", baseUrl: "https://bedrock-mantle.eu-west-1.api.aws/anthropic" } }), org))
+      .toEqual({ kind: "scope", model: "amazon-bedrock/eu.anthropic.claude-sonnet-5-5", keyScope: scope });
   });
 
   it("sends the ChatGPT subscription through chiridion's Codex forwarder", () => {

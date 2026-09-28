@@ -83,7 +83,7 @@ export class PiModelMapping {
       case "fable-5.1":
         return claudeReference("claude-fable-5-1");
       case "sonnet":
-        return claudeReference("claude-sonnet-5");
+        return claudeReference("claude-sonnet-5-5");
       case "gpt-6-sol":
       case "gpt-6-luna":
         return openAiReference(normalizedModelId);
@@ -190,7 +190,9 @@ export class PiModelMapping {
   openRouterClaudeModel(model: string): string {
     switch (model.trim().toLowerCase()) {
       case "sonnet":
-        return "anthropic/claude-sonnet-5";
+      case "claude-sonnet-5-5":
+      case "claude-sonnet-5":
+        return "anthropic/claude-sonnet-5.5";
       case "fable-5.1":
       case "fable-5":
       case "claude-fable-5-1":
@@ -210,8 +212,6 @@ export class PiModelMapping {
       case "claude-opus-4-6":
       case "claude-opus-4.6":
         return "anthropic/claude-opus-5.5";
-      case "claude-sonnet-5":
-        return "anthropic/claude-sonnet-5";
       case "claude-sonnet-4-6":
         return "anthropic/claude-sonnet-4.6";
       case "claude-sonnet-4-5-20250929":
@@ -271,11 +271,11 @@ export class PiModelMapping {
       case "claude-fable-5-1":
       case "claude-fable-5":
         return "anthropic.claude-fable-5-1";
+      case "claude-sonnet-5-5":
       case "claude-sonnet-5":
-        return "anthropic.claude-sonnet-5";
       case "claude-sonnet-4-6":
       default:
-        return "anthropic.claude-sonnet-5";
+        return "anthropic.claude-sonnet-5-5";
     }
   }
 

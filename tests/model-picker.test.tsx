@@ -109,8 +109,8 @@ describe('ModelPicker metadata card state', () => {
       screen.getByLabelText('Speed rating: 2 out of 5'),
     ).toBeInTheDocument();
 
-    fireEvent.focus(getModelItem('Sonnet 5'));
-    expect(screen.getByRole('tooltip')).toHaveTextContent('Sonnet 5');
+    fireEvent.focus(getModelItem('Sonnet 5.5'));
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Sonnet 5.5');
     expect(
       screen.getByLabelText('Intelligence rating: 4 out of 5'),
     ).toBeInTheDocument();
@@ -119,7 +119,7 @@ describe('ModelPicker metadata card state', () => {
     ).toBeInTheDocument();
     expect(screen.getAllByText('cost')).toHaveLength(1);
 
-    fireEvent.blur(getModelItem('Sonnet 5'));
+    fireEvent.blur(getModelItem('Sonnet 5.5'));
     expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
   });
 
@@ -139,9 +139,9 @@ describe('ModelPicker metadata card state', () => {
     act(() => vi.advanceTimersByTime(150));
     expect(screen.getByRole('tooltip')).toHaveTextContent('Opus 5.5');
 
-    fireEvent.pointerEnter(getModelItem('Sonnet 5'));
+    fireEvent.pointerEnter(getModelItem('Sonnet 5.5'));
     act(() => vi.advanceTimersByTime(150));
-    expect(screen.getByRole('tooltip')).toHaveTextContent('Sonnet 5');
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Sonnet 5.5');
     expect(screen.getAllByRole('tooltip')).toHaveLength(1);
   });
 
@@ -220,7 +220,7 @@ describe('ModelPicker metadata card state', () => {
     const premiumLabel = screen
       .getByText('Premium models')
       .closest('[data-slot="dropdown-menu-label"]');
-    const sonnetItem = getModelItem('Sonnet 5');
+    const sonnetItem = getModelItem('Sonnet 5.5');
     expect(premiumLabel).not.toBeNull();
     expect(gptItem.compareDocumentPosition(premiumLabel!)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
@@ -340,7 +340,7 @@ describe('ModelPicker metadata card state', () => {
       />,
     );
 
-    fireEvent.click(getModelItem('Sonnet 5'));
+    fireEvent.click(getModelItem('Sonnet 5.5'));
     expect(onLockedModelSelect).toHaveBeenCalledWith('sonnet');
     expect(onValueChange).not.toHaveBeenCalled();
   });
@@ -362,7 +362,7 @@ describe('ModelPicker metadata card state', () => {
       />,
     );
 
-    fireEvent.focus(getModelItem('Sonnet 5'));
+    fireEvent.focus(getModelItem('Sonnet 5.5'));
     expect(screen.getByRole('tooltip')).toHaveTextContent(
       'Available again when your plan renews, or add credits now.',
     );

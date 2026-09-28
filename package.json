@@ -64,7 +64,7 @@
 		"deploy:dispatcher:evals": "wrangler deploy -c workers/dispatcher/wrangler.evals.jsonc",
 		"deploy:dispatcher:dev-miguel": "wrangler deploy -c workers/dispatcher/wrangler.dev-miguel.jsonc",
 		"deploy:dispatcher:dev-illiana": "wrangler deploy -c workers/dispatcher/wrangler.dev-illiana.jsonc",
-		"deploy:dispatcher:local": "wrangler deploy -c workers/dispatcher/wrangler.jsonc --env local",
+		"deploy:dispatcher:local": "wrangler deploy -c workers/dispatcher/wrangler.jsonc",
 		"deploy:tail:prod": "wrangler deploy -c workers/user-logs-tail/wrangler.jsonc --env prod",
 		"deploy:tail:staging": "wrangler deploy -c workers/user-logs-tail/wrangler.jsonc --env staging",
 		"deploy:tail:dev-miguel": "wrangler deploy -c workers/user-logs-tail/wrangler.jsonc --env dev-miguel",

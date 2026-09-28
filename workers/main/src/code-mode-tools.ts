@@ -5587,7 +5587,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (!isLocalMainWorker) return [];
     if (this.isRemoteDispatcherHostConfigured()) return [];
     return [
-      "App deployed successfully. If the app URL is unreachable in local dev with `chiridion-dispatcher-local` not found, start the local dispatcher worker (`wrangler dev -c workers/dispatcher/wrangler.jsonc --env local`) and retry the URL.",
+      "App deployed successfully. If the app URL is unreachable in local dev with `chiridion-dispatcher-local` not found, start the local dispatcher worker (`wrangler dev -c workers/dispatcher/wrangler.jsonc`) and retry the URL.",
     ];
   }
 

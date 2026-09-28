@@ -94,7 +94,7 @@ managementRoutes.get(
     const userId = c.req.param("id");
     const [user, orgs, ban] = await Promise.all([
       getUserStub(c.env, userId).getProfile(),
-      getUserOrgs(authEnv(c.env), userId),
+      getUserOrgs(authEnv(c.env), userId, { d1Read: true }),
       getUserBanById(c.env.APP_KV, userId),
     ]);
     if (!user) return c.json({ error: "User not found" }, 404);

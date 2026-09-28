@@ -365,6 +365,65 @@ const MIRROR_FANOUT_COLUMN_STATEMENTS = [
   'ALTER TABLE threads ADD COLUMN channel_message_id TEXT',
 ];
 
+export interface MirroredUserProfile {
+  id: string;
+  email: string;
+  email_verified_at: number | null;
+  name: string | null;
+  created_at: number;
+  is_superuser: boolean;
+  avatar: { color: string; content: string };
+  is_orphaned: boolean;
+  orphaned_at: number | null;
+}
+
+/** A D1 threads row projected for thread lists (previews already truncated). */
+export interface MirroredThreadRow {
+  id: string;
+  workspace_id: string;
+  title: string | null;
+  created_by: string | null;
+  model: string;
+  created_at: number;
+  updated_at: number;
+  user_message_count: number | null;
+  first_user_message_preview: string | null;
+  last_user_message_preview: string | null;
+  last_user_message_at: number | null;
+  last_assistant_completed_at: number | null;
+  last_assistant_summary: string | null;
+  last_assistant_summary_status: string | null;
+  source: string | null;
+  channel_kind: string | null;
+  channel_kinds: string | null;
+  channel_connection_id: string | null;
+  channel_conversation_id: string | null;
+  channel_message_id: string | null;
+}
+
+const MIRRORED_THREAD_COLUMNS = [
+  'id',
+  'workspace_id',
+  'title',
+  'created_by',
+  'model',
+  'created_at',
+  'updated_at',
+  'user_message_count',
+  'first_user_message_preview',
+  'last_user_message_preview',
+  'last_user_message_at',
+  'last_assistant_completed_at',
+  'last_assistant_summary',
+  'last_assistant_summary_status',
+  'source',
+  'channel_kind',
+  'channel_kinds',
+  'channel_connection_id',
+  'channel_conversation_id',
+  'channel_message_id',
+].join(', ');
+
 /** Thread list previews: the same limit `toThreadListPreview` applies. */
 export const THREAD_LIST_PREVIEW_LENGTH = 500;
 
@@ -2168,6 +2227,82 @@ export class AppIndexDatabase {
       WHERE u.id IN (SELECT value FROM json_each(?))
     `, JSON.stringify(normalizedUserIds));
     return rows.map((u) => ({ ...u, avatar: { color: u.avatar_color || '#666', content: u.avatar_content || 'U' }, is_superuser: u.is_superuser === 1, is_orphaned: u.is_orphaned === 1, signup_ip: u.signup_ip ?? null }));
+  }
+
+  // -------------------------------------------------------------------------
+  // Mirror reads for the product fan-out call sites (phase 2, flag-gated in
+  // src/lib/d1-read-shadow.server.ts). Never used for auth decisions.
+  // -------------------------------------------------------------------------
+
+  /** Org names and archive state by id (replaces one OrgDO.getInfo per org). */
+  async getMirroredOrgSummaries(orgIds: string[]): Promise<Array<{ id: string; name: string; archived: boolean }>> {
+    const ids = Array.from(new Set(orgIds.filter(Boolean)));
+    if (ids.length === 0) return [];
+    const rows = await this.all<{ id: string; name: string; archived: number }>(
+      'SELECT id, name, archived FROM orgs WHERE id IN (SELECT value FROM json_each(?))',
+      JSON.stringify(ids),
+    );
+    return rows.map((row) => ({ id: row.id, name: row.name, archived: row.archived === 1 }));
+  }
+
+  /** Full user profiles by id (replaces one UserDO.getProfile per member). */
+  async getMirroredUserProfiles(userIds: string[]): Promise<MirroredUserProfile[]> {
+    const ids = Array.from(new Set(userIds.filter(Boolean)));
+    if (ids.length === 0) return [];
+    const rows = await this.all<any>(
+      `SELECT id, email, email_verified_at, name, created_at, is_superuser, avatar_color, avatar_content, is_orphaned, orphaned_at
+         FROM users
+        WHERE id IN (SELECT value FROM json_each(?))`,
+      JSON.stringify(ids),
+    );
+    return rows.map((row) => ({
+      id: row.id,
+      email: row.email,
+      email_verified_at: row.email_verified_at ?? null,
+      name: row.name ?? null,
+      created_at: row.created_at,
+      is_superuser: row.is_superuser === 1,
+      avatar: { color: row.avatar_color ?? '', content: row.avatar_content ?? '' },
+      is_orphaned: row.is_orphaned === 1,
+      orphaned_at: row.orphaned_at ?? null,
+    }));
+  }
+
+  /** A page of threads, ordered like OrgDO.getThreadsPaginated (no search). */
+  async getMirroredThreadPage(input: {
+    workspaceIds: string[];
+    createdBy?: string;
+    offset: number;
+    limit: number;
+  }): Promise<{ items: MirroredThreadRow[]; total: number }> {
+    const where = ['workspace_id IN (SELECT value FROM json_each(?))'];
+    const binds: unknown[] = [JSON.stringify(input.workspaceIds)];
+    if (input.createdBy) {
+      where.push('created_by = ?');
+      binds.push(input.createdBy);
+    }
+    const whereSql = where.join(' AND ');
+    const [items, totalRow] = await Promise.all([
+      this.all<MirroredThreadRow>(
+        `SELECT ${MIRRORED_THREAD_COLUMNS} FROM threads WHERE ${whereSql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`,
+        ...binds,
+        input.limit,
+        input.offset,
+      ),
+      this.all<{ count: number }>(`SELECT COUNT(*) AS count FROM threads WHERE ${whereSql}`, ...binds),
+    ]);
+    return { items, total: Number(totalRow[0]?.count ?? 0) };
+  }
+
+  async getMirroredThreadsByIds(workspaceId: string, threadIds: string[]): Promise<MirroredThreadRow[]> {
+    const ids = Array.from(new Set(threadIds.filter(Boolean)));
+    if (ids.length === 0) return [];
+    return this.all<MirroredThreadRow>(
+      `SELECT ${MIRRORED_THREAD_COLUMNS} FROM threads
+        WHERE workspace_id = ? AND id IN (SELECT value FROM json_each(?))`,
+      workspaceId,
+      JSON.stringify(ids),
+    );
   }
 
   async getThreadsByOrgIds(orgIds: string[]): Promise<AdminThreadListRow[]> {

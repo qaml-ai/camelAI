@@ -60,6 +60,16 @@ import {
 import { retryTransientDurableObjectRead } from "./do-rpc-retry.server";
 import { truncateThreadPreviewText } from "./thread-preview";
 import {
+  THREAD_LIST_PREVIEW_LENGTH,
+  type MirroredThreadRow,
+} from "../../workers/main/src/app-index-db";
+import {
+  d1ReadMode,
+  diffById,
+  recordShadowComparison,
+  safeMirrorRead,
+} from "./d1-read-shadow.server";
+import {
   buildThreadSearchMatch,
   parseThreadSearchTerms,
 } from "./thread-search";
@@ -174,6 +184,123 @@ function toThreadListPreview(
     first_user_message: truncateThreadPreviewText(thread.first_user_message, 500),
     last_user_message: truncateThreadPreviewText(thread.last_user_message, 500),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Thread lists from the D1 mirror (phase 2, D1_READ_SHADOW / D1_READ_SERVE
+// "threadLists"; off by default). Searches always go to the OrgDO.
+// ---------------------------------------------------------------------------
+
+function mirroredRowToOrgThread(row: MirroredThreadRow): OrgThread {
+  return {
+    id: row.id,
+    workspace_id: row.workspace_id,
+    title: row.title ?? "",
+    created_by: row.created_by ?? "",
+    model: row.model as OrgThread["model"],
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    user_message_count: row.user_message_count ?? 0,
+    first_user_message: row.first_user_message_preview,
+    last_user_message: row.last_user_message_preview,
+    last_user_message_at: row.last_user_message_at,
+    last_assistant_completed_at: row.last_assistant_completed_at,
+    last_assistant_summary: row.last_assistant_summary,
+    last_assistant_summary_status:
+      row.last_assistant_summary_status as OrgThread["last_assistant_summary_status"],
+    source: row.source ?? "web",
+    channel_kind: row.channel_kind,
+    channel_kinds: row.channel_kinds,
+    channel_connection_id: row.channel_connection_id,
+    channel_conversation_id: row.channel_conversation_id,
+    channel_message_id: row.channel_message_id,
+  } as OrgThread;
+}
+
+const THREAD_SHADOW_FIELDS = [
+  "title",
+  "created_by",
+  "model",
+  "updated_at",
+  "user_message_count",
+  "first_user_message",
+  "last_user_message",
+  "last_assistant_completed_at",
+  "last_assistant_summary_status",
+] as const;
+
+function threadShadowFields(thread: OrgThread): Record<string, unknown> {
+  return {
+    title: thread.title ?? "",
+    created_by: thread.created_by ?? "",
+    model: thread.model,
+    updated_at: thread.updated_at,
+    user_message_count: thread.user_message_count ?? 0,
+    first_user_message: truncateThreadPreviewText(thread.first_user_message ?? null, THREAD_LIST_PREVIEW_LENGTH),
+    last_user_message: truncateThreadPreviewText(thread.last_user_message ?? null, THREAD_LIST_PREVIEW_LENGTH),
+    last_assistant_completed_at: thread.last_assistant_completed_at ?? null,
+    last_assistant_summary_status: thread.last_assistant_summary_status ?? null,
+  };
+}
+
+function compareThreadLists(
+  env: CloudflareEnv,
+  primary: OrgThread[],
+  mirror: MirroredThreadRow[],
+  extra: string[],
+  ids: { workspaceId?: string | null },
+): void {
+  const mismatches = [...extra];
+  if (primary.map((thread) => thread.id).join() !== mirror.map((row) => row.id).join()) {
+    const primaryIds = new Set(primary.map((thread) => thread.id));
+    const sameSet = mirror.length === primary.length && mirror.every((row) => primaryIds.has(row.id));
+    if (sameSet) mismatches.push("order");
+  }
+  mismatches.push(
+    ...diffById(
+      new Map(primary.map((thread) => [thread.id, threadShadowFields(thread)])),
+      new Map(mirror.map((row) => [row.id, threadShadowFields(mirroredRowToOrgThread(row))])),
+      [...THREAD_SHADOW_FIELDS],
+    ),
+  );
+  recordShadowComparison(env, "threadLists", mismatches, ids);
+}
+
+async function threadPageWithMirror(
+  env: CloudflareEnv,
+  workspaceIds: string[],
+  params: PaginationParams,
+  loadFromDurableObject: () =>
+    | Promise<{ items: OrgThread[]; total: number; offset: number; limit: number }>
+    | { items: OrgThread[]; total: number; offset: number; limit: number },
+): Promise<{ items: OrgThread[]; total: number; offset: number; limit: number }> {
+  const mode = params.searchQuery?.trim() ? "do" : d1ReadMode(env, "threadLists");
+  if (mode === "do") return loadFromDurableObject();
+  // Same clamping as OrgDO.getThreadsPaginated.
+  const offset = Math.max(0, Math.floor(params.offset ?? 0));
+  const limit = Math.max(1, Math.min(200, Math.floor(params.limit ?? 50)));
+  const mirrorRead = safeMirrorRead(env, "threadLists", (db) =>
+    db.getMirroredThreadPage({ workspaceIds, createdBy: params.createdBy, offset, limit }),
+  );
+  if (mode === "d1") {
+    const mirrored = await mirrorRead;
+    if (mirrored) {
+      return { items: mirrored.items.map(mirroredRowToOrgThread), total: mirrored.total, offset, limit };
+    }
+    return loadFromDurableObject();
+  }
+  const result = await loadFromDurableObject();
+  const mirrored = await mirrorRead;
+  if (mirrored) {
+    compareThreadLists(
+      env,
+      result.items,
+      mirrored.items,
+      mirrored.total === result.total ? [] : ["total"],
+      { workspaceId: workspaceIds.length === 1 ? workspaceIds[0] : null },
+    );
+  }
+  return result;
 }
 
 // Helper to get workspace info and org ID
@@ -533,12 +660,14 @@ export async function getThreadsPaginated(
     orgId = wsInfo.org_id;
   }
   const orgStub = getOrgStub(env, orgId);
-  const result = await orgStub.getThreadsPaginated(
-    offset,
-    limit,
-    workspaceId,
-    params.createdBy,
-    params.searchQuery,
+  const result = await threadPageWithMirror(env, [workspaceId], params, () =>
+    orgStub.getThreadsPaginated(
+      offset,
+      limit,
+      workspaceId,
+      params.createdBy,
+      params.searchQuery,
+    ),
   );
   const searchTerms = parseThreadSearchTerms(params.searchQuery);
   return {
@@ -578,12 +707,14 @@ export async function getThreadsPaginatedAllWorkspaces(
     orgId = wsInfo.org_id;
   }
   const orgStub = getOrgStub(env, orgId);
-  const result = await orgStub.getThreadsAllWorkspacesPaginated(
-    workspaceIds,
-    offset,
-    limit,
-    params.createdBy,
-    params.searchQuery,
+  const result = await threadPageWithMirror(env, workspaceIds, params, () =>
+    orgStub.getThreadsAllWorkspacesPaginated(
+      workspaceIds,
+      offset,
+      limit,
+      params.createdBy,
+      params.searchQuery,
+    ),
   );
   const searchTerms = parseThreadSearchTerms(params.searchQuery);
   return {
@@ -752,11 +883,36 @@ export async function getThreadsByIds(
     new Set(threadIds.map((threadId) => threadId.trim()).filter(Boolean)),
   );
   if (uniqueThreadIds.length === 0) return [];
+  const mode = d1ReadMode(env, "threadLists");
+  const mirrorRead =
+    mode === "do"
+      ? null
+      : safeMirrorRead(env, "threadLists", (db) =>
+          db.getMirroredThreadsByIds(workspaceId, uniqueThreadIds),
+        );
+  const mirrored = mode === "d1" ? await mirrorRead : null;
+  if (mirrored) {
+    // Match OrgDO.getThreadsByIds: requested order, missing ids dropped.
+    const byId = new Map(mirrored.map((row) => [row.id, row]));
+    return uniqueThreadIds
+      .map((id) => byId.get(id))
+      .filter((row): row is MirroredThreadRow => Boolean(row))
+      .map((row) => toThreadListPreview(env, mirroredRowToOrgThread(row)));
+  }
   const orgStub = env.ORG.get(env.ORG.idFromName(wsInfo.org_id));
   const threads = await retryTransientDurableObjectRead(
     "OrgDO.getThreadsByIds",
     () => orgStub.getThreadsByIds(workspaceId, uniqueThreadIds),
   );
+  if (mode === "shadow") {
+    const shadow = await mirrorRead;
+    if (shadow) {
+      // Neither side promises an order here: compare as sets.
+      const byId = <T extends { id: string }>(rows: T[]) =>
+        [...rows].sort((a, b) => a.id.localeCompare(b.id));
+      compareThreadLists(env, byId(threads), byId(shadow), [], { workspaceId });
+    }
+  }
   return threads.map((thread) => toThreadListPreview(env, thread));
 }
 

@@ -1,4 +1,4 @@
-import { expect, test } from './base';
+import { expect, gotoHydrated, test } from './base';
 
 /**
  * Bypass-native UI-interaction E2E — fully local, deterministic, no LLM/backend.
@@ -7,7 +7,7 @@ import { expect, test } from './base';
  */
 test.describe('chat UI (local, interactions)', () => {
   test('New chat button opens a fresh chat composer', async ({ page }) => {
-    await page.goto('/chat', { waitUntil: 'domcontentloaded' });
+    await gotoHydrated(page, '/chat');
     await page.getByRole('button', { name: 'New chat' }).first().click();
     await expect(page).toHaveURL(/\/chat\b/);
     await expect(page.locator('textarea').first()).toBeVisible();

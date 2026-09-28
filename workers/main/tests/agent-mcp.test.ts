@@ -121,6 +121,39 @@ describe("agent MCP", () => {
     expect(tools).toHaveBeenCalledWith(expect.objectContaining({ threadId: "thread1", directRuntime: true }));
   });
 
+  it("keeps a runtime thread marked running while a tool call is in flight", async () => {
+    const runtime = { threadId: "thread1", agentId: "agt_1", model: "m", keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
+    const streaming = vi.fn(async () => {});
+    const workspaces: string[] = [];
+    let finish!: () => void;
+    const validate = vi.fn(async (_user: string, workspaceId: string, threadId: string) => ({ ...allowed(_user, workspaceId, threadId), runtime }));
+    const env = {
+      AGENT_RUNTIME_URL: rt.url,
+      AGENT_RUNTIME_TENANT: "chiridion",
+      ORG: { idFromName: (name: string) => name, get: () => ({ validateChatWebSocketAccess: validate }) },
+      WORKSPACE: { idFromName: (name: string) => name, get: (id: string) => { workspaces.push(id); return { recordThreadStreaming: streaming }; } },
+    } as unknown as Env;
+    const callToolEnvelope = vi.fn(() => new Promise<Envelope>((resolve) => { finish = () => resolve({ ok: true, data: { done: true } }); }));
+    const handler = agentMcpHandler(env, () => ({ callToolEnvelope }) as never, { fetch: rt.fetch });
+
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const call = rt.callTool(handler, MCP_URL, "list_projects", {}, ALICE);
+      await vi.waitFor(() => expect(callToolEnvelope).toHaveBeenCalled());
+      // Marked running when the call starts (a sweep may have cleared the row).
+      expect(streaming).toHaveBeenCalledWith("thread1", true, undefined);
+      await vi.advanceTimersByTimeAsync(130_000);
+      expect(streaming.mock.calls.filter(([, , options]) => (options as { refresh?: boolean } | undefined)?.refresh)).toHaveLength(2);
+      finish();
+      await call;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(streaming.mock.calls.filter(([, , options]) => (options as { refresh?: boolean } | undefined)?.refresh)).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(new Set(workspaces)).toEqual(new Set(["ws1"]));
+  });
+
   it("refuses callers OrgDO does not admit, other tenants, and agents without a thread", async () => {
     const denied = setup({ access: () => ({ ok: false, reason: "forbidden" }) });
     expect(await rt.callTool(denied.handler, MCP_URL, "list_projects", {}, ALICE))

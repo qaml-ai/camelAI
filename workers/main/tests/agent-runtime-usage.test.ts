@@ -111,7 +111,8 @@ describe("usageRowFor", () => {
 });
 
 describe("usage.recorded on POST /agent-runtime/events", () => {
-  function fakeEnv() {
+  function fakeEnv(thread: { last_assistant_completed_at: number | null } | null = { last_assistant_completed_at: null }) {
+    const getThread = vi.fn(async () => thread);
     const recordUsage = vi.fn(async () => ({ id: 1, cost_usd: 0, inserted: true }));
     const recordThreadStreaming = vi.fn(async () => {});
     const workspaces: string[] = [];
@@ -125,7 +126,7 @@ describe("usage.recorded on POST /agent-runtime/events", () => {
       },
       ORG: {
         idFromName: (name: string) => name,
-        get: (id: string) => { orgs.push(id); return { getInfo: async () => ({ billing_status: "active" }), recordUsage }; },
+        get: (id: string) => { orgs.push(id); return { getInfo: async () => ({ billing_status: "active" }), recordUsage, getThread }; },
       },
       WORKSPACE: {
         idFromName: (name: string) => name,
@@ -154,11 +155,23 @@ describe("usage.recorded on POST /agent-runtime/events", () => {
     expect(recordUsage).toHaveBeenCalledTimes(1);
   });
 
-  it("renews the thread's running lease, refresh-only, so a long run keeps showing as running", async () => {
-    const { env, recordThreadStreaming, workspaces } = fakeEnv();
+  it("marks the thread running again, so a lease the sweeper cleared mid-run comes back", async () => {
+    const { env, recordThreadStreaming, workspaces } = fakeEnv({ last_assistant_completed_at: data.at! - 60_000 });
     await deliver(env, usageEvent());
     expect(workspaces).toEqual(["ws1"]);
+    expect(recordThreadStreaming).toHaveBeenCalledWith("t1", true, undefined);
+  });
+
+  it("only renews the lease for a response from before the thread's last completion", async () => {
+    // A late delivery of a finished run's usage must not mark the thread running.
+    const { env, recordThreadStreaming } = fakeEnv({ last_assistant_completed_at: data.at! + 1 });
+    await deliver(env, usageEvent());
     expect(recordThreadStreaming).toHaveBeenCalledWith("t1", true, { refresh: true, source: "runtime_usage" });
+    // Completion times are whole seconds (the run event's `created`): a
+    // response later in the completing second is the same run's.
+    const sameSecond = fakeEnv({ last_assistant_completed_at: data.at! - 400 });
+    await deliver(sameSecond.env, usageEvent("evt_same_second"));
+    expect(sameSecond.recordThreadStreaming).toHaveBeenCalledWith("t1", true, { refresh: true, source: "runtime_usage" });
   });
 
   it("still records usage when the lease cannot be renewed", async () => {

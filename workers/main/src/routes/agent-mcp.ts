@@ -16,6 +16,7 @@ import { CODE_MODE_PI_PASSTHROUGH_TOOL_DEFINITIONS, CODE_MODE_TOOL_DEFINITIONS }
 import type { CodeModeToolsProps } from "../code-mode-tools.js";
 import type { Env, RouteContext } from "../types.js";
 import { getOrgStub } from "../helpers/stubs.js";
+import { recordWorkspaceThreadStreaming } from "../thread-status.js";
 
 const DEFAULT_RUNTIME = "https://agents.camelai.dev";
 
@@ -190,6 +191,28 @@ function imageDataUrlBlock(value: unknown): { type: "image"; data: string; mimeT
   return match ? { type: "image", data: match[2], mimeType: match[1].toLowerCase() } : null;
 }
 
+/** How often a tool call in flight renews its runtime thread's 5-minute running lease. */
+const RUNNING_HEARTBEAT_MS = 60_000;
+
+/**
+ * A runtime thread has no ChatThreadDO to heartbeat its running lease, and
+ * the runtime reports nothing while a tool call runs: keep the thread marked
+ * running for as long as one is in flight here. The call's start marks it
+ * (bringing back a row the sweeper cleared); the ticks only renew it.
+ */
+function runningHeartbeat(env: Env, workspaceId: string, threadId: string | undefined): () => void {
+  if (!threadId) return () => {};
+  // Never in the tool call's way: a lease write that fails is only logged.
+  const mark = (options?: { refresh: true; source: string }) => {
+    Promise.resolve()
+      .then(() => recordWorkspaceThreadStreaming(env, workspaceId, threadId, true, options))
+      .catch((error) => console.warn("[agent-mcp] could not renew the thread's running lease", error));
+  };
+  mark();
+  const timer = setInterval(() => mark({ refresh: true, source: "runtime_tool_call" }), RUNNING_HEARTBEAT_MS);
+  return () => clearInterval(timer);
+}
+
 export function agentToolServer(env: Env, tools: ToolsFactory): ToolServer {
   return {
     listTools: agentMcpTools,
@@ -204,6 +227,7 @@ export function agentToolServer(env: Env, tools: ToolsFactory): ToolServer {
       // the thread's live UI, as it does for js_exec's calls in chiridion.
       const parentToolUseId = context.toolCallId;
       const scoped = parentToolUseId ? { ...props, parentToolUseId } : props;
+      const stopHeartbeat = props.directRuntime ? runningHeartbeat(env, props.workspaceId, props.threadId) : () => {};
       try {
         if (AGENT_MCP_CONFIRMED_TOOL_NAMES.has(name)) {
           // Ask first: everything before an ask runs again when the user answers.
@@ -225,6 +249,8 @@ export function agentToolServer(env: Env, tools: ToolsFactory): ToolServer {
           } as unknown as CallToolResult;
         }
         throw error;
+      } finally {
+        stopHeartbeat();
       }
     },
   };

@@ -85,10 +85,18 @@ export async function recordRuntimeUsage(env: Env, eventId: string, data: Runtim
   // Idempotent by (source, source_id): a redelivery finds the row and inserts nothing.
   const row = usageRowFor(eventId, data, info);
   await org.recordUsage(row);
-  // A model response means the run is still going: renew the thread's
-  // running lease (5 minutes), which only ChatThreadDO heartbeats otherwise.
-  // Refresh-only, so a late event never marks a finished thread running.
-  await recordWorkspaceThreadStreaming(env, row.workspace_id, row.thread_id, true, { refresh: true, source: "runtime_usage" })
+  // A model response means the run is still going: mark the thread running
+  // (5-minute lease), which also brings back a row the sweeper cleared during
+  // a long step. A response from before the thread's last completion is a
+  // late delivery of a finished run: it only renews a row that is there.
+  const running = async () => {
+    const thread = row.thread_id ? await org.getThread(row.thread_id) : null;
+    const completedAt = thread?.last_assistant_completed_at ?? null;
+    // Completion times come from run events' `created`, whole seconds.
+    const finished = completedAt !== null && completedAt + 1_000 >= row.created_at_ms;
+    await recordWorkspaceThreadStreaming(env, row.workspace_id, row.thread_id, true, finished ? { refresh: true, source: "runtime_usage" } : undefined);
+  };
+  await running()
     .catch((error) => console.warn("[agent-runtime-usage] could not renew the thread's running lease", error));
   return true;
 }

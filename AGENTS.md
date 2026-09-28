@@ -246,6 +246,7 @@ curl "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/analytics_eng
   - `runtime_watch_error` (browser, via /api/client-errors): component `browser`, `blob4` `runtime_watch`, `blob5` the HTTP status or error name; its details carry `phase` `start`/`watch`.
   - `runtime_event_handler_failed` (also `ERROR_ANALYTICS`) / `runtime_event_unknown_thread`: component `agent_runtime_events`, `blob4` the event type, `blob13` the event id. A handler failure answers 500 and the runtime redelivers.
   - `thread_running_lease_expired`: component `workspace_do`, `blob4` `lease_sweep`, `blob5` `any_backend` (the running row does not record which backend ran the turn), `double2` ms since its last heartbeat. `thread_running_lease_refresh_missed`: `blob4` `lease_refresh`, `blob5` the refresher (`runtime_usage`, `chat_thread_do`); a refresh that found no running row (a late tick, or a lease that expired mid-turn).
+  - `agent_mcp_call`: component `agent_mcp`, one per tool call on `/mcp/agent`; `blob4` the tool name, `blob5` `ok` / `error` / `forbidden` (authorization refused) / `input_required` / `exception` (thrown; `blob16` its error name), `blob9`–`blob12` thread/workspace/org/user, `double2` duration ms. No arguments or output. `agent_mcp_auth_failed`: the runtime token was refused (401), `blob5` `no_token` / `invalid_token` (expired, wrong audience or issuer, another tenant).
 - For aggregate counts/sums, account for sampling with `_sample_interval`, for example `SUM(_sample_interval)` instead of `COUNT()`.
 
 ## Chat And Runtime Flow

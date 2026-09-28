@@ -1490,6 +1490,29 @@ export class AppIndexDatabase {
     return [...ids].sort().slice(0, limit);
   }
 
+  /** Recent D1 activity for an org: any hit vetoes an orphan purge. */
+  async getOrgActivitySince(orgId: string, sinceMs: number): Promise<{ members: number; workspaces: number; threads: number }> {
+    const count = async (query: string) =>
+      Number((await first<{ n: number }>(this.db.prepare(query).bind(orgId, sinceMs)))?.n ?? 0);
+    await this.ensureSchema();
+    const [members, workspaces, threads] = await Promise.all([
+      count('SELECT COUNT(*) AS n FROM org_memberships WHERE org_id = ? AND joined_at > ?'),
+      count('SELECT COUNT(*) AS n FROM workspaces WHERE org_id = ? AND created_at > ?'),
+      count('SELECT COUNT(*) AS n FROM threads WHERE org_id = ? AND updated_at > ?'),
+    ]);
+    return { members, workspaces, threads };
+  }
+
+  /** What D1 knows about a user that could corroborate (or veto) an orphan purge. */
+  async getUserOrphanEvidence(userId: string): Promise<{ email: string | null; memberships: number }> {
+    await this.ensureSchema();
+    const [user, memberships] = await Promise.all([
+      first<{ email: string | null }>(this.db.prepare('SELECT email FROM users WHERE id = ?').bind(userId)),
+      first<{ n: number }>(this.db.prepare('SELECT COUNT(*) AS n FROM org_memberships WHERE user_id = ?').bind(userId)),
+    ]);
+    return { email: user?.email ?? null, memberships: Number(memberships?.n ?? 0) };
+  }
+
   async listMirroredUserIds(afterId: string, limit: number): Promise<string[]> {
     const rows = await this.all<{ id: string }>(
       'SELECT id FROM users WHERE id > ? ORDER BY id LIMIT ?',

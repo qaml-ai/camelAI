@@ -99,6 +99,65 @@ describe('D1 mirror hard deletes and orphans', () => {
     expect((await orgRowCounts(live.org.id)).orgs).toBe(1);
   });
 
+  it('dry run lists candidates without deleting; purges need corroboration', async () => {
+    const appIndex = getAppIndexDatabase(testEnv)!;
+    await appIndex.ensureSchema();
+    const db = testEnv.APP_DB!;
+    const now = Date.now();
+    const quietOrg = `quiet-${crypto.randomUUID()}`;
+    const recentOrg = `recent-${crypto.randomUUID()}`;
+    const goneUser = `gone-${crypto.randomUUID()}`;
+    const loginUser = `login-${crypto.randomUUID()}`;
+    const memberUser = `member-${crypto.randomUUID()}`;
+    const loginEmail = `${loginUser}@example.com`;
+    const userRow = (id: string, email: string) =>
+      db.prepare(
+        'INSERT INTO users (id, email, created_at, is_superuser, is_orphaned, org_count) VALUES (?, ?, 1, 0, 0, 0)',
+      ).bind(id, email);
+    await db.batch([
+      // No OrgDO behind either org; only the recent one has fresh D1 activity.
+      db.prepare("INSERT INTO orgs (id, name, created_at, archived, member_count, workspace_count) VALUES (?, 'Quiet', 1, 0, 0, 0)").bind(quietOrg),
+      db.prepare("INSERT INTO orgs (id, name, created_at, archived, member_count, workspace_count) VALUES (?, 'Recent', 1, 0, 1, 0)").bind(recentOrg),
+      db.prepare("INSERT INTO org_memberships (org_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)").bind(recentOrg, memberUser, now),
+      // No UserDO profile behind any of these users.
+      userRow(goneUser, `${goneUser}@example.com`),
+      userRow(loginUser, loginEmail),
+      userRow(memberUser, `${memberUser}@example.com`),
+    ]);
+    // The login index still maps this user's email to it.
+    await testEnv.EMAIL_TO_USER.put(`email:${loginEmail}`, loginUser);
+
+    const runJob = async (dryRun: boolean) => {
+      await startMirrorBackfill(testEnv, { orphansOnly: true, dryRun });
+      let state = await getMirrorBackfillState(testEnv);
+      for (let step = 0; step < 500 && state.status === 'running'; step += 1) {
+        state = await runMirrorBackfillStep(testEnv, 50);
+      }
+      return state;
+    };
+    const exists = async (table: string, id: string) =>
+      Boolean(await db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).bind(id).first());
+
+    const dry = await runJob(true);
+    expect(dry).toMatchObject({ status: 'done', dry_run: true });
+    expect(dry.orphan_org_candidates).toContain(quietOrg);
+    expect(dry.orphan_org_candidates).not.toContain(recentOrg);
+    expect(dry.orphan_user_candidates).toContain(goneUser);
+    expect(dry.orphan_user_candidates).not.toContain(loginUser);
+    expect(dry.orphan_user_candidates).not.toContain(memberUser);
+    expect(await exists('orgs', quietOrg)).toBe(true);
+    expect(await exists('users', goneUser)).toBe(true);
+
+    const real = await runJob(false);
+    expect(real).toMatchObject({ status: 'done', dry_run: false });
+    expect(await exists('orgs', quietOrg)).toBe(false);
+    expect(await exists('orgs', recentOrg)).toBe(true);
+    expect(await exists('users', goneUser)).toBe(false);
+    expect(await exists('users', loginUser)).toBe(true);
+    expect(await exists('users', memberUser)).toBe(true);
+    expect(await db.prepare('SELECT 1 FROM deleted_users WHERE id = ?').bind(loginUser).first()).toBeNull();
+  });
+
   it('the reconciler purges a do_missing org it samples', async () => {
     const { org, orgStub } = await mirroredOrg('Reconciler Purge Org');
     await orgStub.hardDeleteOrg('system-admin');

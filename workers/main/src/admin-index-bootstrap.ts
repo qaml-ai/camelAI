@@ -229,6 +229,11 @@ export interface MirrorBackfillState {
   /** D1 orgs/users whose owning DO no longer exists, purged from D1. */
   orphan_orgs_purged: number;
   orphan_users_purged: number;
+  /** Count and list orphan candidates without deleting anything. */
+  dry_run: boolean;
+  /** First MAX_LISTED_CANDIDATES orphan ids found (purged, or would be in a dry run). */
+  orphan_org_candidates: string[];
+  orphan_user_candidates: string[];
   errors: number;
   last_error: string | null;
   started_at: number | null;
@@ -244,6 +249,9 @@ const IDLE_BACKFILL_STATE: MirrorBackfillState = {
   orgs_queued: 0,
   orphan_orgs_purged: 0,
   orphan_users_purged: 0,
+  dry_run: false,
+  orphan_org_candidates: [],
+  orphan_user_candidates: [],
   errors: 0,
   last_error: null,
   started_at: null,
@@ -276,12 +284,13 @@ async function saveMirrorBackfillState(env: MirrorBackfillEnv, state: MirrorBack
 /** Start (or restart from the beginning) the backfill. */
 export async function startMirrorBackfill(
   env: MirrorBackfillEnv,
-  options: { orphansOnly?: boolean } = {},
+  options: { orphansOnly?: boolean; dryRun?: boolean } = {},
 ): Promise<MirrorBackfillState> {
   const now = Date.now();
   const state: MirrorBackfillState = {
     ...IDLE_BACKFILL_STATE,
     status: 'running',
+    dry_run: Boolean(options.dryRun),
     // The orphan cleanup alone skips the resync walk.
     phase: options.orphansOnly ? 'orphan_orgs' : 'users',
     started_at: now,
@@ -373,10 +382,10 @@ export async function runMirrorBackfillStep(
     await Promise.all(
       orgIds.map(async (orgId) => {
         try {
-          if (!(await env.ORG.get(env.ORG.idFromName(orgId)).mirrorOrgExists())) {
-            await appIndex.purgeMirroredOrg(orgId);
-            state.orphan_orgs_purged += 1;
-          }
+          if (!(await isOrphanedOrg(env, appIndex, orgId))) return;
+          noteCandidate(state.orphan_org_candidates, orgId);
+          if (!state.dry_run) await appIndex.purgeMirroredOrg(orgId);
+          state.orphan_orgs_purged += 1;
         } catch (error) {
           recordError(error);
         }
@@ -394,10 +403,12 @@ export async function runMirrorBackfillStep(
     await Promise.all(
       userIds.map(async (userId) => {
         try {
-          if (!(await env.USER.get(env.USER.idFromName(userId)).mirrorUserExists())) {
+          if (!(await isOrphanedUser(env, appIndex, userId))) return;
+          noteCandidate(state.orphan_user_candidates, userId);
+          if (!state.dry_run) {
             await appIndex.applyAdminEvent({ type: 'user_delete', payload: { id: userId } });
-            state.orphan_users_purged += 1;
           }
+          state.orphan_users_purged += 1;
         } catch (error) {
           recordError(error);
         }
@@ -429,4 +440,59 @@ export async function runMirrorBackfillFor(env: MirrorBackfillEnv, budgetMs: num
     state = await runMirrorBackfillStep(env);
   }
   return state;
+}
+
+// ---------------------------------------------------------------------------
+// Orphan checks (shared with the reconciler's do_missing repair)
+// ---------------------------------------------------------------------------
+
+const MAX_LISTED_CANDIDATES = 50;
+/** An org with D1 member/workspace/thread activity this recent is never purged. */
+export const ORPHAN_ORG_MIN_QUIET_MS = 30 * 24 * 60 * 60 * 1000;
+
+function noteCandidate(list: string[], id: string): void {
+  if (list.length < MAX_LISTED_CANDIDATES) list.push(id);
+}
+
+type OrphanCheckEnv = Pick<AdminIndexBootstrapEnv, 'EMAIL_TO_USER' | 'USER' | 'ORG'>;
+
+/**
+ * An org's D1 rows are orphaned only when its OrgDO holds no org AND D1 shows
+ * no membership, workspace or thread activity in the last 30 days.
+ */
+export async function isOrphanedOrg(
+  env: OrphanCheckEnv,
+  appIndex: AppIndexDatabase,
+  orgId: string,
+  now = Date.now(),
+): Promise<boolean> {
+  if (await env.ORG.get(env.ORG.idFromName(orgId)).mirrorOrgExists()) return false;
+  const recent = await appIndex.getOrgActivitySince(orgId, now - ORPHAN_ORG_MIN_QUIET_MS);
+  return recent.members === 0 && recent.workspaces === 0 && recent.threads === 0;
+}
+
+/**
+ * A D1 user is orphaned only when three sources agree it is gone: its UserDO
+ * has no profile, the login index (EMAIL_TO_USER, prefixed or legacy key) does
+ * not map its email to it, and D1 holds no org membership for it. Purging
+ * writes deleted_users, which permanently blocks re-mirroring, so any doubt
+ * keeps the row.
+ */
+export async function isOrphanedUser(
+  env: OrphanCheckEnv,
+  appIndex: AppIndexDatabase,
+  userId: string,
+): Promise<boolean> {
+  if (await env.USER.get(env.USER.idFromName(userId)).mirrorUserExists()) return false;
+  const evidence = await appIndex.getUserOrphanEvidence(userId);
+  if (evidence.memberships > 0) return false;
+  const email = evidence.email?.trim().toLowerCase();
+  if (email) {
+    const [prefixed, legacy] = await Promise.all([
+      env.EMAIL_TO_USER.get(`email:${email}`),
+      env.EMAIL_TO_USER.get(email),
+    ]);
+    if (prefixed === userId || legacy === userId) return false;
+  }
+  return true;
 }

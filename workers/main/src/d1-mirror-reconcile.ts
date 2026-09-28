@@ -20,10 +20,12 @@ import { THREAD_LIST_PREVIEW_LENGTH, getAppIndexDatabase } from "./app-index-db"
 import { recordObservabilityEvent, type ObservabilityEnv } from "./observability";
 import { truncateThreadPreviewText } from "../../../src/lib/thread-preview";
 import type { OrgDO, UserDO } from "./auth";
+import { isOrphanedOrg, isOrphanedUser } from "./admin-index-bootstrap";
 
 type ReconcileEnv = ObservabilityEnv & {
   APP_DB?: D1Database;
   USER: DurableObjectNamespace<UserDO>;
+  EMAIL_TO_USER: KVNamespace;
   ORG: DurableObjectNamespace<OrgDO>;
   D1_RECONCILE_SAMPLE_PER_DAY?: string;
 };
@@ -348,8 +350,15 @@ export async function runMirrorReconcile(
     total.drift.filter((f) => f.entity === "user" && f.field === "do_missing").map((f) => f.userId!),
   );
   await Promise.allSettled([
-    ...[...goneOrgs].map((id) => appIndex.purgeMirroredOrg(id)),
-    ...[...goneUsers].map((id) => appIndex.applyAdminEvent({ type: "user_delete", payload: { id } })),
+    // Purge only with corroboration (see isOrphanedOrg / isOrphanedUser).
+    ...[...goneOrgs].map(async (id) => {
+      if (await isOrphanedOrg(env, appIndex, id)) await appIndex.purgeMirroredOrg(id);
+    }),
+    ...[...goneUsers].map(async (id) => {
+      if (await isOrphanedUser(env, appIndex, id)) {
+        await appIndex.applyAdminEvent({ type: "user_delete", payload: { id } });
+      }
+    }),
     ...[...driftedOrgs]
       .filter((id) => !goneOrgs.has(id))
       .map((id) => env.ORG.get(env.ORG.idFromName(id)).requestMirrorResync()),

@@ -36,7 +36,7 @@ case "$target" in
     ;;
   prod)
     ENDPOINT_URL="${ENDPOINT_URL:-https://camelai.dev/agent-runtime/events}"
-    TOKEN_SECRET_ID="${TOKEN_SECRET_ID:-camelai/agent-runtime/operator-token/chiridion}"
+    TOKEN_SECRET_ID="${TOKEN_SECRET_ID:-camelai/agent-runtime/operator-token/chiridion-prod}"
     WORKER_NAME="chiridion-app"
     ;;
   *) usage ;;

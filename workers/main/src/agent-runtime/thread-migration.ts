@@ -228,6 +228,43 @@ function orgStub(env: ChatEnv, orgId: string) {
   };
 }
 
+/**
+ * A thread's agent, made with a history (initialMessages) and no model or
+ * configuration: the thread's first send configures it. The same history
+ * always makes the same agent (a retry adopts it); a changed one makes a new
+ * one, never an agent with stale history.
+ */
+export async function createAgentWithHistory(
+  env: ChatEnv,
+  context: ChatContextState,
+  initialMessages: AgentMessage[],
+  purpose: "migrate" | "fork",
+): Promise<string> {
+  const thread = await orgStub(env, context.orgId).getThread(context.threadId);
+  const subject = thread?.created_by?.trim() || context.userId || "";
+  const key = `${purpose}_${context.threadId}_${(await sha256Hex(JSON.stringify(initialMessages))).slice(0, 16)}`;
+  const created = await runtimeApi(env, "POST", "/v1/agents", {
+    definition: env.AGENT_RUNTIME_DEFINITION,
+    name: context.threadId,
+    type: "camelai-thread",
+    ttlSeconds: null,
+    systemPromptAppend: runtimeSystemPromptAppend(env, context),
+    fileTools: false,
+    ...(subject ? { subject } : {}),
+    context: { org: context.orgId, workspace: context.workspaceId, thread: context.threadId },
+    ...(initialMessages.length ? { initialMessages } : {}),
+  }, { "Idempotency-Key": key }) as { id?: unknown };
+  if (typeof created?.id !== "string") throw new Error("Agent runtime returned no agent id");
+  return created.id;
+}
+
+/** Delete an agent a failed move or fork made (one already gone is fine). */
+export async function deleteUnusedAgent(env: ChatEnv, agentId: string): Promise<void> {
+  await runtimeApi(env, "DELETE", `/v1/agents/${encodeURIComponent(agentId)}`).catch((cause: unknown) => {
+    if (!(cause instanceof RuntimeApiError && cause.status === 404)) console.warn("[runtime-thread] could not delete an unused agent", cause);
+  });
+}
+
 function doStub(env: ChatEnv, threadId: string) {
   return env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId)) as unknown as {
     beginRuntimeMigration(): Promise<RuntimeMigrationExport>;
@@ -236,7 +273,7 @@ function doStub(env: ChatEnv, threadId: string) {
   };
 }
 
-async function archiveTranscript(env: ChatEnv, agentId: string, messages: AgentMessage[]): Promise<void> {
+export async function archiveTranscript(env: ChatEnv, agentId: string, messages: AgentMessage[]): Promise<void> {
   const body = messages.map((message) => JSON.stringify(message)).join("\n");
   const response = await fetch(
     `${runtimeUrl(env)}/v1/agents/${encodeURIComponent(agentId)}/uploads/${ARCHIVE_REQUEST_ID}/${ARCHIVE_FILE_NAME}`,
@@ -298,25 +335,7 @@ export async function migrateThreadToRuntime(
       await dostub.abortRuntimeMigration(leaseId);
       return { status: "dry_run", stats: converted.stats, lossy: converted.lossy, bytes: byteLength(initialMessages) };
     }
-    const thread = await org.getThread(context.threadId);
-    const subject = thread?.created_by?.trim() || context.userId || "";
-    const payload = JSON.stringify(initialMessages);
-    // The same transcript always makes the same agent (a retried move adopts
-    // it); a changed one makes a new one, never an agent with stale history.
-    const key = `migrate_${context.threadId}_${(await sha256Hex(payload)).slice(0, 16)}`;
-    const created = await runtimeApi(env, "POST", "/v1/agents", {
-      definition: env.AGENT_RUNTIME_DEFINITION,
-      name: context.threadId,
-      type: "camelai-thread",
-      ttlSeconds: null,
-      systemPromptAppend: runtimeSystemPromptAppend(env, context),
-      fileTools: false,
-      ...(subject ? { subject } : {}),
-      context: { org: context.orgId, workspace: context.workspaceId, thread: context.threadId },
-      ...(initialMessages.length ? { initialMessages } : {}),
-    }, { "Idempotency-Key": key }) as { id?: unknown };
-    if (typeof created?.id !== "string") throw new Error("Agent runtime returned no agent id");
-    agentId = created.id;
+    agentId = await createAgentWithHistory(env, context, initialMessages, "migrate");
     if (converted.lossy) await archiveTranscript(env, agentId, handover.messages);
     if (handover.previewTabs.length) {
       await org.setThreadUiState(context.threadId, { tabs: handover.previewTabs, activeTabId: handover.previewActiveTabId });
@@ -331,11 +350,7 @@ export async function migrateThreadToRuntime(
     return { status: "migrated", row, stats: converted.stats, archived: converted.lossy };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (agentId) {
-      await runtimeApi(env, "DELETE", `/v1/agents/${encodeURIComponent(agentId)}`).catch((cause: unknown) => {
-        if (!(cause instanceof RuntimeApiError && cause.status === 404)) console.warn("[runtime-migration] could not delete the agent of a failed move", cause);
-      });
-    }
+    if (agentId) await deleteUnusedAgent(env, agentId);
     await dostub.abortRuntimeMigration(leaseId).catch(() => false);
     return { status: "failed", error: message };
   }

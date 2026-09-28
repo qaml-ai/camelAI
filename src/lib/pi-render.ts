@@ -273,8 +273,8 @@ export function piRender(input: PiRenderInput, memo?: PiRenderMemo): PiRenderRes
   }
 
   type Group =
-    | { kind: "user"; index: number; user: PiUser; clientMessageId: string | undefined }
-    | { kind: "turn"; index: number; assistants: AssistantMessage[]; lastUserAt: number | undefined };
+    | { kind: "user"; index: number; lastIndex: number; user: PiUser; clientMessageId: string | undefined }
+    | { kind: "turn"; index: number; lastIndex: number; assistants: AssistantMessage[]; lastUserAt: number | undefined };
   const groups: Group[] = [];
   let lastUserAt: number | undefined;
   let open: Extract<Group, { kind: "turn" }> | null = null;
@@ -288,14 +288,19 @@ export function piRender(input: PiRenderInput, memo?: PiRenderMemo): PiRenderRes
       const clientMessageId = typeof user.requestId === "string" && user.requestId
         ? user.requestId
         : input.clientMessageIds?.get(index);
-      groups.push({ kind: "user", index, user, clientMessageId });
+      groups.push({ kind: "user", index, lastIndex: index, user, clientMessageId });
       return;
     }
-    if (role !== "assistant") return;
+    if (role !== "assistant") {
+      // A tool result belongs to its turn: forking there keeps it.
+      if (open) open.lastIndex = index;
+      return;
+    }
     if (!open) {
-      open = { kind: "turn", index, assistants: [], lastUserAt };
+      open = { kind: "turn", index, lastIndex: index, assistants: [], lastUserAt };
       groups.push(open);
     }
+    open.lastIndex = index;
     open.assistants.push(message as unknown as AssistantMessage);
   });
 
@@ -317,7 +322,7 @@ export function piRender(input: PiRenderInput, memo?: PiRenderMemo): PiRenderRes
     if (lastGroup?.kind === "turn" && continuesTurn(lastMessage)) {
       streaming = lastGroup;
     } else {
-      streaming = { kind: "turn", index: lastIndex + 1 + (input.pendingSends ?? 0), assistants: [], lastUserAt };
+      streaming = { kind: "turn", index: lastIndex + 1 + (input.pendingSends ?? 0), lastIndex: lastIndex + 1 + (input.pendingSends ?? 0), assistants: [], lastUserAt };
       groups.push(streaming);
     }
   } else if (input.running && !input.pendingSends && lastGroup?.kind === "turn") {
@@ -369,6 +374,8 @@ export function piRender(input: PiRenderInput, memo?: PiRenderMemo): PiRenderRes
         }
       }
     }
+    // Where a fork from this message cuts the history (routes/api/…fork.ts).
+    if (!isStreaming) built.forkEntryId = runtimeMessageId(group.lastIndex);
     view.push(built);
     if (!isStreaming) nextMemo.set(id, { sources, message: built });
   }

@@ -19,6 +19,9 @@ import { getEffectiveLlmProviderConfig } from "../../../src/lib/selfhost-ai-prov
 import { isSelfhostRuntime } from "../../../src/lib/selfhost-runtime.js";
 import type { LlmModel } from "../../../src/types.js";
 import type { Env } from "./types.js";
+import type { ChatEnv } from "./chat-thread/types.js";
+import { startChannelRuntimeTurn } from "./agent-runtime/channel-turns.js";
+import { pinNewThreadToRuntime } from "./agent-runtime/thread-runtime.js";
 import {
   readOrgModelPickerConfig,
   readWorkspaceModelPickerConfig,
@@ -321,6 +324,15 @@ export async function getOrCreateChannelThread(
     },
   );
 
+  // A new channel thread runs directly on the runtime where new threads do.
+  await pinNewThreadToRuntime(env as unknown as ChatEnv, {
+    orgId: input.orgId,
+    workspaceId: input.workspaceId,
+    threadId: thread.id,
+    userId: null,
+    userName: null,
+    userEmail: null,
+  }).catch((error) => console.warn("[channels] new channel thread stays on ChatThreadDO", error));
   await env.APP_KV.put(mapKey, thread.id, ttlOptions(input.mapTtlSeconds));
 
   return {
@@ -369,8 +381,12 @@ async function channelConnectionOwner(
   }
 }
 
+/**
+ * Start a channel message's turn: on the runtime when the thread runs there
+ * directly (agent-runtime/channel-turns.ts), else through ChatThreadDO.
+ */
 export async function enqueueChannelMessage(
-  env: Pick<Env, "CHAT_THREAD" | "WORKSPACE">,
+  env: Env,
   request: ChannelInitialUserMessageRequest,
 ): Promise<InitialUserMessageResult> {
   const { channelKind, connectionId, ...messageRequest } = request;
@@ -378,12 +394,27 @@ export async function enqueueChannelMessage(
     const owner = await channelConnectionOwner(env, messageRequest.workspaceId, connectionId);
     if (owner) messageRequest.userId = owner;
   }
-  const stub = env.CHAT_THREAD.get(
-    env.CHAT_THREAD.idFromName(request.threadId),
-  ) as unknown as InitialUserMessageRpc;
   const systemMessage = buildChannelReplySystemMessage(channelKind, request);
 
   try {
+    if (messageRequest.workspaceId && messageRequest.orgId) {
+      const direct = await startChannelRuntimeTurn(env as unknown as ChatEnv, {
+        threadId: request.threadId,
+        workspaceId: messageRequest.workspaceId,
+        orgId: messageRequest.orgId,
+        channelKind,
+        userId: messageRequest.userId ?? null,
+        userName: messageRequest.userName,
+        userEmail: messageRequest.userEmail,
+        systemMessage,
+        message: request.message ?? "",
+        clientMessageId: messageRequest.clientMessageId,
+      });
+      if (direct) return direct.status === "accepted" ? { status: "accepted" } : { status: direct.status, error: direct.error };
+    }
+    const stub = env.CHAT_THREAD.get(
+      env.CHAT_THREAD.idFromName(request.threadId),
+    ) as unknown as InitialUserMessageRpc;
     const result = await stub.startInitialUserMessage({
       ...messageRequest,
       messageSource: channelKind,

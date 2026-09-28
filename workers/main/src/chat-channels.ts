@@ -25,6 +25,7 @@ import {
   getEmailReplyReferenceKey,
   getEmailThreadReferencesKey,
 } from "./channels";
+import { queueChannelHistoryNote } from "./agent-runtime/channel-turns";
 import type {
   ChatEnv,
   ChatContextState,
@@ -986,6 +987,28 @@ export class ChannelTools {
       },
     );
     if (channelThread.threadId === context.threadId) return "skipped";
+    const org = this.env.ORG.get(this.env.ORG.idFromName(context.orgId)) as unknown as {
+      getThreadRuntime(threadId: string): Promise<unknown>;
+    };
+    if (await org.getThreadRuntime(channelThread.threadId)) {
+      // A direct runtime thread has no transcript here: its next prompt
+      // carries the note (agent-runtime/channel-turns.ts).
+      if (!args.text?.trim() && args.attachmentCount <= 0) return "skipped";
+      await queueChannelHistoryNote(this.env, channelThread.threadId, {
+        channelKind: args.kind,
+        sentAt: Date.now(),
+        direction: "outbound",
+        sourceThreadId: context.threadId,
+        connectionId: args.integrationId,
+        remoteConversationId: args.remoteConversationId,
+        providerMessageIds: args.providerMessageIds
+          .map((id) => (id === undefined ? "" : String(id).trim()))
+          .filter(Boolean),
+        attachmentCount: args.attachmentCount,
+        text: args.text,
+      });
+      return "recorded";
+    }
     const stub = this.env.CHAT_THREAD.get(
       this.env.CHAT_THREAD.idFromName(channelThread.threadId),
     ) as unknown as {

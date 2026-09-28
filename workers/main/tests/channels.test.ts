@@ -4,10 +4,22 @@ const {
   getOrgStubMock,
   getWorkspaceStubMock,
   startInitialUserMessageMock,
+  startChannelRuntimeTurnMock,
+  pinNewThreadToRuntimeMock,
 } = vi.hoisted(() => ({
   getOrgStubMock: vi.fn(),
   getWorkspaceStubMock: vi.fn(),
   startInitialUserMessageMock: vi.fn(),
+  startChannelRuntimeTurnMock: vi.fn(async () => null),
+  pinNewThreadToRuntimeMock: vi.fn(async () => null),
+}));
+
+vi.mock("../src/agent-runtime/channel-turns.js", () => ({
+  startChannelRuntimeTurn: startChannelRuntimeTurnMock,
+}));
+
+vi.mock("../src/agent-runtime/thread-runtime.js", () => ({
+  pinNewThreadToRuntime: pinNewThreadToRuntimeMock,
 }));
 
 vi.mock("../src/helpers/stubs.js", () => ({
@@ -62,6 +74,43 @@ function defaultWorkspaceModelPickerConfig() {
 describe("channels", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    startChannelRuntimeTurnMock.mockResolvedValue(null);
+  });
+
+  it("starts a direct runtime thread's turn there, not through ChatThreadDO", async () => {
+    startChannelRuntimeTurnMock.mockResolvedValue({ status: "accepted" });
+    const result = await enqueueChannelMessage(
+      { CHAT_THREAD: { idFromName: (id: string) => id, get: () => ({ startInitialUserMessage: startInitialUserMessageMock }) } } as never,
+      { channelKind: "slack", threadId: "thread-1", workspaceId: "workspace-1", orgId: "org-1", userId: "owner-1", userName: "Slack U1", message: "hello" },
+    );
+    expect(result).toEqual({ status: "accepted" });
+    expect(startInitialUserMessageMock).not.toHaveBeenCalled();
+    expect(startChannelRuntimeTurnMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      threadId: "thread-1",
+      channelKind: "slack",
+      userId: "owner-1",
+      message: "hello",
+      systemMessage: expect.stringContaining("send_slack_message"),
+    }));
+  });
+
+  it("pins a new channel thread to the runtime", async () => {
+    const kv = createMockKvStore();
+    getOrgStubMock.mockReturnValue({
+      getLlmProviderConfig: vi.fn().mockResolvedValue(null),
+      getModelPickerConfig: vi.fn().mockResolvedValue(defaultOrgModelPickerConfig()),
+      createThread: vi.fn().mockResolvedValue({ id: "thread-9", title: "Chat" }),
+    });
+    getWorkspaceStubMock.mockReturnValue({
+      getModelPickerConfig: vi.fn().mockResolvedValue(defaultWorkspaceModelPickerConfig()),
+    });
+    await getOrCreateChannelThread({ APP_KV: kv } as never, {
+      kind: "telegram", workspaceId: "ws-1", orgId: "org-1", connectionId: "int-1",
+      remoteConversationId: "42", title: "Chat", createdBy: "telegram",
+    });
+    expect(pinNewThreadToRuntimeMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: "org-1", workspaceId: "ws-1", threadId: "thread-9",
+    }));
   });
 
   it("normalizes channel thread map keys", () => {

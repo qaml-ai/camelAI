@@ -204,6 +204,7 @@ function createChannelOrgNamespace({
   },
   integrations = [] as any[],
   integration = null as any,
+  threadRuntime = null as any,
 }: {
   billingPlan?: string;
   billingStatus?: string;
@@ -212,8 +213,10 @@ function createChannelOrgNamespace({
   workspaceInfo?: any;
   integrations?: any[];
   integration?: any;
+  threadRuntime?: any;
 } = {}) {
   const orgStub = {
+    getThreadRuntime: vi.fn(async () => threadRuntime),
     getInfo: vi.fn(async () => ({
       billing_plan: billingPlan,
       billing_status: billingStatus,
@@ -7519,6 +7522,92 @@ describe('ChatThreadDO Pi turn handling', () => {
       threadId: 'telegram-thread',
     }));
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps Telegram outbound history for a direct runtime channel thread's next prompt", async () => {
+    const appendChannelHistoryEvent = vi.fn(async () => ({ status: 'appended' }));
+    const kvPut = vi.fn(async (_key: string, _value: string, _options?: unknown) => undefined);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toMatch(/\/sendMessage$/);
+      const payload = JSON.parse(String(init?.body));
+      expect(payload).toMatchObject({ chat_id: '12345', text: 'Hello from workflow' });
+      return Response.json({ ok: true, result: { message_id: 29 } });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const fake = Object.create(CodeModeToolsBinding.prototype) as any;
+    fake.ctx = {
+      props: {
+        orgId: 'org1',
+        workspaceId: 'workspace1',
+        userId: 'user1',
+      },
+    };
+    fake.env = {
+      TELEGRAM_BOT_TOKEN: 'bot-token',
+      R2_BUCKET: { get: vi.fn() },
+      WORKSPACE: {
+        idFromName: vi.fn((id: string) => id),
+        get: vi.fn(() => ({
+          getIntegration: vi.fn(async () => ({
+            id: 'telegram-int',
+            integration_type: 'telegram',
+            name: 'Product Telegram',
+            config: JSON.stringify({
+              chat_id: '12345',
+              chat_title: 'Product team',
+            }),
+          })),
+        })),
+      },
+      APP_KV: {
+        get: vi.fn(async (key: string) =>
+          key === 'channel_thread:telegram:workspace1:telegram-int:12345'
+            ? 'telegram-thread'
+            : null
+        ),
+        put: kvPut,
+        delete: vi.fn(async () => undefined),
+      },
+      ORG: createChannelOrgNamespace({
+        threadRuntime: { threadId: 'telegram-thread', agentId: 'agt_1' },
+        thread: { id: 'telegram-thread', title: 'Product team' },
+        integration: {
+          id: 'telegram-int',
+          integration_type: 'telegram',
+          name: 'Product Telegram',
+          config: JSON.stringify({
+            chat_id: '12345',
+            chat_title: 'Product team',
+          }),
+        },
+      }),
+      CHAT_THREAD: {
+        idFromName: vi.fn((id: string) => id),
+        get: vi.fn(() => ({ appendChannelHistoryEvent })),
+      },
+    };
+
+    const result = await CodeModeToolsBinding.prototype.callTool.call(
+      fake,
+      'send_telegram_message',
+      {
+        integration_id: 'telegram-int',
+        text: 'Hello from workflow',
+      },
+    );
+
+    expect(result.details).toMatchObject({
+      status: 'sent',
+      channel: 'telegram',
+      chatId: '12345',
+      integrationId: 'telegram-int',
+      messageIds: [29],
+      channelHistoryStatus: 'recorded',
+    });
+    expect(appendChannelHistoryEvent).not.toHaveBeenCalled();
+    const noteWrite = kvPut.mock.calls.find(([key]) => key === 'channel_history_notes:telegram-thread');
+    expect(JSON.parse(String(noteWrite?.[1]))).toEqual([expect.stringContaining('Delivered message:\nHello from workflow')]);
   });
 
   it('prefixes deployed-CONNECTIONS skill reads with an override when the binding is disabled', async () => {

@@ -384,6 +384,7 @@ import {
   type RuntimeAgentRecord,
   type RuntimeRunRecord,
 } from "./chat-thread/runtime-agent";
+import { formatChannelHistoryNote, type RelayRuntimeAgent } from "./agent-runtime/channel-turns";
 import {
   codexError,
   codexRoute,
@@ -4321,6 +4322,19 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     });
   }
 
+  /**
+   * The runtime agent this thread relays to, for the direct path to adopt
+   * (agent-runtime/channel-turns.ts). Null when the thread has none, or while
+   * a turn runs here (it is adopted at a later message).
+   */
+  relayRuntimeAgent(): RelayRuntimeAgent | null {
+    const kv = this.ctx.storage.kv;
+    const agent = kv.get<RuntimeAgentRecord>(RUNTIME_AGENT_KEY);
+    if (!agent?.id) return null;
+    if (this.isThreadStreaming() || kv.get(RUNTIME_AGENT_RUN_KEY)) return null;
+    return { agentId: agent.id, model: agent.model ?? null, keyScope: agent.keyScope ?? null };
+  }
+
   async appendChannelHistoryEvent(
     input: ChannelHistoryEventRequest,
   ): Promise<ChannelHistoryEventResult> {
@@ -4352,35 +4366,17 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
           .map((id) => (id === undefined || id === null ? "" : String(id).trim()))
           .filter(Boolean)
       : [];
-    const lines = [
-      "<camelai system message>",
-      `A camelAI run sent an outbound ${channelKind} message to this channel at ${new Date(sentAt).toISOString()}.`,
-    ];
-    if (direction !== "outbound") {
-      lines.push(`Direction: ${direction}.`);
-    }
-    if (input.sourceThreadId?.trim()) {
-      lines.push(`Source thread: ${input.sourceThreadId.trim()}.`);
-    }
-    if (input.connectionId?.trim()) {
-      lines.push(`Channel connection: ${input.connectionId.trim()}.`);
-    }
-    if (input.remoteConversationId?.trim()) {
-      lines.push(`Remote conversation: ${input.remoteConversationId.trim()}.`);
-    }
-    if (providerMessageIds.length > 0) {
-      lines.push(`Provider message ids: ${providerMessageIds.join(", ")}.`);
-    }
-    if (attachmentCount > 0) {
-      lines.push(`Attachment count: ${attachmentCount}.`);
-    }
-    lines.push(
-      "Treat this as already-delivered channel history. Do not resend it unless the user explicitly asks.",
-    );
-    if (text) {
-      lines.push("", "Delivered message:", text);
-    }
-    lines.push("</camelai system message>");
+    const note = formatChannelHistoryNote({
+      channelKind,
+      sentAt,
+      direction,
+      sourceThreadId: input.sourceThreadId,
+      connectionId: input.connectionId,
+      remoteConversationId: input.remoteConversationId,
+      providerMessageIds,
+      attachmentCount,
+      text,
+    });
 
     const channelSkeleton = text
       ? this.buildUserUiSkeleton({
@@ -4394,7 +4390,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     const message = withPiRenderMessageId(
       {
         role: "user" as const,
-        content: lines.join("\n"),
+        content: note,
         timestamp: sentAt,
       } satisfies AgentMessage,
       channelSkeleton?.id ?? null,

@@ -76,22 +76,10 @@ export const ALLOWLIST = {
         "1 RPC declaration; agentEvalResult (eval harness, off the user path).",
     },
   },
-  "workers/main/src/routes/admin-mcp.ts": {
-    getPiCoreParsedMessages: {
-      count: 3,
-      why: "admin MCP transcript export: a stub type, a capability probe, and the call.",
-    },
-  },
-  "workers/main/src/routes/admin/helpers.ts": {
-    getPiCoreParsedMessages: {
-      count: 3,
-      why: "admin thread inspector: a stub type, a capability probe, and the call.",
-    },
-  },
   "workers/main/src/agent-runtime/thread-transcript.ts": {
     getPiCoreParsedMessages: {
       count: 2,
-      why: "the whole-thread reader for admin views, JSONL export and condensed transcripts " +
+      why: "the whole-thread reader for admin views and the admin MCP, JSONL export and condensed transcripts " +
         "(a DO thread's side; a runtime thread's is the runtime's history): a stub type and the call.",
     },
   },

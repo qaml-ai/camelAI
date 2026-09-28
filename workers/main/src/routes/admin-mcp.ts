@@ -25,6 +25,8 @@ import { ACCESS_JWT_HEADER, getAccessConfig } from "../helpers/access-session.js
 import { ProxyAuthUnavailableError, verifyProxyJwt } from "../helpers/proxy-auth-core.js";
 import { getUserByEmail } from "../../../../src/lib/auth-do.js";
 import type { AuthEnv } from "../../../../src/lib/auth-helpers.js";
+import { parsedThreadTranscript } from "../agent-runtime/thread-transcript.js";
+import type { ChatEnv } from "../chat-thread/types.js";
 import {
   createAdminJsExecActor,
   deleteAdminJsExecActor,
@@ -909,10 +911,6 @@ type ChatThreadMessageRowsStub = {
   }): Promise<{ ok: true; inserted: boolean; idx: number }> | { ok: true; inserted: boolean; idx: number };
 };
 
-type ChatThreadParsedMessagesStub = {
-  getPiCoreParsedMessages(threadId: string): Promise<unknown[]> | unknown[];
-};
-
 type AdminThreadContext = {
   id?: string;
   title?: string | null;
@@ -930,13 +928,6 @@ function getChatThreadMessageRowsStub(env: Env, threadId: string): ChatThreadMes
   return env.CHAT_THREAD.get(
     env.CHAT_THREAD.idFromName(threadId),
   ) as unknown as ChatThreadMessageRowsStub;
-}
-
-function getChatThreadParsedMessagesStub(env: Env, threadId: string): ChatThreadParsedMessagesStub | null {
-  if (!("CHAT_THREAD" in env) || !env.CHAT_THREAD) return null;
-  return env.CHAT_THREAD.get(
-    env.CHAT_THREAD.idFromName(threadId),
-  ) as unknown as ChatThreadParsedMessagesStub;
 }
 
 function isDurableObjectNamespace(value: unknown): value is DurableObjectNamespace {
@@ -2224,13 +2215,8 @@ async function getThreadJsonlTool(env: Env, args: Record<string, unknown>) {
     return toolText({ error: "Thread not found" }, true);
   }
 
-  const chatThreadStub = getChatThreadParsedMessagesStub(env, threadId);
-  if (!chatThreadStub || typeof chatThreadStub.getPiCoreParsedMessages !== "function") {
-    return toolText({ error: "CHAT_THREAD binding is not available" }, true);
-  }
-
-  const messages = await Promise.resolve(chatThreadStub.getPiCoreParsedMessages(threadId));
-  const parsedMessages = Array.isArray(messages) ? messages : [];
+  // Wherever the thread runs: a runtime thread's messages are its agent's history.
+  const parsedMessages = await parsedThreadTranscript(env as unknown as ChatEnv, threadContext.org_id, threadId);
   const jsonl = messagesToJsonl(parsedMessages);
   return {
     content: [{ type: "text", text: jsonl }],

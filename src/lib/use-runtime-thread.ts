@@ -80,6 +80,11 @@ const EMPTY_UI_MESSAGES: UIMessage[] = [];
 /** How long a sent message counts as "submitted" without its run appearing on the stream. */
 const SUBMITTED_WINDOW_MS = 60_000;
 const RECONNECT_DELAY_MS = 1_000;
+/**
+ * A watcher disconnected this long has stopped (a 403 or 404 ends it without
+ * `expired`) or cannot get through: watch again. Its own reconnects take less.
+ */
+const WATCH_STALL_MS = 20_000;
 
 // The watcher's messages are Pi's (the SDK declares its own structural copy
 // of them); the view keeps Pi's types for pi-render.
@@ -221,6 +226,9 @@ export function useRuntimeThread(options: {
     let frame: number | null = null;
     let latest: AgentView | null = null;
     let restart: number | null = null;
+    let stall: number | null = null;
+    // Which watcher is current: a replaced one's late changes are ignored.
+    let generation = 0;
     let restartDelay = RECONNECT_DELAY_MS;
     const flush = () => {
       frame = null;
@@ -243,6 +251,7 @@ export function useRuntimeThread(options: {
         ? { token: seed.token, expiresAt: seed.expiresAt ?? undefined, url: seed.url }
         : await getToken();
       if (cancelled) return;
+      const mine = ++generation;
       watcherRef.current = watchAgent({
         url: initial.url,
         agentId,
@@ -254,12 +263,26 @@ export function useRuntimeThread(options: {
           else if (event?.type === "agent_end") runStartRef.current = undefined;
         },
         onChange: (state) => {
+          if (mine !== generation) return;
           // The watcher stops when its token cannot be renewed: watch again
           // with a new one, backing off while the token route keeps failing.
           if (state.expired) {
+            if (stall !== null) window.clearTimeout(stall);
+            stall = null;
             watcherRef.current?.close();
             rewatch();
             return;
+          }
+          if (state.connected) {
+            if (stall !== null) window.clearTimeout(stall);
+            stall = null;
+          } else if (stall === null) {
+            stall = window.setTimeout(() => {
+              stall = null;
+              if (cancelled) return;
+              watcherRef.current?.close();
+              rewatch();
+            }, WATCH_STALL_MS);
           }
           latest = state;
           // Deltas arrive per token: render at most once a frame.
@@ -268,11 +291,15 @@ export function useRuntimeThread(options: {
         onError: (error) => console.warn("[runtime-thread] watcher", error.message),
       });
     };
-    start().catch((error) => console.error("[runtime-thread] could not watch the agent", error));
+    start().catch((error) => {
+      console.error("[runtime-thread] could not watch the agent", error);
+      rewatch();
+    });
     return () => {
       cancelled = true;
       if (frame !== null) cancelAnimationFrame(frame);
       if (restart !== null) window.clearTimeout(restart);
+      if (stall !== null) window.clearTimeout(stall);
       watcherRef.current?.close();
       watcherRef.current = null;
     };

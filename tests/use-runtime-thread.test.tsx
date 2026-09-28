@@ -118,6 +118,40 @@ describe("useRuntimeThread", () => {
     expect(watchers[1].options).toMatchObject({ agentId: "agt_1", token: "abt_new" });
   });
 
+  it("watches again when the watcher stays disconnected (a 403/404 stops it without expiring)", async () => {
+    responses["/api/threads/t1/token"] = { token: "abt_new", expiresAt: Date.now() + 900_000, url: "https://agents.test", agentId: "agt_1" };
+    mount();
+    await waitFor(() => expect(watchers).toHaveLength(1));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      act(() => watchers[0].emit({ connected: false }));
+      // A short drop is the watcher's own reconnect: left alone.
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+      act(() => watchers[0].emit({ connected: true }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      expect(watchers).toHaveLength(1);
+      // Disconnected past the stall limit: a new watcher.
+      act(() => watchers[0].emit({ connected: false }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(25_000); });
+    } finally {
+      vi.useRealTimers();
+    }
+    await waitFor(() => expect(watchers).toHaveLength(2), { timeout: 3_000 });
+    expect(watchers[0].closed).toBe(true);
+    expect(watchers[1].options).toMatchObject({ token: "abt_new" });
+  });
+
+  it("keeps trying to watch when the first token cannot be minted", async () => {
+    statuses["/api/threads/t1/token"] = 503;
+    // The loader's token is too close to expiry to use, so the hook mints one.
+    mount({ ...seed, expiresAt: Date.now() });
+    await waitFor(() => expect(fetchCalls.filter((call) => call.url.startsWith("/api/threads/t1/token"))).toHaveLength(1));
+    statuses["/api/threads/t1/token"] = 200;
+    responses["/api/threads/t1/token"] = { token: "abt_late", expiresAt: Date.now() + 900_000, url: "https://agents.test", agentId: "agt_1" };
+    await waitFor(() => expect(watchers).toHaveLength(1), { timeout: 3_000 });
+    expect(watchers[0].options).toMatchObject({ token: "abt_late" });
+  });
+
   it("sends through the route, and matches the message that comes back to the client's id", async () => {
     responses["/api/threads/t1/messages"] = { status: "accepted", requestId: "cm_1", agentId: "agt_1", fallback: null };
     const { result } = mount();

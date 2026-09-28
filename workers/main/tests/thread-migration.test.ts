@@ -57,8 +57,13 @@ describe("convertTranscript", () => {
     expect(converted.messages).toHaveLength(2);
   });
 
-  it("writes old tool calls and results as text", () => {
-    const converted = convertTranscript([user("deploy"), assistantCall("tc1", "deploy_project", { name: "shop" }), toolResult("tc1", "deploy_project", "Deployed to https://shop.test")] as never);
+  it("keeps old tool calls as calls: every provider takes calls to tools the agent lacks", () => {
+    const messages = [user("deploy"), assistantCall("tc1", "deploy_project", { name: "shop" }), toolResult("tc1", "deploy_project", "Deployed")];
+    expect(convertTranscript(messages as never).messages).toEqual(messages);
+  });
+
+  it("can write old tool calls and results as text", () => {
+    const converted = convertTranscript([user("deploy"), assistantCall("tc1", "deploy_project", { name: "shop" }), toolResult("tc1", "deploy_project", "Deployed to https://shop.test")] as never, { rewriteToolCalls: true });
     const [, assistant, result] = converted.messages as Array<{ role: string; content: unknown }>;
     expect(assistant.content).toEqual([{ type: "text", text: "Let me check." }, { type: "text", text: '[called deploy_project({"name":"shop"})]' }]);
     expect(result).toMatchObject({ role: "user", content: "[deploy_project result] Deployed to https://shop.test" });
@@ -74,14 +79,39 @@ describe("convertTranscript", () => {
     expect(converted).toMatchObject({ lossy: true, stats: { shortenedResults: 1 } });
   });
 
-  it("leaves out other message kinds and images, and says so", () => {
+  it("keeps inline images, leaves out stored ones and other message kinds, and says so", () => {
+    const stored = { type: "image", data: "", mimeType: "image/png", metadata: { chiridionR2Image: { key: "k", mimeType: "image/png", sha256: "s" } } };
     const converted = convertTranscript([
-      user("look", { content: [{ type: "text", text: "look" }, { type: "image", data: "AAAA", mimeType: "image/png" }] }),
+      user("look", { content: [{ type: "text", text: "look" }, { type: "image", data: "AAAA", mimeType: "image/png" }, stored] }),
       { role: "bashExecution", command: "ls" },
     ] as never);
     expect(converted.messages).toHaveLength(1);
+    expect((converted.messages[0] as { content: unknown[] }).content).toEqual([
+      { type: "text", text: "look" },
+      { type: "image", data: "AAAA", mimeType: "image/png" },
+      { type: "text", text: `[image left out of the import; see ${ARCHIVE_PATH}]` },
+    ]);
     expect(converted.stats).toMatchObject({ droppedRoles: 1, omittedImages: 1 });
     expect(converted.lossy).toBe(true);
+  });
+
+  it("drops thinking signatures, which only the recording model can check", () => {
+    const converted = convertTranscript([{
+      role: "assistant", provider: "anthropic", model: "claude-sonnet-5-5", timestamp: 2,
+      content: [
+        { type: "thinking", thinking: "plan", thinkingSignature: "sig" },
+        { type: "thinking", thinking: "", thinkingSignature: "opaque", redacted: true },
+        { type: "text", text: "done" },
+      ],
+    }] as never);
+    expect((converted.messages[0] as { content: unknown[] }).content).toEqual([{ type: "thinking", thinking: "plan" }, { type: "text", text: "done" }]);
+    expect(converted.messages[0]).toMatchObject({ provider: "anthropic", model: "claude-sonnet-5-5" });
+    expect(converted.lossy).toBe(false);
+  });
+
+  it("imports a compaction summary as one, standing in for what came before", () => {
+    const converted = convertTranscript([user("old"), user("[Context Summary]\n\nEarlier: built the shop.", { timestamp: 9 }), user("and now?")] as never);
+    expect(converted.messages[1]).toEqual({ role: "compactionSummary", summary: "Earlier: built the shop.", timestamp: 9 });
   });
 
   it("imports the latest context of a history over the cap, from its last compaction summary", () => {
@@ -93,7 +123,7 @@ describe("convertTranscript", () => {
     ];
     const converted = convertTranscript(messages as never);
     expect(converted.stats.tail).toBe(true);
-    expect((converted.messages[0] as { content: string }).content).toContain("[Context Summary]");
+    expect(converted.messages[0]).toMatchObject({ role: "compactionSummary", summary: "Earlier: built the shop." });
     expect(new TextEncoder().encode(JSON.stringify(converted.messages)).length).toBeLessThanOrEqual(MAX_IMPORT_BYTES);
   });
 });
@@ -149,6 +179,14 @@ describe("migrateThreadToRuntime", () => {
     expect(org.setThreadRuntimeAgent).toHaveBeenCalledWith("t1", { agentId: "agt_new", model: null, keyScope: null, configured: null });
     expect(doStub.completeRuntimeMigration).toHaveBeenCalledWith("lease-1", "agt_new");
     expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it("puts the import note after the last compaction summary, where the model still sees it", async () => {
+    const { env } = fakeEnv(ok([user("old"), user("[Context Summary]\n\nEarlier."), user("now")]));
+    await migrateThreadToRuntime(env, context);
+    const roles = runtimeApiMock.mock.calls[0][3].initialMessages.map((message: { role: string; content?: string }) =>
+      message.role === "user" ? message.content?.slice(0, 22) : message.role);
+    expect(roles).toEqual(["old", "compactionSummary", "<camelai system messag", "now"]);
   });
 
   it("archives the original transcript when the import is not all of it", async () => {

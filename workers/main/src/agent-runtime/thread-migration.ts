@@ -48,10 +48,12 @@ export const ARCHIVE_REQUEST_ID = "camel-migration";
 export const ARCHIVE_FILE_NAME = "original-transcript.jsonl";
 export const ARCHIVE_PATH = `/workspace/uploads/${ARCHIVE_REQUEST_ID}/${ARCHIVE_FILE_NAME}`;
 /**
- * Old tool calls become text: the DO's tool names are not the runtime agent's
- * (camel__…), and not every provider takes calls to tools it was not given.
+ * Old tool calls stay calls: the DO's tool names are not the runtime agent's
+ * (camel__…), but every provider the runtime reaches takes calls to tools it
+ * was not given (checked by the runtime team). True writes them as text.
  */
-export const REWRITE_TOOL_CALLS = true;
+export const REWRITE_TOOL_CALLS = false;
+const SUMMARY_PREFIX = "[Context Summary]";
 
 const ARGS_PREVIEW_CHARS = 500;
 const RESULT_PREVIEW_CHARS = 2_000;
@@ -79,6 +81,22 @@ function blockText(content: unknown): string {
   return (content as Block[]).map((block) => (block.type === "text" && typeof block.text === "string" ? block.text : "")).join("");
 }
 
+/**
+ * Images with their bytes inline go as they are; ones the DO keeps in storage
+ * (a reference, no bytes) become a note pointing at the archive.
+ */
+function inlineImages(blocks: Block[], stats: { omittedImages: number }): Block[] {
+  return blocks.map((block) => {
+    if (block.type !== "image") return block;
+    if (typeof block.data === "string" && block.data) {
+      const { metadata: _metadata, ...image } = block;
+      return image;
+    }
+    stats.omittedImages++;
+    return { type: "text", text: `[image left out of the import; see ${ARCHIVE_PATH}]` };
+  });
+}
+
 function preview(value: unknown, max: number): string {
   const text = typeof value === "string" ? value : JSON.stringify(value ?? null);
   return text.length <= max ? text : `${text.slice(0, max)}…`;
@@ -86,9 +104,10 @@ function preview(value: unknown, max: number): string {
 
 /**
  * A DO transcript as a runtime import: the user, assistant and tool messages
- * (other kinds left out), long tool results shortened, images left out, old
- * tool calls as text (REWRITE_TOOL_CALLS), and, over the cap, the latest
- * context (from the last compaction summary, else the newest messages that fit).
+ * (other kinds left out), compaction summaries as the runtime's, thinking
+ * unsigned, long tool results shortened, stored images left out (inline ones
+ * kept), and, over the cap, the latest context (from the last compaction
+ * summary, else the newest messages that fit).
  */
 export function convertTranscript(source: AgentMessage[], options: { rewriteToolCalls?: boolean } = {}): ConvertedTranscript {
   const rewrite = options.rewriteToolCalls ?? REWRITE_TOOL_CALLS;
@@ -102,13 +121,17 @@ export function convertTranscript(source: AgentMessage[], options: { rewriteTool
       continue;
     }
     if (message.role === "user") {
-      const content = Array.isArray(message.content)
-        ? (message.content as Block[]).map((block) => {
-            if (block.type !== "image") return block;
-            stats.omittedImages++;
-            return { type: "text", text: `[image left out of the import; see ${ARCHIVE_PATH}]` };
-          })
-        : message.content;
+      // The DO's compaction summary, as the runtime's: it stands in for all before it.
+      const text = typeof message.content === "string" ? message.content : null;
+      if (text?.startsWith(SUMMARY_PREFIX) && text.slice(SUMMARY_PREFIX.length).trim()) {
+        out.push({
+          role: "compactionSummary",
+          summary: text.slice(SUMMARY_PREFIX.length).trim(),
+          ...(typeof message.timestamp === "number" ? { timestamp: message.timestamp } : {}),
+        } as unknown as AgentMessage);
+        continue;
+      }
+      const content = Array.isArray(message.content) ? inlineImages(message.content as Block[], stats) : message.content;
       out.push({ ...message, content } as unknown as AgentMessage);
       continue;
     }
@@ -117,20 +140,25 @@ export function convertTranscript(source: AgentMessage[], options: { rewriteTool
       for (const block of blocks) {
         if (block.type === "toolCall" && typeof block.id === "string" && typeof block.name === "string") names.set(block.id, block.name);
       }
-      const content = rewrite
-        ? blocks.map((block) => block.type === "toolCall"
-          ? { type: "text", text: `[called ${String(block.name)}(${preview(block.arguments, ARGS_PREVIEW_CHARS)})]` }
-          : block)
-        : blocks;
+      const content = blocks.flatMap((block): Block[] => {
+        if (rewrite && block.type === "toolCall") {
+          return [{ type: "text", text: `[called ${String(block.name)}(${preview(block.arguments, ARGS_PREVIEW_CHARS)})]` }];
+        }
+        if (block.type !== "thinking") return [block];
+        // A signature is checked by the model that made it, and an import can not
+        // vouch for one; unsigned, the thinking reaches the model as text.
+        if (block.redacted) return [];
+        const { thinkingSignature: _signature, ...unsigned } = block;
+        return [unsigned];
+      });
       out.push({ ...message, content } as unknown as AgentMessage);
       continue;
     }
     // toolResult
     const text = blockText(message.content);
     const shortened = shorten(text, MAX_TOOL_RESULT_CHARS);
-    const images = Array.isArray(message.content) ? (message.content as Block[]).filter((block) => block.type === "image").length : 0;
-    stats.omittedImages += images;
     if (rewrite) {
+      if (Array.isArray(message.content)) stats.omittedImages += (message.content as Block[]).filter((block) => block.type === "image").length;
       const name = typeof message.toolName === "string" ? message.toolName : names.get(String(message.toolCallId)) ?? "tool";
       out.push({
         role: "user",
@@ -140,13 +168,14 @@ export function convertTranscript(source: AgentMessage[], options: { rewriteTool
       if (text.length > RESULT_PREVIEW_CHARS) stats.shortenedResults++;
     } else {
       if (shortened !== text) stats.shortenedResults++;
-      out.push({ ...message, content: [{ type: "text", text: shortened }] } as unknown as AgentMessage);
+      const images = Array.isArray(message.content) ? inlineImages((message.content as Block[]).filter((block) => block.type === "image"), stats) : [];
+      out.push({ ...message, content: [{ type: "text", text: shortened }, ...images] } as unknown as AgentMessage);
     }
   }
   let messages = out;
   if (byteLength(messages) > MAX_IMPORT_BYTES) {
     stats.tail = true;
-    const summaryAt = findLastIndex(messages, (message) => message.role === "user" && blockText((message as { content?: unknown }).content).startsWith("[Context Summary]"));
+    const summaryAt = findLastIndex(messages, (message) => (message.role as string) === "compactionSummary");
     if (summaryAt > 0) messages = messages.slice(summaryAt);
     while (messages.length > 1 && byteLength(messages) > MAX_IMPORT_BYTES) messages = messages.slice(Math.ceil(messages.length / 10));
   }
@@ -260,7 +289,11 @@ export async function migrateThreadToRuntime(
   try {
     const converted = convertTranscript(handover.messages);
     const importedAt = Date.now();
-    const initialMessages = handover.messages.length ? [importNote(converted.lossy, importedAt), ...converted.messages] : [];
+    // After the last compaction summary: the model sees nothing before it.
+    const noteAt = findLastIndex(converted.messages, (message) => (message.role as string) === "compactionSummary") + 1;
+    const initialMessages = handover.messages.length
+      ? [...converted.messages.slice(0, noteAt), importNote(converted.lossy, importedAt), ...converted.messages.slice(noteAt)]
+      : [];
     if (options.dryRun) {
       await dostub.abortRuntimeMigration(leaseId);
       return { status: "dry_run", stats: converted.stats, lossy: converted.lossy, bytes: byteLength(initialMessages) };

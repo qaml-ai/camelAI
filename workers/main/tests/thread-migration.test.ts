@@ -5,10 +5,12 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { runtimeApiMock, directEnabledMock, routeMock } = vi.hoisted(() => ({
+const { runtimeApiMock, directEnabledMock, routeMock, hostedScopeMock, orgScopeMock } = vi.hoisted(() => ({
   runtimeApiMock: vi.fn(),
   routeMock: vi.fn(),
   directEnabledMock: vi.fn(() => true),
+  hostedScopeMock: vi.fn(async () => true),
+  orgScopeMock: vi.fn(async () => undefined),
 }));
 
 vi.mock("../src/agent-runtime/runtime-api.js", async (importOriginal) => ({
@@ -18,6 +20,11 @@ vi.mock("../src/agent-runtime/runtime-api.js", async (importOriginal) => ({
 vi.mock("../src/agent-runtime/run-gates.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   resolveThreadRuntimeRoute: routeMock,
+}));
+vi.mock("../src/agent-runtime/key-scopes", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  ensureHostedKeyScope: hostedScopeMock,
+  syncOrgKeyScope: orgScopeMock,
 }));
 vi.mock("../src/agent-runtime/thread-runtime.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -39,6 +46,7 @@ import {
   type DoMigrationResult,
 } from "../src/agent-runtime/thread-migration";
 import type { ChatEnv } from "../src/chat-thread/types";
+import { hostedModelHeaders } from "../src/agent-runtime/key-scopes";
 
 const user = (text: string, extra: Record<string, unknown> = {}) => ({ role: "user", content: text, timestamp: 1, ...extra });
 const assistantCall = (id: string, name: string, args: unknown) => ({
@@ -291,14 +299,74 @@ describe("migrateThreadToRuntime", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     directEnabledMock.mockReturnValue(true);
-    routeMock.mockResolvedValue({ route: { provider: "openrouter" } });
+    hostedScopeMock.mockResolvedValue(true);
+    routeMock.mockResolvedValue(HOSTED_ROUTE);
   });
+
+  const HOSTED_ROUTE = {
+    route: { kind: "scope", model: "openrouter/anthropic/claude-sonnet-5", keyScope: "hosted" },
+    threadModel: "claude-sonnet-5",
+    llmProviderRecord: null,
+  };
+  const HOSTED_AGENT = {
+    model: "openrouter/anthropic/claude-sonnet-5",
+    keyScope: "hosted",
+    modelHeaders: hostedModelHeaders(context),
+    thinkingLevel: "medium",
+  };
 
   it("has the thread's DO move it, acting for its creator", async () => {
     const migrated = { status: "migrated", row: ROW, archived: false, stats: {} } as unknown as DoMigrationResult;
     const { env, chat } = fakeEnv(migrated);
     expect(await migrateThreadToRuntime(env, context)).toBe(migrated);
-    expect(chat.migrateToRuntime).toHaveBeenCalledWith({ context, subject: "u1", dryRun: undefined });
+    expect(chat.migrateToRuntime).toHaveBeenCalledWith({ context, subject: "u1", agentModel: HOSTED_AGENT, dryRun: undefined });
+  });
+
+  describe("the agent's model and key scope (canary 1)", () => {
+    it("syncs the hosted scope first and has the agent made on it, with the hosted model headers", async () => {
+      const { env, chat } = fakeEnv({ status: "busy", reason: "running" });
+      await migrateThreadToRuntime(env, context);
+      expect(hostedScopeMock).toHaveBeenCalledWith(env);
+      expect(orgScopeMock).not.toHaveBeenCalled();
+      expect(hostedScopeMock.mock.invocationCallOrder[0]).toBeLessThan(chat.migrateToRuntime.mock.invocationCallOrder[0]);
+      expect(chat.migrateToRuntime).toHaveBeenCalledWith(expect.objectContaining({ agentModel: HOSTED_AGENT }));
+    });
+
+    it("syncs a BYOK org's own scope first and has the agent made on it, without hosted headers", async () => {
+      const record = { provider: "anthropic", credentials_encrypted: "x", config: "{}" };
+      routeMock.mockResolvedValue({
+        route: { kind: "scope", model: "anthropic/claude-sonnet-5", keyScope: "org_org1" },
+        threadModel: "gpt-6-luna",
+        llmProviderRecord: record,
+      });
+      const { env, chat } = fakeEnv({ status: "busy", reason: "running" });
+      await migrateThreadToRuntime(env, context);
+      expect(orgScopeMock).toHaveBeenCalledWith(env, "org1", record);
+      expect(hostedScopeMock).not.toHaveBeenCalled();
+      expect(chat.migrateToRuntime).toHaveBeenCalledWith(expect.objectContaining({
+        agentModel: { model: "anthropic/claude-sonnet-5", keyScope: "org_org1", modelHeaders: null, thinkingLevel: "high" },
+      }));
+    });
+
+    it("leaves the thread where it is when its key scope cannot be had", async () => {
+      hostedScopeMock.mockResolvedValueOnce(false);
+      const unconfigured = fakeEnv({ status: "busy", reason: "running" });
+      expect(await migrateThreadToRuntime(unconfigured.env, context)).toMatchObject({ status: "skipped", reason: expect.stringContaining("not_configured") });
+      expect(unconfigured.chat.migrateToRuntime).not.toHaveBeenCalled();
+      hostedScopeMock.mockRejectedValueOnce(new Error("runtime down"));
+      const down = fakeEnv({ status: "busy", reason: "running" });
+      expect(await migrateThreadToRuntime(down.env, context)).toEqual({ status: "failed", error: "key scope: runtime down" });
+      expect(down.chat.migrateToRuntime).not.toHaveBeenCalled();
+    });
+
+    it("checks the route and key scope on a dry run too, and says which", async () => {
+      const { env } = fakeEnv({ status: "dry_run", stats: {}, lossy: false, bytes: 10 } as unknown as DoMigrationResult);
+      expect(await migrateThreadToRuntime(env, context, { dryRun: true })).toMatchObject({ status: "dry_run", model: HOSTED_AGENT.model, keyScope: "hosted" });
+      expect(hostedScopeMock).toHaveBeenCalled();
+      hostedScopeMock.mockResolvedValueOnce(false);
+      expect(await migrateThreadToRuntime(fakeEnv({ status: "dry_run" } as unknown as DoMigrationResult).env, context, { dryRun: true }))
+        .toMatchObject({ status: "skipped", reason: expect.stringContaining("not_configured") });
+    });
   });
 
   it("moves a thread of the caller's workspace only", async () => {

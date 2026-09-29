@@ -266,14 +266,7 @@ export async function prepareThreadRuntimeRun(
       throw error;
     }
   };
-  const keyScope = async () => {
-    if (route.kind !== "scope") return;
-    if (route.keyScope === HOSTED_KEY_SCOPE) {
-      if (!await ensureHostedKeyScope(env)) throw new RuntimeRunRefused("Hosted models are not configured for the agent runtime.", "not_configured");
-    } else {
-      await syncOrgKeyScope(env, context.orgId, resolved.llmProviderRecord);
-    }
-  };
+  const keyScope = () => syncRouteKeyScope(env, context, resolved);
   const credit = async () => config.billingSource === "hosted" && config.creditChargeable
     ? await hostedCreditRemainingUsd(org)
     : null;
@@ -289,14 +282,47 @@ export async function prepareThreadRuntimeRun(
   ]);
   const budgets = [...(creditLeft !== null ? [creditLeft] : []), ...userHeadroom];
   return {
-    model: route.model,
-    keyScope: route.kind === "scope" ? route.keyScope : null,
+    ...runtimeAgentModel(context, route, threadModel),
     spendLimitUsd: budgets.length > 0 ? Math.max(0, Math.min(...budgets)) : null,
-    modelHeaders: route.kind === "scope" && route.keyScope === HOSTED_KEY_SCOPE ? hostedModelHeaders(context) : null,
     threadModel,
-    thinkingLevel: primaryPiThinkingLevel(threadModel),
     fallback,
   };
+}
+
+/** How a thread's agent runs its model on the runtime: what a new agent is made with, and a send configures. */
+export interface RuntimeAgentModel {
+  model: string;
+  keyScope: string | null;
+  modelHeaders: Record<string, string> | null;
+  thinkingLevel: "medium" | "high";
+}
+
+export function runtimeAgentModel(context: ChatContextState, route: RuntimeModelRoute, threadModel: LlmModel): RuntimeAgentModel {
+  return {
+    model: route.model,
+    keyScope: route.kind === "scope" ? route.keyScope : null,
+    modelHeaders: route.kind === "scope" && route.keyScope === HOSTED_KEY_SCOPE ? hostedModelHeaders(context) : null,
+    thinkingLevel: primaryPiThinkingLevel(threadModel),
+  };
+}
+
+/**
+ * The runtime's copy of the key scope the thread's route runs under, brought
+ * up to date (the hosted scope, or the org's BYOK one); a run or agent create
+ * under a scope the runtime lacks is refused. Throws RuntimeRunRefused when
+ * hosted models are not configured.
+ */
+export async function syncRouteKeyScope(
+  env: ChatEnv,
+  context: ChatContextState,
+  { route, llmProviderRecord }: Pick<ThreadRuntimeRoute, "route" | "llmProviderRecord">,
+): Promise<void> {
+  if (route?.kind !== "scope") return;
+  if (route.keyScope === HOSTED_KEY_SCOPE) {
+    if (!await ensureHostedKeyScope(env)) throw new RuntimeRunRefused("Hosted models are not configured for the agent runtime.", "not_configured");
+  } else {
+    await syncOrgKeyScope(env, context.orgId, llmProviderRecord);
+  }
 }
 
 /**

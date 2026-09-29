@@ -8715,21 +8715,38 @@ export class OrgDO extends DurableObject<DOEnv> {
    * only a thread with no agent yet takes it (no row, or a row pinned without
    * one), so a move re-driven or raced never replaces the agent a thread
    * already has. `claimed` says whether the row is this agent's (now, or from
-   * an earlier claim of the same agent). Null when the thread does not exist.
+   * an earlier claim of the same agent). `configuration`, what the agent was
+   * made with, is recorded only by the claim that gives it the thread. Null
+   * when the thread does not exist.
    */
-  claimThreadRuntimeAgent(threadId: string, agentId: string): { row: ThreadRuntimeRecord; claimed: boolean } | null {
+  claimThreadRuntimeAgent(
+    threadId: string,
+    agentId: string,
+    configuration?: Omit<ThreadRuntimeAgentUpdate, "agentId">,
+  ): { row: ThreadRuntimeRecord; claimed: boolean } | null {
     if (!this.getThread(threadId)) return null;
     const now = Date.now();
+    const model = configuration?.model ?? null;
+    const keyScope = configuration?.keyScope ?? null;
+    const configured = configuration?.configured ? JSON.stringify(configuration.configured) : null;
     this.sql.exec(
-      "INSERT OR IGNORE INTO thread_runtime (thread_id, agent_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+      `INSERT OR IGNORE INTO thread_runtime (thread_id, agent_id, model, key_scope, configured_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       threadId,
       agentId,
+      model,
+      keyScope,
+      configured,
       now,
       now,
     );
     this.sql.exec(
-      "UPDATE thread_runtime SET agent_id = ?, updated_at = ? WHERE thread_id = ? AND agent_id IS NULL",
+      `UPDATE thread_runtime SET agent_id = ?, model = ?, key_scope = ?, configured_json = ?, updated_at = ?
+       WHERE thread_id = ? AND agent_id IS NULL`,
       agentId,
+      model,
+      keyScope,
+      configured,
       now,
       threadId,
     );

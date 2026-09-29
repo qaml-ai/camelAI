@@ -7,7 +7,10 @@
  *        a page at a time; pass the answer's `next` as `after` for the next page.
  *   POST /api/admin/runtime-migration/dry-run   {"org_id", "thread_id"}: what moving
  *        the thread would import (stats, lossy, bytes), without moving it: no
- *        lease, no agent, and the thread keeps running where it does.
+ *        lease, no agent, and the thread keeps running where it does. Its model's
+ *        route and key scope are resolved (and the scope synced) as for a move.
+ *   POST /api/admin/runtime-migration/clear-backoff   {"org_id", "thread_id"}: end a
+ *        failed move's backoff, so the thread's next open or send tries again.
  */
 
 import { Hono } from "hono";
@@ -65,5 +68,25 @@ runtimeMigrationRoutes.post(
       thread: { id: thread.id, title: thread.title, source: thread.source, channel_kind: thread.channel_kind, created_at: thread.created_at, user_message_count: thread.user_message_count },
       result,
     });
+  },
+);
+
+runtimeMigrationRoutes.post(
+  "/runtime-migration/clear-backoff",
+  openApi({
+    summary: "End a thread's failed-move backoff, so its next open or send tries the move again",
+    request: { json: z.object({ org_id: z.string().min(1), thread_id: z.string().min(1) }) },
+    responses: { 200: z.record(z.string(), z.unknown()), 404: z.record(z.string(), z.unknown()) },
+  }),
+  async (c) => {
+    const { org_id: orgId, thread_id: threadId } = c.req.valid("json");
+    const thread = await (getOrgStub(c.env, orgId) as unknown as { getThread(id: string): Promise<OrgThread | null> }).getThread(threadId);
+    if (!thread) return c.json({ error: "Thread not found" }, 404);
+    const chat = c.env.CHAT_THREAD.get(c.env.CHAT_THREAD.idFromName(threadId)) as unknown as {
+      clearRuntimeMigrationBackoff(): Promise<boolean>;
+      runtimeMigrationStatus(): Promise<{ state: string | null; retryAt?: number }>;
+    };
+    const cleared = await chat.clearRuntimeMigrationBackoff();
+    return c.json({ thread_id: threadId, cleared, status: await chat.runtimeMigrationStatus() });
   },
 );

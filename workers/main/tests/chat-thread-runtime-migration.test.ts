@@ -27,11 +27,18 @@ import {
   type RuntimeMigrationRecord,
 } from "../src/chat-thread/runtime-migration";
 import { RuntimeApiError, provisionedAgentId } from "../src/agent-runtime/runtime-api";
+import { RUNTIME_PROMPT_VERSION } from "../src/chat-thread/runtime-agent";
 import { ARCHIVE_PATH, MAX_IMPORT_BYTES, MAX_TOOL_RESULT_CHARS, convertTranscript } from "../src/agent-runtime/thread-migration";
 import { renderArchiveToPiMessages } from "../src/chat-thread/render-archive-export";
 
 const context = { orgId: "org1", workspaceId: "ws1", threadId: "t1", userId: "u1", userName: "Ada", userEmail: null };
 const ROW = { threadId: "t1", agentId: "agt_new", model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
+const agentModel = {
+  model: "openrouter/anthropic/claude-sonnet-5",
+  keyScope: "hosted",
+  modelHeaders: { "cf-aig-metadata": "{}" },
+  thinkingLevel: "medium" as const,
+};
 const user = (text: string, timestamp = 1) => ({ role: "user", content: text, timestamp });
 
 function harness() {
@@ -121,33 +128,40 @@ afterEach(() => {
 describe("ChatThreadRuntimeMigration", () => {
   it("moves a thread: an agent with its history, the row claimed, then final, then its preview tabs", async () => {
     const h = harness();
-    const result = await h.migration.migrate({ context, subject: "u1" });
+    const result = await h.migration.migrate({ context, subject: "u1", agentModel });
     expect(result).toMatchObject({ status: "migrated", row: ROW, archived: false });
     const [create] = creates();
     expect(create.url).toBe("https://runtime.test/v1/agents");
     const body = await createBody();
     expect(body).toMatchObject({ definition: "def_1", name: "t1", subject: "u1", ttlSeconds: null, context: { org: "org1", workspace: "ws1", thread: "t1" } });
+    // Made as a new thread's agent is: its model, key scope, model headers and thinking level.
+    expect(body).toMatchObject({ model: agentModel.model, keyScope: "hosted", modelHeaders: agentModel.modelHeaders, thinkingLevel: "medium" });
     expect(body.initialMessages[0].content).toContain("with all of its messages");
     expect(body.initialMessages[1]).toEqual(user("hi"));
     // This attempt's own key: the thread and its lease.
     expect(header(create, "Idempotency-Key")).toBe(`migrate_t1_${(h.record() as { leaseId: string }).leaseId.replace(/-/g, "").slice(0, 16)}`);
     expect(create.init.signal).toBeInstanceOf(AbortSignal);
-    expect(h.org.claimThreadRuntimeAgent).toHaveBeenCalledWith("t1", "agt_new");
+    // The row records that configuration, so the first send reconfigures nothing.
+    expect(h.org.claimThreadRuntimeAgent).toHaveBeenCalledWith("t1", "agt_new", {
+      model: agentModel.model,
+      keyScope: "hosted",
+      configured: { thinkingLevel: "medium", promptVersion: RUNTIME_PROMPT_VERSION },
+    });
     expect(h.org.setThreadUiState).toHaveBeenCalledWith("t1", { tabs: [{ kind: "app", scriptName: "shop", isPublic: true }], activeTabId: "app:shop" });
     expect(h.record()).toMatchObject({ phase: "moved", agentId: "agt_new" });
     expect(h.migration.state()).toBe("moved");
-    expect(await h.migration.migrate({ context, subject: "u1" })).toEqual({ status: "skipped", reason: "moved" });
+    expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toEqual({ status: "skipped", reason: "moved" });
   });
 
   it("holds the thread while it moves", async () => {
     const h = harness();
     let release!: () => void;
     createResponse = () => new Promise((resolve) => { release = () => resolve(new Response(JSON.stringify({ id: "agt_new" }), { status: 201 })); });
-    const moving = h.migration.migrate({ context, subject: "u1" });
+    const moving = h.migration.migrate({ context, subject: "u1", agentModel });
     await vi.waitFor(() => expect(creates()).toHaveLength(1));
     expect(h.migration.state()).toBe("moving");
     expect(h.migration.status()).toEqual({ state: "moving" });
-    expect(await h.migration.migrate({ context, subject: "u1" })).toEqual({ status: "busy", reason: "moving" });
+    expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toEqual({ status: "busy", reason: "moving" });
     release();
     expect(await moving).toMatchObject({ status: "migrated" });
   });
@@ -159,7 +173,7 @@ describe("ChatThreadRuntimeMigration", () => {
         h.state.busy = "running";
         return { messages: h.state.history as never[], whole: true };
       });
-      expect(await h.migration.migrate({ context, subject: "u1" })).toEqual({ status: "busy", reason: "running" });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toEqual({ status: "busy", reason: "running" });
       await h.settle();
       expect(h.org.claimThreadRuntimeAgent).not.toHaveBeenCalled();
       expect(deleted()).toContain("/v1/agents/agt_new");
@@ -173,7 +187,7 @@ describe("ChatThreadRuntimeMigration", () => {
         h.state.revision = { generation: 2, count: 3 };
         return { messages: h.state.history as never[], whole: true };
       });
-      expect(await h.migration.migrate({ context, subject: "u1" })).toEqual({ status: "busy", reason: "the thread changed while it was moving" });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toEqual({ status: "busy", reason: "the thread changed while it was moving" });
       expect(h.org.claimThreadRuntimeAgent).not.toHaveBeenCalled();
       expect(h.migration.state()).toBeNull();
     });
@@ -185,7 +199,7 @@ describe("ChatThreadRuntimeMigration", () => {
       const h = harness();
       let release!: () => void;
       createResponse = () => new Promise((resolve) => { release = () => resolve(new Response(JSON.stringify({ id: "agt_new" }), { status: 201 })); });
-      const moving = h.migration.migrate({ context, subject: "u1" });
+      const moving = h.migration.migrate({ context, subject: "u1", agentModel });
       await vi.waitFor(() => expect(creates()).toHaveLength(1));
       vi.setSystemTime(Date.now() + RUNTIME_MIGRATION_LEASE_MS + 1);
       await h.migration.onAlarm();
@@ -201,7 +215,7 @@ describe("ChatThreadRuntimeMigration", () => {
       const h = harness();
       h.org.claimThreadRuntimeAgent.mockRejectedValueOnce(new Error("OrgDO reset"));
       h.org.getThreadRuntime.mockRejectedValueOnce(new Error("OrgDO reset"));
-      const result = await h.migration.migrate({ context, subject: "u1" });
+      const result = await h.migration.migrate({ context, subject: "u1", agentModel });
       expect(result).toMatchObject({ status: "failed", error: expect.stringContaining("commit is pending") });
       vi.setSystemTime(Date.now() + 10 * RUNTIME_MIGRATION_LEASE_MS);
       expect(h.record()).toMatchObject({ phase: "committing", agentId: "agt_new" });
@@ -215,7 +229,7 @@ describe("ChatThreadRuntimeMigration", () => {
       const h = harness();
       h.org.claimThreadRuntimeAgent.mockResolvedValueOnce({ row: { ...ROW, agentId: "agt_first" }, claimed: false });
       h.org.getThreadRuntime.mockResolvedValue({ ...ROW, agentId: "agt_first" });
-      expect(await h.migration.migrate({ context, subject: "u1" })).toEqual({ status: "runtime", row: { ...ROW, agentId: "agt_first" } });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toEqual({ status: "runtime", row: { ...ROW, agentId: "agt_first" } });
       await h.settle();
       expect(deleted()).toEqual(["/v1/agents/agt_new"]);
       expect(h.record()).toMatchObject({ phase: "moved", agentId: "agt_first" });
@@ -224,7 +238,7 @@ describe("ChatThreadRuntimeMigration", () => {
     it("saves the preview tabs best-effort: a failed save never holds the commit (L1)", async () => {
       const h = harness();
       h.org.setThreadUiState.mockRejectedValueOnce(new Error("OrgDO busy"));
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "migrated" });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "migrated" });
       await h.settle();
       expect(h.record()).toMatchObject({ phase: "moved" });
     });
@@ -237,10 +251,10 @@ describe("ChatThreadRuntimeMigration", () => {
       h.store.set(RUNTIME_MIGRATION_KEY, { phase: "failed", failures: 1, retryAt: Date.now() - 1, error: "x", orgId: "org1", threadId: "t1", orphanAgentId: "agt_old" });
       let releaseDelete!: () => void;
       runtimeApiMock.mockImplementationOnce(() => new Promise((resolve) => { releaseDelete = () => resolve(null); }));
-      const first = h.migration.migrate({ context, subject: "u1" });
+      const first = h.migration.migrate({ context, subject: "u1", agentModel });
       await vi.waitFor(() => expect(deleted()).toEqual(["/v1/agents/agt_old"]));
       expect(h.record()).toMatchObject({ phase: "leased", orphanAgentId: "agt_old" });
-      expect(await h.migration.migrate({ context, subject: "u1" })).toEqual({ status: "busy", reason: "moving" });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toEqual({ status: "busy", reason: "moving" });
       releaseDelete();
       expect(await first).toMatchObject({ status: "migrated" });
       expect(creates()).toHaveLength(1);
@@ -266,7 +280,7 @@ describe("ChatThreadRuntimeMigration", () => {
         { id: "u1", role: "user", parts: [{ type: "text", text: "build a shop" }], metadata: { pi: { createdAtMs: 10 } } },
         { id: "a1", role: "assistant", parts: [{ type: "text", text: "Built it." }], metadata: { pi: { createdAtMs: 11 } } },
       ]];
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "migrated", archived: true });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "migrated", archived: true });
       const imported = (await createBody()).initialMessages as Array<{ role: string; content?: unknown; summary?: string }>;
       expect(imported[0]).toMatchObject({ role: "user", content: "build a shop" });
       expect(imported[1]).toMatchObject({ role: "assistant", content: [{ type: "text", text: "Built it." }] });
@@ -284,14 +298,14 @@ describe("ChatThreadRuntimeMigration", () => {
         { id: "q1", role: "user", parts: [{ type: "text", text: "question 1" }], metadata: { pi: { createdAtMs: 10 } } },
         { id: "turn1", role: "assistant", parts: [{ type: "text", text: "answer 1" }], metadata: { pi: { createdAtMs: 11 } } },
       ]];
-      await h.migration.migrate({ context, subject: "u1" });
+      await h.migration.migrate({ context, subject: "u1", agentModel });
       expect(JSON.stringify((await createBody()).initialMessages)).toContain("answer 1");
     });
 
     it("counts a thread whose rows open on a summary as not whole, even with no render archive", async () => {
       const h = harness();
       h.state.history = [user("[Context Summary]\n\nEarlier.", 50), user("and now?", 60)];
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "migrated", archived: true });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "migrated", archived: true });
       expect(JSON.stringify((await createBody()).initialMessages)).not.toContain("with all of its messages");
     });
   });
@@ -305,7 +319,7 @@ describe("ChatThreadRuntimeMigration", () => {
         keyDuringCall = (h.record() as { pendingKey?: string }).pendingKey;
         throw new DOMException("The operation timed out.", "TimeoutError");
       };
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "failed" });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "failed" });
       const key = header(creates()[0], "Idempotency-Key");
       expect(keyDuringCall).toBe(key);
       const byKey = `/v1/agents/${await provisionedAgentId("chiridion", key)}`;
@@ -327,7 +341,7 @@ describe("ChatThreadRuntimeMigration", () => {
       const h = harness();
       createResponse = async () => { throw new DOMException("The operation timed out.", "TimeoutError"); };
       runtimeApiMock.mockRejectedValue(new RuntimeApiError("gone", 404));
-      await h.migration.migrate({ context, subject: "u1" });
+      await h.migration.migrate({ context, subject: "u1", agentModel });
       await h.settle();
       expect(h.record()).toHaveProperty("orphanKey");
       vi.setSystemTime(Date.now() + ORPHAN_KEY_SETTLE_MS + 1);
@@ -341,7 +355,7 @@ describe("ChatThreadRuntimeMigration", () => {
       const h = harness();
       h.store.set(RUNTIME_MIGRATION_KEY, { phase: "failed", failures: 1, retryAt: Date.now() - 1, error: "x", orgId: "org1", threadId: "t1", orphanKey: "migrate_t1_old", orphanKeyAt: Date.now() - 60_000 });
       runtimeApiMock.mockRejectedValue(new RuntimeApiError("gone", 404));
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "skipped", reason: expect.stringContaining("backoff") });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "skipped", reason: expect.stringContaining("backoff") });
       expect(creates()).toHaveLength(0);
       expect(h.record()).toMatchObject({ phase: "failed", orphanKey: "migrate_t1_old", failures: 1 });
       expect(h.migration.state()).toBeNull();
@@ -384,7 +398,7 @@ describe("ChatThreadRuntimeMigration", () => {
         archived.push(text);
         return new Response("{}", { status: 201 });
       };
-      const result = await h.migration.migrate({ context, subject: "u1" });
+      const result = await h.migration.migrate({ context, subject: "u1", agentModel });
       expect(result).toMatchObject({ status: "migrated", archived: true });
       expect(archived[0]).toBe("a\nb\nc\nd\ne\nf\n");
     });
@@ -399,23 +413,23 @@ describe("ChatThreadRuntimeMigration", () => {
         archived.push(await new Response(body).text());
         return new Response("{}", { status: 201 });
       };
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "migrated", reason: expect.stringContaining("archive too large") });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "migrated", reason: expect.stringContaining("archive too large") });
       expect(archived[0]).toContain("too large to save here");
     });
 
-    it("waits a day after an archive the runtime refuses otherwise", async () => {
+    it("retries an archive the runtime refuses otherwise on the usual backoff", async () => {
       const h = harness();
       h.state.whole = false;
       archiveResponse = async () => new Response(JSON.stringify({ error: "bad" }), { status: 400 });
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "skipped", reason: expect.stringContaining("refused_400") });
-      expect((h.record() as { retryAt: number }).retryAt).toBeGreaterThanOrEqual(Date.now() + PERMANENT_FAILURE_RETRY_MS - 1_000);
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "failed" });
+      expect((h.record() as { retryAt: number }).retryAt).toBeLessThanOrEqual(Date.now() + migrationBackoffMs(1));
     });
 
     it("gives every runtime call a deadline", async () => {
       const h = harness();
       h.state.whole = false;
       h.org.claimThreadRuntimeAgent.mockResolvedValueOnce({ row: { ...ROW, agentId: "agt_first" }, claimed: false });
-      await h.migration.migrate({ context, subject: "u1" });
+      await h.migration.migrate({ context, subject: "u1", agentModel });
       await h.settle();
       expect(fetchCalls.every((call) => call.init.signal instanceof AbortSignal)).toBe(true);
       // The spare agent's delete goes through the deadline fetch.
@@ -427,9 +441,39 @@ describe("ChatThreadRuntimeMigration", () => {
     it("waits a day after INVALID_HISTORY instead of retrying every minute", async () => {
       const h = harness();
       createResponse = async () => new Response(JSON.stringify({ error: "INVALID_HISTORY: initialMessages[3] …", code: "INVALID_HISTORY" }), { status: 400 });
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "skipped", reason: expect.stringContaining("invalid_history") });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "skipped", reason: expect.stringContaining("invalid_history") });
       expect((h.record() as { retryAt: number }).retryAt).toBeGreaterThanOrEqual(Date.now() + PERMANENT_FAILURE_RETRY_MS - 1_000);
       expect(h.migration.status()).toMatchObject({ state: "backoff" });
+    });
+  });
+
+  describe("the agent's model and key scope (canary 1)", () => {
+    it("retries a create refused for chiridion's configuration (a key scope the runtime lacks) on the usual backoff, not a day", async () => {
+      const h = harness();
+      createResponse = async () => new Response(JSON.stringify({ error: "No openrouter API key is configured for tenant chiridion-staging" }), { status: 400 });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "failed", error: expect.stringContaining("No openrouter API key") });
+      expect((h.record() as { retryAt: number }).retryAt).toBeLessThanOrEqual(Date.now() + migrationBackoffMs(1));
+    });
+
+    it("makes no agent without the model it runs", async () => {
+      const h = harness();
+      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "failed", error: expect.stringContaining("no model") });
+      expect(creates()).toHaveLength(0);
+      // Nothing was made, so nothing is left to delete.
+      expect(h.record()).toMatchObject({ phase: "failed" });
+      expect(h.record()).not.toHaveProperty("orphanKey");
+    });
+
+    it("clears a failed move's backoff, so the next attempt moves at once", async () => {
+      const h = harness();
+      createResponse = async () => new Response(JSON.stringify({ error: "INVALID_HISTORY", code: "INVALID_HISTORY" }), { status: 400 });
+      await h.migration.migrate({ context, subject: "u1", agentModel });
+      expect(h.migration.status()).toMatchObject({ state: "backoff" });
+      expect(h.migration.clearBackoff()).toBe(true);
+      expect(h.migration.status()).toEqual({ state: null });
+      expect(h.migration.clearBackoff()).toBe(false);
+      createResponse = async () => new Response(JSON.stringify({ id: "agt_new" }), { status: 201 });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "migrated" });
     });
   });
 
@@ -437,7 +481,7 @@ describe("ChatThreadRuntimeMigration", () => {
     it("takes a 402 as passing (the tenant's, not the thread's): the usual backoff, not a day", async () => {
       const h = harness();
       createResponse = async () => new Response(JSON.stringify({ error: "payment required" }), { status: 402 });
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "failed" });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "failed" });
       expect((h.record() as { retryAt: number }).retryAt).toBeLessThan(Date.now() + PERMANENT_FAILURE_RETRY_MS / 2);
     });
 
@@ -448,7 +492,7 @@ describe("ChatThreadRuntimeMigration", () => {
         h.state.busy = "running";
         return { messages: h.state.history as never[], whole: true };
       });
-      await h.migration.migrate({ context, subject: "u1" });
+      await h.migration.migrate({ context, subject: "u1", agentModel });
       expect(h.onUndone).toHaveBeenCalledTimes(1);
     });
 
@@ -456,7 +500,7 @@ describe("ChatThreadRuntimeMigration", () => {
       const h = harness();
       h.store.set(RUNTIME_MIGRATION_KEY, { phase: "committing", leaseId: "l", agentId: "agt_new", orgId: "org1", threadId: "t1", previewTabs: [], previewActiveTabId: null, attempts: 3 });
       expect(h.migration.status()).toEqual({ state: "committing" });
-      expect(await h.migration.migrate({ context, subject: null })).toMatchObject({ status: "runtime" });
+      expect(await h.migration.migrate({ context, subject: null, agentModel })).toMatchObject({ status: "runtime" });
       expect(h.record()).toMatchObject({ phase: "moved" });
     });
   });
@@ -466,7 +510,7 @@ describe("ChatThreadRuntimeMigration", () => {
       const h = harness();
       h.org.claimThreadRuntimeAgent.mockRejectedValueOnce(new Error("network lost after write"));
       h.org.getThreadRuntime.mockResolvedValueOnce(ROW);
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "migrated", row: ROW });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "migrated", row: ROW });
       await h.settle();
       expect(deleted()).toEqual([]);
       expect(h.record()).toMatchObject({ phase: "moved" });
@@ -479,10 +523,10 @@ describe("ChatThreadRuntimeMigration", () => {
       const h = harness();
       h.state.history = [user("hi", 5), { role: "assistant", content: [{ type: "text", text: "hello" }], timestamp: 6 }];
       createResponse = async () => new Response("unavailable", { status: 503 });
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "failed" });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "failed" });
       vi.setSystemTime(Date.now() + migrationBackoffMs(1) + 1);
       createResponse = async () => new Response(JSON.stringify({ id: "agt_new" }), { status: 201 });
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "migrated" });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "migrated" });
       // The same import, under each attempt's own key: no two attempts share an agent.
       expect(await bodyText(creates()[1])).toBe(await bodyText(creates()[0]));
       expect(header(creates()[1], "Idempotency-Key")).not.toBe(header(creates()[0], "Idempotency-Key"));
@@ -495,11 +539,11 @@ describe("ChatThreadRuntimeMigration", () => {
       vi.useFakeTimers({ toFake: ["Date"] });
       const h = harness();
       createResponse = async () => new Response("unavailable", { status: 503 });
-      await h.migration.migrate({ context, subject: "u1" });
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "skipped", reason: expect.stringContaining("backoff") });
+      await h.migration.migrate({ context, subject: "u1", agentModel });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "skipped", reason: expect.stringContaining("backoff") });
       expect(creates()).toHaveLength(1);
       vi.setSystemTime(Date.now() + migrationBackoffMs(1) + 1);
-      await h.migration.migrate({ context, subject: "u1" });
+      await h.migration.migrate({ context, subject: "u1", agentModel });
       expect(creates()).toHaveLength(2);
       expect(h.record()).toMatchObject({ phase: "failed", failures: 2 });
       expect(migrationBackoffMs(2)).toBe(2 * migrationBackoffMs(1));
@@ -510,7 +554,7 @@ describe("ChatThreadRuntimeMigration", () => {
     it("refuses a history not even whose newest turn fits, without making an agent", async () => {
       const h = harness();
       h.state.history = [{ role: "user", content: [{ type: "image", data: "A".repeat(MAX_IMPORT_BYTES + 1), mimeType: "image/png" }], timestamp: 1 }];
-      expect(await h.migration.migrate({ context, subject: "u1" })).toEqual({ status: "skipped", reason: "too_large" });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toEqual({ status: "skipped", reason: "too_large" });
       expect(creates()).toHaveLength(0);
       expect(h.migration.state()).toBeNull();
       expect(h.loadHistory).toHaveBeenCalledWith(12_000_000);
@@ -519,7 +563,7 @@ describe("ChatThreadRuntimeMigration", () => {
     it("archives the whole original, streamed from storage, when the import is not all of it", async () => {
       const h = harness();
       h.state.whole = false;
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "migrated", archived: true });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "migrated", archived: true });
       const archive = fetchCalls.find((call) => call.init.method === "PUT")!;
       expect(archive.url).toBe("https://runtime.test/v1/agents/agt_new/uploads/camel-migration/original-transcript.jsonl");
       expect(archived[0]).toBe('{"role":"user","content":"hi"}\n{"role":"assistant"}\n');
@@ -532,23 +576,23 @@ describe("ChatThreadRuntimeMigration", () => {
         { role: "assistant", content: [{ type: "toolCall", id: "tc1", name: "read", arguments: {} }], timestamp: 1 },
         { role: "toolResult", toolCallId: "tc1", toolName: "read", content: [{ type: "text", text: "z".repeat(MAX_TOOL_RESULT_CHARS + 1) }], isError: false, timestamp: 2 },
       ];
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "migrated", archived: true });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "migrated", archived: true });
     });
   });
 
   it("waits out a running turn, and points a relay thread at adoption", async () => {
     const h = harness();
     h.state.busy = "question";
-    expect(await h.migration.migrate({ context, subject: "u1" })).toEqual({ status: "busy", reason: "question" });
+    expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toEqual({ status: "busy", reason: "question" });
     h.state.busy = null;
     h.state.relay = true;
-    expect(await h.migration.migrate({ context, subject: "u1" })).toEqual({ status: "relay" });
+    expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toEqual({ status: "relay" });
     expect(h.record()).toBeUndefined();
   });
 
   it("reports a dry run without holding the thread or making anything", async () => {
     const h = harness();
-    expect(await h.migration.migrate({ context, subject: "u1", dryRun: true })).toMatchObject({ status: "dry_run", lossy: false, stats: { total: 1, imported: 1 } });
+    expect(await h.migration.migrate({ context, subject: "u1", agentModel, dryRun: true })).toMatchObject({ status: "dry_run", lossy: false, stats: { total: 1, imported: 1 } });
     expect(creates()).toHaveLength(0);
     expect(h.record()).toBeUndefined();
   });

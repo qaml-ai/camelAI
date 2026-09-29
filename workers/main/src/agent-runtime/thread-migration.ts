@@ -18,7 +18,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import type { OrgMember, OrgThread, ThreadRuntimeRecord } from "../identity/org-do.js";
 import type { RelayRuntimeAgent } from "./channel-turns.js";
-import { resolveThreadRuntimeRoute } from "./run-gates.js";
+import { RuntimeRunRefused, resolveThreadRuntimeRoute, runtimeAgentModel, syncRouteKeyScope, type RuntimeAgentModel } from "./run-gates.js";
 import { runtimeApi } from "./runtime-api.js";
 import { runtimeDirectThreadsEnabled } from "./thread-runtime.js";
 import { recordRuntimeMigration } from "./runtime-thread-telemetry.js";
@@ -322,7 +322,7 @@ export type RuntimeMigrationResult =
   | { status: "busy"; reason: string }
   | { status: "skipped"; reason: string }
   | { status: "failed"; error: string }
-  | { status: "dry_run"; stats: ConvertedTranscript["stats"]; lossy: boolean; bytes: number };
+  | { status: "dry_run"; stats: ConvertedTranscript["stats"]; lossy: boolean; bytes: number; model?: string; keyScope?: string | null };
 
 /** What ChatThreadDO#migrateToRuntime answers: a result, or "relay" (the worker adopts its agent). */
 export type DoMigrationResult = RuntimeMigrationResult | { status: "relay" };
@@ -331,6 +331,8 @@ export interface DoMigrationRequest {
   context: ChatContextState;
   /** Who the agent acts for (its `subject`). */
   subject: string | null;
+  /** The model the agent runs, as a new thread's agent is made with it (its key scope synced first). */
+  agentModel?: RuntimeAgentModel;
   dryRun?: boolean;
 }
 
@@ -426,14 +428,28 @@ export async function migrateThreadToRuntime(
     if (state === "backoff") return { status: "skipped", reason: "backoff" };
   }
   // A model the runtime cannot run yet (a custom endpoint, Bedrock's OpenAI models) stays here.
+  let resolved: Awaited<ReturnType<typeof resolveThreadRuntimeRoute>>;
   try {
-    const { route } = await resolveThreadRuntimeRoute(env, context, { persistFallback: false });
-    if (!route) return { status: "skipped", reason: "no runtime route for its model" };
+    resolved = await resolveThreadRuntimeRoute(env, context, { persistFallback: false });
   } catch (error) {
     return { status: "skipped", reason: `its model did not resolve: ${error instanceof Error ? error.message : String(error)}` };
   }
+  const { route } = resolved;
+  if (!route) return { status: "skipped", reason: "no runtime route for its model" };
+  // The agent is made on its model's key scope, as a send's would be: the
+  // runtime refuses a create under a scope it does not have. Dry runs check it too.
+  try {
+    await syncRouteKeyScope(env, context, resolved);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return error instanceof RuntimeRunRefused
+      ? { status: "skipped", reason: `${error.code}: ${message}` }
+      : { status: "failed", error: `key scope: ${message}` };
+  }
+  const agentModel = runtimeAgentModel(context, route, resolved.threadModel);
   const subject = await migrationSubject(env, thread, context);
-  const result = await chat.migrateToRuntime({ context, subject, dryRun: options.dryRun });
+  const result = await chat.migrateToRuntime({ context, subject, agentModel, dryRun: options.dryRun });
+  if (result.status === "dry_run") return { ...result, model: agentModel.model, keyScope: agentModel.keyScope };
   if (result.status !== "relay") return result;
   if (options.dryRun) return { status: "skipped", reason: "relay (adopted, no import)" };
   const row = await directRuntimeRow(env, context.orgId, context.threadId, { adopt: true });

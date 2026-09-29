@@ -50,6 +50,17 @@ describe('OrgDO thread_runtime', () => {
     expect(await orgStub.claimThreadRuntimeAgent('missing-thread', 'agt_1')).toBeNull();
   });
 
+  it('records the configuration a claimed agent was made with, only on the claim that wins', async () => {
+    const configuration = { model: 'openrouter/anthropic/claude-sonnet-5', keyScope: 'hosted', configured: { thinkingLevel: 'medium', promptVersion: 4 } };
+    const { orgStub, threadId } = await freshThread();
+    expect(await orgStub.claimThreadRuntimeAgent(threadId, 'agt_1', configuration)).toMatchObject({ claimed: true, row: { agentId: 'agt_1', ...configuration } });
+    expect(await orgStub.claimThreadRuntimeAgent(threadId, 'agt_2', { model: 'other', keyScope: 'org_x', configured: null }))
+      .toMatchObject({ claimed: false, row: { agentId: 'agt_1', ...configuration } });
+    const pinned = await freshThread();
+    await pinned.orgStub.pinThreadRuntime(pinned.threadId);
+    expect(await pinned.orgStub.claimThreadRuntimeAgent(pinned.threadId, 'agt_3', configuration)).toMatchObject({ claimed: true, row: { agentId: 'agt_3', ...configuration } });
+  });
+
   it('records the agent and its configuration, and keeps the first created_at', async () => {
     const { orgStub, threadId } = await freshThread();
     await orgStub.pinThreadRuntime(threadId);

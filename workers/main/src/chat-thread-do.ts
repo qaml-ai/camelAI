@@ -4398,6 +4398,11 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     return this.runtimeMigration.holds(agentId, key);
   }
 
+  /** End a failed move's backoff (the admin retry route): the next open or send may move the thread. */
+  clearRuntimeMigrationBackoff(): boolean {
+    return this.runtimeMigration.clearBackoff();
+  }
+
   /** Where this thread's move to the runtime stands (moving, moved, backing off), before anyone asks for one. */
   runtimeMigrationStatus(): { state: "moving" | "committing" | "moved" | "backoff" | null; retryAt?: number } {
     return this.runtimeMigration.status();

@@ -29,7 +29,8 @@ import type { PreviewTarget } from "../../../../src/types.js";
 import type { ThreadRuntimeRecord } from "../identity/org-do.js";
 import type { PiCoreRevision } from "./pi-core-store.js";
 import { RuntimeApiError, provisionedAgentId, runtimeApi, runtimeUrl } from "../agent-runtime/runtime-api.js";
-import { runtimeSystemPromptAppend } from "../agent-runtime/run-gates.js";
+import { runtimeSystemPromptAppend, type RuntimeAgentModel } from "../agent-runtime/run-gates.js";
+import { RUNTIME_PROMPT_VERSION } from "./runtime-agent.js";
 import {
   ARCHIVE_FILE_NAME,
   ARCHIVE_REQUEST_ID,
@@ -91,6 +92,8 @@ export type RuntimeMigrationRecord =
     previewTabs: PreviewTarget[];
     previewActiveTabId: string | null;
     attempts: number;
+    /** What the agent was made with, recorded on the runtime row it is claimed under. */
+    agentModel?: RuntimeAgentModel;
     stats?: Extract<DoMigrationResult, { status: "migrated" }>["stats"];
     archived?: boolean;
     /** Why the archive the import names is not the original (the runtime would not keep it). */
@@ -142,7 +145,11 @@ export interface RuntimeMigrationDeps {
 
 interface OrgStub {
   setThreadUiState(threadId: string, preview: Record<string, unknown> | null): Promise<unknown>;
-  claimThreadRuntimeAgent(threadId: string, agentId: string): Promise<{ row: ThreadRuntimeRecord; claimed: boolean } | null>;
+  claimThreadRuntimeAgent(
+    threadId: string,
+    agentId: string,
+    configuration?: { model: string | null; keyScope: string | null; configured: Record<string, unknown> | null },
+  ): Promise<{ row: ThreadRuntimeRecord; claimed: boolean } | null>;
   getThreadRuntime(threadId: string): Promise<ThreadRuntimeRecord | null>;
 }
 
@@ -154,14 +161,15 @@ export function migrationBackoffMs(failures: number): number {
 const commitRetryMs = (attempts: number) => Math.min(10 * 60_000, 30_000 * 2 ** attempts);
 
 /**
- * A refusal the runtime will give every time for this history (its validator,
- * its size caps, an archive it will not store): tried again only after a day.
+ * A refusal the runtime will give every time for this history (its import
+ * validator, its size cap): tried again only after a day. Any other refusal
+ * (a key scope or model the runtime lacks: chiridion's configuration, not the
+ * history) is retried on the usual backoff.
  */
 function permanentRefusal(error: unknown): string | null {
   if (!(error instanceof RuntimeApiError)) return null;
   if (error.code === "INVALID_HISTORY" || /INVALID_HISTORY/.test(error.message)) return "invalid_history";
   if (error.status === 413 || error.code === "HISTORY_TOO_LARGE") return "too_large";
-  if (error.status >= 400 && error.status < 500 && ![401, 402, 403, 404, 408, 409, 429].includes(error.status)) return `refused_${error.status}`;
   return null;
 }
 
@@ -236,6 +244,20 @@ export class ChatThreadRuntimeMigration {
     const record = this.read();
     if (record?.phase === "failed" && record.retryAt > now) return { state: "backoff", retryAt: record.retryAt };
     return { state: null };
+  }
+
+  /**
+   * End a failed move's backoff (an operator retrying it): the next open or
+   * send may move the thread at once. What the failed attempt left to delete
+   * stays recorded, and is deleted before the next agent is made. False when
+   * the thread is not backing off.
+   */
+  clearBackoff(now = Date.now()): boolean {
+    const record = this.read();
+    // A deleted thread's record never retries.
+    if (record?.phase !== "failed" || record.retryAt <= now || record.retryAt === Number.MAX_SAFE_INTEGER) return false;
+    this.write({ ...record, retryAt: now });
+    return true;
   }
 
   /**
@@ -329,7 +351,7 @@ export class ChatThreadRuntimeMigration {
       if (!agentId) return { status: "failed", error: "the move's lease ran out" };
       const archive = archived ? await this.archive(leaseId, agentId) : null;
 
-      const prepared = this.prepare(leaseId, agentId, context.orgId, context.threadId);
+      const prepared = this.prepare(leaseId, agentId, context.orgId, context.threadId, request.agentModel);
       if (typeof prepared === "string") {
         this.fail(leaseId, prepared);
         return { status: "busy", reason: prepared };
@@ -426,7 +448,7 @@ export class ChatThreadRuntimeMigration {
    * commit: the lease is still ours and live, no turn runs, and the
    * transcript is the one exported. Returns why not otherwise.
    */
-  private prepare(leaseId: string, agentId: string, orgId: string, threadId: string): Committing | string {
+  private prepare(leaseId: string, agentId: string, orgId: string, threadId: string, agentModel?: RuntimeAgentModel): Committing | string {
     const record = this.lease(leaseId);
     if (!record || record.agentId !== agentId) return "the move's lease ran out";
     const busy = this.deps.busyReason();
@@ -445,6 +467,7 @@ export class ChatThreadRuntimeMigration {
       previewTabs: tabs,
       previewActiveTabId: activeTabId,
       attempts: 0,
+      ...(agentModel ? { agentModel } : {}),
     };
     this.write(committing);
     return committing;
@@ -465,7 +488,15 @@ export class ChatThreadRuntimeMigration {
     const org = this.org(record.orgId);
     let outcome: { row: ThreadRuntimeRecord; claimed: boolean } | null;
     try {
-      outcome = await withTimeout(org.claimThreadRuntimeAgent(record.threadId, record.agentId));
+      // The row records what the agent was made with, as a new thread's does, so its first send reconfigures nothing.
+      const configuration = record.agentModel
+        ? {
+          model: record.agentModel.model,
+          keyScope: record.agentModel.keyScope,
+          configured: { thinkingLevel: record.agentModel.thinkingLevel, promptVersion: RUNTIME_PROMPT_VERSION },
+        }
+        : undefined;
+      outcome = await withTimeout(org.claimThreadRuntimeAgent(record.threadId, record.agentId, configuration));
     } catch (error) {
       const row = await withTimeout(org.getThreadRuntime(record.threadId)).catch(() => undefined);
       if (!row) {
@@ -643,6 +674,10 @@ export class ChatThreadRuntimeMigration {
     const hasHistory = held.messages.length > 0;
     const history = new TextEncoder().encode(JSON.stringify(held.messages)) as Uint8Array<ArrayBuffer>;
     held.messages = [];
+    // Made as a new thread's agent is: on its model and key scope (without
+    // them the runtime falls back to its default model's keys, which the tenant may not have).
+    const agentModel = request.agentModel;
+    if (!agentModel) throw new Error("the move has no model for its agent");
     const key = runtimeMigrationKey(context.threadId, leaseId);
     if (!this.renew(leaseId, { pendingKey: key })) return null;
     const fields = JSON.stringify({
@@ -650,6 +685,10 @@ export class ChatThreadRuntimeMigration {
       name: context.threadId,
       type: "camelai-thread",
       ttlSeconds: null,
+      model: agentModel.model,
+      ...(agentModel.keyScope ? { keyScope: agentModel.keyScope } : {}),
+      ...(agentModel.modelHeaders ? { modelHeaders: agentModel.modelHeaders } : {}),
+      thinkingLevel: agentModel.thinkingLevel,
       systemPromptAppend: runtimeSystemPromptAppend(env, context),
       fileTools: false,
       ...(request.subject ? { subject: request.subject } : {}),

@@ -14,6 +14,8 @@ vi.mock("../src/agent-runtime/runtime-api.js", async (importOriginal) => ({
 
 import { forkRuntimeThread } from "../src/agent-runtime/thread-fork";
 import type { ChatEnv } from "../src/chat-thread/types";
+import { hostedModelHeaders } from "../src/agent-runtime/key-scopes";
+import { RUNTIME_PROMPT_VERSION } from "../src/chat-thread/runtime-agent";
 
 const history = [
   { role: "user", content: "build it", timestamp: 1 },
@@ -59,7 +61,20 @@ describe("forkRuntimeThread", () => {
     expect(body).toMatchObject({ name: "fork1", subject: "u1", context: { org: "org1", workspace: "ws1", thread: "fork1" } });
     expect(headers["Idempotency-Key"]).toMatch(/^fork_fork1_[0-9a-f]{16}$/);
     expect(org.setThreadUiState).toHaveBeenCalledWith("fork1", { tabs: [{ kind: "app", scriptName: "shop", isPublic: true }], activeTabId: "app:shop" });
-    expect(org.claimThreadRuntimeAgent).toHaveBeenCalledWith("fork1", "agt_fork");
+    // Made on its source's model and key scope (the runtime refuses an agent without keys), recorded on its row.
+    expect(body).toMatchObject({ model: "anthropic/claude-sonnet-5-5", keyScope: "org_org1", thinkingLevel: "medium" });
+    expect(body).not.toHaveProperty("modelHeaders");
+    expect(org.claimThreadRuntimeAgent).toHaveBeenCalledWith("fork1", "agt_fork", {
+      model: "anthropic/claude-sonnet-5-5",
+      keyScope: "org_org1",
+      configured: { thinkingLevel: "medium", promptVersion: RUNTIME_PROMPT_VERSION },
+    });
+  });
+
+  it("gives a fork of a hosted thread the hosted model headers for its own thread", async () => {
+    await forkRuntimeThread(fakeEnv().env, { source: { ...SOURCE, keyScope: "hosted", configured: { thinkingLevel: "high" } }, target, forkEntryId: "rt:3" });
+    const [, , , body] = runtimeApiMock.mock.calls.find((call) => call[1] === "POST")!;
+    expect(body).toMatchObject({ keyScope: "hosted", modelHeaders: hostedModelHeaders(target), thinkingLevel: "high" });
   });
 
   it("keeps a forked turn's tool results after its last message", async () => {

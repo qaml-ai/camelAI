@@ -24,7 +24,7 @@ import {
   getEvalTimeoutMs,
   type EvalModelEnv,
 } from "./model-config";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
+import { runRuntimeEval } from "./runtime-eval";
 
 // End-to-end eval for handing the user a generated FILE.
 //
@@ -48,7 +48,6 @@ import type { ChatThreadDO } from "../../src/chat-thread-do";
 // agent misbehaved — check the run log for that message before believing the
 // verdict. Run against a real deploy to exercise this end to end.
 type OutputFileEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   R2_BUCKET: R2Bucket;
   RUN_AGENT_EVALS?: string;
 };
@@ -106,10 +105,7 @@ describe("output file delivery agent eval", () => {
         testEnv.EVAL_MODEL,
       );
 
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

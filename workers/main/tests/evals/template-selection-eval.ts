@@ -1,4 +1,3 @@
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import type { ProjectScaffoldTemplate } from "../../src/project-scaffold";
 import {
   ProjectFilesystemClient,
@@ -23,14 +22,15 @@ import {
 import { configureEvalModel, type EvalModelEnv } from "./model-config";
 import {
   collectRuntimeEvidence,
+  readSkillWithTool,
   toolCallReferences,
   usedTool,
 } from "./project-eval-helpers";
+import { runRuntimeEval } from "./runtime-eval";
 
 export type TemplateSelectionEvalEnv = TestEnv &
   EvalModelEnv &
   EvalSignalEnv & {
-    CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
     WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
     RUN_AGENT_EVALS?: string;
   };
@@ -73,9 +73,6 @@ export async function runTemplateSelectionEval(
     undefined,
     testEnv.EVAL_MODEL,
   );
-  const chatThread = testEnv.CHAT_THREAD.get(
-    testEnv.CHAT_THREAD.idFromName(thread.id),
-  );
   const message = [
     `Create a new project named exactly "${projectName}" with a concise description.`,
     config.prompt,
@@ -83,7 +80,7 @@ export async function runTemplateSelectionEval(
     "Only create the project and inspect enough of its initial files to confirm the starter. Do not edit files, build, deploy, or install dependencies.",
     "Reply with the project name and the starter you selected.",
   ].join(" ");
-  const result = await chatThread.runAgentEvalSession({
+  const result = await runRuntimeEval(testEnv, {
     threadId: thread.id,
     workspaceId: defaultWorkspaceId,
     orgId: org.id,
@@ -113,7 +110,7 @@ export async function runTemplateSelectionEval(
     result.events,
     "read",
     "developing-software/SKILL.md",
-  );
+  ) || readSkillWithTool(result.events, "developing-software");
   const referencedExpectedTemplate = toolCallReferences(
     result.events,
     "create_project",

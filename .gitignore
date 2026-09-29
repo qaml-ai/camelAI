@@ -118,3 +118,6 @@ workers/main/src/embedded-skills.ts
 
 .firecrawl/
 __pycache__/
+
+# local agent runtime for evals (scripts/runtime-eval-harness.mjs)
+.eval-runtime/

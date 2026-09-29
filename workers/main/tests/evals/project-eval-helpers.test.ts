@@ -88,6 +88,12 @@ describe("project eval runtime evidence extraction", () => {
     expect(jsExecCodeMentionsTool('await callTool("list_apps", {});', "list_apps")).toBe(true);
   });
 
+  it("accepts the agent runtime's server-prefixed tool names in code", () => {
+    expect(jsExecCodeMentionsTool("await tools.camel__list_commits({ project: 'p' });", "list_commits")).toBe(true);
+    expect(jsExecCodeMentionsTool("await tools['camel__set_preview']({});", "set_preview")).toBe(true);
+    expect(jsExecCodeMentionsTool("await tools.camel__list_commits_all({});", "list_commits")).toBe(false);
+  });
+
   it("matches direct and js_exec tool calls that reference the expected path", () => {
     const eventFor = (item: Record<string, unknown>) => ({
       type: "runtime_event",

@@ -210,7 +210,9 @@ function jsExecToolCalls(
   code: string,
   toolName: string,
 ): Array<{ index: number; argumentsText: string }> {
-  const escaped = escapeRegex(toolName);
+  // On the agent runtime code reaches chiridion's tools as `tools.camel__<name>`
+  // (its MCP server's name, then `__`); the in-DO loop named them bare.
+  const escaped = `(?:[a-z0-9_]+__)?${escapeRegex(toolName)}`;
   const patterns = [
     new RegExp(`\\btools\\s*\\.\\s*${escaped}\\s*\\(`, "gi"),
     new RegExp("\\btools\\s*\\[\\s*([\"'`])" + escaped + "\\1\\s*\\]\\s*\\(", "gi"),
@@ -368,6 +370,26 @@ export function toolCallReferences(
     return item.isError !== true && !failedOutcome &&
       asString(item.status)?.toLowerCase() === "completed" &&
       runtimeItemToolCallReferences(item, toolName, expectedText);
+  });
+}
+
+/**
+ * Whether the agent read `skill`'s `file` (its SKILL.md by default) with the
+ * read_skill tool, which is how the agent runtime's model reads skills (the
+ * in-DO loop read them as files: `read` of `<skill>/SKILL.md`).
+ */
+export function readSkillWithTool(
+  events: Array<Record<string, unknown>>,
+  skill: string,
+  file = "SKILL.md",
+): boolean {
+  return collectRuntimeItems(events).some((item) => {
+    if (!runtimeItemSucceeded(item) || asString(item.status)?.toLowerCase() !== "completed") return false;
+    const tool = runtimeToolName(item);
+    if (tool !== "read_skill" && !tool?.endsWith("__read_skill")) return false;
+    const args = asRecord(item.arguments);
+    const readFile = asString(args?.file)?.trim() || "SKILL.md";
+    return asString(args?.skill) === skill && readFile === file;
   });
 }
 

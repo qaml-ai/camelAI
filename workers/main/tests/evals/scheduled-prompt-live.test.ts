@@ -23,8 +23,8 @@ import {
   getEvalTimeoutMs,
   type EvalModelEnv,
 } from "./model-config";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import type { WorkspaceCronDO } from "../../src/workspace-cron";
+import { runRuntimeEval } from "./runtime-eval";
 
 // This eval exercises the scheduled-prompt tools (create_scheduled_prompt /
 // list_scheduled_prompts). Those tools live in the "schedules" category, which the lean
@@ -33,7 +33,6 @@ import type { WorkspaceCronDO } from "../../src/workspace-cron";
 // js_exec, the long-tail capability that had no coverage before.
 
 type ScheduledPromptEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   WORKSPACE_CRON: DurableObjectNamespace<WorkspaceCronDO>;
   RUN_AGENT_EVALS?: string;
 };
@@ -73,10 +72,7 @@ describe("scheduled prompt agent eval", () => {
         testEnv.EVAL_MODEL,
       );
 
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

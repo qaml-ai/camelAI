@@ -3,7 +3,6 @@ import { describe, it } from "vitest";
 
 import { isRealEvalDeployEnabled } from "../../src/eval-deploy-context";
 import { ProjectFilesystemClient } from "../../src/workspace-filesystem-do";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import type {
   WorkspaceFilesystemDO,
   WorkspaceProject,
@@ -43,10 +42,10 @@ import {
   getEvalTimeoutMs,
   type EvalModelEnv,
 } from "./model-config";
+import { runRuntimeEval } from "./runtime-eval";
 
 type ProjectUpdateRedeployStateEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
   APP_DB?: D1Database;
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   R2_BUCKET: R2Bucket;
   RUN_AGENT_EVALS?: string;
@@ -427,10 +426,7 @@ describe("project update redeploy state agent eval", () => {
         testEnv.EVAL_MODEL,
       );
 
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const firstResult = await chatThread.runAgentEvalSession({
+      const firstResult = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,
@@ -444,7 +440,7 @@ describe("project update redeploy state agent eval", () => {
           "Use the default deployable React Router scaffold; do not use the data-analysis template.",
           "Implement a Durable Object-backed check-in counter with binding name CHECKINS. GET /api/checkins must return JSON with numeric count and names: string[] of submitted check-in names. POST /api/checkins must accept JSON { name: string }, persist that name in the Durable Object, increment the count, and return JSON with numeric count and names: string[].",
           `Make the root page contain the exact text "${INITIAL_MARKER}".`,
-          `Deploy it using js_exec with await tools.deploy_project({ project: "${PROJECT_NAME}", script_name: "${PROJECT_NAME}" }); deploy_project is not a top-level tool.`,
+          `Deploy it by calling the deploy_project tool directly with { project: "${PROJECT_NAME}", script_name: "${PROJECT_NAME}" } (not from js_exec: its 120-second limit is shorter than a deploy).`,
           "Do not use legacy VM work, create-worker, wrangler deploy, or bun run deploy for this DO-backed project.",
           "Leave live-app verification to the eval harness, which will verify the public app and seed one live check-in before asking for the update.",
           "When done, reply with the deployed URL.",
@@ -463,7 +459,7 @@ describe("project update redeploy state agent eval", () => {
       }
       const seedSmoke = await seedLiveCheckinState(firstDeployedApp);
 
-      const secondResult = await chatThread.runAgentEvalSession({
+      const secondResult = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,
@@ -476,7 +472,7 @@ describe("project update redeploy state agent eval", () => {
           `The eval harness has now called the live deployed app's POST /api/checkins once. The Durable Object count should be at least 1.`,
           `Update only the user-visible root page marker to exact text "${UPDATED_MARKER}" and remove "${INITIAL_MARKER}" from the page.`,
           "Preserve the same Durable Object binding name CHECKINS, Durable Object class, API behavior, and migrations so existing live state is preserved.",
-          `Redeploy the same project using js_exec with await tools.deploy_project({ project: "${PROJECT_NAME}", script_name: "${PROJECT_NAME}" }) again, using the same script_name.`,
+          `Redeploy the same project by calling the deploy_project tool directly with { project: "${PROJECT_NAME}", script_name: "${PROJECT_NAME}" } again, using the same script_name (not from js_exec: its 120-second limit is shorter than a deploy).`,
           "Do not use legacy VM work, create-worker, wrangler deploy, bun run deploy, rollback_deploy, or a new project.",
           "Leave live-app verification to the eval harness, which will verify the updated marker and current Durable Object count after the redeploy.",
           "When done, reply with the deployed URL and state that the existing Durable Object data was preserved by keeping the same binding/class/migrations.",

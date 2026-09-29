@@ -29,11 +29,10 @@ import {
   usedTool,
 } from "./project-eval-helpers";
 import { ProjectFilesystemClient } from "../../src/workspace-filesystem-do";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import type { WorkspaceFilesystemDO } from "../../src/workspace-filesystem-do";
+import { runRuntimeEval } from "./runtime-eval";
 
 type ProjectSnapshotRevertEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   R2_BUCKET: R2Bucket;
   RUN_AGENT_EVALS?: string;
@@ -105,10 +104,7 @@ describe("project snapshot revert agent eval", () => {
       });
       await projectFiles.writeFile("/README.md", BROKEN_README);
 
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,
@@ -119,8 +115,8 @@ describe("project snapshot revert agent eval", () => {
         timeoutMs: SESSION_TIMEOUT_MS,
         message: [
           `The existing DO-backed project named "${PROJECT_NAME}" has a broken README edit.`,
-          `Use js_exec to call await tools.list_commits({ project: "${PROJECT_NAME}" }) and find the source snapshot with message exactly "${BASELINE_MESSAGE}"; list_commits is not a top-level tool.`,
-          `Use js_exec to call await tools.revert_project({ project: "${PROJECT_NAME}", snapshot_id }) to restore that snapshot; revert_project is not a top-level tool. Do not deploy or run build/deploy commands.`,
+          `Use js_exec to call await tools.camel__list_commits({ project: "${PROJECT_NAME}" }) and find the source snapshot with message exactly "${BASELINE_MESSAGE}"; list_commits is not a top-level tool.`,
+          `Use js_exec to call await tools.camel__revert_project({ project: "${PROJECT_NAME}", snapshot_id }) to restore that snapshot; revert_project is not a top-level tool. Do not deploy or run build/deploy commands.`,
           "After reverting, read /README.md from the project and reply with the restored marker.",
         ].join(" "),
       });

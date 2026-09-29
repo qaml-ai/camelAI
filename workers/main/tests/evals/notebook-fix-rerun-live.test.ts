@@ -3,7 +3,6 @@ import { describe, it } from "vitest";
 
 import { defaultProjectScaffoldFiles } from "../../src/project-scaffold";
 import { ProjectFilesystemClient } from "../../src/workspace-filesystem-do";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import type {
   WorkspaceFilesystemDO,
   WorkspaceProject,
@@ -37,9 +36,9 @@ import {
   legacyDeployPathEvidence,
   usedTool,
 } from "./project-eval-helpers";
+import { runRuntimeEval } from "./runtime-eval";
 
 type NotebookFixRerunEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   R2_BUCKET: R2Bucket;
   RUN_AGENT_EVALS?: string;
@@ -240,10 +239,7 @@ describe("notebook fix and rerun agent eval", () => {
         testEnv.EVAL_MODEL,
       );
 
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

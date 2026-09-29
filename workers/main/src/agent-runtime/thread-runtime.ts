@@ -78,8 +78,14 @@ export function runtimeDirectThreadsEnabled(env: Partial<ChatEnv>): boolean {
  * Pin a new thread to the runtime, when its model has a runtime route. The
  * row is the thread's backend from then on. Null: the thread cannot run (the
  * runtime is not configured, or its model has no route there).
+ * `pendingFirstMessage`: the first message the thread's page sends (as its
+ * creator), kept on the row until a send is accepted.
  */
-export async function pinNewThreadToRuntime(env: ChatEnv, context: ChatContextState): Promise<ThreadRuntimeRecord | null> {
+export async function pinNewThreadToRuntime(
+  env: ChatEnv,
+  context: ChatContextState,
+  options: { pendingFirstMessage?: string | null } = {},
+): Promise<ThreadRuntimeRecord | null> {
   if (!runtimeDirectThreadsEnabled(env)) return null;
   let route: Awaited<ReturnType<typeof resolveThreadRuntimeRoute>>["route"];
   try {
@@ -90,7 +96,7 @@ export async function pinNewThreadToRuntime(env: ChatEnv, context: ChatContextSt
   }
   if (!route) return null;
   const org = orgStub(env, context.orgId);
-  if (!await org.pinThreadRuntime(context.threadId)) return null;
+  if (!await org.pinThreadRuntime(context.threadId, options.pendingFirstMessage ?? null)) return null;
   return await org.getThreadRuntime(context.threadId);
 }
 
@@ -98,7 +104,8 @@ function orgStub(env: ChatEnv, orgId: string) {
   return env.ORG.get(env.ORG.idFromName(orgId)) as unknown as {
     getThread(id: string): Promise<{ created_by?: string | null } | null>;
     getThreadRuntime(threadId: string): Promise<ThreadRuntimeRecord | null>;
-    pinThreadRuntime(threadId: string): Promise<boolean>;
+    pinThreadRuntime(threadId: string, pendingFirstMessage?: string | null): Promise<boolean>;
+    clearThreadPendingFirstMessage(threadId: string): Promise<void>;
     setThreadRuntimeAgent(threadId: string, update: {
       agentId: string;
       model: string | null;
@@ -462,6 +469,14 @@ async function sendRuntimeTurn(
   // run events (routes/agent-runtime-events.ts), for every run however started;
   // runs no message of ours started (a resume after an input) find the thread here.
   input.waitUntil(rememberAgentThread(env, agentId, context));
+  // The thread's first message, kept for its page to send, is sent now (by
+  // this send, or superseded by it).
+  if (input.row.pendingFirstMessage) {
+    input.waitUntil(
+      onceMore("clear_pending_first_message", () => orgStub(env, context.orgId).clearThreadPendingFirstMessage(context.threadId))
+        .catch((error: unknown) => console.error("[runtime-thread] failed to clear the thread's pending first message", error)),
+    );
+  }
   input.waitUntil(
     threadMetadata(env, context, input.waitUntil).updateThreadMetadataForUserMessage(text, input.source ?? "web").catch((error) => {
       console.error("[runtime-thread] failed to update thread metadata after a user message", error);

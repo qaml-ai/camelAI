@@ -14,16 +14,14 @@ import {
   mintRuntimeBrowserToken,
   pinNewThreadToRuntime,
   runtimeHistoryPage,
-  startRuntimeTurn,
   type RuntimeThreadSender,
-  type RuntimeTurnResult,
 } from "../../workers/main/src/agent-runtime/thread-runtime";
 import type { RuntimeThreadSeed } from "@/lib/use-runtime-thread";
-import { recordRuntimeMigration, recordRuntimeSendFailure, recordRuntimeTokenMintFailure } from "../../workers/main/src/agent-runtime/runtime-thread-telemetry";
+import { recordRuntimeMigration, recordRuntimeTokenMintFailure } from "../../workers/main/src/agent-runtime/runtime-thread-telemetry";
 import { classifyMove, migrateThreadToRuntime, type UnmovableReason } from "../../workers/main/src/agent-runtime/thread-migration";
 import type { ChatThreadReadOnlyHistory } from "../../workers/main/src/chat-thread-do";
 import { normalizePreviewTabs } from "../../workers/main/src/chat-thread/preview-state";
-import { initialRuntimeRequestId, requireSameOriginJson, runtimeReadProxyBase, startErrorStillCurrent } from "@/lib/agent-runtime-shared";
+import { requireSameOriginJson, runtimeReadProxyBase, startErrorStillCurrent } from "@/lib/agent-runtime-shared";
 
 export interface RuntimeThreadAccess {
   env: ChatEnv;
@@ -152,7 +150,7 @@ export async function loadRuntimeThreadSeed(
   };
 }
 
-/** Why a runtime thread's first message was refused (recorded by startFirstRuntimeTurn), or null. */
+/** Why a runtime thread's first message was refused, as an earlier release recorded it on the thread, or null. */
 async function runtimeStartError(
   org: unknown,
   threadId: string,
@@ -249,53 +247,12 @@ export async function readOnlyThreadHistory(
 
 /**
  * A new web thread, just created: pinned to the runtime (its model must have
- * a runtime route). Null: it cannot run.
+ * a runtime route), with the first message its page sends. Null: it cannot run.
  */
 export async function pinNewWebThread(
   loadContext: AppLoadContext,
   context: ChatContextState,
+  options: { pendingFirstMessage?: string | null } = {},
 ): Promise<ThreadRuntimeRecord | null> {
-  return await pinNewThreadToRuntime(getEnv(loadContext) as unknown as ChatEnv, context);
-}
-
-/**
- * A new runtime thread's first message, sent before the page redirects to it
- * (so the page finds the agent and the message on its first read).
- */
-export async function startFirstRuntimeTurn(
-  loadContext: AppLoadContext,
-  input: {
-    context: ChatContextState;
-    row: ThreadRuntimeRecord;
-    sender: RuntimeThreadSender;
-    text: string;
-    waitUntil(promise: Promise<unknown>): void;
-  },
-): Promise<RuntimeTurnResult> {
-  const env = getEnv(loadContext) as unknown as ChatEnv;
-  let turn: RuntimeTurnResult;
-  try {
-    turn = await startRuntimeTurn(env, {
-      ...input,
-      clientMessageId: initialRuntimeRequestId(input.context.threadId),
-      source: "web",
-    });
-    recordRuntimeSendFailure(env, input.context, "first_send", { result: turn });
-  } catch (error) {
-    recordRuntimeSendFailure(env, input.context, "first_send", { error });
-    turn = { status: "error", error: error instanceof Error ? error.message : "Failed to send message" };
-  }
-  if (turn.status !== "accepted") {
-    // Nobody is on the page yet: keep the refusal on the thread, where its
-    // page reads it (loadRuntimeThreadSeed) and shows it as the DO path does.
-    await env.ORG.get(env.ORG.idFromName(input.context.orgId))
-      .recordThreadError(input.context.threadId, {
-        message: turn.error,
-        source: "agent_runtime_start",
-        errorKind: turn.code ?? turn.status,
-        userId: input.sender.userId,
-      })
-      .catch((error: unknown) => console.error("[runtime-thread] failed to record a refused first message", error));
-  }
-  return turn;
+  return await pinNewThreadToRuntime(getEnv(loadContext) as unknown as ChatEnv, context, options);
 }

@@ -14,7 +14,6 @@ const addThreadToExistingGroupMock = vi.fn();
 const addThreadToExistingGroupLightweightMock = vi.fn();
 const startInitialUserMessageMock = vi.fn();
 const pinNewWebThreadMock = vi.fn();
-const startFirstRuntimeTurnMock = vi.fn();
 const CLIENT_BUILD_ID = 'development';
 
 vi.mock('@/lib/wait-until', () => ({
@@ -54,7 +53,6 @@ vi.mock('@/lib/chat-do.server', () => ({
 
 vi.mock('@/lib/runtime-threads.server', () => ({
   pinNewWebThread: pinNewWebThreadMock,
-  startFirstRuntimeTurn: startFirstRuntimeTurnMock,
 }));
 
 vi.mock('@/lib/chat-groups.server', () => ({
@@ -125,7 +123,6 @@ describe('new chat create action', () => {
     });
     startInitialUserMessageMock.mockResolvedValue({ status: 'accepted' });
     pinNewWebThreadMock.mockResolvedValue({ threadId: 'thread_123', agentId: null, model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 });
-    startFirstRuntimeTurnMock.mockResolvedValue({ status: 'accepted', requestId: 'initial:thread_123', agentId: 'agt_1', fallback: null });
   });
 
   it('does not use the first user message as the initial chat group name', async () => {
@@ -197,11 +194,10 @@ describe('new chat create action', () => {
 
     expect(response.status).toBeGreaterThanOrEqual(400);
     expect(deleteThreadMock).toHaveBeenCalledWith({}, 'thread_123', 'ws_123', { orgId: 'org_123' });
-    expect(startFirstRuntimeTurnMock).not.toHaveBeenCalled();
     expect(startInitialUserMessageMock).not.toHaveBeenCalled();
   });
 
-  it('starts a runtime thread\'s first message on the runtime before redirecting, with no ChatThreadDO', async () => {
+  it('redirects without sending, keeping the first message on the thread\'s runtime row for its page to send', async () => {
     const row = { threadId: 'thread_123', agentId: null, model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
     pinNewWebThreadMock.mockResolvedValue(row);
     const formData = makeCreateThreadFormData();
@@ -224,13 +220,9 @@ describe('new chat create action', () => {
       userName: 'Ada Lovelace',
       userEmail: 'ada@example.com',
     };
-    expect(pinNewWebThreadMock).toHaveBeenCalledWith({}, threadContext);
-    expect(startFirstRuntimeTurnMock).toHaveBeenCalledWith({}, expect.objectContaining({
-      context: threadContext,
-      row,
-      sender: { userId: 'user_123', userName: 'Ada Lovelace', userEmail: 'ada@example.com' },
-      text: 'Build an analytics dashboard',
-    }));
+    expect(pinNewWebThreadMock).toHaveBeenCalledWith({}, threadContext, {
+      pendingFirstMessage: 'Build an analytics dashboard',
+    });
     expect(startInitialUserMessageMock).not.toHaveBeenCalled();
     // The runtime turn's own bookkeeping generates the title.
     expect(generateThreadTitleMock).not.toHaveBeenCalled();
@@ -265,9 +257,9 @@ describe('new chat create action', () => {
       'sonnet',
     );
     expect(createThreadMock).not.toHaveBeenCalled();
-    expect(startFirstRuntimeTurnMock).toHaveBeenCalledWith({}, expect.objectContaining({
-      text: 'Build from an old tab',
-    }));
+    expect(pinNewWebThreadMock).toHaveBeenCalledWith({}, expect.anything(), {
+      pendingFirstMessage: 'Build from an old tab',
+    });
     expect(createGroupForNewThreadLightweightMock).toHaveBeenCalledWith(
       {},
       expect.objectContaining({

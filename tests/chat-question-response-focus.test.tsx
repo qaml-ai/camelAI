@@ -507,6 +507,51 @@ describe("Chat AskUserQuestion composer focus", () => {
     expect(prompt).toHaveValue("");
   });
 
+  it("sends a new thread's first message from the page, under its initial id, once", async () => {
+    render(
+      <Chat
+        threadId="thread-1"
+        workspaceId="ws-1"
+        initialMessages={[]}
+        initialSend={{ clientMessageId: "initial_thread-1", text: "Build a dashboard" }}
+      />,
+    );
+
+    const agent = getMainAgent();
+    agent.call.mockResolvedValue({ status: "accepted" });
+    act(() => agent.emitOpen());
+
+    await waitFor(() => {
+      expect(agent.call).toHaveBeenCalledWith(
+        "sendMessage",
+        ["Build a dashboard", "initial_thread-1"],
+        { timeout: 15_000 },
+      );
+    });
+    // A reopen after it was accepted does not send it again.
+    act(() => agent.emitOpen());
+    expect(agent.call.mock.calls.filter(([method]) => method === "sendMessage")).toHaveLength(1);
+    expect(screen.getByLabelText("Prompt")).toHaveValue("");
+  });
+
+  it("puts a refused first message back in the composer with its error", async () => {
+    render(
+      <Chat
+        threadId="thread-1"
+        workspaceId="ws-1"
+        initialMessages={[]}
+        initialSend={{ clientMessageId: "initial_thread-1", text: "Build a dashboard" }}
+      />,
+    );
+
+    const agent = getMainAgent();
+    agent.call.mockResolvedValueOnce({ status: "error", error: "Your organization is out of credits." });
+    act(() => agent.emitOpen());
+
+    await waitFor(() => expect(screen.getByLabelText("Prompt")).toHaveValue("Build a dashboard"));
+    expect(await screen.findByText(/out of credits/)).toBeInTheDocument();
+  });
+
   it("shows the provider message for a rate-limit error via agent state", async () => {
     render(
       <Chat

@@ -168,6 +168,11 @@ import { isManualCompactCommand } from "@/lib/slash-commands";
 import { buildAppThreadFallbackTitle } from "@/lib/thread-title";
 import { buildAppWorkSystemMessage } from "@/lib/app-chat-context";
 import { normalizeThreadPreviewUserMessage } from "@/lib/thread-preview";
+import {
+  clearNewChatSubmitted,
+  markNewChatSubmitted,
+  trackNewChatStage,
+} from "@/lib/new-chat-timing";
 import { trackNewCamelActivationAfterAcceptedMessage } from "@/lib/marketing-attribution.client";
 import {
   getDefaultLlmModel,
@@ -359,6 +364,12 @@ interface ChatBaseProps {
   backend?: "runtime" | "pending";
   /** A runtime thread's first-paint data from the loader. */
   runtimeSeed?: RuntimeThreadSeed | null;
+  /**
+   * A new thread's first message, not yet accepted: this page sends it as
+   * its creator, through the normal send path under this clientMessageId
+   * (idempotent, so a reload or a second tab resends the same request).
+   */
+  initialSend?: { clientMessageId: string; text: string } | null;
 }
 
 interface ChatWelcomeData {
@@ -682,6 +693,7 @@ export default function Chat({
   onSnapshotChange,
   backend = "runtime",
   runtimeSeed = null,
+  initialSend = null,
   welcomeData,
 }: ChatProps) {
   const threadModel =
@@ -830,6 +842,10 @@ export default function Chat({
     null,
   );
   const isStreaming = piChat.isStreaming;
+  // A new chat's first streamed output (its reasoning, or its reply).
+  useEffect(() => {
+    if (piChat.status === "streaming") trackNewChatStage(threadId, "first_output");
+  }, [piChat.status, threadId]);
   const isStreamingRef = useRef(false);
   isStreamingRef.current = isStreaming;
 
@@ -1493,6 +1509,7 @@ export default function Chat({
       return;
     }
     handledNewChatActionErrorRef.current = newChatActionError;
+    clearNewChatSubmitted();
 
     const pendingSubmission = pendingNewThreadSubmissionRef.current;
     pendingNewThreadSubmissionRef.current = null;
@@ -2720,6 +2737,7 @@ export default function Chat({
         .then((result) => {
           if (result.status === "accepted") {
             sendTracker.accepted();
+            trackNewChatStage(activeThreadId, "first_send_accepted");
             void trackNewCamelActivationAfterAcceptedMessage();
           } else {
             sendTracker.rejected(result.status ?? "error");
@@ -3132,6 +3150,78 @@ export default function Chat({
     readOnly,
     setMessages,
     syncCompactionIndicator,
+  ]);
+
+  // A new thread's first message (the new-chat action redirected before
+  // sending it): queue it as this tab's own send. The transport's open flushes
+  // it through sendPendingMessageToAgent, which retries transport failures
+  // under the same id and, on a refusal, shows the error and puts the message
+  // back in the composer to send again. Runs after the reset above.
+  const queuedInitialSendRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    if (!initialSend || !threadId || readOnly || !agentEnabled) return;
+    const { clientMessageId, text } = initialSend;
+    if (queuedInitialSendRef.current === clientMessageId) return;
+    queuedInitialSendRef.current = clientMessageId;
+    if (isPendingMessageAccepted(clientMessageId)) return;
+    const authorDisplayName = resolveMessageAuthorDisplayName(
+      user?.name,
+      user?.email,
+    );
+    const userMsg: Message = {
+      id: clientMessageId,
+      clientMessageId,
+      thread_id: threadId,
+      role: "user",
+      content: text,
+      created_at: Date.now(),
+      ...(authorDisplayName ? { authorDisplayName } : {}),
+      messageSource: "web",
+    };
+    // Restored to the composer if the send is refused (the thread keeps its
+    // own copy until a send is accepted).
+    if (resolvedWorkspaceId) {
+      pendingDraftCountRef.current++;
+      pendingDeliveryDraftRef.current = {
+        workspaceId: resolvedWorkspaceId,
+        threadId,
+        clientMessageId,
+        text,
+        attachments: [],
+        acceptedAt: null,
+      };
+    }
+    const has = (list: Message[]) =>
+      list.some(
+        (message) =>
+          message.id === clientMessageId ||
+          message.clientMessageId === clientMessageId,
+      );
+    setMessages((prev) => (has(prev) ? prev : [...prev, userMsg]));
+    setPendingMessages((prev) => (has(prev) ? prev : [...prev, userMsg]));
+    setLoading(true);
+    trackNewChatStage(threadId, "thread_visible");
+    const previewUserMessage = normalizeThreadPreviewUserMessage(text);
+    const at = Date.now();
+    dispatchLocalThreadStatus(threadId, "running", {
+      latestUserMessage: previewUserMessage,
+      latestUserMessageAt: at,
+      firstUserMessage: previewUserMessage,
+      runningActivityText: previewUserMessage,
+      runningActivityAt: at,
+      runningStartedAt: at,
+    });
+  }, [
+    agentEnabled,
+    initialSend,
+    isPendingMessageAccepted,
+    readOnly,
+    resolvedWorkspaceId,
+    setMessages,
+    setPendingMessages,
+    threadId,
+    user?.email,
+    user?.name,
   ]);
 
   useEffect(() => {
@@ -3891,6 +3981,7 @@ export default function Chat({
       });
       const threadTitle = buildAppThreadFallbackTitle(app.script_name);
 
+      markNewChatSubmitted();
       submit(
         {
           intent: "createThreadAndStart",
@@ -3960,8 +4051,9 @@ export default function Chat({
     // image previews without rebuilding local object URLs.
     setAttachments([]);
 
-    // Submit as a navigational route action. The action creates the thread,
-    // starts the first turn in the ChatThreadDO, then redirects to the thread.
+    // Submit as a navigational route action. The action creates the thread
+    // (keeping the first message on it) and redirects at once; the thread's
+    // page sends the message (see `initialSend`).
     const createThreadPayload: Record<string, string> = {
       intent: "createThreadAndStart",
       clientBuildId: APP_BUILD_ID,
@@ -3974,6 +4066,7 @@ export default function Chat({
       createThreadPayload.firstMessage = finalContent;
     }
 
+    markNewChatSubmitted();
     submit(createThreadPayload, {
       method: "post",
       action: "/chat",

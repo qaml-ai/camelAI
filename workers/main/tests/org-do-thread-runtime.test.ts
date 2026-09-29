@@ -35,6 +35,21 @@ describe('OrgDO thread_runtime', () => {
     expect(await orgStub.pinThreadRuntime('missing-thread')).toBe(false);
   });
 
+  it('keeps a new thread\'s first message until a send clears it, across its agent being recorded', async () => {
+    const { orgStub, threadId } = await freshThread();
+    expect(await orgStub.pinThreadRuntime(threadId, 'Build me a dashboard')).toBe(true);
+    // Pinning again (a retried create) keeps the message it has.
+    expect(await orgStub.pinThreadRuntime(threadId, 'something else')).toBe(true);
+    expect(await orgStub.getThreadRuntime(threadId)).toMatchObject({ pendingFirstMessage: 'Build me a dashboard' });
+    await orgStub.setThreadRuntimeAgent(threadId, { agentId: 'agt_1', model: 'm', keyScope: 'hosted', configured: null });
+    expect(await orgStub.getThreadRuntime(threadId)).toMatchObject({ agentId: 'agt_1', pendingFirstMessage: 'Build me a dashboard' });
+    await orgStub.clearThreadPendingFirstMessage(threadId);
+    expect(await orgStub.getThreadRuntime(threadId)).toMatchObject({ agentId: 'agt_1', pendingFirstMessage: null });
+    const blank = await freshThread();
+    await blank.orgStub.pinThreadRuntime(blank.threadId, '   ');
+    expect(await blank.orgStub.getThreadRuntime(blank.threadId)).toMatchObject({ pendingFirstMessage: null });
+  });
+
   it('claims a moving thread for one agent only (compare-and-set)', async () => {
     const { orgStub, threadId } = await freshThread();
     const first = await orgStub.claimThreadRuntimeAgent(threadId, 'agt_1');

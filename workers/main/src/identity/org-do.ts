@@ -613,6 +613,13 @@ export interface ThreadRuntimeRecord {
   keyScope: string | null;
   /** The rest of the configuration last applied (thinking level, model headers, …). */
   configured: Record<string, unknown> | null;
+  /**
+   * The new thread's first message, kept from its creation until a send to
+   * the thread is accepted: the thread's page sends it (as its creator), so
+   * starting a chat never waits on the runtime, and a message whose send
+   * failed, or whose tab closed first, is still there to send.
+   */
+  pendingFirstMessage?: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -637,6 +644,7 @@ type ThreadRuntimeRow = {
   model: string | null;
   key_scope: string | null;
   configured_json: string | null;
+  pending_first_message?: string | null;
   created_at: number;
   updated_at: number;
 };
@@ -658,6 +666,7 @@ function threadRuntimeRecord(row: ThreadRuntimeRow): ThreadRuntimeRecord {
     model: row.model,
     keyScope: row.key_scope,
     configured: parseJsonObject(row.configured_json),
+    pendingFirstMessage: row.pending_first_message ?? null,
     createdAt: Number(row.created_at) || 0,
     updatedAt: Number(row.updated_at) || 0,
   };
@@ -2525,6 +2534,18 @@ export class OrgDO extends DurableObject<DOEnv> {
            SELECT COALESCE(SUM(cost_usd), 0) FROM usage_log WHERE credit_chargeable = 1
          ) WHERE id = 1`,
       );
+    }
+
+    // thread_runtime.pending_first_message: a new thread's first message until
+    // a send is accepted (the thread's page sends it). Keyed on the column.
+    const threadRuntimeColumns = this.sql
+      .exec<{ name: string }>("PRAGMA table_info(thread_runtime)")
+      .toArray();
+    if (
+      threadRuntimeColumns.length > 0 &&
+      !threadRuntimeColumns.some((column) => column.name === "pending_first_message")
+    ) {
+      this.sql.exec("ALTER TABLE thread_runtime ADD COLUMN pending_first_message TEXT");
     }
 
     const CURRENT_SCHEMA_VERSION = 53;
@@ -8629,7 +8650,7 @@ export class OrgDO extends DurableObject<DOEnv> {
   getThreadRuntime(threadId: string): ThreadRuntimeRecord | null {
     const row = this.sql
       .exec<ThreadRuntimeRow>(
-        "SELECT thread_id, agent_id, model, key_scope, configured_json, created_at, updated_at FROM thread_runtime WHERE thread_id = ?",
+        "SELECT thread_id, agent_id, model, key_scope, configured_json, pending_first_message, created_at, updated_at FROM thread_runtime WHERE thread_id = ?",
         threadId,
       )
       .toArray()[0];
@@ -8667,19 +8688,30 @@ export class OrgDO extends DurableObject<DOEnv> {
   }
 
   /**
-   * Pin a thread to the runtime (before it has an agent). Idempotent; false
-   * when the thread does not exist.
+   * Pin a thread to the runtime (before it has an agent), with the first
+   * message its page sends, for a new thread started with one. Idempotent
+   * (a row already there keeps its message); false when the thread does not
+   * exist.
    */
-  pinThreadRuntime(threadId: string): boolean {
+  pinThreadRuntime(threadId: string, pendingFirstMessage?: string | null): boolean {
     if (!this.getThread(threadId)) return false;
     const now = Date.now();
     this.sql.exec(
-      "INSERT OR IGNORE INTO thread_runtime (thread_id, created_at, updated_at) VALUES (?, ?, ?)",
+      "INSERT OR IGNORE INTO thread_runtime (thread_id, pending_first_message, created_at, updated_at) VALUES (?, ?, ?, ?)",
       threadId,
+      pendingFirstMessage?.trim() ? pendingFirstMessage : null,
       now,
       now,
     );
     return true;
+  }
+
+  /** A send to the thread was accepted: its first message is no longer pending. */
+  clearThreadPendingFirstMessage(threadId: string): void {
+    this.sql.exec(
+      "UPDATE thread_runtime SET pending_first_message = NULL WHERE thread_id = ? AND pending_first_message IS NOT NULL",
+      threadId,
+    );
   }
 
   /**

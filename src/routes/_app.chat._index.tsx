@@ -23,7 +23,6 @@ import {
   getDevBillingCreditStatus,
   getDevChatInitialError,
 } from "@/lib/chat-credit-status";
-import { waitUntil } from "@/lib/wait-until";
 import { getAuthEnv } from "@/lib/auth-helpers";
 import type { MentionableProject } from "@/lib/mentions";
 import { getWorkerScript } from "@/lib/auth-do";
@@ -764,12 +763,28 @@ export async function action({ request, context }: Route.ActionArgs) {
         userName: session.user_name ?? null,
         userEmail: session.user_email ?? null,
       };
+      const pinStartedAt = Date.now();
+      // The first message is kept on the thread's runtime row, and the thread's
+      // page sends it through the normal send path (idempotent by its
+      // clientMessageId): the redirect never waits on the runtime, a failed
+      // send shows on the page with the message restored, and a tab closed
+      // before it sent leaves the message there to send when the thread opens.
       const runtimeRow = await runtimeThreads
-        .pinNewWebThread(context, threadContext)
+        .pinNewWebThread(context, threadContext, {
+          pendingFirstMessage: shouldStartAndRedirect ? firstMessage : null,
+        })
         .catch((error: unknown) => {
           console.error("Failed to pin a new thread to the agent runtime:", error);
           return null;
         });
+      recordChatCreateThreadStage(
+        env,
+        traceContext,
+        traceIds,
+        "runtime_pinned",
+        pinStartedAt,
+        { status: runtimeRow ? "ok" : "unavailable", model: thread.model },
+      );
       if (!runtimeRow) {
         await chatDO.deleteThread(context, thread.id, workspaceId, { orgId }).catch(() => {});
         throw new Error("This chat's model is not available right now. Pick another model and try again.");
@@ -867,47 +882,6 @@ export async function action({ request, context }: Route.ActionArgs) {
           count: group.member_count,
         },
       );
-
-      if (shouldStartAndRedirect && firstMessage) {
-        // Sent before the redirect, so the thread page finds the agent and the
-        // message on its first read.
-        const initialStartStartedAt = Date.now();
-        try {
-          const turn = await runtimeThreads.startFirstRuntimeTurn(context, {
-            context: threadContext,
-            row: runtimeRow,
-            sender: {
-              userId,
-              userName: session.user_name ?? null,
-              userEmail: session.user_email ?? null,
-            },
-            text: firstMessage,
-            waitUntil,
-          });
-          recordChatCreateThreadStage(
-            env,
-            traceContext,
-            traceIds,
-            "initial_message_start_completed",
-            initialStartStartedAt,
-            { model: thread.model, status: turn.status, size: firstMessage.length },
-          );
-          if (turn.status !== "accepted") {
-            console.error("Failed to start initial runtime message:", turn.error);
-          }
-        } catch (error) {
-          console.error("Failed to start initial runtime message:", error);
-          recordChatCreateThreadError(
-            env,
-            traceContext,
-            traceIds,
-            "initial_message_start_completed",
-            initialStartStartedAt,
-            error,
-            { model: thread.model, size: firstMessage.length },
-          );
-        }
-      }
 
       if (shouldStartAndRedirect) {
         const nextUrl = new URL(

@@ -51,6 +51,7 @@ import type { ProxyAuthValidationEnv } from "../../workers/main/src/helpers/prox
 import { getChatDebugFlags } from "@/lib/chat-debug-flags";
 import { shouldRevalidateActiveChatRoute } from "@/lib/chat-route-revalidation";
 import { resolveMessageAuthorDisplayName } from "@/lib/message-author";
+import { initialRuntimeRequestId } from "@/lib/agent-runtime-shared";
 import {
   saveChatGroupRename,
   type ChatGroupRenameInput,
@@ -814,8 +815,27 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
         thread.created_by === authContext.user.id ? authContext.user : null,
       )
     : null;
-  const chatDataSeed: ChatData = seededFirstMessage && runtime
-    ? { ...EMPTY_CHAT_DATA, messages: [seededFirstMessage] }
+  // A new thread's first message, kept on its runtime row until a send is
+  // accepted: its creator's page sends it (Chat's initialSend), under the id
+  // that makes every resend the same request.
+  const pendingFirstMessage = runtime?.pendingFirstMessage?.trim()
+    ? runtime.pendingFirstMessage
+    : null;
+  const initialSend =
+    pendingFirstMessage && actingUserId && thread.created_by === actingUserId
+      ? { clientMessageId: initialRuntimeRequestId(params.id), text: pendingFirstMessage }
+      : null;
+  // Painted under the send's id, so the page's own bubble for it takes over
+  // without a flicker when the loader's seed gives way.
+  const seededMessage = initialSend
+    ? {
+        ...threadRecordFirstUserMessage(params.id, initialSend.text, authContext.user),
+        id: initialSend.clientMessageId,
+        clientMessageId: initialSend.clientMessageId,
+      }
+    : seededFirstMessage;
+  const chatDataSeed: ChatData = seededMessage && runtime
+    ? { ...EMPTY_CHAT_DATA, messages: [seededMessage] }
     : EMPTY_CHAT_DATA;
   const chatDataStartedAt = Date.now();
   const chatData: ChatDataValue = thread
@@ -948,6 +968,7 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
     moveChatGroups,
     chatDataSeed,
     runtimeThread: Boolean(runtime),
+    initialSend,
   };
 }
 
@@ -981,6 +1002,7 @@ export default function ChatPage() {
     moveChatGroups = [],
     chatDataSeed = EMPTY_CHAT_DATA,
     runtimeThread = false,
+    initialSend = null,
   } = useLoaderData<typeof loader>();
   const {
     chatData: resolvedChatData,
@@ -1363,6 +1385,7 @@ export default function ChatPage() {
               readOnlyNotice={readOnlyMove ? readOnlyMoveNotice(readOnlyMove.reason, readOnlyMove.truncated) : null}
               backend={displayBackend}
               runtimeSeed={isDisplayingLoaderThread ? resolvedChatData.runtime ?? null : null}
+              initialSend={isDisplayingLoaderThread && !readOnly ? initialSend : null}
             />
           )}
         </div>

@@ -113,6 +113,22 @@ async function send(setup: Awaited<ReturnType<typeof runtimeThread>>, text: stri
 }
 
 describe("startRuntimeTurn", () => {
+  it("clears a new thread's pending first message once a send is accepted, and not on a refusal", async () => {
+    const setup = await runtimeThread();
+    // A thread pinned with its first message (as the new-chat action does).
+    const fresh = await setup.orgStub.createThread(setup.context.workspaceId, "New", setup.sender.userId, "Hello runtime");
+    await setup.orgStub.pinThreadRuntime(fresh.id, "Hello runtime");
+    const next = { ...setup, threadId: fresh.id, context: { ...setup.context, threadId: fresh.id } };
+    const agent = { "POST /v1/agents": () => Response.json({ id: "agt_pending" }, { status: 201 }) };
+    fakeRuntime({ ...agent, "POST /v1/agents/agt_pending/prompt": () => Response.json({ error: "Too many" }, { status: 429 }) });
+    expect(await send(next, "Hello runtime", `initial_${fresh.id}`)).toMatchObject({ status: "busy" });
+    expect(await setup.orgStub.getThreadRuntime(fresh.id)).toMatchObject({ pendingFirstMessage: "Hello runtime" });
+    vi.restoreAllMocks();
+    fakeRuntime(agent);
+    expect(await send(next, "Hello runtime", `initial_${fresh.id}`)).toMatchObject({ status: "accepted" });
+    expect(await setup.orgStub.getThreadRuntime(fresh.id)).toMatchObject({ pendingFirstMessage: null });
+  });
+
   it("creates the thread's agent on the first send and prompts it as the sender", async () => {
     const setup = await runtimeThread();
     const calls = fakeRuntime();

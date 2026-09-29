@@ -5,7 +5,7 @@
  *
  * Run with: bun run test:workers
  */
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:test";
 import { getAppIndexDatabase } from "../src/app-index-db";
 import type { ChatContextState, ChatEnv } from "../src/chat-thread/types";
@@ -25,6 +25,15 @@ const sweepEnv = env as unknown as ChatEnv & { APP_DB: D1Database };
 
 const email = () => `sweep-${crypto.randomUUID()}@example.com`;
 
+/** Every org a test made, so the next test's sweep never finds its threads (D1's mirror re-adds orgs on its own schedule). */
+const installed: Array<{ stub: { listThreadsWithoutRuntime(after: string | null, limit: number): Promise<Array<{ id: string }>>; pinThreadRuntime(id: string): Promise<boolean> } }> = [];
+
+afterEach(async () => {
+  for (const { stub } of installed.splice(0)) {
+    for (const thread of await stub.listThreadsWithoutRuntime(null, 500)) await stub.pinThreadRuntime(thread.id);
+  }
+});
+
 /** Orgs with `threads` ChatThreadDO threads each, and only those orgs in D1's index. */
 async function install(threadsPerOrg: number[]) {
   await getAppIndexDatabase(testEnv)!.ensureSchema();
@@ -41,6 +50,7 @@ async function install(threadsPerOrg: number[]) {
     }
     await testEnv.APP_DB!.prepare("INSERT OR REPLACE INTO orgs (id, name, created_at) VALUES (?, ?, ?)").bind(org.id, "Sweep Org", Date.now()).run();
     orgs.push({ orgId: org.id, workspaceId: defaultWorkspaceId as string, stub, threads });
+    installed.push({ stub: stub as never });
   }
   return orgs;
 }

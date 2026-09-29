@@ -444,7 +444,7 @@ describe("channels", () => {
       message: "hi",
     });
     expect(getIntegration).toHaveBeenCalledWith("int-1");
-    expect(startChannelRuntimeTurnMock.mock.calls.at(-1)?.[1]).toMatchObject({
+    expect((startChannelRuntimeTurnMock.mock.calls.at(-1) as unknown[] | undefined)?.[1]).toMatchObject({
       userId: "owner-1",
       userName: "discord-author",
     });
@@ -459,7 +459,7 @@ describe("channels", () => {
       userId: "member-9",
       message: "hi",
     });
-    expect(startChannelRuntimeTurnMock.mock.calls.at(-1)?.[1]).toMatchObject({ userId: "member-9" });
+    expect((startChannelRuntimeTurnMock.mock.calls.at(-1) as unknown[] | undefined)?.[1]).toMatchObject({ userId: "member-9" });
   });
 
   it("starts channel messages on the runtime, with the channel's reply instructions", async () => {

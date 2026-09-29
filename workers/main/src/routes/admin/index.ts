@@ -64,6 +64,7 @@ import type { Env, RouteContext } from '../../types.js';
 import { routes } from './routes.js';
 import { managementRoutes } from './management-routes.js';
 import { d1MirrorRoutes } from './d1-mirror-routes.js';
+import { selfhostSweepRoutes } from './selfhost-sweep-routes.js';
 
 // ---------------------------------------------------------------------------
 // Hono app
@@ -77,6 +78,7 @@ const app = new Hono<HonoEnv>().basePath('/api/admin');
 app.route('/', routes);
 app.route('/', managementRoutes);
 app.route('/', d1MirrorRoutes);
+app.route('/', selfhostSweepRoutes);
 
 // Auto-generate and serve OpenAPI spec from route middleware declarations
 createOpenApiDocument(app, {

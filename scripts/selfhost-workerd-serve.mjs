@@ -5,6 +5,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { spawn, spawnSync } from 'node:child_process';
 import { startSelfhostLoopbackServer } from './selfhost-loopback-server.mjs';
+import { driveRuntimeSweep, waitForApp } from './selfhost-runtime-sweep.mjs';
 
 const repoRoot = process.cwd();
 const configPath = path.resolve(
@@ -63,7 +64,21 @@ try {
     stdio: 'inherit',
   });
 
+  // Move threads still on the in-app loop to the agent runtime, in the
+  // background (SELF_HOSTING.md, "Moving existing threads").
+  const sweep = new AbortController();
+  if (process.env.SELFHOST_RUNTIME_SWEEP !== '0' && process.env.ADMIN_API_KEY) {
+    const baseUrl = appLoopbackUrl(process.env.SELFHOST_WORKERD_SOCKET);
+    (async () => {
+      if (!await waitForApp({ baseUrl, signal: sweep.signal })) return;
+      await driveRuntimeSweep({ baseUrl, adminKey: process.env.ADMIN_API_KEY, signal: sweep.signal });
+    })().catch((error) => {
+      console.error('[selfhost:runtime-sweep] stopped', error);
+    });
+  }
+
   const shutdown = async (signal) => {
+    sweep.abort();
     if (!child.killed) child.kill(signal);
     if (loopbackServer) {
       await loopbackServer.close().catch((error) => {
@@ -91,4 +106,11 @@ try {
   }
   console.error(error);
   process.exit(1);
+}
+
+function appLoopbackUrl(socket) {
+  const match = /^(.*):(\d+)$/.exec(String(socket ?? '').trim());
+  const [host, port] = match ? [match[1], match[2]] : ['127.0.0.1', '3001'];
+  const loopback = !host || host === '*' || host === '0.0.0.0' ? '127.0.0.1' : host === '::' ? '::1' : host;
+  return `http://${loopback.includes(':') && !loopback.startsWith('[') ? `[${loopback}]` : loopback}:${port}`;
 }

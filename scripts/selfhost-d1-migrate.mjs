@@ -6,6 +6,7 @@ import net from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
 import os from 'node:os';
+import { runtimeMigrationGate } from './selfhost-runtime-gate.mjs';
 
 const repoRoot = process.cwd();
 const stateDir = path.resolve(repoRoot, process.env.SELFHOST_WORKERD_STATE_DIR ?? '.selfhost/workerd/state');
@@ -207,7 +208,18 @@ export default {
       await env.APP_DB.prepare("INSERT INTO selfhost_d1_migrations (name, applied_at) VALUES (?, ?)").bind(migration.name, Date.now()).run();
       applied.push(migration.name);
     }
-    return Response.json({ applied, skipped });
+    // What the runtime migration gate reads (selfhost-runtime-gate.mjs): the
+    // thread sweep's record and whether this install has any org.
+    const hasTable = async (name) => Boolean(await env.APP_DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").bind(name).first());
+    const sweepRow = await hasTable("app_index_metadata")
+      ? await env.APP_DB.prepare("SELECT value FROM app_index_metadata WHERE key = 'selfhost_runtime_sweep'").first()
+      : null;
+    let runtimeSweep = null;
+    try { runtimeSweep = sweepRow ? JSON.parse(sweepRow.value) : null; } catch {}
+    const orgCount = await hasTable("orgs")
+      ? Number((await env.APP_DB.prepare("SELECT COUNT(*) AS count FROM orgs").first())?.count ?? 0)
+      : 0;
+    return Response.json({ applied, skipped, runtimeSweep, orgCount });
   }
 };
 `;
@@ -298,6 +310,7 @@ async function main() {
   const port = await freePort();
   await generateConfig({ outDir: tempDir, configPath, port, migrations });
 
+  let gate = { ok: true, message: null };
   const child = spawnWorkerd(configPath);
   const stdout = [];
   const stderr = [];
@@ -307,6 +320,11 @@ async function main() {
     const result = await waitForMigrator(port, child);
     console.log(`[selfhost:d1] Applied ${result.applied.length}, skipped ${result.skipped.length}.`);
     for (const name of result.applied) console.log(`[selfhost:d1] applied ${name}`);
+    gate = runtimeMigrationGate({
+      sweep: result.runtimeSweep,
+      orgCount: result.orgCount,
+      allowUnmigrated: process.env.SELFHOST_ALLOW_UNMIGRATED_THREADS === '1',
+    });
   } catch (error) {
     const output = workerOutput(stderr, stdout);
     if (output) {
@@ -320,6 +338,11 @@ async function main() {
       console.error(text);
     }
   }
+  if (!gate.ok) {
+    console.error(`[selfhost:runtime-gate] ${gate.message}`);
+    process.exit(3);
+  }
+  if (gate.message) console.warn(`[selfhost:runtime-gate] ${gate.message}`);
 }
 
 main().catch((error) => {

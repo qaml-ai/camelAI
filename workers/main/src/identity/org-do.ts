@@ -8637,6 +8637,36 @@ export class OrgDO extends DurableObject<DOEnv> {
   }
 
   /**
+   * Threads that still run on ChatThreadDO (no thread_runtime row), in id
+   * order after `after`, at most `limit`: the self-host thread sweep's page
+   * (agent-runtime/selfhost-sweep.ts).
+   */
+  listThreadsWithoutRuntime(after: string | null, limit: number): Array<{ id: string; workspace_id: string; created_by: string }> {
+    const size = Math.max(1, Math.min(Math.floor(limit) || 1, 500));
+    return this.sql
+      .exec<{ id: string; workspace_id: string; created_by: string }>(
+        `SELECT t.id, t.workspace_id, t.created_by FROM threads t
+         LEFT JOIN thread_runtime r ON r.thread_id = t.id
+         WHERE r.thread_id IS NULL AND t.id > ?
+         ORDER BY t.id LIMIT ?`,
+        after ?? "",
+        size,
+      )
+      .toArray();
+  }
+
+  /** How many threads still run on ChatThreadDO (no thread_runtime row). */
+  countThreadsWithoutRuntime(): number {
+    return Number(
+      this.sql
+        .exec<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM threads t LEFT JOIN thread_runtime r ON r.thread_id = t.id WHERE r.thread_id IS NULL",
+        )
+        .toArray()[0]?.count ?? 0,
+    );
+  }
+
+  /**
    * Pin a thread to the runtime (before it has an agent). Idempotent; false
    * when the thread does not exist.
    */

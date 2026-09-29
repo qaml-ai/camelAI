@@ -21,7 +21,7 @@ import { applyMentionContext } from "../mention-context";
 import { WorkspaceFilesystemClient } from "../workspace-filesystem-do";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
-import { RuntimeApiError, provisionedAgentId, runtimeApi, runtimeUrl } from "./runtime-api";
+import { RuntimeApiError, runtimeApi, runtimeUrl } from "./runtime-api";
 import { codexError, codexRoute, codexUpstreamCall, forwardedResponseHeaders } from "./codex-forwarder";
 import { HostedModelFallbackRequiredError } from "../chat-thread/pi-model-config";
 import { assertUserLlmUsageAccess, UserLlmUsageLimitError } from "../user-llm-usage-policy";
@@ -219,48 +219,33 @@ async function rememberAgentThread(env: ChatEnv, agentId: string, context: ChatC
 }
 
 /**
- * Create the thread's agent, idempotently per thread. When the runtime
- * answers that the key was used with a different configuration (the agent
- * definition changed since), adopt the agent it made then; the caller
- * reconfigures it. `adopted` says so.
+ * Create the thread's agent, idempotently per thread. The runtime's create is
+ * an upsert per Idempotency-Key: the same key always answers the same agent,
+ * reconfigured to what this call asks for.
  */
 async function createThreadAgent(
   env: ChatEnv,
   context: ChatContextState,
   run: PreparedRuntimeRun,
-): Promise<{ agentId: string; adopted: boolean }> {
-  const key = `thread_${context.threadId}`;
+): Promise<string> {
   const thread = await orgStub(env, context.orgId).getThread(context.threadId);
   const subject = thread?.created_by?.trim() || context.userId || "";
-  try {
-    const created = await runtimeApi(env, "POST", "/v1/agents", {
-      definition: env.AGENT_RUNTIME_DEFINITION,
-      name: context.threadId,
-      type: "camelai-thread",
-      ttlSeconds: null,
-      model: run.model,
-      ...(run.keyScope ? { keyScope: run.keyScope } : {}),
-      ...(run.modelHeaders ? { modelHeaders: run.modelHeaders } : {}),
-      thinkingLevel: run.thinkingLevel,
-      systemPromptAppend: runtimeSystemPromptAppend(env, context),
-      fileTools: false,
-      ...(subject ? { subject } : {}),
-      context: { org: context.orgId, workspace: context.workspaceId, thread: context.threadId },
-    }, { "Idempotency-Key": key }) as { id?: unknown };
-    if (typeof created?.id !== "string") throw new Error("Agent runtime returned no agent id");
-    return { agentId: created.id, adopted: false };
-  } catch (error) {
-    // The key made an agent before, with a configuration since changed.
-    if (!(error instanceof RuntimeApiError && error.code === "IDEMPOTENCY_CONFLICT")) throw error;
-    const tenant = env.AGENT_RUNTIME_TENANT?.trim() ?? "";
-    const byKey = await provisionedAgentId(tenant, key);
-    const found = await runtimeApi(env, "GET", `/v1/agents/${encodeURIComponent(byKey)}`).then(() => byKey, () => null)
-      ?? ((await runtimeApi(env, "GET", "/v1/agents")) as Array<{ id: string; name?: string }>)
-        .find((agent) => agent.name === context.threadId)?.id
-      ?? null;
-    if (!found) throw error;
-    return { agentId: found, adopted: true };
-  }
+  const created = await runtimeApi(env, "POST", "/v1/agents", {
+    definition: env.AGENT_RUNTIME_DEFINITION,
+    name: context.threadId,
+    type: "camelai-thread",
+    ttlSeconds: null,
+    model: run.model,
+    ...(run.keyScope ? { keyScope: run.keyScope } : {}),
+    ...(run.modelHeaders ? { modelHeaders: run.modelHeaders } : {}),
+    thinkingLevel: run.thinkingLevel,
+    systemPromptAppend: runtimeSystemPromptAppend(env, context),
+    fileTools: false,
+    ...(subject ? { subject } : {}),
+    context: { org: context.orgId, workspace: context.workspaceId, thread: context.threadId },
+  }, { "Idempotency-Key": `thread_${context.threadId}` }) as { id?: unknown };
+  if (typeof created?.id !== "string") throw new Error("Agent runtime returned no agent id");
+  return created.id;
 }
 
 /** The configuration recorded for an agent made for `run` (see ensureConfiguredAgent). */
@@ -307,17 +292,14 @@ export async function prewarmThreadAgent(
       return null;
     }
     const createStartedAt = Date.now();
-    const made = await onceMore("prewarm_agent", () => createThreadAgent(env, context, run));
+    const agentId = await onceMore("prewarm_agent", () => createThreadAgent(env, context, run));
     createMs = Date.now() - createStartedAt;
-    // An adopted agent (made under an earlier configuration) is left for the
-    // send, which brings it up to date. Recorded compare-and-set: a send that
-    // recorded the agent first keeps its row as it wrote it.
-    if (!made.adopted) {
-      await onceMore("prewarm_record_agent", () =>
-        org.claimThreadRuntimeAgent(context.threadId, made.agentId, madeConfiguration(run)));
-    }
-    recordRuntimeAgentPrewarm(env, context, { status: made.adopted ? "adopted" : "created", durationMs: Date.now() - startedAt, createMs });
-    return made.adopted ? null : made.agentId;
+    // Recorded compare-and-set: a send that recorded the agent first keeps its
+    // row as it wrote it.
+    await onceMore("prewarm_record_agent", () =>
+      org.claimThreadRuntimeAgent(context.threadId, agentId, madeConfiguration(run)));
+    recordRuntimeAgentPrewarm(env, context, { status: "created", durationMs: Date.now() - startedAt, createMs });
+    return agentId;
   } catch (error) {
     console.warn("[runtime-thread] could not create a new thread's agent ahead of its first send", error);
     recordRuntimeAgentPrewarm(env, context, { status: "exception", durationMs: Date.now() - startedAt, createMs, error });
@@ -334,7 +316,7 @@ async function retriedRequest(env: ChatEnv, agentId: string, requestId: string):
 }
 
 /**
- * The thread's agent, created (or adopted) on first use and configured for
+ * The thread's agent, created on first use and configured for
  * this send where the model, key scope or instructions changed. The usual
  * send changes none of them and makes no runtime call here. The budget is not
  * the agent's: each prompt carries its run's own spend limit. An agent given a
@@ -349,26 +331,19 @@ async function ensureConfiguredAgent(
   timings: SendTimings,
 ): Promise<string> {
   const org = orgStub(env, context.orgId);
-  let agentId = row.agentId;
-  /** An agent made under an earlier configuration (adopted): bring all of it up to date. */
-  let stale = false;
-  if (!agentId) {
-    const made = await createThreadAgent(env, context, run);
-    agentId = made.agentId;
-    if (!made.adopted) {
-      await org.setThreadRuntimeAgent(context.threadId, { agentId, ...madeConfiguration(run) });
-      return agentId;
-    }
-    stale = true;
+  if (!row.agentId) {
+    const agentId = await createThreadAgent(env, context, run);
+    await org.setThreadRuntimeAgent(context.threadId, { agentId, ...madeConfiguration(run) });
+    return agentId;
   }
-  const id = agentId;
-  const modelChanged = stale || row.model !== run.model;
-  const scopeChanged = stale || (row.keyScope ?? null) !== run.keyScope;
+  const id = row.agentId;
+  const modelChanged = row.model !== run.model;
+  const scopeChanged = (row.keyScope ?? null) !== run.keyScope;
   const { spendLimitUsd: agentLimit, spendLimitSetAt: _setAt, ...configured } = row.configured ?? {};
   // A limit an earlier release set on the agent itself (each run carries its own now).
-  const limitLeft = stale || (agentLimit !== undefined && agentLimit !== null);
+  const limitLeft = agentLimit !== undefined && agentLimit !== null;
   // Instructions from an earlier version (or none recorded): send the current ones.
-  const promptChanged = stale || row.configured?.promptVersion !== RUNTIME_PROMPT_VERSION;
+  const promptChanged = row.configured?.promptVersion !== RUNTIME_PROMPT_VERSION;
   if (!modelChanged && !scopeChanged && !limitLeft && !promptChanged) return id;
   if (await timed(timings, "activity", () => retriedRequest(env, id, requestId))) return id;
   await timed(timings, "patch", () => runtimeApi(env, "PATCH", `/v1/agents/${encodeURIComponent(id)}/configuration`, {

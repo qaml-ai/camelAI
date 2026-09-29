@@ -489,24 +489,6 @@ describe("the usual send", () => {
   });
 });
 
-describe("agent creation conflicts", () => {
-  it("adopts the thread's agent when its key was used with an earlier configuration, and reconfigures it", async () => {
-    const setup = await runtimeThread();
-    const tenantKey = `chiridion-test:thread_${setup.threadId}`;
-    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(tenantKey));
-    const adopted = `client_${[...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 40)}`;
-    const calls = fakeRuntime({
-      "POST /v1/agents": () => Response.json({ error: "This Idempotency-Key was sent with another request: a key is for one method, path and body", code: "IDEMPOTENCY_CONFLICT" }, { status: 409 }),
-      [`GET /v1/agents/${adopted}`]: () => Response.json({ id: adopted }),
-    });
-    expect(await send(setup, "hello", "cm_adopt")).toMatchObject({ status: "accepted", agentId: adopted });
-    const configure = calls.find((call) => call.path === `/v1/agents/${adopted}/configuration`)!;
-    expect(configure.body).toMatchObject({ model: expect.stringMatching(/^anthropic\//), keyScope: `org_${setup.context.orgId}`, spendLimit: null });
-    expect(configure.body.systemPromptAppend).toContain("camelAI tools on this runtime");
-    expect(await setup.orgStub.getThreadRuntime(setup.threadId)).toMatchObject({ agentId: adopted });
-  });
-});
-
 describe("the runtime prompt's two filesystems", () => {
   it("tells the model /workspace is this thread's scratch and camelAI's workspace is durable, without forbidding fs", async () => {
     const setup = await runtimeThread();

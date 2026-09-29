@@ -71,7 +71,7 @@ export function recordRuntimeSendTiming(
 /**
  * `runtime_thread_agent_prewarm`: a new thread's agent created ahead of its
  * first send (prewarmThreadAgent). Status `created`, `exists` (the send, or
- * another prewarm, made it first), `refused` (a run gate refused: the send
+ * another prewarm, made it first), `no_row`, `refused` (a run gate refused: the send
  * will say why; errorName is its code) or the class of a thrown error.
  * durationMs is the whole prewarm; double6 the runtime's create call.
  */

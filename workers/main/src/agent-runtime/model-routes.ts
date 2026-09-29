@@ -92,8 +92,12 @@ export function runtimeModelRoute(
   context: {
     orgId: string;
     freeTier?: boolean;
-    /** A self-host install's own runtime may call `http` custom endpoints its operator allowed. */
-    allowHttpEndpoints?: boolean;
+    /**
+     * The origin of a self-host operator's own custom endpoint
+     * (key-scopes.ts, selfhostOperatorEndpointOrigin), the one endpoint the
+     * bundled runtime may call over `http` or on loopback.
+     */
+    operatorEndpointOrigin?: string | null;
   },
 ): RuntimeModelRoute | null {
   const { model } = config;
@@ -123,7 +127,7 @@ export function runtimeModelRoute(
     // Anthropic Messages takes x-api-key unless the org chose Bearer.
     const bearer = typeof config.headers?.Authorization === "string";
     const authType = model.api === "anthropic-messages" && !bearer ? "x-api-key" : "bearer";
-    if (model.provider !== "custom" || !runtimeModelId(model.id) || !customEndpointRunsOnRuntime(model.api, authType, model.baseUrl, context.allowHttpEndpoints)) return null;
+    if (model.provider !== "custom" || !runtimeModelId(model.id) || !customEndpointRunsOnRuntime(model.api, authType, model.baseUrl, context.operatorEndpointOrigin)) return null;
     return { kind: "scope", model: `${CUSTOM_MODEL_PROVIDER}/${model.id}`, keyScope: scope };
   }
   if (config.usageProvider === "openrouter") {

@@ -134,7 +134,26 @@ export async function orgScopeProviders(
 ): Promise<ScopeEntries> {
   if (!record) return { providers: {} };
   const creds = await decryptCredentials<Record<string, string>>(record.credentials_encrypted, env.INTEGRATION_SECRET_KEY);
-  return await scopeEntries(record.provider, creds, parseStoredLlmProviderConfig(record.config), { allowHttp: isSelfhostRuntime(env) });
+  // An org's own endpoint: https, never loopback, whatever the install.
+  return await scopeEntries(record.provider, creds, parseStoredLlmProviderConfig(record.config), { operatorOrigin: null });
+}
+
+/**
+ * The origin of a self-host operator's own custom endpoint (SELFHOST_AI_* with
+ * provider `custom`): the one endpoint the bundled runtime may call over plain
+ * `http` or on loopback, because the operator chose it. Null outside self-host
+ * or without one. Org-supplied endpoints never get this.
+ */
+export function selfhostOperatorEndpointOrigin(env: SelfhostAiProviderEnv): string | null {
+  if (!isSelfhostRuntime(env)) return null;
+  const record = getSelfhostAiProviderRecord(env);
+  if (record?.provider !== "custom") return null;
+  const baseUrl = parseStoredLlmProviderConfig(record.config).custom_base_url;
+  try {
+    return baseUrl ? new URL(baseUrl).origin : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -149,14 +168,14 @@ export async function selfhostScopeProviders(env: KeyScopeEnv): Promise<ScopeEnt
   const record = getSelfhostAiProviderRecord(env);
   if (!credentials || !record) return null;
   const creds: Record<string, string> = credentials.provider === "bedrock" ? { bearer_token: credentials.apiKey } : { api_key: credentials.apiKey };
-  return await scopeEntries(record.provider, creds, parseStoredLlmProviderConfig(record.config), { allowHttp: true });
+  return await scopeEntries(record.provider, creds, parseStoredLlmProviderConfig(record.config), { operatorOrigin: selfhostOperatorEndpointOrigin(env) });
 }
 
 async function scopeEntries(
   provider: string,
   creds: Record<string, string>,
   config: LlmProviderStoredConfig,
-  options: { allowHttp: boolean },
+  options: { operatorOrigin: string | null },
 ): Promise<ScopeEntries> {
   switch (provider) {
     case "anthropic":
@@ -173,7 +192,7 @@ async function scopeEntries(
       };
     }
     case "custom": {
-      const provider = creds.api_key ? await customModelProvider(creds.api_key, config, options.allowHttp) : null;
+      const provider = creds.api_key ? await customModelProvider(creds.api_key, config, options.operatorOrigin) : null;
       return { providers: {}, modelProviders: provider ? { [CUSTOM_MODEL_PROVIDER]: provider } : {} };
     }
     default:
@@ -224,17 +243,42 @@ function declaredModel(id: string, catalog: Model<any> | null): KeyScopeModel | 
  * (Bearer; x-api-key for Anthropic Messages) or as another header. Anthropic
  * Messages behind `Authorization: Bearer` cannot be said (the runtime sets
  * Authorization itself), so such an endpoint stays on the in-DO loop.
- * `allowHttp`: a self-host install's bundled runtime, whose operator allows
- * plain `http` model endpoints on their network (SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_CIDRS).
+ *
+ * An org-supplied endpoint must be `https` and not on loopback (the bundled
+ * self-host runtime can reach the app and its own API there). Only the
+ * endpoint at `operatorOrigin`, a self-host operator's own (SELFHOST_AI_*;
+ * selfhostOperatorEndpointOrigin), may be plain `http` or on loopback: the
+ * operator allows its network with SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_CIDRS.
  */
 export function customEndpointRunsOnRuntime(
   api: string | undefined,
   authType: LlmProviderStoredConfig["custom_auth_type"],
   baseUrl: string | undefined,
-  allowHttp = false,
+  operatorOrigin?: string | null,
 ): boolean {
-  if (!api || !CUSTOM_APIS.has(api) || !baseUrl || !(allowHttp ? /^https?:\/\//i : /^https:\/\//i).test(baseUrl)) return false;
+  if (!api || !CUSTOM_APIS.has(api) || !baseUrl) return false;
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return false;
+  }
+  const operator = Boolean(operatorOrigin) && url.origin === operatorOrigin;
+  if (!operator && (url.protocol !== "https:" || loopbackHost(url.hostname))) return false;
+  if (operator && url.protocol !== "https:" && url.protocol !== "http:") return false;
   return api !== "anthropic-messages" || authType === "x-api-key";
+}
+
+/**
+ * localhost names and loopback or unspecified addresses, as URL normalizes a
+ * hostname (IPv4 in dotted decimal, IPv6 compressed, IPv4-mapped as `::ffff:7f00:1`).
+ */
+function loopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (/^127(\.\d{1,3}){3}$/.test(host) || host === "0.0.0.0") return true;
+  if (host === "::1" || host === "::") return true;
+  return /^::ffff:(7f[0-9a-f]{2}:[0-9a-f]{1,4}|0:0)$/.test(host);
 }
 
 const CUSTOM_APIS = new Set(["openai-completions", "openai-responses", "anthropic-messages"]);
@@ -249,9 +293,9 @@ export const runtimeModelId = (id: string) => /^\S{1,200}$/.test(id);
  * own model id, or chiridion's models of the endpoint's API by the ids the
  * loop sends.
  */
-async function customModelProvider(apiKey: string, config: LlmProviderStoredConfig, allowHttp: boolean): Promise<KeyScopeModelProvider | null> {
+async function customModelProvider(apiKey: string, config: LlmProviderStoredConfig, operatorOrigin: string | null): Promise<KeyScopeModelProvider | null> {
   const { custom_api: api, custom_base_url: baseUrl, custom_auth_type: authType, custom_model_id: customModelId } = config;
-  if (!api || !baseUrl || !customEndpointRunsOnRuntime(api, authType, baseUrl, allowHttp)) return null;
+  if (!api || !baseUrl || !customEndpointRunsOnRuntime(api, authType, baseUrl, operatorOrigin)) return null;
   const mapping = new PiModelMapping();
   const getModel = await catalogGetModel();
   const models = new Map<string, KeyScopeModel>();

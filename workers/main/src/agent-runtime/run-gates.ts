@@ -37,7 +37,7 @@ import { createPiSystemPrompt } from "../pi-system-prompt";
 import { resolveAgentSkillCatalog } from "../selfhost-agent-pack";
 import { RUNTIME_PROMPT_PREAMBLE, type RuntimeRunConfig } from "../chat-thread/runtime-agent";
 import { FREE_TIER_RUNTIME_MODEL, runtimeModelRoute, type RuntimeModelRoute } from "./model-routes";
-import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, syncOrgKeyScope } from "./key-scopes";
+import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, selfhostOperatorEndpointOrigin, syncOrgKeyScope } from "./key-scopes";
 
 type OrgInfoLike = {
   billing_status?: string | null;
@@ -182,7 +182,7 @@ export async function resolveThreadRuntimeRoute(env: ChatEnv, context: ChatConte
   const route = runtimeModelRoute(config, {
     orgId: context.orgId,
     freeTier: isCreditFreeHostedModel(threadModel),
-    allowHttpEndpoints: isSelfhostRuntime(env),
+    operatorEndpointOrigin: selfhostOperatorEndpointOrigin(env),
   });
   return { threadModel, config, route, fallback, llmProviderRecord };
 }

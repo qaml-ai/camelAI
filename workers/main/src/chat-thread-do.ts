@@ -397,7 +397,7 @@ import {
   runtimeModelRoute,
   type RuntimeModelRoute,
 } from "./agent-runtime/model-routes";
-import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, syncOrgKeyScope } from "./agent-runtime/key-scopes";
+import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, selfhostOperatorEndpointOrigin, syncOrgKeyScope } from "./agent-runtime/key-scopes";
 import { storedThreadModel } from "./agent-runtime/run-gates";
 
 // Pi tool-definition surface (executor-style tool list + Agent/Explore
@@ -7927,7 +7927,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     return runtimeModelRoute(config, {
       orgId: this.chatContext?.orgId ?? "",
       freeTier: isCreditFreeHostedModel(this.currentThreadModel),
-      allowHttpEndpoints: isSelfhostRuntime(this.env),
+      operatorEndpointOrigin: selfhostOperatorEndpointOrigin(this.env),
     });
   }
 

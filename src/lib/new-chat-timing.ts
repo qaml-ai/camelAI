@@ -65,6 +65,11 @@ export function trackNewChatStage(
   return durationMs;
 }
 
+/** When the click that started `threadId` happened, once its page claimed it (see trackNewChatStage). */
+export function newChatStartedAt(threadId: string | null | undefined): number | null {
+  return threadId ? timedThreads.get(threadId)?.startedAt ?? null : null;
+}
+
 /** For tests. */
 export function resetNewChatTiming(): void {
   submittedAt = null;

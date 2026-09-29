@@ -171,8 +171,10 @@ import { normalizeThreadPreviewUserMessage } from "@/lib/thread-preview";
 import {
   clearNewChatSubmitted,
   markNewChatSubmitted,
+  newChatStartedAt,
   trackNewChatStage,
 } from "@/lib/new-chat-timing";
+import { NewChatPending } from "@/components/chat/new-chat-pending";
 import { trackNewCamelActivationAfterAcceptedMessage } from "@/lib/marketing-attribution.client";
 import {
   getDefaultLlmModel,
@@ -1438,6 +1440,11 @@ export default function Chat({
     attachments: Attachment[];
   } | null>(null);
   const handledNewChatActionErrorRef = useRef<string | null>(null);
+  /** The chat being started from this page: shown from the click until the thread's page takes over. */
+  const [pendingNewChat, setPendingNewChat] = useState<{
+    message: Message | null;
+    startedAt: number;
+  } | null>(null);
   const pendingDraftCountRef = useRef(0);
   const restoredDraftKeyRef = useRef<string | null>(null);
   const { saveDraft, flushDraft, clearDraft } = useDraftPersistence(
@@ -1510,6 +1517,7 @@ export default function Chat({
     }
     handledNewChatActionErrorRef.current = newChatActionError;
     clearNewChatSubmitted();
+    setPendingNewChat(null);
 
     const pendingSubmission = pendingNewThreadSubmissionRef.current;
     pendingNewThreadSubmissionRef.current = null;
@@ -3202,7 +3210,8 @@ export default function Chat({
     setLoading(true);
     trackNewChatStage(threadId, "thread_visible");
     const previewUserMessage = normalizeThreadPreviewUserMessage(text);
-    const at = Date.now();
+    // Running from the click that started the chat, when this tab made it.
+    const at = newChatStartedAt(threadId) ?? Date.now();
     dispatchLocalThreadStatus(threadId, "running", {
       latestUserMessage: previewUserMessage,
       latestUserMessageAt: at,
@@ -3981,7 +3990,9 @@ export default function Chat({
       });
       const threadTitle = buildAppThreadFallbackTitle(app.script_name);
 
-      markNewChatSubmitted();
+      const startedAt = Date.now();
+      markNewChatSubmitted(startedAt);
+      setPendingNewChat({ message: null, startedAt });
       submit(
         {
           intent: "createThreadAndStart",
@@ -4066,7 +4077,26 @@ export default function Chat({
       createThreadPayload.firstMessage = finalContent;
     }
 
-    markNewChatSubmitted();
+    const startedAt = Date.now();
+    markNewChatSubmitted(startedAt);
+    const authorDisplayName = resolveMessageAuthorDisplayName(
+      user?.name,
+      user?.email,
+    );
+    setPendingNewChat({
+      message: finalContent
+        ? {
+            id: "new-chat-pending",
+            thread_id: "",
+            role: "user",
+            content: finalContent,
+            created_at: startedAt,
+            ...(authorDisplayName ? { authorDisplayName } : {}),
+            messageSource: "web",
+          }
+        : null,
+      startedAt,
+    });
     submit(createThreadPayload, {
       method: "post",
       action: "/chat",
@@ -4728,6 +4758,11 @@ export default function Chat({
                 </ResizablePanelGroup>
               )}
             </div>
+          ) : isSubmittingNewThread && pendingNewChat ? (
+            <NewChatPending
+              message={pendingNewChat.message}
+              startedAt={pendingNewChat.startedAt}
+            />
           ) : (
             <>
               {/* Welcome Screen */}

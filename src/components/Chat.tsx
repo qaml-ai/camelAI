@@ -2931,7 +2931,7 @@ export default function Chat({
 
     try {
       const { exportNotebookReportAsPdf } =
-        await import("@/components/chat-file-preview/notebook-preview/pdf-export");
+        await import("@/components/chat-file-preview/notebook-preview/pdf-export.client");
       await exportNotebookReportAsPdf({
         notebook: notebookState.notebook,
         filename,

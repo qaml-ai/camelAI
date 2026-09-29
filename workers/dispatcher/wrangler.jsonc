@@ -1,6 +1,7 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "chiridion-dispatcher",
+	// Local dev dispatcher. Deployed environments use wrangler.<env>.jsonc.
+	"name": "chiridion-dispatcher-local",
 	"main": "src/index.ts",
 	"alias": {
 		"virtual:db-query-runner-source": "./src/db-query-runner-source.ts"
@@ -10,6 +11,10 @@
 	],
 	"compatibility_date": "2024-12-01",
 	"compatibility_flags": ["nodejs_compat"],
+	"routes": [
+		{ "pattern": "*.apps.local.camelai.dev/*", "zone_name": "camelai.dev" },
+		{ "pattern": "*.local.camelai.app/*", "zone_name": "camelai.app" }
+	],
 	// Local dev defaults - skip auth and use local namespace
 	"vars": {
 		"AI_VIRTUAL_MODEL": "dynamic/auto",
@@ -36,164 +41,5 @@
 		"bindings": [
 			{ "name": "ORG", "class_name": "OrgDO", "script_name": "chiridion-app" }
 		]
-	},
-	"env": {
-		"prod": {
-			"name": "chiridion-dispatcher",
-			"vars": {
-				"MAIN_APP_URL": "https://camelai.dev"
-			},
-			"routes": [
-				{ "pattern": "*.apps.camelai.dev/*", "zone_name": "camelai.dev" },
-				{ "pattern": "*.camelai.app/*", "zone_name": "camelai.app" }
-			],
-			"dispatch_namespaces": [
-				{
-					"binding": "DISPATCHER",
-					"namespace": "chiridion-platform"
-				}
-			],
-			"kv_namespaces": [
-				{
-					"binding": "APP_KV",
-					"id": "0ee80299e67c4c7fa0c1ad618b7e7a9c"
-				},
-				{
-					"binding": "SESSIONS",
-					"id": "67958a5b0d104621bd93c91c802ccd1c"
-				}
-			],
-			"durable_objects": {
-				"bindings": [
-					{ "name": "ORG", "class_name": "OrgDO", "script_name": "chiridion-app" }
-				]
-			}
-		},
-		"staging": {
-			"name": "chiridion-dispatcher-staging",
-			"vars": {
-				"MAIN_APP_URL": "https://staging.camelai.dev"
-			},
-			"routes": [
-				{ "pattern": "*.apps.staging.camelai.dev/*", "zone_name": "camelai.dev" },
-				{ "pattern": "*.staging.camelai.app/*", "zone_name": "camelai.app" }
-			],
-			"dispatch_namespaces": [
-				{
-					"binding": "DISPATCHER",
-					"namespace": "chiridion-platform-staging"
-				}
-			],
-			"kv_namespaces": [
-				{
-					"binding": "APP_KV",
-					"id": "e894eb2caf1641ad8870da994b992fce"
-				},
-				{
-					"binding": "SESSIONS",
-					"id": "f5ab08fdb1d7404fbc45a171217b4a27"
-				}
-			],
-			"durable_objects": {
-				"bindings": [
-					{ "name": "ORG", "class_name": "OrgDO", "script_name": "chiridion-app-staging" }
-				]
-			}
-		},
-		"dev-miguel": {
-			"name": "chiridion-dispatcher-dev-miguel",
-			"vars": {
-				"MAIN_APP_URL": "https://dev-miguel.camelai.dev"
-			},
-			"routes": [
-				{ "pattern": "*.apps.dev-miguel.camelai.dev/*", "zone_name": "camelai.dev" },
-				{ "pattern": "*.dev-miguel.camelai.app/*", "zone_name": "camelai.app" }
-			],
-			"dispatch_namespaces": [
-				{
-					"binding": "DISPATCHER",
-					"namespace": "chiridion-platform-dev-miguel"
-				}
-			],
-			"kv_namespaces": [
-				{
-					"binding": "APP_KV",
-					"id": "e894eb2caf1641ad8870da994b992fce"
-				},
-				{
-					"binding": "SESSIONS",
-					"id": "a38773869d2e465fbf705c81fa2e01eb"
-				}
-			],
-			"durable_objects": {
-				"bindings": [
-					{ "name": "ORG", "class_name": "OrgDO", "script_name": "chiridion-app-dev-miguel" }
-				]
-			}
-		},
-		"dev-illiana": {
-			"name": "chiridion-dispatcher-dev-illiana",
-			"vars": {
-				"MAIN_APP_URL": "https://dev-illiana.camelai.dev"
-			},
-			"routes": [
-				{ "pattern": "*.apps.dev-illiana.camelai.dev/*", "zone_name": "camelai.dev" },
-				{ "pattern": "*.dev-illiana.camelai.app/*", "zone_name": "camelai.app" }
-			],
-			"dispatch_namespaces": [
-				{
-					"binding": "DISPATCHER",
-					"namespace": "chiridion-platform-dev-illiana"
-				}
-			],
-			"kv_namespaces": [
-				{
-					"binding": "APP_KV",
-					"id": "e894eb2caf1641ad8870da994b992fce"
-				},
-				{
-					"binding": "SESSIONS",
-					"id": "c632a963433e4949b6dea43728034b36"
-				}
-			],
-			"durable_objects": {
-				"bindings": [
-					{ "name": "ORG", "class_name": "OrgDO", "script_name": "chiridion-app-dev-illiana" }
-				]
-			}
-		},
-		"local": {
-			"name": "chiridion-dispatcher-local",
-			"routes": [
-				{ "pattern": "*.apps.local.camelai.dev/*", "zone_name": "camelai.dev" },
-				{ "pattern": "*.local.camelai.app/*", "zone_name": "camelai.app" }
-			],
-			"vars": {
-				"AI_VIRTUAL_MODEL": "dynamic/auto",
-				"MAIN_APP_URL": "https://local.camelai.dev",
-				"SKIP_AUTH": "true"
-			},
-			"dispatch_namespaces": [
-				{
-					"binding": "DISPATCHER",
-					"namespace": "chiridion-platform-local"
-				}
-			],
-			"kv_namespaces": [
-				{
-					"binding": "APP_KV",
-					"id": "e894eb2caf1641ad8870da994b992fce"
-				},
-				{
-					"binding": "SESSIONS",
-					"id": "f5ab08fdb1d7404fbc45a171217b4a27"
-				}
-			],
-			"durable_objects": {
-				"bindings": [
-					{ "name": "ORG", "class_name": "OrgDO", "script_name": "chiridion-app" }
-				]
-			}
-		}
 	}
 }

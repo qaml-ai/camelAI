@@ -460,43 +460,6 @@ export interface AuthState {
   error: string | null;
 }
 
-export interface AdminUserSummary {
-  id: string;
-  email: string;
-  name: string | null;
-  created_at: number;
-  is_superuser: boolean;
-  org_count: number;
-  avatar: Avatar;
-  is_orphaned: boolean;
-  signup_ip: string | null;
-}
-
-export interface AdminOverview {
-  users: AdminUserSummary[];
-  total_users: number;
-  total_orgs: number;
-  total_memberships: number;
-  total_workspaces: number;
-  total_integrations: number;
-  orphaned_users: number;
-}
-
-export interface AdminWorkspaceSummary extends Workspace {
-  org_id: string;
-  org_name: string;
-  thread_count: number;
-  integration_count: number;
-}
-
-export interface AdminWorkspaceDetail {
-  workspace: Workspace;
-  org: Organization;
-  threads: Thread[];
-  integrations: Integration[];
-  members: WorkspaceMember[];
-}
-
 export interface AdminThreadWithContext extends Thread {
   org_id: string;
   org_name: string;
@@ -504,40 +467,7 @@ export interface AdminThreadWithContext extends Thread {
   workspace_name: string;
 }
 
-export interface AdminAppSummary {
-  script_name: string;
-  workspace_id: string;
-  workspace_name: string;
-  project_id: string | null;
-  org_id: string;
-  org_name: string;
-  org_slug: string | null;
-  created_by: string;
-  created_by_name: string | null;
-  created_by_email: string | null;
-  created_at: number;
-  updated_at: number;
-  is_public: boolean;
-  preview_status: AppPreviewStatus | null;
-  preview_error: string | null;
-}
-
-export type AdminAppDetail = AdminAppSummary;
-
-export interface AdminInvitation {
-  id: string;
-  email: string;
-  role: OrgRole;
-  org_id: string;
-  org_name: string;
-  invited_by: string;
-  inviter_email: string;
-  inviter_name: string | null;
-  created_at: number;
-  expires_at: number;
-}
-
-// Paginated result types for admin lists
+// Paginated result types
 export interface PaginatedResult<T> {
   items: T[];
   total: number;

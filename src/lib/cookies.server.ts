@@ -2,8 +2,8 @@
  * Cookie utilities for React Router routes.
  */
 
-import { parse } from 'cookie';
 import {
+  parseCookie,
   SESSION_MAX_AGE,
   getSessionIdFromRequest as getSessionIdFromRequestBase,
   getSignedSessionFromRequest as getSignedSessionFromRequestBase,
@@ -20,14 +20,15 @@ export function getSessionIdFromRequest(request: Request): string | null {
   return getSessionIdFromRequestBase(request);
 }
 
-export function parseCookies(request: Request): Record<string, string | undefined> {
-  const cookieHeader = request.headers.get('Cookie');
-  return cookieHeader ? parse(cookieHeader) : {};
-}
-
+/** A request cookie's value, URI-decoded; null when absent or empty. */
 export function getCookie(request: Request, name: string): string | null {
-  const cookies = parseCookies(request);
-  return cookies[name] || null;
+  const value = parseCookie(request.headers.get('Cookie'), name);
+  if (!value) return null;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }
 
 export function createSessionCookieHeader(

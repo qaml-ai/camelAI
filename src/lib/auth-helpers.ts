@@ -32,6 +32,11 @@ export interface AuthEnv {
   CF_DISPATCH_NAMESPACE?: string;
   /** Comma/whitespace-separated bootstrap superuser emails (optional secret). */
   SUPERUSER_EMAILS?: string;
+  /** Phase-2 D1 mirror read flags (see d1-read-shadow.server.ts); unset = off. */
+  D1_READ_SHADOW?: string;
+  D1_READ_SERVE?: string;
+  D1_READ_SHADOW_SAMPLE_RATE?: string;
+  OBSERVABILITY_EVENTS?: AnalyticsEngineDataset;
 }
 
 /**
@@ -51,6 +56,10 @@ export function getAuthEnv(env: CloudflareEnv): AuthEnv {
     CF_ACCOUNT_ID: env.CF_ACCOUNT_ID,
     CF_DISPATCH_NAMESPACE: env.CF_DISPATCH_NAMESPACE,
     SUPERUSER_EMAILS: env.SUPERUSER_EMAILS,
+    D1_READ_SHADOW: (env as any).D1_READ_SHADOW,
+    D1_READ_SERVE: (env as any).D1_READ_SERVE,
+    D1_READ_SHADOW_SAMPLE_RATE: (env as any).D1_READ_SHADOW_SAMPLE_RATE,
+    OBSERVABILITY_EVENTS: (env as any).OBSERVABILITY_EVENTS,
   };
 }
 

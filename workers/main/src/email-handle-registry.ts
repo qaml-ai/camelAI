@@ -12,7 +12,7 @@ interface ClaimResult {
 
 /**
  * Durable Object keyed by email handle for race-safe handle ownership.
- * Each instance stores exactly one owner record (same pattern as OrgSlugDO).
+ * Each instance stores exactly one owner record.
  */
 export class EmailHandleDO extends DurableObject {
   getOwner(): string | null {

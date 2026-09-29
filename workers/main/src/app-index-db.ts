@@ -9,7 +9,6 @@ import type {
   AdminChatErrorSummary,
   AdminChatErrorThreadRow,
   AdminChatExplorerRow,
-  AdminEventType,
   AdminThreadListRow,
   AdminUserSummaryRow,
   AppFilters,
@@ -18,6 +17,7 @@ import type {
   OrgFilters,
   ThreadFilters,
   UserFilters,
+  VersionedAdminEvent,
   WorkspaceFilters,
 } from './admin-index-types.js';
 import {
@@ -338,6 +338,146 @@ function normalizeInternalDomainList(
   );
 }
 
+/** Mirrored entity kinds, as recorded in `mirror_rows.entity`. */
+export type MirrorEntity =
+  | 'user'
+  | 'org'
+  | 'workspace'
+  | 'thread'
+  | 'app'
+  | 'invitation'
+  | 'org_membership'
+  | 'workspace_member';
+
+const MIRROR_FANOUT_COLUMN_STATEMENTS = [
+  'ALTER TABLE users ADD COLUMN email_verified_at INTEGER',
+  'ALTER TABLE users ADD COLUMN orphaned_at INTEGER',
+  'ALTER TABLE org_memberships ADD COLUMN workspace_access_default TEXT',
+  'ALTER TABLE workspaces ADD COLUMN email_handle TEXT',
+  // Thread-list projection: previews truncated exactly like the list mapper.
+  'ALTER TABLE threads ADD COLUMN first_user_message_preview TEXT',
+  'ALTER TABLE threads ADD COLUMN last_user_message_preview TEXT',
+  'ALTER TABLE threads ADD COLUMN last_assistant_completed_at INTEGER',
+  'ALTER TABLE threads ADD COLUMN last_assistant_summary TEXT',
+  'ALTER TABLE threads ADD COLUMN last_assistant_summary_status TEXT',
+  'ALTER TABLE threads ADD COLUMN channel_connection_id TEXT',
+  'ALTER TABLE threads ADD COLUMN channel_conversation_id TEXT',
+  'ALTER TABLE threads ADD COLUMN channel_message_id TEXT',
+];
+
+export interface MirroredUserProfile {
+  id: string;
+  email: string;
+  email_verified_at: number | null;
+  name: string | null;
+  created_at: number;
+  is_superuser: boolean;
+  avatar: { color: string; content: string };
+  is_orphaned: boolean;
+  orphaned_at: number | null;
+}
+
+/** A D1 threads row projected for thread lists (previews already truncated). */
+export interface MirroredThreadRow {
+  id: string;
+  workspace_id: string;
+  title: string | null;
+  created_by: string | null;
+  model: string;
+  created_at: number;
+  updated_at: number;
+  user_message_count: number | null;
+  first_user_message_preview: string | null;
+  last_user_message_preview: string | null;
+  last_user_message_at: number | null;
+  last_assistant_completed_at: number | null;
+  last_assistant_summary: string | null;
+  last_assistant_summary_status: string | null;
+  source: string | null;
+  channel_kind: string | null;
+  channel_kinds: string | null;
+  channel_connection_id: string | null;
+  channel_conversation_id: string | null;
+  channel_message_id: string | null;
+}
+
+const MIRRORED_THREAD_COLUMNS = [
+  'id',
+  'workspace_id',
+  'title',
+  'created_by',
+  'model',
+  'created_at',
+  'updated_at',
+  'user_message_count',
+  'first_user_message_preview',
+  'last_user_message_preview',
+  'last_user_message_at',
+  'last_assistant_completed_at',
+  'last_assistant_summary',
+  'last_assistant_summary_status',
+  'source',
+  'channel_kind',
+  'channel_kinds',
+  'channel_connection_id',
+  'channel_conversation_id',
+  'channel_message_id',
+].join(', ');
+
+/** Thread list previews: the same limit `toThreadListPreview` applies. */
+export const THREAD_LIST_PREVIEW_LENGTH = 500;
+
+export function workspaceMemberMirrorKey(workspaceId: string, userId: string): string {
+  return `${workspaceId}:${userId}`;
+}
+
+const MIRROR_ROW_CLAIM_SQL = `
+  INSERT INTO mirror_rows (entity, entity_key, version, deleted, updated_at)
+  VALUES (?, ?, ?, ?, ?)
+  ON CONFLICT(entity, entity_key) DO UPDATE SET
+    version = excluded.version,
+    deleted = excluded.deleted,
+    updated_at = excluded.updated_at
+  WHERE excluded.version > mirror_rows.version
+`;
+
+export function orgMembershipMirrorKey(orgId: string, userId: string): string {
+  return `${orgId}:${userId}`;
+}
+
+function normalizeMirrorVersion(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+type MirrorGuard = { sql: string; binds: unknown[] };
+
+/**
+ * Guard for a mirrored upsert. Versioned: the write lands only while `version`
+ * is the row's recorded live version, so a newer write or a newer delete turns
+ * it into a no-op. Unversioned (legacy/repair): lands unless a versioned delete
+ * has tombstoned the row.
+ */
+function mirrorUpsertGuard(entity: MirrorEntity, key: string, version: number | undefined): MirrorGuard {
+  if (version === undefined) {
+    return {
+      sql: 'NOT EXISTS (SELECT 1 FROM mirror_rows WHERE entity = ? AND entity_key = ? AND deleted = 1)',
+      binds: [entity, key],
+    };
+  }
+  return {
+    sql: 'EXISTS (SELECT 1 FROM mirror_rows WHERE entity = ? AND entity_key = ? AND version = ? AND deleted = 0)',
+    binds: [entity, key, version],
+  };
+}
+
+function mirrorDeleteGuard(entity: MirrorEntity, key: string, version: number | undefined): MirrorGuard {
+  if (version === undefined) return { sql: '1', binds: [] };
+  return {
+    sql: 'EXISTS (SELECT 1 FROM mirror_rows WHERE entity = ? AND entity_key = ? AND version = ? AND deleted = 1)',
+    binds: [entity, key, version],
+  };
+}
+
 export class AppIndexDatabase {
   private schemaReady: Promise<void> | null = null;
 
@@ -473,6 +613,26 @@ export class AppIndexDatabase {
         value TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS mirror_rows (
+        entity TEXT NOT NULL,
+        entity_key TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        deleted INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (entity, entity_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_mirror_rows_deleted_updated_at ON mirror_rows(deleted, updated_at);
+      CREATE TABLE IF NOT EXISTS workspace_members (
+        workspace_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        org_id TEXT NOT NULL,
+        access_level TEXT NOT NULL,
+        granted_by TEXT,
+        granted_at INTEGER NOT NULL,
+        PRIMARY KEY (workspace_id, user_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_id, org_id);
+      CREATE INDEX IF NOT EXISTS idx_workspace_members_org ON workspace_members(org_id);
       CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
       CREATE INDEX IF NOT EXISTS idx_orgs_created_at ON orgs(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_orgs_llm_provider_created_at ON orgs(llm_provider, created_at DESC);
@@ -550,6 +710,15 @@ export class AppIndexDatabase {
         try {
           await this.db.prepare("ALTER TABLE threads ADD COLUMN last_model_changed_at INTEGER").run();
         } catch {}
+        // Columns the fan-out reads (org members, user orgs, thread lists,
+        // workspace switcher) need to be served from D1. Added here rather than
+        // in migrations/ because SQLite has no ADD COLUMN IF NOT EXISTS and this
+        // runtime path may already have run against a database.
+        for (const statement of MIRROR_FANOUT_COLUMN_STATEMENTS) {
+          try {
+            await this.db.prepare(statement).run();
+          } catch {}
+        }
         await this.db
           .prepare("CREATE INDEX IF NOT EXISTS idx_apps_project_updated_at ON apps(project_id, updated_at DESC)")
           .run();
@@ -612,6 +781,22 @@ export class AppIndexDatabase {
       `),
     );
     return row?.value === '1';
+  }
+
+  async getMetadata(key: string): Promise<string | null> {
+    await this.ensureSchema();
+    const row = await first<{ value: string }>(
+      this.db.prepare('SELECT value FROM app_index_metadata WHERE key = ? LIMIT 1').bind(key),
+    );
+    return row?.value ?? null;
+  }
+
+  async setMetadata(key: string, value: string): Promise<void> {
+    await this.ensureSchema();
+    await this.db
+      .prepare('INSERT OR REPLACE INTO app_index_metadata (key, value, updated_at) VALUES (?, ?, ?)')
+      .bind(key, value, Date.now())
+      .run();
   }
 
   async markBootstrapComplete(): Promise<void> {
@@ -679,8 +864,28 @@ export class AppIndexDatabase {
     await this.db.prepare('DELETE FROM blocked_signup_ips WHERE ip = ?').bind(normalizedIp).run();
   }
 
-  async applyAdminEvent(event: AdminEventType): Promise<void> {
+  /**
+   * Statements that record `version` as the entity row's current version.
+   * Monotonic: an older or equal version leaves the ledger untouched, and the
+   * data statement's guard then decides whether this write is still current.
+   */
+  private claimMirrorVersion(
+    entity: MirrorEntity,
+    key: string,
+    version: number | undefined,
+    deleted: boolean,
+  ): D1PreparedStatement[] {
+    if (version === undefined) return [];
+    return [
+      this.db
+        .prepare(MIRROR_ROW_CLAIM_SQL)
+        .bind(entity, key, version, deleted ? 1 : 0, Date.now()),
+    ];
+  }
+
+  async applyAdminEvent(event: VersionedAdminEvent): Promise<void> {
     await this.ensureSchema();
+    const version = normalizeMirrorVersion(event.version);
     switch (event.type) {
       case 'user_upsert': {
         const u = event.payload;
@@ -688,22 +893,34 @@ export class AppIndexDatabase {
         if (deleted) break;
         const orgCount = typeof u.org_count === 'number' && Number.isFinite(u.org_count) ? u.org_count : null;
         const signupIp = typeof u.signup_ip === 'string' && u.signup_ip.trim() ? u.signup_ip.trim().toLowerCase() : null;
-        await this.db
-          .prepare(`
-            INSERT INTO users (id, email, name, avatar_color, avatar_content, created_at, is_superuser, is_orphaned, org_count, signup_ip)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, COALESCE((SELECT org_count FROM users WHERE id = ?), 0)), COALESCE(?, (SELECT signup_ip FROM users WHERE id = ?)))
-            ON CONFLICT(id) DO UPDATE SET
-              email=excluded.email,
-              name=excluded.name,
-              avatar_color=excluded.avatar_color,
-              avatar_content=excluded.avatar_content,
-              is_superuser=excluded.is_superuser,
-              is_orphaned=excluded.is_orphaned,
-              org_count=COALESCE(excluded.org_count, users.org_count),
-              signup_ip=COALESCE(excluded.signup_ip, users.signup_ip)
-          `)
-          .bind(u.id, u.email ?? '', u.name ?? null, u.avatar?.color ?? '', u.avatar?.content ?? '', u.created_at ?? Date.now(), u.is_superuser ? 1 : 0, u.is_orphaned ? 1 : 0, orgCount, u.id, signupIp, u.id)
-          .run();
+        const guard = mirrorUpsertGuard('user', u.id, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('user', u.id, version, false),
+          this.db
+            .prepare(`
+              INSERT INTO users (id, email, name, avatar_color, avatar_content, created_at, is_superuser, is_orphaned, org_count, signup_ip, email_verified_at, orphaned_at)
+              SELECT ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, COALESCE((SELECT org_count FROM users WHERE id = ?), 0)), COALESCE(?, (SELECT signup_ip FROM users WHERE id = ?)), ?, ?
+              WHERE ${guard.sql}
+              ON CONFLICT(id) DO UPDATE SET
+                email=excluded.email,
+                name=excluded.name,
+                avatar_color=excluded.avatar_color,
+                avatar_content=excluded.avatar_content,
+                is_superuser=excluded.is_superuser,
+                is_orphaned=excluded.is_orphaned,
+                org_count=COALESCE(excluded.org_count, users.org_count),
+                signup_ip=COALESCE(excluded.signup_ip, users.signup_ip),
+                email_verified_at=CASE WHEN ? THEN excluded.email_verified_at ELSE users.email_verified_at END,
+                orphaned_at=CASE WHEN ? THEN excluded.orphaned_at ELSE users.orphaned_at END
+            `)
+            .bind(
+              u.id, u.email ?? '', u.name ?? null, u.avatar?.color ?? '', u.avatar?.content ?? '', u.created_at ?? Date.now(), u.is_superuser ? 1 : 0, u.is_orphaned ? 1 : 0, orgCount, u.id, signupIp, u.id,
+              normalizeNullableNumber(u.email_verified_at), normalizeNullableNumber(u.orphaned_at),
+              ...guard.binds,
+              hasOwnField(u, 'email_verified_at') ? 1 : 0,
+              hasOwnField(u, 'orphaned_at') ? 1 : 0,
+            ),
+        ]);
         break;
       }
       case 'user_delete':
@@ -718,53 +935,71 @@ export class AppIndexDatabase {
         const slug = typeof o.slug === 'string' && o.slug.trim() ? o.slug : null;
         const memberCount = typeof o.member_count === 'number' && Number.isFinite(o.member_count) ? o.member_count : null;
         const workspaceCount = typeof o.workspace_count === 'number' && Number.isFinite(o.workspace_count) ? o.workspace_count : null;
-        await this.db
-          .prepare(`
-            INSERT INTO orgs (id, name, slug, created_at, archived, billing_status, billing_plan, created_by, member_count, workspace_count)
-            VALUES (?, ?, COALESCE(?, (SELECT slug FROM orgs WHERE id = ?)), ?, ?, ?, ?, ?, COALESCE(?, COALESCE((SELECT member_count FROM orgs WHERE id = ?), 0)), COALESCE(?, COALESCE((SELECT workspace_count FROM orgs WHERE id = ?), 0)))
-            ON CONFLICT(id) DO UPDATE SET
-              name=excluded.name,
-              slug=COALESCE(excluded.slug, orgs.slug),
-              archived=excluded.archived,
-              billing_status=excluded.billing_status,
-              billing_plan=excluded.billing_plan,
-              member_count=COALESCE(excluded.member_count, orgs.member_count),
-              workspace_count=COALESCE(excluded.workspace_count, orgs.workspace_count)
-          `)
-          .bind(o.id, o.name, slug, o.id, o.created_at ?? Date.now(), o.archived ? 1 : 0, o.billing_status ?? null, o.billing_plan ?? null, o.created_by ?? null, memberCount, o.id, workspaceCount, o.id)
-          .run();
+        const guard = mirrorUpsertGuard('org', o.id, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('org', o.id, version, false),
+          this.db
+            .prepare(`
+              INSERT INTO orgs (id, name, slug, created_at, archived, billing_status, billing_plan, created_by, member_count, workspace_count)
+              SELECT ?, ?, COALESCE(?, (SELECT slug FROM orgs WHERE id = ?)), ?, ?, ?, ?, ?, COALESCE(?, COALESCE((SELECT member_count FROM orgs WHERE id = ?), 0)), COALESCE(?, COALESCE((SELECT workspace_count FROM orgs WHERE id = ?), 0))
+              WHERE ${guard.sql}
+              ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name,
+                slug=COALESCE(excluded.slug, orgs.slug),
+                archived=excluded.archived,
+                billing_status=excluded.billing_status,
+                billing_plan=excluded.billing_plan,
+                member_count=COALESCE(excluded.member_count, orgs.member_count),
+                workspace_count=COALESCE(excluded.workspace_count, orgs.workspace_count)
+            `)
+            .bind(o.id, o.name, slug, o.id, o.created_at ?? Date.now(), o.archived ? 1 : 0, o.billing_status ?? null, o.billing_plan ?? null, o.created_by ?? null, memberCount, o.id, workspaceCount, o.id, ...guard.binds),
+        ]);
         break;
       }
-      case 'org_llm_provider_update':
-        await this.db
-          .prepare('UPDATE orgs SET llm_provider = ?, llm_provider_updated_at = ? WHERE id = ?')
-          .bind(event.payload.provider, event.payload.updated_at, event.payload.org_id)
-          .run();
+      case 'org_llm_provider_update': {
+        const guard = mirrorUpsertGuard('org', event.payload.org_id, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('org', event.payload.org_id, version, false),
+          this.db
+            .prepare(`UPDATE orgs SET llm_provider = ?, llm_provider_updated_at = ? WHERE id = ? AND ${guard.sql}`)
+            .bind(event.payload.provider, event.payload.updated_at, event.payload.org_id, ...guard.binds),
+        ]);
         break;
+      }
       case 'workspace_upsert': {
         const w = event.payload;
         const integrationCount = typeof w.integration_count === 'number' && Number.isFinite(w.integration_count) ? w.integration_count : null;
-        await this.db
-          .prepare(`
-            INSERT INTO workspaces (id, name, org_id, description, avatar_color, avatar_content, created_at, created_by, archived, archived_at, archived_by, compute_tier, thread_count, integration_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT thread_count FROM workspaces WHERE id = ?), 0), COALESCE(?, COALESCE((SELECT integration_count FROM workspaces WHERE id = ?), 0)))
-            ON CONFLICT(id) DO UPDATE SET
-              name=excluded.name,
-              org_id=excluded.org_id,
-              description=excluded.description,
-              avatar_color=COALESCE(excluded.avatar_color, workspaces.avatar_color),
-              avatar_content=COALESCE(excluded.avatar_content, workspaces.avatar_content),
-              created_at=excluded.created_at,
-              created_by=excluded.created_by,
-              archived=excluded.archived,
-              archived_at=excluded.archived_at,
-              archived_by=excluded.archived_by,
-              compute_tier=COALESCE(excluded.compute_tier, 'standard'),
-              integration_count=COALESCE(excluded.integration_count, integration_count)
-          `)
-          .bind(w.id, w.name, w.org_id, w.description ?? null, w.avatar?.color ?? null, w.avatar?.content ?? null, w.created_at ?? Date.now(), w.created_by ?? null, w.archived ? 1 : 0, w.archived_at ?? null, w.archived_by ?? null, w.compute_tier ?? 'standard', w.id, integrationCount, w.id)
-          .run();
-        await this.db.prepare('UPDATE orgs SET workspace_count = (SELECT COUNT(*) FROM workspaces WHERE org_id = ?) WHERE id = ?').bind(w.org_id, w.org_id).run();
+        const guard = mirrorUpsertGuard('workspace', w.id, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('workspace', w.id, version, false),
+          this.db
+            .prepare(`
+              INSERT INTO workspaces (id, name, org_id, description, avatar_color, avatar_content, created_at, created_by, archived, archived_at, archived_by, compute_tier, thread_count, integration_count, email_handle)
+              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT thread_count FROM workspaces WHERE id = ?), 0), COALESCE(?, COALESCE((SELECT integration_count FROM workspaces WHERE id = ?), 0)), ?
+              WHERE ${guard.sql}
+              ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name,
+                org_id=excluded.org_id,
+                description=excluded.description,
+                avatar_color=COALESCE(excluded.avatar_color, workspaces.avatar_color),
+                avatar_content=COALESCE(excluded.avatar_content, workspaces.avatar_content),
+                created_at=excluded.created_at,
+                created_by=excluded.created_by,
+                archived=excluded.archived,
+                archived_at=excluded.archived_at,
+                archived_by=excluded.archived_by,
+                compute_tier=COALESCE(excluded.compute_tier, 'standard'),
+                integration_count=COALESCE(excluded.integration_count, integration_count),
+                email_handle=CASE WHEN ? THEN excluded.email_handle ELSE workspaces.email_handle END
+            `)
+            .bind(
+              w.id, w.name, w.org_id, w.description ?? null, w.avatar?.color ?? null, w.avatar?.content ?? null, w.created_at ?? Date.now(), w.created_by ?? null, w.archived ? 1 : 0, w.archived_at ?? null, w.archived_by ?? null, w.compute_tier ?? 'standard', w.id, integrationCount, w.id,
+              typeof w.email_handle === 'string' ? w.email_handle : null,
+              ...guard.binds,
+              hasOwnField(w, 'email_handle') ? 1 : 0,
+            ),
+          this.db.prepare('UPDATE orgs SET workspace_count = (SELECT COUNT(*) FROM workspaces WHERE org_id = ?) WHERE id = ?').bind(w.org_id, w.org_id),
+        ]);
         break;
       }
       case 'thread_upsert': {
@@ -820,92 +1055,140 @@ export class AppIndexDatabase {
           (existingLastModelChangedAt === null || incomingLastModelChangedAt >= existingLastModelChangedAt)
             ? incomingLastModelChangedAt
             : existingLastModelChangedAt;
-        await this.db
-          .prepare(`
-            INSERT INTO threads (
-              id,
-              title,
-              model,
-              org_id,
-              workspace_id,
-              created_at,
-              updated_at,
-              created_by,
-              user_message_count,
-              first_user_message,
-              last_user_message_at,
-              source,
-              channel_kind,
-              channel_kinds,
-              chat_error_count,
-              last_chat_error_at,
-              last_chat_error_message,
-              last_chat_error_source,
-              last_chat_error_status,
-              last_chat_error_provider,
-              last_chat_error_model,
-              model_history,
-              last_model_changed_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-              title=excluded.title,
-              model=excluded.model,
-              updated_at=excluded.updated_at,
-              created_by=excluded.created_by,
-              user_message_count=excluded.user_message_count,
-              first_user_message=excluded.first_user_message,
-              last_user_message_at=excluded.last_user_message_at,
-              source=excluded.source,
-              channel_kind=excluded.channel_kind,
-              channel_kinds=excluded.channel_kinds,
-              chat_error_count=excluded.chat_error_count,
-              last_chat_error_at=excluded.last_chat_error_at,
-              last_chat_error_message=excluded.last_chat_error_message,
-              last_chat_error_source=excluded.last_chat_error_source,
-              last_chat_error_status=excluded.last_chat_error_status,
-              last_chat_error_provider=excluded.last_chat_error_provider,
-              last_chat_error_model=excluded.last_chat_error_model,
-              model_history=excluded.model_history,
-              last_model_changed_at=excluded.last_model_changed_at
-          `)
-          .bind(
-            t.id,
-            t.title ?? null,
-            t.model ?? 'sonnet',
-            t.org_id,
-            t.workspace_id,
-            t.created_at ?? Date.now(),
-            t.updated_at ?? Date.now(),
-            t.created_by ?? null,
-            userMessageCount,
-            firstUserMessage,
-            t.last_user_message_at ?? null,
-            t.source ?? null,
-            t.channel_kind ?? null,
-            channelKinds,
-            chatErrorCount,
-            shouldUseIncomingErrorSummary ? incomingErrorAt : existingErrorAt,
-            shouldUseIncomingErrorSummary
-              ? truncateChatMetadata(t.last_chat_error_message)
-              : existingThreadMetadata?.last_chat_error_message ?? null,
-            shouldUseIncomingErrorSummary
-              ? truncateChatMetadata(t.last_chat_error_source, 64)
-              : existingThreadMetadata?.last_chat_error_source ?? null,
-            shouldUseIncomingErrorSummary
-              ? normalizeNullableNumber(t.last_chat_error_status)
-              : existingThreadMetadata?.last_chat_error_status ?? null,
-            shouldUseIncomingErrorSummary
-              ? truncateChatMetadata(t.last_chat_error_provider, 80)
-              : existingThreadMetadata?.last_chat_error_provider ?? null,
-            shouldUseIncomingErrorSummary
-              ? truncateChatMetadata(t.last_chat_error_model, 160)
-              : existingThreadMetadata?.last_chat_error_model ?? null,
-            modelHistory,
-            lastModelChangedAt,
-          )
-          .run();
-        await this.db.prepare('UPDATE workspaces SET thread_count = (SELECT COUNT(*) FROM threads WHERE workspace_id = ?) WHERE id = ?').bind(t.workspace_id, t.workspace_id).run();
+        const guard = mirrorUpsertGuard('thread', t.id, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('thread', t.id, version, false),
+          this.db
+            .prepare(`
+              INSERT INTO threads (
+                id,
+                title,
+                model,
+                org_id,
+                workspace_id,
+                created_at,
+                updated_at,
+                created_by,
+                user_message_count,
+                first_user_message,
+                last_user_message_at,
+                source,
+                channel_kind,
+                channel_kinds,
+                chat_error_count,
+                last_chat_error_at,
+                last_chat_error_message,
+                last_chat_error_source,
+                last_chat_error_status,
+                last_chat_error_provider,
+                last_chat_error_model,
+                model_history,
+                last_model_changed_at,
+                first_user_message_preview,
+                last_user_message_preview,
+                last_assistant_completed_at,
+                last_assistant_summary,
+                last_assistant_summary_status,
+                channel_connection_id,
+                channel_conversation_id,
+                channel_message_id
+              )
+              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+              WHERE ${guard.sql}
+              ON CONFLICT(id) DO UPDATE SET
+                title=excluded.title,
+                model=excluded.model,
+                updated_at=excluded.updated_at,
+                created_by=excluded.created_by,
+                user_message_count=excluded.user_message_count,
+                first_user_message=excluded.first_user_message,
+                last_user_message_at=excluded.last_user_message_at,
+                source=excluded.source,
+                channel_kind=excluded.channel_kind,
+                channel_kinds=excluded.channel_kinds,
+                chat_error_count=excluded.chat_error_count,
+                last_chat_error_at=excluded.last_chat_error_at,
+                last_chat_error_message=excluded.last_chat_error_message,
+                last_chat_error_source=excluded.last_chat_error_source,
+                last_chat_error_status=excluded.last_chat_error_status,
+                last_chat_error_provider=excluded.last_chat_error_provider,
+                last_chat_error_model=excluded.last_chat_error_model,
+                model_history=excluded.model_history,
+                last_model_changed_at=excluded.last_model_changed_at,
+                first_user_message_preview=CASE WHEN ? THEN excluded.first_user_message_preview ELSE threads.first_user_message_preview END,
+                last_user_message_preview=CASE WHEN ? THEN excluded.last_user_message_preview ELSE threads.last_user_message_preview END,
+                last_assistant_completed_at=CASE WHEN ? THEN excluded.last_assistant_completed_at ELSE threads.last_assistant_completed_at END,
+                last_assistant_summary=CASE WHEN ? THEN excluded.last_assistant_summary ELSE threads.last_assistant_summary END,
+                last_assistant_summary_status=CASE WHEN ? THEN excluded.last_assistant_summary_status ELSE threads.last_assistant_summary_status END,
+                channel_connection_id=CASE WHEN ? THEN excluded.channel_connection_id ELSE threads.channel_connection_id END,
+                channel_conversation_id=CASE WHEN ? THEN excluded.channel_conversation_id ELSE threads.channel_conversation_id END,
+                channel_message_id=CASE WHEN ? THEN excluded.channel_message_id ELSE threads.channel_message_id END
+            `)
+            .bind(
+              t.id,
+              t.title ?? null,
+              t.model ?? 'sonnet',
+              t.org_id,
+              t.workspace_id,
+              t.created_at ?? Date.now(),
+              t.updated_at ?? Date.now(),
+              t.created_by ?? null,
+              userMessageCount,
+              firstUserMessage,
+              t.last_user_message_at ?? null,
+              t.source ?? null,
+              t.channel_kind ?? null,
+              channelKinds,
+              chatErrorCount,
+              shouldUseIncomingErrorSummary ? incomingErrorAt : existingErrorAt,
+              shouldUseIncomingErrorSummary
+                ? truncateChatMetadata(t.last_chat_error_message)
+                : existingThreadMetadata?.last_chat_error_message ?? null,
+              shouldUseIncomingErrorSummary
+                ? truncateChatMetadata(t.last_chat_error_source, 64)
+                : existingThreadMetadata?.last_chat_error_source ?? null,
+              shouldUseIncomingErrorSummary
+                ? normalizeNullableNumber(t.last_chat_error_status)
+                : existingThreadMetadata?.last_chat_error_status ?? null,
+              shouldUseIncomingErrorSummary
+                ? truncateChatMetadata(t.last_chat_error_provider, 80)
+                : existingThreadMetadata?.last_chat_error_provider ?? null,
+              shouldUseIncomingErrorSummary
+                ? truncateChatMetadata(t.last_chat_error_model, 160)
+                : existingThreadMetadata?.last_chat_error_model ?? null,
+              modelHistory,
+              lastModelChangedAt,
+              truncateThreadPreviewText(
+                typeof t.first_user_message === 'string' ? t.first_user_message : null,
+                THREAD_LIST_PREVIEW_LENGTH,
+              ),
+              truncateThreadPreviewText(
+                typeof t.last_user_message === 'string' ? t.last_user_message : null,
+                THREAD_LIST_PREVIEW_LENGTH,
+              ),
+              normalizeNullableNumber(t.last_assistant_completed_at),
+              typeof t.last_assistant_summary === 'string' ? t.last_assistant_summary : null,
+              typeof t.last_assistant_summary_status === 'string' ? t.last_assistant_summary_status : null,
+              t.channel_connection_id ?? null,
+              t.channel_conversation_id ?? null,
+              t.channel_message_id ?? null,
+              ...guard.binds,
+              // The list projection is owned by the DO snapshot: unversioned
+              // (legacy/repair) writes, which may carry admin-truncated text,
+              // leave it alone, as do snapshots that omit a field.
+              ...[
+                'first_user_message',
+                'last_user_message',
+                'last_assistant_completed_at',
+                'last_assistant_summary',
+                'last_assistant_summary_status',
+                'channel_connection_id',
+                'channel_conversation_id',
+                'channel_message_id',
+              ].map((field) => (version !== undefined && hasOwnField(t, field) ? 1 : 0)),
+            ),
+          this.db.prepare('UPDATE workspaces SET thread_count = (SELECT COUNT(*) FROM threads WHERE workspace_id = ?) WHERE id = ?').bind(t.workspace_id, t.workspace_id),
+        ]);
         break;
       }
       case 'thread_error_recorded': {
@@ -943,6 +1226,7 @@ export class AppIndexDatabase {
         if (!normalized.thread_id || !normalized.org_id || !normalized.workspace_id) {
           break;
         }
+        // Append-only and keyed by id, so replays are idempotent without a version.
         await this.db
           .prepare(`
             INSERT OR IGNORE INTO chat_error_events (
@@ -984,81 +1268,261 @@ export class AppIndexDatabase {
       }
       case 'app_upsert': {
         const a = event.payload;
-        await this.db
-          .prepare(`
-            INSERT INTO apps (app_id, script_name, org_id, workspace_id, project_id, created_by, created_at, updated_at, is_public, preview_status, preview_error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(app_id) DO UPDATE SET
-              script_name=excluded.script_name,
-              org_id=excluded.org_id,
-              workspace_id=excluded.workspace_id,
-              project_id=excluded.project_id,
-              created_by=excluded.created_by,
-              created_at=excluded.created_at,
-              updated_at=excluded.updated_at,
-              is_public=excluded.is_public,
-              preview_status=excluded.preview_status,
-              preview_error=excluded.preview_error
-          `)
-          .bind(this.getAppId(a.org_id, a.script_name), a.script_name, a.org_id ?? null, a.workspace_id, a.project_id ?? null, a.created_by ?? null, a.created_at ?? Date.now(), a.updated_at ?? Date.now(), a.is_public ? 1 : 0, a.preview_status ?? null, a.preview_error ?? null)
-          .run();
+        const appId = this.getAppId(a.org_id, a.script_name);
+        const guard = mirrorUpsertGuard('app', appId, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('app', appId, version, false),
+          this.db
+            .prepare(`
+              INSERT INTO apps (app_id, script_name, org_id, workspace_id, project_id, created_by, created_at, updated_at, is_public, preview_status, preview_error)
+              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+              WHERE ${guard.sql}
+              ON CONFLICT(app_id) DO UPDATE SET
+                script_name=excluded.script_name,
+                org_id=excluded.org_id,
+                workspace_id=excluded.workspace_id,
+                project_id=excluded.project_id,
+                created_by=excluded.created_by,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at,
+                is_public=excluded.is_public,
+                preview_status=excluded.preview_status,
+                preview_error=excluded.preview_error
+            `)
+            .bind(appId, a.script_name, a.org_id ?? null, a.workspace_id, a.project_id ?? null, a.created_by ?? null, a.created_at ?? Date.now(), a.updated_at ?? Date.now(), a.is_public ? 1 : 0, a.preview_status ?? null, a.preview_error ?? null, ...guard.binds),
+        ]);
         break;
       }
       case 'invitation_upsert': {
         const i = event.payload;
-        await this.db
-          .prepare(`
-            INSERT INTO invitations (id, org_id, email, role, invited_by, status, created_at, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET status=excluded.status, role=excluded.role
-          `)
-          .bind(i.id, i.org_id, i.email, i.role, i.invited_by, i.status ?? 'pending', i.created_at ?? Date.now(), i.expires_at ?? Date.now())
-          .run();
+        const guard = mirrorUpsertGuard('invitation', i.id, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('invitation', i.id, version, false),
+          this.db
+            .prepare(`
+              INSERT INTO invitations (id, org_id, email, role, invited_by, status, created_at, expires_at)
+              SELECT ?, ?, ?, ?, ?, ?, ?, ?
+              WHERE ${guard.sql}
+              ON CONFLICT(id) DO UPDATE SET status=excluded.status, role=excluded.role
+            `)
+            .bind(i.id, i.org_id, i.email, i.role, i.invited_by, i.status ?? 'pending', i.created_at ?? Date.now(), i.expires_at ?? Date.now(), ...guard.binds),
+        ]);
         break;
       }
       case 'thread_delete': {
         const workspaceId = event.payload.workspace_id ?? (await first<{ workspace_id: string }>(this.db.prepare('SELECT workspace_id FROM threads WHERE id = ?').bind(event.payload.id)))?.workspace_id ?? null;
-        await this.db.prepare('DELETE FROM threads WHERE id = ?').bind(event.payload.id).run();
-        if (workspaceId) {
-          await this.db.prepare('UPDATE workspaces SET thread_count = (SELECT COUNT(*) FROM threads WHERE workspace_id = ?) WHERE id = ?').bind(workspaceId, workspaceId).run();
-        }
+        const guard = mirrorDeleteGuard('thread', event.payload.id, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('thread', event.payload.id, version, true),
+          this.db.prepare(`DELETE FROM threads WHERE id = ? AND ${guard.sql}`).bind(event.payload.id, ...guard.binds),
+          ...(workspaceId
+            ? [this.db.prepare('UPDATE workspaces SET thread_count = (SELECT COUNT(*) FROM threads WHERE workspace_id = ?) WHERE id = ?').bind(workspaceId, workspaceId)]
+            : []),
+        ]);
         break;
       }
-      case 'app_delete':
-        await this.db
-          .prepare(event.payload.org_id ? 'DELETE FROM apps WHERE app_id = ?' : 'DELETE FROM apps WHERE script_name = ?')
-          .bind(event.payload.org_id ? this.getAppId(event.payload.org_id, event.payload.script_name) : event.payload.script_name)
-          .run();
+      case 'app_delete': {
+        if (!event.payload.org_id) {
+          await this.db.prepare('DELETE FROM apps WHERE script_name = ?').bind(event.payload.script_name).run();
+          break;
+        }
+        const appId = this.getAppId(event.payload.org_id, event.payload.script_name);
+        const guard = mirrorDeleteGuard('app', appId, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('app', appId, version, true),
+          this.db.prepare(`DELETE FROM apps WHERE app_id = ? AND ${guard.sql}`).bind(appId, ...guard.binds),
+        ]);
         break;
-      case 'invitation_delete':
-        await this.db.prepare('DELETE FROM invitations WHERE id = ?').bind(event.payload.id).run();
+      }
+      case 'invitation_delete': {
+        const guard = mirrorDeleteGuard('invitation', event.payload.id, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('invitation', event.payload.id, version, true),
+          this.db.prepare(`DELETE FROM invitations WHERE id = ? AND ${guard.sql}`).bind(event.payload.id, ...guard.binds),
+        ]);
         break;
-      case 'workspace_delete':
-        await this.db.prepare('DELETE FROM workspaces WHERE id = ?').bind(event.payload.id).run();
+      }
+      case 'workspace_delete': {
+        const orgId = (await first<{ org_id: string }>(this.db.prepare('SELECT org_id FROM workspaces WHERE id = ?').bind(event.payload.id)))?.org_id ?? null;
+        const guard = mirrorDeleteGuard('workspace', event.payload.id, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('workspace', event.payload.id, version, true),
+          this.db.prepare(`DELETE FROM workspaces WHERE id = ? AND ${guard.sql}`).bind(event.payload.id, ...guard.binds),
+          ...(orgId
+            ? [this.db.prepare('UPDATE orgs SET workspace_count = (SELECT COUNT(*) FROM workspaces WHERE org_id = ?) WHERE id = ?').bind(orgId, orgId)]
+            : []),
+        ]);
         break;
+      }
+      // Legacy relative counters: not idempotent, so the DO outbox never emits
+      // them (it mirrors absolute counts in org/user snapshots instead).
       case 'org_member_delta':
         await this.db.prepare('UPDATE orgs SET member_count = MAX(0, member_count + ?) WHERE id = ?').bind(event.payload.delta, event.payload.org_id).run();
         break;
       case 'user_org_delta':
         await this.db.prepare('UPDATE users SET org_count = MAX(0, org_count + ?) WHERE id = ?').bind(event.payload.delta, event.payload.user_id).run();
         break;
-      case 'org_membership_upsert':
-        await this.db
-          .prepare(`
-            INSERT INTO org_memberships (org_id, user_id, role, joined_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(org_id, user_id) DO UPDATE SET role = excluded.role, joined_at = COALESCE(org_memberships.joined_at, excluded.joined_at)
-          `)
-          .bind(event.payload.org_id, event.payload.user_id, event.payload.role, event.payload.joined_at)
-          .run();
+      case 'org_membership_upsert': {
+        const key = orgMembershipMirrorKey(event.payload.org_id, event.payload.user_id);
+        const guard = mirrorUpsertGuard('org_membership', key, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('org_membership', key, version, false),
+          this.db
+            .prepare(`
+              INSERT INTO org_memberships (org_id, user_id, role, joined_at, workspace_access_default)
+              SELECT ?, ?, ?, ?, ?
+              WHERE ${guard.sql}
+              ON CONFLICT(org_id, user_id) DO UPDATE SET
+                role = excluded.role,
+                joined_at = CASE WHEN ? THEN excluded.joined_at ELSE COALESCE(org_memberships.joined_at, excluded.joined_at) END,
+                workspace_access_default = COALESCE(excluded.workspace_access_default, org_memberships.workspace_access_default)
+            `)
+            .bind(
+              event.payload.org_id,
+              event.payload.user_id,
+              event.payload.role,
+              event.payload.joined_at,
+              event.payload.workspace_access_default ?? null,
+              ...guard.binds,
+              // A versioned snapshot is the DO's current row: take its joined_at.
+              version === undefined ? 0 : 1,
+            ),
+        ]);
         break;
-      case 'org_membership_delete':
-        await this.db.prepare('DELETE FROM org_memberships WHERE org_id = ? AND user_id = ?').bind(event.payload.org_id, event.payload.user_id).run();
+      }
+      case 'org_membership_delete': {
+        const key = orgMembershipMirrorKey(event.payload.org_id, event.payload.user_id);
+        const guard = mirrorDeleteGuard('org_membership', key, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('org_membership', key, version, true),
+          this.db
+            .prepare(`DELETE FROM org_memberships WHERE org_id = ? AND user_id = ? AND ${guard.sql}`)
+            .bind(event.payload.org_id, event.payload.user_id, ...guard.binds),
+        ]);
         break;
+      }
+      case 'workspace_member_upsert': {
+        const m = event.payload;
+        const key = workspaceMemberMirrorKey(m.workspace_id, m.user_id);
+        const guard = mirrorUpsertGuard('workspace_member', key, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('workspace_member', key, version, false),
+          this.db
+            .prepare(`
+              INSERT INTO workspace_members (workspace_id, user_id, org_id, access_level, granted_by, granted_at)
+              SELECT ?, ?, ?, ?, ?, ?
+              WHERE ${guard.sql}
+              ON CONFLICT(workspace_id, user_id) DO UPDATE SET
+                org_id = excluded.org_id,
+                access_level = excluded.access_level,
+                granted_by = excluded.granted_by,
+                granted_at = excluded.granted_at
+            `)
+            .bind(m.workspace_id, m.user_id, m.org_id, m.access_level, m.granted_by ?? null, m.granted_at, ...guard.binds),
+        ]);
+        break;
+      }
+      case 'workspace_member_delete': {
+        const key = workspaceMemberMirrorKey(event.payload.workspace_id, event.payload.user_id);
+        const guard = mirrorDeleteGuard('workspace_member', key, version);
+        await this.db.batch([
+          ...this.claimMirrorVersion('workspace_member', key, version, true),
+          this.db
+            .prepare(`DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND ${guard.sql}`)
+            .bind(event.payload.workspace_id, event.payload.user_id, ...guard.binds),
+        ]);
+        break;
+      }
     }
   }
 
-  async handleEvent(event: AdminEventType): Promise<void> {
+  /**
+   * Remove every mirrored row of a hard-deleted org and tombstone the org row
+   * permanently, so a late drain cannot resurrect it. Idempotent.
+   */
+  async purgeMirroredOrg(orgId: string): Promise<void> {
+    await this.ensureSchema();
+    await this.db.batch([
+      this.db
+        .prepare(`
+          INSERT INTO mirror_rows (entity, entity_key, version, deleted, updated_at)
+          VALUES ('org', ?, ?, 1, ?)
+          ON CONFLICT(entity, entity_key) DO UPDATE SET
+            version = excluded.version, deleted = 1, updated_at = excluded.updated_at
+        `)
+        .bind(orgId, Number.MAX_SAFE_INTEGER, Date.now()),
+      this.db.prepare('DELETE FROM workspace_members WHERE org_id = ?').bind(orgId),
+      this.db.prepare('DELETE FROM org_memberships WHERE org_id = ?').bind(orgId),
+      this.db.prepare('DELETE FROM invitations WHERE org_id = ?').bind(orgId),
+      this.db.prepare('DELETE FROM apps WHERE org_id = ?').bind(orgId),
+      this.db.prepare('DELETE FROM threads WHERE org_id = ?').bind(orgId),
+      this.db.prepare('DELETE FROM chat_error_events WHERE org_id = ?').bind(orgId),
+      this.db.prepare('DELETE FROM workspaces WHERE org_id = ?').bind(orgId),
+      this.db.prepare('DELETE FROM orgs WHERE id = ?').bind(orgId),
+    ]);
+  }
+
+  /**
+   * Org ids D1 holds any row for (the org row or an orphaned child), after
+   * `afterId`, in id order: the orphan-cleanup walk.
+   */
+  async listMirroredOrgIds(afterId: string, limit: number): Promise<string[]> {
+    // One query per table (D1 caps compound SELECT terms); the smallest
+    // `limit` ids of the union are the next page.
+    const sources: Array<[string, string]> = [
+      ['orgs', 'id'],
+      ['workspaces', 'org_id'],
+      ['org_memberships', 'org_id'],
+      ['threads', 'org_id'],
+      ['apps', 'org_id'],
+      ['invitations', 'org_id'],
+    ];
+    const pages = await Promise.all(
+      sources.map(([table, column]) =>
+        this.all<{ org_id: string }>(
+          `SELECT DISTINCT ${column} AS org_id FROM ${table} WHERE ${column} > ? ORDER BY ${column} LIMIT ?`,
+          afterId,
+          limit,
+        ),
+      ),
+    );
+    const ids = new Set(pages.flat().map((row) => row.org_id).filter((id): id is string => Boolean(id)));
+    return [...ids].sort().slice(0, limit);
+  }
+
+  /** Recent D1 activity for an org: any hit vetoes an orphan purge. */
+  async getOrgActivitySince(orgId: string, sinceMs: number): Promise<{ members: number; workspaces: number; threads: number }> {
+    const count = async (query: string) =>
+      Number((await first<{ n: number }>(this.db.prepare(query).bind(orgId, sinceMs)))?.n ?? 0);
+    await this.ensureSchema();
+    const [members, workspaces, threads] = await Promise.all([
+      count('SELECT COUNT(*) AS n FROM org_memberships WHERE org_id = ? AND joined_at > ?'),
+      count('SELECT COUNT(*) AS n FROM workspaces WHERE org_id = ? AND created_at > ?'),
+      count('SELECT COUNT(*) AS n FROM threads WHERE org_id = ? AND updated_at > ?'),
+    ]);
+    return { members, workspaces, threads };
+  }
+
+  /** What D1 knows about a user that could corroborate (or veto) an orphan purge. */
+  async getUserOrphanEvidence(userId: string): Promise<{ email: string | null; memberships: number }> {
+    await this.ensureSchema();
+    const [user, memberships] = await Promise.all([
+      first<{ email: string | null }>(this.db.prepare('SELECT email FROM users WHERE id = ?').bind(userId)),
+      first<{ n: number }>(this.db.prepare('SELECT COUNT(*) AS n FROM org_memberships WHERE user_id = ?').bind(userId)),
+    ]);
+    return { email: user?.email ?? null, memberships: Number(memberships?.n ?? 0) };
+  }
+
+  async listMirroredUserIds(afterId: string, limit: number): Promise<string[]> {
+    const rows = await this.all<{ id: string }>(
+      'SELECT id FROM users WHERE id > ? ORDER BY id LIMIT ?',
+      afterId,
+      limit,
+    );
+    return rows.map((row) => row.id);
+  }
+
+  async handleEvent(event: VersionedAdminEvent): Promise<void> {
     await this.applyAdminEvent(event);
   }
 
@@ -1195,18 +1659,6 @@ export class AppIndexDatabase {
       total_workspaces: toNumber(totalWorkspaces?.count),
       total_integrations: toNumber(totalIntegrations?.count),
       orphaned_users: toNumber(orphanedUsers?.count),
-    };
-  }
-
-  async getOverview() {
-    const [stats, users] = await Promise.all([
-      this.getStats(),
-      this.all<any>('SELECT * FROM users'),
-    ]);
-    return {
-      users: users.map((u) => ({ ...u, avatar: { color: u.avatar_color || '#666', content: u.avatar_content || 'U' }, is_superuser: u.is_superuser === 1, is_orphaned: u.is_orphaned === 1, signup_ip: u.signup_ip ?? null })),
-      ...stats,
-      superusers: users.filter((u) => u.is_superuser === 1).map((u) => ({ ...u, avatar: { color: u.avatar_color || '#666', content: u.avatar_content || 'U' }, is_superuser: true, is_orphaned: u.is_orphaned === 1 })),
     };
   }
 
@@ -1680,20 +2132,6 @@ export class AppIndexDatabase {
     }));
   }
 
-  async getAllThreads() {
-    return this.all<AdminThreadListRow>(`
-      SELECT t.*, o.name as org_name, w.name as workspace_name
-      FROM threads t
-      LEFT JOIN orgs o ON t.org_id = o.id
-      LEFT JOIN workspaces w ON t.workspace_id = w.id
-      ORDER BY t.updated_at DESC
-    `);
-  }
-
-  async getAppCount() {
-    return toNumber((await first<{ count: number }>(this.db.prepare('SELECT COUNT(*) AS count FROM apps')))?.count);
-  }
-
   async getOrgsPaginated(offset: number, limit: number, search?: string, filters?: OrgFilters) {
     const conditions: string[] = [];
     const params: unknown[] = [];
@@ -1798,17 +2236,6 @@ export class AppIndexDatabase {
     return { items: rows.map(normalizeWorkspaceRow), total, offset, limit, hasMore: offset + rows.length < total };
   }
 
-  async getWorkspacesByOrg(orgId: string) {
-    const rows = await this.all<any>(`
-      SELECT w.*, o.name as org_name
-      FROM workspaces w
-      LEFT JOIN orgs o ON w.org_id = o.id
-      WHERE w.org_id = ?
-      ORDER BY w.created_at DESC
-    `, orgId);
-    return rows.map(normalizeWorkspaceRow);
-  }
-
   async getWorkspaceOrgId(workspaceId: string): Promise<string | null> {
     const row = await first<{ org_id: string }>(
       this.db.prepare('SELECT org_id FROM workspaces WHERE id = ?').bind(workspaceId),
@@ -1886,6 +2313,82 @@ export class AppIndexDatabase {
       WHERE u.id IN (SELECT value FROM json_each(?))
     `, JSON.stringify(normalizedUserIds));
     return rows.map((u) => ({ ...u, avatar: { color: u.avatar_color || '#666', content: u.avatar_content || 'U' }, is_superuser: u.is_superuser === 1, is_orphaned: u.is_orphaned === 1, signup_ip: u.signup_ip ?? null }));
+  }
+
+  // -------------------------------------------------------------------------
+  // Mirror reads for the product fan-out call sites (phase 2, flag-gated in
+  // src/lib/d1-read-shadow.server.ts). Never used for auth decisions.
+  // -------------------------------------------------------------------------
+
+  /** Org names and archive state by id (replaces one OrgDO.getInfo per org). */
+  async getMirroredOrgSummaries(orgIds: string[]): Promise<Array<{ id: string; name: string; archived: boolean }>> {
+    const ids = Array.from(new Set(orgIds.filter(Boolean)));
+    if (ids.length === 0) return [];
+    const rows = await this.all<{ id: string; name: string; archived: number }>(
+      'SELECT id, name, archived FROM orgs WHERE id IN (SELECT value FROM json_each(?))',
+      JSON.stringify(ids),
+    );
+    return rows.map((row) => ({ id: row.id, name: row.name, archived: row.archived === 1 }));
+  }
+
+  /** Full user profiles by id (replaces one UserDO.getProfile per member). */
+  async getMirroredUserProfiles(userIds: string[]): Promise<MirroredUserProfile[]> {
+    const ids = Array.from(new Set(userIds.filter(Boolean)));
+    if (ids.length === 0) return [];
+    const rows = await this.all<any>(
+      `SELECT id, email, email_verified_at, name, created_at, is_superuser, avatar_color, avatar_content, is_orphaned, orphaned_at
+         FROM users
+        WHERE id IN (SELECT value FROM json_each(?))`,
+      JSON.stringify(ids),
+    );
+    return rows.map((row) => ({
+      id: row.id,
+      email: row.email,
+      email_verified_at: row.email_verified_at ?? null,
+      name: row.name ?? null,
+      created_at: row.created_at,
+      is_superuser: row.is_superuser === 1,
+      avatar: { color: row.avatar_color ?? '', content: row.avatar_content ?? '' },
+      is_orphaned: row.is_orphaned === 1,
+      orphaned_at: row.orphaned_at ?? null,
+    }));
+  }
+
+  /** A page of threads, ordered like OrgDO.getThreadsPaginated (no search). */
+  async getMirroredThreadPage(input: {
+    workspaceIds: string[];
+    createdBy?: string;
+    offset: number;
+    limit: number;
+  }): Promise<{ items: MirroredThreadRow[]; total: number }> {
+    const where = ['workspace_id IN (SELECT value FROM json_each(?))'];
+    const binds: unknown[] = [JSON.stringify(input.workspaceIds)];
+    if (input.createdBy) {
+      where.push('created_by = ?');
+      binds.push(input.createdBy);
+    }
+    const whereSql = where.join(' AND ');
+    const [items, totalRow] = await Promise.all([
+      this.all<MirroredThreadRow>(
+        `SELECT ${MIRRORED_THREAD_COLUMNS} FROM threads WHERE ${whereSql} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`,
+        ...binds,
+        input.limit,
+        input.offset,
+      ),
+      this.all<{ count: number }>(`SELECT COUNT(*) AS count FROM threads WHERE ${whereSql}`, ...binds),
+    ]);
+    return { items, total: Number(totalRow[0]?.count ?? 0) };
+  }
+
+  async getMirroredThreadsByIds(workspaceId: string, threadIds: string[]): Promise<MirroredThreadRow[]> {
+    const ids = Array.from(new Set(threadIds.filter(Boolean)));
+    if (ids.length === 0) return [];
+    return this.all<MirroredThreadRow>(
+      `SELECT ${MIRRORED_THREAD_COLUMNS} FROM threads
+        WHERE workspace_id = ? AND id IN (SELECT value FROM json_each(?))`,
+      workspaceId,
+      JSON.stringify(ids),
+    );
   }
 
   async getThreadsByOrgIds(orgIds: string[]): Promise<AdminThreadListRow[]> {

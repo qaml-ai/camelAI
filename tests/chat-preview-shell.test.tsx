@@ -10,7 +10,7 @@ import {
 } from "@/components/chat-preview/chat-preview-shell";
 import type { PreviewTab, PreviewTarget } from "@/types";
 
-vi.mock("@/lib/shiki-config", () => ({
+vi.mock("@/lib/shiki-config.client", () => ({
   codeToHtml: vi.fn(() => new Promise<string>(() => {})),
   SHIKI_DEFAULT_THEMES: {
     light: "github-light",

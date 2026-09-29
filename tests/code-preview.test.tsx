@@ -7,7 +7,7 @@ const codeToHtmlMock = vi.hoisted(() =>
   vi.fn(() => new Promise<string>(() => {}))
 );
 
-vi.mock('@/lib/shiki-config', () => ({
+vi.mock('@/lib/shiki-config.client', () => ({
   codeToHtml: codeToHtmlMock,
   SHIKI_DEFAULT_THEMES: {
     light: 'github-light',

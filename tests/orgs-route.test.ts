@@ -49,7 +49,7 @@ describe("GET /api/orgs (lazy switcher org list)", () => {
 
     // Resolves names for ALL orgs (the per-org getInfo fan-out that no longer runs
     // in the auth critical path), keyed by the authenticated user.
-    expect(getUserOrgsMock).toHaveBeenCalledWith({ auth: true }, "user_1");
+    expect(getUserOrgsMock).toHaveBeenCalledWith({ auth: true }, "user_1", { d1Read: true });
     expect(result).toEqual({ orgs });
   });
 

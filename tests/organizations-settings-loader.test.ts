@@ -162,7 +162,7 @@ describe("organizations settings loader", () => {
   });
 
   it("hides archived orgs that linger in the auth bootstrap membership list", async () => {
-    // qaml-backdoor archiveOrg doesn't prune UserDO memberships, so an archived
+    // Admin archiveOrg doesn't prune UserDO memberships, so an archived
     // org can still appear in authContext.orgs. The settings page must not
     // render it (or its "Switch to this org" action) — except the current org,
     // which stays visible so a user already inside one isn't stranded.

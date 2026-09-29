@@ -60,8 +60,8 @@ describe('D1 admin index bootstrap', () => {
       id: org.id,
       name: 'Bootstrap Org',
     });
-    const overview = await appIndex.getOverview();
-    expect(overview.users).toEqual(
+    const users = await appIndex.getUsersPaginated(0, 100, 'Bootstrap User');
+    expect(users.items).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           id: userId,

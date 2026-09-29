@@ -40,6 +40,22 @@ describe("eval relay routing", () => {
 		expect(await any).toEqual({ status: 202 });
 	});
 
+	it("never hands a request to a poller that went away, and requeues one it missed", async () => {
+		const queue = createRelayQueue();
+		const gone = new AbortController();
+		const left = queue.next("org_1", 1_000, { signal: gone.signal });
+		gone.abort();
+		expect(await left).toBeNull();
+		const answered = queue.submit("org_1", { id: "r1", method: "POST", url: "u", headers: {}, body: null });
+		expect(queue.stats()).toMatchObject({ pending: 1, pollers: 0 });
+		const taken = await queue.next("org_1", 10);
+		// Its poller disconnected before the request was written: back to the queue, first.
+		queue.requeue(taken);
+		expect(await queue.next("org_1", 10)).toMatchObject({ id: "r1" });
+		queue.respond("r1", { status: 200 });
+		expect(await answered).toEqual({ status: 200 });
+	});
+
 	it("queues a request until its org polls, and drops one abandoned", async () => {
 		const queue = createRelayQueue();
 		void queue.submit("org_1", { id: "late", method: "POST", url: "u", headers: {}, body: null });

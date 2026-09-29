@@ -19,6 +19,8 @@ export const TUNNEL_PREFIX = "/__eval_tunnel";
 export const ANY_KEY = "*";
 /** What the relay's health route answers, so a check cannot mistake another server on the port for it. */
 export const RELAY_NAME = "chiridion-eval-relay";
+/** Bumped when the relay changes, so `up` replaces a running older one. */
+export const RELAY_VERSION = 2;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 /**
@@ -101,24 +103,35 @@ export function createRelayQueue({ now = () => Date.now() } = {}) {
         list(pending, key).push(entry);
       });
     },
-    /** Take the next request for `key` (or one for no org); null after `waitMs`. */
-    next(key, waitMs) {
+    /**
+     * Take the next request for `key` (or one for no org); null after `waitMs`,
+     * or at once when `signal` aborts (the poller went away: nothing is handed
+     * to it after).
+     */
+    next(key, waitMs, { signal } = {}) {
       lastPoll.set(key, now());
       const own = pending.get(key)?.shift() ?? pending.get(ANY_KEY)?.shift();
       if (own) return Promise.resolve(own);
+      if (signal?.aborted) return Promise.resolve(null);
       return new Promise((resolve) => {
         const pollers = list(waiting, key);
-        const poller = (request) => {
+        const done = (request) => {
           clearTimeout(timer);
-          resolve(request);
-        };
-        const timer = setTimeout(() => {
           const index = pollers.indexOf(poller);
           if (index >= 0) pollers.splice(index, 1);
-          resolve(null);
-        }, waitMs);
+          resolve(request);
+        };
+        const poller = (request) => done(request);
+        const timer = setTimeout(() => done(null), waitMs);
+        signal?.addEventListener("abort", () => done(null), { once: true });
         pollers.push(poller);
       });
+    },
+    /** Put back a request whose poller went away before it got it. */
+    requeue(request) {
+      if (!inFlight.has(request.id)) return;
+      if (hand(request.key, request)) return;
+      list(pending, request.key).unshift(request);
     },
     /** The worker's answer to request `id`; false when nothing waits on it. */
     respond(id, response) {
@@ -161,11 +174,19 @@ export function createRelayServer({
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? "/", "http://relay");
-      if (url.pathname === `${TUNNEL_PREFIX}/health`) return send(res, 200, { ok: true, relay: RELAY_NAME, ...queue.stats() });
+      if (url.pathname === `${TUNNEL_PREFIX}/health`) return send(res, 200, { ok: true, relay: RELAY_NAME, version: RELAY_VERSION, pid: process.pid, ...queue.stats() });
       if (url.pathname === `${TUNNEL_PREFIX}/next` && req.method === "GET") {
         const key = url.searchParams.get("key") || ANY_KEY;
         const wait = Math.min(Number(url.searchParams.get("waitMs")) || pollWaitMs, 60_000);
-        const request = await queue.next(key, wait);
+        // An eval that finished (or a poll it aborted) must not be handed a
+        // request: it would never answer, and the runtime's call would hang.
+        const gone = new AbortController();
+        res.on("close", () => gone.abort());
+        const request = await queue.next(key, wait, { signal: gone.signal });
+        if (request && (gone.signal.aborted || res.destroyed)) {
+          queue.requeue(request);
+          return;
+        }
         return request ? send(res, 200, request) : send(res, 204, "");
       }
       const respond = /^\/__eval_tunnel\/respond\/([^/]+)$/.exec(url.pathname);

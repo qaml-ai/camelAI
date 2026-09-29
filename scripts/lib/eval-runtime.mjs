@@ -11,7 +11,7 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { RELAY_NAME } from "./eval-runtime-relay.mjs";
+import { RELAY_NAME, RELAY_VERSION } from "./eval-runtime-relay.mjs";
 
 export const EVAL_TENANT = "chiridion-eval";
 const COMPOSE_PROJECT = "chiridion-eval-runtime";
@@ -199,15 +199,35 @@ async function runtimeHealthy(config) {
   return Boolean(response?.ok);
 }
 
-async function relayHealthy(config) {
+/** The running relay's health (its version and pid), or null when no relay of ours answers on the port. */
+async function relayInfo(config) {
   const response = await fetch(`${config.relayUrlFromHost}/__eval_tunnel/health`).catch(() => null);
   const body = response?.ok ? await response.json().catch(() => null) : null;
-  return body?.relay === RELAY_NAME;
+  return body?.relay === RELAY_NAME ? body : null;
+}
+
+async function relayHealthy(config) {
+  return (await relayInfo(config))?.version === RELAY_VERSION;
+}
+
+function stopRelay(pid) {
+  if (typeof pid !== "number") return;
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    // Already gone.
+  }
 }
 
 /** The relay, as a daemon shared by every eval run until `down`. */
 async function ensureRelay(config) {
-  if (await relayHealthy(config)) return readEvalRuntimeState(config)?.relayPid ?? null;
+  const running = await relayInfo(config);
+  if (running?.version === RELAY_VERSION) return running.pid ?? null;
+  if (running) {
+    // An older relay (from before this checkout changed it): replace it.
+    stopRelay(running.pid ?? readEvalRuntimeState(config)?.relayPid);
+    await waitFor(async () => !(await relayInfo(config)), { timeoutMs: 10_000, intervalMs: 200, what: "the old eval relay to stop" });
+  }
   const out = openSync(config.relayLog, "a");
   const child = spawn(process.execPath, [RELAY_SCRIPT, "--port", String(config.relayPort), "--host", config.relayHost], {
     detached: true,
@@ -298,14 +318,8 @@ export async function evalRuntimeUp(config = evalRuntimeConfig(), { rebuild = fa
 /** Stop the runtime and the relay; `purge` also drops the runtime's data and the generated secrets. */
 export async function evalRuntimeDown(config = evalRuntimeConfig(), { purge = false } = {}) {
   const state = readEvalRuntimeState(config);
-  // Only a relay that answers as ours: a recorded pid may since be another process's.
-  if (state?.relayPid && await relayHealthy(config)) {
-    try {
-      process.kill(state.relayPid, "SIGTERM");
-    } catch {
-      // Already gone.
-    }
-  }
+  // The pid the relay itself reports: a recorded one may since be another process's.
+  stopRelay((await relayInfo(config))?.pid);
   if (existsSync(path.join(config.dir, COMPOSE_FILES[0]))) {
     spawnSync("docker", [...composeArgs(config), "down", "--remove-orphans", ...(purge ? ["-v"] : [])], { stdio: "inherit" });
   }

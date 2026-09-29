@@ -1372,9 +1372,15 @@ export class PiCoreMessageStore {
     return { messages, whole: true, totalRows: totals.rows, openingRenderMessageId: this.openingRenderMessageId(0) };
   }
 
-  /** The renderMessageId of the first row from `fromIdx` that is not a compaction summary, read as stored. */
+  /**
+   * The render message the rows from `fromIdx` open on, read as stored: the
+   * renderMessageId of the first row that has one before the first user
+   * message (a turn a cut split opens on its tool results, which carry none,
+   * then the assistant rows that do). Compaction summaries are passed over;
+   * null when the rows open on a user message.
+   */
   private openingRenderMessageId(fromIdx: number): string | null {
-    for (const meta of this.listPiCoreRowMetaAscending({ fromIdx, limit: 4 })) {
+    for (const meta of this.listPiCoreRowMetaAscending({ fromIdx, limit: 32 })) {
       const row = this.deps.sql()
         .exec<{ payload: string }>("SELECT payload FROM pi_core_messages WHERE idx = ? LIMIT 1", meta.idx)
         .toArray()[0];
@@ -1385,9 +1391,12 @@ export class PiCoreMessageStore {
         continue;
       }
       if (!parsed) continue;
-      if (parsed.role === "user" && typeof parsed.content === "string" && parsed.content.startsWith("[Context Summary]")) continue;
+      if (parsed.role === "user") {
+        if (typeof parsed.content === "string" && parsed.content.startsWith("[Context Summary]")) continue;
+        return null;
+      }
       const id = parsed.uiMetadata?.renderMessageId;
-      return typeof id === "string" && id ? id : null;
+      if (typeof id === "string" && id) return id;
     }
     return null;
   }

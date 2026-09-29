@@ -38,6 +38,21 @@ describe("a moved thread's history, each message once", () => {
     });
   }, 60_000);
 
+  it("rewrite whose cut keeps a turn's tool result (no render id) before its stamped reply", async () => {
+    await runInDurableObject(stub("r3-fold-result"), async (instance: any) => {
+      instance.chatContext = ctx("r3-fold-result");
+      const rows = Array.from({ length: 4 }, (_, i) => toolTurn(i)).flat();
+      await instance.appendPiCoreMessages(rows);
+      await instance.topUpUiMessagesFromPiCore({ force: true });
+      await instance.replacePiCoreMessages([createPiSummaryMessage("Earlier.", 1_100), ...rows.slice(-2)], { uiRender: "preserve" });
+      const { messages } = convertTranscript((await instance.runtimeMigration.history()).messages);
+      expect(count(messages, "answer 3")).toBe(1);
+      expect(count(messages, "result 3")).toBe(1);
+      expect(count(messages, "calling 3")).toBe(1);
+      expect(count(messages, "question 0")).toBe(1);
+    });
+  }, 60_000);
+
   it("rewrite whose cut falls inside a stamped assistant turn", async () => {
     await runInDurableObject(stub("r3-fold"), async (instance: any) => {
       instance.chatContext = ctx("r3-fold");

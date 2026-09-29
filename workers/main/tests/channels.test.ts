@@ -90,7 +90,7 @@ describe("channels", () => {
       channelKind: "slack",
       userId: "owner-1",
       message: "hello",
-      systemMessage: expect.stringContaining("send_slack_message"),
+      systemMessage: expect.stringContaining("await tools.camel__send_slack_message("),
     }));
   });
 
@@ -225,6 +225,12 @@ describe("channels", () => {
     expect(message).toContain("await tools.send_telegram_message");
     expect(message).toContain("do not need to provide the channel/chat id");
     expect(message).toContain("originating conversation");
+  });
+
+  it("names the reply tool as the agent runtime has it, for a thread on the runtime", () => {
+    const message = buildChannelReplySystemMessage("telegram", { userEmail: null }, { runtime: true });
+    expect(message).toContain("await tools.camel__send_telegram_message(");
+    expect(message).not.toContain("tools.send_telegram_message");
   });
 
   it("tells Discord replies to use the scoped js_exec provider tool", () => {

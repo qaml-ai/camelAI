@@ -25,6 +25,43 @@ Knobs: `--model <id>`, `--timeout-ms <ms>`, `EVAL_REAL_DEPLOY=0/1`, `CUSTOM_EVAL
 Cloudflare API, and judge gateway credentials/settings; ordinary eval knobs such as `EVAL_MODEL`
 and `EVAL_REPORT` should be passed explicitly in the shell or CLI.
 
+### On the local agent runtime
+
+Every eval's thread runs on a **local agent runtime** (the hosted runtime's self-host Compose files,
+`deploy/selfhost/docker-compose.yml` + `compose.dev.yml` from `qaml-ai/agent-runtime`), as chiridion
+threads run on the hosted one: the test calls `runRuntimeEval` (`workers/main/tests/evals/runtime-eval.ts`),
+which pins the thread to the runtime, sends the prompt with `startRuntimeTurn`, polls the run's request
+record until it settles, and reads the agent's history back into the result shape the graders read.
+`run-agent-eval.mjs` starts the runtime when it is not up; manage it with:
+
+```bash
+node scripts/runtime-eval-harness.mjs up            # build once (from ~/agent-runtime at origin/main) and start
+node scripts/runtime-eval-harness.mjs run project-write-file-live   # or a list, all, hard, standard; --down to stop after
+node scripts/runtime-eval-harness.mjs list          # runnable evals
+node scripts/runtime-eval-harness.mjs status
+node scripts/runtime-eval-harness.mjs down [--purge]
+```
+
+- Needs Docker and a `qaml-ai/agent-runtime` checkout at `~/agent-runtime` (`AGENT_RUNTIME_DIR`; its
+  `AGENT_RUNTIME_REF`, default `origin/main`, is built into `chiridion-eval-agent-runtime:<sha>`
+  once, and kept until `up --rebuild`), or a ready image in `AGENT_RUNTIME_IMAGE`.
+- Model keys are the same as before: chiridion syncs the runtime's `hosted` key scope from the AI
+  Gateway credentials in `.dev.vars` (`CF_GATEWAY_TOKEN` or `AI_GATEWAY_AUTH_TOKEN`), so the
+  runtime itself holds no provider key. The runtime's tenant (`chiridion-eval`), operator token and
+  secrets are generated into `.eval-runtime/` (git-ignored) and never printed.
+- The runtime (host port 18790, `AGENT_RUNTIME_PORT`) reaches chiridion's tools at
+  `http://host.docker.internal:18791/mcp/agent`: the **eval relay** (`scripts/lib/eval-runtime-relay.mjs`,
+  `EVAL_RUNTIME_RELAY_PORT`), which each running eval serves for its org by long-polling it, since the
+  vitest workers pool listens on no port. Concurrent evals (the matrix) share it.
+- A model must have a runtime route: hosted OpenRouter models (`gpt-6-luna`, `sonnet`, …; the free
+  tier runs as `openrouter/openai/gpt-6-luna`) or BYOK Anthropic/OpenAI/OpenRouter/Bedrock. `--model custom`
+  is refused. Nobody answers a run's human input (`ask_user`, confirmations): it is declined, as the
+  in-DO loop's AskUserQuestion answered with no browser attached.
+- Evals whose subject the runtime lacks carry `runtimeBlocked` in the manifest and are skipped
+  (`EVAL_RUN_BLOCKED=1` runs them anyway): `research-agent-live` and `research-known-url-live`
+  (the Research subagent). In js_exec, chiridion's tools are `tools.camel__<name>`; the eval helpers
+  accept both spellings.
+
 When `scripts/run-eval-suite.sh` runs a list or `all`, it automatically mints one
 `EVAL_BATCH_ID` and default `EVAL_BATCH_LABEL` for the whole invocation. Pre-set those env vars to
 join a run into an existing dashboard batch.

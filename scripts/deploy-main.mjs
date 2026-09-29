@@ -7,7 +7,12 @@
  * 2. Copies the environment-specific wrangler config to build/server/
  * 3. Fixes paths to be relative to build/server/
  * 4. Updates the .wrangler/deploy/config.json redirect
- * 5. Runs wrangler deploy
+ * 5. Applies the APP_DB D1 migrations (--remote; SKIP_D1_MIGRATIONS=1 skips)
+ * 6. Runs wrangler deploy
+ *
+ * Workers Builds runs this for both environments (deploy command
+ * `bun run deploy:main:staging` on main, `deploy:main:prod` on the
+ * production branch the Deploy to Production workflow pushes).
  *
  * Usage: node scripts/deploy-main.mjs [staging|prod]
  */
@@ -70,6 +75,27 @@ fs.writeFileSync(redirectConfig, JSON.stringify({
   configPath: `../../build/server/wrangler.${env}.json`,
   auxiliaryWorkers: []
 }));
+
+// Apply the app index D1 migrations (migrations/) before the worker that reads
+// them ships. Every migration is idempotent (CREATE ... IF NOT EXISTS; columns
+// are added by AppIndexDatabase.ensureSchema), so databases whose tables the
+// runtime already created take them as no-ops. A failure stops the deploy.
+if (process.env.SKIP_D1_MIGRATIONS === '1') {
+  console.log('Skipping D1 migrations because SKIP_D1_MIGRATIONS=1');
+} else {
+  console.log(`\nApplying D1 migrations (APP_DB, ${env})...`);
+  try {
+    execSync(`npx wrangler d1 migrations apply APP_DB --remote -c wrangler.${env}.jsonc`, {
+      cwd: rootDir,
+      stdio: 'inherit',
+      // Non-interactive: no confirmation prompt.
+      env: { ...process.env, CI: 'true' },
+    });
+  } catch (error) {
+    console.error('D1 migrations failed; not deploying the worker.');
+    process.exit(error.status || 1);
+  }
+}
 
 // Run wrangler deploy
 console.log(`\nDeploying to ${env}...`);

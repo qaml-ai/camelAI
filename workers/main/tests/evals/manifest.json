@@ -1,5 +1,5 @@
 {
-  "$comment": "Single source of truth for committed agent evals. Adding an eval = create workers/main/tests/evals/<id>.test.ts (gated on RUN_AGENT_EVALS, ending in emitEvalTranscript from ./eval-transcript) and add one entry here. Each entry requires kind: unit checks one mechanism; skill checks end-to-end agent ability. Optional tier:\"hard\" marks high-difficulty evals; absent means standard. New evals should emit a task-specific 0-4 anchored rubric with 3-8 criteria whose positive weights total 100. Machine checks and scorecards remain diagnostic evidence; the rollout judge is primary when available, while harness and artifact-contract failures remain hard gates. Deterministic pass/fail checks should cover objective persisted state, safety boundaries, and harness integrity—not exact tool spellings, incidental call order, prose wording, or efficiency; put those semantic judgments in the task rubric and retain probes as runtimeAssertions. Consumed by scripts/run-agent-eval.mjs and scripts/run-eval-suite.sh. custom-prompt-live is intentionally NOT listed — it's the generic env-driven custom-prompt harness, not a fixed eval. realDeploy:true marks evals that only run when real deploy is enabled (CF_API_TOKEN + EVAL_REAL_DEPLOY!=0).",
+  "$comment": "Single source of truth for committed agent evals. Adding an eval = create workers/main/tests/evals/<id>.test.ts (gated on RUN_AGENT_EVALS, ending in emitEvalTranscript from ./eval-transcript) and add one entry here. Each entry requires kind: unit checks one mechanism; skill checks end-to-end agent ability. Optional tier:\"hard\" marks high-difficulty evals; absent means standard. New evals should emit a task-specific 0-4 anchored rubric with 3-8 criteria whose positive weights total 100. Machine checks and scorecards remain diagnostic evidence; the rollout judge is primary when available, while harness and artifact-contract failures remain hard gates. Deterministic pass/fail checks should cover objective persisted state, safety boundaries, and harness integrity—not exact tool spellings, incidental call order, prose wording, or efficiency; put those semantic judgments in the task rubric and retain probes as runtimeAssertions. Consumed by scripts/run-agent-eval.mjs and scripts/run-eval-suite.sh. custom-prompt-live is intentionally NOT listed — it's the generic env-driven custom-prompt harness, not a fixed eval. realDeploy:true marks evals that only run when real deploy is enabled (CF_API_TOKEN + EVAL_REAL_DEPLOY!=0). Evals run on a local agent runtime (scripts/runtime-eval-harness.mjs; each test calls runRuntimeEval from ./runtime-eval); runtimeBlocked:\"<reason>\" marks an eval whose subject the runtime does not have, which the runners skip (EVAL_RUN_BLOCKED=1 runs it anyway).",
   "evals": [
     {
       "id": "dashboard-fake-data-live",
@@ -151,12 +151,14 @@
     {
       "id": "research-agent-live",
       "description": "Delegate a multi-source web investigation to the Research agent",
-      "kind": "skill"
+      "kind": "skill",
+      "runtimeBlocked": "Research is a subagent of the in-DO loop only: the agent runtime has no subagents (routes/agent-mcp.ts excludes Agent, Explore, Research and Oracle) and gives the model its own web_search/web_fetch instead, so there is no Research call to grade."
     },
     {
       "id": "research-known-url-live",
       "description": "Delegate a supplied external URL to one efficient Research fetch without needless search",
-      "kind": "skill"
+      "kind": "skill",
+      "runtimeBlocked": "Research is a subagent of the in-DO loop only: the agent runtime has no subagents (routes/agent-mcp.ts excludes Agent, Explore, Research and Oracle) and gives the model its own web_search/web_fetch instead, so there is no Research call to grade."
     },
     {
       "id": "orders-analytics-api-live",

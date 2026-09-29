@@ -23,9 +23,9 @@ import {
   getEvalTimeoutMs,
   type EvalModelEnv,
 } from "./model-config";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import type { WorkspaceFilesystemDO } from "../../src/workspace-filesystem-do";
 import { asRecord } from "./project-eval-helpers";
+import { runRuntimeEval } from "./runtime-eval";
 
 // Generic, env-driven eval used by the control plane to run custom prompts that are NOT
 // committed to the source tree. The prompt, optional project name, and optional pass/fail
@@ -37,7 +37,6 @@ import { asRecord } from "./project-eval-helpers";
 // Model selection (EVAL_MODEL / EVAL_CUSTOM_*), signal thresholds (EVAL_MAX_* /
 // EVAL_ENFORCE_SIGNAL), and real-deploy opt-in (EVAL_REAL_DEPLOY) reuse the shared harness.
 type CustomEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   R2_BUCKET: R2Bucket;
   RUN_AGENT_EVALS?: string;
@@ -165,10 +164,7 @@ describe("custom prompt agent eval", () => {
         backend: "do-r2",
       });
 
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

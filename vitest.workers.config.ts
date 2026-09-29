@@ -103,6 +103,27 @@ function loadBedrockDevVars(): Record<string, string> {
   return bindings;
 }
 
+// Live agent evals run their threads on a local agent runtime
+// (scripts/runtime-eval-harness.mjs); scripts/run-agent-eval.mjs puts its
+// address, tenant, token, definition and the eval relay in the environment.
+// Taken from the process environment only, and only for eval runs: never from
+// .dev.vars, which may name a deployed runtime tenant.
+const runtimeEvalBindingNames = [
+  'AGENT_RUNTIME_URL',
+  'AGENT_RUNTIME_TENANT',
+  'AGENT_RUNTIME_API_TOKEN',
+  'AGENT_RUNTIME_DEFINITION',
+  'AGENT_RUNTIME_DIRECT_THREADS',
+  'EVAL_RUNTIME_RELAY_URL',
+];
+
+function loadRuntimeEvalBindings(): Record<string, string> {
+  if (process.env.RUN_AGENT_EVALS !== '1') return {};
+  return Object.fromEntries(
+    runtimeEvalBindingNames.flatMap((name) => (process.env[name] ? [[name, process.env[name] as string]] : [])),
+  );
+}
+
 // Attach Docker containers to the sandbox DO bindings ONLY for runs that
 // actually boot them (agent evals, the build-sandbox repro, the sandbox eval
 // prototype — all opt-in via env). Regular unit/CI runs leave the DOs
@@ -133,6 +154,7 @@ export default defineConfig({
       miniflare: {
         bindings: {
           ...loadBedrockDevVars(),
+          ...loadRuntimeEvalBindings(),
         },
         compatibilityDate: '2026-03-24',
         compatibilityFlags: ['nodejs_compat'],

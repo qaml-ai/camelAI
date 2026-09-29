@@ -71,13 +71,70 @@ describe("runtimeModelRoute", () => {
       .toEqual({ kind: "scope", model: "amazon-bedrock/eu.anthropic.claude-opus-5-5", keyScope: scope });
   });
 
+  // Each id is one the runtime's catalog (Pi 0.87.1) lists and Bedrock serves in that region (2026-09-28).
+  it.each([
+    ["us-east-1", "anthropic.claude-opus-5-5", "us.anthropic.claude-opus-5-5"],
+    ["us-west-2", "anthropic.claude-fable-5-1", "us.anthropic.claude-fable-5-1"],
+    ["us-east-1", "anthropic.claude-haiku-4-5", "us.anthropic.claude-haiku-4-5-20251001-v1:0"],
+    ["eu-west-1", "anthropic.claude-opus-5-5", "eu.anthropic.claude-opus-5-5"],
+    ["eu-central-1", "anthropic.claude-haiku-4-5", "eu.anthropic.claude-haiku-4-5-20251001-v1:0"],
+    ["eu-west-1", "anthropic.claude-fable-5-1", "global.anthropic.claude-fable-5-1"],
+    ["ap-northeast-1", "anthropic.claude-opus-5-5", "jp.anthropic.claude-opus-5-5"],
+    ["ap-northeast-3", "anthropic.claude-haiku-4-5", "jp.anthropic.claude-haiku-4-5-20251001-v1:0"],
+    ["ap-northeast-1", "anthropic.claude-fable-5-1", "global.anthropic.claude-fable-5-1"],
+    ["ap-southeast-2", "anthropic.claude-opus-5-5", "au.anthropic.claude-opus-5-5"],
+    ["ap-southeast-4", "anthropic.claude-haiku-4-5", "au.anthropic.claude-haiku-4-5-20251001-v1:0"],
+    ["ap-southeast-1", "anthropic.claude-opus-5-5", "global.anthropic.claude-opus-5-5"],
+    ["ap-south-1", "anthropic.claude-haiku-4-5", "global.anthropic.claude-haiku-4-5-20251001-v1:0"],
+    ["ap-northeast-1", "anthropic.claude-sonnet-5-5", "global.anthropic.claude-sonnet-5-5"],
+    ["sa-east-1", "anthropic.claude-opus-5-5", "global.anthropic.claude-opus-5-5"],
+  ])("runs Bedrock in %s: %s as %s", (region, id, profile) => {
+    expect(runtimeModelRoute(config({ usageProvider: "bedrock", model: { provider: "custom", api: "anthropic-messages", id, baseUrl: `https://bedrock-mantle.${region}.api.aws/anthropic` } }), org))
+      .toEqual({ kind: "scope", model: `amazon-bedrock/${profile}`, keyScope: "org_org1" });
+  });
+
   it("sends the ChatGPT subscription through chiridion's Codex forwarder", () => {
     expect(runtimeModelRoute(config({ usageProvider: "openai", apiKey: CODEX_TOKEN, model: { provider: "openai-codex", id: "gpt-6-luna", baseUrl: "https://chatgpt.com/backend-api/codex" } }), org))
       .toEqual({ kind: "codex", model: "chiridion/openai-codex/gpt-6-luna" });
   });
 
-  it("has no route for custom endpoints or Bedrock OpenAI models", () => {
-    expect(runtimeModelRoute(config({ usageProvider: "custom", model: { provider: "custom", id: "x", baseUrl: "https://llm.example" } }), org)).toBeNull();
-    expect(runtimeModelRoute(config({ usageProvider: "bedrock", model: { provider: "custom", api: "openai-responses", id: "openai.gpt", baseUrl: "https://bedrock-mantle.us-east-1.api.aws/openai/v1" } }), org)).toBeNull();
+  it.each(["openai-completions", "openai-responses", "anthropic-messages"])("runs a custom %s endpoint as the org scope's custom provider", (api) => {
+    const custom = (headers?: Record<string, string | null>) => ({
+      ...config({ usageProvider: "custom", model: { provider: "custom", api, id: "acme-70b", baseUrl: "https://llm.acme.example/v1" } }),
+      headers,
+    }) as PiResolvedModelConfig;
+    expect(runtimeModelRoute(custom(), org)).toEqual({ kind: "scope", model: "custom/acme-70b", keyScope: "org_org1" });
+    // Anthropic Messages behind Authorization: Bearer (the provider's `auth: "bearer"`).
+    if (api === "anthropic-messages") {
+      expect(runtimeModelRoute(custom({ "x-api-key": null, Authorization: "Bearer key" }), org)).toEqual({ kind: "scope", model: "custom/acme-70b", keyScope: "org_org1" });
+    }
+    // An OpenAI endpoint that takes x-api-key gets it as a header.
+    if (api !== "anthropic-messages") {
+      expect(runtimeModelRoute(custom({ Authorization: null, "x-api-key": "key" }), org)).toEqual({ kind: "scope", model: "custom/acme-70b", keyScope: "org_org1" });
+    }
+  });
+
+  it("keeps custom endpoints the runtime cannot call on the in-DO loop", () => {
+    const custom = (model: Record<string, unknown>, headers?: Record<string, string | null>) => ({
+      ...config({ usageProvider: "custom", model: { provider: "custom", api: "openai-completions", id: "acme-70b", baseUrl: "https://llm.acme.example/v1", ...model } }),
+      headers,
+    }) as PiResolvedModelConfig;
+    // Not https.
+    expect(runtimeModelRoute(custom({ baseUrl: "http://llm.acme.example/v1" }), org)).toBeNull();
+    // A model id the runtime refuses.
+    expect(runtimeModelRoute(custom({ id: "acme 70b" }), org)).toBeNull();
+    // Without a key, or not BYOK.
+    expect(runtimeModelRoute(config({ usageProvider: "custom", apiKey: "", model: { provider: "custom", api: "openai-completions", id: "m", baseUrl: "https://llm.acme.example/v1" } }), org)).toBeNull();
+    expect(runtimeModelRoute(config({ billingSource: "hosted", usageProvider: "custom", model: { provider: "custom", api: "openai-completions", id: "m", baseUrl: "https://llm.acme.example/v1" } }), org)).toBeNull();
+  });
+
+  it("runs Bedrock's OpenAI models as the org scope's provider for their bedrock-mantle region", () => {
+    const { modelId, baseUrl } = new PiModelMapping().bedrockOpenAiModelConfig("gpt-5.6-terra", "us-west-2")!;
+    expect(runtimeModelRoute(config({ usageProvider: "bedrock", model: { provider: "custom", api: "openai-responses", id: modelId, baseUrl } }), org))
+      .toEqual({ kind: "scope", model: "bedrock-openai-us-west-2/openai.gpt-5.6-terra", keyScope: "org_org1" });
+    // Not BYOK (no key): no route.
+    expect(runtimeModelRoute(config({ usageProvider: "bedrock", apiKey: "", model: { provider: "custom", api: "openai-responses", id: modelId, baseUrl } }), org)).toBeNull();
+    // Another address (the E2E replay stub): no route.
+    expect(runtimeModelRoute(config({ usageProvider: "bedrock", model: { provider: "custom", api: "openai-responses", id: modelId, baseUrl: "http://127.0.0.1:8788" } }), org)).toBeNull();
   });
 });

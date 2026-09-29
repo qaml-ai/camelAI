@@ -5,6 +5,7 @@ import process from "node:process";
 import {
   capture,
   composeArgs,
+  optionalVolumeNames,
   readSelfhostEnv,
   repoRoot,
   run,
@@ -16,7 +17,14 @@ import {
 const env = await readSelfhostEnv(true);
 const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 const backupDir = path.resolve(repoRoot, process.argv[2] || `.selfhost/backups/${timestamp}`);
-const selectedVolumeNames = volumeNamesForEnv(env);
+const selectedVolumeNames = [];
+for (const name of volumeNamesForEnv(env)) {
+  if (optionalVolumeNames.has(name) && !(await volumeExists(volumeName(name, env)))) {
+    console.log(`[selfhost:backup] ${volumeName(name, env)} does not exist yet; skipped.`);
+    continue;
+  }
+  selectedVolumeNames.push(name);
+}
 
 await fs.mkdir(backupDir, { recursive: true });
 
@@ -50,6 +58,13 @@ await fs.writeFile(
 );
 
 console.log(`Self-host backup written to ${backupDir}`);
+
+async function volumeExists(dockerVolume) {
+  const inspect = await capture("docker", ["volume", "inspect", dockerVolume], {
+    env: scriptEnv(env),
+  });
+  return inspect.code === 0;
+}
 
 async function backupVolume(dockerVolume, archiveName) {
   const inspect = await capture("docker", ["volume", "inspect", dockerVolume], {

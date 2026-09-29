@@ -161,6 +161,7 @@ function buildGroupNewChatPayload(
 
 async function loadGroupNewChatRecentItems(
   context: Route.LoaderArgs["context"],
+  orgId: string,
   group: ChatGroupView | null,
   connections: Integration[],
   projects: MentionableProject[],
@@ -173,10 +174,10 @@ async function loadGroupNewChatRecentItems(
   const threadMessages = await Promise.all(
     candidateThreads.map(async (thread) => {
       try {
-        const source = await chatDO.getGroupNewChatRecentSource(
-          context,
-          thread.id,
-        );
+        const source = await chatDO.getGroupNewChatRecentSource(context, {
+          orgId,
+          threadId: thread.id,
+        });
         return {
           threadId: thread.id,
           title: thread.title || "Untitled Chat",
@@ -480,6 +481,7 @@ export async function loader({ request, context }: Route.LoaderArgs) {
         const mentionSources = await mentionSourcesPromise;
         return loadGroupNewChatRecentItems(
           context,
+          authContext.currentOrg.id,
           activeChatGroup,
           mentionSources.connections,
           mentionSources.projects,

@@ -6,6 +6,11 @@ import process from 'node:process';
 import { spawn } from 'node:child_process';
 import { loadSelfhostAgentPack } from './selfhost-agent-pack.mjs';
 import { readSelfhostEnv } from './selfhost-common.mjs';
+import {
+  AGENT_RUNTIME_PRIVATE_KEYS,
+  chiridionLoopbackUrl,
+  provisionSelfhostAgentRuntime,
+} from './selfhost-agent-runtime.mjs';
 
 const repoRoot = process.cwd();
 const defaultOut = path.join(repoRoot, '.selfhost/workerd/camelai.capnp');
@@ -98,6 +103,14 @@ const SELFHOST_DEFAULT_VARS = {
   POMERIUM_ADMIN_GROUP_PREFIX: '',
   POMERIUM_DEFAULT_ORG_NAME: '',
   POMERIUM_REQUIRED_EMAIL_DOMAIN: '',
+  // The bundled agent runtime (selfhost-agent-runtime.mjs). The definition
+  // and the events webhook's secret are provisioned at startup, below.
+  AGENT_RUNTIME_URL: '',
+  AGENT_RUNTIME_TENANT: '',
+  AGENT_RUNTIME_API_TOKEN: '',
+  AGENT_RUNTIME_DEFINITION: '',
+  AGENT_RUNTIME_DIRECT_THREADS: '',
+  AGENT_RUNTIME_EVENTS_WEBHOOK_SECRET: '',
 };
 
 const SELFHOST_KV_IDS = {
@@ -807,6 +820,32 @@ async function main() {
   // Production self-host app access always passes through dispatcher auth.
   // SKIP_AUTH remains available only in isolated development/smoke configs.
   delete vars.SKIP_AUTH;
+  // The runtime's own secrets never become Worker bindings.
+  for (const key of AGENT_RUNTIME_PRIVATE_KEYS) delete vars[key];
+
+  // Set up the install's tenant on the bundled agent runtime (its thread
+  // definition and events webhook) and bind what the Worker needs. Without a
+  // runtime, or when it cannot be provisioned on a first start, threads run
+  // on the in-DO loop.
+  if (process.env.SELFHOST_AGENT_RUNTIME_PROVISION !== '0') {
+    try {
+      const provisioned = await provisionSelfhostAgentRuntime({
+        env: { ...vars, SELFHOST_WORKERD_SOCKET: socketAddress, AGENT_RUNTIME_CHIRIDION_URL: process.env.AGENT_RUNTIME_CHIRIDION_URL },
+        stateDir,
+      });
+      if (provisioned) {
+        vars.AGENT_RUNTIME_DEFINITION = provisioned.definitionId;
+        vars.AGENT_RUNTIME_EVENTS_WEBHOOK_SECRET = provisioned.webhookSecret;
+        console.log(`[selfhost:agent-runtime] Threads run on the agent runtime; it calls the app at ${chiridionLoopbackUrl({ SELFHOST_WORKERD_SOCKET: socketAddress, AGENT_RUNTIME_CHIRIDION_URL: process.env.AGENT_RUNTIME_CHIRIDION_URL })}`);
+      }
+    } catch (error) {
+      vars.AGENT_RUNTIME_DEFINITION = '';
+      console.error(
+        `[selfhost:agent-runtime] The agent runtime could not be provisioned: ${error instanceof Error ? error.message : error}. ` +
+        'New threads run on the in-app loop until it can be; run `bun run selfhost:doctor`.',
+      );
+    }
+  }
 
   for (const [name, value] of Object.entries(vars)) {
     bindings.push(bindingText(name, value));
@@ -1118,7 +1157,10 @@ const camelai :Workerd.Config = (
 );
 `;
 
-  await fs.writeFile(outPath, config);
+  // The config carries every secret binding (the runtime's operator token and
+  // webhook secret among them): owner-only, also when the file already existed.
+  await fs.writeFile(outPath, config, { mode: 0o600 });
+  await fs.chmod(outPath, 0o600);
   const manifest = {
     generatedAt: new Date().toISOString(),
     source: path.relative(repoRoot, wranglerPath),

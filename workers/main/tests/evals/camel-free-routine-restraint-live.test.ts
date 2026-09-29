@@ -1,7 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, it } from "vitest";
 
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import {
   ProjectFilesystemClient,
   type WorkspaceFilesystemDO,
@@ -25,9 +24,9 @@ import {
 } from "./eval-signal";
 import { getEvalTimeoutMs, type EvalModelEnv } from "./model-config";
 import { usedTool } from "./project-eval-helpers";
+import { runRuntimeEval } from "./runtime-eval";
 
 type RoutineRestraintEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   RUN_AGENT_EVALS?: string;
 };
@@ -97,10 +96,7 @@ describe("Camel Free routine-work restraint eval", () => {
         undefined,
         CAMEL_FREE_MODEL,
       );
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

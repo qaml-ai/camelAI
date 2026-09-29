@@ -22,7 +22,8 @@ services:
       - caddy-data:/data
       - caddy-config:/config
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--output-document=-", "http://127.0.0.1:2019/config/"]
+      # The admin API listens only on this 0600 unix socket (no TCP port).
+      test: ["CMD", "curl", "--fail", "--silent", "--output", "/dev/null", "--unix-socket", "/config/caddy-admin.sock", "http://localhost/config/"]
       interval: 10s
       timeout: 5s
       retries: 30

@@ -8,17 +8,30 @@
  * ChatThreadDO kept it in its own state.
  */
 import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
+import { RUNTIME_TOOL_PREFIX } from "../../../../src/lib/agent-runtime-shared.js";
 import { runtimeApi } from "./runtime-api.js";
 import { directRuntimeRow } from "./channel-turns.js";
 import { runtimeDirectThreadsEnabled, startRuntimeTurn } from "./thread-runtime.js";
 
-/** What a scheduled run must do before it ends, as ChatThreadDO puts it in its system prompt. */
-export const AUTOMATION_OUTCOME_INSTRUCTION = [
-  "## Scheduled Automation Outcome",
-  "Before your final response, you MUST call `report_automation_outcome` exactly once.",
-  "Use `success` only when the requested business objective was actually completed and verified. A clean turn, partial data extraction, or a decision not to deploy is not success.",
-  "Use `failed` when the objective was not completed, `partial` when only part completed, and `needs_attention` when operator action is required. Give a concise factual summary.",
-].join("\n");
+/** What a scheduled run must do before it ends, naming the outcome tool as the run's agent has it. */
+export function automationOutcomeInstruction(toolName: string, howToCall = ""): string {
+  return [
+    "## Scheduled Automation Outcome",
+    `Before your final response, you MUST call \`${toolName}\` exactly once.${howToCall}`,
+    "Use `success` only when the requested business objective was actually completed and verified. A clean turn, partial data extraction, or a decision not to deploy is not success.",
+    "Use `failed` when the objective was not completed, `partial` when only part completed, and `needs_attention` when operator action is required. Give a concise factual summary.",
+  ].join("\n");
+}
+
+/** As ChatThreadDO puts it in its system prompt. */
+export const AUTOMATION_OUTCOME_INSTRUCTION = automationOutcomeInstruction("report_automation_outcome");
+
+/** As a runtime agent has the tool (camel__<tool>, in js_exec too). */
+const RUNTIME_OUTCOME_TOOL = `${RUNTIME_TOOL_PREFIX}report_automation_outcome`;
+export const RUNTIME_AUTOMATION_OUTCOME_INSTRUCTION = automationOutcomeInstruction(
+  RUNTIME_OUTCOME_TOOL,
+  ` From js_exec: await tools.${RUNTIME_OUTCOME_TOOL}({ status, summary }).`,
+);
 
 export interface ScheduledTurnRequest {
   orgId: string;
@@ -67,7 +80,7 @@ export async function startScheduledRuntimeTurn(env: ChatEnv, request: Scheduled
     context,
     row,
     sender: { userId: request.userId, userName: "Scheduler", userEmail: null },
-    text: `<camelai system message>${AUTOMATION_OUTCOME_INSTRUCTION}</camelai system message>\n\n${request.message}`,
+    text: `<camelai system message>${RUNTIME_AUTOMATION_OUTCOME_INSTRUCTION}</camelai system message>\n\n${request.message}`,
     clientMessageId: request.runId,
     source: "scheduled prompt",
     waitUntil: (promise) => { pending.push(promise); },

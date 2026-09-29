@@ -71,6 +71,12 @@ services:
       POMERIUM_ADMIN_GROUP_PREFIX: ${POMERIUM_ADMIN_GROUP_PREFIX:-}
       POMERIUM_DEFAULT_ORG_NAME: ${POMERIUM_DEFAULT_ORG_NAME:-}
       POMERIUM_REQUIRED_EMAIL_DOMAIN: ${POMERIUM_REQUIRED_EMAIL_DOMAIN:-}
+      # Chat threads run on the bundled agent runtime (agent-runtime below).
+      # The app provisions its thread definition and events webhook at start.
+      AGENT_RUNTIME_URL: http://127.0.0.1:${SELFHOST_AGENT_RUNTIME_PORT:-8790}
+      AGENT_RUNTIME_TENANT: ${AGENT_RUNTIME_TENANT:?Run bun run selfhost:migrate-secrets}
+      AGENT_RUNTIME_API_TOKEN: ${AGENT_RUNTIME_API_TOKEN:?Run bun run selfhost:migrate-secrets}
+      AGENT_RUNTIME_DIRECT_THREADS: ${SELFHOST_AGENT_RUNTIME_DIRECT_THREADS:-1}
     volumes:
       - app-state:/workspace/.selfhost/workerd/state
       # Operator agent customization pack (skills + prompt append/prepend).
@@ -81,6 +87,8 @@ services:
       - ${SELFHOST_DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock:rw
     depends_on:
       local-artifacts:
+        condition: service_healthy
+      agent-runtime:
         condition: service_healthy
       project-build-image:
         condition: service_completed_successfully
@@ -118,6 +126,66 @@ services:
     entrypoint: ["/bin/true"]
     restart: "no"
 
+  # The agent runtime chat threads run on (docs: SELF_HOSTING.md, "Upgrading
+  # to the runtime"). Private: it shares the VM's network namespace with the
+  # app and listens on loopback only, so the app reaches it at 127.0.0.1 and
+  # it calls the app's MCP tools and events webhook on the app's loopback
+  # socket. Browsers never reach it; they read threads through the app.
+  agent-runtime:
+    image: ${SELFHOST_AGENT_RUNTIME_IMAGE:?Run bun run selfhost:migrate-secrets}
+    network_mode: host
+    environment:
+      HOST: 127.0.0.1
+      PORT: ${SELFHOST_AGENT_RUNTIME_PORT:-8790}
+      AGENT_TENANT: ${AGENT_RUNTIME_TENANT:?Run bun run selfhost:migrate-secrets}
+      AGENT_OPERATOR_TOKEN: ${AGENT_RUNTIME_API_TOKEN:?Run bun run selfhost:migrate-secrets}
+      AGENT_SESSION_SECRET: ${AGENT_RUNTIME_SESSION_SECRET:?Run bun run selfhost:migrate-secrets}
+      AGENT_SECRETS_KEY: ${AGENT_RUNTIME_SECRETS_KEY:?Run bun run selfhost:migrate-secrets}
+      AGENT_DATABASE_URL: postgres://agent_runtime:${AGENT_RUNTIME_POSTGRES_PASSWORD:?Run bun run selfhost:migrate-secrets}@127.0.0.1:${SELFHOST_AGENT_RUNTIME_POSTGRES_PORT:-15432}/agent_runtime
+      # Its own address, as the app reaches it: identity tokens name it.
+      AGENT_PUBLIC_URL: http://127.0.0.1:${SELFHOST_AGENT_RUNTIME_PORT:-8790}
+      # Empty: browser tokens name no URL, and the app proxies browser reads.
+      AGENT_BROWSER_URL: ""
+      # Exact origins the runtime may reach despite its outbound guard, over
+      # plain http too: the app's MCP tools and events webhook on loopback
+      # (spelled exactly as the app provisions them: http://127.0.0.1:<port>),
+      # plus private model endpoints (a vLLM or gateway on your network) from
+      # SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS, e.g. http://10.1.2.3:8000.
+      # Nothing else on loopback is reachable, and agents' web_fetch never
+      # gets these origins. Needs a runtime release with ALLOW_ORIGINS.
+      AGENT_OUTBOUND_ALLOW_ORIGINS: http://127.0.0.1:${SELFHOST_APP_PORT:-3001}${SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS:+,${SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS}}
+    volumes:
+      - agent-runtime-data:/data
+    depends_on:
+      agent-runtime-postgres:
+        condition: service_healthy
+    # SIGTERM lets running turns finish (up to 100 s) before the node stops.
+    stop_grace_period: 130s
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:${SELFHOST_AGENT_RUNTIME_PORT:-8790}/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  agent-runtime-postgres:
+    image: ${SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE:?Run bun run selfhost:migrate-secrets}
+    environment:
+      POSTGRES_USER: agent_runtime
+      POSTGRES_DB: agent_runtime
+      POSTGRES_PASSWORD: ${AGENT_RUNTIME_POSTGRES_PASSWORD:?Run bun run selfhost:migrate-secrets}
+    ports:
+      - "127.0.0.1:${SELFHOST_AGENT_RUNTIME_POSTGRES_PORT:-15432}:5432"
+    volumes:
+      - agent-runtime-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_runtime -d agent_runtime"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
   local-artifacts:
     image: ${SELFHOST_LOCAL_ARTIFACTS_IMAGE:?Set SELFHOST_LOCAL_ARTIFACTS_IMAGE to an immutable local-artifacts image}
     environment:
@@ -138,3 +206,5 @@ services:
 volumes:
   app-state:
   local-artifacts-repos:
+  agent-runtime-data:
+  agent-runtime-postgres:

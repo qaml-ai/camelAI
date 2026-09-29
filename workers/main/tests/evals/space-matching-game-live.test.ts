@@ -32,18 +32,17 @@ import {
   type EvalDeployedApp,
 } from "./eval-deploy-assert";
 import { emitEvalTranscript } from "./eval-transcript";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import {
   ProjectFilesystemClient,
   type WorkspaceFilesystemDO,
   type WorkspaceFilesystemEnv,
   type WorkspaceProject,
 } from "../../src/workspace-filesystem-do";
-import { legacyDeployPathEvidence } from "./project-eval-helpers";
+import { legacyDeployPathEvidence, readSkillWithTool } from "./project-eval-helpers";
+import { runRuntimeEval } from "./runtime-eval";
 
 type SpaceMatchingGameEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
   APP_DB?: D1Database;
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   RUN_AGENT_EVALS?: string;
   EVAL_REAL_DEPLOY?: string;
@@ -316,7 +315,8 @@ function extractCommandEvidenceFromJsExec(code: string): string[] {
 
 function jsExecCodeMentionsTool(code: string, toolName: string): boolean {
   const stripped = stripComments(code);
-  const escaped = escapeRegex(toolName);
+  // The agent runtime's code names chiridion's tools `tools.camel__<name>`.
+  const escaped = `(?:[a-z0-9_]+__)?${escapeRegex(toolName)}`;
   return [
     new RegExp(`\\btools\\s*\\.\\s*${escaped}\\s*\\(`, "i"),
     new RegExp(`\\btools\\s*\\[\\s*(["'\`])${escaped}\\1\\s*\\]\\s*\\(`, "i"),
@@ -483,6 +483,8 @@ function readDevelopingSoftwareSkill(
   })) {
     return true;
   }
+  // The agent runtime's model reads skills with the read_skill tool.
+  if (readSkillWithTool(events, "developing-software")) return true;
 
   return (
     evidence.jsExecCodeBlocks.some((code) => {
@@ -1558,11 +1560,8 @@ describe("space matching game deploy agent eval", () => {
         return;
       }
 
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
       const appsBefore = await countWorkspaceApps(orgStub, defaultWorkspaceId);
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

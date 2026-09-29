@@ -367,6 +367,23 @@ jobs:
             selfhost-release.json > selfhost-release.next.json
           mv selfhost-release.next.json selfhost-release.json
 
+          # The bundled agent runtime, released from qaml-ai/agent-runtime
+          # (runtime-v* tags), at the version this checkout pins, and its
+          # Postgres, pinned by digest in the same module.
+          runtime_image="$(node --input-type=module -e 'const m = await import("./scripts/selfhost-agent-runtime.mjs"); console.log(m.SELFHOST_AGENT_RUNTIME_IMAGE)')"
+          runtime_postgres_image="$(node --input-type=module -e 'const m = await import("./scripts/selfhost-agent-runtime.mjs"); console.log(m.SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE)')"
+          runtime_digest="$(
+            docker buildx imagetools inspect "$runtime_image" |
+              awk '/^Digest:/ { print $2; exit }'
+          )"
+          test -n "$runtime_digest"
+          jq \
+            --arg runtime "${runtime_image%:*}@${runtime_digest}" \
+            --arg postgres "$runtime_postgres_image" \
+            '.images["agent-runtime"] = $runtime | .images["agent-runtime-postgres"] = $postgres' \
+            selfhost-release.json > selfhost-release.next.json
+          mv selfhost-release.next.json selfhost-release.json
+
           jq --sort-keys . selfhost-release.json
 
       - uses: actions/upload-artifact@v4

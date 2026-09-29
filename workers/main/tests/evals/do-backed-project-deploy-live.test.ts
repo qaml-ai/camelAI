@@ -37,15 +37,14 @@ import {
   usedTool,
 } from "./project-eval-helpers";
 import { ProjectFilesystemClient } from "../../src/workspace-filesystem-do";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import type {
   WorkspaceFilesystemDO,
   WorkspaceProject,
 } from "../../src/workspace-filesystem-do";
+import { runRuntimeEval } from "./runtime-eval";
 
 type DoBackedDeployEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
   APP_DB?: D1Database;
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   R2_BUCKET: R2Bucket;
   RUN_AGENT_EVALS?: string;
@@ -294,11 +293,8 @@ describe("DO-backed project deploy agent eval", () => {
       const workspaceFs = testEnv.WORKSPACE_FS.get(
         testEnv.WORKSPACE_FS.idFromName(defaultWorkspaceId),
       );
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
       const appsBefore = await countWorkspaceApps(orgStub, defaultWorkspaceId);
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,
@@ -310,12 +306,12 @@ describe("DO-backed project deploy agent eval", () => {
         message: [
           `Create a new DO-backed React Router project named exactly "${PROJECT_NAME}" using create_project with a concise description.`,
           "Use the default deployable React Router scaffold; do not use the data-analysis template for this web app.",
-          "Use js_exec to call `await tools.add_dependency({ project: \"event-check-in\", dependency: \"zod\" })`; add_dependency is not a top-level tool.",
+          "Use js_exec to call `await tools.camel__add_dependency({ project: \"event-check-in\", dependency: \"zod\" })`; add_dependency is not a top-level tool.",
           `Update the root React page so the deployed HTML contains the exact text "${APP_TITLE}" and "${COUNTER_LABEL}".`,
           "Update workers/app.ts so the Worker exports a Durable Object-backed check-in counter class and intercepts /api/checkins before falling through to React Router.",
           "Use Durable Object binding name CHECKINS. Add GET /api/checkins returning JSON with a numeric count, and POST /api/checkins accepting JSON { name: string }, validating it with zod, incrementing the Durable Object count, and returning JSON with the numeric count.",
           "Ensure the wrangler config/build manifest preserves durable_objects and migrations for that Durable Object.",
-          `Use js_exec to call await tools.deploy_project({ project: "${PROJECT_NAME}", script_name: "${PROJECT_NAME}" }); deploy_project is not a top-level tool.`,
+          `Call the deploy_project tool directly with { project: "${PROJECT_NAME}", script_name: "${PROJECT_NAME}" } (not from js_exec: its 120-second limit is shorter than a deploy).`,
           "Do not use legacy VM work, create-worker, wrangler deploy, or bun run deploy for this DO-backed project.",
           "When done, reply with the deployed URL and the current check-in count.",
         ].join(" "),

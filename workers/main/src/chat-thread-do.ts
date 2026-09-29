@@ -207,7 +207,7 @@ import {
   piCoreForkMessageIds,
   piCoreMessageToParsedChatMessage,
   attachPiToolResultToParsedMessages,
-  summarizeAdminExplorerThread,
+  piMessagesToParsedMessages,
 } from "./pi-message-export";
 
 // Pure Pi model/provider mapping helpers live in ./pi-model-resolution.
@@ -399,7 +399,7 @@ import {
   runtimeModelRoute,
   type RuntimeModelRoute,
 } from "./agent-runtime/model-routes";
-import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, syncOrgKeyScope } from "./agent-runtime/key-scopes";
+import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, selfhostOperatorEndpointOrigin, syncOrgKeyScope } from "./agent-runtime/key-scopes";
 import { storedThreadModel } from "./agent-runtime/run-gates";
 
 // Pi tool-definition surface (executor-style tool list + Agent/Explore
@@ -431,7 +431,6 @@ import type {
 // use and re-exported below so existing `from "./chat-thread-do"` import paths
 // keep working for external callers.
 import type {
-  AdminExplorerThreadSummary,
   AgentEvalParsedMessage,
   AgentEvalSessionRequest,
   AgentEvalSessionResult,
@@ -456,7 +455,6 @@ import type {
   PreviewTarget,
 } from "./chat-thread/types";
 export type {
-  AdminExplorerThreadSummary,
   AgentEvalDeployedApp,
   AgentEvalParsedMessage,
   AgentEvalSessionRequest,
@@ -1081,6 +1079,10 @@ function unpackReplaySegmentBody(rowBody: string): string[] {
 // buffering + replay on reconnect) and, later, chatRecovery. The ai-chat
 // message model is transport-internal only: pi_core_messages remains the
 // canonical history and the Pi runtime owns the agent loop.
+function* mapIterable<T, U>(items: Iterable<T>, map: (item: T) => U): Generator<U> {
+  for (const item of items) yield map(item);
+}
+
 export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState> {
   private static readonly CONNECTION_SETUP_TIMEOUT_MS = 30 * 60 * 1000;
   static renderHistoryWindow = {
@@ -4052,23 +4054,13 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     threadId: string,
   ): Promise<AgentEvalParsedMessage[]> {
     const normalizedThreadId = threadId.trim() || this.chatContext?.threadId || "";
-    const parsed: AgentEvalParsedMessage[] = [];
-
     // The browser rebuilds live assistant/tool content from the replay buffer,
     // so only canonical persisted history is returned here.
     const storedMessages = await this.loadFullPiCoreTranscriptUnbounded({
       includeUiMetadata: true,
       imagePolicy: "render",
     });
-    storedMessages.forEach((message, index) => {
-      const record = message as unknown as Record<string, unknown>;
-      if (record.role === "toolResult") {
-        attachPiToolResultToParsedMessages(parsed, record);
-        return;
-      }
-      parsed.push(...piCoreMessageToParsedChatMessage(message, index, normalizedThreadId));
-    });
-    return parsed;
+    return piMessagesToParsedMessages(storedMessages, normalizedThreadId);
   }
 
   /**
@@ -4312,19 +4304,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     };
   }
 
-  async getAdminExplorerSummary(input: {
-    userMessageCap?: number;
-  } = {}): Promise<AdminExplorerThreadSummary> {
-    const messages = await this.loadFullPiCoreTranscriptUnbounded({
-      includeUiMetadata: true,
-      imagePolicy: "render",
-    });
-    return summarizeAdminExplorerThread(messages, {
-      userMessageCap: input.userMessageCap,
-      sessionModelId: this.piSession?.state.model?.id,
-    });
-  }
-
   private runtimeMigrationInstance: ChatThreadRuntimeMigration | null = null;
 
   /** This thread's move to the runtime, which the DO drives (chat-thread/runtime-migration.ts). */
@@ -4341,7 +4320,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       hasRelayAgent: () => Boolean(this.ctx.storage.kv.get(RUNTIME_AGENT_KEY)),
       revision: () => this.piCoreStore.getPiCoreRevision(),
       loadHistory: (maxChars) => this.piCoreStore.loadPiCoreHistoryForMigration(maxChars),
-      payloadBatches: () => this.piCoreStore.piCorePayloadBatches(),
+      renderArchivePages: () => this.renderArchivePages(),
+      payloadBatches: () => mapIterable(this.piCoreStore.piCoreRowBatches(), (batch) => batch.map((row) => row.payload)),
       preview: () => ({ tabs: cloneDurableState(this.previewTabs), activeTabId: this.previewActiveTabId }),
       scheduleAlarm: (at) => {
         this.ctx.waitUntil(this.schedule(new Date(at), "runtimeMigrationAlarm").catch((error: unknown) =>
@@ -4371,6 +4351,36 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
    */
   async migrateToRuntime(request: DoMigrationRequest): Promise<DoMigrationResult> {
     return await this.runtimeMigration.migrate(request);
+  }
+
+  /** Where this thread's move to the runtime stands (moving, moved, backing off), before anyone asks for one. */
+  runtimeMigrationStatus(): { state: "moving" | "moved" | "backoff" | null; retryAt?: number } {
+    return this.runtimeMigration.status();
+  }
+
+  /**
+   * The render rows a post-turn compaction left as the only copy of the
+   * history below its cut (render-archive-preserve.ts): those older than the
+   * oldest message pi_core still derives, a bounded page at a time, newest
+   * page first.
+   */
+  private *renderArchivePages(): Generator<UIMessage[]> {
+    const seam = this.oldestDerivedPiCreatedAtMs();
+    if (seam === undefined) return;
+    let beforeCursor: string | null = `e:${formatAiChatCreatedAt(seam)}`;
+    while (beforeCursor) {
+      const page = this.getRenderHistoryPage({ beforeCursor, maxMessages: 50, maxBytes: 2_000_000 });
+      const archived = (page.messages as UIMessage[]).filter((message) => {
+        const createdAt = uiMessageCreatedAtMs(message);
+        return createdAt !== undefined && createdAt < seam;
+      });
+      if (archived.length) yield archived;
+      if (!page.hasMore || !page.nextCursor) return;
+      const key = page.nextCursor.startsWith("i:") || page.nextCursor.startsWith("e:") ? page.nextCursor.slice(2) : page.nextCursor;
+      const next = `e:${key}`;
+      if (next === beforeCursor) return;
+      beforeCursor = next;
+    }
   }
 
   /** The move's alarm (scheduled by the move): undo an abandoned one, finish a commit. */
@@ -4416,6 +4426,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     if (!text && attachmentCount === 0) {
       return { status: "skipped" };
     }
+    // A transcript being exported, or already moved, takes no more history here.
+    if (this.runtimeMigrationState()) return { status: "moved" };
 
     const providerMessageIds = Array.isArray(input.providerMessageIds)
       ? input.providerMessageIds
@@ -8019,6 +8031,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     return runtimeModelRoute(config, {
       orgId: this.chatContext?.orgId ?? "",
       freeTier: isCreditFreeHostedModel(this.currentThreadModel),
+      operatorEndpointOrigin: selfhostOperatorEndpointOrigin(this.env),
     });
   }
 
@@ -8071,12 +8084,11 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   private async hostedCreditRemainingUsd(orgId: string): Promise<number | null> {
     const org = this.env.ORG.get(this.env.ORG.idFromName(orgId)) as unknown as {
       getInfo(): Promise<Record<string, unknown> | null>;
-      getUsageLogSum(from: number, to: number, creditChargeableOnly: boolean): Promise<{ total_cost_usd?: number }>;
+      getCreditChargeableSpendUsd(): Promise<number>;
     };
     const info = await org.getInfo();
     if (!info || info.billing_status === "enterprise") return null;
-    const usage = await org.getUsageLogSum(0, Date.now(), true);
-    const spentCents = Math.round(Number(usage.total_cost_usd ?? 0) * 100);
+    const spentCents = Math.round(Number(await org.getCreditChargeableSpendUsd()) * 100);
     const totalCents = Number(info.billing_credit_purchase_total_cents ?? 0) + Number(info.billing_credit_grant_total_cents ?? 0);
     return Math.max(0, totalCents - spentCents) / 100;
   }

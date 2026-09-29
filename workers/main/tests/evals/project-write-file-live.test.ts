@@ -1,7 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, it } from "vitest";
 
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import {
   ProjectFilesystemClient,
   type WorkspaceFilesystemDO,
@@ -29,9 +28,9 @@ import {
   getEvalTimeoutMs,
   type EvalModelEnv,
 } from "./model-config";
+import { runRuntimeEval } from "./runtime-eval";
 
 type ProjectWriteEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   R2_BUCKET: R2Bucket;
   RUN_AGENT_EVALS?: string;
@@ -81,10 +80,7 @@ describe("project write file agent eval", () => {
         backend: "do-r2",
       });
 
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

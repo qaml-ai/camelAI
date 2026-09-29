@@ -577,8 +577,9 @@ async function connectPostgres(socket, request) {
   return client;
 }
 
-async function runPostgresQuery(socket, request) {
+async function runPostgresQuery(socket, request, progress) {
   const client = await connectPostgres(socket, request);
+  progress.connectedAtMs = Date.now();
   try {
     if (request.mode === "modify") {
       const result = await client.query({ text: request.sql, values: request.params });
@@ -633,7 +634,7 @@ function mysqlTlsUnsupported(error) {
   return error?.code === "HANDSHAKE_NO_SSL_SUPPORT" || /does not support secure connection|SSL is required but the server/i.test(message);
 }
 
-async function runMysqlQuery(socket, request, relay) {
+async function runMysqlQuery(socket, request, relay, progress) {
   let connection;
   try {
     connection = await connectMysql(socket, request);
@@ -645,6 +646,7 @@ async function runMysqlQuery(socket, request, relay) {
     socket = await openSocket(request.target, request.timeoutMs, relay);
     connection = await connectMysql(socket, request, true /* plaintext */);
   }
+  progress.connectedAtMs = Date.now();
   try {
     if (request.mode === "modify") {
       const [result] = await connection.query({ sql: request.sql, values: request.params, timeout: request.timeoutMs });
@@ -753,8 +755,9 @@ function mssqlTransaction(connection, method) {
   });
 }
 
-async function runMssqlQuery(socket, request) {
+async function runMssqlQuery(socket, request, progress) {
   const connection = await connectMssql(socket, request);
+  progress.connectedAtMs = Date.now();
   try {
     if (request.mode === "modify") {
       const rowCount = await mssqlExecute(connection, request.sql, request.params, {});
@@ -812,22 +815,54 @@ function jsonSafe(_key, value) {
   return value;
 }
 
+/**
+ * The error for a query that hit `timeoutMs`, worded by where the time went.
+ *
+ * Prod saw a burst of bare "Query timed out after 30000ms" errors, and the
+ * agent could not tell a slow database from a slow login. When the driver
+ * finished connecting, the database spent the rest of the budget running the
+ * statement: that is the user's query being slow, and the fix is a narrower
+ * query. When it never finished connecting, the query was never sent.
+ *
+ * @param {number} timeoutMs
+ * @param {number | null} connectedAfterMs ms from the timer start to a finished
+ *   connect + login, or null when the connection never finished.
+ */
+export function queryTimeoutError(timeoutMs, connectedAfterMs) {
+  const message =
+    connectedAfterMs === null
+      ? `Query timed out after ${timeoutMs}ms before the database finished the connection and login ` +
+        `handshake, so the query was never sent. The database is unreachable, overloaded, or not ` +
+        `answering logins; retry later or check the database.`
+      : `Query timed out after ${timeoutMs}ms: the database connected in ${connectedAfterMs}ms and spent ` +
+        `the rest running the query. This limit cannot be raised. Make the query cheaper (filter on ` +
+        `indexed columns, aggregate in SQL, add LIMIT, drop unneeded joins) or split it into smaller ` +
+        `queries; for a large extract, use the connection's export instead.`;
+  return Object.assign(new Error(message), { status: 504, code: "ETIMEOUT" });
+}
+
 async function runQuery(request, relay) {
   const socket = await openSocket(request.target, request.timeoutMs, relay);
+  // Set by the engine runner once connect + login finished.
+  const progress = { connectedAtMs: null };
+  const startedAtMs = Date.now();
   let timer;
   const deadline = new Promise((_resolve, reject) => {
     timer = setTimeout(() => {
       socket.destroy();
-      reject(Object.assign(new Error(`Query timed out after ${request.timeoutMs}ms`), { status: 504, code: "ETIMEOUT" }));
+      reject(queryTimeoutError(
+        request.timeoutMs,
+        progress.connectedAtMs === null ? null : progress.connectedAtMs - startedAtMs,
+      ));
     }, request.timeoutMs);
   });
   try {
     const run =
       request.engine === "postgres"
-        ? runPostgresQuery(socket, request)
+        ? runPostgresQuery(socket, request, progress)
         : request.engine === "mysql"
-          ? runMysqlQuery(socket, request, relay)
-          : runMssqlQuery(socket, request);
+          ? runMysqlQuery(socket, request, relay, progress)
+          : runMssqlQuery(socket, request, progress);
     return await Promise.race([run, deadline]);
   } catch (error) {
     socket.destroy();

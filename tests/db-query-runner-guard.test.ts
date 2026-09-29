@@ -17,6 +17,7 @@ import {
   exportFileSizeAfterClose,
   streamMysqlRows,
   writeResultAndExit,
+  queryTimeoutError,
   DEFAULT_ROW_LIMIT,
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
@@ -25,6 +26,24 @@ import {
   DEFAULT_MAX_RESPONSE_BYTES,
   PARQUET_KIND,
 } from '../workers/main/db-query-sandbox-assets/runner/db-query-runner.mjs';
+
+describe('queryTimeoutError', () => {
+  it('blames the query, not the sandbox, once the database connected', () => {
+    const error = queryTimeoutError(30_000, 412);
+    expect(error.message).toMatch(/^Query timed out after 30000ms: the database connected in 412ms/);
+    expect(error.message).toMatch(/cannot be raised/);
+    expect(error.message).toMatch(/export/);
+    // The legacy mapping keys off these, so the 504/ETIMEOUT contract holds.
+    expect(error).toMatchObject({ status: 504, code: 'ETIMEOUT' });
+  });
+
+  it('says the query was never sent when the login handshake never finished', () => {
+    const error = queryTimeoutError(30_000, null);
+    expect(error.message).toMatch(/^Query timed out after 30000ms before the database finished/);
+    expect(error.message).toMatch(/never sent/);
+    expect(error).toMatchObject({ status: 504, code: 'ETIMEOUT' });
+  });
+});
 
 describe('Parquet export finalization', () => {
   it('creates the per-connection parent directory before opening an export', async () => {

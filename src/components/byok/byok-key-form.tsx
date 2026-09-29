@@ -177,7 +177,7 @@ export function ByokKeyForm({
               value={customModelId}
               placeholder={
                 customApi === "anthropic-messages"
-                  ? "claude-sonnet-5"
+                  ? "claude-sonnet-5-5"
                   : "gpt-4o"
               }
               onChange={(event) => onCustomModelIdChange?.(event.target.value)}

@@ -77,7 +77,7 @@ export const ANTHROPIC_LLM_MODEL_OPTIONS: ReadonlyArray<{
   },
   {
     value: "sonnet",
-    label: "Sonnet 5",
+    label: "Sonnet 5.5",
     description: "Balanced Claude model",
   },
 ];

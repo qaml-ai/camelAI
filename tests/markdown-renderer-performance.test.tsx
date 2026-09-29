@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import { createElement } from 'react';
 
-vi.mock('@/lib/shiki-config', () => ({
+vi.mock('@/lib/shiki-config.client', () => ({
   codeToHtml: vi.fn(() => new Promise<string>(() => {})),
   SHIKI_DEFAULT_THEMES: {
     light: 'github-light',
@@ -12,7 +12,7 @@ vi.mock('@/lib/shiki-config', () => ({
 }));
 
 import { MarkdownRenderer } from '@/components/markdown-renderer';
-import { codeToHtml } from '@/lib/shiki-config';
+import { codeToHtml } from '@/lib/shiki-config.client';
 import type { AtMentionConnection, Integration } from '@/types';
 
 const codeToHtmlMock = vi.mocked(codeToHtml);

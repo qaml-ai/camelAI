@@ -10,6 +10,7 @@
  * remain as shadow logic here.
  */
 
+import { runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import type { UserDO, OrgDO, OrgRole, User } from '../src/auth';
 import type { WorkspaceDO, Workspace, WorkspaceAccessLevel as WorkspaceAccessLevelDO } from '../src/workspace';
 import type { AuthEnv } from '../../../src/lib/auth-helpers';
@@ -761,4 +762,17 @@ export async function switchSessionWorkspace(
   // Update last_workspace_id in user's org membership
   const userStub = env.USER.get(env.USER.idFromName(session.user_id));
   await userStub.setOrgLastWorkspace(session.org_id, workspaceId);
+}
+
+// ============ D1 mirror ============
+
+/**
+ * Drain a UserDO/OrgDO D1 mirror outbox now: skip the coalescing delay and run
+ * the DO alarm, which applies every due row to D1.
+ */
+export async function flushD1Mirror(stub: DurableObjectStub<any>): Promise<void> {
+  await runInDurableObject(stub, (_instance, state) => {
+    state.storage.sql.exec('UPDATE d1_mirror_outbox SET next_attempt_at = 0');
+  });
+  await runDurableObjectAlarm(stub);
 }

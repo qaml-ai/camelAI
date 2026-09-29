@@ -25,7 +25,7 @@
 import type { Env, RouteContext } from "../types.js";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import type { ThreadRuntimeRecord } from "../identity/org-do.js";
-import { ChatThreadMetadata, type ChatThreadMetadataEnv } from "../chat-thread/metadata.js";
+import { runtimeThreadMetadata } from "../agent-runtime/thread-metadata.js";
 import { recordWorkspaceThreadStreaming } from "../thread-status.js";
 import { runtimeAgentThreadKey, runtimeHistoryPage } from "../agent-runtime/thread-runtime.js";
 import { RuntimeApiError, runtimeApi } from "../agent-runtime/runtime-api.js";
@@ -74,23 +74,6 @@ async function threadOf(env: Env, data: RuntimeEventEnvelope["data"]): Promise<T
   return stored && text(stored.org) && text(stored.workspace) && text(stored.thread) ? stored : null;
 }
 
-function completions(env: Env, context: ChatContextState, waitUntil: (promise: Promise<unknown>) => void): ChatThreadMetadata {
-  return new ChatThreadMetadata({
-    chatContext: () => context,
-    env: () => env as unknown as ChatThreadMetadataEnv,
-    waitUntil,
-    titleGenerationInFlight: () => true,
-    setTitleGenerationInFlight: () => {},
-    setAssistantCompletionRecordedAt: () => {},
-    setAssistantCompletionSummaryRequestedAt: () => {},
-    setTitle: async () => {},
-    broadcastChat: () => {},
-    recordWorkspaceThreadStreaming: (workspaceId, threadId, isStreaming, options) =>
-      recordWorkspaceThreadStreaming(env, workspaceId, threadId, isStreaming, options),
-    retryChatDurableObjectRpc: (_operation, fn) => fn(),
-    recordChatThreadObservabilityEvent: () => {},
-  });
-}
 
 /** The text of the run's final reply, for the thread's completion summary. */
 async function replyText(env: Env, agentId: string, replyIndex: unknown): Promise<string | null> {
@@ -202,7 +185,7 @@ export async function handleRuntimeEvent(
   const summarySource = event.type === "run.completed" ? await replyText(env, agentId, data.replyIndex) : null;
   // Clears the running row, then records the completion; its summary (a model
   // call) finishes after the runtime has its acknowledgement.
-  const done = completions(env, context, waitUntil).recordThreadAssistantCompletion(context, completedAt, summarySource);
+  const done = runtimeThreadMetadata(env, context, waitUntil).recordThreadAssistantCompletion(context, completedAt, summarySource);
   waitUntil(done.catch((error) => console.error("[agent-runtime-events] completion bookkeeping failed", error)));
   return true;
 }

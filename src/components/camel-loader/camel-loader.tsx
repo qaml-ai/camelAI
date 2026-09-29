@@ -135,8 +135,8 @@ function loadInterpolators(): Promise<Interpolator[] | null> {
     return Promise.resolve(null);
   }
 
-  interpolatorsPromise ??= import("flubber")
-    .then((flubber) => {
+  interpolatorsPromise ??= import("./flubber.client")
+    .then(({ default: flubber }) => {
       const interpolate = getFlubberInterpolate(flubber);
       const segCount = KEYFRAMES.length;
       const interpolators = KEYFRAMES.map((from, i) =>

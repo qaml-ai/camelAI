@@ -57,14 +57,6 @@ describe('route config', () => {
       routes as RouteNode[],
       'api/dev/sent-emails/:id'
     );
-    const adminThreadJsonlRoute = findRouteByPath(
-      routes as RouteNode[],
-      'api/admin/threads/:id/jsonl'
-    );
-    const adminThreadMessagesRoute = findRouteByPath(
-      routes as RouteNode[],
-      'api/admin/threads/:id/messages'
-    );
     const billingStartSubscriptionRoute = findRouteByPath(
       routes as RouteNode[],
       'api/billing/start-subscription'
@@ -75,8 +67,6 @@ describe('route config', () => {
     expect(helpRoute).not.toBeNull();
     expect(devSentEmailsRoute).not.toBeNull();
     expect(devSentEmailByIdRoute).not.toBeNull();
-    expect(adminThreadJsonlRoute).not.toBeNull();
-    expect(adminThreadMessagesRoute).not.toBeNull();
     expect(billingStartSubscriptionRoute).not.toBeNull();
   });
 });

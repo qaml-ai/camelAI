@@ -81,6 +81,8 @@ const EMPTY_UI_MESSAGES: UIMessage[] = [];
 /** How long a sent message counts as "submitted" without its run appearing on the stream. */
 const SUBMITTED_WINDOW_MS = 60_000;
 const RECONNECT_DELAY_MS = 1_000;
+/** The longest pause before resending after sends keep failing (a runtime rollout, an outage). */
+const MAX_RECONNECT_DELAY_MS = 30_000;
 /**
  * A watcher disconnected this long has stopped (a 403 or 404 ends it without
  * `expired`) or cannot get through: watch again. Its own reconnects take less.
@@ -521,6 +523,12 @@ export function useRuntimeThread(options: {
 
   const viewRef = useRef(view);
   viewRef.current = view;
+  /** Sends that failed in a row, and the pending reopen after them (see `reconnect`). */
+  const sendFailuresRef = useRef(0);
+  const reopenRef = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (reopenRef.current !== null) window.clearTimeout(reopenRef.current);
+  }, []);
   const call = useCallback(async (method: string, args: unknown[] = []): Promise<any> => {
     if (!base) throw new Error("No thread");
     switch (method) {
@@ -539,10 +547,12 @@ export function useRuntimeThread(options: {
         }
         const sent = await postJson(`${base}/messages${query}`, { text, clientMessageId });
         // The runtime or the network failed: a transport failure to Chat, which
-        // resends under the same id (the runtime deduplicates it).
+        // resends under the same id (the runtime deduplicates it) after `reconnect`'s pause.
         if (sent.status >= 500 || !isRecord(sent.data)) {
+          sendFailuresRef.current++;
           throw new Error(isRecord(sent.data) && typeof sent.data.error === "string" ? sent.data.error : `HTTP ${sent.status}`);
         }
+        sendFailuresRef.current = 0;
         const result = sent.data;
         if (result.status === "accepted") {
           setSubmittedAt(Date.now());
@@ -596,8 +606,15 @@ export function useRuntimeThread(options: {
     send: () => {},
     // A send whose response was lost: open again after a pause, which resends
     // Chat's queued messages under the same ids (the runtime deduplicates them).
+    // One reopen at a time, however many failures ask for it, and a longer pause
+    // for each send that failed in a row: otherwise every failed resend adds a loop.
     reconnect: () => {
-      window.setTimeout(() => callbacks.current.onOpen(), RECONNECT_DELAY_MS);
+      if (reopenRef.current !== null) return;
+      const delay = Math.min(RECONNECT_DELAY_MS * 2 ** sendFailuresRef.current, MAX_RECONNECT_DELAY_MS);
+      reopenRef.current = window.setTimeout(() => {
+        reopenRef.current = null;
+        callbacks.current.onOpen();
+      }, delay);
     },
     call: call as RuntimeThreadClient["call"],
   }), [enabled, call, callbacks]);

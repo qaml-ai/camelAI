@@ -54,7 +54,7 @@ function toMantleAnthropicModelId(modelId: string): string {
   ) {
     return "anthropic.claude-opus-5-5";
   }
-  if (normalized.includes("sonnet-5")) return "anthropic.claude-sonnet-5";
+  if (normalized.includes("sonnet-5")) return "anthropic.claude-sonnet-5-5";
   if (normalized.includes("haiku-4-5") || normalized.includes("haiku-4.5")) {
     return "anthropic.claude-haiku-4-5";
   }
@@ -104,7 +104,7 @@ function anthropicMantleMetadata(modelId: string): AnthropicMantleMetadata {
     };
   }
   return {
-    name: "Claude Sonnet 5",
+    name: "Claude Sonnet 5.5",
     reasoning: true,
     input: ["text", "image"],
     cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },

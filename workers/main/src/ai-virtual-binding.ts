@@ -59,22 +59,22 @@ const TIER_MODELS: Readonly<Record<ProviderKind, Readonly<Record<TierName, strin
     smart: "gpt-6-sol",
   },
   anthropic: {
-    cheap: "claude-sonnet-5",
-    fast: "claude-sonnet-5",
-    auto: "claude-sonnet-5",
+    cheap: "claude-sonnet-5-5",
+    fast: "claude-sonnet-5-5",
+    auto: "claude-sonnet-5-5",
     smart: "claude-opus-5-5",
   },
   bedrock: {
-    cheap: "anthropic.claude-sonnet-5",
-    fast: "anthropic.claude-sonnet-5",
-    auto: "anthropic.claude-sonnet-5",
+    cheap: "anthropic.claude-sonnet-5-5",
+    fast: "anthropic.claude-sonnet-5-5",
+    auto: "anthropic.claude-sonnet-5-5",
     smart: "anthropic.claude-opus-5-5",
   },
   openrouter: {
     cheap: "openai/gpt-6-luna",
     fast: "openai/gpt-6-luna",
     auto: "openai/gpt-6-luna",
-    smart: "anthropic/claude-sonnet-5",
+    smart: "anthropic/claude-sonnet-5.5",
   },
 };
 
@@ -524,8 +524,9 @@ async function checkHostedModelAccess(
     );
   }
   if (creditFree) return { creditChargeable: false, vllmPriority };
-  const usage = await orgStub.getUsageLogSum(0, Date.now(), true);
-  const spentCents = Math.round(Number(usage.total_cost_usd ?? 0) * 100);
+  const spentCents = Math.round(
+    Number(await orgStub.getCreditChargeableSpendUsd()) * 100,
+  );
   const totalCreditsCents =
     (org.billing_credit_purchase_total_cents ?? 0) +
     (org.billing_credit_grant_total_cents ?? 0);

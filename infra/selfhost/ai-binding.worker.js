@@ -8,7 +8,7 @@ const AUXILIARY_MODEL_IDS = new Set([
 // independent from the user-facing chat model picker (Bedrock has no GPT-6
 // Luna yet).
 const AUXILIARY_MODELS = {
-  anthropic: "claude-sonnet-5",
+  anthropic: "claude-sonnet-5-5",
   bedrock: "openai.gpt-5.6-luna",
   openai: "gpt-6-luna",
   openrouter: "openai/gpt-6-luna",

@@ -74,7 +74,13 @@ import {
   utcDayKey,
   type HostedCapability,
 } from "../../../../src/lib/capability-allowances";
-import { dispatchAdminEvent } from "./admin-events";
+import type { AdminEventType } from "../admin-index-types";
+import { getAppIndexDatabase, workspaceMemberMirrorKey } from "../app-index-db";
+import {
+  D1MirrorOutbox,
+  scheduleEarliestAlarm,
+  type MirrorKind,
+} from "./d1-mirror-outbox";
 import { normalizeOrgBillingFields } from "./billing-state";
 import { recordErrorEvent, recordObservabilityEvent } from "../observability";
 import { SCRIPT_PREFIX } from "../types";
@@ -940,27 +946,267 @@ export class OrgDO extends DurableObject<DOEnv> {
   private sql: SqlStorage;
   private usageControlsInstance?: OrgUsageControls;
   private workerScriptsHasPreviewColumns = true;
-  private static readonly LEGACY_HOST_USAGE_BACKFILL_STATUS_KEY =
-    "legacyHostUsageBackfillStatus";
-  private static readonly LEGACY_HOST_USAGE_BACKFILL_STARTED_AT_KEY =
-    "legacyHostUsageBackfillStartedAt";
-  private static readonly LEGACY_HOST_USAGE_BACKFILL_COMPLETED_AT_KEY =
-    "legacyHostUsageBackfillCompletedAt";
-  private static readonly LEGACY_HOST_USAGE_BACKFILL_RESULT_KEY =
-    "legacyHostUsageBackfillResult";
-  private static readonly LEGACY_HOST_USAGE_BACKFILL_ERROR_KEY =
-    "legacyHostUsageBackfillError";
   private static readonly ACCESS_MAPPED_ORG_ID_KEY = "accessMappedOrgId";
   private static readonly WORKSPACE_ACCESS_MIGRATION_PREFIX =
     "workspaceTenantDataMigrated:access:";
   private static readonly WORKSPACE_INTEGRATIONS_MIGRATION_PREFIX =
     "workspaceTenantDataMigrated:integrations:";
+  private readonly mirror: D1MirrorOutbox;
+
   constructor(ctx: DurableObjectState, env: DOEnv) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    this.mirror = new D1MirrorOutbox(ctx.storage);
 
     ctx.blockConcurrencyWhile(async () => {
       this.migrate();
+      this.mirror.ensureSchema();
+    });
+  }
+
+  /**
+   * Queue `kind`/`id` for the D1 mirror. Call it in the same storage
+   * transaction as the fact write (inside `transactionSync`, or with no
+   * `await` between the write and this call); the alarm drains current state.
+   */
+  private markMirrorDirty(kind: MirrorKind, id: string): void {
+    this.mirror.markDirty(kind, id);
+  }
+
+  /** Current state of one mirrored entity this org owns, as D1 admin events. */
+  private readonly mirrorSnapshot = (kind: MirrorKind, id: string): AdminEventType[] => {
+    const info = this.getInfoSync();
+    if (!info) return [];
+    const orgId = info.id;
+    const count = (query: string): number =>
+      Number(this.sql.exec<{ count: number }>(query).toArray()[0]?.count ?? 0);
+    switch (kind) {
+      case "org": {
+        const llmProvider = this.getLlmProviderConfig();
+        return [
+          {
+            type: "org_upsert",
+            payload: {
+              ...info,
+              member_count: count("SELECT COUNT(*) AS count FROM members"),
+              workspace_count: count("SELECT COUNT(*) AS count FROM workspaces"),
+            },
+          },
+          {
+            type: "org_llm_provider_update",
+            payload: {
+              org_id: orgId,
+              provider: llmProvider?.provider ?? null,
+              updated_at: llmProvider?.updated_at ?? null,
+            },
+          },
+        ];
+      }
+      case "org_membership": {
+        const member = this.sql
+          .exec<{ role: string; joined_at: number; workspace_access_default: string | null }>(
+            "SELECT role, joined_at, workspace_access_default FROM members WHERE user_id = ?",
+            id,
+          )
+          .toArray()[0];
+        return member
+          ? [
+              {
+                type: "org_membership_upsert",
+                payload: {
+                  org_id: orgId,
+                  user_id: id,
+                  role: member.role,
+                  joined_at: member.joined_at,
+                  workspace_access_default: member.workspace_access_default === "none" ? "none" : "full",
+                },
+              },
+            ]
+          : [{ type: "org_membership_delete", payload: { org_id: orgId, user_id: id } }];
+      }
+      case "workspace_member": {
+        const separator = id.indexOf(":");
+        const workspaceId = id.slice(0, separator);
+        const userId = id.slice(separator + 1);
+        const row = this.sql
+          .exec<{ access_level: string; granted_by: string | null; granted_at: number }>(
+            "SELECT access_level, granted_by, granted_at FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?",
+            workspaceId,
+            userId,
+          )
+          .toArray()[0];
+        return row
+          ? [
+              {
+                type: "workspace_member_upsert",
+                payload: {
+                  org_id: orgId,
+                  workspace_id: workspaceId,
+                  user_id: userId,
+                  access_level: this.normalizeWorkspaceAccess(row.access_level),
+                  granted_by: row.granted_by ?? null,
+                  granted_at: row.granted_at,
+                },
+              },
+            ]
+          : [{ type: "workspace_member_delete", payload: { workspace_id: workspaceId, user_id: userId } }];
+      }
+      case "invitation": {
+        const invitation = this.sql
+          .exec<{
+            id: string;
+            email: string;
+            role: string;
+            invited_by: string;
+            created_at: number;
+            expires_at: number;
+          }>(
+            "SELECT id, email, role, invited_by, created_at, expires_at FROM invitations WHERE id = ?",
+            id,
+          )
+          .toArray()[0];
+        return invitation
+          ? [{ type: "invitation_upsert", payload: { ...invitation, status: "pending", org_id: orgId } }]
+          : [{ type: "invitation_delete", payload: { id } }];
+      }
+      case "workspace": {
+        const row = this.sql
+          .exec<OrgWorkspaceInfoRow>(
+            `SELECT id, name, created_at, archived, description, created_by,
+                    avatar_color, avatar_content, archived_at, archived_by,
+                    compute_tier, email_handle
+               FROM workspaces
+              WHERE id = ?`,
+            id,
+          )
+          .toArray()[0];
+        return row
+          ? [
+              {
+                type: "workspace_upsert",
+                payload: {
+                  ...this.workspaceFromRow(row),
+                  integration_count: this.getActiveWorkspaceIntegrationCount(id),
+                },
+              },
+            ]
+          : [{ type: "workspace_delete", payload: { id } }];
+      }
+      case "app": {
+        const [row] = this.execWorkerScriptsQuery(
+          `SELECT script_name, workspace_id, created_by, created_at, updated_at, is_public,
+                  preview_key, preview_updated_at, preview_status, preview_error, config_path, project_id, commit_sha, artifact_cache_key,
+                  custom_domain_hostname, custom_domain_cf_hostname_id, custom_domain_status,
+                  custom_domain_ssl_status, custom_domain_error, custom_domain_updated_at
+             FROM worker_scripts WHERE script_name = ?`,
+          `SELECT script_name, workspace_id, created_by, created_at, updated_at, is_public,
+                  NULL AS preview_key, NULL AS preview_updated_at, NULL AS preview_status, NULL AS preview_error, NULL AS config_path, NULL AS project_id, NULL AS commit_sha, NULL AS artifact_cache_key,
+                  NULL AS custom_domain_hostname, NULL AS custom_domain_cf_hostname_id, NULL AS custom_domain_status,
+                  NULL AS custom_domain_ssl_status, NULL AS custom_domain_error, NULL AS custom_domain_updated_at
+             FROM worker_scripts WHERE script_name = ?`,
+          [id],
+        );
+        return row
+          ? [{ type: "app_upsert", payload: { ...this.toWorkerScript(row), org_id: orgId } }]
+          : [{ type: "app_delete", payload: { script_name: id, org_id: orgId } }];
+      }
+      case "thread": {
+        const thread = this.getThread(id);
+        return thread
+          ? [{ type: "thread_upsert", payload: toAdminThreadPayload(thread, orgId) }]
+          : [{ type: "thread_delete", payload: { id } }];
+      }
+      default:
+        return [];
+    }
+  };
+
+  /** Test/ops helper: queue the org row and every entity it owns for re-mirroring. */
+  async requestMirrorResync(): Promise<{ queued: number }> {
+    let queued = 0;
+    this.ctx.storage.transactionSync(() => {
+      const mark = (kind: MirrorKind, id: string) => {
+        this.markMirrorDirty(kind, id);
+        queued += 1;
+      };
+      mark("org", "");
+      for (const { user_id } of this.sql.exec<{ user_id: string }>("SELECT user_id FROM members").toArray()) {
+        mark("org_membership", user_id);
+      }
+      for (const { id } of this.sql.exec<{ id: string }>("SELECT id FROM invitations").toArray()) {
+        mark("invitation", id);
+      }
+      for (const { id } of this.sql.exec<{ id: string }>("SELECT id FROM workspaces").toArray()) {
+        mark("workspace", id);
+      }
+      for (const row of this.sql
+        .exec<{ workspace_id: string; user_id: string }>(
+          "SELECT workspace_id, user_id FROM workspace_memberships",
+        )
+        .toArray()) {
+        mark("workspace_member", workspaceMemberMirrorKey(row.workspace_id, row.user_id));
+      }
+      for (const { script_name } of this.sql
+        .exec<{ script_name: string }>("SELECT script_name FROM worker_scripts")
+        .toArray()) {
+        mark("app", script_name);
+      }
+      for (const { id } of this.sql.exec<{ id: string }>("SELECT id FROM threads").toArray()) {
+        mark("thread", id);
+      }
+    });
+    return { queued };
+  }
+
+  /**
+   * Reconciler: current mirrored state of the org and every child row it owns
+   * (threads: the requested ids plus a random sample), keyed like the outbox,
+   * plus the outbox keys still in flight. `orgId` is null for a hard-deleted org.
+   */
+  async getMirrorReconcileSnapshot(
+    options: { threadIds?: string[]; threadSample?: number } = {},
+  ): Promise<{ orgId: string | null; entities: Array<{ key: string; events: AdminEventType[] }>; pending: string[] }> {
+    const info = this.getInfoSync();
+    if (!info) return { orgId: null, entities: [], pending: [] };
+    const entities: Array<{ key: string; events: AdminEventType[] }> = [];
+    const add = (kind: MirrorKind, id: string) =>
+      entities.push({ key: `${kind}:${id}`, events: this.mirrorSnapshot(kind, id) });
+    const ids = (query: string) =>
+      this.sql.exec<{ id: string }>(query).toArray().map((row) => row.id);
+
+    add("org", "");
+    for (const id of ids("SELECT user_id AS id FROM members")) add("org_membership", id);
+    for (const id of ids("SELECT id FROM invitations")) add("invitation", id);
+    for (const id of ids("SELECT id FROM workspaces")) add("workspace", id);
+    for (const id of ids(
+      "SELECT workspace_id || ':' || user_id AS id FROM workspace_memberships",
+    )) {
+      add("workspace_member", id);
+    }
+    for (const id of ids("SELECT script_name AS id FROM worker_scripts")) add("app", id);
+    const threadIds = new Set(options.threadIds ?? []);
+    const sample = Math.max(0, Math.min(200, Math.floor(options.threadSample ?? 20)));
+    if (sample > 0) {
+      for (const id of ids(`SELECT id FROM threads ORDER BY RANDOM() LIMIT ${sample}`)) threadIds.add(id);
+    }
+    for (const id of threadIds) add("thread", id);
+    return { orgId: info.id, entities, pending: this.mirror.pendingKeys() };
+  }
+
+  /** Orphan cleanup: whether this OrgDO still holds an org (read-only). */
+  mirrorOrgExists(): boolean {
+    return this.getInfoSync() !== null;
+  }
+
+  async getMirrorOutboxStats() {
+    return this.mirror.stats();
+  }
+
+  /** Apply everything queued for D1 now (bootstrap/backfill). */
+  async drainMirrorNow() {
+    return this.mirror.drainAll(getAppIndexDatabase(this.env), this.mirrorSnapshot, {
+      observability: this.env,
+      component: "OrgDO",
     });
   }
 
@@ -1017,16 +1263,6 @@ export class OrgDO extends DurableObject<DOEnv> {
     } catch {
       return 0;
     }
-  }
-
-  private dispatchWorkspaceUpsert(info: Workspace): void {
-    dispatchAdminEvent(this.ctx, this.env, {
-      type: "workspace_upsert",
-      payload: {
-        ...info,
-        integration_count: this.getActiveWorkspaceIntegrationCount(info.id),
-      },
-    });
   }
 
   private async syncWorkspaceInfoToWorkspaceDO(info: Workspace): Promise<void> {
@@ -2273,6 +2509,24 @@ export class OrgDO extends DurableObject<DOEnv> {
       `);
     }
 
+    // usage_spend.chargeable_cost_usd is the O(1) running total the credit
+    // gates read instead of scanning usage_log. Keyed on the column rather
+    // than the schema version: adding it backfills it from the ledger once.
+    const usageSpendColumns = this.sql
+      .exec<{ name: string }>("PRAGMA table_info(usage_spend)")
+      .toArray();
+    if (!usageSpendColumns.some((column) => column.name === "chargeable_cost_usd")) {
+      this.sql.exec(
+        "ALTER TABLE usage_spend ADD COLUMN chargeable_cost_usd REAL NOT NULL DEFAULT 0",
+      );
+      this.sql.exec("INSERT OR IGNORE INTO usage_spend (id) VALUES (1)");
+      this.sql.exec(
+        `UPDATE usage_spend SET chargeable_cost_usd = (
+           SELECT COALESCE(SUM(cost_usd), 0) FROM usage_log WHERE credit_chargeable = 1
+         ) WHERE id = 1`,
+      );
+    }
+
     const CURRENT_SCHEMA_VERSION = 53;
     if (version < CURRENT_SCHEMA_VERSION) {
       this.ctx.storage.kv.put("schemaVersion", CURRENT_SCHEMA_VERSION);
@@ -2853,58 +3107,6 @@ export class OrgDO extends DurableObject<DOEnv> {
     return info;
   }
 
-  claimLegacyHostUsageBackfill(): "claimed" | "complete" | "running" {
-    const status = this.ctx.storage.kv.get<string>(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_STATUS_KEY,
-    );
-    if (status === "complete") return "complete";
-    const startedAt =
-      this.ctx.storage.kv.get<number>(
-        OrgDO.LEGACY_HOST_USAGE_BACKFILL_STARTED_AT_KEY,
-      ) ?? 0;
-    if (status === "running" && Date.now() - startedAt < 15 * 60 * 1000) {
-      return "running";
-    }
-    this.ctx.storage.kv.put(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_STATUS_KEY,
-      "running",
-    );
-    this.ctx.storage.kv.put(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_STARTED_AT_KEY,
-      Date.now(),
-    );
-    this.ctx.storage.kv.delete(OrgDO.LEGACY_HOST_USAGE_BACKFILL_ERROR_KEY);
-    return "claimed";
-  }
-
-  completeLegacyHostUsageBackfill(result: unknown): void {
-    const now = Date.now();
-    this.ctx.storage.kv.put(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_STATUS_KEY,
-      "complete",
-    );
-    this.ctx.storage.kv.put(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_COMPLETED_AT_KEY,
-      now,
-    );
-    this.ctx.storage.kv.put(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_RESULT_KEY,
-      result,
-    );
-    this.ctx.storage.kv.delete(OrgDO.LEGACY_HOST_USAGE_BACKFILL_ERROR_KEY);
-  }
-
-  failLegacyHostUsageBackfill(error: string): void {
-    this.ctx.storage.kv.put(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_STATUS_KEY,
-      "failed",
-    );
-    this.ctx.storage.kv.put(
-      OrgDO.LEGACY_HOST_USAGE_BACKFILL_ERROR_KEY,
-      error,
-    );
-  }
-
   /**
    * Get just the org slug (for contexts where we only need the slug).
    * Also ensures the slug→orgId reverse mapping exists in KV.
@@ -2928,10 +3130,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       "data",
       JSON.stringify(info),
     );
-    dispatchAdminEvent(this.ctx, this.env, {
-      type: "org_upsert",
-      payload: info,
-    });
+    this.markMirrorDirty("org", "");
   }
 
   claimSsoProvisioning(): string | null {
@@ -3393,6 +3592,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         now,
         workspaceAccessDefault,
       );
+      this.markWorkspaceMembershipsDirty(claimedIdentity.userId);
       this.sql.exec(
         "DELETE FROM workspace_memberships WHERE user_id = ?",
         claimedIdentity.userId,
@@ -3424,6 +3624,8 @@ export class OrgDO extends DurableObject<DOEnv> {
         claimedIdentity.userId,
       );
       this.sql.exec("DELETE FROM invitations WHERE id = ?", invitationRow.id);
+      this.markMirrorDirty("invitation", invitationRow.id);
+      this.markMembershipDirty(claimedIdentity.userId);
 
       return { ...claimedIdentity, membershipRevoked: false };
     });
@@ -3436,19 +3638,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         role: invitation.role,
         source: "enterprise-sso-invitation",
       });
-      const info = await this.getInfo();
-      if (info) {
-        dispatchAdminEvent(this.ctx, this.env, {
-          type: "org_member_delta",
-          payload: { org_id: info.id, delta: 1 },
-        });
-      }
-      this.dispatchOrgMembershipUpsert(identity.userId, invitation.role, now);
     }
-    dispatchAdminEvent(this.ctx, this.env, {
-      type: "invitation_delete",
-      payload: { id: invitation.id },
-    });
     return identity;
   }
 
@@ -3806,6 +3996,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         "data",
         JSON.stringify(nextInfo),
       );
+      this.markMirrorDirty("org", "");
 
       return {
         org: nextInfo,
@@ -3871,15 +4062,10 @@ export class OrgDO extends DurableObject<DOEnv> {
         "data",
         JSON.stringify(nextInfo),
       );
+      this.markMirrorDirty("org", "");
       return { org: nextInfo, applied: true };
     });
 
-    if (result?.applied) {
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "org_upsert",
-        payload: result.org,
-      });
-    }
     return result;
   }
 
@@ -4011,6 +4197,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         "data",
         JSON.stringify(nextInfo),
       );
+      this.markMirrorDirty("org", "");
       return {
         org: nextInfo,
         applied: true,
@@ -4020,9 +4207,6 @@ export class OrgDO extends DurableObject<DOEnv> {
       };
     });
 
-    if (result?.applied) {
-      dispatchAdminEvent(this.ctx, this.env, { type: "org_upsert", payload: result.org });
-    }
     return result;
   }
 
@@ -4137,6 +4321,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         "data",
         JSON.stringify(nextInfo),
       );
+      this.markMirrorDirty("org", "");
       this.log(
         "usage_credit_granted",
         normalizedCreatedBy ?? normalizedSource ?? "system-admin",
@@ -4161,12 +4346,6 @@ export class OrgDO extends DurableObject<DOEnv> {
       };
     });
 
-    if (result?.applied) {
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "org_upsert",
-        payload: result.org,
-      });
-    }
     return result;
   }
 
@@ -4241,36 +4420,23 @@ export class OrgDO extends DurableObject<DOEnv> {
     return rows[0] || null;
   }
 
-  private dispatchOrgMembershipUpsert(
-    userId: string,
-    role: OrgRole,
-    joinedAt: number,
-  ): void {
-    this.getInfo().then((info) => {
-      if (!info) return;
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "org_membership_upsert",
-        payload: {
-          org_id: info.id,
-          user_id: userId,
-          role,
-          joined_at: joinedAt,
-        },
-      });
-    });
+  /** A member row changed (added, removed, role): mirror it and the org's member count. */
+  private markMembershipDirty(userId: string): void {
+    this.markMirrorDirty("org_membership", userId);
+    this.markMirrorDirty("org", "");
+    this.markWorkspaceMembershipsDirty(userId);
   }
 
-  private dispatchOrgMembershipDelete(userId: string): void {
-    this.getInfo().then((info) => {
-      if (!info) return;
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "org_membership_delete",
-        payload: {
-          org_id: info.id,
-          user_id: userId,
-        },
-      });
-    });
+  /** Mark every workspace access override `userId` currently has (call before deleting them too). */
+  private markWorkspaceMembershipsDirty(userId: string): void {
+    for (const { workspace_id } of this.sql
+      .exec<{ workspace_id: string }>(
+        "SELECT workspace_id FROM workspace_memberships WHERE user_id = ?",
+        userId,
+      )
+      .toArray()) {
+      this.markMirrorDirty("workspace_member", workspaceMemberMirrorKey(workspace_id, userId));
+    }
   }
 
   async addMember(
@@ -4335,6 +4501,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         );
       }
       if (options.workspaceAccessRows) {
+        this.markWorkspaceMembershipsDirty(userId);
         this.sql.exec(
           "DELETE FROM workspace_memberships WHERE user_id = ?",
           userId,
@@ -4356,17 +4523,10 @@ export class OrgDO extends DurableObject<DOEnv> {
         "UPDATE enterprise_sso_identities SET membership_revoked = 0 WHERE user_id = ?",
         userId,
       );
+      this.markMembershipDirty(userId);
     });
     if (!existing) {
       this.log("member_added", actorId, userId, { role });
-      const info = await this.getInfo();
-      if (info) {
-        dispatchAdminEvent(this.ctx, this.env, {
-          type: "org_member_delta",
-          payload: { org_id: info.id, delta: 1 },
-        });
-      }
-      this.dispatchOrgMembershipUpsert(userId, role, now);
     }
   }
 
@@ -4443,23 +4603,17 @@ export class OrgDO extends DurableObject<DOEnv> {
     }
     this.ctx.storage.transactionSync(() => {
       this.sql.exec("DELETE FROM members WHERE user_id = ?", userId);
+      this.markWorkspaceMembershipsDirty(userId);
       this.sql.exec("DELETE FROM workspace_memberships WHERE user_id = ?", userId);
       this.sql.exec("DELETE FROM user_llm_usage_limits WHERE user_id = ?", userId);
       this.sql.exec(
         "UPDATE enterprise_sso_identities SET membership_revoked = 1 WHERE user_id = ?",
         userId,
       );
+      this.markMembershipDirty(userId);
     });
     if (existing) {
       this.log("member_removed", actorId, userId, { role: existing.role });
-      const info = await this.getInfo();
-      if (info) {
-        dispatchAdminEvent(this.ctx, this.env, {
-          type: "org_member_delta",
-          payload: { org_id: info.id, delta: -1 },
-        });
-      }
-      this.dispatchOrgMembershipDelete(userId);
     }
     this.ensureOwnerExists(actorId);
   }
@@ -4483,12 +4637,12 @@ export class OrgDO extends DurableObject<DOEnv> {
       role,
       userId,
     );
+    this.markMirrorDirty("org_membership", userId);
     if (existing && existing.role !== role) {
       this.log("member_role_changed", actorId, userId, {
         old_role: existing.role,
         new_role: role,
       });
-      this.dispatchOrgMembershipUpsert(userId, role, existing.joined_at);
     }
     this.ensureOwnerExists(actorId);
   }
@@ -4551,6 +4705,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       "owner",
       fallback.user_id,
     );
+    this.markMirrorDirty("org_membership", fallback.user_id);
     this.log("owner_recovered", actorId, fallback.user_id);
   }
 
@@ -4700,28 +4855,16 @@ export class OrgDO extends DurableObject<DOEnv> {
           invitation.expires_at,
           workspaceAccess ? JSON.stringify(workspaceAccess) : null,
         );
+        this.markMirrorDirty("invitation", invitation.id);
       }
     });
-
-    const info = this.getInfoSync();
-    if (info) {
-      for (const invitation of invitations) {
-        dispatchAdminEvent(this.ctx, this.env, {
-          type: "invitation_upsert",
-          payload: { ...invitation, org_id: info.id },
-        });
-      }
-    }
 
     return invitations;
   }
 
   async deleteInvitation(id: string): Promise<void> {
     this.sql.exec("DELETE FROM invitations WHERE id = ?", id);
-    dispatchAdminEvent(this.ctx, this.env, {
-      type: "invitation_delete",
-      payload: { id },
-    });
+    this.markMirrorDirty("invitation", id);
   }
 
   async updateInvitationWorkspaceAccess(
@@ -4802,6 +4945,8 @@ export class OrgDO extends DurableObject<DOEnv> {
         userId,
       );
       this.sql.exec("DELETE FROM invitations WHERE id = ?", invitationId);
+      this.markMirrorDirty("invitation", invitationId);
+      this.markMembershipDirty(userId);
     });
 
     const acceptedInvitation = invitation as OrgInvitation | null;
@@ -4810,19 +4955,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       this.log("member_added", userId, userId, {
         role: acceptedInvitation.role,
       });
-      const info = await this.getInfo();
-      if (info) {
-        dispatchAdminEvent(this.ctx, this.env, {
-          type: "org_member_delta",
-          payload: { org_id: info.id, delta: 1 },
-        });
-      }
-      this.dispatchOrgMembershipUpsert(userId, acceptedInvitation.role, now);
     }
-    dispatchAdminEvent(this.ctx, this.env, {
-      type: "invitation_delete",
-      payload: { id: invitationId },
-    });
     return acceptedInvitation;
   }
 
@@ -5097,8 +5230,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       integration_type: integrationType,
       name,
     });
-    const workspace = await this.getWorkspaceInfo(workspaceId);
-    if (workspace) this.dispatchWorkspaceUpsert(workspace);
+    this.markMirrorDirty("workspace", workspaceId);
     if (resolvedTokenExpiresAt !== null) {
       await this.scheduleNextTokenRefresh();
     }
@@ -5233,8 +5365,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       workspace_id: workspaceId,
       changes: Object.keys(updates),
     });
-    const workspace = await this.getWorkspaceInfo(workspaceId);
-    if (workspace) this.dispatchWorkspaceUpsert(workspace);
+    this.markMirrorDirty("workspace", workspaceId);
     if (updates.tokenExpiresAt !== undefined) {
       await this.scheduleNextTokenRefresh();
     }
@@ -5339,8 +5470,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       id,
     );
     this.log("integration_deleted", actorId, id, { workspace_id: workspaceId });
-    const workspace = await this.getWorkspaceInfo(workspaceId);
-    if (workspace) this.dispatchWorkspaceUpsert(workspace);
+    this.markMirrorDirty("workspace", workspaceId);
     await this.scheduleNextTokenRefresh();
   }
 
@@ -5356,18 +5486,32 @@ export class OrgDO extends DurableObject<DOEnv> {
       )
       .toArray();
     const nextExpiry = rows[0]?.token_expires_at ?? null;
-    if (!nextExpiry) {
-      await this.ctx.storage.deleteAlarm();
-      return;
-    }
-    const alarmTime = nextExpiry - TOKEN_REFRESH_BUFFER_MS;
     const now = Date.now();
-    await this.ctx.storage.setAlarm(alarmTime <= now ? now + 1000 : alarmTime);
+    const tokenAlarmTime = nextExpiry
+      ? Math.max(now + 1000, nextExpiry - TOKEN_REFRESH_BUFFER_MS)
+      : null;
+    // The alarm is shared with the D1 mirror outbox: schedule the earliest of both.
+    await scheduleEarliestAlarm(this.ctx.storage, [
+      tokenAlarmTime,
+      this.mirror.nextDueAt(),
+    ]);
   }
 
   async alarm(): Promise<void> {
     const now = Date.now();
     await this.ctx.storage.setAlarm(now + TOKEN_REFRESH_FALLBACK_MS);
+    this.mirror.noteAlarmFired();
+
+    // Drain the D1 mirror first: bounded by a time budget, never throws, and
+    // must not be starved by token-refresh failures.
+    try {
+      await this.mirror.drain(getAppIndexDatabase(this.env), this.mirrorSnapshot, {
+        observability: this.env,
+        component: "OrgDO",
+      });
+    } catch (error) {
+      console.error("[OrgDO] D1 mirror drain failed", error);
+    }
 
     try {
       const batchCutoff = now + TOKEN_BATCH_WINDOW_MS;
@@ -5793,6 +5937,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         artifactCacheKey ?? null,
         scriptName,
       );
+      this.markMirrorDirty("app", scriptName);
       this.log("worker_script_updated", createdBy, scriptName, {
         workspace_id: workspaceId,
         config_path: configPath,
@@ -5835,6 +5980,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       commitSha ?? null,
       artifactCacheKey ?? null,
     );
+    this.markMirrorDirty("app", scriptName);
     this.log("worker_script_registered", createdBy, scriptName, {
       workspace_id: workspaceId,
       config_path: configPath,
@@ -5874,12 +6020,6 @@ export class OrgDO extends DurableObject<DOEnv> {
       custom_domain_error: null,
       custom_domain_updated_at: null,
     };
-    const info = await this.getInfo();
-    if (info)
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "app_upsert",
-        payload: { ...newScript, org_id: info.id },
-      });
     return newScript;
   }
 
@@ -6096,15 +6236,10 @@ export class OrgDO extends DurableObject<DOEnv> {
       now,
       scriptName,
     );
+    this.markMirrorDirty("app", scriptName);
     const script = await this.getWorkerScript(scriptName);
     if (script) {
       this.log("worker_script_touched", actorId, scriptName);
-      const info = await this.getInfo();
-      if (info)
-        dispatchAdminEvent(this.ctx, this.env, {
-          type: "app_upsert",
-          payload: { ...script, org_id: info.id },
-        });
     }
     return script;
   }
@@ -6126,18 +6261,12 @@ export class OrgDO extends DurableObject<DOEnv> {
       scriptName,
       workspaceId,
     );
+    this.markMirrorDirty("app", scriptName);
     this.log("worker_script_project_updated", actorId, scriptName, {
       workspace_id: workspaceId,
       project_id: projectId,
     });
-    const script = await this.getWorkerScript(scriptName);
-    const info = await this.getInfo();
-    if (info && script)
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "app_upsert",
-        payload: { ...script, org_id: info.id },
-      });
-    return script;
+    return this.getWorkerScript(scriptName);
   }
 
   async setWorkerScriptPublic(
@@ -6172,6 +6301,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       now,
       scriptName,
     );
+    this.markMirrorDirty("app", scriptName);
     this.log("worker_script_visibility_changed", actorId, scriptName, {
       is_public: isPublic,
     });
@@ -6183,11 +6313,6 @@ export class OrgDO extends DurableObject<DOEnv> {
     if (isPublic && visibilityIndexKey && visibilityIndexValue) {
       await this.env.APP_KV.put(visibilityIndexKey, visibilityIndexValue);
     }
-    if (info)
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "app_upsert",
-        payload: { ...updated, org_id: info.id },
-      });
     return updated;
   }
 
@@ -6219,14 +6344,9 @@ export class OrgDO extends DurableObject<DOEnv> {
       previewUpdatedAt,
       scriptName,
     );
+    this.markMirrorDirty("app", scriptName);
 
     const script = await this.getWorkerScript(scriptName);
-    const info = await this.getInfo();
-    if (info && script)
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "app_upsert",
-        payload: { ...script, org_id: info.id },
-      });
     return { script, updated: true, stale: false };
   }
 
@@ -6287,6 +6407,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       input.updated_at ?? Date.now(),
       scriptName,
     );
+    this.markMirrorDirty("app", scriptName);
 
     const script = await this.getWorkerScript(scriptName);
     const info = await this.getInfo();
@@ -6310,10 +6431,6 @@ export class OrgDO extends DurableObject<DOEnv> {
           }),
         );
       }
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "app_upsert",
-        payload: { ...script, org_id: info.id },
-      });
     }
     return script;
   }
@@ -6338,6 +6455,7 @@ export class OrgDO extends DurableObject<DOEnv> {
        WHERE script_name = ?`,
       scriptName,
     );
+    this.markMirrorDirty("app", scriptName);
 
     if (existing.custom_domain_hostname) {
       await this.env.APP_KV.delete(
@@ -6345,15 +6463,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       );
     }
 
-    const script = await this.getWorkerScript(scriptName);
-    const info = await this.getInfo();
-    if (info && script) {
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "app_upsert",
-        payload: { ...script, org_id: info.id },
-      });
-    }
-    return script;
+    return this.getWorkerScript(scriptName);
   }
 
   async clearWorkerScriptCustomDomains(): Promise<void> {
@@ -6394,13 +6504,9 @@ export class OrgDO extends DurableObject<DOEnv> {
       "DELETE FROM worker_scripts WHERE script_name = ?",
       scriptName,
     );
+    this.markMirrorDirty("app", scriptName);
     this.log("worker_script_deleted", actorId, scriptName, {
       workspace_id: existing.workspace_id,
-    });
-    const info = await this.getInfo();
-    dispatchAdminEvent(this.ctx, this.env, {
-      type: "app_delete",
-      payload: { script_name: scriptName, org_id: info?.id ?? null },
     });
     return true;
   }
@@ -6523,21 +6629,6 @@ export class OrgDO extends DurableObject<DOEnv> {
     });
   }
 
-  private syncThreadToAdminIndex(thread: OrgThread, operation: string): void {
-    this.getInfo()
-      .then((info) => {
-        if (info) {
-          dispatchAdminEvent(this.ctx, this.env, {
-            type: "thread_upsert",
-            payload: toAdminThreadPayload(thread, info.id),
-          });
-        }
-      })
-      .catch((err) => {
-        console.error(`Failed to sync ${operation} to AdminIndex`, err);
-      });
-  }
-
   private scheduleThreadCreateSideEffects(
     thread: OrgThread,
     actorId: string,
@@ -6560,62 +6651,6 @@ export class OrgDO extends DurableObject<DOEnv> {
               threadId: thread.id,
               workspaceId: thread.workspace_id,
               userId: actorId,
-            });
-          }
-
-          const infoStartedAt = Date.now();
-          let info: Organization | null = null;
-          try {
-            info = await this.getInfo();
-            this.recordThreadCreateStage("admin_index_org_loaded", infoStartedAt, {
-              threadId: thread.id,
-              workspaceId: thread.workspace_id,
-              userId: actorId,
-              orgId: info?.id ?? null,
-            });
-          } catch (error) {
-            console.error("[OrgDO] failed to load org info for thread admin index", error);
-            this.recordThreadCreateError("admin_index_org_load", infoStartedAt, error, {
-              threadId: thread.id,
-              workspaceId: thread.workspace_id,
-              userId: actorId,
-            });
-            return;
-          }
-
-          if (!info) {
-            this.recordThreadCreateStage(
-              "admin_index_org_loaded",
-              infoStartedAt,
-              {
-                threadId: thread.id,
-                workspaceId: thread.workspace_id,
-                userId: actorId,
-              },
-              { status: "missing", severity: "warn" },
-            );
-            return;
-          }
-
-          const dispatchStartedAt = Date.now();
-          try {
-            dispatchAdminEvent(this.ctx, this.env, {
-              type: "thread_upsert",
-              payload: toAdminThreadPayload(thread, info.id),
-            });
-            this.recordThreadCreateStage("admin_index_dispatch_scheduled", dispatchStartedAt, {
-              threadId: thread.id,
-              workspaceId: thread.workspace_id,
-              userId: actorId,
-              orgId: info.id,
-            });
-          } catch (error) {
-            console.error("[OrgDO] failed to dispatch thread admin index event", error);
-            this.recordThreadCreateError("admin_index_dispatch", dispatchStartedAt, error, {
-              threadId: thread.id,
-              workspaceId: thread.workspace_id,
-              userId: actorId,
-              orgId: info.id,
             });
           }
         })
@@ -6698,6 +6733,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       avatar.color,
       avatar.content,
     );
+    this.markMirrorDirty("workspace", workspaceId);
     this.log("workspace_created", actorId, workspaceId, { name });
     await this.indexWorkspace(workspaceId);
   }
@@ -6807,8 +6843,8 @@ export class OrgDO extends DurableObject<DOEnv> {
       info.compute_tier ?? "standard",
       info.email_handle ?? null,
     );
+    this.markMirrorDirty("workspace", info.id);
     await this.indexWorkspace(info.id);
-    this.dispatchWorkspaceUpsert(info);
   }
 
   async updateWorkspaceName(workspaceId: string, name: string): Promise<void> {
@@ -6823,6 +6859,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       name,
       workspaceId,
     );
+    this.markMirrorDirty("workspace", workspaceId);
   }
 
   async updateWorkspaceRecord(
@@ -6882,6 +6919,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       "UPDATE workspaces SET archived = 1 WHERE id = ?",
       workspaceId,
     );
+    this.markMirrorDirty("workspace", workspaceId);
   }
 
   async archiveWorkspaceRecord(
@@ -7155,6 +7193,7 @@ export class OrgDO extends DurableObject<DOEnv> {
           member.granted_by || "system",
           Number.isFinite(member.granted_at) ? member.granted_at : Date.now(),
         );
+        this.markMirrorDirty("workspace_member", workspaceMemberMirrorKey(workspaceId, member.user_id));
       }
     } catch (error) {
       console.warn("[OrgDO] failed to hydrate workspace restrictions", {
@@ -7211,6 +7250,7 @@ export class OrgDO extends DurableObject<DOEnv> {
           workspaceId,
           userId,
         );
+        this.markMirrorDirty("workspace_member", workspaceMemberMirrorKey(workspaceId, userId));
         this.log("workspace_access_changed", actorId, userId, {
           workspace_id: workspaceId,
           access_level: "full",
@@ -7239,6 +7279,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       actorId,
       now,
     );
+    this.markMirrorDirty("workspace_member", workspaceMemberMirrorKey(workspaceId, userId));
     this.log("workspace_access_changed", actorId, userId, {
       workspace_id: workspaceId,
       access_level: normalizedAccess,
@@ -7591,16 +7632,8 @@ export class OrgDO extends DurableObject<DOEnv> {
     this.log("ownership_transferred", actorId, newOwnerId, {
       from_user_id: currentOwner,
     });
-    this.dispatchOrgMembershipUpsert(
-      newOwnerId,
-      "owner",
-      newOwnerRows[0]!.joined_at,
-    );
-    this.dispatchOrgMembershipUpsert(
-      currentOwner,
-      "admin",
-      currentOwnerRows[0]!.joined_at,
-    );
+    this.markMirrorDirty("org_membership", newOwnerId);
+    this.markMirrorDirty("org_membership", currentOwner);
   }
 
   async adminTransferOwnership(
@@ -7642,16 +7675,8 @@ export class OrgDO extends DurableObject<DOEnv> {
     this.log("ownership_transferred", actorId, newOwnerId, {
       from_user_id: currentOwner,
     });
-    this.dispatchOrgMembershipUpsert(
-      newOwnerId,
-      "owner",
-      newOwnerRows[0]!.joined_at,
-    );
-    this.dispatchOrgMembershipUpsert(
-      currentOwner,
-      "admin",
-      currentOwnerRows[0]!.joined_at,
-    );
+    this.markMirrorDirty("org_membership", newOwnerId);
+    this.markMirrorDirty("org_membership", currentOwner);
   }
 
   async archiveOrg(actorId: string): Promise<void> {
@@ -7708,6 +7733,18 @@ export class OrgDO extends DurableObject<DOEnv> {
     this.sql.exec("DELETE FROM thread_ui_state");
     this.sql.exec("DELETE FROM proxy_usage");
     this.sql.exec("DELETE FROM openai_subscription");
+    // Nothing left to mirror: drop queued rows, then purge (and tombstone) the
+    // org's D1 rows. If this fails, the backfill's orphan phase and the
+    // reconciler (org.do_missing) purge them later.
+    this.mirror.clear();
+    try {
+      await getAppIndexDatabase(this.env)?.purgeMirroredOrg(info.id);
+    } catch (error) {
+      console.error("[OrgDO] failed to purge hard-deleted org from D1", {
+        orgId: info.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
 
     console.log("[OrgDO] hard deleted org", {
       orgId: info.id,
@@ -8092,6 +8129,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         modelHistory,
         now,
       );
+      this.markMirrorDirty("thread", id);
       this.recordThreadCreateStage("thread_inserted", insertStartedAt, ids, {
         size: msg?.length ?? 0,
       });
@@ -8369,17 +8407,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       title,
       updated_at: now,
     };
-    this.getInfo()
-      .then((info) => {
-        if (info)
-          dispatchAdminEvent(this.ctx, this.env, {
-            type: "thread_upsert",
-            payload: toAdminThreadPayload(updated, info.id),
-          });
-      })
-      .catch((err) => {
-        console.error("Failed to sync thread update to AdminIndex", err);
-      });
+    this.markMirrorDirty("thread", id);
     return updated;
   }
 
@@ -8424,17 +8452,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       model_history: modelHistory,
       last_model_changed_at: now,
     };
-    this.getInfo()
-      .then((info) => {
-        if (info)
-          dispatchAdminEvent(this.ctx, this.env, {
-            type: "thread_upsert",
-            payload: toAdminThreadPayload(updated, info.id),
-          });
-      })
-      .catch((err) => {
-        console.error("Failed to sync thread model update to AdminIndex", err);
-      });
+    this.markMirrorDirty("thread", id);
     return updated;
   }
 
@@ -8460,11 +8478,8 @@ export class OrgDO extends DurableObject<DOEnv> {
       id,
     );
 
-    const updated = this.getThread(id);
-    if (updated && result.rowsWritten > 0) {
-      this.syncThreadToAdminIndex(updated, "thread first user message");
-    }
-    return updated;
+    if (result.rowsWritten > 0) this.markMirrorDirty("thread", id);
+    return this.getThread(id);
   }
 
   recordThreadChannelUsed(
@@ -8484,9 +8499,8 @@ export class OrgDO extends DurableObject<DOEnv> {
       nextChannelKinds,
       id,
     );
-    const updated = { ...existing, channel_kinds: nextChannelKinds };
-    this.syncThreadToAdminIndex(updated, "thread channel usage");
-    return updated;
+    this.markMirrorDirty("thread", id);
+    return { ...existing, channel_kinds: nextChannelKinds };
   }
 
   /**
@@ -8551,17 +8565,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       model_history: nextModelHistory,
       last_model_changed_at: shouldPersistModel ? now : existing.last_model_changed_at,
     };
-    this.getInfo()
-      .then((info) => {
-        if (info)
-          dispatchAdminEvent(this.ctx, this.env, {
-            type: "thread_upsert",
-            payload: toAdminThreadPayload(updated, info.id),
-          });
-      })
-      .catch((err) => {
-        console.error("Failed to sync admin thread update to AdminIndex", err);
-      });
+    this.markMirrorDirty("thread", id);
     return updated;
   }
 
@@ -8588,6 +8592,7 @@ export class OrgDO extends DurableObject<DOEnv> {
     if (!existing) return false;
     const agentId = this.getThreadRuntime(id)?.agentId;
     this.sql.exec("DELETE FROM threads WHERE id = ?", id);
+    this.markMirrorDirty("thread", id);
     this.sql.exec("DELETE FROM thread_runtime WHERE thread_id = ?", id);
     this.sql.exec("DELETE FROM thread_ui_state WHERE thread_id = ?", id);
     if (actorId) {
@@ -8595,10 +8600,6 @@ export class OrgDO extends DurableObject<DOEnv> {
         workspace_id: existing.workspace_id,
       });
     }
-    dispatchAdminEvent(this.ctx, this.env, {
-      type: "thread_delete",
-      payload: { id, workspace_id: existing.workspace_id },
-    });
     // A runtime thread's transcript lives only on its agent: delete it too.
     if (agentId) this.deleteRuntimeAgents([agentId]);
     return true;
@@ -8758,23 +8759,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       now,
       id,
     );
-    const updated = {
-      ...existing,
-      updated_at: now,
-      user_message_count: existing.user_message_count + 1,
-      last_user_message_at: now,
-    };
-    this.getInfo()
-      .then((info) => {
-        if (info)
-          dispatchAdminEvent(this.ctx, this.env, {
-            type: "thread_upsert",
-            payload: toAdminThreadPayload(updated, info.id),
-          });
-      })
-      .catch((err) => {
-        console.error("Failed to sync thread touch to AdminIndex", err);
-      });
+    this.markMirrorDirty("thread", id);
   }
 
   recordThreadUserMessage(
@@ -8824,17 +8809,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       last_user_message_at: now,
       channel_kinds: nextChannelKinds ?? existing.channel_kinds,
     };
-    this.getInfo()
-      .then((info) => {
-        if (info)
-          dispatchAdminEvent(this.ctx, this.env, {
-            type: "thread_upsert",
-            payload: toAdminThreadPayload(updated, info.id),
-          });
-      })
-      .catch((err) => {
-        console.error("Failed to sync thread user message to AdminIndex", err);
-    });
+    this.markMirrorDirty("thread", id);
     return withoutThreadAskLog(updated);
   }
 
@@ -8870,16 +8845,11 @@ export class OrgDO extends DurableObject<DOEnv> {
       now,
     );
     if (inserted.rowsWritten === 0) {
+      // A replayed error: re-mirror both (the D1 insert is idempotent).
       const current = this.getThread(id);
       if (current) {
-        dispatchAdminEvent(this.ctx, this.env, {
-          type: "thread_upsert",
-          payload: toAdminThreadPayload(current, info.id),
-        });
-        dispatchAdminEvent(this.ctx, this.env, {
-          type: "thread_error_recorded",
-          payload: event,
-        });
+        this.markMirrorDirty("thread", id);
+        this.mirror.enqueueEvent({ type: "thread_error_recorded", payload: event });
       }
       return current;
     }
@@ -8906,6 +8876,8 @@ export class OrgDO extends DurableObject<DOEnv> {
       event.model,
       id,
     );
+    this.markMirrorDirty("thread", id);
+    this.mirror.enqueueEvent({ type: "thread_error_recorded", payload: event });
 
     const updated: OrgThread = {
       ...existing,
@@ -8918,15 +8890,6 @@ export class OrgDO extends DurableObject<DOEnv> {
       last_chat_error_provider: event.provider,
       last_chat_error_model: event.model,
     };
-
-    dispatchAdminEvent(this.ctx, this.env, {
-      type: "thread_upsert",
-      payload: toAdminThreadPayload(updated, info.id),
-    });
-    dispatchAdminEvent(this.ctx, this.env, {
-      type: "thread_error_recorded",
-      payload: event,
-    });
 
     this.log("thread_chat_error_recorded", input.userId ?? "system", id, {
       source: event.source,
@@ -9000,24 +8963,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       requestedSummaryStatus,
       id,
     );
-    const updated: OrgThread = {
-      ...existing,
-      updated_at: updatedAt,
-      last_assistant_completed_at: completedAt,
-      last_assistant_summary: summary,
-      last_assistant_summary_status: requestedSummaryStatus,
-    };
-    this.getInfo()
-      .then((info) => {
-        if (info)
-          dispatchAdminEvent(this.ctx, this.env, {
-            type: "thread_upsert",
-            payload: toAdminThreadPayload(updated, info.id),
-          });
-      })
-      .catch((err) => {
-        console.error("Failed to sync thread assistant completion to AdminIndex", err);
-      });
+    this.markMirrorDirty("thread", id);
     return completedAt;
   }
 
@@ -9035,21 +8981,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       activityAt,
       id,
     );
-    const updated = {
-      ...existing,
-      updated_at: activityAt,
-    };
-    this.getInfo()
-      .then((info) => {
-        if (info)
-          dispatchAdminEvent(this.ctx, this.env, {
-            type: "thread_upsert",
-            payload: toAdminThreadPayload(updated, info.id),
-          });
-      })
-      .catch((err) => {
-        console.error("Failed to sync thread activity to AdminIndex", err);
-      });
+    this.markMirrorDirty("thread", id);
     return true;
   }
 
@@ -9290,24 +9222,12 @@ export class OrgDO extends DurableObject<DOEnv> {
       now,
       now,
     );
-    const info = this.getInfoSync();
-    if (info) {
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "org_llm_provider_update",
-        payload: { org_id: info.id, provider, updated_at: now },
-      });
-    }
+    this.markMirrorDirty("org", "");
   }
 
   deleteLlmProviderConfig(): boolean {
     this.sql.exec("DELETE FROM llm_provider_config WHERE id = 'active'");
-    const info = this.getInfoSync();
-    if (info) {
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "org_llm_provider_update",
-        payload: { org_id: info.id, provider: null, updated_at: null },
-      });
-    }
+    this.markMirrorDirty("org", "");
     return true;
   }
 
@@ -9692,11 +9612,13 @@ export class OrgDO extends DurableObject<DOEnv> {
           total_cache_creation_tokens,
           total_cache_read_tokens,
           total_requests,
+          chargeable_cost_usd,
           updated_at_ms
         )
-        VALUES (1, ?, ?, ?, ?, ?, 1, ?)
+        VALUES (1, ?, ?, ?, ?, ?, 1, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           total_cost_usd = total_cost_usd + excluded.total_cost_usd,
+          chargeable_cost_usd = chargeable_cost_usd + excluded.chargeable_cost_usd,
           total_input_tokens = total_input_tokens + excluded.total_input_tokens,
           total_output_tokens = total_output_tokens + excluded.total_output_tokens,
           total_cache_creation_tokens = total_cache_creation_tokens + excluded.total_cache_creation_tokens,
@@ -9709,6 +9631,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         outputTokens,
         cacheCreationTokens,
         cacheReadTokens,
+        creditChargeable ? costUsd : 0,
         now,
       );
       const row = this.sql
@@ -9759,6 +9682,20 @@ export class OrgDO extends DurableObject<DOEnv> {
       total_cache_read_input_tokens: Number(row?.total_cache_read_tokens ?? 0),
       windows: [],
     };
+  }
+
+  /**
+   * All-time credit-chargeable spend in USD: what
+   * getUsageLogSum(0, now, true).total_cost_usd returns, kept as a running
+   * total so per-request credit gates stay O(1).
+   */
+  getCreditChargeableSpendUsd(): number {
+    const row = this.sql
+      .exec<{ chargeable_cost_usd: number }>(
+        "SELECT chargeable_cost_usd FROM usage_spend WHERE id = 1",
+      )
+      .toArray()[0];
+    return Number(row?.chargeable_cost_usd ?? 0);
   }
 
   getUsageLog(query: UsageLogQuery = {}): UsageLogPage {
@@ -9884,23 +9821,6 @@ export class OrgDO extends DurableObject<DOEnv> {
           ? String(entries[entries.length - 1].id)
           : null,
     };
-  }
-
-  /**
-   * What a runtime thread's agent spent since `fromMs`, as its usage.recorded
-   * events were logged: the spend its runtime spend limit counts, when that
-   * limit was set at `fromMs` (agent-runtime/thread-runtime.ts).
-   */
-  getThreadRuntimeSpendSince(threadId: string, fromMs: number): number {
-    const row = this.sql
-      .exec<{ total: number }>(
-        `SELECT COALESCE(SUM(cost_usd), 0) AS total FROM usage_log
-         WHERE created_at_ms >= ? AND thread_id = ? AND source = 'agent_runtime'`,
-        usageInteger(fromMs),
-        threadId,
-      )
-      .one();
-    return Number(row?.total ?? 0);
   }
 
   getUsageLogSum(

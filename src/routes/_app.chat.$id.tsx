@@ -645,7 +645,7 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
       params.id,
     );
     if (!threadContext) {
-      throw redirect("/qaml-backdoor/threads");
+      throw redirect("/");
     }
 
     const thread = await chatDO.getThread(

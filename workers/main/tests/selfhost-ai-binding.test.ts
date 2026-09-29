@@ -147,7 +147,7 @@ describe("selfhost ai binding", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
-  it("uses Sonnet 5 for Anthropic auxiliary generation", async () => {
+  it("uses Sonnet 5.5 for Anthropic auxiliary generation", async () => {
     const fetchMock = vi.fn(async () =>
       Response.json({
         content: [{ type: "text", text: "Generated Anthropic title" }],
@@ -179,7 +179,7 @@ describe("selfhost ai binding", () => {
       "Content-Type": "application/json",
     });
     expect(JSON.parse(String(init.body))).toEqual({
-      model: "claude-sonnet-5",
+      model: "claude-sonnet-5-5",
       system: "Return a short title",
       messages: [{ role: "user", content: "Build an incident dashboard" }],
       max_tokens: 50,

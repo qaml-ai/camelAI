@@ -2,7 +2,7 @@
  * Superuser bootstrap allowlist.
  *
  * Configure via the `SUPERUSER_EMAILS` Worker secret (comma or whitespace
- * separated). Explicit admin grants via the admin panel remain the normal path;
+ * separated). Explicit admin grants via the admin API (PATCH /api/admin/users/:id) remain the normal path;
  * the env list is only for first-admin bootstrap.
  */
 

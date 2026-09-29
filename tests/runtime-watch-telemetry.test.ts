@@ -63,6 +63,20 @@ describe("trackRuntimeWatchError", () => {
       threadId: "thread-a",
     });
     expect(String(event.details)).toContain('"phase":"watch"');
+    expect(event.message).toBe("Runtime thread watcher error (watch, 404, stopped).");
+  });
+
+  it("tells a dropped stream the watcher reconnects from one that stops it", async () => {
+    const beacons = captureBeacons();
+    trackRuntimeWatchError("thread-c", new TypeError("network error"), "watch");
+    trackRuntimeWatchError("thread-c", Object.assign(new Error("events: HTTP 503"), { status: 503 }), "watch");
+    trackRuntimeWatchError("thread-c", new Error("The runtime refused the renewed browser token; the watcher stopped"), "watch");
+    await beacons.flush();
+    expect(beacons.events().map((event) => event.message)).toEqual([
+      "Runtime thread watcher error (watch, TypeError, reconnecting).",
+      "Runtime thread watcher error (watch, 503, reconnecting).",
+      "Runtime thread watcher error (watch, Error, stopped).",
+    ]);
   });
 
   it("reports an error without a status by its name, and a failed start as an error", async () => {

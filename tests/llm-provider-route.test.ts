@@ -9,7 +9,7 @@ describe('LLM provider API route', () => {
       'utf8',
     );
 
-    expect(source).toContain("ANTHROPIC_API_KEY_VALIDATION_MODEL = 'claude-sonnet-5'");
+    expect(source).toContain("ANTHROPIC_API_KEY_VALIDATION_MODEL = 'claude-sonnet-5-5'");
     expect(source).toContain('model: ANTHROPIC_API_KEY_VALIDATION_MODEL');
     expect(source).not.toContain("model: 'claude-sonnet-4-20250514'");
   });

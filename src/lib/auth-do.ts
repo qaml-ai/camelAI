@@ -34,6 +34,12 @@ import type { WorkspaceIntegrationRecord } from "../../workers/main/src/workspac
 import type { WorkspaceIntegrationDefinitionRecord } from "@/lib/integration-definition";
 import type { LlmProviderConfigRecord } from "./llm-provider-config";
 import { getAppIndexDatabase, getAppIndexReadDatabase } from "../../workers/main/src/app-index-db";
+import {
+  d1ReadMode,
+  diffById,
+  recordShadowComparison,
+  safeMirrorRead,
+} from "./d1-read-shadow.server";
 
 interface GetUserOrgsOptions {
   preloadedOrgInfoById?: Map<
@@ -41,6 +47,11 @@ interface GetUserOrgsOptions {
     Promise<Organization | null> | Organization | null
   >;
   preloadedUserOrgs?: UserOrg[];
+  /**
+   * Allow the D1 mirror (D1_READ_SHADOW / D1_READ_SERVE "getUserOrgs") for org
+   * names. Only list surfaces opt in; login and session paths never do.
+   */
+  d1Read?: boolean;
 }
 
 interface ListUserWorkspacesAcrossOrgsOptions {
@@ -529,31 +540,86 @@ export async function getUserOrgs(
   userId: string,
   options?: GetUserOrgsOptions,
 ): Promise<OrgMembership[]> {
+  // The membership list itself always comes from the user's own DO.
   const userOrgs =
     options?.preloadedUserOrgs ??
     (await env.USER.get(env.USER.idFromName(userId)).getOrgs());
   const preloadedOrgInfoById = options?.preloadedOrgInfoById;
+  // Only opted-in, non-auth callers may use the D1 mirror for org names.
+  const mode =
+    options?.d1Read && !preloadedOrgInfoById ? d1ReadMode(env, "getUserOrgs") : "do";
+  const orgIds = userOrgs.map((uo) => uo.org_id);
+  const mirrorRead =
+    mode === "do"
+      ? null
+      : safeMirrorRead(env, "getUserOrgs", (db) => db.getMirroredOrgSummaries(orgIds));
 
-  // Fetch all org info in parallel instead of sequential loop
-  const orgInfos = await Promise.all(
-    userOrgs.map(async (uo) => {
-      const preloadedOrgInfo = preloadedOrgInfoById?.get(uo.org_id);
-      const orgInfo = preloadedOrgInfo
-        ? await preloadedOrgInfo
-        : await env.ORG.get(env.ORG.idFromName(uo.org_id)).getInfo();
-      return { uo, orgInfo };
-    }),
-  );
+  const toMembership = (
+    uo: UserOrg,
+    org: { name: string; archived: boolean } | null,
+  ): OrgMembership | null =>
+    org && !org.archived
+      ? {
+          org_id: uo.org_id,
+          org_name: org.name,
+          role: uo.role,
+          joined_at: uo.joined_at,
+          last_workspace_id: uo.last_workspace_id ?? null,
+        }
+      : null;
+  const fromDurableObjects = async (orgs: UserOrg[]) =>
+    Promise.all(
+      orgs.map(async (uo) => {
+        const preloadedOrgInfo = preloadedOrgInfoById?.get(uo.org_id);
+        const orgInfo = preloadedOrgInfo
+          ? await preloadedOrgInfo
+          : await env.ORG.get(env.ORG.idFromName(uo.org_id)).getInfo();
+        return { uo, org: orgInfo ? { name: orgInfo.name, archived: Boolean(orgInfo.archived) } : null };
+      }),
+    );
 
-  return orgInfos
-    .filter(({ orgInfo }) => orgInfo && !orgInfo.archived)
-    .map(({ uo, orgInfo }) => ({
-      org_id: uo.org_id,
-      org_name: orgInfo!.name,
-      role: uo.role,
-      joined_at: uo.joined_at,
-      last_workspace_id: uo.last_workspace_id ?? null,
-    }));
+  if (mode === "d1") {
+    const mirrored = await mirrorRead;
+    if (mirrored) {
+      const byId = new Map(mirrored.map((org) => [org.id, org]));
+      // Orgs the mirror does not have yet fall back to their DO.
+      const fallback = new Map(
+        (await fromDurableObjects(userOrgs.filter((uo) => !byId.has(uo.org_id)))).map(
+          ({ uo, org }) => [uo.org_id, org] as const,
+        ),
+      );
+      return userOrgs
+        .map((uo) => toMembership(uo, byId.get(uo.org_id) ?? fallback.get(uo.org_id) ?? null))
+        .filter((membership): membership is OrgMembership => membership !== null);
+    }
+  }
+
+  const orgInfos = await fromDurableObjects(userOrgs);
+  const result = orgInfos
+    .map(({ uo, org }) => toMembership(uo, org))
+    .filter((membership): membership is OrgMembership => membership !== null);
+
+  if (mode === "shadow") {
+    const mirrored = await mirrorRead;
+    if (mirrored) {
+      const mirrorById = new Map(mirrored.map((org) => [org.id, org]));
+      recordShadowComparison(
+        env,
+        "getUserOrgs",
+        diffById(
+          new Map(orgInfos.filter(({ org }) => org).map(({ uo, org }) => [uo.org_id, { ...org! }])),
+          new Map(
+            orgIds
+              .filter((id) => mirrorById.has(id))
+              .map((id) => [id, { name: mirrorById.get(id)!.name, archived: mirrorById.get(id)!.archived }]),
+          ),
+          ["name", "archived"],
+        ),
+        { userId },
+      );
+    }
+  }
+  return result;
 }
 
 // Admin functions that operate on single DOs (real implementations)
@@ -754,16 +820,65 @@ export async function getOrgMembers(
   orgId: string,
 ): Promise<Array<{ user: User; role: OrgRole; joined_at: number }>> {
   const stub = env.ORG.get(env.ORG.idFromName(orgId));
+  // The member list itself always comes from the OrgDO.
   const members = await stub.getMembers();
+  const mode = d1ReadMode(env, "getOrgMembers");
+  const mirrorRead =
+    mode === "do"
+      ? null
+      : safeMirrorRead(env, "getOrgMembers", (db) =>
+          db.getMirroredUserProfiles(members.map((member) => member.user_id)),
+        );
+  const profileFromDurableObject = (userId: string) =>
+    env.USER.get(env.USER.idFromName(userId)).getProfile();
 
-  // Fetch all user profiles in parallel instead of sequential loop
-  const profileResults = await Promise.all(
-    members.map(async (member) => {
-      const userStub = env.USER.get(env.USER.idFromName(member.user_id));
-      const profile = await userStub.getProfile();
-      return { member, profile };
-    }),
-  );
+  let profileResults: Array<{ member: (typeof members)[number]; profile: User | null }>;
+  const mirrored = mode === "d1" ? await mirrorRead : null;
+  if (mirrored) {
+    const byId = new Map(mirrored.map((profile) => [profile.id, profile as User]));
+    // Profiles the mirror does not have yet fall back to their DO.
+    profileResults = await Promise.all(
+      members.map(async (member) => ({
+        member,
+        profile: byId.get(member.user_id) ?? (await profileFromDurableObject(member.user_id)),
+      })),
+    );
+  } else {
+    profileResults = await Promise.all(
+      members.map(async (member) => ({
+        member,
+        profile: await profileFromDurableObject(member.user_id),
+      })),
+    );
+    if (mode === "shadow") {
+      const shadow = await mirrorRead;
+      if (shadow) {
+        const pick = (profile: User) => ({
+          email: profile.email,
+          name: profile.name ?? null,
+          avatar: profile.avatar,
+          is_superuser: Boolean(profile.is_superuser),
+          is_orphaned: Boolean(profile.is_orphaned),
+          email_verified_at: profile.email_verified_at ?? null,
+          orphaned_at: profile.orphaned_at ?? null,
+        });
+        recordShadowComparison(
+          env,
+          "getOrgMembers",
+          diffById(
+            new Map(
+              profileResults
+                .filter(({ profile }) => profile)
+                .map(({ profile }) => [profile!.id, pick(profile!)]),
+            ),
+            new Map(shadow.map((profile) => [profile.id, pick(profile as User)])),
+            ["email", "name", "avatar", "is_superuser", "is_orphaned", "email_verified_at", "orphaned_at"],
+          ),
+          { orgId },
+        );
+      }
+    }
+  }
 
   return profileResults
     .filter(({ profile }) => profile !== null)

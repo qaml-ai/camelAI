@@ -131,7 +131,6 @@ For deeper implementation details and repository conventions, see
 | `workers/main/` | Main Worker, Durable Objects, HTTP/SSE transports, MCP, and sandbox services |
 | `workers/dispatcher/` | Routing for published user applications |
 | `workers/app-usage-guard/` | Usage monitoring and reversible app quarantine |
-| `workers/bedrock-provider/` | Anthropic-to-Bedrock AI Gateway provider |
 | `workers/discord-bridge/` | Discord Gateway connection and control Worker |
 | `sandbox/` | Agent skills and project scaffold templates |
 | `scripts/` | Development, deployment, eval, and maintenance tooling |

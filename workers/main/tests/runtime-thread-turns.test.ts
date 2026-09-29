@@ -19,7 +19,6 @@ import {
   pinNewThreadToRuntime,
   runtimeAgentThreadKey,
   threadScratchVolume,
-  spendLimitHolds,
   startRuntimeTurn,
 } from "../src/agent-runtime/thread-runtime";
 import { createOrg, createUser, type TestEnv } from "./test-helpers";
@@ -261,7 +260,7 @@ describe("pinNewThreadToRuntime", () => {
   });
 });
 
-describe("spend limits and retries on an existing agent", () => {
+describe("an existing agent's spend limit, and retries", () => {
   async function withLimit(limit: number | null) {
     const setup = await runtimeThread();
     fakeRuntime();
@@ -271,24 +270,13 @@ describe("spend limits and retries on an existing agent", () => {
     return setup;
   }
 
-  it("sets the spend limit while the agent is idle", async () => {
+  it("removes a spend limit an earlier release set on the agent itself", async () => {
     const setup = await withLimit(5);
     const calls = fakeRuntime();
     await send(setup, "next", "cm_idle");
     const configure = calls.find((call) => call.path.endsWith("/configuration"));
     expect(configure?.body).toMatchObject({ spendLimit: null });
-    expect(await setup.orgStub.getThreadRuntime(setup.threadId)).toMatchObject({ configured: { spendLimitUsd: null } });
-  });
-
-  it("leaves a running turn's budget alone when someone sends during it", async () => {
-    const setup = await withLimit(5);
-    const calls = fakeRuntime({
-      "GET /v1/agents/agt_1/state": () => Response.json({ cursor: 3, requests: [{ id: "r1", method: "prompt", state: "running" }] }),
-    });
-    expect(await send(setup, "during", "cm_during")).toMatchObject({ status: "accepted" });
-    expect(calls.some((call) => call.path.endsWith("/configuration"))).toBe(false);
-    expect(calls.some((call) => call.path.endsWith("/prompt"))).toBe(true);
-    expect(await setup.orgStub.getThreadRuntime(setup.threadId)).toMatchObject({ configured: { spendLimitUsd: 5 } });
+    expect((await setup.orgStub.getThreadRuntime(setup.threadId))!.configured).not.toHaveProperty("spendLimitUsd");
   });
 
   it("changes nothing for a retried request", async () => {
@@ -359,14 +347,13 @@ describe("the usual send", () => {
     expect(await runningRows(setup)).toEqual([expect.objectContaining({ threadId: setup.threadId, startedAt: otherStart })]);
   });
 
-  it("keeps the spend limit while only this thread spent, and sets it again when the budget moved otherwise", async () => {
+  it("sends each run the budget left now, and never reconfigures the agent for it", async () => {
     const setup = await runtimeThread();
     await setup.orgStub.setUserLlmUsageLimits(setup.sender.userId, [{ window_hours: 24, limit_usd: 5 }]);
     let calls = fakeRuntime();
     await send(setup, "first", "cm_s1");
-    expect(calls.find((call) => call.path === "/v1/agents")!.body.spendLimit).toEqual({ usd: 5 });
-    const created = (await setup.orgStub.getThreadRuntime(setup.threadId))!;
-    expect(created.configured).toMatchObject({ spendLimitUsd: 5, spendLimitSetAt: expect.any(Number) });
+    expect(calls.find((call) => call.path === "/v1/agents")!.body).not.toHaveProperty("spendLimit");
+    expect(calls.find((call) => call.path.endsWith("/prompt"))!.body.spendLimit).toEqual({ usd: 5 });
 
     const usage = (threadId: string, id: string) => setup.orgStub.recordUsage({
       workspace_id: setup.context.workspaceId,
@@ -381,36 +368,17 @@ describe("the usual send", () => {
       source: "agent_runtime",
       source_id: id,
     });
-    // This thread's agent spent $1: the runtime counted it against the $5 too.
+    // This thread spent $1, then another thread $1 of the user's budget: each next run gets what is left.
     await usage(setup.threadId, "evt_own");
     calls = fakeRuntime();
     await send(setup, "second", "cm_s2");
     expect(calls.map((call) => call.path)).toEqual(["/v1/agents/agt_1/prompt"]);
-
-    // Another thread spent $1 of the user's budget: $3 left, not the $4 the agent counts.
+    expect(calls[0].body.spendLimit).toEqual({ usd: 4 });
     await usage(crypto.randomUUID(), "evt_other");
     calls = fakeRuntime();
     await send(setup, "third", "cm_s3");
-    const configure = calls.find((call) => call.path.endsWith("/configuration"))!;
-    expect(configure.body).toEqual({ requestId: expect.any(String), spendLimit: { usd: 3 } });
-    const updated = (await setup.orgStub.getThreadRuntime(setup.threadId))!;
-    expect(updated.configured).toMatchObject({ spendLimitUsd: 3 });
-    expect(updated.configured!.spendLimitSetAt as number).toBeGreaterThan(created.configured!.spendLimitSetAt as number);
-  });
-});
-
-describe("spendLimitHolds", () => {
-  it("holds a budget the thread's own spend explains, within a cent", () => {
-    expect(spendLimitHolds(null, null, null)).toBe(true);
-    expect(spendLimitHolds(5, null, null)).toBe(false);
-    expect(spendLimitHolds(null, 5, 0)).toBe(false);
-    expect(spendLimitHolds(5, 5, null)).toBe(false);
-    expect(spendLimitHolds(4, 5, 1)).toBe(true);
-    expect(spendLimitHolds(4.004, 5, 1)).toBe(true);
-    expect(spendLimitHolds(3, 5, 1)).toBe(false);
-    expect(spendLimitHolds(6, 5, 0)).toBe(false);
-    // Spent past the limit: none left on either side.
-    expect(spendLimitHolds(0, 5, 7)).toBe(true);
+    expect(calls.map((call) => call.path)).toEqual(["/v1/agents/agt_1/prompt"]);
+    expect(calls[0].body.spendLimit).toEqual({ usd: 3 });
   });
 });
 
@@ -531,5 +499,53 @@ describe("uploads attached to the runtime message", () => {
     expect(calls.filter(uploadRoute).map((call) => call.path)).toEqual(["/v1/agents/agt_1/uploads/cm_bad/notes.txt"]);
     const prompt = calls.find((call) => call.path.endsWith("/prompt"))!;
     expect(prompt.body).not.toHaveProperty("files");
+  });
+});
+
+describe("sends while the runtime rolls its tasks", () => {
+  it("retries a prompt a shutting-down node refused, then accepts it", async () => {
+    const setup = await runtimeThread();
+    let refusals = 0;
+    const calls = fakeRuntime({
+      "POST /v1/agents/agt_1/prompt": (call) => refusals++ < 2
+        ? Response.json({ error: "This node is shutting down; retry", code: "UNAVAILABLE" }, { status: 503, headers: { "Retry-After": "1" } })
+        : Response.json({ id: call.body.requestId, method: "prompt", state: "running", fingerprint: "f" }, { status: 202 }),
+    });
+    const result = await send(setup, "Hello during a deploy", "cm_deploy");
+    expect(result).toMatchObject({ status: "accepted", requestId: "cm_deploy" });
+    expect(calls.filter((call) => call.path === "/v1/agents/agt_1/prompt")).toHaveLength(3);
+  });
+
+  it("gives up after three refusals, so the browser gets its 503", async () => {
+    const setup = await runtimeThread();
+    const calls = fakeRuntime({
+      "POST /v1/agents/agt_1/prompt": () => Response.json({ error: "This node is shutting down; retry", code: "UNAVAILABLE" }, { status: 503 }),
+    });
+    await expect(send(setup, "Hello", "cm_down")).rejects.toMatchObject({ status: 503 });
+    expect(calls.filter((call) => call.path === "/v1/agents/agt_1/prompt")).toHaveLength(3);
+  });
+
+  it("does not retry other errors", async () => {
+    const setup = await runtimeThread();
+    const calls = fakeRuntime({
+      "POST /v1/agents/agt_1/prompt": () => Response.json({ error: "boom", code: "INTERNAL" }, { status: 500 }),
+    });
+    await expect(send(setup, "Hello", "cm_500")).rejects.toMatchObject({ status: 500 });
+    expect(calls.filter((call) => call.path === "/v1/agents/agt_1/prompt")).toHaveLength(1);
+  });
+
+  it("remembers an agent's thread once, not on every send", async () => {
+    const setup = await runtimeThread();
+    const agentId = `agt_${crypto.randomUUID()}`;
+    fakeRuntime({
+      "POST /v1/agents": () => Response.json({ id: agentId, token: "agent-token" }, { status: 201 }),
+      [`POST /v1/agents/${agentId}/prompt`]: (call) => Response.json({ id: call.body.requestId, method: "prompt", state: "running", fingerprint: "f" }, { status: 202 }),
+    });
+    const puts = vi.spyOn(runtimeEnv.APP_KV, "put");
+    await send(setup, "one", "cm_a");
+    await send(setup, "two", "cm_b");
+    await send(setup, "two", "cm_b");
+    expect(puts.mock.calls.filter(([key]) => key === runtimeAgentThreadKey(agentId))).toHaveLength(1);
+    expect(await testEnv.APP_KV.get(runtimeAgentThreadKey(agentId), "json")).toMatchObject({ thread: setup.threadId });
   });
 });

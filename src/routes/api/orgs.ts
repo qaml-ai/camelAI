@@ -16,7 +16,7 @@ export async function loader({ request, context }: Route.LoaderArgs) {
   const authContext = await requireAuthContext(request, context);
   const env = getEnv(context);
   const authEnv = getAuthEnv(env);
-  const orgs = await getUserOrgs(authEnv, authContext.user.id);
+  const orgs = await getUserOrgs(authEnv, authContext.user.id, { d1Read: true });
   return {
     orgs:
       authContext.session.auth_source === ENTERPRISE_OIDC_AUTH_SOURCE

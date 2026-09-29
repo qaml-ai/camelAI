@@ -22,7 +22,7 @@ import type { Options as RehypeSanitizeSchema } from 'rehype-sanitize';
 import type { PluggableList } from 'unified';
 import { cn } from '@/lib/utils';
 import { Check, Copy, ImageOff } from 'lucide-react';
-import { codeToHtml, SHIKI_DEFAULT_THEMES, SUPPORTED_LANGUAGES } from '@/lib/shiki-config';
+import { codeToHtml, SHIKI_DEFAULT_THEMES, SUPPORTED_LANGUAGES } from '@/lib/shiki-config.client';
 import { MentionChip } from '@/components/at-mention-menu/mention-chip';
 import {
   parseMentions,

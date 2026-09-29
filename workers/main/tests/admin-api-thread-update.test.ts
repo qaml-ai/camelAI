@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { env } from 'cloudflare:test';
 import { handleAdminApi } from '../src/routes/admin/index';
 import type { Env as WorkerEnv } from '../src/types';
-import { createOrg, createUser, type TestEnv } from './test-helpers';
+import { createOrg, createUser, flushD1Mirror, type TestEnv } from './test-helpers';
 import { getAppIndexReadDatabase } from '../src/app-index-db';
 
 const testEnv = env as unknown as TestEnv;
@@ -11,8 +11,10 @@ function testEmail() {
   return `admin-api-thread-update-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`;
 }
 
-async function waitForAdminIndexThreadPresence(threadId: string): Promise<void> {
+async function waitForAdminIndexThreadPresence(orgId: string, threadId: string): Promise<void> {
   const appIndex = getAppIndexReadDatabase(testEnv)!;
+  await appIndex.ensureSchema();
+  await flushD1Mirror(testEnv.ORG.get(testEnv.ORG.idFromName(orgId)));
 
   for (let attempt = 0; attempt < 50; attempt += 1) {
     const threadContext = await appIndex.getThreadContextById(threadId);
@@ -33,7 +35,7 @@ describe('admin API thread patch route', () => {
     const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
     const thread = await orgStub.createThread(defaultWorkspaceId, 'Thread with non-id title', userId);
 
-    await waitForAdminIndexThreadPresence(thread.id);
+    await waitForAdminIndexThreadPresence(org.id, thread.id);
 
     const request = new Request(
       `http://example/api/admin/threads?search=${encodeURIComponent(thread.id)}`,
@@ -70,7 +72,7 @@ describe('admin API thread patch route', () => {
     const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
     const thread = await orgStub.createThread(defaultWorkspaceId, 'Patch thread model', userId);
 
-    await waitForAdminIndexThreadPresence(thread.id);
+    await waitForAdminIndexThreadPresence(org.id, thread.id);
 
     const request = new Request(`http://example/api/admin/threads/${thread.id}`, {
       method: 'PATCH',
@@ -110,7 +112,7 @@ describe('admin API thread patch route', () => {
     const thread = await orgStub.createThread(defaultWorkspaceId, 'Legacy null model thread', userId);
     const appIndex = getAppIndexReadDatabase(testEnv)!;
 
-    await waitForAdminIndexThreadPresence(thread.id);
+    await waitForAdminIndexThreadPresence(org.id, thread.id);
 
     await expect(appIndex.getThreadContextById(thread.id)).resolves.toMatchObject({ model: 'gpt-6-luna' });
   });
@@ -122,7 +124,7 @@ describe('admin API thread patch route', () => {
     const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
     const thread = await orgStub.createThread(defaultWorkspaceId, 'Legacy indexed model', userId);
 
-    await waitForAdminIndexThreadPresence(thread.id);
+    await waitForAdminIndexThreadPresence(org.id, thread.id);
     await testEnv.APP_DB!.prepare('UPDATE threads SET model = ? WHERE id = ?')
       .bind('opus-4.7', thread.id)
       .run();
@@ -161,7 +163,7 @@ describe('admin API thread patch route', () => {
     const { org, defaultWorkspaceId } = await createOrg(testEnv, 'Admin API Legacy Patch Org', userId);
     const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
     const thread = await orgStub.createThread(defaultWorkspaceId, 'Legacy stored model', userId);
-    await waitForAdminIndexThreadPresence(thread.id);
+    await waitForAdminIndexThreadPresence(org.id, thread.id);
     await (orgStub as unknown as {
       setThreadModelForTest(id: string, model: string): Promise<unknown>;
     }).setThreadModelForTest(thread.id, 'opus-4.7');
@@ -210,7 +212,7 @@ describe('admin API thread patch route', () => {
       undefined,
       'opus-5.5',
     );
-    await waitForAdminIndexThreadPresence(thread.id);
+    await waitForAdminIndexThreadPresence(org.id, thread.id);
 
     const setTitle = vi.fn().mockResolvedValue(undefined);
     const setModel = vi.fn().mockResolvedValue(undefined);

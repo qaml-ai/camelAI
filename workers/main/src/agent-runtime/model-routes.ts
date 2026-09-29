@@ -30,6 +30,9 @@ export const RUNTIME_MODEL_ENDPOINT = "chiridion";
  */
 export const FREE_TIER_RUNTIME_MODEL = "openrouter/openai/gpt-6-luna";
 
+/** Claude models Bedrock offers only through the global profile (no `us.`/`eu.` ones yet, 2026-09-28). */
+const GLOBAL_ONLY_BEDROCK_MODELS = new Set(["anthropic.claude-sonnet-5-5"]);
+
 /**
  * Converse on bedrock-runtime takes Claude through a cross-region inference
  * profile (`us.`/`eu.`/`apac.` + the model id; `global.` elsewhere), where the
@@ -37,6 +40,7 @@ export const FREE_TIER_RUNTIME_MODEL = "openrouter/openai/gpt-6-luna";
  */
 export function bedrockInferenceProfileId(modelId: string, region: string): string {
   if (/^(us|eu|apac|global)\./.test(modelId)) return modelId;
+  if (GLOBAL_ONLY_BEDROCK_MODELS.has(modelId)) return `global.${modelId}`;
   const geo = region.startsWith("us-") ? "us"
     : region.startsWith("eu-") ? "eu"
     : region.startsWith("ap-") ? "apac"

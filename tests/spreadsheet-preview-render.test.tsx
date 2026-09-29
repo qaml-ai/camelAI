@@ -12,7 +12,7 @@ import {
   parseSpreadsheetWorkbook,
   SpreadsheetPreview,
 } from '@/components/chat-file-preview/spreadsheet';
-import { parseWorkbookSheet } from '@/components/chat-file-preview/spreadsheet/parse-excel';
+import { parseWorkbookSheet } from '@/components/chat-file-preview/spreadsheet/parse-excel.client';
 import { createInitialColumnWidths } from '@/components/chat-file-preview/spreadsheet/utils';
 
 function toArrayBuffer(value: ArrayBuffer | Uint8Array): ArrayBuffer {

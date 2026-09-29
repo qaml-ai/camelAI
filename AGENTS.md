@@ -43,7 +43,6 @@ worker-side). There is no in-repo Go sandbox-host or data-proxy tree.
 - `workers/main/src/routes/` - Worker-native HTTP (SSE streams, Stripe webhook, admin MCP, most `/api/admin/*` on Hono). Prefer documenting new paths here vs `src/routes/api/` — see **API routing** below.
 - `workers/dispatcher/` - Workers for Platforms dispatcher for deployed user apps.
 - `workers/app-usage-guard/` - Account-wide Durable Object SQLite usage monitor and reversible app quarantine Worker; see `docs/deployed-app-usage-guard-design.md`.
-- `workers/bedrock-provider/` - AI Gateway custom provider translating Anthropic-style requests to Bedrock.
 - `workers/user-logs-tail/` - Tail worker for deployed app logs.
 - `workers/e2e-reports/` - Public viewer at `e2e-reports.camelai.dev` serving Playwright E2E reports from R2 (uploaded by the E2E workflow); deploy with `bun run deploy:e2e-reports`.
 - `workers/eval-reports/` - Read-only results store + viewer for agent evals at `evals.camelai.dev` (evals run locally; `EVAL_REPORT=1` publishes them); deploy with `bun run deploy:eval-reports`.
@@ -71,7 +70,7 @@ Two HTTP surfaces share the main worker:
 
 ### Internal vs product names
 
-Product name is **camelAI**. Internal Cloudflare resources, DO/MCP class names, headers, and Analytics Engine datasets often still use legacy internal codenames (for example the `/qaml-backdoor` superuser UI and the `*_observability_*` / `*_errors_*` dataset prefixes). Prefer the existing name in code; do not rename bindings or exported DO classes casually.
+Product name is **camelAI**. Internal Cloudflare resources, DO/MCP class names, headers, and Analytics Engine datasets often still use legacy internal codenames (for example the `*_observability_*` / `*_errors_*` dataset prefixes). Prefer the existing name in code; do not rename bindings or exported DO classes casually.
 
 ## Development Commands
 
@@ -105,7 +104,6 @@ bun run deploy:dispatcher:staging
 bun run deploy:dispatcher:evals       # testing-grounds dispatcher for real-deploy evals
 bun run deploy:usage-guard:prod
 bun run deploy:usage-guard:staging
-bun run deploy:bedrock-provider:prod
 ```
 
 ### Real-deploy evals (testing grounds)
@@ -197,7 +195,6 @@ Important DOs and runtime classes live primarily in `workers/main/src/`:
 - `workspace-cron.ts` - `WorkspaceCronDO`, scheduled prompt storage and dispatch.
 - `worker-logs-do.ts` - `WorkerLogsDO`, recent deployed-app logs written by the tail worker and read over RPC (in-memory ring buffer; not SQLite-persisted).
 - `admin-index-do.ts` - `AdminIndexDO`, admin indexes and dashboard-style aggregates.
-- `org-slug-registry.ts` - `OrgSlugDO`, atomic org slug ownership.
 - `email-handle-registry.ts` - `EmailHandleDO`, email handle ownership.
 - `*-mcp.ts` / `connections-runtime.ts` - Per-provider connection MCP wrappers and shared connection runtime (candidate for an `integrations/` folder).
 - `observability.ts` - Shared Cloudflare Analytics Engine event/error writer. New structured instrumentation should go through this helper instead of calling `writeDataPoint` directly.
@@ -306,8 +303,8 @@ if any of them drift apart.
 - Self-host agent customization (additive skills + prompt append/prepend) loads from `.selfhost/agent/` at workerd-config generation; see `SELF_HOSTING.md` and `scripts/selfhost-agent-pack.mjs`. Verify with `bun run test:workers -- selfhost-agent-pack` and `bun run test:run -- selfhost-agent-pack-loader`.
 - Password auth, OAuth account creation, email verification, onboarding, bans, and blocked signup policies all have tests in `workers/main/tests/`; update or add focused tests when touching these flows.
 - First-touch marketing attribution and the durable first-accepted-message definition of `new_camel_activation` are documented in `MARKETING_ATTRIBUTION.md`.
-- Superuser UI routes live under `/qaml-backdoor`.
-- Bearer-auth admin APIs live under `/api/admin/*`; implementation is in `workers/main/src/routes/admin/` and related route modules in `src/routes/api/`.
+- There is no superuser web UI; admin work goes through the admin REST API and admin MCP below.
+- Bearer-auth admin APIs live under `/api/admin/*`; implementation is in `workers/main/src/routes/admin/` (entity detail/management endpoints in `management-routes.ts`); the spec is served at `/api/admin/openapi.json`.
 - Admin MCP is served at `/api/admin/mcp` (`https://staging.camelai.dev/api/admin/mcp` in staging) and uses OAuth scope `admin:mcp`. Staging is also behind Cloudflare Access; pass `CF-Access-Token: $(cloudflared access token -app=https://staging.camelai.dev)` when connecting with `mcporter`. If an MCP client opens an authorize URL with `scope=openid+email+profile`, the flow will fail with `invalid_scope`; force `admin:mcp` with `oauthScope` or a pre-registered static OAuth client.
 - `admin_js_exec` is the generic superuser remote Worker console for staging/production (binding RPC/fetch, Durable Objects, admin/self/outbound HTTP, assertions, and checked-in smoke suites). See `docs/admin-js-exec.md`; primitive env values and secrets are intentionally non-readable.
 - A reliable staging smoke path for admin MCP is: register or provide an OAuth client for the chosen localhost callback with `scope: "admin:mcp"`, set `ACCESS_TOKEN=$(cloudflared access token -app=https://staging.camelai.dev)`, then add a private `mcporter` config entry with `baseUrl: "https://staging.camelai.dev/api/admin/mcp"`, `auth: "oauth"`, `oauthScope: "admin:mcp"`, and `headers: { "CF-Access-Token": "$env:ACCESS_TOKEN" }`. Run `npx mcporter auth <server-name>` followed by `npx mcporter list <server-name> --json`. The browser session must be a camelAI superuser, otherwise authorization fails with `Admin access required`.

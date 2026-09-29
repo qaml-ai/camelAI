@@ -380,7 +380,7 @@ describe("resolveRouting", () => {
     expect(routing.awsRegion).toBe("us-east-1");
   });
 
-  it("routes Bedrock BYOK cheap tier to Sonnet 5 now that Haiku is retired", async () => {
+  it("routes Bedrock BYOK cheap tier to Sonnet 5.5 now that Haiku is retired", async () => {
     const encrypted = await encryptCredentials({ bearer_token: "bedrock-token" }, "secret");
     const routing = await resolveRouting(
       {
@@ -404,7 +404,7 @@ describe("resolveRouting", () => {
     );
 
     expect(routing.provider).toBe("bedrock");
-    expect(routing.model).toBe("anthropic.claude-sonnet-5");
+    expect(routing.model).toBe("anthropic.claude-sonnet-5-5");
   });
 });
 
@@ -429,7 +429,7 @@ describe("resolveRouting tier defaults", () => {
       expect(routing.model, tier).toBe("openai/gpt-6-luna");
     }
     expect((await resolveRouting(hostedScope(), "smart")).model).toBe(
-      "anthropic/claude-sonnet-5:nitro",
+      "anthropic/claude-sonnet-5.5:nitro",
     );
   });
 
@@ -536,7 +536,7 @@ describe("executeVirtualAiRun", () => {
         headers: { "Content-Type": "application/json" },
       }),
     );
-    const getUsageLogSum = vi.fn(async () => ({ total_cost_usd: 0 }));
+    const getCreditChargeableSpendUsd = vi.fn(async () => 0);
     const recordUsage = vi.fn(async () => undefined);
     const checkUserLlmUsageAccess = vi.fn(async () => ({
       allowed: true,
@@ -564,7 +564,7 @@ describe("executeVirtualAiRun", () => {
                   billing_credit_purchase_total_cents: 0,
                   billing_credit_grant_total_cents: 0,
                 })),
-                getUsageLogSum,
+                getCreditChargeableSpendUsd,
                 checkUserLlmUsageAccess,
                 recordUsage,
               })),
@@ -587,7 +587,7 @@ describe("executeVirtualAiRun", () => {
       expect(headers.get("X-Chiridion-VLLM-Priority")).toBeNull();
       const body = JSON.parse(String(init.body)) as { model: string };
       expect(body.model).toBe("openai/gpt-5.6-luna");
-      expect(getUsageLogSum).not.toHaveBeenCalled();
+      expect(getCreditChargeableSpendUsd).not.toHaveBeenCalled();
       expect(checkUserLlmUsageAccess).toHaveBeenCalledOnce();
       await Promise.all(backgroundTasks);
       expect(recordUsage).toHaveBeenCalledWith(
@@ -789,7 +789,7 @@ describe("executeVirtualAiRun", () => {
       content: [],
       api: "anthropic-messages",
       provider: "custom",
-      model: "anthropic.claude-sonnet-5",
+      model: "anthropic.claude-sonnet-5-5",
       usage: {
         input: 100,
         output: 5,
@@ -839,7 +839,7 @@ describe("executeVirtualAiRun", () => {
     expect(recordUsage).toHaveBeenCalledWith(expect.objectContaining({
       user_id: "user1",
       provider: "bedrock",
-      model: "anthropic.claude-sonnet-5",
+      model: "anthropic.claude-sonnet-5-5",
       usage_kind: "llm",
       usage_surface: "virtual_ai",
       input_tokens: 100,

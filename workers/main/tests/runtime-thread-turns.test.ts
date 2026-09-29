@@ -244,19 +244,31 @@ describe("pinNewThreadToRuntime", () => {
     expect(await setup.orgStub.getThreadRuntime(thread.id)).toMatchObject({ threadId: thread.id });
   });
 
-  it("leaves a thread whose model has no runtime route on ChatThreadDO", async () => {
+  async function customThread(baseUrl: string) {
     const setup = await runtimeThread();
     const encrypted = await encryptCredentials({ api_key: "sk-custom" }, testEnv.INTEGRATION_SECRET_KEY ?? "test-secret");
     await setup.orgStub.setLlmProviderConfig(
       "custom",
       encrypted,
-      stringifyStoredLlmProviderConfig({ custom_base_url: "https://llm.example.test/v1", custom_api: "openai-completions", custom_model_id: "house-model" }),
+      stringifyStoredLlmProviderConfig({ custom_base_url: baseUrl, custom_api: "openai-completions", custom_model_id: "house-model" }),
       setup.sender.userId,
     );
     const thread = await setup.orgStub.createThread(setup.context.workspaceId, "Custom", setup.sender.userId);
-    const context = { ...setup.context, threadId: thread.id };
+    return { setup, thread, context: { ...setup.context, threadId: thread.id } };
+  }
+
+  it("leaves a thread whose model has no runtime route on ChatThreadDO", async () => {
+    // A custom endpoint the runtime cannot call (not https).
+    const { setup, thread, context } = await customThread("http://llm.example.test/v1");
     expect(await pinNewThreadToRuntime({ ...runtimeEnv, AGENT_RUNTIME_DIRECT_THREADS: "1" } as ChatEnv, context)).toBeNull();
     expect(await setup.orgStub.getThreadRuntime(thread.id)).toBeNull();
+  });
+
+  it("pins a thread on the org's custom endpoint (the org scope's custom provider)", async () => {
+    const { setup, thread, context } = await customThread("https://llm.example.test/v1");
+    expect(await pinNewThreadToRuntime({ ...runtimeEnv, AGENT_RUNTIME_DIRECT_THREADS: "1" } as ChatEnv, context))
+      .toMatchObject({ threadId: thread.id });
+    expect(await setup.orgStub.getThreadRuntime(thread.id)).toMatchObject({ threadId: thread.id });
   });
 });
 

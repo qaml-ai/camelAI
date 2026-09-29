@@ -8,13 +8,26 @@
  * - `codex`: the org's ChatGPT subscription, which only chiridion can
  *   authenticate: `chiridion/openai-codex/<model>` through chiridion's
  *   forwarder (agent-runtime/codex-forwarder.ts);
- * - null: no runtime route (custom endpoints, self-host providers, Bedrock
- *   OpenAI models, the gateway's other dynamic routes). Such a thread stays on
+ * - null: no runtime route (self-host providers, the gateway's other dynamic
+ *   routes, a custom endpoint the runtime cannot call: not `https`, or
+ *   Anthropic Messages behind `Authorization: Bearer`). Such a thread stays on
  *   the in-DO loop.
+ *
+ * An org's own endpoints are model providers of its key scope (key-scopes.ts):
+ * its custom endpoint `custom/<model id>`, Bedrock's OpenAI models
+ * `bedrock-openai-<region>/<model id>`.
  */
 import type { PiResolvedModelConfig } from "../chat-thread/pi-model-config";
 import { codexRoute } from "./codex-forwarder";
-import { HOSTED_KEY_SCOPE, orgKeyScope } from "./key-scopes";
+import {
+  BEDROCK_OPENAI_BASE_URL,
+  CUSTOM_MODEL_PROVIDER,
+  HOSTED_KEY_SCOPE,
+  bedrockOpenAiModelProvider,
+  customEndpointRunsOnRuntime,
+  orgKeyScope,
+  runtimeModelId,
+} from "./key-scopes";
 
 export type RuntimeModelRoute =
   | { kind: "scope"; model: string; keyScope: string }
@@ -67,9 +80,20 @@ export function runtimeModelRoute(
     return codexRoute(config) ? { kind: "codex", model: `${RUNTIME_MODEL_ENDPOINT}/openai-codex/${model.id}` } : null;
   }
   if (config.usageProvider === "bedrock") {
+    // GPT over bedrock-mantle's OpenAI API: the scope's model provider for that region.
+    const served = model.api === "openai-responses" ? BEDROCK_OPENAI_BASE_URL.exec(model.baseUrl)?.[1] : undefined;
+    if (served) return { kind: "scope", model: `${bedrockOpenAiModelProvider(served)}/${model.id}`, keyScope: scope };
     const region = /^https:\/\/bedrock-mantle\.([a-z0-9-]+)\.api\.aws\/anthropic\/?$/.exec(model.baseUrl)?.[1];
     if (!region || model.api !== "anthropic-messages") return null;
     return { kind: "scope", model: `amazon-bedrock/${bedrockInferenceProfileId(model.id, region)}`, keyScope: scope };
+  }
+  if (config.usageProvider === "custom") {
+    // The key's header as the in-DO loop sends it (customProviderAuthHeaders):
+    // Anthropic Messages takes x-api-key unless the org chose Bearer.
+    const bearer = typeof config.headers?.Authorization === "string";
+    const authType = model.api === "anthropic-messages" && !bearer ? "x-api-key" : "bearer";
+    if (model.provider !== "custom" || !runtimeModelId(model.id) || !customEndpointRunsOnRuntime(model.api, authType, model.baseUrl)) return null;
+    return { kind: "scope", model: `${CUSTOM_MODEL_PROVIDER}/${model.id}`, keyScope: scope };
   }
   if (config.usageProvider === "openrouter") {
     if (!/^https:\/\/openrouter\.ai\/api(\/v1)?\/?$/.test(model.baseUrl)) return null;

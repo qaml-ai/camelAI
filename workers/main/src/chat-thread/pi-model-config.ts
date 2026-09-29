@@ -421,6 +421,21 @@ function resolvePiModelCatalogFallback(
   return PI_MODEL_CATALOG_FALLBACKS[`${resolved.provider}/${resolved.modelId}`] ?? null;
 }
 
+/**
+ * A model as the in-DO loop looks it up for its context window, output limit,
+ * reasoning and input: Pi's catalog, else chiridion's fallbacks (models Pi's
+ * catalog predates).
+ */
+export function piCatalogModel(
+  getModelFn: (provider: never, modelId: never) => Model<any> | null | undefined,
+  provider: string,
+  modelId: string,
+): Model<any> | null {
+  return (getModelFn(provider as never, modelId as never) as Model<any> | null | undefined) ??
+    PI_MODEL_CATALOG_FALLBACKS[`${provider}/${modelId}`] ??
+    null;
+}
+
 export async function resolvePiModelConfig(
   deps: ResolvePiModelDeps,
   context: ChatContextState,

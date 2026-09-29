@@ -1,6 +1,7 @@
 /**
  * The hosted agent runtime's tenant API, as chiridion's operator: key scopes
- * (the provider keys agents of a scope call providers with) and per-agent
+ * (the provider keys agents of a scope call providers with, and the scope's
+ * own model providers) and per-agent
  * configuration (model, key scope, spend limit).
  */
 export interface RuntimeApiEnv {
@@ -92,6 +93,43 @@ export function putKeyScopeProvider(
   fetcher?: typeof globalThis.fetch,
 ) {
   return runtimeApi(env, "PUT", `/v1/key-scopes/${encodeURIComponent(scope)}/providers/${encodeURIComponent(provider)}`, entry, {}, fetcher);
+}
+
+/** A model a scope model provider declares; `pricing` in USD per million tokens (left out: runs cost 0). */
+export interface KeyScopeModel {
+  id: string;
+  contextWindow: number;
+  maxOutputTokens?: number;
+  input?: Array<"text" | "image">;
+  reasoning?: boolean;
+  pricing?: { input: number; output: number; cacheRead?: number; cacheWrite?: number };
+}
+
+/**
+ * A key scope's own model provider: a server speaking one of the runtime's
+ * APIs, its key (null: none), extra headers (null: none) and declared models.
+ * The scope's agents name its models `<name>/<model id>`.
+ */
+export interface KeyScopeModelProvider {
+  type: "openai-completions" | "openai-responses" | "anthropic-messages";
+  baseUrl: string;
+  apiKey: string | null;
+  headers: Record<string, string> | null;
+  models: KeyScopeModel[];
+}
+
+export function putKeyScopeModelProvider(
+  env: RuntimeApiEnv,
+  scope: string,
+  name: string,
+  provider: KeyScopeModelProvider,
+  fetcher?: typeof globalThis.fetch,
+) {
+  return runtimeApi(env, "PUT", `/v1/key-scopes/${encodeURIComponent(scope)}/model-providers/${encodeURIComponent(name)}`, provider, {}, fetcher);
+}
+
+export function deleteKeyScopeModelProvider(env: RuntimeApiEnv, scope: string, name: string, fetcher?: typeof globalThis.fetch) {
+  return runtimeApi(env, "DELETE", `/v1/key-scopes/${encodeURIComponent(scope)}/model-providers/${encodeURIComponent(name)}`, undefined, {}, fetcher);
 }
 
 export async function deleteKeyScope(env: RuntimeApiEnv, scope: string, fetcher?: typeof globalThis.fetch) {

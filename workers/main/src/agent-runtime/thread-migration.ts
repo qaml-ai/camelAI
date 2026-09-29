@@ -19,6 +19,7 @@ import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import type { OrgMember, OrgThread, ThreadRuntimeRecord } from "../identity/org-do.js";
 import { directRuntimeRow } from "./channel-turns.js";
 import { resolveThreadRuntimeRoute } from "./run-gates.js";
+import { runtimeApi } from "./runtime-api.js";
 import { runtimeDirectThreadsEnabled } from "./thread-runtime.js";
 
 /** Tool results longer than this are shortened (their head and tail kept). */
@@ -171,6 +172,11 @@ export function convertTranscript(source: AgentMessage[], options: { rewriteTool
       const content = typeof message.content === "string"
         ? message.content
         : inputBlocks(Array.isArray(message.content) ? message.content : [], stats);
+      // A provider refuses an empty message.
+      if (typeof content === "string" ? !content.trim() : content.length === 0) {
+        stats.normalized++;
+        continue;
+      }
       out.push({ ...message, content } as unknown as AgentMessage);
       continue;
     }
@@ -208,6 +214,10 @@ export function convertTranscript(source: AgentMessage[], options: { rewriteTool
         stats.normalized++;
         return [];
       });
+      if (content.length === 0) {
+        stats.normalized++;
+        continue;
+      }
       out.push({ ...message, content } as unknown as AgentMessage);
       continue;
     }
@@ -305,7 +315,7 @@ export function withImportNote(messages: AgentMessage[], archived: boolean): Age
 }
 
 export type RuntimeMigrationResult =
-  | { status: "migrated"; row: ThreadRuntimeRecord; stats: ConvertedTranscript["stats"]; archived: boolean }
+  | { status: "migrated"; row: ThreadRuntimeRecord; stats: ConvertedTranscript["stats"]; archived: boolean; reason?: string }
   | { status: "adopted" | "runtime"; row: ThreadRuntimeRecord }
   | { status: "busy"; reason: string }
   | { status: "skipped"; reason: string }
@@ -369,12 +379,17 @@ export async function migrateThreadToRuntime(
   const existing = await org.getThreadRuntime(context.threadId);
   if (existing) return { status: "runtime", row: existing };
   const chat = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(context.threadId)) as unknown as {
-    runtimeMigrationStatus(): Promise<{ state: "moving" | "moved" | "backoff" | null; retryAt?: number }>;
+    runtimeMigrationStatus(): Promise<{ state: "moving" | "committing" | "moved" | "backoff" | null; retryAt?: number }>;
     migrateToRuntime(request: DoMigrationRequest): Promise<DoMigrationResult>;
   };
   // One cheap question first: a thread moving, moved or backing off needs none of the reads below.
   if (!options.dryRun) {
     const { state } = await chat.runtimeMigrationStatus();
+    // A commit left pending (its alarm lost, say) is finished by whoever opens the thread.
+    if (state === "committing") {
+      const result = await chat.migrateToRuntime({ context, subject: null });
+      return result.status === "relay" ? { status: "busy", reason: "moving" } : result;
+    }
     if (state === "moving") return { status: "busy", reason: "moving" };
     if (state === "moved") return { status: "skipped", reason: "moved" };
     if (state === "backoff") return { status: "skipped", reason: "backoff" };
@@ -392,4 +407,78 @@ export async function migrateThreadToRuntime(
   if (options.dryRun) return { status: "skipped", reason: "relay (adopted, no import)" };
   const row = await directRuntimeRow(env, context.orgId, context.threadId, { adopt: true });
   return row ? { status: "adopted", row } : { status: "busy", reason: "relay turn running" };
+}
+
+/** An attempt's Idempotency-Key: the thread and the attempt's lease, never reused. */
+export function runtimeMigrationKey(threadId: string, leaseId: string): string {
+  return `migrate_${threadId}_${leaseId}`;
+}
+
+/** The thread a move's Idempotency-Key names, or null for any other key. */
+export function runtimeMigrationKeyThread(key: string | null | undefined): string | null {
+  const match = /^migrate_(.+)_[^_]+$/.exec(key ?? "");
+  return match ? match[1] : null;
+}
+
+
+/** A runtime agent as GET /v1/agents lists it. */
+interface RuntimeAgentSummary {
+  id: string;
+  key: string | null;
+  name: string;
+}
+
+export interface OrphanReconcileReport {
+  /** Agents made by a move (migrate_ keys). */
+  scanned: number;
+  /** Held by their thread's move or runtime row. */
+  kept: number;
+  /** Held by nothing: deleted, or listed on a dry run. */
+  orphans: string[];
+  deleted: string[];
+  /** Their thread's org is not known here, so their runtime row cannot be checked: left alone. */
+  unverifiable: string[];
+}
+
+/**
+ * The backstop against agents a move made and lost track of (a create the
+ * runtime finished after chiridion stopped waiting, a cleanup cut off): every
+ * tenant agent made under a move's key that neither its thread's move nor its
+ * thread's runtime row holds is deleted. `dryRun` only lists them.
+ */
+export async function reconcileRuntimeMigrationOrphans(
+  env: ChatEnv,
+  options: { dryRun?: boolean } = {},
+): Promise<OrphanReconcileReport> {
+  const agents = await runtimeApi(env, "GET", "/v1/agents") as RuntimeAgentSummary[];
+  const report: OrphanReconcileReport = { scanned: 0, kept: 0, orphans: [], deleted: [], unverifiable: [] };
+  for (const agent of agents ?? []) {
+    const threadId = runtimeMigrationKeyThread(agent.key);
+    if (!threadId) continue;
+    report.scanned++;
+    const chat = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId)) as unknown as {
+      runtimeMigrationHolds(agentId: string, key: string | null): Promise<{ holds: boolean; orgId?: string }>;
+    };
+    const { holds, orgId } = await chat.runtimeMigrationHolds(agent.id, agent.key);
+    if (holds) {
+      report.kept++;
+      continue;
+    }
+    if (!orgId) {
+      report.unverifiable.push(agent.id);
+      continue;
+    }
+    const row = await orgStub(env, orgId).getThreadRuntime(threadId);
+    if (row?.agentId === agent.id) {
+      report.kept++;
+      continue;
+    }
+    report.orphans.push(agent.id);
+    if (options.dryRun) continue;
+    await runtimeApi(env, "DELETE", `/v1/agents/${encodeURIComponent(agent.id)}`).then(
+      () => report.deleted.push(agent.id),
+      (error: unknown) => console.warn("[runtime-migration] could not delete an orphaned agent", { agentId: agent.id, error }),
+    );
+  }
+  return report;
 }

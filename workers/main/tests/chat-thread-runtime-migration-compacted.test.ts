@@ -33,7 +33,7 @@ describe("moving a thread compacted by rewrite", () => {
       );
       expect(result.status).toBe("rewritten");
 
-      const archive = [...instance.renderArchivePages()].flat();
+      const archive = [...instance.renderArchivePages(1_080)].flat();
       const texts = JSON.stringify(archive);
       expect(texts).toContain("question 0");
       expect(texts).toContain("answer 7");

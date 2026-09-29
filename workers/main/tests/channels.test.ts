@@ -94,6 +94,17 @@ describe("channels", () => {
     }));
   });
 
+  it("sends a message to the runtime when the thread moved there while it was on its way", async () => {
+    startChannelRuntimeTurnMock.mockResolvedValueOnce(null).mockResolvedValueOnce({ status: "accepted" });
+    startInitialUserMessageMock.mockResolvedValueOnce({ status: "moved", error: "moved" });
+    const result = await enqueueChannelMessage(
+      { CHAT_THREAD: { idFromName: (id: string) => id, get: () => ({ startInitialUserMessage: startInitialUserMessageMock }) } } as never,
+      { channelKind: "discord", threadId: "thread-1", workspaceId: "workspace-1", orgId: "org-1", userId: "owner-1", userName: "D", message: "hello" },
+    );
+    expect(result).toEqual({ status: "accepted" });
+    expect(startChannelRuntimeTurnMock).toHaveBeenCalledTimes(2);
+  });
+
   it("pins a new channel thread to the runtime", async () => {
     const kv = createMockKvStore();
     getOrgStubMock.mockReturnValue({

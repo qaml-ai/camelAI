@@ -86,7 +86,7 @@ export async function queueChannelHistoryNote(env: Pick<ChatEnv, "APP_KV">, thre
   await env.APP_KV.put(notesKey(threadId), JSON.stringify(notes.slice(-MAX_NOTES)), { expirationTtl: NOTES_TTL_SECONDS });
 }
 
-async function takeChannelHistoryNotes(env: Pick<ChatEnv, "APP_KV">, threadId: string): Promise<string[]> {
+export async function takeChannelHistoryNotes(env: Pick<ChatEnv, "APP_KV">, threadId: string): Promise<string[]> {
   const notes = await env.APP_KV.get<string[]>(notesKey(threadId), "json") ?? [];
   if (notes.length) await env.APP_KV.delete(notesKey(threadId));
   return notes;

@@ -1367,6 +1367,22 @@ export class PiCoreMessageStore {
   }
 
   /**
+   * The timestamp of the oldest stored message that is not a compaction
+   * summary (a rewrite puts one at row 0, stamped when it ran): where stored
+   * history begins. Scans a few rows, payloads one at a time.
+   */
+  firstStoredMessageAtMs(): number | undefined {
+    this.ensurePiCoreTables();
+    for (const meta of this.listPiCoreRowMetaAscending({ fromIdx: 0, limit: 16 })) {
+      const message = this.loadPiCoreRenderMessageAt(meta.idx) as { role?: unknown; content?: unknown; timestamp?: unknown } | null;
+      if (!message || typeof message.timestamp !== "number") continue;
+      if (message.role === "user" && typeof message.content === "string" && message.content.startsWith("[Context Summary]")) continue;
+      return message.timestamp;
+    }
+    return undefined;
+  }
+
+  /**
    * Every stored row, oldest first, a batch of at most `maxChars` stored
    * characters at a time (a row larger than that alone): a whole transcript
    * walked, or streamed out, without ever holding it.

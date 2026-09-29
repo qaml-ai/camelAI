@@ -294,7 +294,8 @@ export interface InitialUserMessageRequest {
 }
 
 export interface InitialUserMessageResult {
-  status: "accepted" | "busy" | "error";
+  /** "moved": the thread runs on the agent runtime now; the caller sends it there. */
+  status: "accepted" | "busy" | "error" | "moved";
   error?: string;
 }
 

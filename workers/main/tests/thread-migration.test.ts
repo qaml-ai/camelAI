@@ -36,6 +36,7 @@ import {
   convertTranscript,
   importNote,
   migrateThreadToRuntime,
+  reconcileRuntimeMigrationOrphans,
   withImportNote,
   type DoMigrationResult,
 } from "../src/agent-runtime/thread-migration";
@@ -203,6 +204,46 @@ describe("convertTranscript: what the runtime's import validator takes (M4)", ()
   });
 });
 
+describe("convertTranscript: messages a provider refuses (review 3)", () => {
+  it("leaves out user and assistant messages left empty", () => {
+    const converted = convertTranscript([
+      { role: "user", content: "  ", timestamp: 1 },
+      { role: "user", content: [{ type: "weird" }].slice(1), timestamp: 2 },
+      { role: "assistant", content: [{ type: "thinking", thinking: "", redacted: true }], timestamp: 3 },
+      { role: "user", content: "real", timestamp: 4 },
+    ] as never);
+    expect(converted.messages).toEqual([{ role: "user", content: "real", timestamp: 4 }]);
+    expect(converted.stats.normalized).toBe(3);
+  });
+});
+
+describe("reconcileRuntimeMigrationOrphans", () => {
+  const ORG_ROW = { threadId: "t1", agentId: "agt_row", model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
+
+  it("deletes a move's agent that neither the thread's move nor its runtime row holds, and nothing else", async () => {
+    runtimeApiMock.mockImplementation(async (_env: unknown, method: string) => method === "GET" ? [
+      { id: "agt_moving", key: "migrate_t1_lease-a", name: "t1" },
+      { id: "agt_row", key: "migrate_t1_lease-b", name: "t1" },
+      { id: "agt_lost", key: "migrate_t1_lease-c", name: "t1" },
+      { id: "agt_unknown_org", key: "migrate_t2_lease-d", name: "t2" },
+      { id: "agt_thread", key: "thread_t1", name: "t1" },
+    ] : null);
+    const holds = vi.fn(async (agentId: string) => (agentId === "agt_unknown_org" ? { holds: false } : { holds: agentId === "agt_moving", orgId: "org1" }));
+    const org = { getThreadRuntime: vi.fn(async () => ORG_ROW) };
+    const env = {
+      ORG: { idFromName: (name: string) => name, get: () => org },
+      CHAT_THREAD: { idFromName: (name: string) => name, get: () => ({ runtimeMigrationHolds: holds }) },
+    } as unknown as ChatEnv;
+    const dry = await reconcileRuntimeMigrationOrphans(env, { dryRun: true });
+    expect(dry).toEqual({ scanned: 4, kept: 2, orphans: ["agt_lost"], deleted: [], unverifiable: ["agt_unknown_org"] });
+    expect(runtimeApiMock).not.toHaveBeenCalledWith(expect.anything(), "DELETE", expect.anything());
+    const real = await reconcileRuntimeMigrationOrphans(env);
+    expect(real.deleted).toEqual(["agt_lost"]);
+    expect(runtimeApiMock).toHaveBeenCalledWith(expect.anything(), "DELETE", "/v1/agents/agt_lost");
+    expect(holds).toHaveBeenCalledWith("agt_moving", "migrate_t1_lease-a");
+  });
+});
+
 describe("migrateThreadToRuntime", () => {
   const context = { orgId: "org1", workspaceId: "ws1", threadId: "t1", userId: "u1", userName: "Ada", userEmail: null };
   const ROW = { threadId: "t1", agentId: "agt_new", model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
@@ -266,6 +307,13 @@ describe("migrateThreadToRuntime", () => {
       expect(waiting.chat.migrateToRuntime).not.toHaveBeenCalled();
       expect(waiting.org.getMembers).not.toHaveBeenCalled();
     }
+    expect(routeMock).not.toHaveBeenCalled();
+  });
+
+  it("finishes a commit left pending when the thread is opened (M-C)", async () => {
+    const pending = fakeEnv({ status: "runtime", row: ROW } as DoMigrationResult, { status: { state: "committing" } });
+    expect(await migrateThreadToRuntime(pending.env, context)).toEqual({ status: "runtime", row: ROW });
+    expect(pending.chat.migrateToRuntime).toHaveBeenCalledWith({ context, subject: null });
     expect(routeMock).not.toHaveBeenCalled();
   });
 

@@ -3,6 +3,7 @@ import { InvalidMountConfigError, S3FSMountError } from '@cloudflare/sandbox';
 import {
   AnalysisSandbox,
   createSingleFlight,
+  forceUnmountCommand,
   isMountAlreadyPresent,
   mountAllowsList,
   mountOrRecover,
@@ -177,6 +178,13 @@ const SESSION_DEATH = () =>
   );
 
 /** Bare AnalysisSandbox instance with just the DO surface the heal touches. */
+/** `[event, status]` of every observability data point the sandbox wrote. */
+function recordedEvents(sandbox: any): Array<[string, string]> {
+  return sandbox.env.OBSERVABILITY_EVENTS.writeDataPoint.mock.calls.map(
+    ([point]: [{ blobs: string[] }]) => [point.blobs[0], point.blobs[4]],
+  );
+}
+
 function healableSandbox() {
   const store = new Map<string, number>();
   const deleted: string[] = [];
@@ -357,9 +365,15 @@ describe('AnalysisSandbox zombie self-heal', () => {
       );
 
       expect(sandbox.destroy).toHaveBeenCalledTimes(1);
+      // mount, remount (the forced detach fails in this container, so no third
+      // attempt there), then the mount on the fresh container.
       expect(sandbox.mountBucket).toHaveBeenCalledTimes(3);
       expect(sandbox.mountedPaths.has('/warehouse/ws-1')).toBe(true);
-      expect(sandbox.env.OBSERVABILITY_EVENTS.writeDataPoint).toHaveBeenCalledTimes(1);
+      // The forced restart, then the mount recovery it produced.
+      expect(recordedEvents(sandbox)).toEqual([
+        ['build_sandbox_zombie_restart', 'restarted'],
+        ['analysis_sandbox_mount_recovery', 'restarted'],
+      ]);
     } finally {
       warn.mockRestore();
     }
@@ -564,7 +578,7 @@ describe('mountOrRecover', () => {
       },
     });
 
-    await expect(mountOrRecover(target, 'R2_BUCKET', '/uploads', options)).resolves.toBeUndefined();
+    await expect(mountOrRecover(target, 'R2_BUCKET', '/uploads', options)).resolves.toBe('present_readable');
   });
 
   it('rethrows genuine mount failures without attempting recovery', async () => {
@@ -577,6 +591,198 @@ describe('mountOrRecover', () => {
       S3FSMountError,
     );
     expect(target.unmounts).toEqual([]);
+  });
+});
+
+describe('mountOrRecover forced remount', () => {
+  const options = { prefix: '/uploads-prefix', readOnly: true as const };
+  const busy = () => new S3FSMountError(
+    'S3FS mount failed: s3fs: MOUNTPOINT directory /uploads is not empty',
+  );
+
+  it('detaches a mount the SDK registry lost and mounts again', async () => {
+    let detached = false;
+    const forceUnmount = vi.fn(async () => { detached = true; });
+    const mountBucket = vi.fn(async () => {
+      if (!detached) throw busy();
+    });
+    const exec = vi.fn(async () => ({ exitCode: 1, stdout: '', stderr: 'ls: Input/output error' }));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const outcome = await mountOrRecover(
+        {
+          mountBucket,
+          // What the SDK answers once its registry lost the path.
+          unmountBucket: async () => {
+            throw new InvalidMountConfigError('No active mount found at path: /uploads');
+          },
+          exec,
+          forceUnmount,
+        },
+        'R2_BUCKET',
+        '/uploads',
+        options,
+      );
+      expect(outcome).toBe('force_remounted');
+    } finally {
+      warn.mockRestore();
+    }
+    expect(forceUnmount).toHaveBeenCalledWith('/uploads');
+    expect(mountBucket).toHaveBeenCalledTimes(3);
+    // Mounted clean, so no probe of the dead mount was needed.
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('still fails loudly when the forced remount cannot clear the mount', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await expect(mountOrRecover(
+        {
+          mountBucket: async () => { throw busy(); },
+          unmountBucket: async () => undefined,
+          exec: async () => ({ exitCode: 2, stdout: '', stderr: 'ls: Input/output error' }),
+          forceUnmount: async () => undefined,
+        },
+        'R2_BUCKET',
+        '/uploads',
+        options,
+      )).rejects.toBeInstanceOf(UnreadableR2MountError);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('does not tell the agent to recreate a container it cannot reach', () => {
+    const message = new UnreadableR2MountError('/uploads').message;
+    expect(message).toContain('not readable');
+    expect(message).not.toMatch(/recreate/i);
+  });
+});
+
+describe('AnalysisSandbox.forceUnmount', () => {
+  function sandboxWith(entry: { mountType: string }) {
+    const sandbox = Object.create(AnalysisSandbox.prototype) as any;
+    sandbox.activeMounts = new Map([['/uploads', entry]]);
+    sandbox.exec = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }));
+    return sandbox;
+  }
+
+  it('lazily detaches the FUSE mount and forgets the SDK registry entry', async () => {
+    const sandbox = sandboxWith({ mountType: 'r2-egress' });
+    await AnalysisSandbox.prototype.forceUnmount.call(sandbox, '/uploads');
+    expect(sandbox.exec).toHaveBeenCalledWith(forceUnmountCommand('/uploads'), { timeout: 15_000 });
+    expect(forceUnmountCommand('/uploads')).toBe(
+      "if mountpoint -q '/uploads'; then fusermount -uz '/uploads' 2>/dev/null || umount -l '/uploads'; fi",
+    );
+    expect(sandbox.activeMounts.has('/uploads')).toBe(false);
+  });
+
+  it('keeps the registry entry when the detach fails', async () => {
+    const sandbox = sandboxWith({ mountType: 'r2-egress' });
+    sandbox.exec.mockResolvedValue({ exitCode: 1, stdout: '', stderr: 'umount: busy' });
+    await expect(AnalysisSandbox.prototype.forceUnmount.call(sandbox, '/uploads')).rejects.toThrow(
+      /Forced unmount of \/uploads failed/,
+    );
+    expect(sandbox.activeMounts.has('/uploads')).toBe(true);
+  });
+
+  it('leaves self-host local-sync mounts to the SDK', async () => {
+    const sandbox = sandboxWith({ mountType: 'local-sync' });
+    await AnalysisSandbox.prototype.forceUnmount.call(sandbox, '/uploads');
+    expect(sandbox.exec).not.toHaveBeenCalled();
+    expect(sandbox.activeMounts.has('/uploads')).toBe(true);
+  });
+
+  it('refuses unexpected paths', async () => {
+    const sandbox = sandboxWith({ mountType: 'r2-egress' });
+    await expect(AnalysisSandbox.prototype.forceUnmount.call(sandbox, '/uploads/../etc')).rejects.toThrow();
+    expect(sandbox.exec).not.toHaveBeenCalled();
+  });
+});
+
+describe('AnalysisSandbox.ensureMounted self-heal', () => {
+  const ensureUploads = (sandbox: any) => AnalysisSandbox.prototype.ensureMounted.call(
+    sandbox,
+    'R2_BUCKET',
+    'org1/workspace1/uploads',
+    '/uploads',
+    { readOnly: true },
+  );
+
+  /**
+   * Prod 2026-09-29: after a forced restart, the old container's late `onStop`
+   * cleared the SDK registry and the r2.internal egress while the new container
+   * kept its FUSE mount. Every later call hit "not empty", `unmountBucket`
+   * answered "No active mount found", and the restart was rate limited, so the
+   * agent saw UnreadableR2MountError five times in a row. The forced detach
+   * recovers that without another container restart.
+   */
+  it('recovers a mount the SDK forgot without restarting the container', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { sandbox, destroy } = healableSandbox();
+      sandbox.containerGeneration = 2;
+      sandbox.mountedContainerGeneration = 2;
+      // The SDK's own registry: empty, as the late onStop left it.
+      sandbox.activeMounts = new Map();
+      let fuseMounted = true;
+      sandbox.mountBucket = vi.fn(async (_bucket: string, path: string) => {
+        if (fuseMounted) {
+          throw new S3FSMountError(`S3FS mount failed: s3fs: MOUNTPOINT directory ${path} is not empty`);
+        }
+        fuseMounted = true;
+        sandbox.activeMounts.set(path, { mountType: 'r2-egress' });
+      });
+      sandbox.unmountBucket = vi.fn(async (path: string) => {
+        throw new InvalidMountConfigError(`No active mount found at path: ${path}`);
+      });
+      sandbox.exec = vi.fn(async (command: string) => {
+        if (command === forceUnmountCommand('/uploads')) fuseMounted = false;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      });
+
+      await ensureUploads(sandbox);
+
+      expect(destroy).not.toHaveBeenCalled();
+      expect(sandbox.mountedPaths.has('/uploads')).toBe(true);
+      expect(recordedEvents(sandbox)).toEqual([
+        ['analysis_sandbox_mount_recovery', 'force_remounted'],
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('restarts at most once per cooldown and reports the rate-limited failure', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { sandbox, destroy } = healableSandbox();
+      sandbox.containerGeneration = 1;
+      sandbox.mountedContainerGeneration = 1;
+      sandbox.activeMounts = new Map();
+      // A mount that nothing fixes, not even a fresh container.
+      sandbox.mountBucket = vi.fn(async () => {
+        throw new S3FSMountError('S3FS mount failed: s3fs: MOUNTPOINT directory /uploads is not empty');
+      });
+      sandbox.unmountBucket = vi.fn(async () => undefined);
+      sandbox.exec = vi.fn(async () => ({ exitCode: 1, stdout: '', stderr: 'ls: Input/output error' }));
+
+      // First call: one restart, one retry against the new container, then fail.
+      await expect(ensureUploads(sandbox)).rejects.toBeInstanceOf(UnreadableR2MountError);
+      expect(destroy).toHaveBeenCalledTimes(1);
+      // Second call inside the cooldown: no second restart (the loop guard).
+      await expect(ensureUploads(sandbox)).rejects.toBeInstanceOf(UnreadableR2MountError);
+      expect(destroy).toHaveBeenCalledTimes(1);
+      expect(sandbox.mountedPaths.has('/uploads')).toBe(false);
+
+      expect(recordedEvents(sandbox)).toEqual([
+        ['build_sandbox_zombie_restart', 'restarted'],
+        ['analysis_sandbox_mount_recovery', 'failed_after_restart'],
+        ['analysis_sandbox_mount_recovery', 'restart_rate_limited'],
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

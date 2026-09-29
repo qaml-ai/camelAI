@@ -26,6 +26,7 @@ function forkMessagesFailureStatus(result: ChatThreadPiCoreForkResult): number {
   ) {
     return 404;
   }
+  if (result.code === 'THREAD_MOVED') return 409;
   return 500;
 }
 

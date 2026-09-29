@@ -30,7 +30,7 @@ function fakeEnv() {
     getThread: vi.fn(async () => ({ created_by: "u1" })),
     getThreadUiState: vi.fn(async () => ({ preview: { tabs: [{ kind: "app", scriptName: "shop", isPublic: true }], activeTabId: "app:shop" } })),
     setThreadUiState: vi.fn(async () => ({})),
-    setThreadRuntimeAgent: vi.fn(async (threadId: string, update: { agentId: string }) => ({ ...SOURCE, threadId, agentId: update.agentId, model: null, keyScope: null })),
+    claimThreadRuntimeAgent: vi.fn(async (threadId: string, agentId: string) => ({ row: { ...SOURCE, threadId, agentId, model: null, keyScope: null }, claimed: true })),
   };
   const env = {
     AGENT_RUNTIME_DEFINITION: "def_1",
@@ -59,7 +59,7 @@ describe("forkRuntimeThread", () => {
     expect(body).toMatchObject({ name: "fork1", subject: "u1", context: { org: "org1", workspace: "ws1", thread: "fork1" } });
     expect(headers["Idempotency-Key"]).toMatch(/^fork_fork1_[0-9a-f]{16}$/);
     expect(org.setThreadUiState).toHaveBeenCalledWith("fork1", { tabs: [{ kind: "app", scriptName: "shop", isPublic: true }], activeTabId: "app:shop" });
-    expect(org.setThreadRuntimeAgent).toHaveBeenCalledWith("fork1", { agentId: "agt_fork", model: null, keyScope: null, configured: null });
+    expect(org.claimThreadRuntimeAgent).toHaveBeenCalledWith("fork1", "agt_fork");
   });
 
   it("keeps a forked turn's tool results after its last message", async () => {
@@ -76,8 +76,15 @@ describe("forkRuntimeThread", () => {
 
   it("deletes the fork's agent when the fork cannot be recorded", async () => {
     const { env, org } = fakeEnv();
-    org.setThreadRuntimeAgent.mockRejectedValueOnce(new Error("OrgDO down"));
+    org.claimThreadRuntimeAgent.mockRejectedValueOnce(new Error("OrgDO down"));
     expect(await forkRuntimeThread(env, { source: SOURCE, target, forkEntryId: "rt:3" })).toMatchObject({ status: "failed", error: "OrgDO down" });
+    expect(runtimeApiMock).toHaveBeenCalledWith(env, "DELETE", "/v1/agents/agt_fork");
+  });
+
+  it("never gives a thread that already has an agent a second one", async () => {
+    const { env, org } = fakeEnv();
+    org.claimThreadRuntimeAgent.mockResolvedValueOnce({ row: { ...SOURCE, threadId: "fork1", agentId: "agt_other" }, claimed: false } as never);
+    expect(await forkRuntimeThread(env, { source: SOURCE, target, forkEntryId: "rt:3" })).toMatchObject({ status: "failed" });
     expect(runtimeApiMock).toHaveBeenCalledWith(env, "DELETE", "/v1/agents/agt_fork");
   });
 });

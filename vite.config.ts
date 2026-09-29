@@ -2,7 +2,6 @@ import { reactRouter } from '@react-router/dev/vite';
 import { cloudflare, type WorkerConfig } from '@cloudflare/vite-plugin';
 import path from 'node:path';
 import { defineConfig, type DepOptimizationOptions, type Plugin } from 'vite';
-import tsconfigPaths from 'vite-tsconfig-paths';
 
 const camelaiBuildId =
   process.env.CAMELAI_BUILD_ID ||
@@ -172,7 +171,6 @@ export default defineConfig(({ command }) => {
       ...(process.env.E2E_LOCAL === '1' ? { remoteBindings: false } : {}),
     }),
     reactRouter(),
-    tsconfigPaths({ ignoreConfigErrors: true }),
     ],
     // Configure SSR environment to use Cloudflare's worker entry as the rollup input
     // This ensures Durable Object exports are included in the bundle
@@ -190,6 +188,7 @@ export default defineConfig(({ command }) => {
       optimizeDeps: ssrOptimizeDeps,
     },
     resolve: {
+      tsconfigPaths: true,
       dedupe: ['react', 'react-dom'],
       alias: [
         {

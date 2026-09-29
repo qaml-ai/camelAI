@@ -36,7 +36,8 @@ import {
   convertTranscript,
   importNote,
   migrateThreadToRuntime,
-  type RuntimeMigrationExport,
+  withImportNote,
+  type DoMigrationResult,
 } from "../src/agent-runtime/thread-migration";
 import type { ChatEnv } from "../src/chat-thread/types";
 
@@ -114,108 +115,118 @@ describe("convertTranscript", () => {
     expect(converted.messages[1]).toEqual({ role: "compactionSummary", summary: "Earlier: built the shop.", timestamp: 9 });
   });
 
-  it("imports the latest context of a history over the cap, from its last compaction summary", () => {
-    const big = "y".repeat(1024 * 1024);
+  const big = (label: string) => user(`${label}:${"y".repeat(1024 * 1024)}`);
+  const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
+
+  it("over the cap, keeps the model's part whole and fills the room left with the newest earlier turns", () => {
     const messages = [
-      ...Array.from({ length: 20 }, () => user(big)),
+      ...Array.from({ length: 20 }, (_, index) => big(`old${index}`)),
       user("[Context Summary]\n\nEarlier: built the shop."),
       user("and now?"),
     ];
     const converted = convertTranscript(messages as never);
-    expect(converted.stats.tail).toBe(true);
-    expect(converted.messages[0]).toMatchObject({ role: "compactionSummary", summary: "Earlier: built the shop." });
-    expect(new TextEncoder().encode(JSON.stringify(converted.messages)).length).toBeLessThanOrEqual(MAX_IMPORT_BYTES);
+    expect(converted).toMatchObject({ tooLarge: false, lossy: true, stats: { tail: true } });
+    const kept = converted.messages as Array<{ role: string; content?: string }>;
+    // The newest old turns, then the summary and what follows it.
+    expect(kept.at(-2)).toMatchObject({ role: "compactionSummary", summary: "Earlier: built the shop." });
+    expect(kept.at(-1)).toMatchObject({ content: "and now?" });
+    expect(kept[0].content?.startsWith("old")).toBe(true);
+    expect(kept.length).toBeGreaterThan(2);
+    expect(bytes(converted.messages)).toBeLessThanOrEqual(MAX_IMPORT_BYTES);
+  });
+
+  it("keeps a summary at the very start when the model's part alone is over the cap", () => {
+    const messages = [user("[Context Summary]\n\nEarlier."), ...Array.from({ length: 20 }, (_, index) => big(`new${index}`))];
+    const converted = convertTranscript(messages as never);
+    expect(converted.messages[0]).toMatchObject({ role: "compactionSummary", summary: "Earlier." });
+    expect((converted.messages.at(-1) as { content: string }).content.startsWith("new19")).toBe(true);
+    expect(bytes(converted.messages)).toBeLessThanOrEqual(MAX_IMPORT_BYTES);
+  });
+
+  it("never starts a cut import at a tool result whose call was cut off", () => {
+    const turn = (index: number) => [
+      big(`ask${index}`),
+      assistantCall(`tc${index}`, "read", {}),
+      toolResult(`tc${index}`, "read", "ok"),
+    ];
+    const converted = convertTranscript(Array.from({ length: 20 }, (_, index) => turn(index)).flat() as never, { rewriteToolCalls: false });
+    expect(converted.messages[0]).toMatchObject({ role: "user" });
+    expect(bytes(converted.messages)).toBeLessThanOrEqual(MAX_IMPORT_BYTES);
+  });
+
+  it("says a history cannot move when not even its newest message fits", () => {
+    const huge = { role: "user", content: [{ type: "image", data: "A".repeat(MAX_IMPORT_BYTES + 1), mimeType: "image/png" }], timestamp: 1 };
+    expect(convertTranscript([user("hi"), huge] as never)).toMatchObject({ tooLarge: true, messages: [] });
+  });
+
+  it("converts the same history to the same import every time, note included", () => {
+    const history = [user("hi", { timestamp: 5 }), assistantCall("tc1", "read", {}), { ...toolResult("tc1", "read", "ok"), timestamp: undefined }];
+    vi.useFakeTimers();
+    const first = withImportNote(convertTranscript(history as never, { rewriteToolCalls: true }).messages, false);
+    vi.setSystemTime(Date.now() + 60_000);
+    const second = withImportNote(convertTranscript(history as never, { rewriteToolCalls: true }).messages, false);
+    vi.useRealTimers();
+    expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+    expect(first[0]).toEqual(importNote(false, 5));
   });
 });
 
 describe("migrateThreadToRuntime", () => {
   const context = { orgId: "org1", workspaceId: "ws1", threadId: "t1", userId: "u1", userName: "Ada", userEmail: null };
   const ROW = { threadId: "t1", agentId: "agt_new", model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
+  const MEMBERS = [{ user_id: "owner1", role: "owner" }, { user_id: "u1", role: "member" }];
 
-  function fakeEnv(handover: RuntimeMigrationExport, options: { row?: typeof ROW | null; setRow?: typeof ROW | null } = {}) {
-    const doStub = {
-      beginRuntimeMigration: vi.fn(async () => handover),
-      abortRuntimeMigration: vi.fn(async () => true),
-      completeRuntimeMigration: vi.fn(async () => true),
-    };
+  function fakeEnv(
+    answer: DoMigrationResult,
+    options: { row?: typeof ROW | null; thread?: Record<string, unknown> | null; connectionOwner?: string | null } = {},
+  ) {
+    const chat = { migrateToRuntime: vi.fn(async () => answer) };
     const org = {
-      getThread: vi.fn(async () => ({ created_by: "u1" })),
+      getThread: vi.fn(async () => (options.thread === undefined ? { workspace_id: "ws1", created_by: "u1" } : options.thread)),
       getThreadRuntime: vi.fn(async () => options.row ?? null),
-      setThreadRuntimeAgent: vi.fn(async () => (options.setRow === undefined ? ROW : options.setRow)),
-      setThreadUiState: vi.fn(async () => ({})),
+      getMember: vi.fn(async (id: string) => MEMBERS.find((member) => member.user_id === id) ?? null),
+      getMembers: vi.fn(async () => MEMBERS),
     };
+    const workspace = { getIntegration: vi.fn(async () => (options.connectionOwner ? { created_by: options.connectionOwner } : null)) };
     const env = {
       AGENT_RUNTIME_DEFINITION: "def_1",
-      AGENT_RUNTIME_URL: "https://runtime.test",
-      AGENT_RUNTIME_API_TOKEN: "operator",
       ORG: { idFromName: (name: string) => name, get: () => org },
-      CHAT_THREAD: { idFromName: (name: string) => name, get: () => doStub },
+      CHAT_THREAD: { idFromName: (name: string) => name, get: () => chat },
+      WORKSPACE: { idFromName: (name: string) => name, get: () => workspace },
     } as unknown as ChatEnv;
-    return { env, doStub, org };
+    return { env, chat, org };
   }
-
-  const ok = (messages: unknown[]): RuntimeMigrationExport => ({
-    status: "ok", leaseId: "lease-1", messages: messages as never, previewTabs: [{ kind: "app", scriptName: "shop", isPublic: true } as never], previewActiveTabId: "app:shop",
-  });
 
   beforeEach(() => {
     vi.clearAllMocks();
     directEnabledMock.mockReturnValue(true);
     routeMock.mockResolvedValue({ route: { provider: "openrouter" } });
-    runtimeApiMock.mockResolvedValue({ id: "agt_new" });
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 201 }));
   });
 
-  it("moves a thread: an agent with its history, its preview tabs, then the row, then the DO told", async () => {
-    const { env, doStub, org } = fakeEnv(ok([user("hi")]));
-    const result = await migrateThreadToRuntime(env, context);
-    expect(result).toMatchObject({ status: "migrated", row: ROW, archived: false });
-    const [, method, path, body, headers] = runtimeApiMock.mock.calls[0];
-    expect([method, path]).toEqual(["POST", "/v1/agents"]);
-    expect(body).toMatchObject({ definition: "def_1", subject: "u1", context: { org: "org1", workspace: "ws1", thread: "t1" } });
-    expect(body.initialMessages).toEqual([importNote(false, body.initialMessages[0].timestamp), user("hi")]);
-    expect(headers["Idempotency-Key"]).toMatch(/^migrate_t1_[0-9a-f]{16}$/);
-    expect(org.setThreadUiState).toHaveBeenCalledWith("t1", { tabs: [{ kind: "app", scriptName: "shop", isPublic: true }], activeTabId: "app:shop" });
-    expect(org.setThreadRuntimeAgent).toHaveBeenCalledWith("t1", { agentId: "agt_new", model: null, keyScope: null, configured: null });
-    expect(doStub.completeRuntimeMigration).toHaveBeenCalledWith("lease-1", "agt_new");
-    expect(globalThis.fetch).not.toHaveBeenCalled();
+  it("has the thread's DO move it, acting for its creator", async () => {
+    const migrated = { status: "migrated", row: ROW, archived: false, stats: {} } as unknown as DoMigrationResult;
+    const { env, chat } = fakeEnv(migrated);
+    expect(await migrateThreadToRuntime(env, context)).toBe(migrated);
+    expect(chat.migrateToRuntime).toHaveBeenCalledWith({ context, subject: "u1", dryRun: undefined });
   });
 
-  it("puts the import note after the last compaction summary, where the model still sees it", async () => {
-    const { env } = fakeEnv(ok([user("old"), user("[Context Summary]\n\nEarlier."), user("now")]));
-    await migrateThreadToRuntime(env, context);
-    const roles = runtimeApiMock.mock.calls[0][3].initialMessages.map((message: { role: string; content?: string }) =>
-      message.role === "user" ? message.content?.slice(0, 22) : message.role);
-    expect(roles).toEqual(["old", "compactionSummary", "<camelai system messag", "now"]);
+  it("moves a thread of the caller's workspace only", async () => {
+    const elsewhere = fakeEnv({ status: "skipped", reason: "moved" }, { thread: { workspace_id: "ws_other", created_by: "u1" } });
+    expect(await migrateThreadToRuntime(elsewhere.env, context)).toEqual({ status: "skipped", reason: "not a thread of this workspace" });
+    expect(elsewhere.chat.migrateToRuntime).not.toHaveBeenCalled();
+    expect(elsewhere.org.getThreadRuntime).not.toHaveBeenCalled();
+    const missing = fakeEnv({ status: "skipped", reason: "moved" }, { thread: null });
+    expect(await migrateThreadToRuntime(missing.env, context)).toMatchObject({ status: "skipped" });
+    expect(missing.chat.migrateToRuntime).not.toHaveBeenCalled();
   });
 
-  it("archives the original transcript when the import is not all of it", async () => {
-    const { env } = fakeEnv(ok([assistantCall("tc1", "read", {}), toolResult("tc1", "read", "z".repeat(MAX_TOOL_RESULT_CHARS + 1))]));
-    expect(await migrateThreadToRuntime(env, context)).toMatchObject({ status: "migrated", archived: true });
-    const [url, init] = vi.mocked(globalThis.fetch).mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("https://runtime.test/v1/agents/agt_new/uploads/camel-migration/original-transcript.jsonl");
-    expect(init.method).toBe("PUT");
-    expect(String(init.body).split("\n")).toHaveLength(2);
-  });
-
-  it("leaves the thread on the DO when anything fails before the row: agent deleted, lease released", async () => {
-    const { env, doStub, org } = fakeEnv(ok([assistantCall("tc1", "read", {}), toolResult("tc1", "read", "z".repeat(MAX_TOOL_RESULT_CHARS + 1))]));
-    vi.mocked(globalThis.fetch).mockResolvedValue(new Response("nope", { status: 500 }));
-    const result = await migrateThreadToRuntime(env, context);
-    expect(result).toMatchObject({ status: "failed" });
-    expect(runtimeApiMock).toHaveBeenCalledWith(expect.anything(), "DELETE", "/v1/agents/agt_new");
-    expect(doStub.abortRuntimeMigration).toHaveBeenCalledWith("lease-1");
-    expect(org.setThreadRuntimeAgent).not.toHaveBeenCalled();
-    expect(doStub.completeRuntimeMigration).not.toHaveBeenCalled();
-  });
-
-  it("reports a dry run without moving anything", async () => {
-    const { env, doStub, org } = fakeEnv(ok([user("hi")]));
-    const result = await migrateThreadToRuntime(env, context, { dryRun: true });
-    expect(result).toMatchObject({ status: "dry_run", lossy: false, stats: { total: 1, imported: 1 } });
-    expect(runtimeApiMock).not.toHaveBeenCalled();
-    expect(org.setThreadRuntimeAgent).not.toHaveBeenCalled();
-    expect(doStub.abortRuntimeMigration).toHaveBeenCalledWith("lease-1");
+  it("acts for the channel's connection owner, or the org's owner, when the creator is no member", async () => {
+    const channel = fakeEnv({ status: "busy", reason: "running" }, { thread: { workspace_id: "ws1", created_by: "slack", channel_connection_id: "conn1" }, connectionOwner: "connector" });
+    await migrateThreadToRuntime(channel.env, context);
+    expect(channel.chat.migrateToRuntime).toHaveBeenCalledWith(expect.objectContaining({ subject: "connector" }));
+    const scheduled = fakeEnv({ status: "busy", reason: "running" }, { thread: { workspace_id: "ws1", created_by: "system" } });
+    await migrateThreadToRuntime(scheduled.env, context);
+    expect(scheduled.chat.migrateToRuntime).toHaveBeenCalledWith(expect.objectContaining({ subject: "owner1" }));
   });
 
   it("adopts a relay thread, and waits out a busy one", async () => {
@@ -226,20 +237,20 @@ describe("migrateThreadToRuntime", () => {
 
   it("leaves a thread whose model has no runtime route on ChatThreadDO", async () => {
     routeMock.mockResolvedValueOnce({ route: null });
-    const unrouted = fakeEnv(ok([user("hi")]));
+    const unrouted = fakeEnv({ status: "skipped", reason: "moved" });
     expect(await migrateThreadToRuntime(unrouted.env, context)).toEqual({ status: "skipped", reason: "no runtime route for its model" });
-    expect(unrouted.doStub.beginRuntimeMigration).not.toHaveBeenCalled();
+    expect(unrouted.chat.migrateToRuntime).not.toHaveBeenCalled();
     // Checking the route must not move the thread to the free model (the DO does that at its next run).
     expect(routeMock).toHaveBeenCalledWith(unrouted.env, context, { persistFallback: false });
     routeMock.mockRejectedValueOnce(new Error("unknown model"));
-    expect(await migrateThreadToRuntime(fakeEnv(ok([])).env, context)).toEqual({ status: "skipped", reason: "its model did not resolve: unknown model" });
+    expect(await migrateThreadToRuntime(fakeEnv({ status: "relay" }).env, context)).toEqual({ status: "skipped", reason: "its model did not resolve: unknown model" });
   });
 
   it("does nothing for a thread already on the runtime, or where direct threads are off", async () => {
-    const onRuntime = fakeEnv(ok([]), { row: ROW });
+    const onRuntime = fakeEnv({ status: "relay" }, { row: ROW });
     expect(await migrateThreadToRuntime(onRuntime.env, context)).toMatchObject({ status: "runtime" });
-    expect(onRuntime.doStub.beginRuntimeMigration).not.toHaveBeenCalled();
+    expect(onRuntime.chat.migrateToRuntime).not.toHaveBeenCalled();
     directEnabledMock.mockReturnValue(false);
-    expect(await migrateThreadToRuntime(fakeEnv(ok([])).env, context)).toMatchObject({ status: "skipped" });
+    expect(await migrateThreadToRuntime(fakeEnv({ status: "relay" }).env, context)).toMatchObject({ status: "skipped" });
   });
 });

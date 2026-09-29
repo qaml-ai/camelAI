@@ -7,8 +7,9 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import type { ThreadRuntimeRecord } from "../identity/org-do.js";
-import { archiveTranscript, convertTranscript, createAgentWithHistory, deleteUnusedAgent } from "./thread-migration.js";
-import { runtimeApi } from "./runtime-api.js";
+import { ARCHIVE_FILE_NAME, ARCHIVE_REQUEST_ID, convertTranscript, withImportNote } from "./thread-migration.js";
+import { RuntimeApiError, runtimeApi, runtimeUrl } from "./runtime-api.js";
+import { runtimeSystemPromptAppend } from "./run-gates.js";
 
 export type RuntimeForkResult =
   | { status: "forked"; row: ThreadRuntimeRecord }
@@ -33,30 +34,75 @@ export async function forkRuntimeThread(
   while (end < history.length && (history[end] as { role?: string }).role === "toolResult") end++;
   const forked: AgentMessage[] = history.slice(0, end);
   const converted = convertTranscript(forked);
+  if (converted.tooLarge) return { status: "failed", error: "The thread's history is too large to fork" };
 
   const org = env.ORG.get(env.ORG.idFromName(target.orgId)) as unknown as {
+    getThread(threadId: string): Promise<{ created_by?: string | null } | null>;
     getThreadUiState(threadId: string): Promise<{ preview?: { tabs?: unknown[]; activeTabId?: string | null } | null } | null>;
     setThreadUiState(threadId: string, preview: Record<string, unknown> | null): Promise<unknown>;
-    setThreadRuntimeAgent(threadId: string, update: {
-      agentId: string;
-      model: string | null;
-      keyScope: string | null;
-      configured: null;
-    }): Promise<ThreadRuntimeRecord | null>;
+    claimThreadRuntimeAgent(threadId: string, agentId: string): Promise<{ row: ThreadRuntimeRecord; claimed: boolean } | null>;
   };
   let agentId: string | null = null;
   try {
-    agentId = await createAgentWithHistory(env, target, converted.messages, "fork");
-    if (converted.lossy) await archiveTranscript(env, agentId, forked);
+    const thread = await org.getThread(target.threadId);
+    // A shortened fork says where its original is; a whole one needs no note.
+    const initialMessages = converted.lossy ? withImportNote(converted.messages, true) : converted.messages;
+    agentId = await createForkAgent(env, target, thread?.created_by?.trim() || target.userId || null, initialMessages);
+    if (converted.lossy) await archiveHistory(env, agentId, forked);
     const preview = (await org.getThreadUiState(source.threadId))?.preview;
     if (preview?.tabs?.length) {
       await org.setThreadUiState(target.threadId, { tabs: preview.tabs, activeTabId: preview.activeTabId ?? null });
     }
-    const row = await org.setThreadRuntimeAgent(target.threadId, { agentId, model: null, keyScope: null, configured: null });
-    if (!row) throw new Error("Thread not found");
-    return { status: "forked", row };
+    const claim = await org.claimThreadRuntimeAgent(target.threadId, agentId);
+    if (!claim) throw new Error("Thread not found");
+    if (!claim.claimed) throw new Error("The fork already has an agent");
+    return { status: "forked", row: claim.row };
   } catch (error) {
-    if (agentId) await deleteUnusedAgent(env, agentId);
+    if (agentId) await deleteAgent(env, agentId);
     return { status: "failed", error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/**
+ * The fork's agent, with its history and no model or configuration (the
+ * thread's first send configures it). The same history makes the same agent
+ * (a retried fork gets it back), never a second one.
+ */
+async function createForkAgent(env: ChatEnv, context: ChatContextState, subject: string | null, initialMessages: AgentMessage[]): Promise<string> {
+  const history = JSON.stringify(initialMessages);
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(history));
+  const key = `fork_${context.threadId}_${[...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 16)}`;
+  const created = await runtimeApi(env, "POST", "/v1/agents", {
+    definition: env.AGENT_RUNTIME_DEFINITION,
+    name: context.threadId,
+    type: "camelai-thread",
+    ttlSeconds: null,
+    systemPromptAppend: runtimeSystemPromptAppend(env, context),
+    fileTools: false,
+    ...(subject ? { subject } : {}),
+    context: { org: context.orgId, workspace: context.workspaceId, thread: context.threadId },
+    ...(initialMessages.length ? { initialMessages } : {}),
+  }, { "Idempotency-Key": key }) as { id?: unknown };
+  if (typeof created?.id !== "string") throw new Error("Agent runtime returned no agent id");
+  return created.id;
+}
+
+/** The forked history as it was, into the fork agent's workspace, when the fork had to shorten it. */
+async function archiveHistory(env: ChatEnv, agentId: string, messages: AgentMessage[]): Promise<void> {
+  const response = await fetch(
+    `${runtimeUrl(env)}/v1/agents/${encodeURIComponent(agentId)}/uploads/${ARCHIVE_REQUEST_ID}/${ARCHIVE_FILE_NAME}`,
+    {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${env.AGENT_RUNTIME_API_TOKEN ?? ""}`, "Content-Type": "application/x-ndjson" },
+      body: messages.map((message) => JSON.stringify(message)).join("\n"),
+    },
+  );
+  await response.body?.cancel();
+  if (!response.ok) throw new Error(`Could not save the forked history: HTTP ${response.status}`);
+}
+
+async function deleteAgent(env: ChatEnv, agentId: string): Promise<void> {
+  await runtimeApi(env, "DELETE", `/v1/agents/${encodeURIComponent(agentId)}`).catch((cause: unknown) => {
+    if (!(cause instanceof RuntimeApiError && cause.status === 404)) console.warn("[runtime-thread] could not delete a failed fork's agent", cause);
+  });
 }

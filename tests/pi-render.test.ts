@@ -185,6 +185,24 @@ describe("piRender and scratch files", () => {
     ]);
   });
 
+  it("shows a user message's inline images (a moved thread's) as thumbnails from their bytes", () => {
+    const message = {
+      role: "user",
+      timestamp: 1,
+      content: [
+        { type: "text", text: "what is in this image?" },
+        { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+        { type: "image", data: "PHN2Zz4=", mimeType: "image/svg+xml" },
+        { type: "image", data: "", mimeType: "image/png" },
+      ],
+    } as unknown as AgentMessage;
+    expect(render([message]).messages[0].content).toEqual([
+      { type: "text", text: "what is in this image?" },
+      { type: "file", path: "image-1.png", name: "image-1.png", href: "data:image/png;base64,iVBORw0KGgo=", contentType: "image/png" },
+      { type: "file", path: "image-2.svg", name: "image-2.svg", href: "data:image/svg+xml;base64,PHN2Zz4=", contentType: "image/svg+xml" },
+    ]);
+  });
+
   it("shows an upload once: by its R2 reference when the text has one, not also by its runtime attachment", () => {
     const message = {
       role: "user",

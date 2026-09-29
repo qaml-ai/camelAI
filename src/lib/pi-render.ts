@@ -32,6 +32,8 @@ type Part = {
   id?: string; name?: string; arguments?: unknown;
   /** A file reference (`type: "file"`): the path as the agent sees it, its size and type. */
   path?: string; size?: number; contentType?: string;
+  /** An inline image (`type: "image"`): its base64 bytes and type. */
+  data?: string; mimeType?: string;
 };
 type PiUser = {
   role: "user";
@@ -99,6 +101,17 @@ function fileBlock(threadId: string, file: { path: string; contentType?: unknown
     ...(typeof file.size === "number" && Number.isFinite(file.size) ? { size: file.size } : {}),
     ...(typeof file.caption === "string" && file.caption.trim() ? { caption: file.caption.trim() } : {}),
   };
+}
+
+function isImagePart(part: unknown): part is Part & { data: string; mimeType: string } {
+  return isRecord(part) && part.type === "image" && typeof part.data === "string" && part.data.length > 0
+    && typeof part.mimeType === "string" && part.mimeType.startsWith("image/");
+}
+
+/** An inline image a user message carries (a moved thread's, a channel's), shown as its thumbnail. */
+function imageBlock(image: Part & { data: string; mimeType: string }, position: number): FileBlock {
+  const name = `image-${position + 1}.${image.mimeType.slice("image/".length).split("+")[0] || "png"}`;
+  return { type: "file", path: name, name, href: `data:${image.mimeType};base64,${image.data}`, contentType: image.mimeType };
 }
 
 function isFilePart(part: unknown): part is Part & { path: string } {
@@ -227,7 +240,7 @@ function assistantBlocks(message: AssistantMessage, results: ReadonlyMap<string,
   return blocks;
 }
 
-/** A user message's text, and its attached files as file blocks after it. */
+/** A user message's text, and its attached files and inline images as file blocks after it. */
 function userContent(threadId: string, content: string | Part[]): string | ContentBlock[] {
   const text = textOf(content);
   // Uploads stay in R2 and are also attached (uploads/<request>/): the text's
@@ -235,8 +248,13 @@ function userContent(threadId: string, content: string | Part[]): string | Conte
   const uploadsShown = parseUploadRefs(text).refs.length > 0;
   const files = (Array.isArray(content) ? content.filter(isFilePart) : [])
     .filter((file) => !(uploadsShown && file.path.startsWith("/workspace/uploads/")));
-  if (files.length === 0) return text;
-  return [...(text ? [{ type: "text" as const, text }] : []), ...files.map((file) => fileBlock(threadId, file))];
+  const images = Array.isArray(content) ? content.filter(isImagePart) : [];
+  if (files.length === 0 && images.length === 0) return text;
+  return [
+    ...(text ? [{ type: "text" as const, text }] : []),
+    ...files.map((file) => fileBlock(threadId, file)),
+    ...images.map(imageBlock),
+  ];
 }
 
 function timestampOf(message: unknown): number | undefined {

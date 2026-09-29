@@ -10,11 +10,24 @@ export interface RuntimeApiEnv {
 }
 
 export class RuntimeApiError extends Error {
-  /** The runtime's error `code` (e.g. IDEMPOTENCY_CONFLICT): stable, where the message is not. */
-  constructor(message: string, readonly status: number, readonly code: string | null = null) {
+  /**
+   * The runtime's error `code` (e.g. IDEMPOTENCY_CONFLICT): stable, where the
+   * message is not. `retryAfterMs`: how long it asked callers to wait (a 429
+   * or 503's Retry-After), when it said.
+   */
+  constructor(message: string, readonly status: number, readonly code: string | null = null, readonly retryAfterMs: number | null = null) {
     super(message);
     this.name = "RuntimeApiError";
   }
+}
+
+/** A Retry-After header (seconds, or an HTTP date) as milliseconds from now, or null. */
+export function retryAfterMs(header: string | null | undefined, now = Date.now()): number | null {
+  const value = header?.trim();
+  if (!value) return null;
+  if (/^\d+$/.test(value)) return Number(value) * 1000;
+  const at = Date.parse(value);
+  return Number.isFinite(at) ? Math.max(0, at - now) : null;
 }
 
 export function runtimeUrl(env: RuntimeApiEnv): string {
@@ -80,7 +93,12 @@ export async function runtimeApi(
     const code = parsed && typeof parsed === "object" && typeof (parsed as { code?: unknown }).code === "string"
       ? (parsed as { code: string }).code
       : null;
-    throw new RuntimeApiError(`Agent runtime ${method} ${path.split("?")[0]}: HTTP ${response.status} ${message}`, response.status, code);
+    throw new RuntimeApiError(
+      `Agent runtime ${method} ${path.split("?")[0]}: HTTP ${response.status} ${message}`,
+      response.status,
+      code,
+      retryAfterMs(response.headers.get("retry-after")),
+    );
   }
   return parsed;
 }

@@ -28,7 +28,7 @@ import type { ChatEnv } from "./types.js";
 import type { PreviewTarget } from "../../../../src/types.js";
 import type { ThreadRuntimeRecord } from "../identity/org-do.js";
 import type { PiCoreRevision } from "./pi-core-store.js";
-import { RuntimeApiError, provisionedAgentId, runtimeApi, runtimeUrl } from "../agent-runtime/runtime-api.js";
+import { RuntimeApiError, provisionedAgentId, retryAfterMs, runtimeApi, runtimeUrl } from "../agent-runtime/runtime-api.js";
 import { runtimeSystemPromptAppend, type RuntimeAgentModel } from "../agent-runtime/run-gates.js";
 import { RUNTIME_PROMPT_VERSION } from "./runtime-agent.js";
 import {
@@ -194,7 +194,12 @@ async function runtimeError(method: string, path: string, response: Response): P
   } catch {
     // Not JSON.
   }
-  return new RuntimeApiError(`Agent runtime ${method} ${path}: HTTP ${response.status} ${text.slice(0, 500)}`, response.status, code);
+  return new RuntimeApiError(
+    `Agent runtime ${method} ${path}: HTTP ${response.status} ${text.slice(0, 500)}`,
+    response.status,
+    code,
+    retryAfterMs(response.headers.get("retry-after")),
+  );
 }
 
 export class ChatThreadRuntimeMigration {
@@ -360,8 +365,15 @@ export class ChatThreadRuntimeMigration {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const permanent = permanentRefusal(error);
-      this.fail(leaseId, permanent ? `${permanent}: ${message}` : message, permanent ? PERMANENT_FAILURE_RETRY_MS : undefined);
-      return permanent ? { status: "skipped", reason: `${permanent}: ${message}` } : { status: "failed", error: message };
+      // The runtime asked for a pause (429, 503): the thread waits at least that long, and so does a sweep.
+      const asked = error instanceof RuntimeApiError ? error.retryAfterMs : null;
+      this.fail(
+        leaseId,
+        permanent ? `${permanent}: ${message}` : message,
+        permanent ? PERMANENT_FAILURE_RETRY_MS : asked !== null ? Math.max(asked, migrationBackoffMs(1)) : undefined,
+      );
+      if (permanent) return { status: "skipped", reason: `${permanent}: ${message}` };
+      return asked !== null ? { status: "failed", error: message, retryAfterMs: asked } : { status: "failed", error: message };
     }
   }
 

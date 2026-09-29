@@ -321,7 +321,7 @@ export type RuntimeMigrationResult =
   | { status: "adopted" | "runtime"; row: ThreadRuntimeRecord }
   | { status: "busy"; reason: string }
   | { status: "skipped"; reason: string }
-  | { status: "failed"; error: string }
+  | { status: "failed"; error: string; retryAfterMs?: number }
   | { status: "dry_run"; stats: ConvertedTranscript["stats"]; lossy: boolean; bytes: number; model?: string; keyScope?: string | null };
 
 /** What ChatThreadDO#migrateToRuntime answers: a result, or "relay" (the worker adopts its agent). */

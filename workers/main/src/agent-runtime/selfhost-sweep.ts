@@ -125,18 +125,18 @@ export const DEFAULT_MOVE_TIMEOUT_MS = 3 * 60_000;
 /** The longest a step can take (its budget, then the moves it started): the driver waits longer. */
 export const MAX_STEP_MS = DEFAULT_BUDGET_MS + DEFAULT_MOVE_TIMEOUT_MS + 30_000;
 /** Moves failing (not busy) in one step that trip the breaker. */
-const BREAKER_FAILURES = 5;
+export const BREAKER_FAILURES = 5;
 /** The breaker's pause: 1 min, doubling, at most 30 min. */
-const breakerPauseMs = (trips: number) => Math.min(60_000 * 2 ** Math.max(0, trips - 1), 30 * 60_000);
+export const breakerPauseMs = (trips: number) => Math.min(60_000 * 2 ** Math.max(0, trips - 1), 30 * 60_000);
 /** A thread given up on (skipped) after this many failed tries, or this long since its first. */
-const GIVE_UP_ATTEMPTS = 12;
-const GIVE_UP_MS = 3 * 24 * 60 * 60_000;
+export const GIVE_UP_ATTEMPTS = 12;
+export const GIVE_UP_MS = 3 * 24 * 60 * 60_000;
 const STEP_LEASE_KEY = "selfhost_runtime_sweep_step";
 /** A thread that could not move now is tried again after 1 min, doubling, at most 1 h. */
-const RETRY_BASE_MS = 60_000;
+export const RETRY_BASE_MS = 60_000;
 const RETRY_MAX_MS = 60 * 60_000;
 /** Reasons a thread will not move however often it is tried: never retried within a start. */
-const PERMANENT = /^(too_large|invalid_history|refused_\d+|thread deleted|not a thread of this workspace)\b/;
+export const PERMANENT = /^(too_large|invalid_history|refused_\d+|thread deleted|not a thread of this workspace)\b/;
 
 function db(env: SweepEnv): D1Database {
   if (!env.APP_DB) throw new Error("APP_DB binding is not configured");
@@ -271,7 +271,7 @@ export function classifyMigration(result: RuntimeMigrationResult): Classified {
   }
 }
 
-function retryDelay(attempts: number): number {
+export function retryDelay(attempts: number): number {
   return Math.min(RETRY_BASE_MS * 2 ** Math.max(0, attempts - 1), RETRY_MAX_MS);
 }
 
@@ -292,21 +292,21 @@ type OrgSweepStub = {
  * startup driver, an operator's POST, a driver that restarted mid-step).
  * False while another step holds it.
  */
-async function acquireStepLease(env: SweepEnv, at: number, until: number): Promise<boolean> {
+export async function acquireStepLease(env: SweepEnv, at: number, until: number, key = STEP_LEASE_KEY): Promise<boolean> {
   const result = await db(env)
     .prepare(`INSERT INTO app_index_metadata (key, value, updated_at) VALUES (?, 'step', ?)
       ON CONFLICT(key) DO UPDATE SET updated_at = excluded.updated_at WHERE app_index_metadata.updated_at <= ?`)
-    .bind(STEP_LEASE_KEY, until, at)
+    .bind(key, until, at)
     .run();
   return Number(result.meta?.changes ?? 0) > 0;
 }
 
-async function releaseStepLease(env: SweepEnv): Promise<void> {
-  await db(env).prepare("UPDATE app_index_metadata SET updated_at = 0 WHERE key = ?").bind(STEP_LEASE_KEY).run();
+export async function releaseStepLease(env: SweepEnv, key = STEP_LEASE_KEY): Promise<void> {
+  await db(env).prepare("UPDATE app_index_metadata SET updated_at = 0 WHERE key = ?").bind(key).run();
 }
 
 /** Whether the runtime answers its health check, within a few seconds. */
-async function runtimeAnswers(env: ChatEnv): Promise<boolean> {
+export async function runtimeAnswers(env: ChatEnv): Promise<boolean> {
   try {
     const response = await fetch(`${runtimeUrl(env)}/healthz`, { signal: AbortSignal.timeout(5_000) });
     await response.body?.cancel();
@@ -316,7 +316,7 @@ async function runtimeAnswers(env: ChatEnv): Promise<boolean> {
   }
 }
 
-function withMoveTimeout<T>(promise: Promise<T>, ms: number): Promise<T | "timed out"> {
+export function withMoveTimeout<T>(promise: Promise<T>, ms: number): Promise<T | "timed out"> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<"timed out">((resolve) => { timer = setTimeout(() => resolve("timed out"), ms); });
   return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));

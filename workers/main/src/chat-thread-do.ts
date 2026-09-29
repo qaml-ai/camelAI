@@ -4398,6 +4398,11 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     return this.runtimeMigration.holds(agentId, key);
   }
 
+  /** How much transcript this thread stores (its pi_core rows' characters): the cloud sweep moves big ones one at a time. */
+  runtimeMigrationSize(): { chars: number; rows: number } {
+    return this.piCoreStore.piCoreVisibleWindowTotals(0);
+  }
+
   /** End a failed move's backoff (the admin retry route): the next open or send may move the thread. */
   clearRuntimeMigrationBackoff(): boolean {
     return this.runtimeMigration.clearBackoff();

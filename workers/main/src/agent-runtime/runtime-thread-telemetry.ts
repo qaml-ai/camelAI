@@ -130,13 +130,15 @@ export function recordRuntimeMigration(
   env: ObservabilityEnv | undefined,
   context: RuntimeThreadTelemetryContext,
   result: RuntimeMigrationResult,
+  /** blob4: who asked, "migrate" (an open or a send) or "sweep". */
+  operation: "migrate" | "sweep" = "migrate",
 ): void {
   const stats = "stats" in result ? result.stats : null;
   recordObservabilityEvent(env, {
     event: "runtime_thread_migration",
     severity: result.status === "failed" ? "warn" : "info",
     component: "runtime_thread",
-    operation: "migrate",
+    operation,
     ...ids(context),
     status: result.status,
     errorName: "reason" in result ? result.reason : null,

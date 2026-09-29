@@ -491,6 +491,13 @@ export default {
   async scheduled(controller: ScheduledController, env: Env): Promise<void> {
     const { handleD1MirrorCron } = await import('./d1-mirror-cron.js');
     await handleD1MirrorCron(env, controller.scheduledTime);
+    // The cloud thread sweep, once an operator started it (agent-runtime/cloud-sweep.ts).
+    try {
+      const { runCloudSweepCron } = await import('./agent-runtime/cloud-sweep.js');
+      await runCloudSweepCron(env as unknown as Parameters<typeof runCloudSweepCron>[0]);
+    } catch (error) {
+      console.error('[runtime-migration-sweep] cron step failed', error);
+    }
   },
 
   async queue(

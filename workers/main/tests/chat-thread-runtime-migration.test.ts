@@ -26,7 +26,7 @@ import {
   migrationBackoffMs,
   type RuntimeMigrationRecord,
 } from "../src/chat-thread/runtime-migration";
-import { RuntimeApiError, provisionedAgentId } from "../src/agent-runtime/runtime-api";
+import { RuntimeApiError, provisionedAgentId, retryAfterMs } from "../src/agent-runtime/runtime-api";
 import { RUNTIME_PROMPT_VERSION } from "../src/chat-thread/runtime-agent";
 import { ARCHIVE_PATH, MAX_IMPORT_BYTES, MAX_TOOL_RESULT_CHARS, convertTranscript } from "../src/agent-runtime/thread-migration";
 import { renderArchiveToPiMessages } from "../src/chat-thread/render-archive-export";
@@ -444,6 +444,23 @@ describe("ChatThreadRuntimeMigration", () => {
       expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "skipped", reason: expect.stringContaining("invalid_history") });
       expect((h.record() as { retryAt: number }).retryAt).toBeGreaterThanOrEqual(Date.now() + PERMANENT_FAILURE_RETRY_MS - 1_000);
       expect(h.migration.status()).toMatchObject({ state: "backoff" });
+    });
+  });
+
+  describe("a runtime that asks to wait (the cloud sweep)", () => {
+    it("says how long the runtime asked to wait, and backs off at least that long", async () => {
+      const h = harness();
+      createResponse = async () => new Response(JSON.stringify({ error: "slow down" }), { status: 429, headers: { "Retry-After": "300" } });
+      expect(await h.migration.migrate({ context, subject: "u1", agentModel })).toMatchObject({ status: "failed", retryAfterMs: 300_000 });
+      expect((h.record() as { retryAt: number }).retryAt).toBeGreaterThanOrEqual(Date.now() + 299_000);
+      expect((h.record() as { retryAt: number }).retryAt).toBeLessThan(Date.now() + PERMANENT_FAILURE_RETRY_MS / 2);
+    });
+
+    it("reads Retry-After as seconds or a date", () => {
+      expect(retryAfterMs("120", 0)).toBe(120_000);
+      expect(retryAfterMs(new Date(60_000).toUTCString(), 0)).toBe(60_000);
+      expect(retryAfterMs("soon", 0)).toBeNull();
+      expect(retryAfterMs(null)).toBeNull();
     });
   });
 

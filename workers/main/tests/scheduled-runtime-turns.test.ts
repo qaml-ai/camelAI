@@ -107,6 +107,19 @@ describe("WorkspaceCronDO scheduled run outcomes for direct threads", () => {
     return runs[`scheduled_prompt:${promptId}`]![0]!;
   }
 
+  it("runs a system prompt on the runtime as the org's owner", async () => {
+    const { userId } = await createUser(testEnv, `cron-sys-${crypto.randomUUID()}@example.com`, "password123", "Cron Owner");
+    const { org } = await createOrg(testEnv, "Cron Org", userId);
+    const workspaceId = (await listUserWorkspaces(testEnv, userId, org.id))[0]!.id;
+    const cron = testEnv.WORKSPACE_CRON.get(testEnv.WORKSPACE_CRON.idFromName(workspaceId)) as DurableObjectStub<WorkspaceCronDO>;
+    const prompt = await cron.createScheduledPrompt({
+      workspaceId, name: "Digest", prompt: "Summarize.", cronExpression: "0 9 * * *", createdBy: "system", scheduledByThreadId: "origin",
+    });
+    await cron.runScheduledPromptNow(workspaceId, prompt.id);
+    expect(startRuntimeTurnMock).toHaveBeenCalledTimes(1);
+    expect(startRuntimeTurnMock.mock.calls[0][1]).toMatchObject({ sender: { userId, userName: "Scheduler" } });
+  });
+
   it("keeps the reported outcome on the run in progress, once, and finishes the run with it", async () => {
     const { cron, workspaceId, promptId, runId, threadId } = await startedRun();
     expect(await cron.reportScheduledRunOutcome({ workspaceId, threadId, status: "success", summary: "Digest sent" }))

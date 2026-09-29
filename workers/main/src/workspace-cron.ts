@@ -35,7 +35,7 @@ import {
 import type { LlmModel } from "../../../src/types";
 import type { ChatEnv } from "./chat-thread/types";
 import { startScheduledRuntimeTurn } from "./agent-runtime/scheduled-turns";
-import { pinNewThreadToRuntime } from "./agent-runtime/thread-runtime";
+import { pinNewThreadToRuntime, runtimeDirectThreadsEnabled } from "./agent-runtime/thread-runtime";
 import {
   readOrgModelPickerConfig,
   readWorkspaceModelPickerConfig,
@@ -1137,6 +1137,18 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     return created.id;
   }
 
+  /**
+   * Who a scheduled run acts for on the runtime: the prompt's creator, or
+   * for a "system" prompt the org's owner. Null when there is no one.
+   */
+  private async scheduledRunActor(prompt: WorkspaceScheduledPrompt, workspace: WorkspaceInfo): Promise<string | null> {
+    const creator = prompt.created_by?.trim();
+    if (creator && creator !== "system") return creator;
+    if (!runtimeDirectThreadsEnabled(this.env as unknown as ChatEnv)) return null;
+    const members = await this.getOrgStub(workspace.org_id).getMembers();
+    return members.find((member) => member.role === "owner")?.user_id ?? null;
+  }
+
   /** A new prompt thread runs directly on the runtime where new threads do. */
   private async pinScheduledThread(workspace: WorkspaceInfo, threadId: string): Promise<void> {
     await pinNewThreadToRuntime(this.env as unknown as ChatEnv, {
@@ -1210,14 +1222,14 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       startedAt: scheduledForMs,
       threadId,
     });
-    const creator = prompt.created_by?.trim();
-    if (creator && creator !== "system") {
-      try {
+    try {
+      const actor = await this.scheduledRunActor(prompt, workspace);
+      if (actor) {
         const direct = await startScheduledRuntimeTurn(this.env as unknown as ChatEnv, {
           orgId: workspace.org_id,
           workspaceId: workspace.id,
           threadId,
-          userId: creator,
+          userId: actor,
           runId,
           message: this.buildScheduledMessage(prompt, scheduledForMs),
         });
@@ -1229,9 +1241,9 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
             threadId,
           };
         }
-      } catch (error) {
-        return { status: "error", error: error instanceof Error ? error.message : String(error), threadId };
       }
+    } catch (error) {
+      return { status: "error", error: error instanceof Error ? error.message : String(error), threadId };
     }
     if (!this.env.CHAT_THREAD) {
       return {

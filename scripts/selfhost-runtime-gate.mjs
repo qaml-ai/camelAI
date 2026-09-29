@@ -45,7 +45,12 @@ export function runtimeMigrationGate({ sweep, orgCount, allowUnmigrated = false,
         `report the sweep complete, then upgrade to this one. ${help}`,
     };
   }
-  if (sweep.status !== "complete" || !sweep.completedAt) {
+  // A complete pass counts while a later one rechecks (every start, every six
+  // hours): the threads it had left are what `completedRemaining` says.
+  const completedBefore = sweep.completedAt && sweep.completedRemaining !== null && sweep.completedRemaining !== undefined;
+  const finished = sweep.status === "complete" && sweep.completedAt;
+  const waitingAccepted = allowUnmigrated && sweep.status === "waiting";
+  if (!finished && !completedBefore && !waitingAccepted) {
     return {
       ok: false,
       message:
@@ -54,7 +59,7 @@ export function runtimeMigrationGate({ sweep, orgCount, allowUnmigrated = false,
         `\`bun run selfhost:doctor\` reports it complete, then upgrade. ${help}`,
     };
   }
-  const remaining = Number(sweep.remaining ?? 0);
+  const remaining = Number((finished ? sweep.remaining : completedBefore ? sweep.completedRemaining : sweep.remaining) ?? 0);
   if (remaining > 0 && !allowUnmigrated) {
     return {
       ok: false,

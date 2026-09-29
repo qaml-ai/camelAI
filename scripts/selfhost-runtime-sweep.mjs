@@ -13,6 +13,13 @@ const RECHECK_COMPLETE_MS = 6 * 60 * 60_000;
 const RECHECK_BLOCKED_MS = 10 * 60_000;
 const MAX_WAIT_MS = 10 * 60_000;
 const ERROR_BACKOFF_MS = 30_000;
+/**
+ * How long one step may take: its budget, then the moves it started (up to
+ * DEFAULT_MOVE_TIMEOUT_MS each), with room to spare (selfhost-sweep.ts, MAX_STEP_MS).
+ */
+const STEP_TIMEOUT_MS = 5 * 60_000;
+/** How long to wait when another step holds the step lease. */
+const STEP_BUSY_MS = 5_000;
 
 export function sweepSummary(state) {
   const counts = state.counts ?? {};
@@ -25,6 +32,9 @@ export function sweepSummary(state) {
     case "blocked":
       return `blocked: ${state.error}`;
     default:
+      if (state.pausedUntil && state.pausedUntil > Date.now()) {
+        return `paused until ${new Date(state.pausedUntil).toISOString()}: ${state.error ?? "the agent runtime is failing"} (${base})`;
+      }
       return `${state.status} (${base})`;
   }
 }
@@ -58,7 +68,7 @@ export async function driveRuntimeSweep({
       method,
       headers: { Authorization: `Bearer ${adminKey}`, ...(body ? { "Content-Type": "application/json" } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}),
-      signal: AbortSignal.timeout(120_000),
+      signal: AbortSignal.timeout(STEP_TIMEOUT_MS),
     });
     const text = await response.text();
     if (!response.ok) throw new Error(`${method} ${SWEEP_PATH}: HTTP ${response.status} ${text.slice(0, 200)}`);
@@ -83,7 +93,12 @@ export async function driveRuntimeSweep({
       log.log?.(`[selfhost:runtime-sweep] ${summary}`);
       last = summary;
     }
-    if (state.status === "running") continue;
+    if (state.status === "running") {
+      // Another step holds the lease, or the breaker paused the sweep: wait, then step again.
+      if (state.stepInProgress) await sleep(STEP_BUSY_MS, signal);
+      else if (state.pausedUntil && state.pausedUntil > now()) await sleep(Math.min(state.pausedUntil - now(), MAX_WAIT_MS), signal);
+      continue;
+    }
     if (state.status === "waiting") {
       await sleep(Math.min(Math.max(1_000, (state.nextPassAt ?? now()) - now()), MAX_WAIT_MS), signal);
       continue;
@@ -104,7 +119,7 @@ export function sweepDoctorReport(report, { limit = 10 } = {}) {
   const describe = (records, label) => {
     const byReason = new Map();
     for (const record of records ?? []) {
-      const reason = record.reason.replace(/^(busy|failed|backoff): .*$/, "$1");
+      const reason = record.reason.replace(/^(busy|failed|backoff|gave up after \d+ attempts|invalid_history|refused_\d+|too_large): .*$/, "$1");
       byReason.set(reason, [...(byReason.get(reason) ?? []), record]);
     }
     for (const [reason, records] of byReason) {

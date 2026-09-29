@@ -96,7 +96,7 @@ describe("self-host thread sweep", () => {
     await startSweep(sweepEnv);
     // Each step may start one page (2 threads) before its budget, measured on a clock each move advances, runs out.
     const time = clock();
-    const step = () => runSweepStep(sweepEnv, {
+    const step = () => runSweepStep(sweepEnv, { probe: async () => true, 
       migrate: async (stepEnv, context) => { time.advance(1_000); return fake.migrate(stepEnv, context); },
       pageSize: 2,
       budgetMs: 1_500,
@@ -122,7 +122,7 @@ describe("self-host thread sweep", () => {
     await install([12]);
     const fake = fakeMigrate();
     await startSweep(sweepEnv);
-    const state = await runSweepStep(sweepEnv, { migrate: fake.migrate, concurrency: 3, pageSize: 12 });
+    const state = await runSweepStep(sweepEnv, { probe: async () => true,  migrate: fake.migrate, concurrency: 3, pageSize: 12 });
     expect(state.status).toBe("complete");
     expect(fake.calls).toHaveLength(12);
     expect(fake.maxInFlight()).toBe(3);
@@ -138,7 +138,7 @@ describe("self-host thread sweep", () => {
       [busy]: () => (++busyTries === 1 ? { status: "busy", reason: "a turn is running" } : undefined as never),
     });
     const time = clock();
-    const step = () => runSweepStep(sweepEnv, { migrate: fake.migrate, now: time.now });
+    const step = () => runSweepStep(sweepEnv, { probe: async () => true,  migrate: fake.migrate, now: time.now });
     await startSweep(sweepEnv, { now: time.now });
 
     const first = await step();
@@ -173,11 +173,11 @@ describe("self-host thread sweep", () => {
     const fake = fakeMigrate({ [org.threads[0]]: { status: "failed", error: "runtime unreachable" } });
     const time = clock();
     await startSweep(sweepEnv, { now: time.now });
-    expect((await runSweepStep(sweepEnv, { migrate: fake.migrate, now: time.now })).status).toBe("waiting");
+    expect((await runSweepStep(sweepEnv, { probe: async () => true,  migrate: fake.migrate, now: time.now })).status).toBe("waiting");
     // Opened by a user meanwhile: moved on open, so it has a row.
     await org.stub.pinThreadRuntime(org.threads[0]);
     time.advance(60 * 60_000);
-    const state = await runSweepStep(sweepEnv, { migrate: fake.migrate, now: time.now });
+    const state = await runSweepStep(sweepEnv, { probe: async () => true,  migrate: fake.migrate, now: time.now });
     expect(state).toMatchObject({ status: "complete", remaining: 0 });
     expect((await getSweepReport(sweepEnv)).retrying).toEqual([]);
   });
@@ -185,12 +185,128 @@ describe("self-host thread sweep", () => {
   it("stops, blocked, while direct threads are off, and a start resumes a pass under way", async () => {
     await install([2]);
     await startSweep(sweepEnv);
-    const blocked = await runSweepStep(sweepEnv, { migrate: async () => ({ status: "skipped", reason: "direct threads are off" }) });
+    const blocked = await runSweepStep(sweepEnv, { probe: async () => true,  migrate: async () => ({ status: "skipped", reason: "direct threads are off" }) });
     expect(blocked).toMatchObject({ status: "blocked", error: "direct threads are off" });
     const restarted = await startSweep(sweepEnv);
     expect(restarted).toMatchObject({ status: "running", pass: blocked.pass + 1 });
     // A start while a pass runs (the app restarted) resumes it rather than starting over.
     expect(await startSweep(sweepEnv)).toEqual(restarted);
+  });
+
+  it("starts no move once the budget is spent, and resumes at the first thread it did not try (S1)", async () => {
+    const [org] = await install([6]);
+    const fake = fakeMigrate();
+    const time = clock();
+    await startSweep(sweepEnv, { now: time.now });
+    const options = {
+      probe: async () => true,
+      migrate: async (stepEnv: ChatEnv, context: ChatContextState) => { time.advance(1_000); return fake.migrate(stepEnv, context); },
+      pageSize: 6,
+      concurrency: 1,
+      budgetMs: 2_500,
+      now: time.now,
+    };
+    const sorted = [...org.threads].sort();
+    const first = await runSweepStep(sweepEnv, options);
+    expect(fake.calls).toEqual(sorted.slice(0, 3));
+    expect(first.cursor).toEqual({ orgId: org.orgId, threadId: sorted[2] });
+    await runSweepStep(sweepEnv, options);
+    expect(fake.calls.slice(3, 4)).toEqual([sorted[3]]);
+  });
+
+  it("runs one step at a time, and leaves a move that takes too long to finish on its own (S1)", async () => {
+    const [org] = await install([2]);
+    await startSweep(sweepEnv);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const slow = runSweepStep(sweepEnv, {
+      probe: async () => true,
+      concurrency: 1,
+      pageSize: 1,
+      migrate: async () => { await held; return { status: "runtime", row: {} as never }; },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const other = await runSweepStep(sweepEnv, { probe: async () => true, migrate: async () => { throw new Error("must not run"); } });
+    expect(other.stepInProgress).toBe(true);
+    release();
+    await slow;
+
+    const stuck = await runSweepStep(sweepEnv, { probe: async () => true, moveTimeoutMs: 10, migrate: () => new Promise(() => {}) });
+    expect(stuck.counts.retrying).toBeGreaterThan(0);
+    expect((await getSweepReport(sweepEnv)).retrying[0]).toMatchObject({ reason: "busy: the move is still going" });
+    void org;
+  });
+
+  it("pauses when the runtime does not answer, or moves keep failing, and moves nothing meanwhile (S2)", async () => {
+    await install([8]);
+    const time = clock();
+    await startSweep(sweepEnv, { now: time.now });
+    const fake = fakeMigrate();
+    const down = await runSweepStep(sweepEnv, { probe: async () => false, migrate: fake.migrate, now: time.now });
+    expect(down.pausedUntil).toBe(time.now() + 60_000);
+    expect(fake.calls).toEqual([]);
+    expect((await runSweepStep(sweepEnv, { probe: async () => true, migrate: fake.migrate, now: time.now })).pausedUntil).toBe(down.pausedUntil);
+    expect(fake.calls).toEqual([]);
+    time.advance(60_001);
+    const failing = await runSweepStep(sweepEnv, { probe: async () => true, concurrency: 1, now: time.now, migrate: async () => ({ status: "failed", error: "runtime 503" }) });
+    expect(failing.counts.checked).toBe(5);
+    expect(failing.pausedUntil).toBe(time.now() + 2 * 60_000);
+    expect(failing.breakerTrips).toBe(2);
+  });
+
+  it("gives up on a thread that keeps failing: skipped, with the reason (S4)", async () => {
+    const [org] = await install([1]);
+    const time = clock();
+    await startSweep(sweepEnv, { now: time.now });
+    const fake = fakeMigrate({ [org.threads[0]]: { status: "busy", reason: "a turn is running" } });
+    await runSweepStep(sweepEnv, { probe: async () => true, migrate: fake.migrate, now: time.now });
+    await testEnv.APP_DB!.prepare("UPDATE selfhost_runtime_sweep_threads SET attempts = 11, next_attempt_at = 0").run();
+    time.advance(60 * 60_000);
+    const state = await runSweepStep(sweepEnv, { probe: async () => true, migrate: fake.migrate, now: time.now });
+    expect(state).toMatchObject({ status: "complete", remaining: 1 });
+    expect((await getSweepReport(sweepEnv)).skipped[0].reason).toBe("gave up after 12 attempts: busy: a turn is running");
+  });
+
+  it("passes over an org it cannot read, with a record, and moves the others' threads (S5)", async () => {
+    const [bad, good] = await install([1, 2]);
+    const real = testEnv.ORG as unknown as DurableObjectNamespace;
+    const env = {
+      ...sweepEnv,
+      ORG: {
+        idFromName: (name: string) => ({ name, id: real.idFromName(name) }),
+        get: (id: { name: string; id: DurableObjectId }) => (id.name === bad.orgId
+          ? { listThreadsWithoutRuntime: async () => { throw new Error("OrgDO reset"); }, countThreadsWithoutRuntime: async () => { throw new Error("OrgDO reset"); } }
+          : real.get(id.id)),
+      },
+    } as unknown as ChatEnv & { APP_DB: D1Database };
+    const fake = fakeMigrate();
+    await startSweep(env);
+    const state = await runSweepStep(env, { probe: async () => true, migrate: fake.migrate });
+    expect(fake.calls.sort()).toEqual([...good.threads].sort());
+    expect(state.status).toBe("waiting");
+    expect((await getSweepReport(env)).retrying).toMatchObject([{ threadId: `org:${bad.orgId}`, reason: expect.stringContaining("could not read the org") }]);
+  });
+
+  it("counts every org's threads before it says complete: one that came meanwhile starts another pass (S6)", async () => {
+    const orgs = await install([1, 1]);
+    const [first] = [...orgs].sort((left, right) => (left.orgId < right.orgId ? -1 : 1));
+    const fake = fakeMigrate();
+    await startSweep(sweepEnv);
+    const late: string[] = [];
+    const state = await runSweepStep(sweepEnv, {
+      probe: async () => true,
+      migrate: async (stepEnv, context) => {
+        // A thread made in an org the pass already walked.
+        if (context.orgId !== first.orgId && late.length === 0) {
+          late.push((await first.stub.createThread(first.workspaceId, "Late", "u")).id);
+        }
+        return fake.migrate(stepEnv, context);
+      },
+    });
+    expect(state).toMatchObject({ status: "running", pass: 2 });
+    const next = await runSweepStep(sweepEnv, { probe: async () => true, migrate: fake.migrate });
+    expect(next).toMatchObject({ status: "complete", remaining: 0, completedRemaining: 0 });
+    expect(fake.calls).toContain(late[0]);
   });
 
   it("classifies every result of a move", () => {
@@ -200,5 +316,8 @@ describe("self-host thread sweep", () => {
     expect(classifyMigration({ status: "skipped", reason: "backoff: lease ran out" })).toMatchObject({ outcome: "retry" });
     expect(classifyMigration({ status: "failed", error: "x" })).toMatchObject({ outcome: "retry", reason: "failed: x" });
     expect(classifyMigration({ status: "skipped", reason: "too_large" })).toEqual({ outcome: "skipped", reason: "too_large" });
+    // A model that did not resolve just now is tried again (S3).
+    expect(classifyMigration({ status: "skipped", reason: "its model did not resolve: gone" })).toMatchObject({ outcome: "retry" });
+    expect(classifyMigration({ status: "skipped", reason: "invalid_history: initialMessages[3]" })).toMatchObject({ outcome: "skipped" });
   });
 });

@@ -628,8 +628,14 @@ in-app loop and moves each with its history (the same move a thread makes
 when it is opened; a very long history is imported up to the runtime's limit,
 and the full original transcript is kept in the thread's files).
 
-- **Bounded.** A few threads move at once, one short step at a time, so users
-  keep working; a thread with a turn running is left alone and retried later.
+- **Bounded.** A few threads move at once, one short step at a time (never
+  two steps together), so users keep working; a thread with a turn running is
+  left alone and retried later, and a move that takes minutes (a very long
+  history) finishes on its own while the sweep goes on.
+- **Paused when the runtime fails.** If the runtime does not answer, or
+  several moves fail in one step, the sweep pauses (1 minute, doubling, at
+  most 30) rather than burn through every thread; the doctor and the log say
+  so.
 - **Resumable.** Its progress (a cursor per org and thread, and a record of
   every thread it could not move yet) is in the app's D1 database, so a
   restart resumes where it stopped. After a complete pass it looks again every
@@ -652,9 +658,15 @@ and the full original transcript is kept in the thread's files).
   or whose
   history cannot be imported at all (`too_large`), stays on the in-app loop
   and keeps working there. Busy threads and failed attempts are retried with a
-  growing delay (1 minute, doubling, at most an hour); a skipped thread is
-  tried again at the next start, after you fixed its cause (allowed the
-  endpoint's range, changed the thread's model).
+  growing delay (1 minute, doubling, at most an hour); one still failing after
+  12 tries or 3 days is skipped ("gave up after …"). A skipped thread is tried
+  again at the next start, after you fixed its cause (allowed the endpoint's
+  origin, changed the thread's model), except one the runtime will never take
+  (`too_large`, `invalid_history`). An organization the app cannot read is
+  passed over, recorded, and tried again with the retries.
+- **Complete means counted.** Before it reports complete, the sweep counts
+  every organization's threads still on the in-app loop; threads that came
+  while it ran start another pass.
 - `SELFHOST_RUNTIME_SWEEP=0` turns the sweep off.
 
 ### The version gate
@@ -670,7 +682,10 @@ completed, and prints what is left and a pointer here:
   with no organizations yet, is never refused.
 - **Threads the sweep skipped.** They also stop the upgrade, since they would
   no longer open. Fix their cause and restart the app (the sweep tries them
-  again), or accept losing them with `SELFHOST_ALLOW_UNMIGRATED_THREADS=1`.
+  again), or accept losing them with `SELFHOST_ALLOW_UNMIGRATED_THREADS=1`
+  (which also accepts a sweep still waiting on retries).
+- **A recheck under way.** The sweep looks again at every start and every six
+  hours; while it does, the gate goes by its last complete pass.
 
 The gate runs before the app's web server starts (in the D1 migration step),
 so a refused upgrade serves nothing; `selfhost:upgrade --rollback` returns to

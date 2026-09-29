@@ -207,7 +207,7 @@ import {
   piCoreForkMessageIds,
   piCoreMessageToParsedChatMessage,
   attachPiToolResultToParsedMessages,
-  summarizeAdminExplorerThread,
+  piMessagesToParsedMessages,
 } from "./pi-message-export";
 
 // Pure Pi model/provider mapping helpers live in ./pi-model-resolution.
@@ -399,7 +399,7 @@ import {
   runtimeModelRoute,
   type RuntimeModelRoute,
 } from "./agent-runtime/model-routes";
-import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, syncOrgKeyScope } from "./agent-runtime/key-scopes";
+import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, selfhostOperatorEndpointOrigin, syncOrgKeyScope } from "./agent-runtime/key-scopes";
 import { storedThreadModel } from "./agent-runtime/run-gates";
 
 // Pi tool-definition surface (executor-style tool list + Agent/Explore
@@ -431,7 +431,6 @@ import type {
 // use and re-exported below so existing `from "./chat-thread-do"` import paths
 // keep working for external callers.
 import type {
-  AdminExplorerThreadSummary,
   AgentEvalParsedMessage,
   AgentEvalSessionRequest,
   AgentEvalSessionResult,
@@ -456,7 +455,6 @@ import type {
   PreviewTarget,
 } from "./chat-thread/types";
 export type {
-  AdminExplorerThreadSummary,
   AgentEvalDeployedApp,
   AgentEvalParsedMessage,
   AgentEvalSessionRequest,
@@ -4056,23 +4054,13 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     threadId: string,
   ): Promise<AgentEvalParsedMessage[]> {
     const normalizedThreadId = threadId.trim() || this.chatContext?.threadId || "";
-    const parsed: AgentEvalParsedMessage[] = [];
-
     // The browser rebuilds live assistant/tool content from the replay buffer,
     // so only canonical persisted history is returned here.
     const storedMessages = await this.loadFullPiCoreTranscriptUnbounded({
       includeUiMetadata: true,
       imagePolicy: "render",
     });
-    storedMessages.forEach((message, index) => {
-      const record = message as unknown as Record<string, unknown>;
-      if (record.role === "toolResult") {
-        attachPiToolResultToParsedMessages(parsed, record);
-        return;
-      }
-      parsed.push(...piCoreMessageToParsedChatMessage(message, index, normalizedThreadId));
-    });
-    return parsed;
+    return piMessagesToParsedMessages(storedMessages, normalizedThreadId);
   }
 
   /**
@@ -4314,19 +4302,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       messages,
       projectActivity: await this.listProjectActivity(),
     };
-  }
-
-  async getAdminExplorerSummary(input: {
-    userMessageCap?: number;
-  } = {}): Promise<AdminExplorerThreadSummary> {
-    const messages = await this.loadFullPiCoreTranscriptUnbounded({
-      includeUiMetadata: true,
-      imagePolicy: "render",
-    });
-    return summarizeAdminExplorerThread(messages, {
-      userMessageCap: input.userMessageCap,
-      sessionModelId: this.piSession?.state.model?.id,
-    });
   }
 
   private runtimeMigrationInstance: ChatThreadRuntimeMigration | null = null;
@@ -8056,6 +8031,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     return runtimeModelRoute(config, {
       orgId: this.chatContext?.orgId ?? "",
       freeTier: isCreditFreeHostedModel(this.currentThreadModel),
+      operatorEndpointOrigin: selfhostOperatorEndpointOrigin(this.env),
     });
   }
 
@@ -8108,12 +8084,11 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   private async hostedCreditRemainingUsd(orgId: string): Promise<number | null> {
     const org = this.env.ORG.get(this.env.ORG.idFromName(orgId)) as unknown as {
       getInfo(): Promise<Record<string, unknown> | null>;
-      getUsageLogSum(from: number, to: number, creditChargeableOnly: boolean): Promise<{ total_cost_usd?: number }>;
+      getCreditChargeableSpendUsd(): Promise<number>;
     };
     const info = await org.getInfo();
     if (!info || info.billing_status === "enterprise") return null;
-    const usage = await org.getUsageLogSum(0, Date.now(), true);
-    const spentCents = Math.round(Number(usage.total_cost_usd ?? 0) * 100);
+    const spentCents = Math.round(Number(await org.getCreditChargeableSpendUsd()) * 100);
     const totalCents = Number(info.billing_credit_purchase_total_cents ?? 0) + Number(info.billing_credit_grant_total_cents ?? 0);
     return Math.max(0, totalCents - spentCents) / 100;
   }

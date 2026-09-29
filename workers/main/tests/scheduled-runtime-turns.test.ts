@@ -28,7 +28,7 @@ vi.mock("../src/agent-runtime/runtime-api.js", async (importOriginal) => ({
   runtimeApi: runtimeApiMock,
 }));
 
-import { AUTOMATION_OUTCOME_INSTRUCTION, startScheduledRuntimeTurn } from "../src/agent-runtime/scheduled-turns";
+import { RUNTIME_AUTOMATION_OUTCOME_INSTRUCTION, startScheduledRuntimeTurn } from "../src/agent-runtime/scheduled-turns";
 import type { ChatEnv } from "../src/chat-thread/types";
 import type { WorkspaceCronDO } from "../src/workspace-cron";
 import { createOrg, createUser, listUserWorkspaces, type TestEnv } from "./test-helpers";
@@ -64,7 +64,10 @@ describe("startScheduledRuntimeTurn", () => {
       clientMessageId: "run-1",
       source: "scheduled prompt",
     });
-    expect(input.text).toContain(AUTOMATION_OUTCOME_INSTRUCTION);
+    expect(input.text).toContain(RUNTIME_AUTOMATION_OUTCOME_INSTRUCTION);
+    // The outcome tool as the runtime names it, never the in-DO name.
+    expect(input.text).toContain("tools.camel__report_automation_outcome(");
+    expect(input.text).not.toMatch(/`report_automation_outcome`/);
     expect(input.text).toContain("Summarize the week.");
   });
 

@@ -1,7 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, it } from "vitest";
 
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import { createOrg, createUser, type TestEnv } from "../test-helpers";
 import {
   assertPassFailCriteria,
@@ -20,9 +19,9 @@ import {
   type EvalSignalEnv,
 } from "./eval-signal";
 import { getEvalTimeoutMs, type EvalModelEnv } from "./model-config";
+import { runRuntimeEval } from "./runtime-eval";
 
 type CreditFallbackEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   RUN_AGENT_EVALS?: string;
 };
 
@@ -69,10 +68,7 @@ describe("hosted credit Camel Free fallback agent eval", () => {
         undefined,
         REQUESTED_MODEL,
       );
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

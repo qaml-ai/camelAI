@@ -186,6 +186,14 @@ describe("agent MCP", () => {
       .toEqual({ content, structuredContent: { path: "a.txt", truncation: { truncated: false }, text: "line 1\nline 2" } });
   });
 
+  it("gives code a read's text when it has no details, in the same shape", async () => {
+    // A short file's read has no truncation details: code still gets { text }, not a bare string.
+    const content = [{ type: "text", text: "line 1" }];
+    const { handler } = setup({ result: { ok: true, data: { content } } });
+    expect(await rt.callTool(handler, MCP_URL, "read", { location: "workspace", path: "a.txt" }, ALICE))
+      .toEqual({ content, structuredContent: { text: "line 1" } });
+  });
+
   it("returns tool failures as isError results", async () => {
     const { handler } = setup({ result: { ok: false, error: { message: "File not found" } } });
     expect(await rt.callTool(handler, MCP_URL, "read", { location: "workspace", path: "x" }, ALICE))

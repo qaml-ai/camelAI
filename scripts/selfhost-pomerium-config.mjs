@@ -156,10 +156,19 @@ export function buildPomeriumConfig(env, { strict = true } = {}) {
   };
 }
 
+/**
+ * Route timeouts for long-lived responses: Pomerium's default 30 s request
+ * timeout would cut event streams (the chat's runtime reads, deployed apps'
+ * SSE) mid-turn, so there is none; a stream idle past 10 minutes still ends
+ * (clients reconnect with Last-Event-ID). WebSockets are not subject to either.
+ */
+const STREAMING_TIMEOUTS = { timeout: "0s", idle_timeout: "10m" };
+
 function protectedRoute(from, to) {
   return {
     from,
     to,
+    ...STREAMING_TIMEOUTS,
     preserve_host_header: true,
     pass_identity_headers: true,
     allow_websockets: true,
@@ -171,6 +180,7 @@ function publicAppRoute(from, to, previewOrigin) {
   return {
     from,
     to,
+    ...STREAMING_TIMEOUTS,
     preserve_host_header: true,
     allow_websockets: true,
     allow_public_unauthenticated_access: true,

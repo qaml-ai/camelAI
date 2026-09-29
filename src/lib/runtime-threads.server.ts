@@ -22,7 +22,7 @@ import type { RuntimeThreadSeed } from "@/lib/use-runtime-thread";
 import { recordRuntimeMigration, recordRuntimeSendFailure, recordRuntimeTokenMintFailure } from "../../workers/main/src/agent-runtime/runtime-thread-telemetry";
 import { migrateThreadToRuntime } from "../../workers/main/src/agent-runtime/thread-migration";
 import { normalizePreviewTabs } from "../../workers/main/src/chat-thread/preview-state";
-import { initialRuntimeRequestId, requireSameOriginJson, runtimeThreadMigrationEnabled, startErrorStillCurrent } from "@/lib/agent-runtime-shared";
+import { initialRuntimeRequestId, requireSameOriginJson, runtimeReadProxyBase, runtimeThreadMigrationEnabled, startErrorStillCurrent } from "@/lib/agent-runtime-shared";
 
 export interface RuntimeThreadAccess {
   env: ChatEnv;
@@ -117,7 +117,7 @@ export async function loadRuntimeThreadSeed(
     org.getThreadUiState(input.threadId).catch(() => null),
     agentId
       ? Promise.all([
-          mintRuntimeBrowserToken(env, { ...input.row, agentId }, input.userId),
+          mintRuntimeBrowserToken(env, { ...input.row, agentId }, input.userId, runtimeReadProxyBase(input.threadId, input.workspaceId)),
           runtimeHistoryPage(env, agentId, { limit: 50 }),
         ]).then(
           ([token, page]) => ({ token, page, error: null as string | null }),

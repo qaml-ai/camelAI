@@ -24,10 +24,9 @@ import {
   type EvalModelEnv,
 } from "./model-config";
 import { usedTool } from "./project-eval-helpers";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
+import { runRuntimeEval } from "./runtime-eval";
 
 type IntegrationDefinitionEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   RUN_AGENT_EVALS?: string;
 };
 
@@ -138,8 +137,7 @@ describe("imported integration definition discovery agent eval", () => {
         undefined,
         testEnv.EVAL_MODEL,
       );
-      const chatThread = testEnv.CHAT_THREAD.get(testEnv.CHAT_THREAD.idFromName(thread.id));
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

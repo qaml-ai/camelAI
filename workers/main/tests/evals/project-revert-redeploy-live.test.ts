@@ -4,7 +4,6 @@ import { describe, it } from "vitest";
 import { isRealEvalDeployEnabled } from "../../src/eval-deploy-context";
 import { defaultProjectScaffoldFiles } from "../../src/project-scaffold";
 import { ProjectFilesystemClient } from "../../src/workspace-filesystem-do";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import type {
   WorkspaceFilesystemDO,
   WorkspaceProject,
@@ -44,10 +43,10 @@ import {
   runtimeToolMentionOrder,
   usedTool,
 } from "./project-eval-helpers";
+import { runRuntimeEval } from "./runtime-eval";
 
 type ProjectRevertRedeployEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
   APP_DB?: D1Database;
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   R2_BUCKET: R2Bucket;
   RUN_AGENT_EVALS?: string;
@@ -214,10 +213,7 @@ describe("project revert and redeploy agent eval", () => {
         testEnv.EVAL_MODEL,
       );
 
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,
@@ -228,8 +224,8 @@ describe("project revert and redeploy agent eval", () => {
         timeoutMs: SESSION_TIMEOUT_MS,
         message: [
           `The existing DO-backed React Router project named exactly "${PROJECT_NAME}" has broken current source containing "${BROKEN_MARKER}".`,
-          `Use js_exec to call await tools.list_commits({ project: "${PROJECT_NAME}" }) and find the source snapshot with message exactly "${BASELINE_MESSAGE}" that contains "${RESTORED_MARKER}"; list_commits is not a top-level tool.`,
-          `Use js_exec to call await tools.revert_project({ project: "${PROJECT_NAME}", snapshot_id }), then await tools.deploy_project({ project: "${PROJECT_NAME}", script_name: "${PROJECT_NAME}" }) to publish the restored source live; revert_project and deploy_project are not top-level tools.`,
+          `Use js_exec to call await tools.camel__list_commits({ project: "${PROJECT_NAME}" }) and find the source snapshot with message exactly "${BASELINE_MESSAGE}" that contains "${RESTORED_MARKER}"; list_commits is not a top-level tool.`,
+          `Use js_exec to call await tools.camel__revert_project({ project: "${PROJECT_NAME}", snapshot_id }), then call the deploy_project tool directly (not from js_exec: its 120-second limit is shorter than a deploy) with { project: "${PROJECT_NAME}", script_name: "${PROJECT_NAME}" } to publish the restored source live; revert_project is not a top-level tool.`,
           "Do not create a new project, do not use rollback_deploy, and do not use wrangler or legacy VM commands.",
           `After deployment, reply with the deployed URL and the restored marker "${RESTORED_MARKER}".`,
         ].join(" "),

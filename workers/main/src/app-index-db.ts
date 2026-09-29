@@ -507,14 +507,16 @@ export class AppIndexDatabase {
   /**
    * The CREATE statements in one batch. D1 fails a batch as a whole without
    * saying which statement broke it, so on failure they run again one at a
-   * time (each is IF NOT EXISTS) to find it.
+   * time (each is IF NOT EXISTS) to find it. When every one of them then
+   * succeeds, the batch's failure was D1's own (a transient internal error):
+   * the schema is in place, and the batch is logged, not thrown.
    */
   private async runSchemaBatch(statements: string[]): Promise<void> {
     try {
       await this.db.batch(statements.map((statement) => this.db.prepare(statement)));
     } catch (error) {
       for (const statement of statements) await this.runSchemaStatement(statement);
-      throw new AppIndexSchemaError('(batch)', error);
+      console.warn('[app-index] the schema batch failed, but each statement succeeded on its own', error);
     }
   }
 

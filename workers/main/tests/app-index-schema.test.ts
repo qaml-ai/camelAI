@@ -6,8 +6,9 @@ import { AppIndexDatabase } from '../src/app-index-db';
  * `workspace_members` table (no org_id) failed `CREATE INDEX ... (org_id)` in
  * prod: a batch fails as a whole, naming no statement.
  */
-function fakeD1(broken: RegExp) {
+function fakeD1(broken: RegExp, options: { batchFailsOnce?: boolean } = {}) {
   const ran: string[] = [];
+  let batchFails = options.batchFailsOnce ?? false;
   let failing = true;
   const fail = (sql: string) => failing && broken.test(sql);
   const statement = (sql: string) => ({
@@ -24,6 +25,10 @@ function fakeD1(broken: RegExp) {
   const db = {
     prepare: (sql: string) => statement(sql),
     batch: async (statements: Array<{ sql: string }>) => {
+      if (batchFails) {
+        batchFails = false;
+        throw new Error('D1_ERROR: internal error; reference = test');
+      }
       if (statements.some((entry) => fail(entry.sql))) throw new Error('D1_ERROR: no such column: org_id: SQLITE_ERROR');
       ran.push(...statements.map((entry) => entry.sql));
       return statements.map(() => ({ success: true, results: [] }));
@@ -74,5 +79,15 @@ describe('AppIndexDatabase.ensureSchema', () => {
 
     await expect(index.ensureSchema()).rejects.toThrow(/idx_threads_chat_error_updated_at/);
     expect(events.points.some((point) => String(point.blobs?.[16]).includes('idx_threads_chat_error_updated_at'))).toBe(true);
+  });
+
+  it('takes a batch D1 failed on its own as done when each statement then succeeds', async () => {
+    const { db, ran } = fakeD1(/^$/, { batchFailsOnce: true });
+    const events = recordingDataset();
+    const index = new AppIndexDatabase(db as never, { OBSERVABILITY_EVENTS: events.dataset });
+
+    await expect(index.ensureSchema()).resolves.toBeUndefined();
+    expect(ran.some((sql) => sql.startsWith('CREATE TABLE IF NOT EXISTS users'))).toBe(true);
+    expect(events.points.some((point) => point.blobs?.[0] === 'app_index_schema_failed')).toBe(false);
   });
 });

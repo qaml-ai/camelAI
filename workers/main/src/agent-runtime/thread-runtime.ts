@@ -20,6 +20,7 @@ import { buildWorkspaceScopedR2Key } from "../../../../src/lib/workspace-r2-path
 import { applyMentionContext } from "../mention-context";
 import { WorkspaceFilesystemClient } from "../workspace-filesystem-do";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
+import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
 import { RuntimeApiError, runtimeApi, runtimeUrl } from "./runtime-api";
 import { codexError, codexRoute, codexUpstreamCall, forwardedResponseHeaders } from "./codex-forwarder";
 import { HostedModelFallbackRequiredError } from "../chat-thread/pi-model-config";
@@ -172,11 +173,11 @@ async function modelText(env: ChatEnv, context: ChatContextState, text: string):
   const safe = injectFileSafetyMessage(text);
   if (!safe.includes("@")) return safe;
   const [integrations, projects] = await Promise.all([
-    orgStub(env, context.orgId).getWorkspaceIntegrations(context.workspaceId).catch((error) => {
+    onceMore("mention_integrations", () => orgStub(env, context.orgId).getWorkspaceIntegrations(context.workspaceId)).catch((error) => {
       console.error("[runtime-thread] getWorkspaceIntegrations for mentions failed", error);
       return [];
     }),
-    new WorkspaceFilesystemClient(env, context.workspaceId).listProjects().catch((error) => {
+    onceMore("mention_projects", () => new WorkspaceFilesystemClient(env, context.workspaceId).listProjects()).catch((error) => {
       console.error("[runtime-thread] listProjects for mentions failed", error);
       return [];
     }),
@@ -341,11 +342,21 @@ async function ensureConfiguredAgent(
  * send that fails can take the mark back.
  */
 async function markThreadRunning(env: ChatEnv, context: ChatContextState, startedAt: number): Promise<boolean> {
-  return await recordWorkspaceThreadStreaming(env, context.workspaceId, context.threadId, true, { startedAt })
+  return await onceMore("mark_thread_running", () =>
+    recordWorkspaceThreadStreaming(env, context.workspaceId, context.threadId, true, { startedAt }))
     .then(() => true, (error: unknown) => {
       console.warn("[runtime-thread] could not mark the thread running", error);
       return false;
     });
+}
+
+/**
+ * A send's idempotent Durable Object work, tried once more when the object
+ * was reset under it ("Network connection lost", "Durable Object reset":
+ * typically a deploy), and never for anything else.
+ */
+function onceMore<T>(operation: string, fn: () => Promise<T>): Promise<T> {
+  return retryTransientDurableObjectRpc(`runtime_send.${operation}`, fn, { attempts: 2 });
 }
 
 /** Take back the running mark this send made, and never another turn's. */
@@ -422,8 +433,10 @@ async function sendRuntimeTurn(
   let agentId: string;
   let request: { id?: unknown; state?: unknown };
   try {
+    // Configuring is idempotent (the agent's Idempotency-Key, PUT/PATCH), so
+    // a Durable Object reset under it (a deploy) is ridden out, once.
     const configured = timed(timings, "configure", () =>
-      ensureConfiguredAgent(env, context, input.row, run, input.clientMessageId, timings));
+      onceMore("configure_agent", () => ensureConfiguredAgent(env, context, input.row, run, input.clientMessageId, timings)));
     // The message's uploads, attached as runtime files too (native images and
     // PDFs); alongside the configuration when the agent already exists.
     const files = (input.row.agentId ? Promise.resolve(input.row.agentId) : configured)

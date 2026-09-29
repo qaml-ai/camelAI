@@ -178,6 +178,31 @@ describe("startRuntimeTurn", () => {
     expect(order.indexOf("/v1/agents/agt_1/configuration")).toBeLessThan(order.indexOf("/v1/agents/agt_1/prompt"));
   });
 
+  it("rides out a connection lost under the agent's configuration once, and nothing else", async () => {
+    const setup = await runtimeThread();
+    let creates = 0;
+    const calls = fakeRuntime({
+      "POST /v1/agents": () => {
+        creates += 1;
+        if (creates === 1) throw new Error("Network connection lost.");
+        return Response.json({ id: "agt_1", token: "agent-token" }, { status: 201 });
+      },
+    });
+    expect(await send(setup, "Hello after a deploy", "cm_retry")).toMatchObject({ status: "accepted", agentId: "agt_1" });
+    expect(calls.filter((call) => call.method === "POST" && call.path === "/v1/agents")).toHaveLength(2);
+
+    const other = await runtimeThread();
+    let otherCreates = 0;
+    fakeRuntime({
+      "POST /v1/agents": () => {
+        otherCreates += 1;
+        throw new Error("boom");
+      },
+    });
+    await expect(send(other, "Hello", "cm_boom")).rejects.toThrow("boom");
+    expect(otherCreates).toBe(1);
+  });
+
   it("refuses an empty message without calling the runtime", async () => {
     const setup = await runtimeThread();
     const calls = fakeRuntime();

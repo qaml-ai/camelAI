@@ -207,6 +207,14 @@ export function projectBuildTransientCause(error: unknown): string | null {
     return upgradeStatus === "500" ? STARTUP_FAILURE_CAUSE : "websocket_upgrade_failed";
   }
   if (/RPCTransportError/i.test(message)) return "rpc_transport";
+  // Typed platform transients added in @cloudflare/sandbox 0.12.5/0.12.3; both
+  // are documented as retryable (the container is starting, replaced, or at
+  // capacity; or the runtime was replaced under an admitted operation).
+  if (/ContainerUnavailableError/.test(message)) return "container_unavailable";
+  if (/OperationInterruptedError/.test(message)) return "operation_interrupted";
+  // sandbox-sdk#928: on the rpc transport a refused container start disposes
+  // the client, and the first call fails ~1s in with this text.
+  if (/disposing the main stub/i.test(message)) return "rpc_session_disposed";
   if (/Network connection lost/i.test(message)) return "network_connection_lost";
   if (/WebSocket upgrade failed/i.test(message)) return "websocket_upgrade_failed";
   // Capacity/provisioning: the container VM has not been handed out yet. Only

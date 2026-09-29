@@ -9,11 +9,11 @@
 # This image carries only the moving-rarely pieces: the node runtime, the DB
 # drivers, and cloudflared. Design doc: docs/db-egress-relay.md.
 #
-# Tag MUST match the @cloudflare/sandbox npm version (0.12.0). Do NOT set
+# Tag MUST match the @cloudflare/sandbox npm version (0.12.10). Do NOT set
 # ENTRYPOINT — the base image's entrypoint starts the sandbox HTTP API server;
 # we only add cloudflared and the baked drivers on top (nothing secret is baked
 # in — relay credentials are injected per-run by db-query-service.ts).
-ARG SANDBOX_BASE_IMAGE=docker.io/cloudflare/sandbox:0.12.0
+ARG SANDBOX_BASE_IMAGE=docker.io/cloudflare/sandbox:0.12.10
 FROM ${SANDBOX_BASE_IMAGE}
 
 # --- cloudflared (Access TCP client for the egress relay) --------------------

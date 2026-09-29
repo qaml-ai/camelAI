@@ -249,12 +249,28 @@ const TRANSIENT_SANDBOX_ERROR_PATTERNS: readonly RegExp[] = [
   /signalled the container to exit/i,
   /container crashed/i,
   /durable object (?:reset|storage operation exceeded)|durable object's code has been updated/i,
+  // sandbox-sdk#928: on the rpc transport a refused container start disposes
+  // the client, and the first call fails ~1s in with this text.
+  /disposing the main stub/i,
+];
+
+/**
+ * Typed transients from @cloudflare/sandbox 0.12.x, all documented as
+ * retryable. Matched by name because the class does not survive the DO RPC hop.
+ */
+const TRANSIENT_SANDBOX_ERROR_NAMES: readonly string[] = [
+  "ContainerUnavailableError",
+  "OperationInterruptedError",
+  "RPCTransportError",
 ];
 
 export function isTransientDbSandboxError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   if (isSandboxDeadlineExceededError(error)) return false;
-  return TRANSIENT_SANDBOX_ERROR_PATTERNS.some((pattern) => pattern.test(error.message));
+  if (TRANSIENT_SANDBOX_ERROR_NAMES.includes(error.name)) return true;
+  const text = `${error.name}: ${error.message}`;
+  return TRANSIENT_SANDBOX_ERROR_PATTERNS.some((pattern) => pattern.test(text)) ||
+    TRANSIENT_SANDBOX_ERROR_NAMES.some((name) => text.includes(name));
 }
 
 /** Pause before the one transient retry, so a rolling container can come back. */

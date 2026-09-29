@@ -103,7 +103,7 @@
 		"@camelai/agent-runtime": "0.10.0",
 		"@cloudflare/dynamic-workflows": "^0.1.1",
 		"@cloudflare/puppeteer": "^1.0.6",
-		"@cloudflare/sandbox": "^0.12.0",
+		"@cloudflare/sandbox": "^0.12.10",
 		"@cloudflare/shell": "0.3.7",
 		"@cloudflare/vite-plugin": "1.46.0",
 		"@conform-to/react": "^1.15.1",

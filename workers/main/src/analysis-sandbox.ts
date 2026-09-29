@@ -674,10 +674,10 @@ export class AnalysisSandbox extends Sandbox<Env> {
    * Container went away: everything mounted into it went with it. Clear the
    * bookkeeping so the next `ensureMounted` really re-mounts.
    */
-  override async onStop(): Promise<void> {
+  override async onStop(params?: Parameters<Sandbox<Env>["onStop"]>[0]): Promise<void> {
     this.clearMountBookkeeping();
     this.sessionDeaths.reset();
-    await super.onStop();
+    await super.onStop(params);
   }
 
   /**

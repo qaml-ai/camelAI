@@ -713,6 +713,9 @@ describe("project build error classification", () => {
     ["no container instance available", "container_provisioning"],
     ["got 503 Service Unavailable", "service_unavailable"],
     ["Container failed to start", "container_failed_to_start"],
+    ["ContainerUnavailableError: max_container_instances_exceeded", "container_unavailable"],
+    ["OperationInterruptedError: runtime replaced", "operation_interrupted"],
+    ["RPC session was shut down by disposing the main stub", "rpc_session_disposed"],
   ])("names the transient cause for %s", (message, expected) => {
     expect(projectBuildTransientCause(new Error(message))).toBe(expected);
     expect(isProjectBuildServiceUnavailableError(new Error(message))).toBe(true);

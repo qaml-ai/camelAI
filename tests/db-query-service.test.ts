@@ -310,6 +310,9 @@ describe('transient sandbox failures', () => {
     'The container is not running, consider calling start()',
     'Network connection lost.',
     'Runtime signalled the container to exit due to a new version rollout: 0',
+    'RPC session was shut down by disposing the main stub',
+    'ContainerUnavailableError: no container instance available, try again later',
+    'OperationInterruptedError: runtime_replaced',
   ])('retries a read once after "%s"', async (message) => {
     const exec = flakyRunner(new Error(message));
     const t = harness({ exec });

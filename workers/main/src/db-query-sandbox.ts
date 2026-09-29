@@ -95,9 +95,9 @@ export class DbQuerySandbox extends Sandbox<Env> {
    * `ensureWarehouseExportMount` no-ops against a fresh container and an export
    * "succeeds" into a plain directory.
    */
-  override async onStop(): Promise<void> {
+  override async onStop(params?: Parameters<Sandbox<Env>["onStop"]>[0]): Promise<void> {
     this.clearMountBookkeeping();
-    await super.onStop();
+    await super.onStop(params);
   }
 
   /**

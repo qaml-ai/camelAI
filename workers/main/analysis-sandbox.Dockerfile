@@ -12,7 +12,7 @@
 # (deleting the old skill's `uv init && uv add …` preamble). Projects that declare
 # a pyproject.toml sync from the seeded uv cache in seconds.
 #
-# Tag MUST match the @cloudflare/sandbox npm version (0.12.0). Do NOT set ENTRYPOINT
+# Tag MUST match the @cloudflare/sandbox npm version (0.12.10). Do NOT set ENTRYPOINT
 # — the base image's entrypoint starts the sandbox HTTP API server; we only add
 # packages and tools on top.
 #
@@ -22,7 +22,7 @@
 # scripts/build-analysis-sandbox-image.mjs builds the same base from the
 # sandbox-sdk source for arm64 and passes it here; production always uses the
 # default.
-ARG SANDBOX_BASE_IMAGE=docker.io/cloudflare/sandbox:0.12.0-python
+ARG SANDBOX_BASE_IMAGE=docker.io/cloudflare/sandbox:0.12.10-python
 FROM ${SANDBOX_BASE_IMAGE}
 
 # --- CLI tools the data-analysis skill documents -----------------------------

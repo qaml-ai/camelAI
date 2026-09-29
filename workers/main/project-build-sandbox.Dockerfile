@@ -12,7 +12,7 @@
 # cache must land in /root/.bun/install/cache (verified against the base
 # image's /api/execute). Wrangler's container build context defaults to this
 # Dockerfile's directory (workers/main), hence the relative COPY path.
-FROM docker.io/cloudflare/sandbox:0.12.0
+FROM docker.io/cloudflare/sandbox:0.12.10
 
 COPY project-build-sandbox-warmup/ /tmp/camelai-warmup/
 RUN cd /tmp/camelai-warmup \

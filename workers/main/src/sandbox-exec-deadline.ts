@@ -14,7 +14,7 @@
 //
 // ## What the SDK does and does not give us
 //
-// `@cloudflare/sandbox` 0.12.0 (`dist/sandbox-*.js`):
+// `@cloudflare/sandbox` 0.12.x (`dist/sandbox-*.js`):
 //   - `exec(command, { timeout })` forwards `timeoutMs` to the container and
 //     the container enforces it ("unlimited by default"), so container-side
 //     enforcement is real — this deadline is strictly the outer bound.

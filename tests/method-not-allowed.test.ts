@@ -5,15 +5,6 @@ import { actionOnlyLoader, methodNotAllowed } from "@/lib/method-not-allowed";
 
 const API_ROUTES_DIR = join(__dirname, "../src/routes/api");
 
-// Action-only routes being rewritten by the chat-thread deletion PR (#137);
-// add their loaders once it lands instead of conflicting with it.
-const PENDING_ACTION_ONLY_ROUTES = new Set([
-  "threads.$id.files.save.ts",
-  "threads.$id.move.ts",
-  "workspaces.$id.chat.$threadId.fork.ts",
-  "workspaces.$id.chat.threads.ts",
-]);
-
 describe("methodNotAllowed", () => {
   it("answers 405 with the allowed methods in the Allow header", async () => {
     const response = methodNotAllowed(["POST", "PUT", "DELETE"]);
@@ -41,7 +32,7 @@ describe("api resource routes", () => {
     const exportsFn = (source: string, name: string) =>
       new RegExp(`^export (async )?(function|const) ${name}\\b`, "m").test(source);
     const missing = readdirSync(API_ROUTES_DIR)
-      .filter((file) => /\.tsx?$/.test(file) && !PENDING_ACTION_ONLY_ROUTES.has(file))
+      .filter((file) => /\.tsx?$/.test(file))
       .filter((file) => {
         const source = readFileSync(join(API_ROUTES_DIR, file), "utf8");
         return exportsFn(source, "action") && !exportsFn(source, "loader");

@@ -6,6 +6,7 @@ import * as chatDO from '@/lib/chat-do.server';
 import { addThreadToExistingGroup } from '@/lib/chat-groups.server';
 import { normalizeLlmModel } from '@/lib/llm-provider-config';
 import type { ThreadRuntimeRecord } from '../../../workers/main/src/identity/org-do';
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 function forkThreadTitle(title: string | null | undefined): string {
   const trimmed = title?.trim();
@@ -17,6 +18,8 @@ function normalizeForkError(error: unknown): string {
     error instanceof Error ? error.message : String(error || 'Failed to fork chat');
   return message;
 }
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context, params }: Route.ActionArgs) {
   if (request.method !== 'POST') {

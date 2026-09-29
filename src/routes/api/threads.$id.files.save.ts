@@ -3,10 +3,13 @@ import { requestWorkspaceId, requireRuntimeThread } from "@/lib/runtime-threads.
 import { scratchVolumePath } from "@/lib/agent-runtime-shared";
 import { scratchFileLink, threadScratchVolume } from "../../../workers/main/src/agent-runtime/thread-runtime";
 import type { CodeModeToolsProps } from "../../../workers/main/src/code-mode-tools";
+import { actionOnlyLoader } from "@/lib/method-not-allowed";
 
 type ToolsBinding = {
   callToolEnvelope(name: string, args: unknown): Promise<{ ok: true; data: unknown } | { ok: false; error: { message: string } }>;
 };
+
+export const loader = actionOnlyLoader("POST");
 
 /**
  * POST /api/threads/:id/files/save {path}: "Save to workspace" for a runtime

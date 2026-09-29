@@ -10,6 +10,7 @@ import {
   createGroupForNewThread,
 } from '@/lib/chat-groups.server';
 import type { LlmModel } from '@/types';
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 type CreateThreadRequestBody = {
   initialTitle?: string;
@@ -24,6 +25,8 @@ function groupThreadFailureStatus(message: string): number {
     ? 404
     : 500;
 }
+
+export const loader = actionOnlyLoader('POST');
 
 /**
  * Lightweight thread creation endpoint that validates workspace access

@@ -34,6 +34,7 @@ import {
   ARCHIVE_FILE_NAME,
   ARCHIVE_REQUEST_ID,
   convertTranscript,
+  runtimeMigrationKey,
   withImportNote,
   type DoMigrationRequest,
   type DoMigrationResult,
@@ -51,8 +52,16 @@ export const RUNTIME_MIGRATION_EXPORT_MAX_CHARS = 12_000_000;
 export const RUNTIME_MIGRATION_RENDER_ARCHIVE_MAX_CHARS = 4_000_000;
 /** How long a thread the runtime will not take (too large, content it refuses) waits before it is tried again. */
 export const PERMANENT_FAILURE_RETRY_MS = 24 * 60 * 60_000;
-/** Generations of a provisioning key looked for when deleting what a failed create made. */
-const KEY_GENERATIONS = 4;
+/**
+ * How long an agent made under a key a cut-off create used may still appear
+ * (the runtime finishing the create after chiridion stopped waiting): until
+ * then, a key that finds no agent is not forgotten.
+ */
+export const ORPHAN_KEY_SETTLE_MS = 10 * 60_000;
+/** Deadline for one runtime or OrgDO call the move makes outside the create and the archive. */
+export const RUNTIME_MIGRATION_CALL_TIMEOUT_MS = 20_000;
+/** Deadline for the archive upload, whatever its size (the lease is renewed as it streams). */
+export const RUNTIME_MIGRATION_ARCHIVE_TIMEOUT_MS = 15 * 60_000;
 
 interface MoveIdentity {
   orgId: string;
@@ -67,12 +76,13 @@ export type RuntimeMigrationRecord =
     expiresAt: number;
     revision: PiCoreRevision;
     failures: number;
-    /** The Idempotency-Key the agent is (being) made under, set before the create. */
+    /** The Idempotency-Key the agent is (being) made under (this attempt's own), set before the create. */
     pendingKey?: string;
     agentId?: string;
     /** What an earlier attempt left behind, deleted under this lease before anything is made. */
     orphanAgentId?: string;
     orphanKey?: string;
+    orphanKeyAt?: number;
   })
   | (MoveIdentity & {
     phase: "committing";
@@ -83,9 +93,20 @@ export type RuntimeMigrationRecord =
     attempts: number;
     stats?: Extract<DoMigrationResult, { status: "migrated" }>["stats"];
     archived?: boolean;
+    /** Why the archive the import names is not the original (the runtime would not keep it). */
+    archiveNote?: string;
   })
   | { phase: "moved"; leaseId: string; agentId: string; movedAt: number }
-  | (Partial<MoveIdentity> & { phase: "failed"; failures: number; retryAt: number; error: string; orphanAgentId?: string; orphanKey?: string });
+  | (Partial<MoveIdentity> & {
+    phase: "failed";
+    failures: number;
+    retryAt: number;
+    error: string;
+    orphanAgentId?: string;
+    /** The key of a create that was cut off, and when: the agent it may have made is looked for until it settles. */
+    orphanKey?: string;
+    orphanKeyAt?: number;
+  });
 
 type Leased = Extract<RuntimeMigrationRecord, { phase: "leased" }>;
 type Committing = Extract<RuntimeMigrationRecord, { phase: "committing" }>;
@@ -102,15 +123,21 @@ export interface RuntimeMigrationDeps {
   /** The thread relays to a runtime agent (adopted, not imported). */
   hasRelayAgent(): boolean;
   revision(): PiCoreRevision;
-  loadHistory(maxChars: number): Promise<{ messages: AgentMessage[]; whole: boolean }>;
-  /** The render rows a compaction left as the only copy of history below its cut, newest page first. */
-  renderArchivePages(): Iterable<UIMessage[]>;
+  loadHistory(maxChars: number): Promise<{ messages: AgentMessage[]; whole: boolean; openingRenderMessageId?: string | null }>;
+  /** The render rows older than `beforeMs` (a compaction's only copy of history below its cut), newest page first. */
+  renderArchivePages(beforeMs: number): Iterable<UIMessage[]>;
+  /** When stored history begins: the oldest stored message that is no compaction summary. */
+  firstStoredAtMs(): number | undefined;
   /** Every stored transcript row as stored, a bounded batch at a time. */
   payloadBatches(): Iterable<string[]>;
   preview(): { tabs: PreviewTarget[]; activeTabId: string | null };
   /** Wake the DO at `at` and call {@link ChatThreadRuntimeMigration.onAlarm}. */
   scheduleAlarm(at: number): void;
   waitUntil(promise: Promise<unknown>): void;
+  /** The thread runs here again: take back what was queued for its runtime prompt meanwhile. */
+  onUndone(): void;
+  /** The thread's org, where the DO knows it. */
+  orgId(): string | undefined;
 }
 
 interface OrgStub {
@@ -134,13 +161,20 @@ function permanentRefusal(error: unknown): string | null {
   if (!(error instanceof RuntimeApiError)) return null;
   if (error.code === "INVALID_HISTORY" || /INVALID_HISTORY/.test(error.message)) return "invalid_history";
   if (error.status === 413 || error.code === "HISTORY_TOO_LARGE") return "too_large";
-  if (error.status >= 400 && error.status < 500 && ![401, 403, 404, 408, 409, 429].includes(error.status)) return `refused_${error.status}`;
+  if (error.status >= 400 && error.status < 500 && ![401, 402, 403, 404, 408, 409, 429].includes(error.status)) return `refused_${error.status}`;
   return null;
 }
 
-async function sha256Hex(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+/** A fetch with the move's per-call deadline. */
+const timedFetch: typeof fetch = (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(RUNTIME_MIGRATION_CALL_TIMEOUT_MS) });
+
+/** An OrgDO call with the move's per-call deadline. */
+function withTimeout<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("the call timed out")), RUNTIME_MIGRATION_CALL_TIMEOUT_MS);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
 }
 
 async function runtimeError(method: string, path: string, response: Response): Promise<RuntimeApiError> {
@@ -194,12 +228,28 @@ export class ChatThreadRuntimeMigration {
   }
 
   /** Where the move stands, for a caller deciding whether to ask for one (and do the work to). */
-  status(now = Date.now()): { state: "moving" | "moved" | "backoff" | null; retryAt?: number } {
+  status(now = Date.now()): { state: "moving" | "committing" | "moved" | "backoff" | null; retryAt?: number } {
+    // A commit the caller should re-drive (migrate() does), not wait out.
+    if (this.read()?.phase === "committing") return { state: "committing" };
     const state = this.state(now);
     if (state) return { state };
     const record = this.read();
     if (record?.phase === "failed" && record.retryAt > now) return { state: "backoff", retryAt: record.retryAt };
     return { state: null };
+  }
+
+  /**
+   * Whether this thread's move holds `agentId` (made under `key`): its agent
+   * once moved or committing, or the one a live lease is making. For the
+   * orphan reconciler; `orgId` lets it check the thread's runtime row too.
+   */
+  holds(agentId: string, key: string | null): { holds: boolean; orgId?: string } {
+    const record = this.read();
+    const orgId = record && "orgId" in record && record.orgId ? record.orgId : this.deps.orgId();
+    if (!record) return { holds: false, orgId };
+    if (record.phase === "moved" || record.phase === "committing") return { holds: record.agentId === agentId, orgId };
+    if (record.phase === "leased") return { holds: record.agentId === agentId || (key !== null && record.pendingKey === key), orgId };
+    return { holds: false, orgId };
   }
 
   /** Move the thread (see the module comment), or say why not. */
@@ -246,20 +296,22 @@ export class ChatThreadRuntimeMigration {
       revision: this.deps.revision(),
       failures: failed?.failures ?? 0,
       ...(failed?.orphanAgentId ? { orphanAgentId: failed.orphanAgentId } : {}),
-      ...(failed?.orphanKey ? { orphanKey: failed.orphanKey } : {}),
+      ...(failed?.orphanKey ? { orphanKey: failed.orphanKey, orphanKeyAt: failed.orphanKeyAt ?? now } : {}),
     };
     this.write(lease);
     this.deps.scheduleAlarm(lease.expiresAt + 1_000);
 
     try {
       if (lease.orphanAgentId || lease.orphanKey) {
-        const cleared = await this.deleteLeftovers(lease, lease.orphanAgentId, lease.orphanKey);
+        const cleared = await this.deleteLeftovers(lease, lease, () => this.lease(leaseId) !== null);
         if (!this.lease(leaseId)) return { status: "failed", error: "the move's lease ran out" };
-        if (!cleared) {
-          this.fail(leaseId, "could not delete an earlier attempt's agent");
-          return { status: "failed", error: "could not delete an earlier attempt's agent" };
+        if (cleared !== "done") {
+          // An earlier attempt's agent is still to be deleted (or may still
+          // appear): no new agent is made until it is settled.
+          this.release(leaseId, cleared === "settling" ? (lease.orphanKeyAt ?? now) + ORPHAN_KEY_SETTLE_MS : Date.now() + migrationBackoffMs(lease.failures + 1));
+          return { status: "skipped", reason: "backoff: an earlier attempt's agent is not deleted yet" };
         }
-        this.renew(leaseId, { orphanAgentId: undefined, orphanKey: undefined });
+        this.renew(leaseId, { orphanAgentId: undefined, orphanKey: undefined, orphanKeyAt: undefined });
       }
 
       const history = await this.history();
@@ -275,14 +327,14 @@ export class ChatThreadRuntimeMigration {
       converted.messages = [];
       const agentId = await this.createAgent(leaseId, request, held);
       if (!agentId) return { status: "failed", error: "the move's lease ran out" };
-      if (archived) await this.archive(leaseId, agentId);
+      const archive = archived ? await this.archive(leaseId, agentId) : null;
 
       const prepared = this.prepare(leaseId, agentId, context.orgId, context.threadId);
       if (typeof prepared === "string") {
         this.fail(leaseId, prepared);
         return { status: "busy", reason: prepared };
       }
-      return await this.commit({ ...prepared, stats: converted.stats, archived });
+      return await this.commit({ ...prepared, stats: converted.stats, archived, ...(archive === "too_large" ? { archiveNote: "archive too large; the move went on without it" } : {}) });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const permanent = permanentRefusal(error);
@@ -306,28 +358,63 @@ export class ChatThreadRuntimeMigration {
   }
 
   /**
-   * The history to import: the pi_core export and, when a compaction left
-   * render rows as the only copy of what came before its cut, those rebuilt
-   * ahead of it. `archived`: the import is not the whole history as stored.
+   * The history to import: the pi_core export and, before it, the render rows
+   * older than anything it holds (what a rewrite compaction left as the only
+   * copy of history below its cut), rebuilt as pi messages. Only rows older
+   * than the export's oldest message come (the chat page's archive seam), and
+   * of a turn the cut split (the render message the export's first row
+   * belongs to) only the part the export does not repeat. `archived`: the
+   * import is not the whole history as stored.
    */
   private async history(): Promise<{ messages: AgentMessage[]; archived: boolean }> {
     const history = await this.deps.loadHistory(RUNTIME_MIGRATION_EXPORT_MAX_CHARS);
+    const exported = history.messages as Array<{ role?: string; content?: unknown; timestamp?: unknown }>;
+    const isSummary = (message: { role?: string; content?: unknown }) =>
+      message.role === "user" && typeof message.content === "string" && message.content.startsWith("[Context Summary]");
+    const held = exported.filter((message) => !isSummary(message));
+    const seam = held.reduce<number | undefined>((oldest, message) =>
+      typeof message.timestamp === "number" && (oldest === undefined || message.timestamp < oldest) ? message.timestamp : oldest, undefined);
+
     const pages: UIMessage[][] = [];
     let chars = 0;
     let complete = true;
-    for (const page of this.deps.renderArchivePages()) {
-      const size = page.reduce((sum, message) => sum + JSON.stringify(message).length, 0);
+    for (const page of seam === undefined ? [] : this.deps.renderArchivePages(seam)) {
+      const kept = page;
+      const size = kept.reduce((sum, message) => sum + JSON.stringify(message).length, 0);
       if (chars + size > RUNTIME_MIGRATION_RENDER_ARCHIVE_MAX_CHARS) {
         complete = false;
         break;
       }
       chars += size;
-      pages.push(page);
+      if (kept.length) pages.push(kept);
     }
-    const before = renderArchiveToPiMessages(pages.reverse().flat());
-    const first = history.messages[0] as { role?: string; content?: unknown } | undefined;
-    // A thread whose rows open on a summary lost what came before it from pi_core.
-    const cutByRewrite = first?.role === "user" && typeof first.content === "string" && first.content.startsWith("[Context Summary]");
+    const archivedRows = pages.reverse().flat();
+
+    // A cut inside a turn: the export opens on that turn's later rows, and the
+    // archived render message of the same id is the whole turn. Its rebuilt
+    // tail that the export repeats goes; if the two do not line up, the
+    // archived turn goes (the archive file keeps it).
+    const firstHeld = exported.findIndex((message) => !isSummary(message));
+    const opening: string[] = [];
+    for (let index = firstHeld; index >= 0 && index < exported.length && exported[index].role !== "user"; index++) {
+      if (!isSummary(exported[index])) opening.push(String(exported[index].role));
+    }
+    let before: AgentMessage[];
+    const fold = archivedRows.at(-1);
+    if (opening.length && fold?.role === "assistant" && history.openingRenderMessageId && fold.id === history.openingRenderMessageId) {
+      const rebuilt = renderArchiveToPiMessages([fold]) as unknown as Array<{ role?: string }>;
+      const tail = rebuilt.slice(-opening.length).map((message) => String(message.role));
+      const lined = tail.length === opening.length && tail.every((role, index) => role === opening[index]);
+      before = [
+        ...renderArchiveToPiMessages(archivedRows.slice(0, -1)),
+        ...(lined ? rebuilt.slice(0, -opening.length) as unknown as AgentMessage[] : []),
+      ];
+      if (!lined) complete = false;
+    } else {
+      before = renderArchiveToPiMessages(archivedRows);
+    }
+    // Rows that open on a summary lost what came before it from pi_core.
+    const cutByRewrite = exported[0] !== undefined && isSummary(exported[0]);
     return {
       messages: before.length ? [...before, ...history.messages] : history.messages,
       archived: !history.whole || before.length > 0 || !complete || cutByRewrite,
@@ -378,9 +465,9 @@ export class ChatThreadRuntimeMigration {
     const org = this.org(record.orgId);
     let outcome: { row: ThreadRuntimeRecord; claimed: boolean } | null;
     try {
-      outcome = await org.claimThreadRuntimeAgent(record.threadId, record.agentId);
+      outcome = await withTimeout(org.claimThreadRuntimeAgent(record.threadId, record.agentId));
     } catch (error) {
-      const row = await org.getThreadRuntime(record.threadId).catch(() => undefined);
+      const row = await withTimeout(org.getThreadRuntime(record.threadId)).catch(() => undefined);
       if (!row) {
         const current = this.read();
         if (current?.phase === "committing" && current.leaseId === record.leaseId) {
@@ -409,11 +496,11 @@ export class ChatThreadRuntimeMigration {
     }
     if (!outcome.claimed) {
       // It was already on the runtime (another path gave it an agent first): ours is spare.
-      this.deps.waitUntil(this.deleteLeftovers(record, record.agentId, undefined));
+      this.deps.waitUntil(this.deleteLeftovers(record, { agentId: record.agentId }, () => true));
       return { status: "runtime", row: outcome.row };
     }
     return record.stats
-      ? { status: "migrated", row: outcome.row, stats: record.stats, archived: record.archived ?? false }
+      ? { status: "migrated", row: outcome.row, stats: record.stats, archived: record.archived ?? false, ...(record.archiveNote ? { reason: record.archiveNote } : {}) }
       : { status: "runtime", row: outcome.row };
   }
 
@@ -426,7 +513,9 @@ export class ChatThreadRuntimeMigration {
     if (record?.phase !== "leased" || record.leaseId !== leaseId) return;
     const failures = record.failures + 1;
     const orphanAgentId = record.agentId ?? record.orphanAgentId;
-    const orphanKey = record.pendingKey ?? record.orphanKey;
+    // This attempt's key when its create was cut off (no agent id came back).
+    const orphanKey = record.agentId ? record.orphanKey : record.pendingKey ?? record.orphanKey;
+    const orphanKeyAt = orphanKey === record.pendingKey && !record.agentId ? Date.now() : record.orphanKeyAt;
     const failed: Failed = {
       phase: "failed",
       failures,
@@ -435,81 +524,126 @@ export class ChatThreadRuntimeMigration {
       orgId: record.orgId,
       threadId: record.threadId,
       ...(orphanAgentId ? { orphanAgentId } : {}),
-      ...(orphanKey ? { orphanKey } : {}),
+      ...(orphanKey ? { orphanKey, orphanKeyAt: orphanKeyAt ?? Date.now() } : {}),
     };
     this.write(failed);
+    this.deps.onUndone();
     if (orphanAgentId || orphanKey) this.cleanUpFailed(failed);
   }
 
-  /** Delete what a failed move left, in the background, and forget it once gone. */
+  /** Give the thread back without a failure: the next attempt waits until `retryAt`, carrying what is left to delete. */
+  private release(leaseId: string, retryAt: number): void {
+    const record = this.read();
+    if (record?.phase !== "leased" || record.leaseId !== leaseId) return;
+    this.write({
+      phase: "failed",
+      failures: record.failures,
+      retryAt,
+      error: "an earlier attempt's agent is not deleted yet",
+      orgId: record.orgId,
+      threadId: record.threadId,
+      ...(record.orphanAgentId ? { orphanAgentId: record.orphanAgentId } : {}),
+      ...(record.orphanKey ? { orphanKey: record.orphanKey, orphanKeyAt: record.orphanKeyAt ?? Date.now() } : {}),
+    });
+    this.deps.onUndone();
+    this.deps.scheduleAlarm(retryAt);
+  }
+
+  /**
+   * Delete what a failed move left, in the background, only while the failed
+   * record still names it, and forget it once gone. What cannot be settled
+   * yet (a delete that failed, a cut-off create's key that finds nothing
+   * before it settles) is tried again by the alarm.
+   */
   private cleanUpFailed(record: Failed): void {
     if (!record.orgId || !record.threadId) return;
     const identity = { orgId: record.orgId, threadId: record.threadId };
-    this.deps.waitUntil(this.deleteLeftovers(identity, record.orphanAgentId, record.orphanKey).then((deleted) => {
+    const same = (current: RuntimeMigrationRecord | undefined): current is Failed =>
+      current?.phase === "failed" && current.orphanAgentId === record.orphanAgentId && current.orphanKey === record.orphanKey;
+    this.deps.waitUntil(this.deleteLeftovers(identity, record, () => same(this.read())).then((outcome) => {
       const current = this.read();
-      if (deleted && current?.phase === "failed" && current.orphanAgentId === record.orphanAgentId && current.orphanKey === record.orphanKey) {
-        this.write({ ...current, orphanAgentId: undefined, orphanKey: undefined });
+      if (!same(current)) return;
+      if (outcome === "done") {
+        this.write({ ...current, orphanAgentId: undefined, orphanKey: undefined, orphanKeyAt: undefined });
+        return;
       }
+      const again = outcome === "settling"
+        ? (record.orphanKeyAt ?? Date.now()) + ORPHAN_KEY_SETTLE_MS
+        : Date.now() + migrationBackoffMs(current.failures);
+      this.deps.scheduleAlarm(again);
     }));
   }
 
   /**
-   * Delete an agent a move made, and any agent made under its key (a create
-   * that timed out, or was cut off, may have made one we never heard of),
-   * never the agent the thread's runtime row holds. True when nothing is left.
+   * Delete the agent a move made, and the one its key made when the create
+   * was cut off, while `stillOwned()` (re-checked before each delete), and
+   * never the agent the thread's runtime row holds (re-read before each).
+   * "done": nothing is left; "settling": the key found no agent yet, but a
+   * create cut off within ORPHAN_KEY_SETTLE_MS may still make one; "failed":
+   * a delete or a read did not go through.
    */
-  private async deleteLeftovers(identity: MoveIdentity, agentId: string | undefined, key: string | undefined): Promise<boolean> {
-    let held: string | null;
-    try {
-      held = (await this.org(identity.orgId).getThreadRuntime(identity.threadId))?.agentId ?? null;
-    } catch (error) {
-      console.warn("[runtime-migration] could not read the thread's runtime row; nothing deleted", error);
-      return false;
-    }
-    const candidates = new Set<string>(agentId ? [agentId] : []);
+  private async deleteLeftovers(
+    identity: MoveIdentity,
+    leftovers: { orphanAgentId?: string; orphanKey?: string; orphanKeyAt?: number; agentId?: string },
+    stillOwned: () => boolean,
+  ): Promise<"done" | "settling" | "failed"> {
+    const candidates: Array<{ id: string; byKey: boolean }> = [];
+    const agentId = leftovers.orphanAgentId ?? leftovers.agentId;
+    if (agentId) candidates.push({ id: agentId, byKey: false });
     const tenant = this.deps.env.AGENT_RUNTIME_TENANT?.trim();
-    if (key && tenant) {
-      for (let generation = 0; generation < KEY_GENERATIONS; generation++) {
-        candidates.add(await provisionedAgentId(tenant, generation ? `${key}#${generation}` : key));
-      }
+    if (leftovers.orphanKey && tenant) {
+      const byKey = await provisionedAgentId(tenant, leftovers.orphanKey);
+      if (byKey !== agentId) candidates.push({ id: byKey, byKey: true });
     }
-    let ok = true;
+    let outcome: "done" | "settling" | "failed" = "done";
     for (const candidate of candidates) {
-      if (candidate === held) {
-        console.warn("[runtime-migration] kept an agent the thread's runtime row holds", { agentId: candidate });
+      if (!stillOwned()) return "failed";
+      let held: string | null;
+      try {
+        held = (await withTimeout(this.org(identity.orgId).getThreadRuntime(identity.threadId)))?.agentId ?? null;
+      } catch (error) {
+        console.warn("[runtime-migration] could not read the thread's runtime row; nothing deleted", error);
+        return "failed";
+      }
+      if (candidate.id === held) {
+        console.warn("[runtime-migration] kept an agent the thread's runtime row holds", { agentId: candidate.id });
         continue;
       }
-      ok = (await this.deleteAgent(candidate)) && ok;
+      if (!stillOwned()) return "failed";
+      const deleted = await this.deleteAgent(candidate.id);
+      if (deleted === "failed") outcome = "failed";
+      else if (deleted === "absent" && candidate.byKey && outcome === "done"
+        && Date.now() < (leftovers.orphanKeyAt ?? 0) + ORPHAN_KEY_SETTLE_MS) outcome = "settling";
     }
-    return ok;
+    return outcome;
   }
 
-  private async deleteAgent(agentId: string): Promise<boolean> {
+  private async deleteAgent(agentId: string): Promise<"deleted" | "absent" | "failed"> {
     try {
-      await runtimeApi(this.deps.env, "DELETE", `/v1/agents/${encodeURIComponent(agentId)}`);
-      return true;
+      await runtimeApi(this.deps.env, "DELETE", `/v1/agents/${encodeURIComponent(agentId)}`, undefined, {}, timedFetch);
+      return "deleted";
     } catch (error) {
-      if (error instanceof RuntimeApiError && (error.status === 404 || error.status === 410)) return true;
+      if (error instanceof RuntimeApiError && (error.status === 404 || error.status === 410)) return "absent";
       console.warn("[runtime-migration] could not delete the agent of a move that did not happen", error);
-      return false;
+      return "failed";
     }
   }
 
   /**
    * The agent, made with the history, under the lease; null once the lease
-   * is lost. Its Idempotency-Key is the history's hash, recorded in the lease
-   * before the call, so a create cut off anywhere can be found and deleted,
-   * and a retry with the same history gets the same agent back.
+   * is lost. Its Idempotency-Key is this attempt's own (the thread and the
+   * lease), recorded in the lease before the call: a retry within the attempt
+   * gets the same agent back, a create cut off anywhere can be found and
+   * deleted exactly, and no two attempts ever share an agent.
    */
   private async createAgent(leaseId: string, request: DoMigrationRequest, held: { messages: AgentMessage[] }): Promise<string | null> {
     const { env } = this.deps;
     const { context } = request;
-    // The history is serialized and encoded once, then only its bytes are
-    // kept: hashed, and sent as they are.
+    // The history is serialized and encoded once, then only its bytes are kept.
     const hasHistory = held.messages.length > 0;
     const history = new TextEncoder().encode(JSON.stringify(held.messages)) as Uint8Array<ArrayBuffer>;
     held.messages = [];
-    const key = `migrate_${context.threadId}_${(await sha256Hex(history)).slice(0, 16)}`;
+    const key = runtimeMigrationKey(context.threadId, leaseId);
     if (!this.renew(leaseId, { pendingKey: key })) return null;
     const fields = JSON.stringify({
       definition: env.AGENT_RUNTIME_DEFINITION,
@@ -543,10 +677,11 @@ export class ChatThreadRuntimeMigration {
    * at a time (pi_core rows as stored, then the pre-compaction render rows,
    * newest first), renewing the lease as it goes.
    */
-  private async archive(leaseId: string, agentId: string): Promise<void> {
+  private async archive(leaseId: string, agentId: string): Promise<"saved" | "too_large"> {
     const { env } = this.deps;
     const encoder = new TextEncoder();
-    const pages = this.deps.renderArchivePages();
+    // Render rows older than anything stored: the only copy of what a rewrite cut.
+    const pages = this.deps.renderArchivePages(this.deps.firstStoredAtMs() ?? Date.now() + 60_000);
     const lines = (function* (payloads: Iterable<string[]>): Generator<string> {
       for (const batch of payloads) yield `${batch.join("\n")}\n`;
       for (const page of pages) {
@@ -565,18 +700,23 @@ export class ChatThreadRuntimeMigration {
         else controller.enqueue(encoder.encode(next.value));
       },
     });
-    const response = await fetch(
-      `${runtimeUrl(env)}/v1/agents/${encodeURIComponent(agentId)}/uploads/${ARCHIVE_REQUEST_ID}/${ARCHIVE_FILE_NAME}`,
-      {
-        method: "PUT",
-        headers: {
-          Authorization: `Bearer ${env.AGENT_RUNTIME_API_TOKEN ?? ""}`,
-          "Content-Type": "application/x-ndjson",
-        },
-        body,
-      },
-    );
-    if (!response.ok) throw await runtimeError("PUT", "/v1/agents/:id/uploads", response);
+    const url = `${runtimeUrl(env)}/v1/agents/${encodeURIComponent(agentId)}/uploads/${ARCHIVE_REQUEST_ID}/${ARCHIVE_FILE_NAME}`;
+    const headers = { Authorization: `Bearer ${env.AGENT_RUNTIME_API_TOKEN ?? ""}`, "Content-Type": "application/x-ndjson" };
+    const response = await fetch(url, { method: "PUT", headers, body, signal: AbortSignal.timeout(RUNTIME_MIGRATION_ARCHIVE_TIMEOUT_MS) });
     await response.body?.cancel();
+    if (response.status === 413) {
+      // Over what the runtime keeps in one file: the move goes on without it,
+      // and the file the import names says so.
+      const note = JSON.stringify({ note: "The original transcript was too large to save here; it stays in camelAI's previous chat engine's storage." });
+      const placeholder = await fetch(url, { method: "PUT", headers, body: `${note}\n`, signal: AbortSignal.timeout(RUNTIME_MIGRATION_CALL_TIMEOUT_MS) });
+      await placeholder.body?.cancel();
+      if (!placeholder.ok) throw await runtimeError("PUT", "/v1/agents/:id/uploads", placeholder);
+      if (!this.renew(leaseId)) throw new Error("the move's lease ran out");
+      return "too_large";
+    }
+    if (!response.ok) throw await runtimeError("PUT", "/v1/agents/:id/uploads", response);
+    // The upload may have taken most of a lease: the move goes on only while it holds.
+    if (!this.renew(leaseId)) throw new Error("the move's lease ran out");
+    return "saved";
   }
 }

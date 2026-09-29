@@ -65,6 +65,7 @@ import { routes } from './routes.js';
 import { managementRoutes } from './management-routes.js';
 import { d1MirrorRoutes } from './d1-mirror-routes.js';
 import { selfhostSweepRoutes } from './selfhost-sweep-routes.js';
+import { runtimeMigrationRoutes } from './runtime-migration-routes.js';
 
 // ---------------------------------------------------------------------------
 // Hono app
@@ -79,6 +80,7 @@ app.route('/', routes);
 app.route('/', managementRoutes);
 app.route('/', d1MirrorRoutes);
 app.route('/', selfhostSweepRoutes);
+app.route('/', runtimeMigrationRoutes);
 
 // Auto-generate and serve OpenAPI spec from route middleware declarations
 createOpenApiDocument(app, {

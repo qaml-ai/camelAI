@@ -5,11 +5,10 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { runtimeApiMock, directEnabledMock, directRowMock, routeMock } = vi.hoisted(() => ({
+const { runtimeApiMock, directEnabledMock, routeMock } = vi.hoisted(() => ({
   runtimeApiMock: vi.fn(),
   routeMock: vi.fn(),
   directEnabledMock: vi.fn(() => true),
-  directRowMock: vi.fn(),
 }));
 
 vi.mock("../src/agent-runtime/runtime-api.js", async (importOriginal) => ({
@@ -24,10 +23,6 @@ vi.mock("../src/agent-runtime/thread-runtime.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   runtimeDirectThreadsEnabled: directEnabledMock,
 }));
-vi.mock("../src/agent-runtime/channel-turns.js", async (importOriginal) => ({
-  ...(await importOriginal<object>()),
-  directRuntimeRow: directRowMock,
-}));
 
 import {
   ARCHIVE_PATH,
@@ -35,7 +30,11 @@ import {
   MAX_TOOL_RESULT_CHARS,
   convertTranscript,
   importNote,
+  migrateThreadOnSend,
   migrateThreadToRuntime,
+  reconcileRuntimeMigrationOrphans,
+  runtimeMigrationKey,
+  runtimeMigrationKeyThread,
   withImportNote,
   type DoMigrationResult,
 } from "../src/agent-runtime/thread-migration";
@@ -203,6 +202,60 @@ describe("convertTranscript: what the runtime's import validator takes (M4)", ()
   });
 });
 
+describe("convertTranscript: messages a provider refuses (review 3)", () => {
+  it("leaves out user and assistant messages left empty", () => {
+    const converted = convertTranscript([
+      { role: "user", content: "  ", timestamp: 1 },
+      { role: "user", content: [{ type: "weird" }].slice(1), timestamp: 2 },
+      { role: "assistant", content: [{ type: "thinking", thinking: "", redacted: true }], timestamp: 3 },
+      { role: "user", content: "real", timestamp: 4 },
+    ] as never);
+    expect(converted.messages).toEqual([{ role: "user", content: "real", timestamp: 4 }]);
+    expect(converted.stats.normalized).toBe(3);
+  });
+});
+
+describe("runtimeMigrationKey", () => {
+  it("is a key the runtime takes for real (UUID) thread and lease ids, and names its thread", () => {
+    const threadId = crypto.randomUUID();
+    const key = runtimeMigrationKey(threadId, crypto.randomUUID());
+    expect(key).toMatch(/^[A-Za-z0-9_-]{1,80}$/);
+    expect(runtimeMigrationKeyThread(key)).toBe(threadId);
+    expect(runtimeMigrationKey(threadId, crypto.randomUUID())).not.toBe(key);
+  });
+});
+
+describe("reconcileRuntimeMigrationOrphans", () => {
+  const ORG_ROW = { threadId: "t1", agentId: "agt_row", model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
+
+  it("deletes a move's agent that neither the thread's move nor its runtime row holds, and nothing else", async () => {
+    runtimeApiMock.mockImplementation(async (_env: unknown, method: string) => method === "GET" ? [
+      { id: "agt_moving", key: "migrate_t1_lease-a", name: "t1" },
+      { id: "agt_row", key: "migrate_t1_lease-b", name: "t1" },
+      { id: "agt_lost", key: "migrate_t1_lease-c", name: "t1" },
+      { id: "agt_unknown_org", key: "migrate_t2_lease-d", name: "t2" },
+      { id: "agt_thread", key: "thread_t1", name: "t1" },
+    ] : null);
+    const holds = vi.fn(async (agentId: string) => (agentId === "agt_unknown_org" ? { holds: false } : { holds: agentId === "agt_moving", orgId: "org1" }));
+    const org = { getThreadRuntime: vi.fn(async () => ORG_ROW) };
+    const env = {
+      ORG: { idFromName: (name: string) => name, get: () => org },
+      CHAT_THREAD: { idFromName: (name: string) => name, get: () => ({ runtimeMigrationHolds: holds }) },
+    } as unknown as ChatEnv;
+    const dry = await reconcileRuntimeMigrationOrphans(env, { dryRun: true });
+    expect(dry).toEqual({ scanned: 4, kept: 2, orphans: ["agt_lost"], deleted: [], unverifiable: ["agt_unknown_org"], next: null });
+    expect(runtimeApiMock.mock.calls.some((call) => call[1] === "DELETE")).toBe(false);
+    const real = await reconcileRuntimeMigrationOrphans(env);
+    expect(real.deleted).toEqual(["agt_lost"]);
+    expect(runtimeApiMock).toHaveBeenCalledWith(expect.anything(), "DELETE", "/v1/agents/agt_lost", undefined, {}, expect.any(Function));
+    expect(holds).toHaveBeenCalledWith("agt_moving", "migrate_t1_lease-a");
+    // A page at a time, in agent id order.
+    const first = await reconcileRuntimeMigrationOrphans(env, { dryRun: true, limit: 2 });
+    expect(first).toMatchObject({ scanned: 2, next: "agt_moving" });
+    expect(await reconcileRuntimeMigrationOrphans(env, { dryRun: true, limit: 2, after: first.next })).toMatchObject({ scanned: 2, next: null });
+  });
+});
+
 describe("migrateThreadToRuntime", () => {
   const context = { orgId: "org1", workspaceId: "ws1", threadId: "t1", userId: "u1", userName: "Ada", userEmail: null };
   const ROW = { threadId: "t1", agentId: "agt_new", model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
@@ -210,20 +263,23 @@ describe("migrateThreadToRuntime", () => {
 
   function fakeEnv(
     answer: DoMigrationResult,
-    options: { row?: typeof ROW | null; thread?: Record<string, unknown> | null; connectionOwner?: string | null; status?: { state: string | null } } = {},
+    options: { row?: typeof ROW | null; rows?: Array<typeof ROW | null>; thread?: Record<string, unknown> | null; connectionOwner?: string | null; relay?: object | null; flags?: Record<string, string>; status?: { state: string | null } } = {},
   ) {
     const chat = {
       migrateToRuntime: vi.fn(async () => answer),
       runtimeMigrationStatus: vi.fn(async () => options.status ?? { state: null }),
+      relayRuntimeAgent: vi.fn(async () => options.relay ?? null),
     };
     const org = {
       getThread: vi.fn(async () => (options.thread === undefined ? { workspace_id: "ws1", created_by: "u1" } : options.thread)),
-      getThreadRuntime: vi.fn(async () => options.row ?? null),
+      getThreadRuntime: vi.fn(async () => (options.rows ? options.rows.shift() ?? null : options.row ?? null)),
+      setThreadRuntimeAgent: vi.fn(async () => ROW),
       getMember: vi.fn(async (id: string) => MEMBERS.find((member) => member.user_id === id) ?? null),
       getMembers: vi.fn(async () => MEMBERS),
     };
     const workspace = { getIntegration: vi.fn(async () => (options.connectionOwner ? { created_by: options.connectionOwner } : null)) };
     const env = {
+      ...options.flags,
       AGENT_RUNTIME_DEFINITION: "def_1",
       ORG: { idFromName: (name: string) => name, get: () => org },
       CHAT_THREAD: { idFromName: (name: string) => name, get: () => chat },
@@ -269,6 +325,13 @@ describe("migrateThreadToRuntime", () => {
     expect(routeMock).not.toHaveBeenCalled();
   });
 
+  it("finishes a commit left pending when the thread is opened (M-C)", async () => {
+    const pending = fakeEnv({ status: "runtime", row: ROW } as DoMigrationResult, { status: { state: "committing" } });
+    expect(await migrateThreadToRuntime(pending.env, context)).toEqual({ status: "runtime", row: ROW });
+    expect(pending.chat.migrateToRuntime).toHaveBeenCalledWith({ context, subject: null });
+    expect(routeMock).not.toHaveBeenCalled();
+  });
+
   it("acts for the channel's connection owner, or the org's owner, when the creator is no member", async () => {
     const channel = fakeEnv({ status: "busy", reason: "running" }, { thread: { workspace_id: "ws1", created_by: "slack", channel_connection_id: "conn1" }, connectionOwner: "connector" });
     await migrateThreadToRuntime(channel.env, context);
@@ -279,8 +342,9 @@ describe("migrateThreadToRuntime", () => {
   });
 
   it("adopts a relay thread, and waits out a busy one", async () => {
-    directRowMock.mockResolvedValue(ROW);
-    expect(await migrateThreadToRuntime(fakeEnv({ status: "relay" }).env, context)).toMatchObject({ status: "adopted", row: ROW });
+    const relay = fakeEnv({ status: "relay" }, { relay: { agentId: "agt_relay", model: "m", keyScope: "hosted" } });
+    expect(await migrateThreadToRuntime(relay.env, context)).toMatchObject({ status: "adopted", row: ROW });
+    expect(relay.org.setThreadRuntimeAgent).toHaveBeenCalledWith("t1", { agentId: "agt_relay", model: "m", keyScope: "hosted", configured: null });
     expect(await migrateThreadToRuntime(fakeEnv({ status: "busy", reason: "running" }).env, context)).toEqual({ status: "busy", reason: "running" });
   });
 
@@ -301,5 +365,57 @@ describe("migrateThreadToRuntime", () => {
     expect(onRuntime.chat.migrateToRuntime).not.toHaveBeenCalled();
     directEnabledMock.mockReturnValue(false);
     expect(await migrateThreadToRuntime(fakeEnv({ status: "relay" }).env, context)).toMatchObject({ status: "skipped" });
+  });
+});
+
+describe("migrateThreadOnSend", () => {
+  const context = { orgId: "org1", workspaceId: "ws1", threadId: "t1", userId: "u1", userName: "Ada", userEmail: null };
+  const ROW = { threadId: "t1", agentId: "agt_new", model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
+  const FLAGS = { AGENT_RUNTIME_API_TOKEN: "operator", AGENT_RUNTIME_TENANT: "chiridion", AGENT_RUNTIME_DIRECT_THREADS: "1", AGENT_RUNTIME_MIGRATE_DO_THREADS: "1" };
+
+  function fakeEnv(answer: DoMigrationResult, rows: Array<typeof ROW | null>, flags: Record<string, string> = FLAGS) {
+    const getThreadRuntime = vi.fn(async () => rows.shift() ?? null);
+    const org = {
+      getThread: vi.fn(async () => ({ workspace_id: "ws1", created_by: "u1" })),
+      getThreadRuntime,
+      getMember: vi.fn(async () => ({ user_id: "u1", role: "member" })),
+      getMembers: vi.fn(async () => []),
+    };
+    const thread = {
+      migrateToRuntime: vi.fn(async () => answer),
+      runtimeMigrationStatus: vi.fn(async () => ({ state: null })),
+      relayRuntimeAgent: vi.fn(async () => null),
+    };
+    return {
+      env: { ...flags, AGENT_RUNTIME_DEFINITION: "def_1", ORG: { idFromName: (n: string) => n, get: () => org }, CHAT_THREAD: { idFromName: (n: string) => n, get: () => thread } } as unknown as ChatEnv,
+      getThreadRuntime,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useRealTimers();
+    directEnabledMock.mockReturnValue(true);
+    routeMock.mockResolvedValue({ route: { provider: "openrouter" } });
+  });
+
+  it("moves the thread and answers its new row", async () => {
+    const { env } = fakeEnv({ status: "migrated", row: ROW, archived: false, stats: {} } as never, [null]);
+    expect(await migrateThreadOnSend(env, context)).toEqual(ROW);
+  });
+
+  it("waits for a move another request is making", async () => {
+    vi.useFakeTimers();
+    const { env } = fakeEnv({ status: "busy", reason: "moving" }, [null, null, ROW]);
+    const row = migrateThreadOnSend(env, context);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(await row).toEqual(ROW);
+  });
+
+  it("leaves the thread on ChatThreadDO when it is busy there, or the flag is off", async () => {
+    expect(await migrateThreadOnSend(fakeEnv({ status: "busy", reason: "running" }, [null]).env, context)).toBeNull();
+    const off = fakeEnv({ status: "skipped", reason: "moved" }, [null], { ...FLAGS, AGENT_RUNTIME_MIGRATE_DO_THREADS: "" });
+    expect(await migrateThreadOnSend(off.env, context)).toBeNull();
+    expect(off.getThreadRuntime).not.toHaveBeenCalled();
   });
 });

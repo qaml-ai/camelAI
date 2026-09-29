@@ -384,7 +384,7 @@ import {
   type RuntimeAgentRecord,
   type RuntimeRunRecord,
 } from "./chat-thread/runtime-agent";
-import { formatChannelHistoryNote, type RelayRuntimeAgent } from "./agent-runtime/channel-turns";
+import { formatChannelHistoryNote, takeChannelHistoryNotes, type RelayRuntimeAgent } from "./agent-runtime/channel-turns";
 import type { DoMigrationRequest, DoMigrationResult } from "./agent-runtime/thread-migration";
 import { ChatThreadRuntimeMigration } from "./chat-thread/runtime-migration";
 import { AUTOMATION_OUTCOME_INSTRUCTION } from "./agent-runtime/scheduled-turns";
@@ -4305,6 +4305,9 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   }
 
   private runtimeMigrationInstance: ChatThreadRuntimeMigration | null = null;
+  /** The move's alarm: the time last asked for and not yet set, and the setting in progress. */
+  private runtimeMigrationAlarmWanted: number | null = null;
+  private runtimeMigrationAlarmSetting: Promise<void> | null = null;
 
   /** This thread's move to the runtime, which the DO drives (chat-thread/runtime-migration.ts). */
   private get runtimeMigration(): ChatThreadRuntimeMigration {
@@ -4320,14 +4323,33 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       hasRelayAgent: () => Boolean(this.ctx.storage.kv.get(RUNTIME_AGENT_KEY)),
       revision: () => this.piCoreStore.getPiCoreRevision(),
       loadHistory: (maxChars) => this.piCoreStore.loadPiCoreHistoryForMigration(maxChars),
-      renderArchivePages: () => this.renderArchivePages(),
+      renderArchivePages: (beforeMs) => this.renderArchivePages(beforeMs),
+      firstStoredAtMs: () => this.piCoreStore.firstStoredMessageAtMs(),
       payloadBatches: () => mapIterable(this.piCoreStore.piCoreRowBatches(), (batch) => batch.map((row) => row.payload)),
       preview: () => ({ tabs: cloneDurableState(this.previewTabs), activeTabId: this.previewActiveTabId }),
       scheduleAlarm: (at) => {
-        this.ctx.waitUntil(this.schedule(new Date(at), "runtimeMigrationAlarm").catch((error: unknown) =>
-          console.warn("[ChatThreadDO] could not schedule the runtime move's alarm", error)));
+        // One alarm for the move at a time, at the latest time asked for: a
+        // burst of lease renewals is one reschedule, not one per renewal.
+        this.runtimeMigrationAlarmWanted = at;
+        if (this.runtimeMigrationAlarmSetting) return;
+        this.runtimeMigrationAlarmSetting = (async () => {
+          while (this.runtimeMigrationAlarmWanted !== null) {
+            const wanted = this.runtimeMigrationAlarmWanted;
+            this.runtimeMigrationAlarmWanted = null;
+            for (const schedule of await this.listSchedules()) {
+              if (schedule.callback === "runtimeMigrationAlarm") await this.cancelSchedule(schedule.id);
+            }
+            await this.schedule(new Date(wanted), "runtimeMigrationAlarm");
+          }
+        })()
+          .catch((error: unknown) => console.warn("[ChatThreadDO] could not schedule the runtime move's alarm", error))
+          .finally(() => { this.runtimeMigrationAlarmSetting = null; });
+        this.ctx.waitUntil(this.runtimeMigrationAlarmSetting);
       },
       waitUntil: (promise) => this.ctx.waitUntil(promise),
+      orgId: () => this.chatContext?.orgId,
+      onUndone: () => this.ctx.waitUntil(this.absorbQueuedChannelNotes().catch((error: unknown) =>
+        console.warn("[ChatThreadDO] could not take back channel notes queued for the runtime", error))),
     }));
   }
 
@@ -4353,26 +4375,46 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     return await this.runtimeMigration.migrate(request);
   }
 
+  /**
+   * Channel history queued for the thread's first runtime prompt while a move
+   * held it (chat-channels.ts), taken back into this transcript when the move
+   * did not happen.
+   */
+  private async absorbQueuedChannelNotes(): Promise<void> {
+    const threadId = this.chatContext?.threadId;
+    if (!threadId || this.runtimeMigrationState()) return;
+    const notes = await takeChannelHistoryNotes(this.env as unknown as ChatEnv, threadId);
+    if (notes.length === 0) return;
+    const now = Date.now();
+    await this.appendPiCoreMessagesIfMissing(notes.map((note, index) => ({
+      role: "user" as const,
+      content: note,
+      timestamp: now + index,
+    }) satisfies AgentMessage));
+  }
+
+  /** Whether this thread's move holds a runtime agent a move made (the orphan reconciler asks). */
+  runtimeMigrationHolds(agentId: string, key: string | null): { holds: boolean; orgId?: string } {
+    return this.runtimeMigration.holds(agentId, key);
+  }
+
   /** Where this thread's move to the runtime stands (moving, moved, backing off), before anyone asks for one. */
-  runtimeMigrationStatus(): { state: "moving" | "moved" | "backoff" | null; retryAt?: number } {
+  runtimeMigrationStatus(): { state: "moving" | "committing" | "moved" | "backoff" | null; retryAt?: number } {
     return this.runtimeMigration.status();
   }
 
   /**
-   * The render rows a post-turn compaction left as the only copy of the
-   * history below its cut (render-archive-preserve.ts): those older than the
-   * oldest message pi_core still derives, a bounded page at a time, newest
-   * page first.
+   * The render rows older than `beforeMs` (render-archive-preserve.ts: what a
+   * post-turn compaction left as the only copy of history below its cut), a
+   * bounded page at a time, newest page first.
    */
-  private *renderArchivePages(): Generator<UIMessage[]> {
-    const seam = this.oldestDerivedPiCreatedAtMs();
-    if (seam === undefined) return;
-    let beforeCursor: string | null = `e:${formatAiChatCreatedAt(seam)}`;
+  private *renderArchivePages(beforeMs: number): Generator<UIMessage[]> {
+    let beforeCursor: string | null = `e:${formatAiChatCreatedAt(beforeMs)}`;
     while (beforeCursor) {
       const page = this.getRenderHistoryPage({ beforeCursor, maxMessages: 50, maxBytes: 2_000_000 });
       const archived = (page.messages as UIMessage[]).filter((message) => {
         const createdAt = uiMessageCreatedAtMs(message);
-        return createdAt !== undefined && createdAt < seam;
+        return createdAt !== undefined && createdAt < beforeMs;
       });
       if (archived.length) yield archived;
       if (!page.hasMore || !page.nextCursor) return;
@@ -7381,6 +7423,11 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       typeof body.message === "string" ? body.message.trim() : "";
     if (!message) {
       return { status: "error", error: "Missing message" };
+    }
+
+    // A thread on the agent runtime: its callers (channels, schedules) send it there.
+    if (this.runtimeMigrationState() === "moved") {
+      return { status: "moved", error: "This conversation runs on the agent runtime now." };
     }
 
     const automationRun = this.automationRun.normalizeActiveAutomationRun(body.automationRun);

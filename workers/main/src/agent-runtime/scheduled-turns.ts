@@ -10,7 +10,7 @@
 import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import { RUNTIME_TOOL_PREFIX } from "../../../../src/lib/agent-runtime-shared.js";
 import { runtimeApi } from "./runtime-api.js";
-import { directRuntimeRow } from "./channel-turns.js";
+import { directRuntimeRow } from "./thread-migration.js";
 import { runtimeDirectThreadsEnabled, startRuntimeTurn } from "./thread-runtime.js";
 
 /** What a scheduled run must do before it ends, naming the outcome tool as the run's agent has it. */

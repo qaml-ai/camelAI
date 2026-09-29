@@ -21,11 +21,12 @@ import {
   ChatThreadRuntimeMigration,
   RUNTIME_MIGRATION_KEY,
   RUNTIME_MIGRATION_LEASE_MS,
+  ORPHAN_KEY_SETTLE_MS,
   PERMANENT_FAILURE_RETRY_MS,
   migrationBackoffMs,
   type RuntimeMigrationRecord,
 } from "../src/chat-thread/runtime-migration";
-import { provisionedAgentId } from "../src/agent-runtime/runtime-api";
+import { RuntimeApiError, provisionedAgentId } from "../src/agent-runtime/runtime-api";
 import { ARCHIVE_PATH, MAX_IMPORT_BYTES, MAX_TOOL_RESULT_CHARS, convertTranscript } from "../src/agent-runtime/thread-migration";
 import { renderArchiveToPiMessages } from "../src/chat-thread/render-archive-export";
 
@@ -41,6 +42,7 @@ function harness() {
     revision: { generation: 1, count: 1 },
     history: [user("hi")] as unknown[],
     whole: true,
+    openingRenderMessageId: null as string | null,
     renderPages: [] as unknown[][],
     payloads: [['{"role":"user","content":"hi"}'], ['{"role":"assistant"}']] as string[][],
   };
@@ -51,7 +53,8 @@ function harness() {
   };
   const alarms: number[] = [];
   const pending: Promise<unknown>[] = [];
-  const loadHistory = vi.fn(async (_maxChars: number) => ({ messages: state.history as never[], whole: state.whole }));
+  const loadHistory = vi.fn(async (_maxChars: number) => ({ messages: state.history as never[], whole: state.whole, openingRenderMessageId: state.openingRenderMessageId }));
+  const onUndone = vi.fn();
   const migration = new ChatThreadRuntimeMigration({
     env: {
       AGENT_RUNTIME_URL: "https://runtime.test",
@@ -66,6 +69,9 @@ function harness() {
     revision: () => state.revision,
     loadHistory,
     renderArchivePages: () => state.renderPages as never,
+    firstStoredAtMs: () => undefined,
+    onUndone,
+    orgId: () => "org1",
     payloadBatches: () => state.payloads,
     preview: () => ({ tabs: [{ kind: "app", scriptName: "shop", isPublic: true } as never], activeTabId: "app:shop" }),
     scheduleAlarm: (at) => { alarms.push(at); },
@@ -73,7 +79,7 @@ function harness() {
   });
   const record = () => store.get(RUNTIME_MIGRATION_KEY) as RuntimeMigrationRecord | undefined;
   const settle = async () => { while (pending.length) await Promise.all(pending.splice(0)); };
-  return { store, state, org, alarms, migration, record, settle, loadHistory };
+  return { store, state, org, alarms, migration, record, settle, loadHistory, onUndone };
 }
 
 type FetchCall = { url: string; init: RequestInit };
@@ -123,7 +129,8 @@ describe("ChatThreadRuntimeMigration", () => {
     expect(body).toMatchObject({ definition: "def_1", name: "t1", subject: "u1", ttlSeconds: null, context: { org: "org1", workspace: "ws1", thread: "t1" } });
     expect(body.initialMessages[0].content).toContain("with all of its messages");
     expect(body.initialMessages[1]).toEqual(user("hi"));
-    expect(header(create, "Idempotency-Key")).toMatch(/^migrate_t1_[0-9a-f]{16}$/);
+    // This attempt's own key: the thread and its lease.
+    expect(header(create, "Idempotency-Key")).toBe(`migrate_t1_${(h.record() as { leaseId: string }).leaseId.replace(/-/g, "").slice(0, 16)}`);
     expect(create.init.signal).toBeInstanceOf(AbortSignal);
     expect(h.org.claimThreadRuntimeAgent).toHaveBeenCalledWith("t1", "agt_new");
     expect(h.org.setThreadUiState).toHaveBeenCalledWith("t1", { tabs: [{ kind: "app", scriptName: "shop", isPublic: true }], activeTabId: "app:shop" });
@@ -269,6 +276,18 @@ describe("ChatThreadRuntimeMigration", () => {
       expect(archived[0]).toContain("build a shop");
     });
 
+    it("keeps the previous turn's reply when the export opens mid-turn on another render message (H-B2)", async () => {
+      const h = harness();
+      h.state.history = [user("[Context Summary]\n\nEarlier.", 50), { role: "assistant", content: [{ type: "text", text: "tail of turn 2" }], timestamp: 60 }];
+      h.state.openingRenderMessageId = "turn2";
+      h.state.renderPages = [[
+        { id: "q1", role: "user", parts: [{ type: "text", text: "question 1" }], metadata: { pi: { createdAtMs: 10 } } },
+        { id: "turn1", role: "assistant", parts: [{ type: "text", text: "answer 1" }], metadata: { pi: { createdAtMs: 11 } } },
+      ]];
+      await h.migration.migrate({ context, subject: "u1" });
+      expect(JSON.stringify((await createBody()).initialMessages)).toContain("answer 1");
+    });
+
     it("counts a thread whose rows open on a summary as not whole, even with no render archive", async () => {
       const h = harness();
       h.state.history = [user("[Context Summary]\n\nEarlier.", 50), user("and now?", 60)];
@@ -277,8 +296,9 @@ describe("ChatThreadRuntimeMigration", () => {
     });
   });
 
-  describe("a create cut off (M1)", () => {
-    it("records the key before the call, and deletes whatever the key made when the call fails", async () => {
+  describe("a create cut off (M1, H-A)", () => {
+    it("records the key before the call, and deletes the agent the key made once it appears", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
       const h = harness();
       let keyDuringCall: string | undefined;
       createResponse = async () => {
@@ -288,11 +308,60 @@ describe("ChatThreadRuntimeMigration", () => {
       expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "failed" });
       const key = header(creates()[0], "Idempotency-Key");
       expect(keyDuringCall).toBe(key);
+      const byKey = `/v1/agents/${await provisionedAgentId("chiridion", key)}`;
+      // The runtime has not made it (yet): the key is kept, and looked for again later.
+      runtimeApiMock.mockRejectedValueOnce(new RuntimeApiError("gone", 404));
       await h.settle();
-      expect(deleted()).toContain(`/v1/agents/${await provisionedAgentId("chiridion", key)}`);
-      expect(deleted()).toContain(`/v1/agents/${await provisionedAgentId("chiridion", `${key}#1`)}`);
-      expect(h.record()).toMatchObject({ phase: "failed" });
+      expect(deleted()).toEqual([byKey]);
+      expect(h.record()).toMatchObject({ phase: "failed", orphanKey: key });
+      expect(h.alarms.at(-1)).toBeGreaterThanOrEqual(Date.now() + ORPHAN_KEY_SETTLE_MS - 1_000);
+      // It appeared after all: the alarm deletes it, and the key is forgotten.
+      await h.migration.onAlarm();
+      await h.settle();
+      expect(deleted()).toEqual([byKey, byKey]);
       expect((h.record() as { orphanKey?: string }).orphanKey).toBeUndefined();
+    });
+
+    it("forgets a cut-off key that never made an agent only once it has settled", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const h = harness();
+      createResponse = async () => { throw new DOMException("The operation timed out.", "TimeoutError"); };
+      runtimeApiMock.mockRejectedValue(new RuntimeApiError("gone", 404));
+      await h.migration.migrate({ context, subject: "u1" });
+      await h.settle();
+      expect(h.record()).toHaveProperty("orphanKey");
+      vi.setSystemTime(Date.now() + ORPHAN_KEY_SETTLE_MS + 1);
+      await h.migration.onAlarm();
+      await h.settle();
+      expect((h.record() as { orphanKey?: string }).orphanKey).toBeUndefined();
+    });
+
+    it("makes no new agent while an earlier attempt's key may still make one", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const h = harness();
+      h.store.set(RUNTIME_MIGRATION_KEY, { phase: "failed", failures: 1, retryAt: Date.now() - 1, error: "x", orgId: "org1", threadId: "t1", orphanKey: "migrate_t1_old", orphanKeyAt: Date.now() - 60_000 });
+      runtimeApiMock.mockRejectedValue(new RuntimeApiError("gone", 404));
+      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "skipped", reason: expect.stringContaining("backoff") });
+      expect(creates()).toHaveLength(0);
+      expect(h.record()).toMatchObject({ phase: "failed", orphanKey: "migrate_t1_old", failures: 1 });
+      expect(h.migration.state()).toBeNull();
+    });
+  });
+
+  describe("a cleanup that outlived its record (H-A)", () => {
+    it("deletes nothing more once the failed record it was for is gone", async () => {
+      const h = harness();
+      h.store.set(RUNTIME_MIGRATION_KEY, { phase: "failed", failures: 1, retryAt: Date.now() + 60_000, error: "x", orgId: "org1", threadId: "t1", orphanAgentId: "agt_old", orphanKey: "migrate_t1_old", orphanKeyAt: 1 });
+      let releaseFirst!: () => void;
+      runtimeApiMock.mockImplementationOnce(() => new Promise((resolve) => { releaseFirst = () => resolve(null); }));
+      await h.migration.onAlarm();
+      await vi.waitFor(() => expect(deleted()).toEqual(["/v1/agents/agt_old"]));
+      // Meanwhile the thread moved (another attempt, another key and agent).
+      h.store.set(RUNTIME_MIGRATION_KEY, { phase: "moved", leaseId: "l2", agentId: "agt_committed", movedAt: 1 });
+      releaseFirst();
+      await h.settle();
+      expect(deleted()).toEqual(["/v1/agents/agt_old"]);
+      expect(h.record()).toMatchObject({ phase: "moved", agentId: "agt_committed" });
     });
   });
 
@@ -320,12 +389,37 @@ describe("ChatThreadRuntimeMigration", () => {
       expect(archived[0]).toBe("a\nb\nc\nd\ne\nf\n");
     });
 
-    it("takes an archive the runtime refuses as permanent: a long wait, not a retry every minute", async () => {
+    it("moves without an archive the runtime will not keep, and says so in the file the import names", async () => {
       const h = harness();
       h.state.whole = false;
-      archiveResponse = async () => new Response(JSON.stringify({ error: "too large" }), { status: 413 });
-      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "skipped", reason: expect.stringContaining("too_large") });
+      let puts = 0;
+      archiveResponse = async (body) => {
+        puts += 1;
+        if (puts === 1) return new Response(JSON.stringify({ error: "too large" }), { status: 413 });
+        archived.push(await new Response(body).text());
+        return new Response("{}", { status: 201 });
+      };
+      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "migrated", reason: expect.stringContaining("archive too large") });
+      expect(archived[0]).toContain("too large to save here");
+    });
+
+    it("waits a day after an archive the runtime refuses otherwise", async () => {
+      const h = harness();
+      h.state.whole = false;
+      archiveResponse = async () => new Response(JSON.stringify({ error: "bad" }), { status: 400 });
+      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "skipped", reason: expect.stringContaining("refused_400") });
       expect((h.record() as { retryAt: number }).retryAt).toBeGreaterThanOrEqual(Date.now() + PERMANENT_FAILURE_RETRY_MS - 1_000);
+    });
+
+    it("gives every runtime call a deadline", async () => {
+      const h = harness();
+      h.state.whole = false;
+      h.org.claimThreadRuntimeAgent.mockResolvedValueOnce({ row: { ...ROW, agentId: "agt_first" }, claimed: false });
+      await h.migration.migrate({ context, subject: "u1" });
+      await h.settle();
+      expect(fetchCalls.every((call) => call.init.signal instanceof AbortSignal)).toBe(true);
+      // The spare agent's delete goes through the deadline fetch.
+      expect(runtimeApiMock.mock.calls.find((call) => call[1] === "DELETE")?.[5]).toEqual(expect.any(Function));
     });
   });
 
@@ -336,6 +430,34 @@ describe("ChatThreadRuntimeMigration", () => {
       expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "skipped", reason: expect.stringContaining("invalid_history") });
       expect((h.record() as { retryAt: number }).retryAt).toBeGreaterThanOrEqual(Date.now() + PERMANENT_FAILURE_RETRY_MS - 1_000);
       expect(h.migration.status()).toMatchObject({ state: "backoff" });
+    });
+  });
+
+  describe("review 3 lows", () => {
+    it("takes a 402 as passing (the tenant's, not the thread's): the usual backoff, not a day", async () => {
+      const h = harness();
+      createResponse = async () => new Response(JSON.stringify({ error: "payment required" }), { status: 402 });
+      expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "failed" });
+      expect((h.record() as { retryAt: number }).retryAt).toBeLessThan(Date.now() + PERMANENT_FAILURE_RETRY_MS / 2);
+    });
+
+    it("takes back channel notes queued for the runtime when a move is undone (L3)", async () => {
+      const h = harness();
+      h.state.busy = null;
+      h.loadHistory.mockImplementationOnce(async () => {
+        h.state.busy = "running";
+        return { messages: h.state.history as never[], whole: true };
+      });
+      await h.migration.migrate({ context, subject: "u1" });
+      expect(h.onUndone).toHaveBeenCalledTimes(1);
+    });
+
+    it("reports a commit in progress as such, so an open re-drives it (M-C)", async () => {
+      const h = harness();
+      h.store.set(RUNTIME_MIGRATION_KEY, { phase: "committing", leaseId: "l", agentId: "agt_new", orgId: "org1", threadId: "t1", previewTabs: [], previewActiveTabId: null, attempts: 3 });
+      expect(h.migration.status()).toEqual({ state: "committing" });
+      expect(await h.migration.migrate({ context, subject: null })).toMatchObject({ status: "runtime" });
+      expect(h.record()).toMatchObject({ phase: "moved" });
     });
   });
 
@@ -352,7 +474,7 @@ describe("ChatThreadRuntimeMigration", () => {
   });
 
   describe("idempotency (blocker 5)", () => {
-    it("sends the same import under the same key on every attempt, whenever it runs", async () => {
+    it("sends the same import on every attempt, whenever it runs", async () => {
       vi.useFakeTimers({ toFake: ["Date"] });
       const h = harness();
       h.state.history = [user("hi", 5), { role: "assistant", content: [{ type: "text", text: "hello" }], timestamp: 6 }];
@@ -361,8 +483,10 @@ describe("ChatThreadRuntimeMigration", () => {
       vi.setSystemTime(Date.now() + migrationBackoffMs(1) + 1);
       createResponse = async () => new Response(JSON.stringify({ id: "agt_new" }), { status: 201 });
       expect(await h.migration.migrate({ context, subject: "u1" })).toMatchObject({ status: "migrated" });
+      // The same import, under each attempt's own key: no two attempts share an agent.
       expect(await bodyText(creates()[1])).toBe(await bodyText(creates()[0]));
-      expect(header(creates()[1], "Idempotency-Key")).toBe(header(creates()[0], "Idempotency-Key"));
+      expect(header(creates()[1], "Idempotency-Key")).not.toBe(header(creates()[0], "Idempotency-Key"));
+      expect(header(creates()[1], "Idempotency-Key")).toMatch(/^migrate_t1_[0-9a-f]{16}$/);
     });
   });
 
@@ -477,6 +601,13 @@ describe("ChatThreadDO turn guard", () => {
     delete moved.sendRunnerCommand;
     moved.store.set(RUNTIME_MIGRATION_KEY, { phase: "moved", leaseId: "l", agentId: "a", movedAt: 1 });
     expect(await call(moved, "sendRunnerCommand", { type: "message", content: "hello" })).toBe(false);
+  });
+
+  it("tells a channel or schedule caller a moved thread moved, so it sends it to the runtime", async () => {
+    const fake = fakeThread();
+    fake.updateExternalChatContext = () => null;
+    fake.store.set(RUNTIME_MIGRATION_KEY, { phase: "moved", leaseId: "l", agentId: "a", movedAt: 1 });
+    expect(await call(fake, "startInitialUserMessage", { message: "hello", threadId: "t1" })).toMatchObject({ status: "moved" });
   });
 
   it("does not fork a moved thread from its stale transcript", async () => {

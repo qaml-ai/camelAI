@@ -1333,17 +1333,23 @@ export class PiCoreMessageStore {
    * never materializes. Deterministic for an unchanged thread: a retried move
    * sends the same import.
    */
-  async loadPiCoreHistoryForMigration(maxChars: number): Promise<{ messages: AgentMessage[]; whole: boolean; totalRows: number }> {
+  async loadPiCoreHistoryForMigration(maxChars: number): Promise<{
+    messages: AgentMessage[];
+    whole: boolean;
+    totalRows: number;
+    /** The render message the export's first (non-summary) row belongs to: a turn a compaction's cut may have split. */
+    openingRenderMessageId: string | null;
+  }> {
     this.ensurePiCoreTables();
     const totals = this.piCoreVisibleWindowTotals(0);
     if (totals.chars > maxChars) {
-      const { messages } = await this.loadBoundedPiCoreSessionWindow({ maxChars });
+      const { messages, window } = await this.loadBoundedPiCoreSessionWindow({ maxChars });
       // A capped window's placeholder summary is stamped with the load time.
       const [first, next] = messages as Array<AgentMessage & { timestamp?: number }>;
       if (first && typeof next?.timestamp === "number" && (first.timestamp ?? 0) > next.timestamp) {
         messages[0] = { ...first, timestamp: next.timestamp } as AgentMessage;
       }
-      return { messages, whole: false, totalRows: totals.rows };
+      return { messages, whole: false, totalRows: totals.rows, openingRenderMessageId: this.openingRenderMessageId(window.firstRowIdx) };
     }
     const compaction = this.loadPiCoreCompaction();
     const cutAt = compaction && compaction.firstKeptIndex > 0 ? compaction.firstKeptIndex : null;
@@ -1363,7 +1369,43 @@ export class PiCoreMessageStore {
       }
     }
     if (!summarized) messages.push(createPiSummaryMessage(compaction!.summary, compaction!.updatedAt));
-    return { messages, whole: true, totalRows: totals.rows };
+    return { messages, whole: true, totalRows: totals.rows, openingRenderMessageId: this.openingRenderMessageId(0) };
+  }
+
+  /** The renderMessageId of the first row from `fromIdx` that is not a compaction summary, read as stored. */
+  private openingRenderMessageId(fromIdx: number): string | null {
+    for (const meta of this.listPiCoreRowMetaAscending({ fromIdx, limit: 4 })) {
+      const row = this.deps.sql()
+        .exec<{ payload: string }>("SELECT payload FROM pi_core_messages WHERE idx = ? LIMIT 1", meta.idx)
+        .toArray()[0];
+      let parsed: { role?: unknown; content?: unknown; uiMetadata?: { renderMessageId?: unknown } } | null = null;
+      try {
+        parsed = row ? JSON.parse(row.payload) : null;
+      } catch {
+        continue;
+      }
+      if (!parsed) continue;
+      if (parsed.role === "user" && typeof parsed.content === "string" && parsed.content.startsWith("[Context Summary]")) continue;
+      const id = parsed.uiMetadata?.renderMessageId;
+      return typeof id === "string" && id ? id : null;
+    }
+    return null;
+  }
+
+  /**
+   * The timestamp of the oldest stored message that is not a compaction
+   * summary (a rewrite puts one at row 0, stamped when it ran): where stored
+   * history begins. Scans a few rows, payloads one at a time.
+   */
+  firstStoredMessageAtMs(): number | undefined {
+    this.ensurePiCoreTables();
+    for (const meta of this.listPiCoreRowMetaAscending({ fromIdx: 0, limit: 16 })) {
+      const message = this.loadPiCoreRenderMessageAt(meta.idx) as { role?: unknown; content?: unknown; timestamp?: unknown } | null;
+      if (!message || typeof message.timestamp !== "number") continue;
+      if (message.role === "user" && typeof message.content === "string" && message.content.startsWith("[Context Summary]")) continue;
+      return message.timestamp;
+    }
+    return undefined;
   }
 
   /**

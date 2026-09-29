@@ -1285,6 +1285,13 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
             error: "Thread is busy with another run",
             threadId,
           };
+        case "moved":
+          // Moved to the runtime since this dispatch looked: the next run goes there.
+          return {
+            status: "busy",
+            error: "The thread moved to the agent runtime; the next run goes there",
+            threadId,
+          };
         case "error":
           return {
             status: "error",

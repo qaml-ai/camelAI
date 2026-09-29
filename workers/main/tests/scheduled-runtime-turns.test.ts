@@ -19,7 +19,7 @@ vi.mock("../src/agent-runtime/thread-runtime.js", async (importOriginal) => ({
   startRuntimeTurn: startRuntimeTurnMock,
   runtimeDirectThreadsEnabled: directEnabledMock,
 }));
-vi.mock("../src/agent-runtime/channel-turns.js", async (importOriginal) => ({
+vi.mock("../src/agent-runtime/thread-migration.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   directRuntimeRow: directRowMock,
 }));

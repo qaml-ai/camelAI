@@ -401,22 +401,27 @@ export async function enqueueChannelMessage(
   const systemMessage = buildChannelReplySystemMessage(channelKind, request);
   const runtimeSystemMessage = buildChannelReplySystemMessage(channelKind, request, { runtime: true });
 
+  const startDirect = async (): Promise<InitialUserMessageResult | null> => {
+    if (!messageRequest.workspaceId || !messageRequest.orgId) return null;
+    const direct = await startChannelRuntimeTurn(env as unknown as ChatEnv, {
+      threadId: request.threadId,
+      workspaceId: messageRequest.workspaceId,
+      orgId: messageRequest.orgId,
+      channelKind,
+      userId: messageRequest.userId ?? null,
+      userName: messageRequest.userName,
+      userEmail: messageRequest.userEmail,
+      systemMessage: runtimeSystemMessage,
+      message: request.message ?? "",
+      clientMessageId: messageRequest.clientMessageId,
+    });
+    if (!direct) return null;
+    return direct.status === "accepted" ? { status: "accepted" } : { status: direct.status, error: direct.error };
+  };
+
   try {
-    if (messageRequest.workspaceId && messageRequest.orgId) {
-      const direct = await startChannelRuntimeTurn(env as unknown as ChatEnv, {
-        threadId: request.threadId,
-        workspaceId: messageRequest.workspaceId,
-        orgId: messageRequest.orgId,
-        channelKind,
-        userId: messageRequest.userId ?? null,
-        userName: messageRequest.userName,
-        userEmail: messageRequest.userEmail,
-        systemMessage: runtimeSystemMessage,
-        message: request.message ?? "",
-        clientMessageId: messageRequest.clientMessageId,
-      });
-      if (direct) return direct.status === "accepted" ? { status: "accepted" } : { status: direct.status, error: direct.error };
-    }
+    const direct = await startDirect();
+    if (direct) return direct;
     const stub = env.CHAT_THREAD.get(
       env.CHAT_THREAD.idFromName(request.threadId),
     ) as unknown as InitialUserMessageRpc;
@@ -425,6 +430,10 @@ export async function enqueueChannelMessage(
       messageSource: channelKind,
       message: `${systemMessage}\n\n${request.message}`,
     });
+    // The thread moved to the runtime meanwhile: send it there.
+    if (result.status === "moved") {
+      return await startDirect() ?? { status: "error", error: result.error ?? "The conversation moved" };
+    }
     if (
       result.status === "accepted" ||
       result.status === "busy" ||

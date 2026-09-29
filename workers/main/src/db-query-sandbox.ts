@@ -3,8 +3,9 @@ import { Sandbox } from "@cloudflare/sandbox";
 import {
   createSingleFlight,
   ensureLocalMountAlias,
+  forceUnmountSdkMount,
   mountAllowsList,
-  mountOrRecover,
+  mountWithSelfHeal,
   sandboxR2MountPath,
   sandboxR2MountOptions,
   waitForWritableLocalMount,
@@ -169,8 +170,15 @@ export class DbQuerySandbox extends Sandbox<Env> {
    * the same `'/' + r2_key` contract the analysis container reads with. At
    * most one mount attempt per path per container life; an already-mounted
    * error from a previous life is recovered via unmount+remount (see
-   * mountOrRecover) so `r2.internal` egress is re-registered.
+   * mountOrRecover) so `r2.internal` egress is re-registered; a mount that
+   * stays unreadable, or a session too blocked to run the mount steps, gets one
+   * cooldown-fenced container restart and one more mount (mountWithSelfHeal).
    */
+  /** `MountRecoverTarget.forceUnmount`; see `forceUnmountSdkMount`. */
+  async forceUnmount(mountPath: string): Promise<void> {
+    await forceUnmountSdkMount(this, mountPath);
+  }
+
   async ensureWarehouseExportMount(prefix: string): Promise<void> {
     const mountPath = `/${prefix}`;
     this.syncMountBookkeepingToContainer();
@@ -194,8 +202,13 @@ export class DbQuerySandbox extends Sandbox<Env> {
       this.mountGates.set(mountPath, gate);
     }
     await gate(async () => {
-      await mountOrRecover(
-        this,
+      await mountWithSelfHeal(
+        {
+          target: this,
+          component: "DbQuerySandbox",
+          heal: (request) => healZombieSandboxContainer(this.zombieHealTarget, "DbQuerySandbox", request),
+          env: this.env,
+        },
         WAREHOUSE_EXPORT_BUCKET_BINDING,
         actualMountPath,
         mountOptions,

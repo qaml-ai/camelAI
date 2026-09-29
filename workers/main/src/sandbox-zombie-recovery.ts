@@ -81,6 +81,7 @@ export type SandboxZombieRestartTrigger =
   | "exec_session_death"
   | "probe_session_death"
   | "mount_io_error"
+  | "mount_session_timeout"
   | "setup_deadline";
 
 export type SandboxZombieRestartOutcome =

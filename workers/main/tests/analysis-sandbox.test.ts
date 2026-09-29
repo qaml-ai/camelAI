@@ -4,11 +4,13 @@ import {
   AnalysisSandbox,
   createSingleFlight,
   forceUnmountCommand,
+  isMountSessionTimeout,
   isMountAlreadyPresent,
   mountAllowsList,
   mountOrRecover,
   sandboxR2MountOptions,
   sandboxR2MountPath,
+  SandboxMountSessionTimeoutError,
   UnreadableR2MountError,
   waitForWritableLocalMount,
   type MountRecoverTarget,
@@ -372,7 +374,7 @@ describe('AnalysisSandbox zombie self-heal', () => {
       // The forced restart, then the mount recovery it produced.
       expect(recordedEvents(sandbox)).toEqual([
         ['build_sandbox_zombie_restart', 'restarted'],
-        ['analysis_sandbox_mount_recovery', 'restarted'],
+        ['sandbox_mount_recovery', 'restarted'],
       ]);
     } finally {
       warn.mockRestore();
@@ -746,7 +748,7 @@ describe('AnalysisSandbox.ensureMounted self-heal', () => {
       expect(destroy).not.toHaveBeenCalled();
       expect(sandbox.mountedPaths.has('/uploads')).toBe(true);
       expect(recordedEvents(sandbox)).toEqual([
-        ['analysis_sandbox_mount_recovery', 'force_remounted'],
+        ['sandbox_mount_recovery', 'force_remounted'],
       ]);
     } finally {
       warn.mockRestore();
@@ -777,12 +779,148 @@ describe('AnalysisSandbox.ensureMounted self-heal', () => {
 
       expect(recordedEvents(sandbox)).toEqual([
         ['build_sandbox_zombie_restart', 'restarted'],
-        ['analysis_sandbox_mount_recovery', 'failed_after_restart'],
-        ['analysis_sandbox_mount_recovery', 'restart_rate_limited'],
+        ['sandbox_mount_recovery', 'failed_after_restart'],
+        ['sandbox_mount_recovery', 'restart_rate_limited'],
       ]);
     } finally {
       warn.mockRestore();
     }
+  });
+
+  /**
+   * Prod 2026-09-26: an earlier command kept the workspace's default session
+   * busy, so the SDK's own mount steps (`chmod 0600 /tmp/.passwd-s3fs-…`) timed
+   * out behind it on every call for 11 minutes. That is not a session death,
+   * so nothing restarted the container. A mount-step timeout now does.
+   */
+  it('restarts a container whose session is too blocked to run the mount steps', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { sandbox, destroy } = healableSandbox();
+      sandbox.containerGeneration = 1;
+      sandbox.mountedContainerGeneration = 1;
+      let restarted = false;
+      destroy.mockImplementation(async () => { restarted = true; });
+      sandbox.mountBucket = vi.fn(async () => {
+        if (!restarted) {
+          throw new Error(
+            "Failed to execute command 'chmod 0600 '/tmp/.passwd-s3fs-173234f4'' in session " +
+            "'sandbox-ws-1': Command timeout after 15000ms",
+          );
+        }
+      });
+      sandbox.unmountBucket = vi.fn(async () => undefined);
+      sandbox.exec = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }));
+
+      await ensureUploads(sandbox);
+
+      expect(destroy).toHaveBeenCalledTimes(1);
+      expect(sandbox.mountBucket).toHaveBeenCalledTimes(2);
+      expect(sandbox.mountedPaths.has('/uploads')).toBe(true);
+      expect(recordedEvents(sandbox)).toEqual([
+        ['build_sandbox_zombie_restart', 'restarted'],
+        ['sandbox_mount_recovery', 'restarted'],
+      ]);
+      // blob16 carries the restart trigger.
+      const lastPoint = sandbox.env.OBSERVABILITY_EVENTS.writeDataPoint.mock.calls.at(-1)[0];
+      expect(lastPoint.blobs[15]).toBe('mount_session_timeout');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('explains a blocked session to the agent when the restart is rate limited', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { sandbox, destroy } = healableSandbox();
+      sandbox.containerGeneration = 1;
+      sandbox.mountedContainerGeneration = 1;
+      // A restart already happened inside the cooldown window.
+      await sandbox.ctx.storage.put('camelai:zombieRestartAtMs', Date.now());
+      sandbox.mountBucket = vi.fn(async () => {
+        throw new Error("Failed to execute command 'chmod 0600 x' in session 's': Command timeout after 15000ms");
+      });
+      sandbox.unmountBucket = vi.fn(async () => undefined);
+      sandbox.exec = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }));
+
+      const error = await ensureUploads(sandbox).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(SandboxMountSessionTimeoutError);
+      expect((error as Error).message).toMatch(/wait a few minutes and retry/);
+      expect(destroy).not.toHaveBeenCalled();
+      expect(recordedEvents(sandbox)).toEqual([
+        ['sandbox_mount_recovery', 'restart_rate_limited'],
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('leaves genuine mount failures alone (no restart)', async () => {
+    const { sandbox, destroy } = healableSandbox();
+    sandbox.containerGeneration = 1;
+    sandbox.mountedContainerGeneration = 1;
+    sandbox.mountBucket = vi.fn(async () => {
+      throw new S3FSMountError('S3FS mount failed: 403 AccessDenied');
+    });
+    sandbox.unmountBucket = vi.fn(async () => undefined);
+    sandbox.exec = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }));
+
+    await expect(ensureUploads(sandbox)).rejects.toBeInstanceOf(S3FSMountError);
+    expect(destroy).not.toHaveBeenCalled();
+    expect(recordedEvents(sandbox)).toEqual([]);
+  });
+
+  it('gives the DbQuerySandbox export mount the same self-heal', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { sandbox: analysis, destroy } = healableSandbox();
+      const sandbox = Object.create(DbQuerySandbox.prototype) as any;
+      Object.assign(sandbox, {
+        ctx: analysis.ctx,
+        env: analysis.env,
+        destroy,
+        zombieHealState: createSandboxZombieHealState(),
+        containerGeneration: 1,
+        mountedContainerGeneration: 1,
+        mountedPaths: new Set<string>(),
+        mountGates: new Map(),
+        activeMounts: new Map(),
+      });
+      let fuseMounted = true;
+      sandbox.mountBucket = vi.fn(async (_bucket: string, path: string) => {
+        if (fuseMounted) {
+          throw new S3FSMountError(`S3FS mount failed: s3fs: MOUNTPOINT directory ${path} is not empty`);
+        }
+      });
+      sandbox.unmountBucket = vi.fn(async (path: string) => {
+        throw new InvalidMountConfigError(`No active mount found at path: ${path}`);
+      });
+      sandbox.exec = vi.fn(async (command: string) => {
+        if (command === forceUnmountCommand('/warehouse/ws-1')) fuseMounted = false;
+        return { exitCode: 0, stdout: '', stderr: '' };
+      });
+
+      await DbQuerySandbox.prototype.ensureWarehouseExportMount.call(sandbox, 'warehouse/ws-1');
+
+      expect(destroy).not.toHaveBeenCalled();
+      expect(recordedEvents(sandbox)).toEqual([
+        ['sandbox_mount_recovery', 'force_remounted'],
+      ]);
+      const point = sandbox.env.OBSERVABILITY_EVENTS.writeDataPoint.mock.calls[0][0];
+      expect(point.blobs[2]).toBe('DbQuerySandbox');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe('isMountSessionTimeout', () => {
+  it('matches the SDK command-timeout text and nothing broader', () => {
+    expect(isMountSessionTimeout(new Error(
+      "CommandError: Failed to execute command 'chmod 0600 '/tmp/.passwd-s3fs-x'' in session 'sandbox-ws': Command timeout after 15000ms",
+    ))).toBe(true);
+    expect(isMountSessionTimeout(new S3FSMountError('S3FS mount failed: 403 AccessDenied'))).toBe(false);
+    expect(isMountSessionTimeout(new Error('connect ETIMEDOUT'))).toBe(false);
   });
 });
 

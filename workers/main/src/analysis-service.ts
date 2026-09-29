@@ -8,6 +8,11 @@ import { annotateWarehouseConnections, withWarehouseParams, type WarehouseConnec
 import { warehouseWorkspacePrefix } from "./warehouse-export.js";
 import { recordObservabilityEvent, type ObservabilityEnv } from "./observability.js";
 import {
+  isSandboxExecTimeoutResult,
+  SANDBOX_EXEC_TIMEOUT_EVENT,
+  sandboxExecTimeoutMessage,
+} from "./sandbox-exec-deadline.js";
+import {
   isSandboxSessionDeathError,
   isSandboxSessionDeathResult,
   sandboxSessionExitCode,
@@ -101,6 +106,38 @@ const DEFAULT_NOTEBOOK_TIMEOUT_MS = ANALYSIS_DEFAULT_NOTEBOOK_TIMEOUT_MS;
 const MAX_NOTEBOOK_TIMEOUT_MS = ANALYSIS_MAX_NOTEBOOK_TIMEOUT_MS;
 const DEFAULT_EXEC_TIMEOUT_MS = ANALYSIS_DEFAULT_EXEC_TIMEOUT_MS;
 const DEFAULT_DEP_TIMEOUT_MS = ANALYSIS_DEFAULT_DEP_TIMEOUT_MS;
+/**
+ * Bound for the service's own housekeeping commands (materialize wipe, tree
+ * manifest, workdir cleanup). Sessionless execs have NO timeout unless one is
+ * passed, so every exec here must carry one; these are cheap on any sane tree.
+ */
+export const ANALYSIS_HOUSEKEEPING_TIMEOUT_MS = 120_000;
+
+/**
+ * `getSandbox()` options for every worker-side AnalysisSandbox stub.
+ *
+ * `enableDefaultSession: false` is load-bearing (same reasoning as
+ * DB_QUERY_SANDBOX_OPTIONS in db-query-service.ts). By default the SDK writes
+ * every exec into ONE persistent bash per sandbox, guarded by a per-session
+ * mutex. A timeout there only rejects our promise: the command keeps running in
+ * that shell, and every later exec (the next run, the SDK's own mount steps)
+ * queues behind it without its own timeout counting the wait. That is what
+ * produced sandbox_exec_deadline_exceeded, mount_session_timeout and the
+ * zombie restarts that followed. A user `exit` or `set -e` also killed the
+ * shared shell (SessionTerminatedError).
+ *
+ * Sessionless, each exec is a fresh detached `bash -c` that inherits the
+ * container server's environment (image ENV: PATH with the baked venv,
+ * PYTHONPATH, UV_CACHE_DIR). On timeout the container kills its process group
+ * and returns exit 124 with partial output (see isSandboxExecTimeoutResult),
+ * and concurrent runs no longer serialize. Nothing here needs shell state:
+ * every call passes an explicit cwd, env and timeout.
+ */
+export const ANALYSIS_SANDBOX_OPTIONS = {
+  normalizeId: true,
+  transport: "rpc",
+  enableDefaultSession: false,
+} as const;
 
 async function r2PrefixHasObjects(bucket: R2Bucket, prefix: string): Promise<boolean> {
   const normalizedPrefix = prefix.replace(/\/+$/, "");
@@ -135,12 +172,6 @@ export interface AnalysisSandboxLike {
 
 /** The full DO-RPC stub surface the service drives (custom AnalysisSandbox methods). */
 export type AnalysisSandboxStub = AnalysisSandboxLike & {
-  /**
-   * Optional: drop the container session handle so the next command
-   * re-handshakes one (see AnalysisSandbox.resetSession). Absent on older
-   * deployments and on test fakes, hence optional at the call site.
-   */
-  resetSession?(): Promise<void>;
   ensureMounted(
     bucketBinding: string,
     prefix: string,
@@ -167,6 +198,8 @@ export interface AnalysisNotebookResult {
   skippedOversize: string[];
   durationMs: number;
   error?: string;
+  /** Set when the container killed the command at its timeout. */
+  timedOut?: true;
 }
 
 export interface AnalysisExecResult {
@@ -179,6 +212,8 @@ export interface AnalysisExecResult {
   skippedOversize: string[];
   durationMs: number;
   error?: string;
+  /** Set when the container killed the command at its timeout. */
+  timedOut?: true;
 }
 
 export interface AnalysisDependencyResult {
@@ -191,6 +226,8 @@ export interface AnalysisDependencyResult {
   lockPersisted: boolean;
   durationMs: number;
   error?: string;
+  /** Set when the container killed the command at its timeout. */
+  timedOut?: true;
 }
 
 export interface AnalysisRunCodeResult {
@@ -198,10 +235,13 @@ export interface AnalysisRunCodeResult {
   stdout?: string;
   stderr?: string;
   error?: string;
+  /** Set when the container killed the program at its timeout. */
+  timedOut?: true;
   /**
-   * Internal recovery marker: the sandbox SESSION died (not the user program).
-   * Set only where the environment error was caught, never from program output.
-   * Stripped by withSessionRecovery before the result leaves the service.
+   * Internal marker: the sandbox environment died (not the user program). Set
+   * only where the environment error was caught, never from program output.
+   * Stripped by AnalysisService.runOperation before the result leaves the
+   * service.
    */
   sessionDeath?: true;
 }
@@ -441,29 +481,11 @@ export function treeManifestCommand(): string {
 // Core run logic (pure of `this`, testable with fakes)
 // ---------------------------------------------------------------------------
 
-/**
- * Two-phase marker for session-death recovery.
- *
- * A dead shell is only SAFE to retry while the agent's own command has not been
- * dispatched yet — a stale session faulting on mkdir/materialize is the case a
- * retry actually fixes. Once `started` flips, the command is in the container's
- * hands: it may have run fully or partly (external DB writes, /outputs writes,
- * outbound calls all survive the shell), so re-running it would double-apply.
- *
- * The flag is flipped immediately before the dispatch and stays set for the
- * rest of the run, which also covers a death raised LATER (persist, cleanup).
- */
-export interface AnalysisCommandDispatch {
-  started: boolean;
-}
-
 interface AnalysisRunDeps {
   sandbox: AnalysisSandboxLike;
   files: WorkspaceFileStoreLike;
   projectId: string;
   newRunId: () => string;
-  /** Set by withSessionRecovery; absent in direct unit calls. */
-  dispatch?: AnalysisCommandDispatch;
 }
 
 /**
@@ -491,7 +513,7 @@ function analysisRunScratchDir(runId: string): string {
 /** Best-effort removal of a run's workdir; never masks the run result. */
 async function cleanupWorkdir(sandbox: AnalysisSandboxLike, workdir: string): Promise<void> {
   try {
-    await sandbox.exec(`rm -rf ${shellQuote(workdir)}`, { cwd: "/" });
+    await sandbox.exec(`rm -rf ${shellQuote(workdir)}`, { cwd: "/", timeout: ANALYSIS_HOUSEKEEPING_TIMEOUT_MS });
   } catch {
     /* workdir cleanup is best-effort */
   }
@@ -506,14 +528,12 @@ interface AnalysisRunOutcome {
 }
 
 /**
- * Remove a run's scratch/work dirs — unless the shell died under it.
+ * Remove a run's scratch/work dirs — unless the environment died under it.
  *
- * A session death means either the SDK will hand the next call a fresh session
- * or (past the zombie threshold) the container has just been destroyed. In both
- * cases the workdir is a per-run path that dies with the container, so the
- * `rm -rf` cleans nothing — and against a destroyed container it is an
- * unconditional 30-120s cold boot, paid inside the caller's exec budget, ahead
- * of the session recovery that actually needs that time.
+ * A container that died (or was destroyed by the zombie self-heal) took the
+ * per-run workdir with it, so the `rm -rf` cleans nothing — and against a
+ * destroyed container it is an unconditional 30-120s cold boot, paid inside the
+ * caller's exec budget.
  */
 async function cleanupRunDirs(
   sandbox: AnalysisSandboxLike,
@@ -526,12 +546,21 @@ async function cleanupRunDirs(
   }
 }
 
-/** Execute + validate a notebook, persisting the changed set back. */
-/** Flip the dispatch marker immediately before the agent's command leaves us. */
-function markCommandDispatched(dispatch?: AnalysisCommandDispatch): void {
-  if (dispatch) dispatch.started = true;
+/**
+ * The container killed the command at `timeoutMs` (sessionless exit 124). The
+ * partial stdout/stderr stay on the result; `error` is the stable timeout text.
+ */
+function execFailure(
+  res: { stderr: string; stdout: string; exitCode: number },
+  timeoutMs: number,
+): { error: string; timedOut?: true } {
+  if (isSandboxExecTimeoutResult(res)) {
+    return { error: sandboxExecTimeoutMessage(timeoutMs), timedOut: true };
+  }
+  return { error: execError(res) };
 }
 
+/** Execute + validate a notebook, persisting the changed set back. */
 export async function runAnalysisNotebook(
   request: { path: string; timeoutMs?: number },
   deps: AnalysisRunDeps,
@@ -556,7 +585,6 @@ export async function runAnalysisNotebook(
     const beforeManifest = await snapshotProjectManifest(deps.sandbox, workdir);
     await deps.sandbox.mkdir(scratchDir, { recursive: true });
 
-    markCommandDispatched(deps.dispatch);
     const nb = normalizeExec(
       await deps.sandbox.exec(notebookExecuteCommand(notebookRel, hasPyproject), {
         cwd: workdir,
@@ -578,6 +606,7 @@ export async function runAnalysisNotebook(
     const persisted = await persistChangedFiles(deps.sandbox, workdir, deps.files, beforeManifest);
     const executed = nb.exitCode === 0;
     const ok = executed && validation.clean;
+    const timedOut = isSandboxExecTimeoutResult(nb);
     return {
       ok,
       executed,
@@ -589,7 +618,9 @@ export async function runAnalysisNotebook(
       exitCode: nb.exitCode,
       ...persisted,
       durationMs: Date.now() - startedAt,
-      ...(ok ? {} : { error: notebookErrorMessage(nb, validation) }),
+      ...(timedOut
+        ? { error: sandboxExecTimeoutMessage(timeoutMs), timedOut: true as const }
+        : ok ? {} : { error: notebookErrorMessage(nb, validation) }),
     };
   } catch (error) {
     outcome.sessionDied = isSandboxSessionDeathError(error);
@@ -616,11 +647,10 @@ export async function runAnalysisExec(
     try {
       await deps.sandbox.mkdir(scratch, { recursive: true });
       const cwd = request.cwd ? joinWithin(scratch, request.cwd) : scratch;
-      markCommandDispatched(deps.dispatch);
       const res = normalizeExec(
         await deps.sandbox.exec(request.command, { cwd, timeout: timeoutMs, env: { ...analysisRunEnv(), SCRATCH: scratch, ...request.env } }),
       );
-      return { ok: res.exitCode === 0, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode, changedFiles: [], removedFiles: [], skippedOversize: [], durationMs: Date.now() - startedAt, ...(res.exitCode === 0 ? {} : { error: execError(res) }) };
+      return { ok: res.exitCode === 0, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode, changedFiles: [], removedFiles: [], skippedOversize: [], durationMs: Date.now() - startedAt, ...(res.exitCode === 0 ? {} : execFailure(res, timeoutMs)) };
     } catch (error) {
       outcome.sessionDied = isSandboxSessionDeathError(error);
       throw error;
@@ -639,7 +669,6 @@ export async function runAnalysisExec(
     const beforeManifest = await snapshotProjectManifest(deps.sandbox, workdir);
     await deps.sandbox.mkdir(scratchDir, { recursive: true });
     const cwd = request.cwd ? joinWithin(workdir, request.cwd) : workdir;
-    markCommandDispatched(deps.dispatch);
     const res = normalizeExec(
       await deps.sandbox.exec(request.command, { cwd, timeout: timeoutMs, env: { ...analysisRunEnv({ projectId: deps.projectId }), SCRATCH: scratchDir, ...request.env } }),
     );
@@ -651,7 +680,7 @@ export async function runAnalysisExec(
       exitCode: res.exitCode,
       ...persisted,
       durationMs: Date.now() - startedAt,
-      ...(res.exitCode === 0 ? {} : { error: execError(res) }),
+      ...(res.exitCode === 0 ? {} : execFailure(res, timeoutMs)),
     };
   } catch (error) {
     outcome.sessionDied = isSandboxSessionDeathError(error);
@@ -685,7 +714,6 @@ export async function runAnalysisAddDependency(
       ? ""
       : `uv init --no-workspace --python 3.13 && uv add ${ANALYSIS_DEFAULT_STACK.map(shellQuote).join(" ")} && `;
     const command = `${initCmd}uv add ${request.dev ? "--dev " : ""}${packages.map(shellQuote).join(" ")}`;
-    markCommandDispatched(deps.dispatch);
     const res = normalizeExec(
       await deps.sandbox.exec(command, { cwd: workdir, timeout: DEFAULT_DEP_TIMEOUT_MS, env: analysisRunEnv({ projectId: deps.projectId }) }),
     );
@@ -701,7 +729,7 @@ export async function runAnalysisAddDependency(
       pyprojectPersisted,
       lockPersisted,
       durationMs: Date.now() - startedAt,
-      ...(res.exitCode === 0 ? {} : { error: execError(res) }),
+      ...(res.exitCode === 0 ? {} : execFailure(res, DEFAULT_DEP_TIMEOUT_MS)),
     };
   } catch (error) {
     outcome.sessionDied = isSandboxSessionDeathError(error);
@@ -721,7 +749,6 @@ export async function runAnalysisCode(
     sandbox: AnalysisSandboxLike;
     scratchId: string;
     connections?: boolean;
-    dispatch?: AnalysisCommandDispatch;
   },
 ): Promise<AnalysisRunCodeResult> {
   if (!request.code || !request.code.trim()) {
@@ -734,15 +761,15 @@ export async function runAnalysisCode(
     await deps.sandbox.mkdir(scratch, { recursive: true });
     const code = withWarehouseParams(request.code, request.params);
     await deps.sandbox.writeFile(scriptPath, base64FromString(code), { encoding: "base64" });
-    markCommandDispatched(deps.dispatch);
     const res = normalizeExec(
       await deps.sandbox.exec(`python ${shellQuote(scriptPath)}`, { cwd: scratch, timeout: DEFAULT_EXEC_TIMEOUT_MS, env: { ...analysisRunEnv({ connections: deps.connections }), SCRATCH: scratch } }),
     );
     if (res.exitCode !== 0) {
       // Deliberately NOT flagged as a session death, whatever the text says:
       // `execError` is the user program's own stderr, and a script that merely
-      // PRINTS "SessionTerminatedError" must not trigger a silent re-run.
-      return { ok: false, stdout: res.stdout, stderr: res.stderr, error: execError(res) };
+      // PRINTS "SessionTerminatedError" must not be reported as an environment
+      // restart.
+      return { ok: false, stdout: res.stdout, stderr: res.stderr, ...execFailure(res, DEFAULT_EXEC_TIMEOUT_MS) };
     }
     return { ok: true, stdout: res.stdout, stderr: res.stderr };
   } catch (error) {
@@ -751,7 +778,7 @@ export async function runAnalysisCode(
       ok: false,
       error: error instanceof Error ? error.message : "analysis code failed",
       // Structured marker: this shape reports environment failures as a VALUE
-      // (deployed apps depend on that), so recovery needs a signal it cannot
+      // (deployed apps depend on that), so the service needs a signal it cannot
       // confuse with program output.
       ...(outcome.sessionDied ? { sessionDeath: true as const } : {}),
     };
@@ -778,7 +805,7 @@ async function materializeProject(
   // correct full-source rewrite — cheap for notebooks + small data.
   await sandbox.exec(
     `find . -mindepth 1 \\( -name .venv -o -name venv -o -name .uv-cache -o -name __pycache__ -o -name node_modules -o -name .git \\) -prune -o -type f -print0 | xargs -0 -r rm -f`,
-    { cwd: workdir },
+    { cwd: workdir, timeout: ANALYSIS_HOUSEKEEPING_TIMEOUT_MS },
   );
   for (const file of sourceFiles) {
     const targetPath = `${workdir}/${file.path}`;
@@ -812,7 +839,9 @@ async function snapshotProjectManifest(
   sandbox: AnalysisSandboxLike,
   workdir: string,
 ): Promise<Map<string, string>> {
-  const manifest = normalizeExec(await sandbox.exec(treeManifestCommand(), { cwd: workdir }));
+  const manifest = normalizeExec(
+    await sandbox.exec(treeManifestCommand(), { cwd: workdir, timeout: ANALYSIS_HOUSEKEEPING_TIMEOUT_MS }),
+  );
   if (manifest.exitCode !== 0) {
     throw new Error(
       `analysis persist aborted: tree manifest failed with exit code ${manifest.exitCode}` +
@@ -949,6 +978,10 @@ function analysisRunEnv(options: { projectId?: string; connections?: boolean } =
   return {
     CI: "1",
     PYTHONUNBUFFERED: "1",
+    // The SDK's default session forced these on its shell; a sessionless exec
+    // only inherits the container server's env, which may not set a locale.
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
     // The baked camelai helper package (see ANALYSIS_PYTHONPATH).
     PYTHONPATH: ANALYSIS_PYTHONPATH,
     // Same protocol + variable the project VMs exposed, so the skill's notebook
@@ -1077,8 +1110,8 @@ function base64FromBytes(bytes: Uint8Array): string {
 // ---------------------------------------------------------------------------
 
 // The classifier itself lives in sandbox-session-death.ts so the readiness
-// gate and the sandbox DOs key off the SAME predicate this recovery path uses
-// (see that module's header). Re-exported here for the existing importers.
+// gate and the sandbox DOs key off the SAME predicate (see that module's
+// header). Re-exported here for the existing importers.
 export {
   isSandboxSessionDeathError,
   isSandboxSessionDeathResult,
@@ -1093,24 +1126,6 @@ export {
 export const ANALYSIS_SESSION_RESTARTED_MESSAGE =
   "The analysis environment restarted while running this command, so it did not complete. " +
   "Try again — if it keeps happening, run a smaller step (less data in memory at once).";
-
-/**
- * Told to the agent when recovery DID re-run something. Silence here is how a
- * double-applied command becomes invisible: an agent that just re-ran a
- * migration needs to be able to say so.
- */
-export const ANALYSIS_SESSION_RECOVERED_MESSAGE =
-  "The analysis environment restarted before this command ran; it was started again on a fresh session.";
-
-/** Stamp a successful recovery onto an object result (never onto a scalar). */
-function annotateSessionRecovered<T>(value: T): T {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
-  return {
-    ...(value as object),
-    sessionRecovered: true,
-    sessionRecoveredNote: ANALYSIS_SESSION_RECOVERED_MESSAGE,
-  } as T;
-}
 
 // ---------------------------------------------------------------------------
 // WorkerEntrypoint
@@ -1140,11 +1155,11 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
 
   async runNotebook(request: { projectId: string; path: string; timeoutMs?: number }): Promise<AnalysisNotebookResult> {
     const files = await this.projectFiles(request.projectId);
-    return this.withSessionRecovery("run_notebook", async (sandbox, dispatch) => {
+    return this.runOperation("run_notebook", async (sandbox) => {
       await this.prepareWorkspaceAccess(sandbox);
       return runAnalysisNotebook(
         { path: request.path, timeoutMs: request.timeoutMs },
-        { sandbox, files, projectId: request.projectId, newRunId: () => crypto.randomUUID(), dispatch },
+        { sandbox, files, projectId: request.projectId, newRunId: () => crypto.randomUUID() },
       );
     });
   }
@@ -1152,14 +1167,13 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
   async exec(request: { projectId?: string; command: string; cwd?: string; env?: Record<string, string>; timeoutMs?: number }): Promise<AnalysisExecResult> {
     const hasProject = Boolean(request.projectId);
     const files = hasProject ? await this.projectFiles(request.projectId as string) : ({} as WorkspaceFileStoreLike);
-    return this.withSessionRecovery("exec", async (sandbox, dispatch) => {
+    return this.runOperation("exec", async (sandbox) => {
       await this.prepareWorkspaceAccess(sandbox);
       return runAnalysisExec(
         { command: request.command, cwd: request.cwd, env: request.env, timeoutMs: request.timeoutMs },
         {
           sandbox,
           files,
-          dispatch,
           projectId: request.projectId ?? "scratch",
           newRunId: () => crypto.randomUUID(),
           hasProject,
@@ -1171,19 +1185,17 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
 
   async addDependency(request: { projectId: string; packages: string[]; dev?: boolean }): Promise<AnalysisDependencyResult> {
     const files = await this.projectFiles(request.projectId);
-    // `uv add` is idempotent (re-adding a pinned package converges on the same
-    // pyproject/uv.lock), so this one operation may retry after dispatch.
-    return this.withSessionRecovery("add_dependency", (sandbox, dispatch) =>
+    return this.runOperation("add_dependency", (sandbox) =>
       runAnalysisAddDependency(
         { packages: request.packages, dev: request.dev },
-        { sandbox, files, projectId: request.projectId, newRunId: () => crypto.randomUUID(), dispatch },
-      ), "agent", { retryAfterDispatch: true });
+        { sandbox, files, projectId: request.projectId, newRunId: () => crypto.randomUUID() },
+      ));
   }
 
   async runCode(request: { code: string; params?: Record<string, unknown> }): Promise<AnalysisRunCodeResult> {
-    return this.withSessionRecovery("run_code", async (sandbox, dispatch) => {
+    return this.runOperation("run_code", async (sandbox) => {
       await this.prepareWorkspaceAccess(sandbox);
-      return runAnalysisCode(request, { sandbox, scratchId: crypto.randomUUID(), dispatch });
+      return runAnalysisCode(request, { sandbox, scratchId: crypto.randomUUID() });
     });
   }
 
@@ -1199,17 +1211,16 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
    * registered on this container, so the host is unreachable regardless).
    */
   async runCodeForApps(request: { code: string; params?: Record<string, unknown> }): Promise<AnalysisRunCodeResult> {
-    return this.withSessionRecovery("run_code_for_apps", async (sandbox, dispatch) => {
+    return this.runOperation("run_code_for_apps", async (sandbox) => {
       // Seal egress before every app run: app code has no PyPI use case, so the
       // class-level allowlist would only be an exfiltration channel for mounted
-      // export data (the override is in-memory DO state, hence per-run). The
-      // seal is re-applied on a recovery retry because a restarted container
-      // starts from the class-level allowlist again.
+      // export data (the override is in-memory DO state, hence per-run; a
+      // restarted container starts from the class-level allowlist again).
       await sandbox.sealAppEgress();
       if (this.env.WAREHOUSE_EXPORT_BUCKET) {
         await sandbox.ensureMounted(ANALYSIS_EXPORT_BUCKET_BINDING, warehouseWorkspacePrefix(this.ctx.props.workspaceId));
       }
-      return runAnalysisCode(request, { sandbox, scratchId: crypto.randomUUID(), connections: false, dispatch });
+      return runAnalysisCode(request, { sandbox, scratchId: crypto.randomUUID(), connections: false });
     }, "app");
   }
 
@@ -1222,125 +1233,72 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
   }
 
   /**
-   * Run one analysis operation, surviving a single death of the container's
-   * persistent shell.
+   * Run one analysis operation and translate environment failures.
    *
-   * A container OOM or restart takes the session down mid-command; the SDK
-   * caches the default session id in DO memory and storage and only clears it
-   * when the CONTAINER stops (`onStop`), so nothing in the app noticed and the
-   * raw `SessionTerminatedError` reached the user.
-   *
-   * At most ONE retry, and ONLY when the death happened BEFORE the agent's own
-   * command was dispatched (`dispatch.started` is still false — a stale session
-   * faulting on ensureMounted/mkdir/materialize). That is the case a retry
-   * actually fixes. Once the command has been handed to the container it may
-   * have run fully or partly, and its external effects (warehouse/DB writes,
-   * /outputs writes, outbound calls) outlive the shell — so a death from there
-   * on is reported, never re-executed. Operations whose command is genuinely
-   * idempotent opt in with `retryAfterDispatch`.
-   *
-   * A retry is never silent: the recovered value carries `sessionRecovered`
-   * plus a one-line note, so an agent can say the environment restarted instead
-   * of the double-run being visible only in AE.
+   * Never retries. Execs are sessionless (ANALYSIS_SANDBOX_OPTIONS), so the old
+   * failure this used to retry — a stale or dead default-session shell — no
+   * longer exists: a user `exit`/`set -e` only ends its own `bash -c`, and a
+   * container that died mid-command may have run it fully or partly, so
+   * re-running would double-apply work whose side effects survived it.
    *
    * The failure SHAPE is preserved: an operation that reports failures as a
    * `{ ok: false, error }` value (runCode, whose callers include deployed apps
    * through AnalysisAppService) keeps getting a value, with the raw SDK text
    * swapped for the user-facing message; one that throws keeps throwing.
    *
-   * The retry inherits the caller's wall-clock budget: the client-side deadline
-   * (sandbox-exec-deadline.ts) and the abort race (pi-tools) both wrap this RPC
-   * from outside, so a retry cannot extend the tool call past either.
+   * A result the container killed at its timeout (exit 124) is counted as
+   * `sandbox_exec_timeout`, so we can see how often commands hit their budget
+   * now that the kill is real.
    */
-  private async withSessionRecovery<T>(
+  private async runOperation<T>(
     operation: string,
-    run: (sandbox: AnalysisSandboxStub, dispatch: AnalysisCommandDispatch) => Promise<T>,
+    run: (sandbox: AnalysisSandboxStub) => Promise<T>,
     scope: "agent" | "app" = "agent",
-    options: { retryAfterDispatch?: boolean } = {},
   ): Promise<T> {
-    const attempt = async (): Promise<
-      | { kind: "value"; value: T }
-      | { kind: "death"; error: Error; result: T | null; retryable: boolean }
-    > => {
-      const dispatch: AnalysisCommandDispatch = { started: false };
-      // Safe to retry only while the command has not left us — unless the
-      // caller declared this operation idempotent.
-      const retryable = () => options.retryAfterDispatch === true || !dispatch.started;
-      try {
-        const value = await run(await this.resolveSandbox(scope), dispatch);
-        if (!isSandboxSessionDeathResult(value)) return { kind: "value", value };
-        return {
-          kind: "death",
-          error: new Error(String((value as { error?: unknown }).error)),
-          result: value,
-          retryable: retryable(),
-        };
-      } catch (error) {
-        if (!isSandboxSessionDeathError(error)) throw error;
-        return {
-          kind: "death",
-          error: error instanceof Error ? error : new Error(String(error)),
-          result: null,
-          retryable: retryable(),
-        };
-      }
-    };
-
-    const first = await attempt();
-    if (first.kind === "value") return first.value;
-    if (!first.retryable) {
-      // The command already ran (or partly ran). Report it; re-running would
-      // double-apply work whose side effects survived the dead shell.
-      this.recordSessionTerminated(operation, first.error, false);
-      return this.sessionDeathOutcome(first.result, first.error);
+    let value: T;
+    try {
+      value = await run(await this.resolveSandbox(scope));
+    } catch (error) {
+      if (!isSandboxSessionDeathError(error)) throw error;
+      this.recordSessionTerminated(operation, error);
+      throw new Error(ANALYSIS_SESSION_RESTARTED_MESSAGE, { cause: error });
     }
-    this.recordSessionTerminated(operation, first.error, true);
-    await this.recreateSandboxSession(scope);
-
-    const retry = await attempt();
-    if (retry.kind === "value") return annotateSessionRecovered(retry.value);
-    this.recordSessionTerminated(operation, retry.error, false);
-    return this.sessionDeathOutcome(retry.result, retry.error);
-  }
-
-  /** Same failure shape the operation uses, with the SDK text swapped out. */
-  private sessionDeathOutcome<T>(result: T | null, error: Error): T {
-    if (result !== null) {
-      const { sessionDeath: _dropped, ...rest } = result as T & { sessionDeath?: true };
+    if (isSandboxSessionDeathResult(value)) {
+      const { sessionDeath: _dropped, ...rest } = value as T & { sessionDeath?: true; error?: unknown };
+      this.recordSessionTerminated(operation, new Error(String(rest.error)));
       return { ...(rest as T), error: ANALYSIS_SESSION_RESTARTED_MESSAGE };
     }
-    throw new Error(ANALYSIS_SESSION_RESTARTED_MESSAGE, { cause: error });
-  }
-
-  /**
-   * Best-effort session recreation between the two attempts. `resetSession`
-   * makes the SDK re-run its create-session handshake instead of reusing the id
-   * of a session the container already reaped; if the method is missing or
-   * fails, the retry still works — the SDK recreates a terminated session
-   * transparently on the next call — so this never fails the operation.
-   */
-  private async recreateSandboxSession(scope: "agent" | "app"): Promise<void> {
-    try {
-      const sandbox = await this.resolveSandbox(scope);
-      await sandbox.resetSession?.();
-    } catch (error) {
-      console.warn("[AnalysisService] failed to reset the sandbox session", error);
+    if ((value as { timedOut?: unknown } | null)?.timedOut === true) {
+      this.recordExecTimeout(operation, value as { durationMs?: number });
     }
+    return value;
   }
 
-  private recordSessionTerminated(operation: string, error: unknown, retried: boolean): void {
-    console.warn("[AnalysisService] analysis session died under a command", {
+  private recordExecTimeout(operation: string, result: { durationMs?: number }): void {
+    recordObservabilityEvent(this.env, {
+      event: SANDBOX_EXEC_TIMEOUT_EVENT,
+      severity: "warn",
+      component: "AnalysisService",
       operation,
-      retried,
+      status: "timed_out",
+      durationMs: typeof result.durationMs === "number" ? result.durationMs : undefined,
+      workspaceId: this.ctx?.props?.workspaceId,
+      orgId: this.ctx?.props?.orgId,
+    });
+  }
+
+  private recordSessionTerminated(operation: string, error: unknown): void {
+    console.warn("[AnalysisService] analysis environment died under a command", {
+      operation,
       workspaceId: this.ctx?.props?.workspaceId,
       error: error instanceof Error ? error.message : String(error),
     });
     recordObservabilityEvent(this.env, {
       event: "sandbox_session_terminated",
-      severity: retried ? "warn" : "error",
+      severity: "error",
       component: "AnalysisService",
       operation,
-      status: retried ? "retried" : "failed",
+      status: "failed",
       count: sandboxSessionExitCode(error) ?? undefined,
       errorName: error instanceof Error ? error.name : "Error",
       errorMessage: error instanceof Error ? error.message : String(error),
@@ -1433,12 +1391,12 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
     if (!this.env.ANALYSIS_SANDBOX) throw new Error("ANALYSIS_SANDBOX container binding is not configured");
     const { getSandbox } = await import("@cloudflare/sandbox");
     // One warm container per workspace and scope; per-call isolation is via
-    // working dirs.
+    // working dirs. Sessionless: see ANALYSIS_SANDBOX_OPTIONS.
     const sandboxId = scope === "app" ? `app-${this.ctx.props.workspaceId}` : this.ctx.props.workspaceId;
     const sandbox = getSandbox(
       this.env.ANALYSIS_SANDBOX as Parameters<typeof getSandbox>[0],
       sandboxId,
-      { normalizeId: true, transport: "rpc" },
+      ANALYSIS_SANDBOX_OPTIONS,
     ) as unknown as AnalysisSandboxStub;
     this.sandboxes.set(scope, sandbox);
     return sandbox;

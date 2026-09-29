@@ -476,6 +476,16 @@ export function createSingleFlight(): (run: () => Promise<void>) => Promise<void
 }
 
 /**
+ * The SDK's sessionless session token (`DISABLE_SESSION_TOKEN` in
+ * @cloudflare/sandbox 0.12.x, not exported). `getSandbox(..., {
+ * enableDefaultSession: false })` routes `exec` to
+ * `execWithSessionToken(command, <this token>, options)`; passing it from
+ * inside the DO gets the same fresh-process execution. A test pins it against
+ * what `getSandbox` actually sends, so an SDK rename fails loudly.
+ */
+export const SANDBOX_SESSIONLESS_TOKEN = "__DISABLE_SESSION__";
+
+/**
  * The in-container hostname for the workspace connections RPC. Container code
  * (notebooks, scripts) POSTs to `http://connections.internal/` — the same
  * `CAMELAI_CONNECTIONS_RPC_URL` protocol the project VMs used — and the request
@@ -516,7 +526,8 @@ export interface AnalysisConnectionsParams {
  * One warm container per workspace runs everything the old per-project VM did for
  * data analysis: Jupyter notebook execution, ad-hoc shell/Python, and the heavy
  * DuckDB cross-source reduction that used to be the sealed warehouse's whole job.
- * Per-call isolation is via sessions/working dirs (see analysis-service.ts).
+ * Per-call isolation is via sessionless execs and per-run working dirs (see
+ * analysis-service.ts).
  *
  * NETWORK POSTURE — `enableInternet = false` with an SDK-enforced egress
  * allowlist, not a sealed box and not open internet:
@@ -583,27 +594,27 @@ export class AnalysisSandbox extends Sandbox<Env> {
   private zombieHealState = createSandboxZombieHealState();
 
   /**
-   * Same zombie self-heal the build container runs (see
-   * sandbox-zombie-recovery.ts), with one deliberate difference: it fires on the
-   * SECOND consecutive session death, not the first.
+   * DO-side exec (the mount probe, forced unmount and self-host mount alias),
+   * run SESSIONLESS like every worker-side exec (ANALYSIS_SANDBOX_OPTIONS in
+   * analysis-service.ts): a fresh `bash -c` that the container kills at its
+   * timeout, instead of a command queued in the default session behind whatever
+   * is still running there. The SDK's own mount steps (`execInternal`) are the
+   * only thing left in the default session.
    *
-   * The analysis path already has a cheap, correct recovery for a single death —
-   * `AnalysisService.withSessionRecovery` clears the cached session id
-   * (`resetSession`) and retries once against the SAME warm container, which is
-   * sub-second and is exactly what the SDK's self-recovering SessionTerminated
-   * class needs. Destroying on the first death would pre-empt that retry with a
-   * 30-120s cold boot plus a full re-mount. A death that survives the fresh
-   * session handshake is a real zombie, and that is what
-   * SANDBOX_ZOMBIE_EXEC_DEATH_THRESHOLD counts. The error always propagates, so
-   * the service's recovery keeps its semantics either way, and the shared
-   * cooldown still prevents a double restart.
+   * Worker stubs from `getSandbox(..., { enableDefaultSession: false })` call
+   * `execWithSessionToken` directly and never reach this override.
+   *
+   * Kept wrapped in the zombie self-heal (sandbox-zombie-recovery.ts), which
+   * fires on the SECOND consecutive session death. Sessionless execs should
+   * never produce one; the wrapper stays until a week of telemetry confirms
+   * that, then goes with the rest of the heal logic.
    */
   override async exec(command: string, options?: ExecOptions): Promise<ExecResult> {
     return withZombieSelfHeal(
       this.zombieHealTarget,
       "AnalysisSandbox",
       "exec",
-      () => super.exec(command, options),
+      () => this.execWithSessionToken(command, SANDBOX_SESSIONLESS_TOKEN, options),
       { threshold: SANDBOX_ZOMBIE_EXEC_DEATH_THRESHOLD, tracker: this.sessionDeaths },
     );
   }
@@ -631,13 +642,14 @@ export class AnalysisSandbox extends Sandbox<Env> {
    * guaranteed to run for that path, so everything that only described THAT
    * container is dropped here: the mount bookkeeping (otherwise the retry that
    * follows short-circuits `ensureMounted` and runs user code against a
-   * container with nothing mounted — an empty `/exports` read as exit 0), the
-   * cached session id, and the consecutive-death count.
+   * container with nothing mounted — an empty `/exports` read as exit 0) and
+   * the consecutive-death count. The SDK's cached default-session id is left
+   * alone: only its own mount steps use that session now, and the container
+   * creates an unknown session id on first use.
    */
   private async forgetDestroyedContainerState(): Promise<void> {
     this.clearMountBookkeeping();
     this.sessionDeaths.reset();
-    await this.resetSession();
   }
 
   private clearMountBookkeeping(): void {
@@ -774,43 +786,6 @@ export class AnalysisSandbox extends Sandbox<Env> {
     // [] is a non-nullish override that matches no host — the SDK's proxy then
     // rejects every origin before any pass-through or handler dispatch.
     await this.setAllowedHosts([]);
-  }
-
-  /**
-   * Forget the container session so the next command re-runs the create-session
-   * handshake.
-   *
-   * A container OOM/restart kills the persistent shell; the container reaps the
-   * session and answers `SessionTerminatedError`, but the SDK caches the default
-   * session id in DO memory AND in DO storage and only clears it from `onStop`
-   * (`node_modules/@cloudflare/sandbox/dist/sandbox-*.js`: `defaultSession`,
-   * `ensureDefaultSession`, `onStop`) — so a shell that dies while the container
-   * stays up leaves the cached id pointing at a session that no longer exists.
-   * Clearing it here is the SDK's own documented remedy ("call createSession()
-   * with the same id to recreate it explicitly"), just driven from inside the DO
-   * where `ensureDefaultSession` will do it on the next call.
-   *
-   * Mount bookkeeping is deliberately left alone: mounts are container-level,
-   * not session-level, so a dead shell does not invalidate them. A real
-   * container stop is the case that DOES invalidate them, and `onStop` clears
-   * them there (the DO instance itself survives a container stop).
-   *
-   * Called only by AnalysisService's one-shot session recovery, and always
-   * best-effort: the SDK recreates a terminated session on the next call anyway,
-   * so a failure here must not fail the run.
-   */
-  async resetSession(): Promise<void> {
-    const sdkState = this as unknown as {
-      defaultSession: string | null;
-      defaultSessionInit: unknown;
-    };
-    sdkState.defaultSession = null;
-    sdkState.defaultSessionInit = null;
-    try {
-      await this.ctx.storage.delete("defaultSession");
-    } catch (error) {
-      console.warn("[AnalysisSandbox] failed to clear the stored default session", error);
-    }
   }
 }
 

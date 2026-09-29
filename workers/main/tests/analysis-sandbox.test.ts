@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { InvalidMountConfigError, S3FSMountError } from '@cloudflare/sandbox';
+import { getSandbox, InvalidMountConfigError, S3FSMountError } from '@cloudflare/sandbox';
 import {
   AnalysisSandbox,
   createSingleFlight,
@@ -11,10 +11,12 @@ import {
   sandboxR2MountOptions,
   sandboxR2MountPath,
   SandboxMountSessionTimeoutError,
+  SANDBOX_SESSIONLESS_TOKEN,
   UnreadableR2MountError,
   waitForWritableLocalMount,
   type MountRecoverTarget,
 } from '../src/analysis-sandbox.js';
+import { ANALYSIS_SANDBOX_OPTIONS } from '../src/analysis-service.js';
 import { DbQuerySandbox } from '../src/db-query-sandbox.js';
 import {
   createSandboxZombieHealState,
@@ -65,35 +67,45 @@ describe('sandboxR2MountOptions', () => {
   });
 });
 
-describe('AnalysisSandbox.resetSession', () => {
-  it('clears the SDK session cache (memory + storage) so the next call re-handshakes', async () => {
-    // The SDK only clears `defaultSession` on a container STOP, so a shell that
-    // dies while the container lives leaves the cached id pointing at a session
-    // the container already reaped. This is the coupling point to re-check when
-    // @cloudflare/sandbox is upgraded.
-    const sandbox = Object.create(AnalysisSandbox.prototype) as any;
-    sandbox.defaultSession = 'sandbox-ws-1';
-    sandbox.defaultSessionInit = { sessionId: 'sandbox-ws-1' };
-    const deleted: string[] = [];
-    sandbox.ctx = { storage: { delete: async (key: string) => { deleted.push(key); } } };
+describe('AnalysisSandbox sessionless exec', () => {
+  /**
+   * The DO-side override passes the SDK's sessionless token by value, because
+   * 0.12.x does not export it. Pin it against what `getSandbox` actually sends
+   * for `enableDefaultSession: false`, so an SDK rename fails here instead of
+   * silently creating a session literally named "__DISABLE_SESSION__".
+   */
+  it('uses the same token getSandbox sends for enableDefaultSession: false', async () => {
+    const stub = {
+      exec: vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' })),
+      execWithSessionToken: vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' })),
+    };
+    const namespace = {
+      idFromName: (name: string) => ({ name, toString: () => name }),
+      get: () => stub,
+    };
+    const sandbox = getSandbox(namespace as never, 'ws-1', ANALYSIS_SANDBOX_OPTIONS);
 
-    await AnalysisSandbox.prototype.resetSession.call(sandbox);
+    await sandbox.exec('python main.py', { cwd: '/scratch/x', timeout: 1_000 });
 
-    expect(sandbox.defaultSession).toBeNull();
-    expect(sandbox.defaultSessionInit).toBeNull();
-    expect(deleted).toEqual(['defaultSession']);
+    expect(stub.exec).not.toHaveBeenCalled();
+    expect(stub.execWithSessionToken).toHaveBeenCalledWith(
+      'python main.py',
+      SANDBOX_SESSIONLESS_TOKEN,
+      { cwd: '/scratch/x', timeout: 1_000 },
+    );
   });
 
-  it('never throws when storage refuses — the retry works without it', async () => {
-    const sandbox = Object.create(AnalysisSandbox.prototype) as any;
-    sandbox.defaultSession = 'sandbox-ws-1';
-    sandbox.defaultSessionInit = null;
-    sandbox.ctx = {
-      storage: { delete: async () => { throw new Error('storage unavailable'); } },
-    };
+  it('runs DO-side execs (mount probe, forced unmount) sessionless', async () => {
+    const { sandbox } = healableSandbox();
+    sandbox.execWithSessionToken = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }));
 
-    await expect(AnalysisSandbox.prototype.resetSession.call(sandbox)).resolves.toBeUndefined();
-    expect(sandbox.defaultSession).toBeNull();
+    await AnalysisSandbox.prototype.exec.call(sandbox, 'ls -la -- /uploads >/dev/null', { timeout: 15_000 });
+
+    expect(sandbox.execWithSessionToken).toHaveBeenCalledWith(
+      'ls -la -- /uploads >/dev/null',
+      SANDBOX_SESSIONLESS_TOKEN,
+      { timeout: 15_000 },
+    );
   });
 });
 
@@ -155,24 +167,6 @@ describe('mount bookkeeping across a container stop', () => {
   });
 });
 
-/** Swap ONE inherited SDK method for a spy while `run` executes. */
-async function withStubbedSuperMethod(
-  cls: { prototype: object },
-  name: string,
-  stub: (...args: any[]) => unknown,
-  run: () => Promise<void>,
-): Promise<void> {
-  const base = Object.getPrototypeOf(cls.prototype) as Record<string, unknown>;
-  const original = Object.getOwnPropertyDescriptor(base, name);
-  Object.defineProperty(base, name, { value: stub, configurable: true, writable: true });
-  try {
-    await run();
-  } finally {
-    if (original) Object.defineProperty(base, name, original);
-    else delete base[name];
-  }
-}
-
 const SESSION_DEATH = () =>
   Object.assign(
     new Error("Session 'sandbox-ws-1' ended because its shell exited (exit code: 128)"),
@@ -215,26 +209,22 @@ function healableSandbox() {
 
 describe('AnalysisSandbox zombie self-heal', () => {
   /**
-   * A single session death is the SDK's self-recovering class, and
-   * `AnalysisService.withSessionRecovery` already handles it by re-handshaking a
-   * session against the SAME warm container (~1s). Destroying on the first death
-   * pre-empts that with a 30-120s cold boot.
+   * A single stray death must not cost a 30-120s cold boot plus a re-mount;
+   * two in a row is zombie evidence.
    */
   it('lets the first session death through and destroys only on the second', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const { sandbox, destroy } = healableSandbox();
       sandbox.mountedPaths = new Set(['/uploads']);
+      sandbox.execWithSessionToken = vi.fn(async () => { throw SESSION_DEATH(); });
 
-      await withStubbedSuperMethod(AnalysisSandbox, 'exec', async () => { throw SESSION_DEATH(); }, async () => {
-        await expect(AnalysisSandbox.prototype.exec.call(sandbox, 'python main.py')).rejects.toThrow();
-        expect(destroy).not.toHaveBeenCalled();
-        // The service's retry still has a warm container (and its mounts).
-        expect(sandbox.mountedPaths.has('/uploads')).toBe(true);
+      await expect(AnalysisSandbox.prototype.exec.call(sandbox, 'python main.py')).rejects.toThrow();
+      expect(destroy).not.toHaveBeenCalled();
+      expect(sandbox.mountedPaths.has('/uploads')).toBe(true);
 
-        await expect(AnalysisSandbox.prototype.exec.call(sandbox, 'python main.py')).rejects.toThrow();
-        expect(destroy).toHaveBeenCalledTimes(1);
-      });
+      await expect(AnalysisSandbox.prototype.exec.call(sandbox, 'python main.py')).rejects.toThrow();
+      expect(destroy).toHaveBeenCalledTimes(1);
     } finally {
       warn.mockRestore();
     }
@@ -246,14 +236,12 @@ describe('AnalysisSandbox zombie self-heal', () => {
    * container and the very next `ensureMounted` short-circuits — the run then
    * reads an empty `/exports` and exits 0.
    */
-  it('drops mount bookkeeping and the cached session when the heal destroys the container', async () => {
+  it('drops mount bookkeeping when the heal destroys the container', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      const { sandbox, destroy, deleted } = healableSandbox();
+      const { sandbox, destroy } = healableSandbox();
       sandbox.mountedPaths = new Set(['/warehouse/ws-1', '/uploads', '/outputs']);
       sandbox.mountGates = new Map([['/uploads', createSingleFlight()]]);
-      sandbox.defaultSession = 'sandbox-ws-1';
-      sandbox.defaultSessionInit = { sessionId: 'sandbox-ws-1' };
 
       await AnalysisSandbox.prototype.restartZombieContainer.call(sandbox, {
         operation: 'exec',
@@ -263,8 +251,6 @@ describe('AnalysisSandbox zombie self-heal', () => {
       expect(destroy).toHaveBeenCalledTimes(1);
       expect(sandbox.mountedPaths.size).toBe(0);
       expect(sandbox.mountGates.size).toBe(0);
-      expect(sandbox.defaultSession).toBeNull();
-      expect(deleted).toEqual(['defaultSession']);
 
       // Proof of the consequence: the next ensureMounted really mounts again.
       sandbox.mountBucket = vi.fn(async () => undefined);

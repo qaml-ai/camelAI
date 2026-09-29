@@ -28,7 +28,10 @@
 //     concurrent work.
 // There is therefore NO safe per-exec cancellation surface to fire on a
 // deadline or an abort. The abandoned command stays bounded by the timeout the
-// container already holds. Re-check this when the SDK is upgraded.
+// container already holds — and for a SESSIONLESS exec (the analysis and DB
+// query sandboxes) that timeout really kills its process group. In the default
+// session it only rejected the promise and left the shell busy. Re-check this
+// when the SDK is upgraded.
 
 /**
  * Cancellable deadline for one awaited operation; the seam tests replace to
@@ -51,6 +54,48 @@ export function createSandboxDeadlineTimer(ms: number): SandboxDeadlineTimer {
       if (handle !== undefined) clearTimeout(handle);
     },
   };
+}
+
+/**
+ * Exit code a SESSIONLESS exec (`getSandbox(..., { enableDefaultSession: false })`)
+ * reports when the container killed the command at its `timeout`. The
+ * container's execution-service spawns each sessionless command as a detached
+ * `bash -c`, and on timeout signals the whole process group (SIGTERM, 5s grace,
+ * SIGKILL), then resolves with this code, the partial output, and a
+ * "Command timed out after <ms>ms" line appended to stderr. Same code GNU
+ * `timeout` uses.
+ */
+export const SANDBOX_EXEC_TIMEOUT_EXIT_CODE = 124;
+
+/** Low-cardinality counter for container-side kills at the exec timeout. */
+export const SANDBOX_EXEC_TIMEOUT_EVENT = "sandbox_exec_timeout";
+
+const SANDBOX_EXEC_TIMEOUT_STDERR = /(^|\n)Command timed out after \d+ms\s*$/;
+
+/**
+ * True when a sessionless exec result is the container's own timeout kill, not
+ * a program that happened to exit 124. Keyed on the stderr trailer the
+ * container appends, so a user's `timeout 5 foo` (exit 124, no trailer) still
+ * reads as an ordinary command failure.
+ */
+export function isSandboxExecTimeoutResult(result: {
+  exitCode?: number;
+  stderr?: string;
+}): boolean {
+  return (
+    result.exitCode === SANDBOX_EXEC_TIMEOUT_EXIT_CODE &&
+    typeof result.stderr === "string" &&
+    SANDBOX_EXEC_TIMEOUT_STDERR.test(result.stderr)
+  );
+}
+
+/**
+ * The error text a timed-out exec reports. Kept identical to what the tool
+ * layer has always shown for a container-side timeout, so the agent's handling
+ * (and our log searches) do not change.
+ */
+export function sandboxExecTimeoutMessage(timeoutMs: number): string {
+  return `Command timed out after ${timeoutMs}ms`;
 }
 
 /**

@@ -60,16 +60,12 @@ export const SANDBOX_ZOMBIE_PROBE_THRESHOLD = 3;
  * Consecutive session-death `exec` failures before the ANALYSIS container is
  * destroyed.
  *
- * The analysis path has its own cheap recovery for the first death
- * (`AnalysisService.withSessionRecovery`: reset the cached session id, re-run
- * the create-session handshake against the SAME warm container, retry once).
- * That is sub-second and is exactly right for the self-recovering class the SDK
- * documents ("the next call with the same sessionId will transparently start a
- * fresh session"). Destroying on the FIRST death would replace it with a
- * 30-120s cold boot plus a full re-mount, for a shell that was going to come
- * back on its own. A death that survives that handshake is real zombie
- * evidence, so the heal fires on the SECOND consecutive one — i.e. the retry
- * the service already performs is the discriminator.
+ * Only DO-side analysis execs still pass through this wrapper, and they run
+ * sessionless (AnalysisSandbox.exec), so a session death there should not
+ * happen at all. Two consecutive ones are strong zombie evidence; the
+ * threshold stays at 2 so a single stray failure never costs a 30-120s cold
+ * boot plus a full re-mount. Remove with the rest of the heal logic once
+ * telemetry shows sessionless execs never trip it.
  *
  * The build path has no such retry (its ladder restarts the whole operation) and
  * keeps the plan's destroy-on-first-exec-death behaviour.

@@ -4237,9 +4237,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     try {
       return await this.sandboxExecDeadline(operation, declaredTimeoutMs, limits).run(run);
     } catch (error) {
-      // The environment died under the command and even AnalysisService's
-      // one-shot recovery could not get it back: the user gets the plain-English
-      // message, never `SessionTerminatedError: ...`.
+      // The environment died under the command: the user gets the
+      // plain-English message, never `SessionTerminatedError: ...`.
       if (isSandboxSessionDeathError(error)) {
         throw new Error(ANALYSIS_SESSION_RESTARTED_MESSAGE, { cause: error });
       }

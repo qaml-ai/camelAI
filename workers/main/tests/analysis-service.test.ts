@@ -7,6 +7,7 @@ import {
 } from "../src/analysis-sandbox.js";
 import { AnalysisService } from "../src/analysis-service.js";
 import {
+  ANALYSIS_DEFAULT_EXEC_TIMEOUT_MS,
   ANALYSIS_MAX_PERSIST_BYTES,
   ANALYSIS_SESSION_RESTARTED_MESSAGE,
   isSandboxSessionDeathError,
@@ -804,16 +805,14 @@ describe("sandbox session-death classification", () => {
   });
 });
 
-describe("AnalysisService session recovery", () => {
-  function recoveringService(
+describe("AnalysisService environment failures", () => {
+  function failingService(
     execImpl: () => Promise<unknown>,
     prepare: { mkdir?: () => Promise<unknown> } = {},
   ) {
     const events: Array<{ blobs: unknown[]; doubles: unknown[] }> = [];
-    const resetSession = vi.fn(async () => undefined);
     const mkdir = vi.fn(prepare.mkdir ?? (async () => ({})));
     const sandbox = {
-      resetSession,
       async ensureMounted() {},
       async ensureConnectionsRpc() {},
       async sealAppEgress() {},
@@ -821,7 +820,7 @@ describe("AnalysisService session recovery", () => {
       async writeFile() { return {}; },
       async readFile() { return { content: "" }; },
       // Cleanup (`rm -rf <workdir>`) runs in a finally and is best-effort; only
-      // the command under test drives the recovery path.
+      // the command under test drives the failure path.
       exec: vi.fn((command: string) =>
         command.startsWith("rm -rf")
           ? Promise.resolve({ exitCode: 0, stdout: "", stderr: "" })
@@ -842,65 +841,21 @@ describe("AnalysisService session recovery", () => {
     service.ctx = { props: { orgId: "org-1", workspaceId: "ws-1" } };
     (service as unknown as { sandboxes: Map<string, AnalysisSandboxStub> }).sandboxes =
       new Map([["agent", sandbox]]);
-    return { service, sandbox, events, resetSession };
+    return { service, sandbox, events };
   }
 
+  const eventsNamed = (events: Array<{ blobs: unknown[] }>, name: string) =>
+    events.filter((point) => (point.blobs as string[])[0] === name);
   const sessionEvents = (events: Array<{ blobs: unknown[] }>) =>
-    events.filter((point) => (point.blobs as string[])[0] === "sandbox_session_terminated");
+    eventsNamed(events, "sandbox_session_terminated");
 
   /** Only the agent's command counts; cleanup `rm -rf` runs unconditionally. */
   const commandRuns = (sandbox: { exec: ReturnType<typeof vi.fn> }) =>
     sandbox.exec.mock.calls.filter(([command]) => !String(command).startsWith("rm -rf")).length;
 
-  it("recreates the session and retries when the shell died BEFORE the command ran", async () => {
+  it("never retries: execs are sessionless, so a death is reported once", async () => {
     let prepares = 0;
-    const { service, sandbox, events, resetSession } = recoveringService(
-      async () => ({ exitCode: 0, stdout: "ok", stderr: "" }),
-      {
-        mkdir: async () => {
-          prepares += 1;
-          if (prepares === 1) throw sessionTerminatedError();
-          return {};
-        },
-      },
-    );
-
-    const result = await service.runCode({ code: "print('ok')" }) as Record<string, unknown>;
-    expect(result).toMatchObject({ ok: true, stdout: "ok" });
-    // A retry is never silent: the agent can say the environment restarted.
-    expect(result.sessionRecovered).toBe(true);
-    expect(String(result.sessionRecoveredNote)).toMatch(/restarted/);
-
-    // The dead session handle is disposed before the retry runs.
-    expect(resetSession).toHaveBeenCalledTimes(1);
-    // The command itself was dispatched exactly once — the first attempt never
-    // got that far.
-    expect(commandRuns(sandbox)).toBe(1);
-    const recorded = sessionEvents(events);
-    expect(recorded).toHaveLength(1);
-    expect((recorded[0].blobs as string[])[4]).toBe("retried");
-  });
-
-  it("does NOT re-run a command whose shell died UNDER it (non-idempotent double-apply)", async () => {
-    const { service, sandbox, events, resetSession } = recoveringService(async () => {
-      throw sessionTerminatedError();
-    });
-
-    // `psql -f migrate.sql` may have applied the migration before the shell
-    // died; re-dispatching it would apply it twice, silently.
-    await expect(service.exec({ command: "psql -f migrate.sql" }))
-      .rejects.toThrow(ANALYSIS_SESSION_RESTARTED_MESSAGE);
-
-    expect(commandRuns(sandbox)).toBe(1);
-    expect(resetSession).not.toHaveBeenCalled();
-    const recorded = sessionEvents(events);
-    expect(recorded).toHaveLength(1);
-    expect((recorded[0].blobs as string[])[4]).toBe("failed");
-  });
-
-  it("retries a pre-dispatch death at most once", async () => {
-    let prepares = 0;
-    const { service, sandbox, events } = recoveringService(
+    const { service, sandbox, events } = failingService(
       async () => ({ exitCode: 0, stdout: "ok", stderr: "" }),
       {
         mkdir: async () => {
@@ -913,31 +868,44 @@ describe("AnalysisService session recovery", () => {
     await expect(service.exec({ command: "psql -f migrate.sql" }))
       .rejects.toThrow(ANALYSIS_SESSION_RESTARTED_MESSAGE);
 
-    expect(prepares).toBe(2);
+    expect(prepares).toBe(1);
     expect(commandRuns(sandbox)).toBe(0);
     const recorded = sessionEvents(events);
-    expect(recorded).toHaveLength(2);
-    expect((recorded[0].blobs as string[])[4]).toBe("retried");
-    expect((recorded[1].blobs as string[])[4]).toBe("failed");
+    expect(recorded).toHaveLength(1);
+    expect((recorded[0].blobs as string[])[4]).toBe("failed");
+  });
+
+  it("does NOT re-run a command whose environment died UNDER it", async () => {
+    const { service, sandbox, events } = failingService(async () => {
+      throw sessionTerminatedError();
+    });
+
+    // `psql -f migrate.sql` may have applied the migration before the
+    // environment died; re-dispatching it would apply it twice, silently.
+    await expect(service.exec({ command: "psql -f migrate.sql" }))
+      .rejects.toThrow(ANALYSIS_SESSION_RESTARTED_MESSAGE);
+
+    expect(commandRuns(sandbox)).toBe(1);
+    expect(sessionEvents(events)).toHaveLength(1);
   });
 
   it("never leaks the raw SDK error name to the caller", async () => {
-    const { service } = recoveringService(async () => {
+    const { service } = failingService(async () => {
       throw sessionTerminatedError();
     });
 
     // runCode reports failures as a VALUE (deployed apps depend on that shape),
-    // so recovery replaces the raw SDK text in place rather than throwing.
+    // so the raw SDK text is replaced in place rather than thrown.
     const result = await service.runCode({ code: "print('ok')" });
     expect(result).toMatchObject({ ok: false, error: ANALYSIS_SESSION_RESTARTED_MESSAGE });
     expect(JSON.stringify(result)).not.toContain("SessionTerminatedError");
     expect(JSON.stringify(result)).not.toContain("shell exited");
-    // The internal recovery marker never reaches a caller.
+    // The internal marker never reaches a caller.
     expect(JSON.stringify(result)).not.toContain("sessionDeath");
   });
 
   it("does not treat a script that PRINTS SessionTerminatedError as an environment death", async () => {
-    const { service, sandbox, events } = recoveringService(async () => ({
+    const { service, sandbox, events } = failingService(async () => ({
       exitCode: 1,
       stdout: "",
       stderr: "Traceback: RuntimeError: SessionTerminatedError is just a string here",
@@ -945,14 +913,14 @@ describe("AnalysisService session recovery", () => {
 
     const result = await service.runCode({ code: "print('boom')" }) as Record<string, unknown>;
     expect(result.ok).toBe(false);
-    // The program's own stderr survives verbatim, and nothing was re-executed.
+    // The program's own stderr survives verbatim.
     expect(String(result.error)).toContain("SessionTerminatedError");
     expect(commandRuns(sandbox)).toBe(1);
     expect(sessionEvents(events)).toHaveLength(0);
   });
 
   it("keeps the throwing shape for operations that throw", async () => {
-    const { service } = recoveringService(async () => {
+    const { service } = failingService(async () => {
       throw sessionTerminatedError();
     });
 
@@ -964,60 +932,93 @@ describe("AnalysisService session recovery", () => {
     expect((failure.cause as Error).name).toBe("SessionTerminatedError");
   });
 
-  it("still retries add_dependency after dispatch — `uv add` is idempotent", async () => {
-    let installs = 0;
-    const { service, sandbox } = recoveringService(
-      async () => ({ exitCode: 0, stdout: "ok", stderr: "" }),
-    );
-    // Fail the FIRST `uv add` specifically, i.e. after dispatch.
-    sandbox.exec.mockImplementation((command: string) => {
-      if (String(command).includes("uv add")) {
-        installs += 1;
-        if (installs === 1) return Promise.reject(sessionTerminatedError());
-      }
-      return Promise.resolve({ exitCode: 0, stdout: "ok", stderr: "" });
-    });
-    (service as unknown as { projectFiles: (id: string) => Promise<unknown> }).projectFiles =
-      async () => fakeFiles({ "pyproject.toml": "[project]\nname='x'\n" });
-
-    const result = await service.addDependency({
-      projectId: "ca-test-proj",
-      packages: ["tabulate"],
-    }) as Record<string, unknown>;
-    expect(result.ok).toBe(true);
-    expect(result.sessionRecovered).toBe(true);
-    expect(sandbox.exec.mock.calls.filter(([c]) => String(c).includes("uv add"))).toHaveLength(2);
-  });
-
   it("does not retry an ordinary command failure", async () => {
     let attempts = 0;
-    const { service, events, resetSession } = recoveringService(async () => {
+    const { service, events } = failingService(async () => {
       attempts += 1;
       throw new Error("bash: nope: command not found");
     });
 
     await expect(service.exec({ command: "nope" })).rejects.toThrow("command not found");
     expect(attempts).toBe(1);
-    expect(resetSession).not.toHaveBeenCalled();
     expect(sessionEvents(events)).toHaveLength(0);
   });
 
-  it("survives a sandbox without resetSession (older deployments, fakes)", async () => {
-    let prepares = 0;
-    const { service, sandbox } = recoveringService(
-      async () => ({ exitCode: 0, stdout: "ok", stderr: "" }),
-      {
-        mkdir: async () => {
-          prepares += 1;
-          if (prepares === 1) throw sessionTerminatedError();
-          return {};
-        },
-      },
-    );
-    delete (sandbox as unknown as Record<string, unknown>).resetSession;
+  describe("sessionless timeout (exit 124)", () => {
+    // Exactly what the container's sessionless execution returns after it
+    // killed the process group at the timeout.
+    const killedAt = (ms: number) => async () => ({
+      exitCode: 124,
+      stdout: "partial row 1\npartial row 2\n",
+      stderr: `still working...\nCommand timed out after ${ms}ms`,
+    });
 
-    await expect(service.runCode({ code: "print('ok')" })).resolves.toMatchObject({ ok: true });
-    expect(prepares).toBe(2);
+    it("reports the stable timeout message and keeps the partial output", async () => {
+      const { service, events } = failingService(killedAt(5_000));
+
+      const result = await service.exec({ command: "python slow.py", timeoutMs: 5_000 });
+
+      expect(result).toMatchObject({
+        ok: false,
+        exitCode: 124,
+        error: "Command timed out after 5000ms",
+        timedOut: true,
+        stdout: "partial row 1\npartial row 2\n",
+      });
+      const recorded = eventsNamed(events, "sandbox_exec_timeout");
+      expect(recorded).toHaveLength(1);
+      expect((recorded[0].blobs as string[])[3]).toBe("exec");
+      expect((recorded[0].blobs as string[])[4]).toBe("timed_out");
+    });
+
+    it("maps run_code's timeout to its fixed budget", async () => {
+      const { service, events } = failingService(killedAt(ANALYSIS_DEFAULT_EXEC_TIMEOUT_MS));
+
+      const result = await service.runCode({ code: "while True: pass" });
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: `Command timed out after ${ANALYSIS_DEFAULT_EXEC_TIMEOUT_MS}ms`,
+        timedOut: true,
+      });
+      expect(eventsNamed(events, "sandbox_exec_timeout")).toHaveLength(1);
+    });
+
+    it("leaves a program that exits 124 on its own as an ordinary failure", async () => {
+      const { service, events } = failingService(async () => ({
+        exitCode: 124,
+        stdout: "",
+        stderr: "inner step timed out",
+      }));
+
+      const result = await service.exec({ command: "timeout 1 sleep 5; exit 124" });
+
+      expect(result).toMatchObject({ ok: false, exitCode: 124, error: "inner step timed out" });
+      expect(result.timedOut).toBeUndefined();
+      expect(eventsNamed(events, "sandbox_exec_timeout")).toHaveLength(0);
+    });
+  });
+
+  it("gives every exec a timeout: a sessionless exec without one is unbounded", async () => {
+    const { service, sandbox } = failingService(async () => ({ exitCode: 0, stdout: "", stderr: "" }));
+    (service as unknown as { projectFiles: (id: string) => Promise<unknown> }).projectFiles =
+      async () => fakeFiles({ "main.py": "print(1)\n" });
+
+    await service.exec({ projectId: "ca-test-proj", command: "python main.py" });
+
+    expect(sandbox.exec.mock.calls.length).toBeGreaterThanOrEqual(4);
+    for (const [command, options] of sandbox.exec.mock.calls) {
+      expect({ command, timeout: typeof options?.timeout }).toEqual({ command, timeout: "number" });
+    }
+  });
+
+  it("runs every exec with a UTF-8 locale (the default session used to force one)", async () => {
+    const { service, sandbox } = failingService(async () => ({ exitCode: 0, stdout: "", stderr: "" }));
+
+    await service.exec({ command: "python -c 'print(1)'" });
+
+    const [, options] = sandbox.exec.mock.calls.find(([c]) => String(c).startsWith("python"))!;
+    expect(options.env).toMatchObject({ LANG: "C.UTF-8", LC_ALL: "C.UTF-8" });
   });
 });
 

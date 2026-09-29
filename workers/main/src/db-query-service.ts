@@ -43,6 +43,27 @@ export const DB_RELAY_LOCAL_PORT = 11080;
 /** cloudflared forwarder command + stable process id (started once, reused). */
 export const DB_RELAY_FORWARDER_PROCESS_ID = "cf-access-tcp";
 
+/**
+ * `getSandbox()` options for every worker-side DbQuerySandbox stub.
+ *
+ * `enableDefaultSession: false` is load-bearing. By default the Sandbox SDK
+ * runs every `exec` in ONE persistent shell session per sandbox, and the
+ * container runs that session's commands one at a time. The sandbox is shared
+ * by a whole workspace, so one slow query or a 5-minute export queued every
+ * other query, readiness probe and export behind it. Prod saw a 1-second
+ * `/dev/tcp` probe wait 160s behind an export, blow the 45s setup deadline, and
+ * the wedge self-heal then destroy a healthy, busy container.
+ *
+ * Nothing here needs shell state: the runner is one stateless exec with an
+ * explicit cwd and env, and the probe is a one-shot. Sessionless execs are
+ * independent processes, so a workspace's calls run concurrently. The DO's own
+ * internal execs (the export mount) still use the default session.
+ */
+export const DB_QUERY_SANDBOX_OPTIONS = {
+  normalizeId: true,
+  enableDefaultSession: false,
+} as const;
+
 /** Relay coordinates + credentials, from worker env (never baked in images). */
 export interface DbEgressRelayConfig {
   hostname: string;

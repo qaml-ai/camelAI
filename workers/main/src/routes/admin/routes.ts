@@ -152,6 +152,7 @@ import { ProjectFilesystemClient, WorkspaceFilesystemClient } from "../../worksp
 import { recordObservabilityEvent } from "../../observability.js";
 import { getSandbox } from "@cloudflare/sandbox";
 import {
+  DB_QUERY_SANDBOX_OPTIONS,
   relayConfigFromEnv,
   runDbQuery,
   type DbQuerySandboxStub,
@@ -956,9 +957,11 @@ routes.post(
     const destroyed: string[] = [];
     const errors: Array<{ sandbox_id: string; error: string }> = [];
     try {
-      const sandbox = getSandbox(c.env.DB_QUERY_SANDBOX, sandboxId, {
-        normalizeId: true,
-      }) as { destroy: () => Promise<void> };
+      const sandbox = getSandbox(
+        c.env.DB_QUERY_SANDBOX,
+        sandboxId,
+        DB_QUERY_SANDBOX_OPTIONS,
+      ) as { destroy: () => Promise<void> };
       await sandbox.destroy();
       destroyed.push(sandboxId);
     } catch (error) {
@@ -1048,9 +1051,11 @@ routes.post(
     const relay = relayConfigFromEnv(c.env);
     const body = c.req.valid("json");
 
-    const sandbox = getSandbox(c.env.DB_QUERY_SANDBOX, body.sandbox_key ?? "admin-smoke", {
-      normalizeId: true,
-    }) as unknown as DbQuerySandboxStub;
+    const sandbox = getSandbox(
+      c.env.DB_QUERY_SANDBOX,
+      body.sandbox_key ?? "admin-smoke",
+      DB_QUERY_SANDBOX_OPTIONS,
+    ) as unknown as DbQuerySandboxStub;
 
     const started = Date.now();
     const result = await runDbQuery(

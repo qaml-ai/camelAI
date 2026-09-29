@@ -55,3 +55,27 @@ describe('data-proxy response limits', () => {
     expect(error).toMatchObject({ status: 500, message: expect.stringContaining('DB_QUERY_SANDBOX') });
   });
 });
+
+describe('data-proxy sandbox sessions', () => {
+  it("runs every exec sessionless so a workspace's calls do not queue behind one shell", async () => {
+    const fake = fakeDbQuerySandboxNamespace(() => (
+      { ok: true, rows: [], fields: [], rowCount: 0, truncated: false, durationMs: 1 }
+    ));
+
+    await postgresQuery(
+      {
+        DB_QUERY_SANDBOX: fake.namespace as never,
+        DB_EGRESS_RELAY_HOSTNAME: 'db-relay.example.com',
+        DB_EGRESS_RELAY_SOCKS_USERNAME: 'u',
+        DB_EGRESS_RELAY_SOCKS_PASSWORD: 'p',
+      },
+      CONTEXT,
+      { mode: 'read', host: 'db.example.com', user: 'u', password: 'p', query: 'SELECT 1' },
+    );
+
+    // Relay probe + runner, neither on the shared default session.
+    expect(fake.execSessions.length).toBeGreaterThanOrEqual(2);
+    expect(fake.execSessions).not.toContain('default');
+    expect(fake.stub.exec).not.toHaveBeenCalled();
+  });
+});

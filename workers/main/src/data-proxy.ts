@@ -17,6 +17,7 @@
 import { getSandbox } from '@cloudflare/sandbox';
 
 import {
+  DB_QUERY_SANDBOX_OPTIONS,
   relayConfigFromEnv,
   runDbExport,
   runDbQuery,
@@ -83,9 +84,11 @@ function resolveDbQueryDeps(env: DataProxyEnv, context: DataProxyContext): DbQue
   if (!env.DB_QUERY_SANDBOX) {
     throw createDataProxyError('DB_QUERY_SANDBOX container binding is not configured', 500);
   }
-  const sandbox = getSandbox(env.DB_QUERY_SANDBOX, `ws-${context.workspaceId}`, {
-    normalizeId: true,
-  }) as unknown as DbQuerySandboxStub;
+  const sandbox = getSandbox(
+    env.DB_QUERY_SANDBOX,
+    `ws-${context.workspaceId}`,
+    DB_QUERY_SANDBOX_OPTIONS,
+  ) as unknown as DbQuerySandboxStub;
   return {
     sandbox,
     relay: relayConfigFromEnv(env),

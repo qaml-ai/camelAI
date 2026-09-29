@@ -18,9 +18,30 @@ export interface FakeDbQueryCall {
   command: string;
 }
 
+type FakeExecOptions = { env?: Record<string, string | undefined> };
+
 export function fakeDbQuerySandboxNamespace(respond: (request: DbQueryRequest) => unknown) {
   const calls: FakeDbQueryCall[] = [];
   const mountPrefixes: string[] = [];
+  /**
+   * Session each exec ran in, as the SDK stub saw it: "default" for the shared
+   * shell (`stub.exec`), else the explicit token. `getSandbox()` with
+   * `enableDefaultSession: false` routes `exec` to `execWithSessionToken`.
+   */
+  const execSessions: string[] = [];
+  const runExec = async (command: string, opts?: FakeExecOptions) => {
+    if (command.includes('/dev/tcp/')) {
+      return { stdout: 'up', stderr: '', exitCode: 0 };
+    }
+    const request = JSON.parse(opts?.env?.DB_QUERY_REQUEST ?? '{}') as DbQueryRequest;
+    calls.push({ request, env: opts?.env ?? {}, command });
+    const body = respond(request);
+    return {
+      stdout: typeof body === 'string' ? body : JSON.stringify(body),
+      stderr: '',
+      exitCode: 0,
+    };
+  };
   const stub = {
     ensureReady: vi.fn(async () => {}),
     ensureRelayEgress: vi.fn(async () => {}),
@@ -28,23 +49,18 @@ export function fakeDbQuerySandboxNamespace(respond: (request: DbQueryRequest) =
       mountPrefixes.push(prefix);
     }),
     startProcess: vi.fn(async () => ({})),
-    exec: vi.fn(async (command: string, opts?: { env?: Record<string, string | undefined> }) => {
-      if (command.includes('/dev/tcp/')) {
-        return { stdout: 'up', stderr: '', exitCode: 0 };
-      }
-      const request = JSON.parse(opts?.env?.DB_QUERY_REQUEST ?? '{}') as DbQueryRequest;
-      calls.push({ request, env: opts?.env ?? {}, command });
-      const body = respond(request);
-      return {
-        stdout: typeof body === 'string' ? body : JSON.stringify(body),
-        stderr: '',
-        exitCode: 0,
-      };
+    exec: vi.fn(async (command: string, opts?: FakeExecOptions) => {
+      execSessions.push('default');
+      return runExec(command, opts);
+    }),
+    execWithSessionToken: vi.fn(async (command: string, sessionId: string, opts?: FakeExecOptions) => {
+      execSessions.push(sessionId);
+      return runExec(command, opts);
     }),
   };
   const namespace = {
     idFromName: (name: string) => ({ name, toString: () => name }),
     get: () => stub,
   };
-  return { namespace, stub, calls, mountPrefixes };
+  return { namespace, stub, calls, mountPrefixes, execSessions };
 }

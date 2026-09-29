@@ -249,17 +249,26 @@ export async function runRuntimeEval(env: unknown, body: RuntimeEvalRequest): Pr
     const historyBefore = row.agentId ? (await runtimeTranscript(chatEnv, row.agentId)).length : 0;
     const startedAtMs = Date.now();
     const deadline = startedAtMs + timeoutMs;
-    const sent = await startRuntimeTurn(chatEnv, {
+    const clientMessageId = body.clientMessageId?.trim() || `eval_${crypto.randomUUID().replace(/-/g, "")}`;
+    const send = async () => startRuntimeTurn(chatEnv, {
       context,
-      row,
+      row: await org.getThreadRuntime(threadId) ?? row,
       sender: { userId, userName: context.userName, userEmail: context.userEmail },
       text: message,
-      clientMessageId: body.clientMessageId?.trim() || `eval_${crypto.randomUUID().replace(/-/g, "")}`,
+      clientMessageId,
       source: body.messageSource?.trim() || "eval",
       waitUntil: (promise) => {
         background.push(promise.catch((error: unknown) => console.warn("[runtime-eval] background work failed", error)));
       },
     });
+    let sent = await send();
+    // A 429 is the tenant's agents-awake quota while other evals run (the
+    // matrix): wait for room, a minute at most. The same request id makes a
+    // retry the same message.
+    for (let tries = 0; sent.status === "busy" && tries < 12 && Date.now() < deadline; tries += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      sent = await send();
+    }
     if (sent.status !== "accepted") return errorResult(sent.error, sent.status === "busy" ? "busy" : "error");
 
     let requestId = sent.requestId;

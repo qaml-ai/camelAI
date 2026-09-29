@@ -385,6 +385,13 @@ export function readSkillWithTool(
 ): boolean {
   return collectRuntimeItems(events).some((item) => {
     if (!runtimeItemSucceeded(item) || asString(item.status)?.toLowerCase() !== "completed") return false;
+    if (isJsExecItem(item)) {
+      // From code: tools.camel__read_skill({ skill: "<skill>" }) (a file argument names another file).
+      const code = asString(asRecord(item.arguments)?.code) ?? "";
+      return jsExecToolCalls(code, "read_skill").some((call) =>
+        call.argumentsText.includes(skill) &&
+        (file === "SKILL.md" ? !/\bfile\s*:/.test(call.argumentsText) || call.argumentsText.includes("SKILL.md") : call.argumentsText.includes(file)));
+    }
     const tool = runtimeToolName(item);
     if (tool !== "read_skill" && !tool?.endsWith("__read_skill")) return false;
     const args = asRecord(item.arguments);

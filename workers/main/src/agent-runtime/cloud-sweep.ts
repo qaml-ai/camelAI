@@ -1,8 +1,8 @@
 /**
  * The cloud thread sweep: move the threads still on ChatThreadDO that were
  * active lately to the agent runtime with migrateThreadToRuntime, in the
- * background, newest activity first, where AGENT_RUNTIME_MIGRATE_DO_THREADS
- * is on for their org. An operator starts it (POST
+ * background, newest activity first (every org's, wherever the runtime is
+ * configured). An operator starts it (POST
  * /api/admin/runtime-migration/sweep); the cron advances it a bounded step at
  * a time. Everything it knows is in D1, so it resumes wherever it stopped:
  *
@@ -540,7 +540,9 @@ export async function runCloudSweepStep(env: SweepEnv, options: CloudSweepOption
         if (reached >= 0) state.cursor = { updatedAt: page[reached].updatedAt, threadId: page[reached].id };
       }
       state.updatedAt = now();
-      if (pausedFor) return await pause(pausedFor.reason, pausedFor.until, false);
+      // Set inside the page loop's callbacks, which the compiler does not see.
+      const paused = pausedFor as { reason: string; until: number } | null;
+      if (paused) return await pause(paused.reason, paused.until, false);
       if (failures >= BREAKER_FAILURES) return await pause(`${failures} moves failed in one step`, now() + breakerPauseMs(state.breakerTrips + 1), true);
       state.pausedUntil = null;
       state.error = null;

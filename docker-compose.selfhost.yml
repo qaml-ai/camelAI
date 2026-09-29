@@ -76,7 +76,6 @@ services:
       AGENT_RUNTIME_URL: http://127.0.0.1:${SELFHOST_AGENT_RUNTIME_PORT:-8790}
       AGENT_RUNTIME_TENANT: ${AGENT_RUNTIME_TENANT:?Run bun run selfhost:migrate-secrets}
       AGENT_RUNTIME_API_TOKEN: ${AGENT_RUNTIME_API_TOKEN:?Run bun run selfhost:migrate-secrets}
-      AGENT_RUNTIME_DIRECT_THREADS: ${SELFHOST_AGENT_RUNTIME_DIRECT_THREADS:-1}
     volumes:
       - app-state:/workspace/.selfhost/workerd/state
       # Operator agent customization pack (skills + prompt append/prepend).

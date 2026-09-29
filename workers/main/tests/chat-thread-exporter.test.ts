@@ -183,7 +183,6 @@ describe("ChatThreadDO: turns, sends and connections answer moved", () => {
     for (const [path, init] of [
       ["/agents/chat-thread/moved-thread", { headers: { Upgrade: "websocket" } }],
       ["/agents/chat-thread/moved-thread/sse", {}],
-      ["/agents/chat-thread/moved-thread/call", { method: "POST", body: "{}" }],
     ] as const) {
       const response = await SELF.fetch(`https://camelai.test${path}`, init);
       expect(response.status, path).toBe(410);

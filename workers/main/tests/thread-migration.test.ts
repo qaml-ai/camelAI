@@ -36,8 +36,10 @@ import {
   MAX_IMPORT_BYTES,
   MAX_TOOL_RESULT_CHARS,
   convertTranscript,
+  classifyMove,
   importNote,
   migrateThreadOnSend,
+  moveThreadForSend,
   migrateThreadToRuntime,
   reconcileRuntimeMigrationOrphans,
   runtimeMigrationKey,
@@ -457,6 +459,7 @@ describe("migrateThreadOnSend", () => {
     return {
       env: { ...flags, AGENT_RUNTIME_DEFINITION: "def_1", ORG: { idFromName: (n: string) => n, get: () => org }, CHAT_THREAD: { idFromName: (n: string) => n, get: () => thread } } as unknown as ChatEnv,
       getThreadRuntime,
+      thread,
     };
   }
 
@@ -484,5 +487,107 @@ describe("migrateThreadOnSend", () => {
     expect(await migrateThreadOnSend(fakeEnv({ status: "failed", error: "HTTP 503" }, [null]).env, context)).toBeNull();
     const anyOrg = fakeEnv({ status: "migrated", row: ROW, archived: false, stats: {} } as never, [null], { ...FLAGS, AGENT_RUNTIME_MIGRATE_DO_THREADS: "" });
     expect(await migrateThreadOnSend(anyOrg.env, context)).toEqual(ROW);
+  });
+});
+
+describe("classifyMove", () => {
+  const ROW = { threadId: "t1", agentId: "agt_1", model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
+  it("sorts every answer a move gives into what the page and a sender do with it", () => {
+    expect(classifyMove({ status: "migrated", row: ROW, archived: false, stats: {} } as never)).toEqual({ state: "runtime", row: ROW });
+    expect(classifyMove({ status: "busy", reason: "moving" })).toEqual({ state: "moving" });
+    expect(classifyMove({ status: "failed", error: "HTTP 503", retryAt: 5_000 })).toEqual({ state: "retrying", retryAt: 5_000, error: "HTTP 503" });
+    // A backoff after a transient failure is retried, with when.
+    expect(classifyMove({ status: "skipped", reason: "backoff: HTTP 503", retryAt: 9_000 })).toEqual({ state: "retrying", retryAt: 9_000, error: "HTTP 503" });
+    // A model that did not resolve just now (a provider setting being changed) is retried, not read-only.
+    expect(classifyMove({ status: "skipped", reason: "its model did not resolve: timeout" })).toMatchObject({ state: "retrying", retryAt: null });
+    // A history the runtime refuses every time, backing off or not, and a model with no route: read-only.
+    expect(classifyMove({ status: "skipped", reason: "too_large" })).toEqual({ state: "readonly", reason: "too_large" });
+    expect(classifyMove({ status: "skipped", reason: "backoff: too_large: HTTP 413" })).toEqual({ state: "readonly", reason: "too_large" });
+    expect(classifyMove({ status: "skipped", reason: "backoff: invalid_history: bad" })).toEqual({ state: "readonly", reason: "invalid_history" });
+    expect(classifyMove({ status: "skipped", reason: "no runtime route for its model" })).toEqual({ state: "readonly", reason: "no_route" });
+    expect(classifyMove({ status: "skipped", reason: "no_route: switch models" })).toEqual({ state: "readonly", reason: "no_route" });
+    // What chiridion must set up first: blocked, saying what.
+    expect(classifyMove({ status: "skipped", reason: "not_configured: Hosted models are not configured for the agent runtime." }))
+      .toEqual({ state: "blocked", code: "not_configured", message: "Hosted models are not configured for the agent runtime." });
+    expect(classifyMove({ status: "skipped", reason: "usage_limit: LLM usage limit reached." })).toMatchObject({ state: "blocked", code: "usage_limit" });
+    expect(classifyMove({ status: "skipped", reason: "the agent runtime is not configured" })).toMatchObject({ state: "blocked", code: "not_configured" });
+    // "moved" read between the row read and the DO's answer: the caller re-reads the row.
+    expect(classifyMove({ status: "skipped", reason: "moved" })).toEqual({ state: "gone", reason: "moved" });
+  });
+});
+
+describe("a person retrying a move", () => {
+  const context = { orgId: "org1", workspaceId: "ws1", threadId: "t1", userId: "u1", userName: "Ada", userEmail: null };
+  const ROW = { threadId: "t1", agentId: "agt_new", model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
+  function env(status: { state: string; retryAt?: number; error?: string }) {
+    const chat = {
+      runtimeMigrationStatus: vi.fn(async () => status),
+      clearRuntimeMigrationBackoff: vi.fn(async () => true),
+      migrateToRuntime: vi.fn(async () => ({ status: "migrated", row: ROW, archived: false, stats: {} })),
+    };
+    const org = {
+      getThread: vi.fn(async () => ({ workspace_id: "ws1", created_by: "u1" })),
+      getThreadRuntime: vi.fn(async () => null),
+      getMember: vi.fn(async () => ({ user_id: "u1", role: "member" })),
+      getMembers: vi.fn(async () => []),
+    };
+    return {
+      chat,
+      env: { AGENT_RUNTIME_DEFINITION: "def_1", ORG: { idFromName: (n: string) => n, get: () => org }, CHAT_THREAD: { idFromName: (n: string) => n, get: () => chat } } as unknown as ChatEnv,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    directEnabledMock.mockReturnValue(true);
+    routeMock.mockResolvedValue({ route: { kind: "scope", model: "openrouter/x", keyScope: "hosted" }, threadModel: "x", llmProviderRecord: null });
+  });
+
+  it("ends a transient backoff and moves the thread at once", async () => {
+    const { env: moveEnv, chat } = env({ state: "backoff", retryAt: Date.now() + 60_000, error: "HTTP 503" });
+    expect(await migrateThreadToRuntime(moveEnv, context, { retryBackoff: true })).toMatchObject({ status: "migrated" });
+    expect(chat.clearRuntimeMigrationBackoff).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a backoff when nobody asked, or when the runtime refuses the history every time", async () => {
+    const at = Date.now() + 60_000;
+    const timer = env({ state: "backoff", retryAt: at, error: "HTTP 503" });
+    expect(await migrateThreadToRuntime(timer.env, context)).toEqual({ status: "skipped", reason: "backoff: HTTP 503", retryAt: at });
+    expect(timer.chat.clearRuntimeMigrationBackoff).not.toHaveBeenCalled();
+    const refused = env({ state: "backoff", retryAt: at, error: "too_large: HTTP 413" });
+    expect(await migrateThreadToRuntime(refused.env, context, { retryBackoff: true })).toMatchObject({ status: "skipped", reason: "backoff: too_large: HTTP 413" });
+    expect(refused.chat.clearRuntimeMigrationBackoff).not.toHaveBeenCalled();
+    expect(refused.chat.migrateToRuntime).not.toHaveBeenCalled();
+  });
+});
+
+describe("moveThreadForSend", () => {
+  const context = { orgId: "org1", workspaceId: "ws1", threadId: "t1", userId: "u1", userName: "Ada", userEmail: null };
+  const ROW = { threadId: "t1", agentId: "agt_new", model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
+  function env(answer: DoMigrationResult, rows: Array<typeof ROW | null>) {
+    const org = {
+      getThread: vi.fn(async () => ({ workspace_id: "ws1", created_by: "u1" })),
+      getThreadRuntime: vi.fn(async () => rows.shift() ?? null),
+      getMember: vi.fn(async () => ({ user_id: "u1", role: "member" })),
+      getMembers: vi.fn(async () => []),
+    };
+    const chat = { migrateToRuntime: vi.fn(async () => answer), runtimeMigrationStatus: vi.fn(async () => ({ state: null })) };
+    return { AGENT_RUNTIME_DEFINITION: "def_1", ORG: { idFromName: (n: string) => n, get: () => org }, CHAT_THREAD: { idFromName: (n: string) => n, get: () => chat } } as unknown as ChatEnv;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    directEnabledMock.mockReturnValue(true);
+    routeMock.mockResolvedValue({ route: { kind: "scope", model: "openrouter/x", keyScope: "hosted" }, threadModel: "x", llmProviderRecord: null });
+  });
+
+  it("says a thread that can never move is read-only, so its sender re-homes it", async () => {
+    expect(await moveThreadForSend(env({ status: "skipped", reason: "too_large" }, [null]), context))
+      .toEqual({ row: null, outcome: { state: "readonly", reason: "too_large" } });
+  });
+
+  it("re-reads the row when the move says it moved meanwhile", async () => {
+    // The first read (before the move) finds none; the move says "moved"; the re-read finds it.
+    expect(await moveThreadForSend(env({ status: "skipped", reason: "moved" }, [null, ROW]), context)).toEqual({ row: ROW });
   });
 });

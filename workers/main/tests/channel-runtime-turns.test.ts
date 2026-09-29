@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { startRuntimeTurnMock, directEnabledMock, migrateOnSendMock } = vi.hoisted(() => ({
   startRuntimeTurnMock: vi.fn(),
-  migrateOnSendMock: vi.fn(async () => null),
+  migrateOnSendMock: vi.fn(async (): Promise<unknown> => ({ row: null, outcome: { state: "retrying", retryAt: null, error: "HTTP 503" } })),
   directEnabledMock: vi.fn(() => true),
 }));
 
@@ -18,7 +18,7 @@ vi.mock("../src/agent-runtime/thread-runtime.js", () => ({
 
 vi.mock("../src/agent-runtime/thread-migration.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
-  migrateThreadOnSend: migrateOnSendMock,
+  moveThreadForSend: migrateOnSendMock,
 }));
 
 import {
@@ -123,9 +123,15 @@ describe("startChannelRuntimeTurn", () => {
   });
 
   it("moves a thread on ChatThreadDO's own loop to the runtime, then runs the message there", async () => {
-    migrateOnSendMock.mockResolvedValueOnce({ ...ROW, agentId: "agt_moved" } as never);
+    migrateOnSendMock.mockResolvedValueOnce({ row: { ...ROW, agentId: "agt_moved" } });
     expect(await startChannelRuntimeTurn(fakeEnv({ row: null, relay: null }).env, request())).toEqual({ status: "accepted" });
     expect(startRuntimeTurnMock.mock.calls[0][1].row.agentId).toBe("agt_moved");
+  });
+
+  it("says a thread that can never move is unmovable, so the channel re-homes the conversation", async () => {
+    migrateOnSendMock.mockResolvedValueOnce({ row: null, outcome: { state: "readonly", reason: "invalid_history" } });
+    expect(await startChannelRuntimeTurn(fakeEnv({ row: null, relay: null }).env, request())).toEqual({ status: "unmovable", reason: "invalid_history" });
+    expect(startRuntimeTurnMock).not.toHaveBeenCalled();
   });
 
   it("does not move a thread with no member to act for its message", async () => {

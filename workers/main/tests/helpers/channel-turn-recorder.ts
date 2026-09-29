@@ -34,7 +34,7 @@ export function recordChannelTurns<T extends object>(actual: T): T {
         message: `${request.systemMessage}\n\n${request.message}`,
       });
       if (result.status === "moved") return null;
-      return { status: result.status as ChannelTurnResult["status"], ...(result.error ? { error: result.error } : {}) };
+      return { status: result.status, ...(result.error ? { error: result.error } : {}) } as ChannelTurnResult;
     },
   };
 }

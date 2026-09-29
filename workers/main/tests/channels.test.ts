@@ -487,4 +487,48 @@ describe("channels", () => {
     }));
     expect(startInitialUserMessageMock).not.toHaveBeenCalled();
   });
+
+  it("re-homes a conversation whose thread can never move: a new thread for the channel, a note linking the old one", async () => {
+    const kv = createMockKvStore();
+    const address = { kind: "slack", workspaceId: "workspace-1", orgId: "org-1", connectionId: "int-1", remoteConversationId: "C1:1.2" };
+    await kv.put(getChannelThreadMapKey(address), "thread-old");
+    const createThread = vi.fn(async () => ({ id: "thread-new", title: "Deploy help" }));
+    getOrgStubMock.mockReturnValue({
+      getThread: vi.fn(async (id: string) => id === "thread-old"
+        ? { id, title: "Deploy help", created_by: "slack", channel_kind: "slack", channel_connection_id: "int-1", channel_conversation_id: "C1:1.2" }
+        : id === "thread-new" ? { id, title: "Deploy help" } : null),
+      getLlmProviderConfig: vi.fn().mockResolvedValue(null),
+      getModelPickerConfig: vi.fn().mockResolvedValue(defaultOrgModelPickerConfig()),
+      createThread,
+    });
+    getWorkspaceStubMock.mockReturnValue({
+      getModelPickerConfig: vi.fn().mockResolvedValue(defaultWorkspaceModelPickerConfig()),
+    });
+    startChannelRuntimeTurnMock
+      .mockResolvedValueOnce({ status: "unmovable", reason: "too_large" } as never)
+      .mockResolvedValue({ status: "accepted" } as never);
+    const env = { APP_KV: kv } as never;
+    const request = { channelKind: "slack", threadId: "thread-old", workspaceId: "workspace-1", orgId: "org-1", userId: "owner-1", message: "hello" };
+
+    expect(await enqueueChannelMessage(env, request)).toEqual({ status: "accepted" });
+    // A new thread for the same channel conversation, pinned, and the mapping points at it.
+    expect(createThread).toHaveBeenCalledOnce();
+    expect(pinNewThreadToRuntimeMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ threadId: "thread-new" }));
+    expect(kv._store.get(getChannelThreadMapKey(address))).toBe("thread-new");
+    // The message ran there, its first message carrying a note linking the old thread.
+    const second = (startChannelRuntimeTurnMock.mock.calls[1] as unknown[])[1] as { threadId: string; systemMessage: string };
+    expect(second.threadId).toBe("thread-new");
+    expect(second.systemMessage).toContain("continues from the earlier thread \"Deploy help\" (thread-old)");
+    expect(second.systemMessage).toContain("/chat/thread-old");
+
+    // A later message on the old thread's other mappings (an email's reply
+    // references, say) goes straight to the new thread, with no note and no new thread.
+    startChannelRuntimeTurnMock.mockClear();
+    expect(await enqueueChannelMessage(env, request)).toEqual({ status: "accepted" });
+    expect(startChannelRuntimeTurnMock).toHaveBeenCalledOnce();
+    const third = (startChannelRuntimeTurnMock.mock.calls[0] as unknown[])[1] as { threadId: string; systemMessage: string };
+    expect(third.threadId).toBe("thread-new");
+    expect(third.systemMessage).not.toContain("earlier thread");
+    expect(createThread).toHaveBeenCalledOnce();
+  });
 });

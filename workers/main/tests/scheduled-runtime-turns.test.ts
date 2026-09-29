@@ -23,7 +23,7 @@ vi.mock("../src/agent-runtime/thread-runtime.js", async (importOriginal) => ({
 vi.mock("../src/agent-runtime/thread-migration.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   directRuntimeRow: directRowMock,
-  migrateThreadOnSend: moveOnSendMock,
+  moveThreadForSend: moveOnSendMock,
 }));
 vi.mock("../src/agent-runtime/runtime-api.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -42,7 +42,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   directEnabledMock.mockReturnValue(true);
   directRowMock.mockResolvedValue(ROW);
-  moveOnSendMock.mockResolvedValue(null);
+  moveOnSendMock.mockResolvedValue({ row: null, outcome: { state: "retrying", retryAt: null, error: "HTTP 503" } });
   runtimeApiMock.mockResolvedValue({ requests: [] });
   startRuntimeTurnMock.mockResolvedValue({ status: "accepted", requestId: "run-1", agentId: "agt_1", fallback: null });
 });
@@ -60,9 +60,16 @@ describe("startScheduledRuntimeTurn", () => {
 
   it("moves a thread still on ChatThreadDO first, then starts the run there", async () => {
     directRowMock.mockResolvedValue(null);
-    moveOnSendMock.mockResolvedValue(ROW);
+    moveOnSendMock.mockResolvedValue({ row: ROW });
     expect(await startScheduledRuntimeTurn({} as ChatEnv, request)).toEqual({ status: "accepted" });
     expect(startRuntimeTurnMock.mock.calls[0][1]).toMatchObject({ row: ROW });
+  });
+
+  it("says a thread that can never move is unmovable, so the scheduler gives the prompt a new one", async () => {
+    directRowMock.mockResolvedValue(null);
+    moveOnSendMock.mockResolvedValue({ row: null, outcome: { state: "readonly", reason: "too_large" } });
+    expect(await startScheduledRuntimeTurn({} as ChatEnv, request)).toEqual({ status: "unmovable", reason: "too_large" });
+    expect(startRuntimeTurnMock).not.toHaveBeenCalled();
   });
 
   it("starts the run as its creator, with the outcome instruction and the run's id", async () => {
@@ -132,6 +139,33 @@ describe("WorkspaceCronDO scheduled run outcomes for direct threads", () => {
     await cron.runScheduledPromptNow(workspaceId, prompt.id);
     expect(startRuntimeTurnMock).toHaveBeenCalledTimes(1);
     expect(startRuntimeTurnMock.mock.calls[0][1]).toMatchObject({ sender: { userId, userName: "Scheduler" } });
+  });
+
+  it("gives a prompt whose thread can never move a new thread, and runs it there with a note", async () => {
+    const { userId } = await createUser(testEnv, `cron-rehome-${crypto.randomUUID()}@example.com`, "password123", "Cron Owner");
+    const { org } = await createOrg(testEnv, "Cron Org", userId);
+    const workspaceId = (await listUserWorkspaces(testEnv, userId, org.id))[0]!.id;
+    const cron = testEnv.WORKSPACE_CRON.get(testEnv.WORKSPACE_CRON.idFromName(workspaceId)) as DurableObjectStub<WorkspaceCronDO>;
+    const prompt = await cron.createScheduledPrompt({
+      workspaceId, name: "Digest", prompt: "Summarize.", cronExpression: "0 9 * * *", createdBy: userId, scheduledByThreadId: "origin",
+    });
+    const oldThreadId = (await cron.listScheduledPrompts(workspaceId)).find((p) => p.id === prompt.id)!.thread_id;
+    // The old thread is still on ChatThreadDO and the runtime refuses its history.
+    directRowMock.mockResolvedValueOnce(null);
+    moveOnSendMock.mockResolvedValueOnce({ row: null, outcome: { state: "readonly", reason: "too_large" } });
+
+    const run = await cron.runScheduledPromptNow(workspaceId, prompt.id);
+    const newThreadId = run!.dispatch.thread_id;
+    expect(newThreadId).toBeTruthy();
+    expect(newThreadId).not.toBe(oldThreadId);
+    expect(startRuntimeTurnMock).toHaveBeenCalledTimes(1);
+    const input = startRuntimeTurnMock.mock.calls[0][1];
+    expect(input.context).toMatchObject({ threadId: newThreadId });
+    expect(input.text).toContain(`/chat/${oldThreadId}`);
+    expect(input.text).toContain("Summarize.");
+    // The prompt runs in the new thread from now on, and the run points at it.
+    expect((await cron.listScheduledPrompts(workspaceId)).find((p) => p.id === prompt.id)!.thread_id).toBe(newThreadId);
+    expect((await latestRun(cron, workspaceId, prompt.id)).thread_id).toBe(newThreadId);
   });
 
   it("keeps the reported outcome on the run in progress, once, and finishes the run with it", async () => {

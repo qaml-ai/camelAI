@@ -31,6 +31,7 @@ import {
 import type { LlmModel } from "../../../src/types";
 import type { ChatEnv } from "./chat-thread/types";
 import { startScheduledRuntimeTurn } from "./agent-runtime/scheduled-turns";
+import { rehomedThreadNote } from "./channels";
 import { pinNewThreadToRuntime, runtimeDirectThreadsEnabled } from "./agent-runtime/thread-runtime";
 import {
   readOrgModelPickerConfig,
@@ -1161,7 +1162,15 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     if (existing && existing.workspace_id === workspace.id) {
       return prompt.thread_id;
     }
+    return await this.newPromptThread(prompt, workspace);
+  }
 
+  /** A new thread for a scheduled prompt (pinned to the runtime), which the prompt runs in from now on. */
+  private async newPromptThread(
+    prompt: WorkspaceScheduledPrompt,
+    workspace: WorkspaceInfo,
+  ): Promise<string> {
+    const orgStub = this.getOrgStub(workspace.org_id);
     const model = await this.resolveDefaultThreadModel(workspace);
     const created = (await orgStub.createThread(
       workspace.id,
@@ -1201,7 +1210,7 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     trigger: AutomationRunTrigger,
     runId: string,
   ): Promise<DispatchResult> {
-    const threadId = await this.ensureRunnableThread(prompt, workspace);
+    let threadId = await this.ensureRunnableThread(prompt, workspace);
     this.insertAutomationRun({
       id: runId,
       kind: "scheduled_prompt",
@@ -1214,15 +1223,26 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     try {
       const actor = await this.scheduledRunActor(prompt, workspace);
       if (!actor) return { status: "error", error: "No workspace member to run this scheduled prompt as", threadId };
-      const direct = await startScheduledRuntimeTurn(this.env as unknown as ChatEnv, {
+      const run = (runThreadId: string, note?: string) => startScheduledRuntimeTurn(this.env as unknown as ChatEnv, {
         orgId: workspace.org_id,
         workspaceId: workspace.id,
-        threadId,
+        threadId: runThreadId,
         userId: actor,
         runId,
-        message: this.buildScheduledMessage(prompt, scheduledForMs),
+        message: note ? `${note}\n\n${this.buildScheduledMessage(prompt, scheduledForMs)}` : this.buildScheduledMessage(prompt, scheduledForMs),
       });
-      if (!direct) {
+      let direct = await run(threadId);
+      if (direct?.status === "unmovable") {
+        // The prompt's thread can never move to the runtime (too large, a
+        // history it refuses, a model it cannot run): the prompt continues in
+        // a new thread, and the old one stays readable, read-only.
+        const oldThreadId = threadId;
+        const oldTitle = ((await this.getOrgStub(workspace.org_id).getThread(oldThreadId)) as OrgThread | null)?.title || `Scheduled: ${prompt.name}`;
+        threadId = await this.newPromptThread(prompt, workspace);
+        this.sql.exec("UPDATE automation_runs SET thread_id = ? WHERE id = ?", threadId, runId);
+        direct = await run(threadId, rehomedThreadNote(oldThreadId, oldTitle, direct.reason));
+      }
+      if (!direct || direct.status === "unmovable") {
         return { status: "error", error: "The scheduled prompt's thread could not move to the agent runtime", threadId };
       }
       if (direct.status === "accepted") return { status: "success", threadId, accepted: true };

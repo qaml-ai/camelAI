@@ -27,21 +27,11 @@
   "routes": [{ "pattern": "camelai.dev", "custom_domain": true }],
   "vpc_services": [],
   "vars": {
-    // Hosted agent runtime (plans/agent-runtime-migration.md): with these plus the
-    // AGENT_RUNTIME_API_TOKEN secret, new threads with a runtime route run on it.
-    // Remove AGENT_RUNTIME_DEFINITION to send new threads back to the in-DO loop.
+    // Hosted agent runtime: with these plus the AGENT_RUNTIME_API_TOKEN secret,
+    // every thread runs on it (threads still on ChatThreadDO move there when
+    // next opened or sent to: agent-runtime/thread-migration.ts).
     "AGENT_RUNTIME_TENANT": "chiridion-prod",
     "AGENT_RUNTIME_DEFINITION": "def_1691d4d5174202254235",
-    // New web threads run directly on the runtime (plans/runtime-threads-direct.md).
-    // Remove to create new web threads on ChatThreadDO again (they are still
-    // pinned to the runtime while AGENT_RUNTIME_DEFINITION is set); threads
-    // already created stay put.
-    "AGENT_RUNTIME_DIRECT_THREADS": "1",
-    // Threads still on ChatThreadDO move to the runtime when next opened (or,
-    // for a channel thread, when a message arrives): agent-runtime/thread-migration.ts.
-    // A comma list of org ids moves only those orgs' threads; "1" moves every
-    // org's. Remove to stop moving threads; threads already moved stay on the runtime.
-    "AGENT_RUNTIME_MIGRATE_DO_THREADS": "1",
     "AI_VIRTUAL_MODEL": "google/gemini-3.8-flash",
     // Static-IP database egress relay (docs/db-egress-relay.md). SOCKS + Access
     // service-token credentials are secrets (DB_EGRESS_RELAY_SOCKS_* /
@@ -138,10 +128,9 @@
     { "binding": "ERROR_ANALYTICS", "dataset": "chiridion_errors_prod" },
     { "binding": "OBSERVABILITY_EVENTS", "dataset": "chiridion_observability_prod" },
   ],
-  // Transcript data lake (config/pipelines/README.md). Streams land in the
+  // Tool-call telemetry (config/pipelines/README.md). The stream lands in the
   // chiridion-transcript-lake-prod R2 Data Catalog as Iceberg tables.
   "pipelines": [
-    { "binding": "TRANSCRIPT_LAKE", "stream": "c3b4395560954073baf658cc22850e03" },
     { "binding": "TOOL_CALLS_LAKE", "stream": "79c4a38bc6134964b1f981734972a622" },
   ],
   "kv_namespaces": [

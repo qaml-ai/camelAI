@@ -329,6 +329,26 @@ describe('chat loader workspace mismatch handling', () => {
     expect(await result.chatData).toMatchObject({ runtime: seed });
   });
 
+  it('carries a stalled move (retrying, or blocked) to the page, not a spinner', async () => {
+    requireAuthContextMock.mockResolvedValue({
+      currentWorkspace: { id: 'ws_active' },
+      currentOrg: { id: 'org_active', slug: 'acme' },
+      orgs: [{ org_id: 'org_active', role: 'admin' }],
+      user: { id: 'user_1' },
+    });
+    getThreadMock.mockResolvedValue({ id: 'thread_123', workspace_id: 'ws_active', title: 'Workspace Thread' });
+    for (const move of [{ state: 'retrying', retryAt: 1_700_000_000_000 }, { state: 'blocked', message: 'Hosted models are not configured.' }]) {
+      openUnmovedThreadMock.mockResolvedValueOnce(move);
+      const result = await loader({
+        request: new Request('https://camelai.com/chat/thread_123'),
+        context: {},
+        params: { id: 'thread_123' },
+      } as never);
+      expect(await result.chatData).toMatchObject({ move });
+    }
+    expect(readOnlyThreadHistoryMock).not.toHaveBeenCalled();
+  });
+
   it('shows a thread that cannot move read-only, from the exporter, with the reason', async () => {
     requireAuthContextMock.mockResolvedValue({
       currentWorkspace: { id: 'ws_active' },

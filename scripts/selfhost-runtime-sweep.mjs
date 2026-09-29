@@ -4,7 +4,7 @@
  * (workers/main/src/routes/admin/selfhost-sweep-routes.ts): it begins a pass
  * once the app answers, advances it one bounded step at a time, waits out
  * retries, and after a complete pass looks again every few hours for threads
- * created on the in-app loop since. Progress goes to the log; state lives in
+ * still not moved. Progress goes to the log; state lives in
  * D1, so a restart resumes it. SELFHOST_RUNTIME_SWEEP=0 turns it off.
  */
 

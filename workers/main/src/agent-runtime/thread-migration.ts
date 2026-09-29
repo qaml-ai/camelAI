@@ -319,8 +319,10 @@ export type RuntimeMigrationResult =
   | { status: "migrated"; row: ThreadRuntimeRecord; stats: ConvertedTranscript["stats"]; archived: boolean; reason?: string }
   | { status: "adopted" | "runtime"; row: ThreadRuntimeRecord }
   | { status: "busy"; reason: string }
-  | { status: "skipped"; reason: string }
-  | { status: "failed"; error: string; retryAfterMs?: number }
+  /** retryAt: a backoff's end, when the skip is one. */
+  | { status: "skipped"; reason: string; retryAt?: number }
+  /** retryAt: when the thread's next attempt is due. */
+  | { status: "failed"; error: string; retryAfterMs?: number; retryAt?: number }
   | { status: "dry_run"; stats: ConvertedTranscript["stats"]; lossy: boolean; bytes: number; model?: string; keyScope?: string | null };
 
 /** What ChatThreadDO#migrateToRuntime answers: a result, or "relay" (the worker adopts its agent). */
@@ -402,7 +404,15 @@ async function migrationSubject(env: ChatEnv, thread: OrgThread, context: ChatCo
 export async function migrateThreadToRuntime(
   env: ChatEnv,
   context: ChatContextState,
-  options: { dryRun?: boolean } = {},
+  options: {
+    dryRun?: boolean;
+    /**
+     * A person asked for the thread (opened it, pressed retry): a backoff
+     * after a transient failure is ended and the move tried at once. A
+     * history the runtime refuses every time keeps its backoff.
+     */
+    retryBackoff?: boolean;
+  } = {},
 ): Promise<RuntimeMigrationResult> {
   if (!runtimeDirectThreadsEnabled(env)) return { status: "skipped", reason: "the agent runtime is not configured" };
   const org = orgStub(env, context.orgId);
@@ -413,10 +423,11 @@ export async function migrateThreadToRuntime(
   const chat = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(context.threadId)) as unknown as {
     runtimeMigrationStatus(): Promise<{ state: "moving" | "committing" | "moved" | "backoff" | null; retryAt?: number; error?: string }>;
     migrateToRuntime(request: DoMigrationRequest): Promise<DoMigrationResult>;
+    clearRuntimeMigrationBackoff(): Promise<boolean>;
   };
   // One cheap question first: a thread moving, moved or backing off needs none of the reads below.
   if (!options.dryRun) {
-    const { state, error } = await chat.runtimeMigrationStatus();
+    const { state, error, retryAt } = await chat.runtimeMigrationStatus();
     // A commit left pending (its alarm lost, say) is finished by whoever opens the thread.
     if (state === "committing") {
       const result = await chat.migrateToRuntime({ context, subject: null });
@@ -424,7 +435,12 @@ export async function migrateThreadToRuntime(
     }
     if (state === "moving") return { status: "busy", reason: "moving" };
     if (state === "moved") return { status: "skipped", reason: "moved" };
-    if (state === "backoff") return { status: "skipped", reason: error ? `backoff: ${error}` : "backoff" };
+    if (state === "backoff") {
+      const permanent = error !== undefined && PERMANENT_REFUSAL.test(error);
+      if (!options.retryBackoff || permanent || !await chat.clearRuntimeMigrationBackoff()) {
+        return { status: "skipped", reason: error ? `backoff: ${error}` : "backoff", ...(retryAt !== undefined ? { retryAt } : {}) };
+      }
+    }
   }
   // A model the runtime cannot run yet (a custom endpoint, Bedrock's OpenAI models) stays here.
   let resolved: Awaited<ReturnType<typeof resolveThreadRuntimeRoute>>;
@@ -564,21 +580,81 @@ export async function reconcileRuntimeMigrationOrphans(
 const MOVING_WAIT_MS = 10_000;
 const MOVING_POLL_MS = 500;
 
+/** A refusal the runtime gives a history every time (the DO backs off a day on it). */
+const PERMANENT_REFUSAL = /^(too_large|invalid_history)\b/;
+
+/** Why a thread cannot move for good: it is shown read-only (a channel or schedule re-homes it). */
+export type UnmovableReason = "too_large" | "invalid_history" | "no_route";
+
 /**
- * Why a thread cannot move, for good: its history is over the runtime's cap
- * or refused by its import, or its model has no runtime route. Null when the
- * move may still happen (it is under way, backing off after a failure, or
- * not tried yet). A thread that cannot move is shown read-only.
+ * Where a thread's move stands, for a page or a message waiting on it:
+ *
+ *   runtime   it runs there (the row);
+ *   moving    a move is under way (or about to be): wait;
+ *   retrying  it failed for now (the runtime, a model that did not resolve,
+ *             a backoff): tried again at `retryAt` (null: whenever next asked);
+ *   blocked   chiridion cannot move it until something is set up (the
+ *             runtime or hosted models not configured, the user's limit or
+ *             credits): `message` says what;
+ *   readonly  it never will (`reason`): shown read-only;
+ *   gone      the result says it moved, or the thread is gone: re-read the row.
  */
-export function permanentMoveSkip(result: RuntimeMigrationResult): string | null {
-  if (result.status !== "skipped") return null;
+export type MoveOutcome =
+  | { state: "runtime"; row: ThreadRuntimeRecord }
+  | { state: "moving" }
+  | { state: "retrying"; retryAt: number | null; error: string }
+  | { state: "blocked"; code: string; message: string }
+  | { state: "readonly"; reason: UnmovableReason }
+  | { state: "gone"; reason: string };
+
+export function classifyMove(result: RuntimeMigrationResult): MoveOutcome {
+  if ("row" in result) return { state: "runtime", row: result.row };
+  if (result.status === "busy" || result.status === "dry_run") return { state: "moving" };
+  if (result.status === "failed") return { state: "retrying", retryAt: result.retryAt ?? null, error: result.error };
   const reason = result.reason.replace(/^backoff: /, "");
-  if (/^too_large\b/.test(reason)) return "too_large";
-  if (/^invalid_history\b/.test(reason)) return "invalid_history";
-  if (/^no runtime route\b|^its model did not resolve\b/.test(reason)) return "no_route";
-  if (/^the agent runtime is not configured\b/.test(reason)) return "not_configured";
-  if (reason === "moved" || reason === "thread deleted" || reason === "not a thread of this workspace") return "gone";
-  return null;
+  const detail = (text: string) => text.replace(/^[a-z_]+: /, "");
+  if (/^too_large\b/.test(reason)) return { state: "readonly", reason: "too_large" };
+  if (/^invalid_history\b/.test(reason)) return { state: "readonly", reason: "invalid_history" };
+  if (/^(no runtime route\b|no_route: )/.test(reason)) return { state: "readonly", reason: "no_route" };
+  if (/^the agent runtime is not configured\b/.test(reason)) {
+    return { state: "blocked", code: "not_configured", message: "The agent runtime is not configured on this install, so this conversation cannot move yet." };
+  }
+  const refused = /^(not_configured|usage_limit|hosted_access): /.exec(reason);
+  if (refused) return { state: "blocked", code: refused[1], message: detail(reason) };
+  if (reason === "moved" || reason === "thread deleted" || reason === "not a thread of this workspace") return { state: "gone", reason };
+  // A backoff after a transient failure, a model that did not resolve just now, anything else.
+  return { state: "retrying", retryAt: result.retryAt ?? null, error: reason };
+}
+
+/**
+ * Move a thread for a message sent to it (a channel's, a schedule's): the
+ * runtime row, or where the move stands when there is none yet (waiting a
+ * few seconds for a move already under way).
+ */
+export async function moveThreadForSend(
+  env: ChatEnv,
+  context: ChatContextState,
+): Promise<{ row: ThreadRuntimeRecord } | { row: null; outcome: MoveOutcome }> {
+  const result = await migrateThreadToRuntime(env, context).catch((error: unknown): RuntimeMigrationResult => ({
+    status: "failed",
+    error: error instanceof Error ? error.message : String(error),
+  }));
+  recordRuntimeMigration(env, context, result);
+  const outcome = classifyMove(result);
+  if (outcome.state === "runtime") return { row: outcome.row };
+  const org = orgStub(env, context.orgId);
+  if (outcome.state === "gone") {
+    // "moved" between the row read and the DO's answer: the row is there now.
+    const row = await org.getThreadRuntime(context.threadId);
+    return row ? { row } : { row: null, outcome };
+  }
+  if (outcome.state !== "moving") return { row: null, outcome };
+  for (let waited = 0; waited < MOVING_WAIT_MS; waited += MOVING_POLL_MS) {
+    await new Promise((resolve) => setTimeout(resolve, MOVING_POLL_MS));
+    const row = await org.getThreadRuntime(context.threadId);
+    if (row) return { row };
+  }
+  return { row: null, outcome };
 }
 
 /**
@@ -587,18 +663,5 @@ export function permanentMoveSkip(result: RuntimeMigrationResult): string | null
  * move is under way elsewhere past a short wait, failed, or cannot happen).
  */
 export async function migrateThreadOnSend(env: ChatEnv, context: ChatContextState): Promise<ThreadRuntimeRecord | null> {
-  const result = await migrateThreadToRuntime(env, context).catch((error: unknown): RuntimeMigrationResult => ({
-    status: "failed",
-    error: error instanceof Error ? error.message : String(error),
-  }));
-  recordRuntimeMigration(env, context, result);
-  if ("row" in result) return result.row;
-  if (result.status !== "busy" || result.reason !== "moving") return null;
-  const org = orgStub(env, context.orgId);
-  for (let waited = 0; waited < MOVING_WAIT_MS; waited += MOVING_POLL_MS) {
-    await new Promise((resolve) => setTimeout(resolve, MOVING_POLL_MS));
-    const row = await org.getThreadRuntime(context.threadId);
-    if (row) return row;
-  }
-  return null;
+  return (await moveThreadForSend(env, context)).row;
 }

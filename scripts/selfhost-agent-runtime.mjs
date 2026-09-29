@@ -196,7 +196,7 @@ export async function inspectSelfhostAgentRuntime({ env, fetchImpl = globalThis.
     }
   } catch (error) {
     add(error.status === 404 ? "warn" : "fail", error.status === 404
-      ? `thread definition ${definitionId} is not provisioned yet (the app provisions it as it starts); new threads run on the in-app loop until then`
+      ? `thread definition ${definitionId} is not provisioned yet (the app provisions it as it starts); chats cannot run until then`
       : `could not read the thread definition: ${error.message}`);
   }
   try {

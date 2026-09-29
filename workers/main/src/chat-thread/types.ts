@@ -4,7 +4,6 @@
 
 import type {
   LakeStream,
-  PiMessageLakeRecord,
   ToolCallLakeRecord,
 } from "../lake-streams";
 import type { OrgDO, UserDO } from "../auth";
@@ -141,9 +140,8 @@ export interface ChatEnv extends WorkspaceFilesystemEnv {
   CODE_MODE_LOADER?: WorkerLoader;
   OBSERVABILITY_EVENTS?: AnalyticsEngineDataset;
   ERROR_ANALYTICS?: AnalyticsEngineDataset;
-  // Transcript data lake streams (Cloudflare Pipelines -> R2 Data Catalog).
+  // Tool-call telemetry stream (Cloudflare Pipelines -> R2 Data Catalog).
   // Optional everywhere: absent bindings disable export, they never fail a turn.
-  TRANSCRIPT_LAKE?: LakeStream<PiMessageLakeRecord>;
   TOOL_CALLS_LAKE?: LakeStream<ToolCallLakeRecord>;
   CF_ZONE_ID?: string;
   CF_API_TOKEN?: string;

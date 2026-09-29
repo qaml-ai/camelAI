@@ -87,7 +87,7 @@ const OPENROUTER_ATTRIBUTION = {
  * camelAI's hosted providers: OpenRouter through the AI Gateway, which holds
  * the provider keys and takes its own token as `cf-aig-authorization` (the
  * entry has no key). Null when the gateway is not configured (hosted threads
- * then stay on the in-DO loop).
+ * then have no runtime route).
  */
 export function hostedScopeProviders(env: KeyScopeEnv): Providers | null {
   const accountId = env.CF_ACCOUNT_ID?.trim();

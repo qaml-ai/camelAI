@@ -328,7 +328,7 @@ export async function getOrCreateChannelThread(
     },
   );
 
-  // A new channel thread runs directly on the runtime where new threads do.
+  // A new channel thread runs on the runtime.
   await pinNewThreadToRuntime(env as unknown as ChatEnv, {
     orgId: input.orgId,
     workspaceId: input.workspaceId,
@@ -336,7 +336,7 @@ export async function getOrCreateChannelThread(
     userId: null,
     userName: null,
     userEmail: null,
-  }).catch((error) => console.warn("[channels] new channel thread stays on ChatThreadDO", error));
+  }).catch((error) => console.warn("[channels] could not pin a new channel thread to the agent runtime", error));
   await env.APP_KV.put(mapKey, thread.id, ttlOptions(input.mapTtlSeconds));
 
   return {
@@ -379,9 +379,67 @@ async function channelConnectionOwner(
   }
 }
 
+/** Where a conversation that had to leave a thread (it could never move to the runtime) continues. */
+function rehomedThreadKey(threadId: string): string {
+  return `channel_thread_rehomed:${threadId}`;
+}
+
+/** The thread a re-homed conversation continues in, when it still exists. */
+async function rehomedThreadId(env: Env, orgId: string, threadId: string): Promise<string | null> {
+  if (!env.APP_KV) return null;
+  const next = await env.APP_KV.get(rehomedThreadKey(threadId));
+  if (!next) return null;
+  return await getOrgStub(env, orgId).getThread(next) ? next : null;
+}
+
+/**
+ * A channel conversation whose thread can never move to the agent runtime
+ * (too large, a history it refuses, a model it cannot run) continues in a
+ * new runtime thread: the channel's mapping points at it from now on (and
+ * the old thread redirects to it, for mappings keyed otherwise: an email's
+ * reply references), and the old thread stays readable, read-only.
+ */
+async function rehomeChannelThread(
+  env: Env,
+  input: { orgId: string; workspaceId: string; threadId: string; channelKind: ChannelKind },
+): Promise<{ threadId: string; oldTitle: string }> {
+  const old = await getOrgStub(env, input.orgId).getThread(input.threadId);
+  const kind = old?.channel_kind || input.channelKind;
+  const address: ChannelAddress = {
+    kind,
+    workspaceId: input.workspaceId,
+    orgId: input.orgId,
+    connectionId: old?.channel_connection_id ?? null,
+    remoteConversationId: old?.channel_conversation_id || `rehomed:${input.threadId}`,
+  };
+  const mapKey = getChannelThreadMapKey(address);
+  if (await env.APP_KV.get(mapKey) === input.threadId) await env.APP_KV.delete(mapKey);
+  const title = old?.title || "Conversation";
+  const created = await getOrCreateChannelThread(env, {
+    ...address,
+    title,
+    createdBy: old?.created_by || kind,
+    ...(kind === "email" ? { mapTtlSeconds: EMAIL_REPLY_REFERENCE_TTL_SECONDS } : {}),
+  });
+  await env.APP_KV.put(rehomedThreadKey(input.threadId), created.threadId);
+  return { threadId: created.threadId, oldTitle: title };
+}
+
+/** The note a re-homed conversation's first message carries, linking the old thread. */
+export function rehomedThreadNote(oldThreadId: string, oldTitle: string, reason: string): string {
+  const why = reason === "too_large"
+    ? "it was too large"
+    : reason === "invalid_history"
+      ? "its history could not be imported"
+      : "its model is not available there";
+  return `<camelai system message>This conversation continues from the earlier thread "${oldTitle}" (${oldThreadId}), which could not move to camelAI's new chat engine (${why}). That thread stays readable, read-only, at /chat/${oldThreadId}; its history is not in this conversation.</camelai system message>`;
+}
+
 /**
  * Start a channel message's turn on the agent runtime
- * (agent-runtime/channel-turns.ts); a thread still on ChatThreadDO moves there first.
+ * (agent-runtime/channel-turns.ts); a thread still on ChatThreadDO moves
+ * there first, and a conversation whose thread never can continues in a new
+ * one (rehomeChannelThread).
  */
 export async function enqueueChannelMessage(
   env: Env,
@@ -394,29 +452,35 @@ export async function enqueueChannelMessage(
   }
   const runtimeSystemMessage = buildChannelReplySystemMessage(channelKind, request, { runtime: true });
 
-  const startDirect = async (): Promise<InitialUserMessageResult | null> => {
+  const start = async (threadId: string, note?: string) => {
     if (!messageRequest.workspaceId || !messageRequest.orgId) return null;
-    const direct = await startChannelRuntimeTurn(env as unknown as ChatEnv, {
-      threadId: request.threadId,
+    return await startChannelRuntimeTurn(env as unknown as ChatEnv, {
+      threadId,
       workspaceId: messageRequest.workspaceId,
       orgId: messageRequest.orgId,
       channelKind,
       userId: messageRequest.userId ?? null,
       userName: messageRequest.userName,
       userEmail: messageRequest.userEmail,
-      systemMessage: runtimeSystemMessage,
+      systemMessage: note ? `${note}\n\n${runtimeSystemMessage}` : runtimeSystemMessage,
       message: request.message ?? "",
       clientMessageId: messageRequest.clientMessageId,
     });
-    if (!direct) return null;
+  };
+  const answer = (direct: Awaited<ReturnType<typeof start>>): InitialUserMessageResult => {
+    if (!direct) return { status: "error", error: "This conversation could not move to the new chat engine; try again in a moment." };
+    if (direct.status === "unmovable") return { status: "error", error: "This conversation could not move to the new chat engine." };
     return direct.status === "accepted" ? { status: "accepted" } : { status: direct.status, error: direct.error };
   };
 
   try {
-    return await startDirect() ?? {
-      status: "error",
-      error: "This conversation could not move to the new chat engine; start a new one.",
-    };
+    const orgId = messageRequest.orgId;
+    const workspaceId = messageRequest.workspaceId;
+    const rehomed = orgId ? await rehomedThreadId(env, orgId, request.threadId) : null;
+    const direct = await start(rehomed ?? request.threadId);
+    if (direct?.status !== "unmovable" || !orgId || !workspaceId) return answer(direct);
+    const next = await rehomeChannelThread(env, { orgId, workspaceId, threadId: rehomed ?? request.threadId, channelKind });
+    return answer(await start(next.threadId, rehomedThreadNote(rehomed ?? request.threadId, next.oldTitle, direct.reason)));
   } catch (error) {
     return {
       status: "error",

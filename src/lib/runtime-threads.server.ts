@@ -20,7 +20,7 @@ import {
 } from "../../workers/main/src/agent-runtime/thread-runtime";
 import type { RuntimeThreadSeed } from "@/lib/use-runtime-thread";
 import { recordRuntimeMigration, recordRuntimeSendFailure, recordRuntimeTokenMintFailure } from "../../workers/main/src/agent-runtime/runtime-thread-telemetry";
-import { migrateThreadToRuntime, permanentMoveSkip } from "../../workers/main/src/agent-runtime/thread-migration";
+import { classifyMove, migrateThreadToRuntime, type UnmovableReason } from "../../workers/main/src/agent-runtime/thread-migration";
 import type { ChatThreadReadOnlyHistory } from "../../workers/main/src/chat-thread-do";
 import { normalizePreviewTabs } from "../../workers/main/src/chat-thread/preview-state";
 import { initialRuntimeRequestId, requireSameOriginJson, runtimeReadProxyBase, startErrorStillCurrent } from "@/lib/agent-runtime-shared";
@@ -171,35 +171,62 @@ const MIGRATE_ON_OPEN_WAIT_MS = 8_000;
 
 /**
  * A thread still on ChatThreadDO, as its page finds it when opened:
- * `runtime` (moved now, or already), `moving` (the move is under way or will
- * be retried: the page waits and polls), or `readonly` (it cannot move, for
- * good: the page shows its history read-only, with the reason).
+ *
+ *   runtime   moved now, or already: open it there;
+ *   moving    the move is under way: the page waits and polls;
+ *   retrying  it failed for now: the page says when it is tried again
+ *             (`retryAt`, null: now, if asked) and offers to retry;
+ *   blocked   it cannot move until something is set up (`message`);
+ *   readonly  it never will (`reason`): the page shows its history read-only.
  */
 export type UnmovedThreadOpen =
   | { state: "runtime"; row: ThreadRuntimeRecord }
   | { state: "moving" }
-  | { state: "readonly"; reason: string };
+  | { state: "retrying"; retryAt: number | null }
+  | { state: "blocked"; message: string }
+  | { state: "readonly"; reason: UnmovableReason | "gone" };
 
 /**
  * Move a thread still on ChatThreadDO to the runtime as it is opened, waiting
  * at most `waitMs` for the move (it finishes in the background otherwise, and
- * the page's poll finds it moved).
+ * the page's poll finds it moved). A person opening it, or pressing retry
+ * (`retryBackoff`), ends a backoff after a transient failure: the move is
+ * tried at once rather than when the timer says.
  */
 export async function openUnmovedThread(
   loadContext: AppLoadContext,
   context: ChatContextState,
   waitUntil: (promise: Promise<unknown>) => void,
   waitMs = MIGRATE_ON_OPEN_WAIT_MS,
+  options: { retryBackoff?: boolean } = { retryBackoff: true },
 ): Promise<UnmovedThreadOpen> {
   const env = getEnv(loadContext) as unknown as ChatEnv;
-  const move = migrateThreadToRuntime(env, context).then((result): UnmovedThreadOpen => {
+  const move = migrateThreadToRuntime(env, context, { retryBackoff: options.retryBackoff }).then(async (result): Promise<UnmovedThreadOpen> => {
     recordRuntimeMigration(env, context, result);
-    if ("row" in result) return { state: "runtime", row: result.row };
-    const permanent = permanentMoveSkip(result);
-    return permanent ? { state: "readonly", reason: permanent } : { state: "moving" };
+    const outcome = classifyMove(result);
+    switch (outcome.state) {
+      case "runtime":
+        return { state: "runtime", row: outcome.row };
+      case "moving":
+        return { state: "moving" };
+      case "retrying":
+        return { state: "retrying", retryAt: outcome.retryAt };
+      case "blocked":
+        return { state: "blocked", message: outcome.message };
+      case "readonly":
+        return { state: "readonly", reason: outcome.reason };
+      case "gone": {
+        // "moved" read between the row read and the DO's answer: the row is there now.
+        const row = await (env.ORG.get(env.ORG.idFromName(context.orgId)) as unknown as {
+          getThreadRuntime(threadId: string): Promise<ThreadRuntimeRecord | null>;
+        }).getThreadRuntime(context.threadId);
+        if (row) return { state: "runtime", row };
+        return outcome.reason === "moved" ? { state: "moving" } : { state: "readonly", reason: "gone" };
+      }
+    }
   }, (error: unknown): UnmovedThreadOpen => {
     recordRuntimeMigration(env, context, { status: "failed", error: error instanceof Error ? error.message : String(error) });
-    return { state: "moving" };
+    return { state: "retrying", retryAt: null };
   });
   waitUntil(move);
   let timer: ReturnType<typeof setTimeout> | undefined;

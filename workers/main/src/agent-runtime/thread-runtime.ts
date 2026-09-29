@@ -69,19 +69,15 @@ export function runtimeThreadsEnabled(env: Partial<ChatEnv>): boolean {
   return runtimeConfigured(env as Parameters<typeof runtimeConfigured>[0]);
 }
 
-/**
- * Whether new web threads run directly on the runtime here: the runtime
- * tenant is configured and AGENT_RUNTIME_DIRECT_THREADS is on (staging first).
- */
+/** Whether threads run on the runtime here: its tenant is configured (every thread does then). */
 export function runtimeDirectThreadsEnabled(env: Partial<ChatEnv>): boolean {
   return directThreadsEnabled(env);
 }
 
 /**
- * Pin a new thread to the runtime, when direct threads are on here and its
- * model has a runtime route (custom endpoints and self-host providers stay on
- * ChatThreadDO). The row is the thread's backend from then on. Null: it runs
- * on ChatThreadDO.
+ * Pin a new thread to the runtime, when its model has a runtime route. The
+ * row is the thread's backend from then on. Null: the thread cannot run (the
+ * runtime is not configured, or its model has no route there).
  */
 export async function pinNewThreadToRuntime(env: ChatEnv, context: ChatContextState): Promise<ThreadRuntimeRecord | null> {
   if (!runtimeDirectThreadsEnabled(env)) return null;
@@ -89,7 +85,7 @@ export async function pinNewThreadToRuntime(env: ChatEnv, context: ChatContextSt
   try {
     ({ route } = await resolveThreadRuntimeRoute(env, context));
   } catch (error) {
-    console.warn("[runtime-thread] new thread stays on ChatThreadDO: its model did not resolve", error);
+    console.warn("[runtime-thread] new thread not pinned: its model did not resolve", error);
     return null;
   }
   if (!route) return null;

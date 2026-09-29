@@ -574,7 +574,7 @@ export class PiContainerTools {
       : null;
     // Models often write Python-style inline flags. JavaScript rejects them as
     // an invalid group, so honour a leading (?i) as the ignore-case flag.
-    const inlineIgnoreCase = /^\(\?i\)/.test(args.pattern);
+    const inlineIgnoreCase = args.pattern.startsWith("(?i)");
     const pattern = inlineIgnoreCase ? args.pattern.slice(4) : args.pattern;
     const ignoreCase = args.ignoreCase === true || inlineIgnoreCase;
     const matcher = args.literal

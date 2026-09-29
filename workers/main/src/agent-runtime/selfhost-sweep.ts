@@ -1,8 +1,7 @@
 /**
  * The self-host thread sweep: move every thread still on ChatThreadDO to the
- * agent runtime with migrateThreadToRuntime, in the background, so a later
- * release can delete the in-DO loop (SELF_HOSTING.md, "Moving existing
- * threads").
+ * agent runtime with migrateThreadToRuntime, in the background (threads also
+ * move when opened; SELF_HOSTING.md, "Moving existing threads").
  *
  * The app's startup process drives it (scripts/selfhost-runtime-sweep.mjs)
  * through the admin API, one bounded step at a time; everything it knows is
@@ -17,10 +16,10 @@
  * A pass walks every org (D1 `orgs`) and each org's threads without a
  * thread_runtime row (OrgDO.listThreadsWithoutRuntime), `concurrency` moves
  * at a time. When a pass ends with nothing left to retry the sweep is
- * `complete`: that marker, with how many threads it had to skip, is what the
- * release that deletes the in-DO loop checks before it starts
+ * `complete`: that marker, with how many threads it had to skip, is what a
+ * release without the exporter checks before it starts
  * (scripts/selfhost-runtime-gate.mjs). A start begins a new pass, so threads
- * created on the in-DO loop since (a model without a runtime route) are found.
+ * a pass could not move yet are tried again.
  */
 import type { ChatContextState, ChatEnv } from "../chat-thread/types";
 import { migrateThreadToRuntime, type RuntimeMigrationResult } from "./thread-migration";

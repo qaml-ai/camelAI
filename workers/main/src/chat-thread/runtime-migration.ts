@@ -379,7 +379,15 @@ export class ChatThreadRuntimeMigration {
         permanent ? PERMANENT_FAILURE_RETRY_MS : asked !== null ? Math.max(asked, migrationBackoffMs(1)) : undefined,
       );
       if (permanent) return { status: "skipped", reason: `${permanent}: ${message}` };
-      return asked !== null ? { status: "failed", error: message, retryAfterMs: asked } : { status: "failed", error: message };
+      // When the next attempt is due (the backoff just written), for a page that says so.
+      const failed = this.read();
+      const retryAt = failed?.phase === "failed" ? failed.retryAt : undefined;
+      return {
+        status: "failed",
+        error: message,
+        ...(asked !== null ? { retryAfterMs: asked } : {}),
+        ...(retryAt !== undefined ? { retryAt } : {}),
+      };
     }
   }
 

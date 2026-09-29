@@ -109,7 +109,6 @@ const SELFHOST_DEFAULT_VARS = {
   AGENT_RUNTIME_TENANT: '',
   AGENT_RUNTIME_API_TOKEN: '',
   AGENT_RUNTIME_DEFINITION: '',
-  AGENT_RUNTIME_DIRECT_THREADS: '',
   AGENT_RUNTIME_EVENTS_WEBHOOK_SECRET: '',
 };
 
@@ -825,8 +824,8 @@ async function main() {
 
   // Set up the install's tenant on the bundled agent runtime (its thread
   // definition and events webhook) and bind what the Worker needs. Without a
-  // runtime, or when it cannot be provisioned on a first start, threads run
-  // on the in-DO loop.
+  // runtime, or when it cannot be provisioned on a first start, chats cannot
+  // run until it can.
   if (process.env.SELFHOST_AGENT_RUNTIME_PROVISION !== '0') {
     try {
       const provisioned = await provisionSelfhostAgentRuntime({
@@ -842,7 +841,7 @@ async function main() {
       vars.AGENT_RUNTIME_DEFINITION = '';
       console.error(
         `[selfhost:agent-runtime] The agent runtime could not be provisioned: ${error instanceof Error ? error.message : error}. ` +
-        'New threads run on the in-app loop until it can be; run `bun run selfhost:doctor`.',
+        'Chats cannot run until it can be; run `bun run selfhost:doctor`.',
       );
     }
   }

@@ -203,7 +203,7 @@ Important DOs and runtime classes live primarily in `workers/main/src/`:
 - `email-handle-registry.ts` - `EmailHandleDO`, email handle ownership.
 - `*-mcp.ts` / `connections-runtime.ts` - Per-provider connection MCP wrappers and shared connection runtime (candidate for an `integrations/` folder).
 - `observability.ts` - Shared Cloudflare Analytics Engine event/error writer. New structured instrumentation should go through this helper instead of calling `writeDataPoint` directly.
-- `lake-streams.ts` + `chat-thread/transcript-lake.ts` - Transcript / tool-call export to Iceberg tables in R2 Data Catalog via Cloudflare Pipelines. Both bindings are optional and every helper no-ops without them, so dev/tests/self-host never export. Tool durations are measured live (Pi records no tool start timestamp) and stamped as `uiMetadata.toolDurationMs`. Design, setup commands, and the privacy posture: `config/pipelines/README.md`. Verify with `bun run test:workers -- transcript-lake`.
+- `lake-streams.ts` - Tool-call telemetry export (one row per CodeModeToolsBinding call) to an Iceberg table in R2 Data Catalog via Cloudflare Pipelines. The binding is optional and the helper no-ops without it. Setup and queries: `config/pipelines/README.md`.
 
 Durable Objects use SQLite-backed storage. Prefer:
 

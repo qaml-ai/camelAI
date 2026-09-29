@@ -4,7 +4,6 @@
 
 import type {
   LakeStream,
-  PiMessageLakeRecord,
   ToolCallLakeRecord,
 } from "./lake-streams.js";
 import type { ChatEnv } from "./chat-thread-do.js";
@@ -76,9 +75,8 @@ export interface Env
   SESSIONS: KVNamespace;
   OBSERVABILITY_EVENTS?: AnalyticsEngineDataset;
   ERROR_ANALYTICS?: AnalyticsEngineDataset;
-  // Transcript data lake streams (Cloudflare Pipelines -> R2 Data Catalog).
+  // Tool-call telemetry stream (Cloudflare Pipelines -> R2 Data Catalog).
   // Optional everywhere: absent bindings disable export, they never fail a turn.
-  TRANSCRIPT_LAKE?: LakeStream<PiMessageLakeRecord>;
   TOOL_CALLS_LAKE?: LakeStream<ToolCallLakeRecord>;
   APP_SCREENSHOT_QUEUE?: Queue<AppScreenshotJob>;
   SLACK_EVENTS_QUEUE?: Queue<SlackEventQueueMessage>;

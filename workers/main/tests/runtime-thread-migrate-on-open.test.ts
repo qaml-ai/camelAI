@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const migrate = vi.fn();
 const record = vi.fn();
-let env: Record<string, string> = {};
+let env: Record<string, unknown> = {};
+const getThreadRuntime = vi.fn(async () => null as unknown);
 vi.mock("@/lib/cloudflare.server", () => ({ getEnv: () => env }));
 vi.mock("../src/agent-runtime/thread-migration", async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -24,7 +25,8 @@ describe("openUnmovedThread", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useRealTimers();
-    env = { ...CONFIGURED };
+    env = { ...CONFIGURED, ORG: { idFromName: (id: string) => id, get: () => ({ getThreadRuntime }) } };
+    getThreadRuntime.mockResolvedValue(null);
   });
 
   it("opens a moved thread on the runtime, and records the move", async () => {
@@ -35,14 +37,46 @@ describe("openUnmovedThread", () => {
     expect(record).toHaveBeenCalledWith(env, context, expect.objectContaining({ status: "migrated" }));
   });
 
-  it("shows the thread moving while its move is under way, failed or backing off", async () => {
+  it("shows the thread moving while its move is under way", async () => {
     migrate.mockResolvedValueOnce({ status: "busy", reason: "moving" });
     expect(await openUnmovedThread({} as never, context, vi.fn())).toEqual({ state: "moving" });
-    migrate.mockResolvedValueOnce({ status: "skipped", reason: "backoff: Agent runtime POST /v1/agents: HTTP 503" });
-    expect(await openUnmovedThread({} as never, context, vi.fn())).toEqual({ state: "moving" });
+  });
+
+  it("says when a move that failed is tried again, instead of spinning", async () => {
+    migrate.mockResolvedValueOnce({ status: "failed", error: "HTTP 503", retryAt: 1_700_000_060_000 });
+    expect(await openUnmovedThread({} as never, context, vi.fn())).toEqual({ state: "retrying", retryAt: 1_700_000_060_000 });
+    migrate.mockResolvedValueOnce({ status: "skipped", reason: "backoff: Agent runtime POST /v1/agents: HTTP 503", retryAt: 1_700_000_120_000 });
+    expect(await openUnmovedThread({} as never, context, vi.fn())).toEqual({ state: "retrying", retryAt: 1_700_000_120_000 });
+    // A model that did not resolve just now is retried, not read-only.
+    migrate.mockResolvedValueOnce({ status: "skipped", reason: "its model did not resolve: timeout" });
+    expect(await openUnmovedThread({} as never, context, vi.fn())).toEqual({ state: "retrying", retryAt: null });
     migrate.mockRejectedValueOnce(new Error("boom"));
-    expect(await openUnmovedThread({} as never, context, vi.fn())).toEqual({ state: "moving" });
+    expect(await openUnmovedThread({} as never, context, vi.fn())).toEqual({ state: "retrying", retryAt: null });
     expect(record).toHaveBeenLastCalledWith(env, context, { status: "failed", error: "boom" });
+  });
+
+  it("asks the move to end a transient backoff when a person opens the thread, and not on an automatic poll", async () => {
+    migrate.mockResolvedValue({ status: "busy", reason: "moving" });
+    await openUnmovedThread({} as never, context, vi.fn());
+    expect(migrate).toHaveBeenLastCalledWith(env, context, { retryBackoff: true });
+    await openUnmovedThread({} as never, context, vi.fn(), 3_000, { retryBackoff: false });
+    expect(migrate).toHaveBeenLastCalledWith(env, context, { retryBackoff: false });
+  });
+
+  it("says what blocks a move chiridion must be set up for", async () => {
+    migrate.mockResolvedValueOnce({ status: "skipped", reason: "not_configured: Hosted models are not configured for the agent runtime." });
+    expect(await openUnmovedThread({} as never, context, vi.fn()))
+      .toEqual({ state: "blocked", message: "Hosted models are not configured for the agent runtime." });
+    migrate.mockResolvedValueOnce({ status: "skipped", reason: "the agent runtime is not configured" });
+    expect(await openUnmovedThread({} as never, context, vi.fn())).toMatchObject({ state: "blocked" });
+  });
+
+  it("re-reads the row when the move says the thread moved meanwhile, never showing it read-only", async () => {
+    migrate.mockResolvedValueOnce({ status: "skipped", reason: "moved" });
+    getThreadRuntime.mockResolvedValueOnce(ROW);
+    expect(await openUnmovedThread({} as never, context, vi.fn())).toEqual({ state: "runtime", row: ROW });
+    migrate.mockResolvedValueOnce({ status: "skipped", reason: "moved" });
+    expect(await openUnmovedThread({} as never, context, vi.fn())).toEqual({ state: "moving" });
   });
 
   it("shows a thread that cannot move read-only, with the reason", async () => {

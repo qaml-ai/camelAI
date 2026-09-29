@@ -235,10 +235,10 @@ const routes: Route[] = [
   { method: 'GET', path: /^\/api\/integrations\/remote_mcp\/callback$/, handler: handleRemoteMcpOAuthCallback },
 
   // The old in-DO chat transport (WebSocket, SSE, polling, calls): every
-  // thread runs on the agent runtime now, so a page still open from before
-  // is told the thread moved (it reloads).
-  { method: 'GET', path: /^\/agents\/chat-thread\/[^/]+$/, handler: async () => chatThreadMoved(), websocket: true },
-  { method: 'ALL', path: /^\/agents\/chat-thread\//, handler: async () => chatThreadMoved() },
+  // thread runs on the agent runtime now. A tab still open from before gets
+  // an answer its client heals from (see oldChatTransport).
+  { method: 'GET', path: /^\/agents\/chat-thread\/[^/]+$/, handler: async ({ req }) => oldChatTransport(req), websocket: true },
+  { method: 'ALL', path: /^\/agents\/chat-thread\//, handler: async ({ req }) => oldChatTransport(req) },
   { method: 'ALL', path: /^\/agents\//, handler: async () => text('Not Found', 404) },
 
   // Workspace thread-status SSE stream (replaces the status WebSocket).
@@ -259,12 +259,33 @@ const reactRouterHandler = createRequestHandler(
 // Main Router
 // =============================================================================
 
-/** The old chat transport's answer: the thread moved to the agent runtime. */
-function chatThreadMoved(): Response {
-  return Response.json(
-    { status: 'moved', error: 'This conversation moved to the new chat engine; reload the page to continue it.' },
-    { status: 410 },
-  );
+const CHAT_THREAD_MOVED = { status: 'moved', error: 'This conversation moved to the new chat engine; reload the page to continue it.' };
+
+/**
+ * The old chat transport, for a tab whose page was loaded before the in-DO
+ * loop was deleted. Its client (sse-agent-client) falls back from a failed
+ * WebSocket to HTTP polling, and a poll that answers opens the connection,
+ * which runs the page's version-skew check: the tab reloads itself (when no
+ * draft or turn would be lost) or offers "camelAI has been updated, Reload".
+ * So a poll answers an empty, well-formed batch (its cursor echoed, no
+ * frames: the client keeps polling, cheaply, until it reloads), and a call
+ * (a send) answers 503, which the client retries after reconnecting, keeping
+ * the message. The WebSocket and the legacy SSE stream answer 410 "moved";
+ * a 410 on a poll would read as "You no longer have access to this chat".
+ */
+function oldChatTransport(req: Request): Response {
+  const url = new URL(req.url);
+  if (req.method === 'GET' && url.pathname.endsWith('/sse') && url.searchParams.get('transport') === 'poll') {
+    const cursor = Number(url.searchParams.get('cursor'));
+    return Response.json(
+      { cursor: Number.isSafeInteger(cursor) ? cursor : -1, frames: [] },
+      { headers: { 'Cache-Control': 'no-store' } },
+    );
+  }
+  if (req.method === 'POST' && url.pathname.endsWith('/call')) {
+    return Response.json(CHAT_THREAD_MOVED, { status: 503, headers: { 'Retry-After': '30' } });
+  }
+  return Response.json(CHAT_THREAD_MOVED, { status: 410 });
 }
 
 export default {

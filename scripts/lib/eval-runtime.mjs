@@ -360,7 +360,6 @@ export async function evalRuntimeVitestEnv(config = evalRuntimeConfig()) {
     AGENT_RUNTIME_TENANT: state.tenant,
     AGENT_RUNTIME_API_TOKEN: values.AGENT_OPERATOR_TOKEN,
     AGENT_RUNTIME_DEFINITION: state.definitionId,
-    AGENT_RUNTIME_DIRECT_THREADS: "1",
     EVAL_RUNTIME_RELAY_URL: state.relayUrl,
   };
 }

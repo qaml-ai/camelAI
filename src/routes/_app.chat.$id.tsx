@@ -69,7 +69,7 @@ import type { UnmovedThreadOpen } from "@/lib/runtime-threads.server";
 import Chat from "@/components/Chat";
 import { ChatTabBar } from "@/components/chat-tab-bar";
 import { ChatLoadingSkeleton } from "@/components/chat/chat-loading";
-import { ChatMovingNotice, readOnlyMoveNotice } from "@/components/chat/chat-moving-notice";
+import { ChatMovingNotice, readOnlyMoveNotice, type ThreadMoveStatus } from "@/components/chat/chat-moving-notice";
 import { NoWorkspacesError } from "@/components/no-workspaces-error";
 import {
   getCloseGroupRedirect,
@@ -269,9 +269,9 @@ export async function action({ request, context, params }: Route.ActionArgs) {
   return { error: "Unknown action" };
 }
 
-/** A thread still on ChatThreadDO: moving to the runtime, or shown read-only because it cannot move. */
+/** A thread still on ChatThreadDO: moving to the runtime (or stalled: see ThreadMoveStatus), or read-only because it cannot move. */
 type ChatMoveState =
-  | { state: "moving" }
+  | ThreadMoveStatus
   | { state: "readonly"; reason: string; truncated: boolean };
 
 interface ChatData {
@@ -484,7 +484,7 @@ async function buildChatData(
       move: { state: "readonly", reason: options.move.reason, truncated: history.truncated },
     };
   }
-  return { ...EMPTY_CHAT_DATA, move: { state: "moving" } };
+  return { ...EMPTY_CHAT_DATA, move: options.move ?? { state: "moving" } };
 }
 
 async function findAccessibleGroupWorkspace(
@@ -1320,11 +1320,12 @@ export default function ChatPage() {
           />
         ) : null}
         <div className="flex min-h-0 flex-1 flex-col">
-          {isDisplayingLoaderThread && displayChatData.move?.state === "moving" ? (
+          {isDisplayingLoaderThread && displayChatData.move && displayChatData.move.state !== "readonly" ? (
             <ChatMovingNotice
               key={displayThreadId}
               threadId={displayThreadId}
               workspaceId={workspaceId}
+              initial={displayChatData.move}
               onSettled={() => revalidator.revalidate()}
             />
           ) : (

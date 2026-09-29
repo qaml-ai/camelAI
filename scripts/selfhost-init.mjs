@@ -136,9 +136,6 @@ const values = {
   ...Object.fromEntries(AGENT_RUNTIME_ENV_DEFAULTS.map(([key, generate]) => [key, generate()])),
   SELFHOST_AGENT_RUNTIME_PORT: DEFAULT_AGENT_RUNTIME_PORT,
   SELFHOST_AGENT_RUNTIME_POSTGRES_PORT: DEFAULT_AGENT_RUNTIME_POSTGRES_PORT,
-  // 1: new threads run on the runtime. 0 creates them on the in-app loop
-  // again (existing runtime threads keep working).
-  SELFHOST_AGENT_RUNTIME_DIRECT_THREADS: "1",
   // Private model endpoints the runtime may call, as exact origins
   // (scheme://host:port, comma-separated), e.g. http://10.1.2.3:8000.
   SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS: "",

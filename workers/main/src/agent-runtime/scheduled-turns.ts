@@ -8,7 +8,7 @@
 import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import { RUNTIME_TOOL_PREFIX } from "../../../../src/lib/agent-runtime-shared.js";
 import { runtimeApi } from "./runtime-api.js";
-import { directRuntimeRow, migrateThreadOnSend } from "./thread-migration.js";
+import { directRuntimeRow, moveThreadForSend, type UnmovableReason } from "./thread-migration.js";
 import { runtimeDirectThreadsEnabled, startRuntimeTurn } from "./thread-runtime.js";
 
 /** What a scheduled run must do before it ends, naming the outcome tool as the run's agent has it. */
@@ -39,7 +39,10 @@ export interface ScheduledTurnRequest {
   message: string;
 }
 
-export type ScheduledTurnResult = { status: "accepted" | "busy" | "error"; error?: string };
+/** "unmovable": the prompt's thread can never move to the runtime (`reason`); the scheduler gives it a new one. */
+export type ScheduledTurnResult =
+  | { status: "accepted" | "busy" | "error"; error?: string }
+  | { status: "unmovable"; reason: UnmovableReason };
 
 /** Whether the agent is in a turn, which a scheduled run must not steer into. */
 async function agentRunning(env: ChatEnv, agentId: string): Promise<boolean> {
@@ -66,8 +69,12 @@ export async function startScheduledRuntimeTurn(env: ChatEnv, request: Scheduled
     userName: "Scheduler",
     userEmail: null,
   };
-  const row = await directRuntimeRow(env, request.orgId, request.threadId, { adopt: true })
-    ?? await migrateThreadOnSend(env, context);
+  let row = await directRuntimeRow(env, request.orgId, request.threadId, { adopt: true });
+  if (!row) {
+    const moved = await moveThreadForSend(env, context);
+    if (!moved.row && moved.outcome.state === "readonly") return { status: "unmovable", reason: moved.outcome.reason };
+    row = moved.row;
+  }
   if (!row) return null;
   if (row.agentId && await agentRunning(env, row.agentId)) {
     return { status: "busy", error: "Thread is busy with another run" };

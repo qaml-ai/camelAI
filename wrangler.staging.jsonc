@@ -33,20 +33,11 @@
     // the admin MCP's own OAuth, which Access keeps unreachable.
     "ADMIN_MCP_ACCESS_TEAM_DOMAIN": "https://qaml.cloudflareaccess.com",
     "ADMIN_MCP_ACCESS_AUD": "724083f7ecdae7fd3b3be02c757980bd0de635c785f9398e4a3faf8a9205d3ad",
-    // Hosted agent runtime (plans/agent-runtime-migration.md): with these plus the
-    // AGENT_RUNTIME_API_TOKEN secret, new threads with a runtime route run on it.
-    // Remove AGENT_RUNTIME_DEFINITION to send new threads back to the in-DO loop.
+    // Hosted agent runtime: with these plus the AGENT_RUNTIME_API_TOKEN secret,
+    // every thread runs on it (threads still on ChatThreadDO move there when
+    // next opened or sent to: agent-runtime/thread-migration.ts).
     "AGENT_RUNTIME_TENANT": "chiridion-staging",
     "AGENT_RUNTIME_DEFINITION": "def_afd1ef916ceb70b5f97e",
-    // New web threads run directly on the runtime: the browser watches the
-    // agent itself and there is no ChatThreadDO (plans/runtime-threads-direct.md).
-    // Remove to create new threads on ChatThreadDO again; threads already
-    // created stay put.
-    "AGENT_RUNTIME_DIRECT_THREADS": "1",
-    // Threads still on ChatThreadDO move to the runtime when next opened (or,
-    // for a channel thread, when a message arrives): agent-runtime/thread-migration.ts.
-    // Remove to stop moving threads; threads already moved stay on the runtime.
-    "AGENT_RUNTIME_MIGRATE_DO_THREADS": "1",
     // Static-IP database egress relay (docs/db-egress-relay.md). SOCKS + Access
     // service-token credentials are secrets (DB_EGRESS_RELAY_SOCKS_* /
     // DB_EGRESS_RELAY_ACCESS_*); this hostname is the tunnel public host gost
@@ -131,10 +122,9 @@
     { "binding": "ERROR_ANALYTICS", "dataset": "chiridion_errors_staging" },
     { "binding": "OBSERVABILITY_EVENTS", "dataset": "chiridion_observability_staging" },
   ],
-  // Transcript data lake (config/pipelines/README.md). Streams land in the
+  // Tool-call telemetry (config/pipelines/README.md). The stream lands in the
   // chiridion-transcript-lake-staging R2 Data Catalog as Iceberg tables.
   "pipelines": [
-    { "binding": "TRANSCRIPT_LAKE", "stream": "02a2d092797b4903bd1f259752d563d2" },
     { "binding": "TOOL_CALLS_LAKE", "stream": "51df244b1d8f4098adf032cd1c35256f" },
   ],
   "kv_namespaces": [

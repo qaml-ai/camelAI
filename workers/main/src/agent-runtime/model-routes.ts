@@ -10,7 +10,7 @@
  *   forwarder (agent-runtime/codex-forwarder.ts);
  * - null: no runtime route (the gateway's other dynamic routes, a custom
  *   endpoint the runtime cannot call: not `https` outside self-host). Such a
- *   thread stays on the in-DO loop. A self-host install's operator provider (SELFHOST_AI_*)
+ *   thread cannot run (a new one is refused; an old one opens read-only). A self-host install's operator provider (SELFHOST_AI_*)
  *   routes as the BYOK provider it is, with the org's scope holding its key
  *   (key-scopes.ts, selfhostScopeProviders).
  *

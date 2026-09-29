@@ -8,10 +8,10 @@ const POLL_WAIT_MS = 3_000;
 /**
  * GET /api/threads/:id/move: where a thread still on ChatThreadDO stands in
  * its move to the agent runtime, for its page's "Moving this conversation"
- * state: `runtime` (moved: reload), `moving` (poll again), or `readonly`
- * (it cannot move; the page shows its history read-only). Each poll drives
- * the move on (a move backing off after a failure is tried again once its
- * backoff ends).
+ * state (see UnmovedThreadOpen): `runtime` (reload), `moving` (poll again),
+ * `retrying` (with `retryAt`), `blocked` (with `message`) or `readonly`
+ * (with `reason`). Each poll drives the move on; `?retry=1` (the page's retry
+ * button) also ends a backoff after a transient failure.
  */
 export async function loader({ request, context, params }: LoaderFunctionArgs) {
   const { context: threadContext, row } = await requireRuntimeThreadAccess(
@@ -22,9 +22,10 @@ export async function loader({ request, context, params }: LoaderFunctionArgs) {
   );
   const headers = { "Cache-Control": "private, no-store" };
   if (row) return Response.json({ state: "runtime" }, { headers });
-  const open = await openUnmovedThread(context, threadContext, waitUntil, POLL_WAIT_MS);
-  return Response.json(
-    open.state === "readonly" ? { state: "readonly", reason: open.reason } : { state: open.state },
-    { headers },
-  );
+  const retryBackoff = new URL(request.url).searchParams.get("retry") === "1";
+  const open = await openUnmovedThread(context, threadContext, waitUntil, POLL_WAIT_MS, { retryBackoff });
+  const { row: _row, ...answer } = open as UnmovedThreadOpen & { row?: unknown };
+  return Response.json(answer, { headers });
 }
+
+type UnmovedThreadOpen = Awaited<ReturnType<typeof openUnmovedThread>>;

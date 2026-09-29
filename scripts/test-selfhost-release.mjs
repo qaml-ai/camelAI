@@ -140,7 +140,6 @@ includesAll(
   compose,
   [
     "AGENT_RUNTIME_URL: http://127.0.0.1:${SELFHOST_AGENT_RUNTIME_PORT:-8790}",
-    "AGENT_RUNTIME_DIRECT_THREADS: ${SELFHOST_AGENT_RUNTIME_DIRECT_THREADS:-1}",
     "agent-runtime:\n        condition: service_healthy",
   ],
   "self-host app on the agent runtime",
@@ -162,7 +161,7 @@ includesAll(
 );
 includesAll(
   initScript,
-  ["AGENT_RUNTIME_ENV_DEFAULTS", "SELFHOST_AGENT_RUNTIME_DIRECT_THREADS"],
+  ["AGENT_RUNTIME_ENV_DEFAULTS"],
   "self-host init (agent runtime)",
 );
 assert(

@@ -19,6 +19,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { AgentMessage } from "../../../src/lib/agent-messages";
 import type { PreviewTarget } from "../../../src/types";
 import { PiCoreMessageStore } from "./chat-thread/pi-core-store";
+import { getPreviewTabId } from "./chat-thread/preview-state";
 import { ChatThreadRuntimeMigration, type RuntimeMigrationStatus } from "./chat-thread/runtime-migration";
 import {
   isRenderMessage,
@@ -42,6 +43,8 @@ export type * from "./chat-thread/types";
 const CHAT_CONTEXT_KEY = "chatContext";
 const PREVIEW_TABS_KEY = "previewTabs";
 const PREVIEW_ACTIVE_TAB_KEY = "previewActiveTabId";
+/** A thread from before preview tabs: its one preview target. */
+const PREVIEW_TARGET_KEY = "previewTarget";
 /** A thread the old loop relayed to a runtime agent: adopted, not imported. */
 const RUNTIME_AGENT_KEY = "runtimeAgent";
 
@@ -126,10 +129,15 @@ export class ChatThreadDO extends DurableObject<ChatEnv> {
   }
 
   private previewTabs(): { tabs: PreviewTarget[]; activeTabId: string | null } {
+    const isTarget = (tab: unknown): tab is PreviewTarget =>
+      Boolean(tab) && typeof tab === "object" && typeof (tab as { kind?: unknown }).kind === "string";
     const stored = this.ctx.storage.kv.get<unknown>(PREVIEW_TABS_KEY);
-    const tabs = Array.isArray(stored)
-      ? stored.filter((tab): tab is PreviewTarget => Boolean(tab) && typeof tab === "object" && typeof (tab as { kind?: unknown }).kind === "string")
-      : [];
+    if (!Array.isArray(stored)) {
+      // Before tabs, a thread kept one preview target: it becomes its one tab.
+      const target = this.ctx.storage.kv.get<unknown>(PREVIEW_TARGET_KEY);
+      return isTarget(target) ? { tabs: [target], activeTabId: getPreviewTabId(target) } : { tabs: [], activeTabId: null };
+    }
+    const tabs = stored.filter(isTarget);
     const active = this.ctx.storage.kv.get<unknown>(PREVIEW_ACTIVE_TAB_KEY);
     return { tabs, activeTabId: typeof active === "string" ? active : null };
   }
@@ -246,14 +254,16 @@ export class ChatThreadDO extends DurableObject<ChatEnv> {
   /**
    * The render rows older than `beforeMs`, a bounded page at a time, newest
    * page first. The old table's rows are ordered by their chronology key
-   * (created_at, then insertion); a table from before that column existed
-   * orders by created_at and rowid the same way.
+   * (created_at, then insertion), which ai-chat backfilled on every row and
+   * indexed (cf_ai_chat_agent_messages_chronology): each page is an index
+   * range. A table from before that column existed orders by created_at and
+   * rowid the same way (a scan; such tables are small).
    */
   private *renderArchivePages(beforeMs: number): Generator<RenderMessage[]> {
     const columns = this.renderTableColumns();
     if (!columns.has("message")) return;
     const key = columns.has("chronology_key")
-      ? "coalesce(chronology_key, created_at || ':' || printf('%020d', rowid) || ':' || id)"
+      ? "chronology_key"
       : "created_at || ':' || printf('%020d', rowid) || ':' || id";
     const bytes = columns.has("serialized_bytes")
       ? "coalesce(serialized_bytes, length(cast(message as blob)))"

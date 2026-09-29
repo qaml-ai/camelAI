@@ -15,7 +15,7 @@ import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import { formatAttributedUserMessage } from "../chat-author-attribution.js";
 import { RUNTIME_REQUEST_ID } from "../../../../src/lib/agent-runtime-shared.js";
 import { runtimeDirectThreadsEnabled, startRuntimeTurn } from "./thread-runtime.js";
-import { directRuntimeRow, migrateThreadOnSend } from "./thread-migration.js";
+import { directRuntimeRow, moveThreadForSend, type UnmovableReason } from "./thread-migration.js";
 
 export interface ChannelTurnRequest {
   threadId: string;
@@ -32,7 +32,10 @@ export interface ChannelTurnRequest {
   clientMessageId?: string | null;
 }
 
-export type ChannelTurnResult = { status: "accepted" | "busy" | "error"; error?: string };
+/** "unmovable": the thread can never move to the runtime (`reason`); the caller re-homes the conversation. */
+export type ChannelTurnResult =
+  | { status: "accepted" | "busy" | "error"; error?: string }
+  | { status: "unmovable"; reason: UnmovableReason };
 
 /** A relay thread's runtime agent, as ChatThreadDO hands it over. */
 export interface RelayRuntimeAgent {
@@ -128,8 +131,12 @@ export async function startChannelRuntimeTurn(env: ChatEnv, request: ChannelTurn
     }
     : null;
   // A thread still on ChatThreadDO moves to the runtime first.
-  const row = await directRuntimeRow(env, request.orgId, request.threadId, { adopt: Boolean(context) })
-    ?? (context ? await migrateThreadOnSend(env, context) : null);
+  let row = await directRuntimeRow(env, request.orgId, request.threadId, { adopt: Boolean(context) });
+  if (!row && context) {
+    const moved = await moveThreadForSend(env, context);
+    if (!moved.row && moved.outcome.state === "readonly") return { status: "unmovable", reason: moved.outcome.reason };
+    row = moved.row;
+  }
   if (!row) return null;
   if (!context || !request.userId) return { status: "error", error: "No workspace member to act for this channel message" };
   const notes = await takeChannelHistoryNotes(env, request.threadId);

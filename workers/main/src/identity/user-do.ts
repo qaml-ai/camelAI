@@ -28,7 +28,9 @@ import type {
   ThreadCompletionSummaryStatus,
   Avatar,
 } from "../../../../src/types";
-import { dispatchAdminEvent } from "./admin-events";
+import type { AdminEventType } from "../admin-index-types";
+import { getAppIndexDatabase } from "../app-index-db";
+import { D1MirrorOutbox, scheduleEarliestAlarm } from "./d1-mirror-outbox";
 import { getDefaultOnboardingPreferences, sanitizeOnboardingPreferences, toOnboardingPreferences } from "./onboarding";
 import { isSuperuserEmail, parseSuperuserEmails } from "./superuser";
 import { recordObservabilityEvent } from "../observability";
@@ -310,13 +312,82 @@ export interface ApplyManualCreditGrantResult {
 // User Durable Object - one per user
 export class UserDO extends DurableObject<DOEnv> {
   private sql: SqlStorage;
+  private readonly mirror: D1MirrorOutbox;
 
   constructor(ctx: DurableObjectState, env: DOEnv) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    this.mirror = new D1MirrorOutbox(ctx.storage);
 
     ctx.blockConcurrencyWhile(async () => {
       this.migrate();
+      this.mirror.ensureSchema();
+    });
+  }
+
+  /**
+   * The D1 `users` row this DO owns, from current state. The only mirrored
+   * entity is the user itself, so the outbox key id is ignored.
+   */
+  private readonly mirrorSnapshot = (): AdminEventType[] => {
+    const rows = this.sql
+      .exec<{ value: string }>("SELECT value FROM profile WHERE key = ?", "data")
+      .toArray();
+    if (rows.length === 0) return [];
+    const profile = JSON.parse(rows[0].value) as User;
+    const orgCount = Number(
+      this.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM orgs").toArray()[0]?.count ?? 0,
+    );
+    return [
+      {
+        type: "user_upsert",
+        payload: { ...profile, org_count: orgCount, signup_ip: this.getSignupIp() },
+      },
+    ];
+  };
+
+  /** Mirror this user's row to D1 once the current write commits. */
+  private markMirrorDirty(): void {
+    this.mirror.markDirty("user", "self");
+  }
+
+  async alarm(): Promise<void> {
+    this.mirror.noteAlarmFired();
+    try {
+      await this.mirror.drain(getAppIndexDatabase(this.env), this.mirrorSnapshot, {
+        observability: this.env,
+        component: "UserDO",
+      });
+    } catch (error) {
+      console.error("[UserDO] D1 mirror drain failed", error);
+    }
+    await scheduleEarliestAlarm(this.ctx.storage, [this.mirror.nextDueAt()]);
+  }
+
+  /** Test/ops helper: queue a full re-mirror of this user's D1 row. */
+  async requestMirrorResync(): Promise<void> {
+    this.markMirrorDirty();
+  }
+
+  /** Reconciler: this user's current mirrored state, plus what is still in flight. */
+  async getMirrorReconcileSnapshot(): Promise<{ events: AdminEventType[]; pending: string[] }> {
+    return { events: this.mirrorSnapshot(), pending: this.mirror.pendingKeys() };
+  }
+
+  /** Orphan cleanup: whether this UserDO still holds a profile (read-only). */
+  mirrorUserExists(): boolean {
+    return this.sql.exec("SELECT 1 FROM profile WHERE key = ?", "data").toArray().length > 0;
+  }
+
+  async getMirrorOutboxStats() {
+    return this.mirror.stats();
+  }
+
+  /** Apply everything queued for D1 now (bootstrap/backfill). */
+  async drainMirrorNow() {
+    return this.mirror.drainAll(getAppIndexDatabase(this.env), this.mirrorSnapshot, {
+      observability: this.env,
+      component: "UserDO",
     });
   }
 
@@ -776,10 +847,7 @@ export class UserDO extends DurableObject<DOEnv> {
       "data",
       JSON.stringify(profile),
     );
-    dispatchAdminEvent(this.ctx, this.env, {
-      type: "user_upsert",
-      payload: profile,
-    });
+    this.markMirrorDirty();
   }
 
   async getPasswordHash(): Promise<string | null> {
@@ -856,6 +924,7 @@ export class UserDO extends DurableObject<DOEnv> {
       USER_SIGNUP_IP_KEY,
       normalizedIp,
     );
+    this.markMirrorDirty();
   }
 
   async createUser(
@@ -882,10 +951,6 @@ export class UserDO extends DurableObject<DOEnv> {
 
       if (signupIp && !this.getSignupIp()) {
         this.setSignupIp(signupIp);
-        dispatchAdminEvent(this.ctx, this.env, {
-          type: "user_upsert",
-          payload: { ...existing, signup_ip: signupIp },
-        });
       }
       return existing;
     }
@@ -910,11 +975,6 @@ export class UserDO extends DurableObject<DOEnv> {
     await this.setPasswordHash(passwordHash);
     if (signupIp) {
       this.setSignupIp(signupIp);
-      // Re-dispatch with signup_ip so the D1 admin index can index it.
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "user_upsert",
-        payload: { ...profile, signup_ip: signupIp },
-      });
     }
 
     return profile;
@@ -1086,12 +1146,7 @@ export class UserDO extends DurableObject<DOEnv> {
       now,
       lastWorkspaceId,
     );
-    const profile = await this.getProfile();
-    if (profile)
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "user_org_delta",
-        payload: { user_id: profile.id, delta: 1 },
-      });
+    this.markMirrorDirty();
   }
 
   async ensureOrg(
@@ -1111,24 +1166,13 @@ export class UserDO extends DurableObject<DOEnv> {
       Date.now(),
       lastWorkspaceId,
     );
-    const profile = await this.getProfile();
-    if (profile) {
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "user_org_delta",
-        payload: { user_id: profile.id, delta: 1 },
-      });
-    }
+    this.markMirrorDirty();
     return true;
   }
 
   async removeOrg(orgId: string): Promise<void> {
     this.sql.exec("DELETE FROM orgs WHERE org_id = ?", orgId);
-    const profile = await this.getProfile();
-    if (profile)
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "user_org_delta",
-        payload: { user_id: profile.id, delta: -1 },
-      });
+    this.markMirrorDirty();
   }
 
   async updateOrgRole(orgId: string, role: OrgRole): Promise<void> {
@@ -2135,11 +2179,6 @@ export class UserDO extends DurableObject<DOEnv> {
     await this.linkOAuthProvider(provider, providerId);
     if (signupIp) {
       this.setSignupIp(signupIp);
-      // Re-dispatch with signup_ip so the D1 admin index can index it.
-      dispatchAdminEvent(this.ctx, this.env, {
-        type: "user_upsert",
-        payload: { ...profile, signup_ip: signupIp },
-      });
     }
 
     return profile;
@@ -2161,6 +2200,8 @@ export class UserDO extends DurableObject<DOEnv> {
     this.sql.exec("DELETE FROM profile");
     this.sql.exec("DELETE FROM orgs");
     this.sql.exec("DELETE FROM oauth_providers");
+    // The caller removes the D1 row (user_delete, tombstoned by deleted_users).
+    this.mirror.clear();
   }
 
   // Test helper RPC: simulate constructor migration path on an existing DO.

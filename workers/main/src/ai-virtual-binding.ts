@@ -524,8 +524,9 @@ async function checkHostedModelAccess(
     );
   }
   if (creditFree) return { creditChargeable: false, vllmPriority };
-  const usage = await orgStub.getUsageLogSum(0, Date.now(), true);
-  const spentCents = Math.round(Number(usage.total_cost_usd ?? 0) * 100);
+  const spentCents = Math.round(
+    Number(await orgStub.getCreditChargeableSpendUsd()) * 100,
+  );
   const totalCreditsCents =
     (org.billing_credit_purchase_total_cents ?? 0) +
     (org.billing_credit_grant_total_cents ?? 0);

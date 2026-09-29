@@ -177,6 +177,35 @@ describe("POST /agent-runtime/events", () => {
     expect(thread?.last_assistant_completed_at).toBeGreaterThanOrEqual(created * 1000);
   });
 
+  it("finishes a scheduled prompt's run when its turn ends, and only that run", async () => {
+    const { runEnv, agentId, metadata } = await setup({ source: "scheduled" });
+    const finishScheduledRun = vi.fn(async () => true);
+    const cronEnv = {
+      ...runEnv,
+      WORKSPACE_CRON: { idFromName: (name: string) => name, get: () => ({ finishScheduledRun }) },
+    } as unknown as Env;
+    const original = globalThis.fetch;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.origin !== RUNTIME) return original(input, init);
+      return Response.json({ entries: [], next: null });
+    });
+    await deliver(cronEnv, {
+      id: eventId(), type: "run.failed", created: 1_790_000_000,
+      data: { agentId, requestId: "run-7", method: "prompt", metadata: { ...metadata, source: "scheduled prompt" }, error: "Out of credit", usage: null },
+    });
+    expect(finishScheduledRun).toHaveBeenCalledWith({
+      workspaceId: metadata.workspace, runId: "run-7", error: "Out of credit", completedAt: 1_790_000_000_000,
+    });
+    // A message someone sent in the thread is no scheduled run.
+    finishScheduledRun.mockClear();
+    await deliver(cronEnv, {
+      id: eventId(), type: "run.completed", created: 1_790_000_001,
+      data: { agentId, requestId: "cm_1", method: "prompt", metadata, usage: null },
+    });
+    expect(finishScheduledRun).not.toHaveBeenCalled();
+  });
+
   it("records a failed run's error on the thread", async () => {
     const { runEnv, agentId, metadata, threadId, orgStub } = await setup();
     await deliver(runEnv, {

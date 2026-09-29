@@ -81,7 +81,7 @@ export async function loader({ request, context }: Route.LoaderArgs) {
     }),
   );
 
-  // The qaml-backdoor archive path calls OrgDO.archiveOrg without pruning
+  // The admin archive path (POST /api/admin/orgs/:id/archive) calls OrgDO.archiveOrg without pruning
   // UserDO memberships, so authContext.orgs can still include archived orgs.
   // Hide them here (mirroring getUserOrgs' archived filter) so the page never
   // renders an archived org or its "Switch to this org" action. Keep the

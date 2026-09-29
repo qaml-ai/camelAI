@@ -22,6 +22,7 @@ const listGroupsForMoveMock = vi.fn();
 const loadWorkspaceMentionSourcesMock = vi.fn();
 const getThreadRuntimeMock = vi.fn(async () => null as unknown);
 const loadRuntimeThreadSeedMock = vi.fn();
+const migrateThreadOnOpenMock = vi.fn(async () => null as unknown);
 
 vi.mock('@/lib/auth.server', () => ({
   requireSuperuser: requireSuperuserMock,
@@ -54,7 +55,7 @@ vi.mock('@/lib/chat-do.server', () => ({
 
 vi.mock('@/lib/runtime-threads.server', () => ({
   loadRuntimeThreadSeed: loadRuntimeThreadSeedMock,
-  migrateThreadOnOpen: vi.fn(async () => null),
+  migrateThreadOnOpen: migrateThreadOnOpenMock,
 }));
 vi.mock('@/lib/wait-until', () => ({ waitUntil: vi.fn() }));
 
@@ -272,6 +273,32 @@ describe('chat loader workspace mismatch handling', () => {
     expect(getThreadMock).toHaveBeenCalledWith({}, 'thread_123', 'ws_active', {
       orgId: 'org_active',
     });
+    // A thread id from another workspace is never moved to the runtime.
+    expect(migrateThreadOnOpenMock).not.toHaveBeenCalled();
+  });
+
+  it('moves a thread to the runtime only once it resolves for the active workspace', async () => {
+    requireAuthContextMock.mockResolvedValue({
+      currentWorkspace: { id: 'ws_active' },
+      currentOrg: { id: 'org_active', slug: 'acme' },
+      orgs: [{ org_id: 'org_active', role: 'admin' }],
+      user: { id: 'u1', name: 'Ada', email: null },
+    });
+    let resolveThread!: (thread: unknown) => void;
+    getThreadMock.mockReturnValue(new Promise((resolve) => { resolveThread = resolve; }));
+
+    const loading = loader({
+      request: new Request('https://camelai.com/chat/thread_123'),
+      context: {},
+      params: { id: 'thread_123' },
+    } as never);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(migrateThreadOnOpenMock).not.toHaveBeenCalled();
+    resolveThread({ id: 'thread_123', workspace_id: 'ws_active', title: 'Workspace Thread' });
+    await loading;
+    expect(migrateThreadOnOpenMock).toHaveBeenCalledWith({}, expect.objectContaining({
+      orgId: 'org_active', workspaceId: 'ws_active', threadId: 'thread_123',
+    }), expect.any(Function));
   });
 
   it('returns chat payload when the thread belongs to the active workspace', async () => {

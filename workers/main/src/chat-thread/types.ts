@@ -245,7 +245,7 @@ export interface ChatThreadPiCoreForkResult {
   messages?: AgentMessage[];
   messageCount?: number;
   error?: string;
-  code?: "NO_PI_CORE_MESSAGES" | "TARGET_NOT_FOUND";
+  code?: "NO_PI_CORE_MESSAGES" | "TARGET_NOT_FOUND" | "THREAD_MOVED";
 }
 
 export interface PiCoreMessageRow {

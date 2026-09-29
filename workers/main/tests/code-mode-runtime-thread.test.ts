@@ -41,9 +41,16 @@ describe("tools on a runtime thread", () => {
     expect(chatThread).not.toHaveBeenCalled();
   });
 
-  it("refuses the automation outcome, which only scheduled runs report", async () => {
-    const { instance } = binding({});
-    await expect(methods.reportAutomationOutcome.call(instance, { status: "success", summary: "x" }))
-      .rejects.toThrow(/scheduled automation runs/);
+  it("keeps a scheduled run's outcome on its WorkspaceCronDO run", async () => {
+    const { instance, chatThread } = binding({});
+    const reportScheduledRunOutcome = vi.fn(async () => ({ status: "partial", text: "Automation outcome recorded: partial" }));
+    (instance.env as Record<string, unknown>).WORKSPACE_CRON = {
+      idFromName: (name: string) => name,
+      get: () => ({ reportScheduledRunOutcome }),
+    };
+    const result = await methods.reportAutomationOutcome.call(instance, { status: "partial", summary: "2 of 3 sent" });
+    expect(result).toEqual({ status: "partial", text: "Automation outcome recorded: partial" });
+    expect(reportScheduledRunOutcome).toHaveBeenCalledWith({ workspaceId: "ws1", threadId: "thread1", status: "partial", summary: "2 of 3 sent" });
+    expect(chatThread).not.toHaveBeenCalled();
   });
 });

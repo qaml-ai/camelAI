@@ -43,6 +43,10 @@
     // Remove to create new threads on ChatThreadDO again; threads already
     // created stay put.
     "AGENT_RUNTIME_DIRECT_THREADS": "1",
+    // Threads still on ChatThreadDO move to the runtime when next opened (or,
+    // for a channel thread, when a message arrives): agent-runtime/thread-migration.ts.
+    // Remove to stop moving threads; threads already moved stay on the runtime.
+    "AGENT_RUNTIME_MIGRATE_DO_THREADS": "1",
     // Static-IP database egress relay (docs/db-egress-relay.md). SOCKS + Access
     // service-token credentials are secrets (DB_EGRESS_RELAY_SOCKS_* /
     // DB_EGRESS_RELAY_ACCESS_*); this hostname is the tunnel public host gost

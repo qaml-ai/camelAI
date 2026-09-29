@@ -645,16 +645,33 @@ export async function action({ request, context }: Route.ActionArgs) {
   const traceIds: ChatCreateThreadTraceIds = {};
   let selectedTraceModel: string | null = null;
 
+  // The body is read alongside the access checks (it decides nothing until
+  // they pass).
+  const formStartedAt = Date.now();
+  const formDataPromise = request.formData();
+  formDataPromise.catch(() => {});
+
   // Security-critical write path: validate current workspace membership/access
   // without loading full auth context.
   const accessStartedAt = Date.now();
+  const accessTimings: { session?: number; access?: number } = {};
   const { orgId, workspaceId, userId, session } =
     await requireSessionWorkspaceAccess(request, context, undefined, {
       requireWrite: true,
+      timings: accessTimings,
     });
   traceIds.orgId = orgId;
   traceIds.workspaceId = workspaceId;
   traceIds.userId = userId;
+  if (accessTimings.session !== undefined) {
+    recordChatCreateThreadStage(
+      env,
+      traceContext,
+      traceIds,
+      "session_validated",
+      Date.now() - accessTimings.session,
+    );
+  }
   recordChatCreateThreadStage(
     env,
     traceContext,
@@ -665,8 +682,7 @@ export async function action({ request, context }: Route.ActionArgs) {
 
   const authEnv = getAuthEnv(env);
 
-  const formStartedAt = Date.now();
-  const formData = await request.formData();
+  const formData = await formDataPromise;
   const intent = formData.get("intent");
   recordChatCreateThreadStage(
     env,

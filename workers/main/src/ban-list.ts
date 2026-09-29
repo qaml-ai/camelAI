@@ -119,14 +119,12 @@ export async function isUserBanned(
     email?: string | null;
   },
 ): Promise<BanRecord | null> {
-  if (identifiers.userId) {
-    const byId = await getUserBanById(kv, identifiers.userId);
-    if (byId) return byId;
-  }
-  if (identifiers.email) {
-    return getUserBanByEmail(kv, identifiers.email);
-  }
-  return null;
+  // Both keys are read together; a ban by id wins over one by email.
+  const [byId, byEmail] = await Promise.all([
+    identifiers.userId ? getUserBanById(kv, identifiers.userId) : null,
+    identifiers.email ? getUserBanByEmail(kv, identifiers.email) : null,
+  ]);
+  return byId ?? byEmail ?? null;
 }
 
 export async function isOrgBanned(

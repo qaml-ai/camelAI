@@ -170,4 +170,33 @@ describe("requireSessionWorkspaceAccess", () => {
     expect(workspaceStub.getMemberAccess).not.toHaveBeenCalled();
     warnSpy.mockRestore();
   });
+
+  it("starts the workspace reads alongside the session checks, and decides nothing until the session is valid", async () => {
+    let releaseInvalidation: (value: number | null) => void = () => {};
+    userStub.getSessionInvalidatedAt.mockReturnValueOnce(
+      new Promise((resolve) => { releaseInvalidation = resolve; }),
+    );
+    const request = await makeRequest();
+    const pending = requireSessionWorkspaceAccess(request, {});
+    await vi.waitFor(() => expect(orgStub.getWorkspaceAccessContext).toHaveBeenCalledWith("ws_123", "user_123"));
+    expect(orgStub.isMember).toHaveBeenCalledWith("user_123");
+    // A logout since the cookie was issued still refuses it.
+    releaseInvalidation(Date.now() + 60_000);
+    await expect(pending).rejects.toMatchObject({ status: 302 });
+  });
+
+  it("still redirects a banned session whose workspace reads started early", async () => {
+    const banned = new Response(null, { status: 302, headers: { Location: "/banned" } });
+    redirectIfBannedSessionMock.mockRejectedValueOnce(banned);
+    const request = await makeRequest();
+    await expect(requireSessionWorkspaceAccess(request, {})).rejects.toBe(banned);
+  });
+
+  it("reports where its time went", async () => {
+    const timings: { session?: number; access?: number } = {};
+    const request = await makeRequest();
+    await requireSessionWorkspaceAccess(request, {}, undefined, { timings });
+    expect(timings.session).toBeGreaterThanOrEqual(0);
+    expect(timings.access).toBeGreaterThanOrEqual(timings.session!);
+  });
 });

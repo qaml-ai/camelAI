@@ -26,18 +26,17 @@ export async function getBanForSessionIdentifiers(
   },
 ): Promise<BanRecord | null> {
   const env = getEnv(context);
-  const userBan = await isUserBanned(env.APP_KV, {
-    userId: identifiers.userId,
-    email: identifiers.userEmail,
-  });
-  if (userBan) return userBan;
-
-  if (identifiers.orgId) {
-    const orgBan = await isOrgBanned(env.APP_KV, { orgId: identifiers.orgId });
-    if (orgBan) return orgBan;
-  }
-
-  return null;
+  // Independent KV reads, together; a user ban still wins over an org ban.
+  const [userBan, orgBan] = await Promise.all([
+    isUserBanned(env.APP_KV, {
+      userId: identifiers.userId,
+      email: identifiers.userEmail,
+    }),
+    identifiers.orgId
+      ? isOrgBanned(env.APP_KV, { orgId: identifiers.orgId })
+      : Promise.resolve(null),
+  ]);
+  return userBan ?? orgBan ?? null;
 }
 
 export async function redirectIfBannedSession(

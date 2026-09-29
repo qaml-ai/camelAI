@@ -213,25 +213,34 @@ async function getSessionUncached(
     }
   }
 
-  await redirectIfBannedSession(request, context, {
-    userId: signedSession.user_id,
-    userEmail: signedSession.user_email,
-    orgId: signedSession.org_id,
-  });
-
-  if (options.checkInvalidation) {
-    // Check if this session was created before a logout invalidation.
-    const authEnv = getAuthEnv(env);
-    const userStub = authEnv.USER.get(
-      authEnv.USER.idFromName(signedSession.user_id),
-    );
-    const invalidatedAt = await retryTransientDurableObjectRead(
-      "UserDO.getSessionInvalidatedAt",
-      () => userStub.getSessionInvalidatedAt(),
-    );
-    if (invalidatedAt && signedSession.created_at < invalidatedAt) {
-      return null;
-    }
+  // The ban check (KV) and the logout-invalidation check (UserDO) are
+  // independent reads: run them together, then apply them in the same order
+  // (a ban redirects even when the session was also invalidated).
+  const [banCheck, invalidationCheck] = await Promise.allSettled([
+    redirectIfBannedSession(request, context, {
+      userId: signedSession.user_id,
+      userEmail: signedSession.user_email,
+      orgId: signedSession.org_id,
+    }),
+    options.checkInvalidation
+      ? (() => {
+          // Check if this session was created before a logout invalidation.
+          const authEnv = getAuthEnv(env);
+          const userStub = authEnv.USER.get(
+            authEnv.USER.idFromName(signedSession.user_id),
+          );
+          return retryTransientDurableObjectRead(
+            "UserDO.getSessionInvalidatedAt",
+            () => userStub.getSessionInvalidatedAt(),
+          );
+        })()
+      : Promise.resolve(null),
+  ]);
+  if (banCheck.status === "rejected") throw banCheck.reason;
+  if (invalidationCheck.status === "rejected") throw invalidationCheck.reason;
+  const invalidatedAt = invalidationCheck.value;
+  if (invalidatedAt && signedSession.created_at < invalidatedAt) {
+    return null;
   }
 
   // Map signed session data to SessionData format (compatible with existing code)
@@ -494,9 +503,39 @@ export async function requireSessionWorkspaceAccess(
   request: Request,
   context: AppLoadContext,
   workspaceIdOverride?: string,
-  options: { requireWrite?: boolean } = {},
+  options: {
+    requireWrite?: boolean;
+    /** Filled with where the time went: `session` and `access` (ms since the call). */
+    timings?: { session?: number; access?: number };
+  } = {},
 ): Promise<SessionWorkspaceAccessContext> {
+  const startedAt = Date.now();
+  const env = getEnv(context);
+  const authEnv = getAuthEnv(env);
+  const readWorkspaceAccess = (orgId: string, workspaceId: string, userId: string) => {
+    const orgStub = authEnv.ORG.get(authEnv.ORG.idFromName(orgId));
+    return Promise.all([
+      getWorkspaceAccessBootstrap(orgStub, workspaceId, userId),
+      orgStub.isMember(userId),
+    ]);
+  };
+
+  // The workspace reads only need the ids the signed cookie names, so they
+  // start alongside the session's own checks (ban, logout invalidation, SSO)
+  // instead of after them. Nothing is decided from them until the session is
+  // validated, and they are used only when the validated session names the
+  // same org, workspace and user; otherwise they are read again.
+  const peeked = await getSignedSessionFromRequest(request, env.TOKEN_SIGNING_SECRET).catch(() => null);
+  const peekedWorkspaceId = workspaceIdOverride ?? peeked?.workspace_id;
+  const speculative =
+    peeked?.org_id && peeked.user_id && peekedWorkspaceId
+      ? readWorkspaceAccess(peeked.org_id, peekedWorkspaceId, peeked.user_id)
+      : null;
+  // Settled below when used; never an unhandled rejection when not.
+  speculative?.catch(() => {});
+
   const sessionContext = await requireSession(request, context);
+  if (options.timings) options.timings.session = Date.now() - startedAt;
   const { session } = sessionContext;
   const orgId = session.org_id;
   const workspaceId = workspaceIdOverride ?? session.workspace_id;
@@ -509,14 +548,15 @@ export async function requireSessionWorkspaceAccess(
     throw Response.json({ error: "No workspace selected" }, { status: 400 });
   }
 
-  const env = getEnv(context);
-  const authEnv = getAuthEnv(env);
-  const orgStub = authEnv.ORG.get(authEnv.ORG.idFromName(orgId));
-
-  const [workspaceAccess, isMember] = await Promise.all([
-    getWorkspaceAccessBootstrap(orgStub, workspaceId, userId),
-    orgStub.isMember(userId),
-  ]);
+  const [workspaceAccess, isMember] = await (
+    speculative &&
+    peeked?.org_id === orgId &&
+    peekedWorkspaceId === workspaceId &&
+    peeked?.user_id === userId
+      ? speculative
+      : readWorkspaceAccess(orgId, workspaceId, userId)
+  );
+  if (options.timings) options.timings.access = Date.now() - startedAt;
   const { workspaceInfo, access } = workspaceAccess;
 
   if (

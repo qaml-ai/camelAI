@@ -365,7 +365,8 @@ export interface ChannelHistoryEventRequest {
 }
 
 export interface ChannelHistoryEventResult {
-  status: "appended" | "skipped" | "error";
+  /** "moved": the thread is moving to the runtime, or moved; the caller queues the note for it. */
+  status: "appended" | "skipped" | "moved" | "error";
   error?: string;
 }
 

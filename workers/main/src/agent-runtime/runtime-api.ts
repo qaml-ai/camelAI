@@ -20,6 +20,17 @@ export function runtimeUrl(env: RuntimeApiEnv): string {
   return (env.AGENT_RUNTIME_URL || "https://agents.camelai.dev").replace(/\/+$/, "");
 }
 
+/**
+ * The runtime's agent id for a provisioning key (its `agentId(tenant, key)`),
+ * to find an agent it already made. A key whose agent was deleted makes its
+ * next one under `<key>#<generation>`.
+ */
+export async function provisionedAgentId(tenant: string, key: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${tenant}:${key}`));
+  const hex = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `client_${hex.slice(0, 40)}`;
+}
+
 /** Pauses before retrying a 503 (a runtime node shutting down or draining), each capped by Retry-After at 1 s. */
 const UNAVAILABLE_RETRY_MS = [300, 700];
 

@@ -1081,6 +1081,10 @@ function unpackReplaySegmentBody(rowBody: string): string[] {
 // buffering + replay on reconnect) and, later, chatRecovery. The ai-chat
 // message model is transport-internal only: pi_core_messages remains the
 // canonical history and the Pi runtime owns the agent loop.
+function* mapIterable<T, U>(items: Iterable<T>, map: (item: T) => U): Generator<U> {
+  for (const item of items) yield map(item);
+}
+
 export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState> {
   private static readonly CONNECTION_SETUP_TIMEOUT_MS = 30 * 60 * 1000;
   static renderHistoryWindow = {
@@ -4341,7 +4345,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       hasRelayAgent: () => Boolean(this.ctx.storage.kv.get(RUNTIME_AGENT_KEY)),
       revision: () => this.piCoreStore.getPiCoreRevision(),
       loadHistory: (maxChars) => this.piCoreStore.loadPiCoreHistoryForMigration(maxChars),
-      payloadBatches: () => this.piCoreStore.piCorePayloadBatches(),
+      renderArchivePages: () => this.renderArchivePages(),
+      payloadBatches: () => mapIterable(this.piCoreStore.piCoreRowBatches(), (batch) => batch.map((row) => row.payload)),
       preview: () => ({ tabs: cloneDurableState(this.previewTabs), activeTabId: this.previewActiveTabId }),
       scheduleAlarm: (at) => {
         this.ctx.waitUntil(this.schedule(new Date(at), "runtimeMigrationAlarm").catch((error: unknown) =>
@@ -4371,6 +4376,36 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
    */
   async migrateToRuntime(request: DoMigrationRequest): Promise<DoMigrationResult> {
     return await this.runtimeMigration.migrate(request);
+  }
+
+  /** Where this thread's move to the runtime stands (moving, moved, backing off), before anyone asks for one. */
+  runtimeMigrationStatus(): { state: "moving" | "moved" | "backoff" | null; retryAt?: number } {
+    return this.runtimeMigration.status();
+  }
+
+  /**
+   * The render rows a post-turn compaction left as the only copy of the
+   * history below its cut (render-archive-preserve.ts): those older than the
+   * oldest message pi_core still derives, a bounded page at a time, newest
+   * page first.
+   */
+  private *renderArchivePages(): Generator<UIMessage[]> {
+    const seam = this.oldestDerivedPiCreatedAtMs();
+    if (seam === undefined) return;
+    let beforeCursor: string | null = `e:${formatAiChatCreatedAt(seam)}`;
+    while (beforeCursor) {
+      const page = this.getRenderHistoryPage({ beforeCursor, maxMessages: 50, maxBytes: 2_000_000 });
+      const archived = (page.messages as UIMessage[]).filter((message) => {
+        const createdAt = uiMessageCreatedAtMs(message);
+        return createdAt !== undefined && createdAt < seam;
+      });
+      if (archived.length) yield archived;
+      if (!page.hasMore || !page.nextCursor) return;
+      const key = page.nextCursor.startsWith("i:") || page.nextCursor.startsWith("e:") ? page.nextCursor.slice(2) : page.nextCursor;
+      const next = `e:${key}`;
+      if (next === beforeCursor) return;
+      beforeCursor = next;
+    }
   }
 
   /** The move's alarm (scheduled by the move): undo an abandoned one, finish a commit. */
@@ -4416,6 +4451,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     if (!text && attachmentCount === 0) {
       return { status: "skipped" };
     }
+    // A transcript being exported, or already moved, takes no more history here.
+    if (this.runtimeMigrationState()) return { status: "moved" };
 
     const providerMessageIds = Array.isArray(input.providerMessageIds)
       ? input.providerMessageIds

@@ -47,7 +47,7 @@ describe("POST /api/threads/:id/files/save", () => {
     expect(response.status).toBe(200);
     expect(scratchFileLinkMock).toHaveBeenCalledWith({}, "vol_1", "/out/chart.png");
     expect(CodeModeToolsBinding).toHaveBeenCalledWith({
-      props: { orgId: "org1", workspaceId: "ws1", threadId: "t1", userId: "u1", directRuntime: true },
+      props: { orgId: "org1", workspaceId: "ws1", threadId: "t1", userId: "u1" },
     });
     expect(callToolEnvelope).toHaveBeenCalledWith("import_file", {
       source: "https://agents.test/v1/links/tok/chart.png",

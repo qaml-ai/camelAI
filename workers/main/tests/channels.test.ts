@@ -94,15 +94,14 @@ describe("channels", () => {
     }));
   });
 
-  it("sends a message to the runtime when the thread moved there while it was on its way", async () => {
-    startChannelRuntimeTurnMock.mockResolvedValueOnce(null).mockResolvedValueOnce({ status: "accepted" });
-    startInitialUserMessageMock.mockResolvedValueOnce({ status: "moved", error: "moved" });
+  it("answers an error, and never reaches ChatThreadDO, when the thread cannot run on the runtime", async () => {
+    startChannelRuntimeTurnMock.mockResolvedValueOnce(null);
     const result = await enqueueChannelMessage(
       { CHAT_THREAD: { idFromName: (id: string) => id, get: () => ({ startInitialUserMessage: startInitialUserMessageMock }) } } as never,
       { channelKind: "discord", threadId: "thread-1", workspaceId: "workspace-1", orgId: "org-1", userId: "owner-1", userName: "D", message: "hello" },
     );
-    expect(result).toEqual({ status: "accepted" });
-    expect(startChannelRuntimeTurnMock).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ status: "error" });
+    expect(startInitialUserMessageMock).not.toHaveBeenCalled();
   });
 
   it("pins a new channel thread to the runtime", async () => {
@@ -426,13 +425,9 @@ describe("channels", () => {
   });
 
   it("acts as the member who connected the channel when the sender is no member", async () => {
-    startInitialUserMessageMock.mockResolvedValue({ status: "accepted" });
+    startChannelRuntimeTurnMock.mockResolvedValue({ status: "accepted" });
     const getIntegration = vi.fn(async (id: string) => (id === "int-1" ? { id, created_by: "owner-1" } : null));
     const env = {
-      CHAT_THREAD: {
-        idFromName: (threadId: string) => threadId,
-        get: () => ({ startInitialUserMessage: startInitialUserMessageMock }),
-      },
       WORKSPACE: {
         idFromName: (workspaceId: string) => workspaceId,
         get: () => ({ getIntegration }),
@@ -449,11 +444,10 @@ describe("channels", () => {
       message: "hi",
     });
     expect(getIntegration).toHaveBeenCalledWith("int-1");
-    expect(startInitialUserMessageMock.mock.calls.at(-1)?.[0]).toMatchObject({
+    expect(startChannelRuntimeTurnMock.mock.calls.at(-1)?.[1]).toMatchObject({
       userId: "owner-1",
       userName: "discord-author",
     });
-    expect(startInitialUserMessageMock.mock.calls.at(-1)?.[0]).not.toHaveProperty("connectionId");
 
     // A sender who is a member (email) keeps acting as themself.
     await enqueueChannelMessage(env, {
@@ -465,21 +459,14 @@ describe("channels", () => {
       userId: "member-9",
       message: "hi",
     });
-    expect(startInitialUserMessageMock.mock.calls.at(-1)?.[0]).toMatchObject({ userId: "member-9" });
+    expect(startChannelRuntimeTurnMock.mock.calls.at(-1)?.[1]).toMatchObject({ userId: "member-9" });
   });
 
-  it("enqueues channel messages through the normal initial message path", async () => {
-    startInitialUserMessageMock.mockResolvedValue({ status: "accepted" });
+  it("starts channel messages on the runtime, with the channel's reply instructions", async () => {
+    startChannelRuntimeTurnMock.mockResolvedValue({ status: "accepted" });
 
     const result = await enqueueChannelMessage(
-      {
-        CHAT_THREAD: {
-          idFromName: (threadId: string) => threadId,
-          get: () => ({
-            startInitialUserMessage: startInitialUserMessageMock,
-          }),
-        },
-      } as never,
+      {} as never,
       {
         channelKind: "slack",
         threadId: "thread-1",
@@ -490,15 +477,14 @@ describe("channels", () => {
     );
 
     expect(result).toEqual({ status: "accepted" });
-    expect(startInitialUserMessageMock).toHaveBeenCalledWith({
+    expect(startChannelRuntimeTurnMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       threadId: "thread-1",
       workspaceId: "workspace-1",
       orgId: "org-1",
-      messageSource: "slack",
-      message: expect.stringContaining("send_slack_message"),
-    });
-    expect(startInitialUserMessageMock.mock.calls[0]?.[0].message).toContain(
-      "\n\nhello",
-    );
+      channelKind: "slack",
+      message: "hello",
+      systemMessage: expect.stringContaining("send_slack_message"),
+    }));
+    expect(startInitialUserMessageMock).not.toHaveBeenCalled();
   });
 });

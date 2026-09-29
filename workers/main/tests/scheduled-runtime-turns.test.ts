@@ -7,10 +7,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 
-const { startRuntimeTurnMock, directEnabledMock, directRowMock, runtimeApiMock } = vi.hoisted(() => ({
+const { startRuntimeTurnMock, directEnabledMock, directRowMock, moveOnSendMock, runtimeApiMock } = vi.hoisted(() => ({
   startRuntimeTurnMock: vi.fn(),
   directEnabledMock: vi.fn(() => true),
   directRowMock: vi.fn(),
+  moveOnSendMock: vi.fn(),
   runtimeApiMock: vi.fn(),
 }));
 
@@ -22,6 +23,7 @@ vi.mock("../src/agent-runtime/thread-runtime.js", async (importOriginal) => ({
 vi.mock("../src/agent-runtime/thread-migration.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   directRuntimeRow: directRowMock,
+  migrateThreadOnSend: moveOnSendMock,
 }));
 vi.mock("../src/agent-runtime/runtime-api.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -40,18 +42,27 @@ beforeEach(() => {
   vi.clearAllMocks();
   directEnabledMock.mockReturnValue(true);
   directRowMock.mockResolvedValue(ROW);
+  moveOnSendMock.mockResolvedValue(null);
   runtimeApiMock.mockResolvedValue({ requests: [] });
   startRuntimeTurnMock.mockResolvedValue({ status: "accepted", requestId: "run-1", agentId: "agt_1", fallback: null });
 });
 
 describe("startScheduledRuntimeTurn", () => {
-  it("leaves the run on ChatThreadDO where direct threads are off, or its thread is not a runtime thread", async () => {
+  it("starts nothing where the runtime is not configured, or when the thread cannot move there", async () => {
     directEnabledMock.mockReturnValue(false);
     expect(await startScheduledRuntimeTurn({} as ChatEnv, request)).toBeNull();
     directEnabledMock.mockReturnValue(true);
     directRowMock.mockResolvedValue(null);
     expect(await startScheduledRuntimeTurn({} as ChatEnv, request)).toBeNull();
+    expect(moveOnSendMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ threadId: "t1", userId: "creator-1" }));
     expect(startRuntimeTurnMock).not.toHaveBeenCalled();
+  });
+
+  it("moves a thread still on ChatThreadDO first, then starts the run there", async () => {
+    directRowMock.mockResolvedValue(null);
+    moveOnSendMock.mockResolvedValue(ROW);
+    expect(await startScheduledRuntimeTurn({} as ChatEnv, request)).toEqual({ status: "accepted" });
+    expect(startRuntimeTurnMock.mock.calls[0][1]).toMatchObject({ row: ROW });
   });
 
   it("starts the run as its creator, with the outcome instruction and the run's id", async () => {

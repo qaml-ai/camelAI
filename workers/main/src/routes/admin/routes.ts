@@ -16,7 +16,6 @@ import { Hono } from "hono";
 import { openApi } from "hono-zod-openapi";
 import { z } from "zod";
 import type { Env } from "../../types.js";
-import type { LlmModel } from "../../../../../src/types.js";
 import {
   buildPublicLlmProviderConfig,
   normalizeLlmModel,

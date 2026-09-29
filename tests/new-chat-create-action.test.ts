@@ -124,7 +124,7 @@ describe('new chat create action', () => {
       id: 'group_existing',
     });
     startInitialUserMessageMock.mockResolvedValue({ status: 'accepted' });
-    pinNewWebThreadMock.mockResolvedValue(null);
+    pinNewWebThreadMock.mockResolvedValue({ threadId: 'thread_123', agentId: null, model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 });
     startFirstRuntimeTurnMock.mockResolvedValue({ status: 'accepted', requestId: 'initial:thread_123', agentId: 'agt_1', fallback: null });
   });
 
@@ -183,55 +183,22 @@ describe('new chat create action', () => {
     ).toBe(false);
   });
 
-  it('starts the first message in the background and redirects immediately to the clean thread URL', async () => {
+  it('refuses a thread whose model cannot run on the agent runtime, and deletes it', async () => {
+    pinNewWebThreadMock.mockResolvedValue(null);
     const formData = makeCreateThreadFormData();
     formData.set('intent', 'createThreadAndStart');
     formData.set('firstMessage', 'Build an analytics dashboard');
     formData.set('model', 'sonnet');
 
     const response = await action({
-      request: new Request('https://camelai.dev/chat', {
-        method: 'POST',
-        body: formData,
-      }),
+      request: new Request('https://camelai.dev/chat', { method: 'POST', body: formData }),
       context: {},
     } as never);
 
-    expect(response.status).toBe(302);
-    expect(response.headers.get('Location')).toBe(
-      '/chat/thread_123?group=group_123',
-    );
-    expect(createThreadWithValidatedAccessMock).toHaveBeenCalledWith(
-      {},
-      'org_123',
-      'ws_123',
-      undefined,
-      'user_123',
-      'Build an analytics dashboard',
-      'sonnet',
-    );
-    expect(createThreadMock).not.toHaveBeenCalled();
-    expect(startInitialUserMessageMock).toHaveBeenCalledWith({
-      threadId: 'thread_123',
-      workspaceId: 'ws_123',
-      orgId: 'org_123',
-      userId: 'user_123',
-      userName: 'Ada Lovelace',
-      userEmail: 'ada@example.com',
-      message: 'Build an analytics dashboard',
-      clientMessageId: 'initial:thread_123',
-    });
-    // The turn start is fired in the background (so the cold DO boot doesn't block
-    // the redirect); title generation also runs via waitUntil → two total.
-    expect(waitUntilMock).toHaveBeenCalledTimes(2);
-    expect(createGroupForNewThreadLightweightMock).toHaveBeenCalledWith(
-      {},
-      expect.objectContaining({
-        threadId: 'thread_123',
-        initialThreadTitle: null,
-      }),
-    );
-    expect(createGroupForNewThreadMock).not.toHaveBeenCalled();
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(deleteThreadMock).toHaveBeenCalledWith({}, 'thread_123', 'ws_123', { orgId: 'org_123' });
+    expect(startFirstRuntimeTurnMock).not.toHaveBeenCalled();
+    expect(startInitialUserMessageMock).not.toHaveBeenCalled();
   });
 
   it('starts a runtime thread\'s first message on the runtime before redirecting, with no ChatThreadDO', async () => {
@@ -298,13 +265,9 @@ describe('new chat create action', () => {
       'sonnet',
     );
     expect(createThreadMock).not.toHaveBeenCalled();
-    expect(startInitialUserMessageMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        threadId: 'thread_123',
-        message: 'Build from an old tab',
-        clientMessageId: 'initial:thread_123',
-      }),
-    );
+    expect(startFirstRuntimeTurnMock).toHaveBeenCalledWith({}, expect.objectContaining({
+      text: 'Build from an old tab',
+    }));
     expect(createGroupForNewThreadLightweightMock).toHaveBeenCalledWith(
       {},
       expect.objectContaining({
@@ -314,44 +277,7 @@ describe('new chat create action', () => {
     );
   });
 
-  it('retries transient ChatThreadDO resets when starting the first message', async () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    startInitialUserMessageMock
-      .mockRejectedValueOnce(
-        new Error('Durable Object reset because its code was updated.'),
-      )
-      .mockResolvedValueOnce({ status: 'accepted' });
-    const formData = makeCreateThreadFormData();
-    formData.set('intent', 'createThreadAndStart');
-    formData.set('firstMessage', 'Survive a deploy reset');
-    formData.set('model', 'sonnet');
-
-    const response = await action({
-      request: new Request('https://camelai.dev/chat', {
-        method: 'POST',
-        body: formData,
-      }),
-      context: {},
-    } as never);
-
-    expect(response.status).toBe(302);
-    // The turn start runs in the background; drive its waitUntil promise to let the
-    // transient retry resolve.
-    const startPromise = waitUntilMock.mock.calls[1]?.[0] as Promise<unknown>;
-    await expect(startPromise).resolves.toBeUndefined();
-    expect(startInitialUserMessageMock).toHaveBeenCalledTimes(2);
-    expect(warnSpy).toHaveBeenCalledWith(
-      '[do-rpc] transient rpc failed; retrying',
-      expect.objectContaining({
-        operation: 'ChatThreadDO.startInitialUserMessage',
-        attempt: 1,
-        attempts: 4,
-      }),
-    );
-    warnSpy.mockRestore();
-  });
-
-  it('returns the new thread and group while title generation runs in the background', async () => {
+  it('returns the new thread and group, leaving the title to its first send on the runtime', async () => {
     const formData = makeCreateThreadFormData();
     formData.set('firstMessage', 'Persist this first message');
     formData.set('model', 'sonnet');
@@ -369,14 +295,7 @@ describe('new chat create action', () => {
       thread: { id: 'thread_123' },
       groupId: 'group_123',
     });
-    expect(waitUntilMock).toHaveBeenCalledTimes(1);
-    expect(generateThreadTitleMock).toHaveBeenCalledWith(
-      {},
-      'thread_123',
-      'ws_123',
-      'Persist this first message',
-      'user_123',
-    );
+    expect(generateThreadTitleMock).not.toHaveBeenCalled();
   });
 
   it('passes a real initial thread title through for the new group', async () => {

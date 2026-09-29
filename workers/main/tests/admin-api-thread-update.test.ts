@@ -200,7 +200,7 @@ describe('admin API thread patch route', () => {
     });
   });
 
-  it('forwards updated thread revisions to ChatThreadDO metadata broadcasts', async () => {
+  it('updates the thread record without touching ChatThreadDO', async () => {
     const email = testEmail();
     const { userId } = await createUser(testEnv, email, 'password123', 'Admin API Revision User');
     const { org, defaultWorkspaceId } = await createOrg(testEnv, 'Admin API Revision Org', userId);
@@ -251,15 +251,10 @@ describe('admin API thread patch route', () => {
     expect(response!.status).toBe(200);
     const result = await response!.json() as { updated_at: number };
     expect(typeof result.updated_at).toBe('number');
-    expect(chatThreadIdFromName).toHaveBeenCalledWith(thread.id);
-    expect(setTitle).toHaveBeenCalledWith(
-      'Renamed through admin API',
-      result.updated_at,
-    );
-    expect(setModel).toHaveBeenCalledWith(
-      'opus-5.5',
-      result.updated_at,
-    );
-    expect(refreshRunnerConfig).toHaveBeenCalledTimes(1);
+    // The page and the runtime read the thread's title and model from OrgDO.
+    expect(chatThreadGet).not.toHaveBeenCalled();
+    expect(setTitle).not.toHaveBeenCalled();
+    expect(setModel).not.toHaveBeenCalled();
+    expect(refreshRunnerConfig).not.toHaveBeenCalled();
   });
 });

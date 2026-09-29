@@ -11,10 +11,10 @@
  * did not know it was one.
  *
  * BOUNDED ALTERNATIVES, so a reviewer never has to guess:
- *   - a render page              → ChatThreadDO#deriveRenderWindow / getDerivedUiMessagePage
- *   - the model's session view    → PiCoreMessageStore#loadBoundedPiCoreSessionWindow
- *   - a forward walk of new rows  → ChatThreadDO#readParsedPiCoreRowRange
- *   - "what is in this window?"   → PiCoreMessageStore#piCoreVisibleWindowTotals / listPiCoreRowMeta*
+ *   - the newest history, to read  → PiCoreMessageStore#loadRecentStoredMessages
+ *   - the model's session view     → PiCoreMessageStore#loadBoundedPiCoreSessionWindow
+ *   - a walk of every row          → PiCoreMessageStore#piCoreRowBatches
+ *   - "what is in this window?"    → PiCoreMessageStore#piCoreVisibleWindowTotals / listPiCoreRowMeta*
  *
  * Run: node scripts/check-unbounded-pi-core-callers.mjs
  */
@@ -60,19 +60,14 @@ export const ALLOWLIST = {
   },
   "workers/main/src/chat-thread-do.ts": {
     loadFullPiCoreTranscriptUnbounded: {
-      count: 4,
+      count: 1,
       why:
-        "1 declaration + 1 delegate body; getPiCoreForkMessages (fork seeding genuinely " +
-        "needs every row); and the parsed transcript load below.",
-    },
-    loadFullPiCoreParsedTranscriptUnbounded: {
-      count: 2,
-      why: "1 declaration + the public RPC wrapper that is its only caller.",
+        "the export RPC getPiCoreParsedMessages (admin views, JSONL export) of a thread not yet " +
+        "moved to the runtime; the exporter's page read is bounded (loadRecentStoredMessages).",
     },
     getPiCoreParsedMessages: {
-      count: 2,
-      why:
-        "1 RPC declaration; agentEvalResult (eval harness, off the user path).",
+      count: 1,
+      why: "1 RPC declaration (the export surface; see thread-transcript.ts for its caller).",
     },
   },
   "workers/main/src/agent-runtime/thread-transcript.ts": {

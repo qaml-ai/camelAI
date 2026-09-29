@@ -243,15 +243,6 @@ describe("capability tool helpers", () => {
 });
 
 describe("report_automation_outcome", () => {
-  it("records the outcome on the thread's DO", async () => {
-    const recordAutomationOutcome = vi.fn(async (status: string) => ({ status, text: `Automation outcome recorded: ${status}` }));
-    const instance = binding();
-    Object.defineProperty(instance, "chatThreadStub", { value: { recordAutomationOutcome } });
-    await expect(methods.reportAutomationOutcome.call(instance, { status: "partial", summary: "half done" }))
-      .resolves.toEqual({ status: "partial", text: "Automation outcome recorded: partial" });
-    expect(recordAutomationOutcome).toHaveBeenCalledWith("partial", "half done");
-  });
-
   it("needs a thread", async () => {
     const instance = binding({ ctx: { props: { ...PROPS, threadId: undefined } } });
     await expect(methods.reportAutomationOutcome.call(instance, { status: "success", summary: "x" })).rejects.toThrow(/thread scope/);
@@ -282,6 +273,12 @@ describe("destructive confirmations for the agent runtime", () => {
     expect(question).toMatch(/Delete deployed app "shop"/);
     expect(deleteAppDeployment).not.toHaveBeenCalled();
     expect(askUserQuestion).not.toHaveBeenCalled();
+  });
+
+  it("does not delete when nobody confirmed it (called from code)", async () => {
+    const { instance, deleteAppDeployment } = deleteAppBinding();
+    await expect(methods.deleteApp.call(instance, { script_name: "shop" })).resolves.toMatchObject({ success: false });
+    expect(deleteAppDeployment).not.toHaveBeenCalled();
   });
 
   it("deletes without the chat question once preconfirmed", async () => {

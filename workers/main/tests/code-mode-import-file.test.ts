@@ -8,7 +8,7 @@ import { CODE_MODE_TOOL_DEFINITIONS, CodeModeToolsBinding } from "../src/code-mo
 import { agentMcpTools } from "../src/routes/agent-mcp";
 
 const RUNTIME = "https://agents.test";
-const PROPS = { orgId: "org1", workspaceId: "ws1", threadId: "thread1", userId: "user1", directRuntime: true };
+const PROPS = { orgId: "org1", workspaceId: "ws1", threadId: "thread1", userId: "user1" };
 type Method = (this: unknown, args: Record<string, unknown>) => Promise<Record<string, unknown>>;
 const methods = CodeModeToolsBinding.prototype as unknown as Record<string, Method>;
 
@@ -73,12 +73,5 @@ describe("import_file", () => {
     await expect(methods.importFile.call(instance, { source: `${RUNTIME}/v1/links/tok/big.bin`, destination: { location: "r2", path: "outputs/big.bin" } }))
       .rejects.toThrow(/too large/);
     expect(writes).toHaveLength(0);
-  });
-
-  it("is only for threads that run on the runtime", async () => {
-    serveLink("x");
-    const { instance } = binding({ ...PROPS, directRuntime: false });
-    await expect(methods.importFile.call(instance, { source: `${RUNTIME}/v1/links/tok/x`, destination: { location: "r2", path: "outputs/x" } }))
-      .rejects.toThrow(/runtime threads/);
   });
 });

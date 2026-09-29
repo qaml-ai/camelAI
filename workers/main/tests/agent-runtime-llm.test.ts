@@ -1,6 +1,9 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { testRuntime, type TestIdentity } from "@camelai/agent-runtime/testing";
 
+const { forward } = vi.hoisted(() => ({ forward: vi.fn() }));
+vi.mock("../src/agent-runtime/thread-runtime.js", () => ({ forwardRuntimeThreadCodexCall: forward }));
+
 import { handleAgentRuntimeLlmRequest } from "../src/routes/agent-runtime-llm";
 import type { Env } from "../src/types";
 
@@ -15,7 +18,9 @@ beforeAll(async () => {
 });
 
 function setup(member = true) {
-  const completion = vi.fn(async () => new Response("data: [DONE]\n\n", { headers: { "Content-Type": "text/event-stream" } }));
+  const completion = forward;
+  completion.mockReset();
+  completion.mockImplementation(async () => new Response("data: [DONE]\n\n", { headers: { "Content-Type": "text/event-stream" } }));
   const env = {
     AGENT_RUNTIME_URL: rt.url,
     AGENT_RUNTIME_TENANT: "chiridion",
@@ -26,10 +31,6 @@ function setup(member = true) {
           ? { ok: true, orgId: "org1", orgSlug: "o", workspaceId, threadId }
           : { ok: false, reason: "forbidden" },
       }),
-    },
-    CHAT_THREAD: {
-      idFromName: (name: string) => name,
-      get: (id: string) => ({ runtimeProviderRequest: (request: unknown, caller: unknown) => completion(id, request, caller) }),
     },
   } as unknown as Env;
   return { env, completion };
@@ -52,12 +53,12 @@ describe("agent runtime inference proxy", () => {
     expect(completion).not.toHaveBeenCalled();
   });
 
-  it("runs the call in the thread's DO as the acting user", async () => {
+  it("forwards the call as the thread's acting user", async () => {
     const { env, completion } = setup();
     const response = await post(env, BASE);
     expect(response.status).toBe(200);
     expect(completion).toHaveBeenCalledWith(
-      "thread1",
+      env,
       expect.objectContaining({ provider: "openai-codex", path: "codex/responses", method: "POST", body: expect.any(ArrayBuffer) }),
       { orgId: "org1", workspaceId: "ws1", threadId: "thread1", userId: "user2" },
     );

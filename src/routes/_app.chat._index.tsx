@@ -802,30 +802,7 @@ export async function action({ request, context }: Route.ActionArgs) {
         );
       }
 
-      // Generate title in background if we have a first message (a runtime
-      // thread's first send generates it).
-      if (firstMessage && !runtimeRow) {
-        waitUntil(
-          chatDO.generateThreadTitle(
-            context,
-            thread.id,
-            workspaceId,
-            firstMessage,
-            userId,
-          ),
-        );
-        recordChatCreateThreadStage(
-          env,
-          traceContext,
-          traceIds,
-          "title_generation_scheduled",
-          actionStartedAt,
-          {
-            model: thread.model,
-            size: firstMessage.length,
-          },
-        );
-      }
+      // The thread's first send on the runtime generates its title.
 
       const groupStartedAt = Date.now();
       const group = await (async () => {

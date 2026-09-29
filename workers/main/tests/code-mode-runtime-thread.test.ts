@@ -7,7 +7,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { CodeModeToolsBinding } from "../src/code-mode-tools";
 
-const PROPS = { orgId: "org1", workspaceId: "ws1", threadId: "thread1", userId: "user1", directRuntime: true };
+const PROPS = { orgId: "org1", workspaceId: "ws1", threadId: "thread1", userId: "user1" };
 type Method = (this: unknown, args: Record<string, unknown>) => Promise<Record<string, unknown>>;
 const methods = CodeModeToolsBinding.prototype as unknown as Record<string, Method>;
 

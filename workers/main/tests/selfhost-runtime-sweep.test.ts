@@ -192,11 +192,11 @@ describe("self-host thread sweep", () => {
     expect((await getSweepReport(sweepEnv)).retrying).toEqual([]);
   });
 
-  it("stops, blocked, while direct threads are off, and a start resumes a pass under way", async () => {
+  it("stops, blocked, while the agent runtime is not configured, and a start resumes a pass under way", async () => {
     await install([2]);
     await startSweep(sweepEnv);
-    const blocked = await runSweepStep(sweepEnv, { probe: async () => true,  migrate: async () => ({ status: "skipped", reason: "direct threads are off" }) });
-    expect(blocked).toMatchObject({ status: "blocked", error: "direct threads are off" });
+    const blocked = await runSweepStep(sweepEnv, { probe: async () => true,  migrate: async () => ({ status: "skipped", reason: "the agent runtime is not configured" }) });
+    expect(blocked).toMatchObject({ status: "blocked", error: "the agent runtime is not configured" });
     const restarted = await startSweep(sweepEnv);
     expect(restarted).toMatchObject({ status: "running", pass: blocked.pass + 1 });
     // A start while a pass runs (the app restarted) resumes it rather than starting over.

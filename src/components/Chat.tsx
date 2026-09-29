@@ -34,8 +34,6 @@ import type {
   GroupNewChatAttachmentCard,
   GroupNewChatPayload,
   GroupNewChatTranscriptCard,
-  ChatGroupAvatar,
-  ChatGroupAvatarStatus,
 } from "@/types";
 import { useAuthData } from "@/hooks/use-auth-data";
 import {

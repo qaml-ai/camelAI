@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { env, evictDurableObject, runInDurableObject } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import type { OrgDO } from '../src/auth';
 import { CodeModeDeterministicAutomations } from '../src/code-mode-deterministic-automations';
 import type { AutomationRunCursor, WorkspaceCronDO } from '../src/workspace-cron';
@@ -96,12 +96,6 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
       ? await orgStub.getThread(run.dispatch.thread_id)
       : null;
     expect(repairedThread?.source).toBe('scheduled');
-    const repairedChatStub = testEnv.CHAT_THREAD.get(
-      testEnv.CHAT_THREAD.idFromName(run!.dispatch.thread_id),
-    );
-    const repairedChatContext = await runInDurableObject(repairedChatStub, (_instance, state) =>
-      state.storage.kv.get<{ userId: string | null }>('chatContext'));
-    expect(repairedChatContext?.userId).toBe(userId);
     const runsAfterStart = await cronStub.listAutomationRuns(workspaceId!, {
       limitPerAutomation: 5,
     });
@@ -148,43 +142,6 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
     expect(listAfterDelete).toHaveLength(0);
     const runsAfterDelete = await cronStub.listAutomationRuns(workspaceId!);
     expect(runsAfterDelete[`scheduled_prompt:${created.id}`]).toBeUndefined();
-  });
-
-  it('attributes a reused scheduled thread to the prompt creator instead of a stale viewer', async () => {
-    const { userId } = await createUser(testEnv, testEmail(), 'password123', 'Cron Attribution Owner');
-    const { org } = await createOrg(testEnv, 'Cron Attribution Org', userId);
-    const workspaces = await listUserWorkspaces(testEnv, userId, org.id);
-    const workspaceId = workspaces[0]!.id;
-    const cronStub = testEnv.WORKSPACE_CRON.get(
-      testEnv.WORKSPACE_CRON.idFromName(workspaceId),
-    ) as DurableObjectStub<WorkspaceCronDO>;
-    const created = await cronStub.createScheduledPrompt({
-      workspaceId,
-      name: 'Attributed digest',
-      prompt: 'Summarize workspace status.',
-      cronExpression: '0 9 * * *',
-      createdBy: userId,
-    });
-    const chatStub = testEnv.CHAT_THREAD.get(
-      testEnv.CHAT_THREAD.idFromName(created.thread_id),
-    );
-    await runInDurableObject(chatStub, (_instance, state) => {
-      state.storage.kv.put('chatContext', {
-        threadId: created.thread_id,
-        workspaceId,
-        orgId: org.id,
-        userId: 'stale-viewer',
-        userName: 'Stale Viewer',
-        userEmail: null,
-      });
-    });
-    await evictDurableObject(chatStub);
-
-    const run = await cronStub.runScheduledPromptNow(workspaceId, created.id);
-    expect(run?.dispatch.thread_id).toBe(created.thread_id);
-    const updatedContext = await runInDurableObject(chatStub, (_instance, state) =>
-      state.storage.kv.get<{ userId: string | null }>('chatContext'));
-    expect(updatedContext?.userId).toBe(userId);
   });
 
   it('does not let an older scheduled prompt completion overwrite the latest run summary', async () => {

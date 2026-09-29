@@ -193,33 +193,13 @@ export class PiCoreMessageStore {
   }
 
   /**
-   * Trim a LOADED message's resident base64 without touching the row it came
-   * from: an inline image over {@link PI_SESSION_INLINE_IMAGE_MAX_CHARS} is put
-   * to the same content-addressed R2 location the storage path uses and the
-   * in-memory part is swapped for the reference shape.
-   *
-   * Three properties this relies on, all load-bearing:
-   *
-   *  - NO STORED-ROW REWRITE. The payload keeps its bytes, so the render path
-   *    (`renderPiStoredImageReferences`) still shows the image and the mirror's
-   *    idempotent upsert still sees the same row content. This is the whole
-   *    reason the working set can be trimmed at 128 KB when storage cannot.
-   *    It is NOT enough to leave the row alone here, because the loaded list is
-   *    itself an input to two rewrites (preserve compaction, fork seeding): the
-   *    reference is tagged `origin: "session"` and
-   *    {@link restoreSessionExternalizedImages} puts the bytes back before any
-   *    of it can be serialized into a row.
-   *  - STABLE IDENTITY. `piCoreMessageKey` weighs an image as
-   *    `(mimeType, base64 length)`, and the ref records `size = data.length`, so
-   *    a trimmed message keys identically to the inline one the live turn holds.
-   *    Without that, every dedup (`appendPiCoreMessagesIfMissing`, the resume
-   *    fold) would re-append rows it already has.
-   *  - IDEMPOTENCE. The key is `sha256(data)`, so the same image resolves to the
-   *    same object on every load, in every isolate. A `head` proves presence
-   *    before any `put`, and the per-store key set skips even that on repeats.
-   *
-   * A failure anywhere here returns the message unchanged: keeping the base64
-   * resident is strictly better than losing the image.
+   * The old session load's image policy, kept so a move imports what the old
+   * model saw: an inline image over {@link PI_SESSION_INLINE_IMAGE_MAX_CHARS}
+   * is put to its content-addressed R2 location (sha256 of the bytes, so the
+   * same image is the same object on every load; a `head` proves presence
+   * before any `put`) and the loaded message references it. The stored row
+   * keeps its bytes. A failure returns the message unchanged: keeping the
+   * base64 is strictly better than losing the image.
    */
   private async externalizeOversizedInlineSessionImages(value: unknown): Promise<unknown> {
     if (value === null || value === undefined || typeof value !== "object") return value;
@@ -447,7 +427,8 @@ export class PiCoreMessageStore {
   }
 
   /**
-   * The model-side session load, bounded by construction.
+   * The old loop's model-side session load, bounded by construction (a move
+   * of a thread over the export cap imports this).
    *
    * Under {@link PI_SESSION_LOAD_MAX_CHARS} this is byte-for-byte the legacy
    * `loadFullPiCoreTranscriptUnbounded({ imagePolicy: "reference" })` — same rows, same order,
@@ -456,18 +437,9 @@ export class PiCoreMessageStore {
    * so the model is told plainly what it cannot see instead of silently
    * believing the tail is the whole conversation.
    *
-   * The placeholder is deliberately the same SHAPE a durable compaction summary
-   * has, because that is what makes the next step work: `compactPiContext` reads
-   * the returned {@link PiSessionLoadWindow} as the session's index space, cuts
-   * within the loaded tail, summarizes the tail's older half (never the
-   * placeholder — it is passed as `previousSummary`, so nothing is summarized
-   * twice), and persists a REAL `pi_core_compaction` row at
-   * `firstRowIdx + cut - summaryOffset`. From the next load on, the thread is an
-   * ordinary summary+tail thread and never reaches this path again.
-   *
-   * What this does NOT do: touch a stored row, touch the render path (the
-   * derive has its own bounded reader), or persist anything itself. A capped
-   * load leaves storage exactly as it found it.
+   * The placeholder has the shape of a compaction summary, which a move
+   * imports as the runtime's compaction summary. A capped load leaves storage
+   * exactly as it found it.
    */
   async loadBoundedPiCoreSessionWindow(options: {
     maxChars: number;

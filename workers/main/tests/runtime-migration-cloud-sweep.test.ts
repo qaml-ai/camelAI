@@ -104,7 +104,7 @@ beforeEach(async () => {
 });
 
 describe("the cloud sweep", () => {
-  it("moves threads active in the window, newest first, where the flag is on for their org, and completes", async () => {
+  it("moves every org's threads active in the window (the old cohort flag no longer limits it), and completes", async () => {
     await install([
       ["t-new", "org-a", 1],
       ["t-mid", "org-b", 5],
@@ -116,8 +116,8 @@ describe("the cloud sweep", () => {
     const h = harness({ onRuntime: ["t-done"] });
     await startCloudSweep(env, { now: h.step.now, restart: true });
     const state = await runCloudSweepStep(env, h.step);
-    expect(h.starts.map((start) => start.id)).toEqual(["t-new", "t-mid"]);
-    expect(state).toMatchObject({ status: "complete", counts: { migrated: 2, alreadyOnRuntime: 1, notEnabled: 1, skipped: 0, retrying: 0 } });
+    expect(new Set(h.starts.map((start) => start.id))).toEqual(new Set(["t-new", "t-mid", "t-other"]));
+    expect(state).toMatchObject({ status: "complete", counts: { migrated: 3, alreadyOnRuntime: 1, notEnabled: 0, skipped: 0, retrying: 0 } });
     // A start again is a new sweep; the same settings under way are returned as they are.
     expect((await startCloudSweep(env, { now: h.step.now })).status).toBe("running");
     expect((await startCloudSweep(env, { now: h.step.now })).startedAt).toBe(h.now());

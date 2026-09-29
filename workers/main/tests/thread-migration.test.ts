@@ -427,7 +427,7 @@ describe("migrateThreadToRuntime", () => {
     expect(await migrateThreadToRuntime(fakeEnv({ status: "relay" }).env, context)).toEqual({ status: "skipped", reason: "its model did not resolve: unknown model" });
   });
 
-  it("does nothing for a thread already on the runtime, or where direct threads are off", async () => {
+  it("does nothing for a thread already on the runtime, or where the agent runtime is not configured", async () => {
     const onRuntime = fakeEnv({ status: "relay" }, { row: ROW });
     expect(await migrateThreadToRuntime(onRuntime.env, context)).toMatchObject({ status: "runtime" });
     expect(onRuntime.chat.migrateToRuntime).not.toHaveBeenCalled();
@@ -480,16 +480,9 @@ describe("migrateThreadOnSend", () => {
     expect(await row).toEqual(ROW);
   });
 
-  it("leaves the thread on ChatThreadDO when it is busy there, or the flag is off", async () => {
-    expect(await migrateThreadOnSend(fakeEnv({ status: "busy", reason: "running" }, [null]).env, context)).toBeNull();
-    const off = fakeEnv({ status: "skipped", reason: "moved" }, [null], { ...FLAGS, AGENT_RUNTIME_MIGRATE_DO_THREADS: "" });
-    expect(await migrateThreadOnSend(off.env, context)).toBeNull();
-    expect(off.getThreadRuntime).not.toHaveBeenCalled();
-    // A cohort that does not name the thread's org.
-    const elsewhere = fakeEnv({ status: "skipped", reason: "moved" }, [null], { ...FLAGS, AGENT_RUNTIME_MIGRATE_DO_THREADS: "org_other" });
-    expect(await migrateThreadOnSend(elsewhere.env, context)).toBeNull();
-    expect(elsewhere.getThreadRuntime).not.toHaveBeenCalled();
-    const listed = fakeEnv({ status: "migrated", row: ROW, archived: false, stats: {} } as never, [null], { ...FLAGS, AGENT_RUNTIME_MIGRATE_DO_THREADS: "org_other,org1" });
-    expect(await migrateThreadOnSend(listed.env, context)).toEqual(ROW);
+  it("moves every org's thread (the old cohort flag no longer limits it), and gives none while a move cannot finish", async () => {
+    expect(await migrateThreadOnSend(fakeEnv({ status: "failed", error: "HTTP 503" }, [null]).env, context)).toBeNull();
+    const anyOrg = fakeEnv({ status: "migrated", row: ROW, archived: false, stats: {} } as never, [null], { ...FLAGS, AGENT_RUNTIME_MIGRATE_DO_THREADS: "" });
+    expect(await migrateThreadOnSend(anyOrg.env, context)).toEqual(ROW);
   });
 });

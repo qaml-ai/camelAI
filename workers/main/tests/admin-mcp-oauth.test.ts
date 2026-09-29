@@ -1224,12 +1224,8 @@ describe("admin MCP OAuth resource", () => {
       payload: { ...thread, org_id: org.id },
     });
 
-    const chatThread = testEnv.CHAT_THREAD.get(
-      testEnv.CHAT_THREAD.idFromName(thread.id),
-    ) as unknown as {
-      replacePiCoreForkMessages(messages: unknown[]): Promise<void>;
-    };
-    await chatThread.replacePiCoreForkMessages([
+    // A thread not yet moved to the runtime: its transcript as ChatThreadDO stored it.
+    const stored = [
       {
         role: "user",
         content: "run the command",
@@ -1261,7 +1257,16 @@ describe("admin MCP OAuth resource", () => {
         isError: true,
         timestamp: 300,
       },
-    ]);
+    ];
+    await runInDurableObject(
+      testEnv.CHAT_THREAD.get(testEnv.CHAT_THREAD.idFromName(thread.id)),
+      async (_instance: unknown, state: DurableObjectState) => {
+        state.storage.sql.exec("CREATE TABLE IF NOT EXISTS pi_core_messages (idx INTEGER PRIMARY KEY, payload TEXT NOT NULL, created_at INTEGER NOT NULL)");
+        stored.forEach((message, idx) => {
+          state.storage.sql.exec("INSERT INTO pi_core_messages (idx, payload, created_at) VALUES (?, ?, ?)", idx, JSON.stringify(message), message.timestamp);
+        });
+      },
+    );
 
     const response = await handleAdminMcp({
       req: mcpRequest(

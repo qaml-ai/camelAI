@@ -8,16 +8,13 @@ import type { WorkspaceDO } from "../workspace.js";
 import type { OrgDO, UserDO } from "../auth.js";
 import { getSignedSessionFromRequest } from "../cookies.js";
 import { text } from "./response.js";
-import { getWorkspaceStub, getOrgStub } from "./stubs.js";
 import { isOrgBanned, isUserBanned } from "../ban-list.js";
 import { validateSessionMapsToOrg } from "./proxy-auth-providers.js";
 import {
   isDegradableChatWebSocketAuthError,
   retryTransientDurableObjectRpc,
 } from "../../../../src/lib/do-rpc-retry.server";
-import { getAppIndexReadDatabase } from "../app-index-db.js";
 import { validateOrgSsoSession } from "../org-sso.js";
-import { ENTERPRISE_OIDC_AUTH_SOURCE } from "../signed-session.js";
 
 export type AuthResult = { session: SessionData } | { error: Response };
 
@@ -27,21 +24,6 @@ export type AuthResult = { session: SessionData } | { error: Response };
 // including the short retry delays.
 const CHAT_WS_AUTH_RPC_TIMEOUT_MS = 2_500;
 const CHAT_WS_AUTH_RPC_ATTEMPTS = 2;
-const WORKSPACE_ORG_INDEX_PREFIX = "workspace_org:";
-
-async function getWorkspaceOrgId(
-  env: Env,
-  workspaceId: string,
-): Promise<string | null> {
-  const indexed = await env.APP_KV.get(`${WORKSPACE_ORG_INDEX_PREFIX}${workspaceId}`);
-  if (indexed) return indexed;
-  const appIndex = getAppIndexReadDatabase(env);
-  const orgId = appIndex ? await appIndex.getWorkspaceOrgId(workspaceId) : null;
-  if (orgId) {
-    await env.APP_KV.put(`${WORKSPACE_ORG_INDEX_PREFIX}${workspaceId}`, orgId);
-  }
-  return orgId;
-}
 
 class ChatWebSocketAuthRpcTimeoutError extends Error {
   // Picked up by isTransientDurableObjectRpcError so timeouts retry and

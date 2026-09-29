@@ -14,7 +14,7 @@
 import { createRequestHandler } from 'react-router';
 import { DurableObject } from 'cloudflare:workers';
 export { ContainerProxy, Sandbox } from '@cloudflare/sandbox';
-import type { Env, Route, RouteContext } from './types.js';
+import type { Env, Route } from './types.js';
 import { handleSlackEventsQueue } from './slack-events-queue.js';
 import type { AppScreenshotJob } from './screenshot-queue.js';
 import type { SlackEventQueueMessage } from './slack-types.js';

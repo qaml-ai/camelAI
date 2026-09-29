@@ -1,232 +1,44 @@
 /**
- * Chat transport access guard regression tests using Cloudflare Vitest pool.
- *
- * The chat transport is HTTP now: an SSE attach admits with 200 +
- * text/event-stream, and a denial is a real status the client can classify as
- * terminal (400/401/403/404) or retryable (409/429/5xx) — replacing the
- * accept-then-close-with-4403 trick the WebSocket upgrade needed.
- *
- * The legacy upgrade routes are gone entirely (2026-08-15), so the guard cases
- * below are joined by removal regressions: an upgrade attempt must 404 without
- * running authorization (the /ws/logs log tail included).
+ * The retired chat transports. Threads run on the agent runtime, so the old
+ * in-DO chat transport (/agents/chat-thread/*: WebSocket, SSE, polling,
+ * calls) answers 410 "moved" to anyone, without running authorization or
+ * reaching ChatThreadDO; any other /agents/ path, and the removed workspace
+ * status and log-tail WebSocket routes, 404 (never the SPA shell).
  */
 
 import { describe, it, expect } from 'vitest';
-import { env, SELF } from 'cloudflare:test';
-import { createSignedSession, type SignedSessionData } from '../src/signed-session';
-import {
-  createUser,
-  createOrg,
-  createInvitation,
-  acceptInvitation,
-  listOrgWorkspaces,
-  setWorkspaceAccess,
-  removeOrgMember,
-  type TestEnv,
-} from './test-helpers';
+import { SELF } from 'cloudflare:test';
 
-const testEmail = () => `test-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`;
-
-describe('Chat transport access guard', () => {
-  const testEnv = env as unknown as TestEnv;
-  const signingSecret = (env as any).TOKEN_SIGNING_SECRET as string;
-
-  async function setupMemberSession() {
-    const ownerEmail = testEmail();
-    const memberEmail = testEmail();
-    const { userId: ownerId } = await createUser(testEnv, ownerEmail, 'password123', 'Owner');
-    const { userId: memberId } = await createUser(testEnv, memberEmail, 'password123', 'Member');
-    const { org } = await createOrg(testEnv, 'WS Access Org', ownerId);
-
-    const invitation = await createInvitation(testEnv, org.id, memberEmail, 'member', ownerId);
-    await acceptInvitation(testEnv, org.id, invitation.id, memberId);
-
-    const workspaces = await listOrgWorkspaces(testEnv, org.id);
-    const workspaceId = workspaces[0]?.id ?? null;
-    const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
-    const thread = await orgStub.createThread(workspaceId!, 'Test thread', memberId);
-
-    // Create a signed session token
-    const sessionData: SignedSessionData = {
-      user_id: memberId,
-      org_id: org.id,
-      workspace_id: workspaceId,
-      created_at: Date.now(),
-      user_name: 'Member',
-      user_email: memberEmail,
-    };
-    const signedToken = await createSignedSession(signingSecret, sessionData);
-
-    return {
-      ownerId,
-      memberId,
-      orgId: org.id,
-      workspaceId: workspaceId!,
-      threadId: thread.id,
-      signedToken,
-    };
-  }
-
-  const attach = (threadId: string, workspaceId: string, signedToken: string) =>
-    SELF.fetch(
-      `http://example/agents/chat-thread/${threadId}/sse?workspaceId=${workspaceId}&_pk=pk-1`,
-      {
-        headers: {
-          Accept: 'text/event-stream',
-          'X-Chiridion-Session-Id': signedToken,
-        },
-      },
-    );
-
-  it('opens the SSE stream for authorized workspace access', async () => {
-    const { workspaceId, threadId, signedToken } = await setupMemberSession();
-
-    const response = await attach(threadId, workspaceId, signedToken);
-
-    expect(response.status).toBe(200);
-    expect(response.headers.get('content-type')).toBe('text/event-stream');
-    expect(response.headers.get('cache-control')).toBe('no-cache, no-transform');
-    // Never read to completion — the stream is long-lived by design.
-    await response.body?.cancel();
+describe('Retired chat transports', () => {
+  it('answers every old chat transport route with moved (410), signed in or not', async () => {
+    for (const [path, init] of [
+      ['/agents/chat-thread/t1?workspaceId=ws1&_pk=pk-ws', { headers: { Upgrade: 'websocket', Connection: 'Upgrade', 'Sec-WebSocket-Version': '13' } }],
+      ['/agents/chat-thread/t1/sse?workspaceId=ws1&_pk=pk-1', { headers: { Accept: 'text/event-stream' } }],
+      ['/agents/chat-thread/t1/sse?transport=poll&_pk=pk-1&cursor=0', {}],
+      ['/agents/chat-thread/t1/call', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }],
+      ['/agents/chat-thread/t1/bogus', {}],
+    ] as const) {
+      const response = await SELF.fetch(`http://example${path}`, init);
+      expect(response.status, path).toBe(410);
+      expect(response.webSocket, path).toBeNull();
+      expect(await response.json(), path).toMatchObject({ status: 'moved' });
+    }
   });
 
-  it('denies the SSE stream for denied workspace access', async () => {
-    const { ownerId, memberId, workspaceId, threadId, signedToken } = await setupMemberSession();
-
-    await setWorkspaceAccess(testEnv, workspaceId, memberId, 'none', ownerId);
-
-    const response = await attach(threadId, workspaceId, signedToken);
-
-    expect(response.status).toBe(403);
-    expect(response.headers.get('content-type')).not.toBe('text/event-stream');
-  });
-
-  it('denies the SSE stream when org membership is removed', async () => {
-    const { ownerId, memberId, orgId, workspaceId, threadId, signedToken } = await setupMemberSession();
-
-    await removeOrgMember(testEnv, orgId, memberId, ownerId);
-
-    const response = await attach(threadId, workspaceId, signedToken);
-
-    expect(response.status).toBe(403);
-  });
-
-  it('strips client-supplied framework routing headers from the attach', async () => {
-    const { workspaceId, threadId, signedToken } = await setupMemberSession();
-
-    // Unlike a WS handshake, an HTTP attach lets the browser set any header.
-    // `x-cf-agents-subagent-url` is the Agents SDK's sub-agent routing input and
-    // is preferred over the connection's own uri, so a forwarded value diverts
-    // the attach out of the chat protocol chain entirely (bye instead of
-    // identity/state/history). The route must not forward it.
-    const response = await SELF.fetch(
-      `http://example/agents/chat-thread/${threadId}/sse?workspaceId=${workspaceId}&_pk=pk-hdr`,
-      {
-        headers: {
-          Accept: 'text/event-stream',
-          'X-Chiridion-Session-Id': signedToken,
-          'x-cf-agents-subagent-url': `http://example/agents/chat-thread/${threadId}/sub/chat-thread-d-o/injected`,
-          'x-partykit-room': 'someone-elses-room',
-        },
-      },
-    );
-
-    expect(response.status).toBe(200);
-    const reader = response.body!.getReader();
-    const first = new TextDecoder().decode((await reader.read()).value);
-    expect(first).toContain('cf_agent_identity');
-    expect(first).not.toContain('event: bye');
-    await reader.cancel();
-  });
-
-  it('rejects an unauthenticated POST send', async () => {
-    const { workspaceId, threadId } = await setupMemberSession();
-
-    const response = await SELF.fetch(
-      `http://example/agents/chat-thread/${threadId}/call?workspaceId=${workspaceId}&_pk=pk-1`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ type: 'rpc', id: 'r1', method: 'requestStop', args: [] }),
-      },
-    );
-
-    expect(response.status).toBe(401);
-  });
-
-  it('404s an /agents/ path that matches no transport route', async () => {
-    const { signedToken } = await setupMemberSession();
-
-    const response = await SELF.fetch('http://example/agents/chat-thread/nope/bogus', {
-      headers: { 'X-Chiridion-Session-Id': signedToken },
-    });
-
+  it('404s an /agents/ path that is no chat thread route', async () => {
+    const response = await SELF.fetch('http://example/agents/other-agent/x');
     // A miss must not fall through to the SPA shell (200 text/html).
     expect(response.status).toBe(404);
   });
 
-  it('upgrades an authorized chat WebSocket', async () => {
-    const { workspaceId, threadId, signedToken } = await setupMemberSession();
-
-    const response = await SELF.fetch(
-      `http://example/agents/chat-thread/${threadId}?workspaceId=${workspaceId}&_pk=pk-ws`,
-      {
-        headers: {
-          Upgrade: 'websocket',
-          Connection: 'Upgrade',
-          'Sec-WebSocket-Version': '13',
-          'X-Chiridion-Session-Id': signedToken,
-        },
-      },
-    );
-
-    expect(response.status).toBe(101);
-    expect(response.webSocket).not.toBeNull();
-    response.webSocket!.accept();
-    response.webSocket!.close();
-  });
-
-  it('rejects a foreign-origin socket even with a valid session', async () => {
-    const { workspaceId, threadId, signedToken } = await setupMemberSession();
-    const response = await SELF.fetch(
-      `http://example/agents/chat-thread/${threadId}?workspaceId=${workspaceId}`,
-      { headers: { Upgrade: 'websocket', Origin: 'https://untrusted.example', 'X-Chiridion-Session-Id': signedToken } },
-    );
-    expect(response.status).toBe(403);
-    expect(response.webSocket).toBeNull();
-  });
-
-  it('denies an unauthenticated chat WebSocket upgrade', async () => {
-    const { workspaceId, threadId } = await setupMemberSession();
-
-    const response = await SELF.fetch(
-      `http://example/agents/chat-thread/${threadId}?workspaceId=${workspaceId}&_pk=pk-ws`,
-      {
-        headers: {
-          Upgrade: 'websocket',
-          Connection: 'Upgrade',
-          'Sec-WebSocket-Version': '13',
-        },
-      },
-    );
-
-    expect(response.status).toBe(401);
-    expect(response.webSocket).toBeNull();
-  });
-
   it('404s the removed workspace status WebSocket route', async () => {
-    const { workspaceId, signedToken } = await setupMemberSession();
-
-    const response = await SELF.fetch(
-      `http://example/ws/workspaces/${encodeURIComponent(workspaceId)}/status`,
-      {
-        headers: {
-          Upgrade: 'websocket',
-          Connection: 'Upgrade',
-          'Sec-WebSocket-Version': '13',
-          'X-Chiridion-Session-Id': signedToken,
-        },
+    const response = await SELF.fetch('http://example/ws/workspaces/ws1/status', {
+      headers: {
+        Upgrade: 'websocket',
+        Connection: 'Upgrade',
+        'Sec-WebSocket-Version': '13',
       },
-    );
+    });
 
     expect(response.status).toBe(404);
     expect(response.webSocket).toBeNull();

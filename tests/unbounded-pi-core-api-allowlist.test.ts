@@ -47,7 +47,7 @@ describe('unbounded pi_core API quarantine', () => {
           'const everything = await this.deps.getPiCoreParsedMessages(threadId);',
         ].join('\n'),
       },
-      { 'workers/main/src/chat-thread-do.ts': { getPiCoreParsedMessages: ALLOWLIST['workers/main/src/chat-thread-do.ts'].getPiCoreParsedMessages } },
+      { 'workers/main/src/chat-thread-do.ts': { getPiCoreParsedMessages: { count: 2, why: 'a declaration and one caller' } } },
     );
 
     expect(violations).toHaveLength(1);
@@ -61,7 +61,7 @@ describe('unbounded pi_core API quarantine', () => {
         'workers/main/src/chat-thread-do.ts':
           'getPiCoreParsedMessages(threadId: string): Promise<unknown[]>;',
       },
-      { 'workers/main/src/chat-thread-do.ts': { getPiCoreParsedMessages: ALLOWLIST['workers/main/src/chat-thread-do.ts'].getPiCoreParsedMessages } },
+      { 'workers/main/src/chat-thread-do.ts': { getPiCoreParsedMessages: { count: 2, why: 'a declaration and one caller' } } },
     );
 
     expect(violations).toHaveLength(1);

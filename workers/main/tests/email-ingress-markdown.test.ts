@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+// Channel turns start on the agent runtime; recorded here through the env's CHAT_THREAD double.
+vi.mock("../src/agent-runtime/channel-turns.js", async (importOriginal) =>
+  (await import("./helpers/channel-turn-recorder")).recordChannelTurns(await importOriginal<object>()));
+
 const {
   mockStartInitialUserMessage,
   mockGetWorkspaceStub,

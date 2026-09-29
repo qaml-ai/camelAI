@@ -37,6 +37,11 @@ vi.mock("@/lib/chat-do.server", () => ({
   setThreadPreviewTarget: vi.fn(),
 }));
 
+// New threads are pinned to the agent runtime as they are made.
+vi.mock("@/lib/runtime-threads.server", () => ({
+  pinNewWebThread: vi.fn(async () => ({ threadId: "thread_123", agentId: null, model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 })),
+}));
+
 vi.mock("@/lib/chat-groups.server", () => ({
   addThreadToExistingGroup: addThreadToExistingGroupMock,
   createGroupForNewThread: createGroupForNewThreadMock,

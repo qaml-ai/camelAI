@@ -106,19 +106,10 @@ describe("agent MCP", () => {
     const result = await rt.callTool(handler, MCP_URL, "list_projects", {}, { ...ALICE, actor: "user2" });
     expect(validate).toHaveBeenCalledWith("user2", "ws1", "thread1");
     expect(tools).toHaveBeenCalledWith({
-      orgId: "org1", workspaceId: "ws1", threadId: "thread1", userId: "user2", allowWebTools: false,
+      orgId: "org1", workspaceId: "ws1", threadId: "thread1", userId: "user2",
     });
     expect(callToolEnvelope).toHaveBeenCalledWith("list_projects", {});
     expect(result).toEqual({ content: [{ type: "text", text: '{"projects":["a"]}' }], structuredContent: { projects: ["a"] } });
-  });
-
-  it("tells the tools when the thread runs on the runtime without a ChatThreadDO", async () => {
-    const runtime = { threadId: "thread1", agentId: "agt_1", model: "m", keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
-    const { handler, tools } = setup({
-      access: (_user, workspaceId, threadId) => ({ ...allowed(_user, workspaceId, threadId), runtime }) as Access,
-    });
-    await rt.callTool(handler, MCP_URL, "list_projects", {}, ALICE);
-    expect(tools).toHaveBeenCalledWith(expect.objectContaining({ threadId: "thread1", directRuntime: true }));
   });
 
   it("keeps a runtime thread marked running while a tool call is in flight", async () => {

@@ -653,7 +653,7 @@ describe("connections action admin guard", () => {
     expect(config).not.toHaveProperty("activation_attempt_id");
   });
 
-  it("completes a pending chat setup exactly once after confirmation and exact binding persistence", async () => {
+  it("clears a pending chat setup once after confirmation and exact binding persistence", async () => {
     isOrgAdminMock.mockResolvedValue(true);
     let record = makeRecord({
       integration_type: "discord_channel",
@@ -745,20 +745,15 @@ describe("connections action admin guard", () => {
       success: true,
       returnTo: "/chat/thread-1",
     });
-    expect(receiveConnectionSetupResponse).toHaveBeenCalledOnce();
-    expect(receiveConnectionSetupResponse).toHaveBeenCalledWith(
-      expect.objectContaining({
-        requestId: "request-1",
-        cancelled: false,
-      }),
-    );
+    // The chat that asked runs on the agent runtime: nothing waits in ChatThreadDO.
+    expect(receiveConnectionSetupResponse).not.toHaveBeenCalled();
     expect(JSON.parse(record.config)).not.toHaveProperty("pending_setup");
     await expect(activate()).resolves.toEqual({ success: true });
-    expect(receiveConnectionSetupResponse).toHaveBeenCalledOnce();
+    expect(receiveConnectionSetupResponse).not.toHaveBeenCalled();
     expect(mutationPaths.filter((path) => path === "/internal/v1/bindings/activate")).toHaveLength(1);
   });
 
-  it("retries setup cleanup after the chat response was already accepted", async () => {
+  it("retries setup cleanup after a failed record write", async () => {
     isOrgAdminMock.mockResolvedValue(true);
     let record = makeRecord({
       integration_type: "discord_channel",
@@ -837,79 +832,8 @@ describe("connections action admin guard", () => {
       success: true,
       returnTo: "/chat/thread-1",
     });
-    expect(receiveConnectionSetupResponse).toHaveBeenCalledTimes(2);
+    expect(receiveConnectionSetupResponse).not.toHaveBeenCalled();
     expect(JSON.parse(record.config)).not.toHaveProperty("pending_setup");
-  });
-
-  it("retains pending chat setup when the original chat turn cannot be resumed", async () => {
-    isOrgAdminMock.mockResolvedValue(true);
-    const record = makeRecord({
-      integration_type: "discord_channel",
-      name: "Example Guild #camel",
-      category: "communication",
-      auth_method: "oauth2",
-      config: JSON.stringify({
-        schema_version: 1,
-        status: "active",
-        application_id: "123456789012345678",
-        guild_id: "guild_1",
-        guild_name: "Example Guild",
-        parent_channel_id: "channel_1",
-        parent_channel_name: "camel",
-        bot_user_id: "123456789012345678",
-        binding_version: 7,
-        message_content_mode: "full",
-        pending_setup: {
-          request_id: "request-1",
-          thread_id: "thread-1",
-          return_path: "/chat/thread-1",
-          created_at: 123,
-        },
-      }),
-    });
-    getIntegrationMock.mockResolvedValue(record);
-    const binding = {
-      guildId: "guild_1",
-      parentChannelId: "channel_1",
-      integrationId: "int_1",
-      orgId: "org_1",
-      workspaceId: "ws_1",
-      guildName: "Example Guild",
-      parentChannelName: "camel",
-      status: "active",
-      version: 7,
-    };
-    const receiveConnectionSetupResponse = vi.fn(async () => ({ accepted: false }));
-    const bridgeFetch = vi.fn(async (request: Request) => {
-      expect(request.method).toBe("GET");
-      expect(new URL(request.url).pathname).toBe("/internal/v1/bindings/int_1");
-      return Response.json({ ok: true, binding });
-    });
-    setEnv({
-      DISCORD_CHANNEL_ENABLED: "true",
-      DISCORD_BRIDGE: { fetch: bridgeFetch },
-      CHAT_THREAD: {
-        idFromName: vi.fn((id: string) => id),
-        get: vi.fn(() => ({ receiveConnectionSetupResponse })),
-      },
-    });
-
-    await expect(action({
-      request: postForm({
-        intent: "discordActivateChannel",
-        integrationId: "int_1",
-        parentChannelId: "channel_1",
-        securityAcknowledged: "true",
-      }),
-      context: {},
-      params: {},
-    } as never)).resolves.toEqual({
-      error: "Discord is connected, but the original chat setup request could not be resumed. Retry Connect channel.",
-    });
-
-    expect(receiveConnectionSetupResponse).toHaveBeenCalledOnce();
-    expect(updateIntegrationMock).not.toHaveBeenCalled();
-    expect(JSON.parse(record.config)).toHaveProperty("pending_setup");
   });
 
   it("keeps an activated bridge binding when product projection persistence fails", async () => {

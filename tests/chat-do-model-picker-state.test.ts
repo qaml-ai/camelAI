@@ -907,75 +907,7 @@ describe('getWorkspaceModelPickerState rollout compatibility', () => {
     });
   });
 
-  it('generates a chat group avatar after app-side title generation', async () => {
-    vi.mocked(generateThreadTitleWithOpenAI).mockResolvedValue(
-      'Database Migrations',
-    );
-    const workspaceStub = {
-      getInfo: vi.fn().mockResolvedValue({ org_id: 'org_123' }),
-    };
-    const orgStub = {
-      updateThread: vi.fn().mockResolvedValue({ updated_at: 123 }),
-      getThreadRuntime: vi.fn().mockResolvedValue(null),
-    };
-    const userStub = {
-      renameEmptySingleThreadGroupForThread: vi.fn().mockResolvedValue(undefined),
-    };
-    const threadStub = {
-      setTitle: vi.fn().mockResolvedValue(undefined),
-      generateChatGroupAvatarForThread: vi.fn().mockResolvedValue(undefined),
-    };
-
-    getEnvMock.mockReturnValue({
-      AI: { run: vi.fn() },
-      CF_GATEWAY_NAME: 'gateway_1',
-      WORKSPACE: {
-        idFromName: (id: string) => id,
-        get: () => workspaceStub,
-      },
-      ORG: {
-        idFromName: (id: string) => id,
-        get: () => orgStub,
-      },
-      USER: {
-        idFromName: (id: string) => id,
-        get: () => userStub,
-      },
-      CHAT_THREAD: {
-        idFromName: (id: string) => id,
-        get: () => threadStub,
-      },
-    });
-
-    await generateThreadTitle(
-      {},
-      'thread_123',
-      'ws_123',
-      'help me plan database migrations',
-      'user_123',
-    );
-
-    expect(orgStub.updateThread).toHaveBeenCalledWith(
-      'thread_123',
-      'Database Migrations',
-    );
-    expect(userStub.renameEmptySingleThreadGroupForThread).toHaveBeenCalledWith(
-      'thread_123',
-      'Database Migrations',
-    );
-    expect(threadStub.setTitle).toHaveBeenCalledWith(
-      'Database Migrations',
-      123,
-    );
-    expect(threadStub.generateChatGroupAvatarForThread).toHaveBeenCalledWith({
-      threadId: 'thread_123',
-      workspaceId: 'ws_123',
-      orgId: 'org_123',
-      userId: 'user_123',
-    });
-  });
-
-  it('titles a runtime thread without waking ChatThreadDO, and makes its group avatar outside it', async () => {
+  it('titles a thread without waking ChatThreadDO, and makes its group avatar outside it', async () => {
     vi.mocked(generateThreadTitleWithOpenAI).mockResolvedValue('Database Migrations');
     const orgStub = {
       updateThread: vi.fn().mockResolvedValue({ updated_at: 123 }),

@@ -1,7 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import type { WorkspaceFilesystemDO } from "../../src/workspace-filesystem-do";
 import { createOrg, createUser, type TestEnv } from "../test-helpers";
 import {
@@ -25,9 +24,9 @@ import {
   seedDoProjectFiles,
   usedTool,
 } from "./project-eval-helpers";
+import { runRuntimeEval } from "./runtime-eval";
 
 type MetricsNotebookEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   R2_BUCKET: R2Bucket;
   RUN_AGENT_EVALS?: string;
@@ -157,8 +156,7 @@ describe("metrics ground-truth notebook agent eval", () => {
       const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
       await configureEvalModel(testEnv, orgStub, userId);
       const thread = await orgStub.createThread(defaultWorkspaceId, "Metrics ground truth notebook eval", userId, undefined, testEnv.EVAL_MODEL);
-      const chatThread = testEnv.CHAT_THREAD.get(testEnv.CHAT_THREAD.idFromName(thread.id));
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

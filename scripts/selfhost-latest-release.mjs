@@ -14,6 +14,8 @@ export const SELFHOST_IMAGE_ENV_BY_MANIFEST_KEY = Object.freeze({
   "container-egress": "SELFHOST_CONTAINER_EGRESS_IMAGE",
   caddy: "SELFHOST_CADDY_IMAGE",
   pomerium: "SELFHOST_POMERIUM_IMAGE",
+  "agent-runtime": "SELFHOST_AGENT_RUNTIME_IMAGE",
+  "agent-runtime-postgres": "SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE",
 });
 
 export async function downloadLatestReleaseManifest({

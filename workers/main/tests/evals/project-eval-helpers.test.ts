@@ -10,6 +10,7 @@ import {
   hasSuccessfulNotebookRun,
   jsExecCodeMentionsTool,
   legacyDeployPathEvidence,
+  readSkillWithTool,
   runtimeItemSucceeded,
   runtimeToolMentionOrder,
   runtimeToolReferenceOrder,
@@ -86,6 +87,24 @@ describe("project eval runtime evidence extraction", () => {
     expect(jsExecCodeMentionsTool("await tools.list_apps({});", "list_apps")).toBe(true);
     expect(jsExecCodeMentionsTool("await tools['set_preview']({});", "set_preview")).toBe(true);
     expect(jsExecCodeMentionsTool('await callTool("list_apps", {});', "list_apps")).toBe(true);
+  });
+
+  it("sees a skill read with read_skill, directly or from code", () => {
+    const item = (fields: Record<string, unknown>) => ({
+      type: "runtime_event",
+      event: { method: "item/completed", params: { item: { status: "completed", ...fields } } },
+    });
+    expect(readSkillWithTool([item({ tool: "read_skill", arguments: { skill: "developing-software" } })], "developing-software")).toBe(true);
+    expect(readSkillWithTool([item({ tool: "read_skill", arguments: { skill: "developing-software", file: "VANILLA-APPS.md" } })], "developing-software")).toBe(false);
+    expect(readSkillWithTool([item({ tool: "js_exec", arguments: { code: 'return await tools.camel__read_skill({skill:"developing-software"});' } })], "developing-software")).toBe(true);
+    expect(readSkillWithTool([item({ tool: "js_exec", arguments: { code: 'await tools.camel__read_skill({skill:"developing-software", file:"CRUD.md"});' } })], "developing-software")).toBe(false);
+    expect(readSkillWithTool([item({ tool: "read_skill", status: "failed", isError: true, arguments: { skill: "developing-software" } })], "developing-software")).toBe(false);
+  });
+
+  it("accepts the agent runtime's server-prefixed tool names in code", () => {
+    expect(jsExecCodeMentionsTool("await tools.camel__list_commits({ project: 'p' });", "list_commits")).toBe(true);
+    expect(jsExecCodeMentionsTool("await tools['camel__set_preview']({});", "set_preview")).toBe(true);
+    expect(jsExecCodeMentionsTool("await tools.camel__list_commits_all({});", "list_commits")).toBe(false);
   });
 
   it("matches direct and js_exec tool calls that reference the expected path", () => {

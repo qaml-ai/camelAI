@@ -9,6 +9,13 @@ import {
 } from "./lib/eval-llm-judge.mjs";
 import { extractVitestUnhandledErrors } from "./eval-harness-errors.mjs";
 import { createEvalTranscriptCapture } from "./lib/eval-transcript-capture.mjs";
+import { evalRuntimeVitestEnv } from "./lib/eval-runtime.mjs";
+
+// Every eval's thread runs on a local agent runtime (Docker; see
+// scripts/runtime-eval-harness.mjs), as chiridion threads run on the hosted
+// one: the eval tests call runRuntimeEval (workers/main/tests/evals/runtime-eval.ts),
+// and chiridion (in the vitest workers pool) serves the agent's tools through
+// the eval relay. The runtime is brought up here when it is not already.
 
 // Workaround for cloudflare/workerd#6793: the stock proxy-everything egress sidecar's TPROXY rules
 // intercept docker bridge control traffic on newer hosts (e.g. kernel 6.17 / Docker 29.x), so the
@@ -119,6 +126,11 @@ const configFor = (id) => ({
   endMarker: END_MARKER,
 });
 
+if (process.argv.slice(2).includes("--list")) {
+  for (const id of evalIds) console.log(id);
+  process.exit(0);
+}
+
 const firstArg = process.argv[2];
 const evalName = firstArg && !firstArg.startsWith("--") ? firstArg : "project-write-file-live";
 const cliArgs = process.argv.slice(firstArg && !firstArg.startsWith("--") ? 3 : 2);
@@ -126,10 +138,16 @@ const cliArgs = process.argv.slice(firstArg && !firstArg.startsWith("--") ? 3 : 
 function usage() {
   console.log(`Usage: node scripts/run-agent-eval.mjs [eval-name] [options]
 
+Runs the eval on the local agent runtime (started if needed; stop it with
+node scripts/runtime-eval-harness.mjs down).
+
 Available evals: ${evalIds.join(", ")}
 
 Options:
-  --model <id>              Thread model id, for example gpt-6-luna, sonnet, custom
+  --list                    Print the available evals, one per line, and exit
+  --model <id>              Thread model id, for example gpt-6-luna, sonnet. It must have a
+                            runtime route (hosted OpenRouter models, BYOK Anthropic/OpenAI/
+                            OpenRouter/Bedrock); custom endpoints have none
   --custom-base-url <url>   Base URL for EVAL_MODEL=custom
   --custom-api-key <key>    API key for EVAL_MODEL=custom
   --custom-api <api>        openai-completions, openai-responses, or anthropic-messages
@@ -280,6 +298,31 @@ const evalEnv = withLoadedEvalEnv({
   ...process.env,
   ...parseOptions(cliArgs),
 });
+
+const runtimeBlocked = manifestEvalById.get(evalName)?.runtimeBlocked;
+if (runtimeBlocked && evalEnv.EVAL_RUN_BLOCKED !== "1") {
+  // Not a failure and not reported: there is nothing on the runtime to grade.
+  console.log(`Skipping "${evalName}": blocked on the agent runtime. ${runtimeBlocked} (EVAL_RUN_BLOCKED=1 runs it anyway.)`);
+  process.exit(0);
+}
+
+if (evalEnv.EVAL_MODEL === "custom") {
+  console.error(
+    "EVAL_MODEL=custom cannot run on the agent runtime: custom endpoints have no runtime route (agent-runtime/model-routes.ts).",
+  );
+  process.exit(1);
+}
+
+let runtimeEnv;
+try {
+  runtimeEnv = await evalRuntimeVitestEnv();
+} catch (error) {
+  console.error(
+    `Could not start the local agent runtime: ${error instanceof Error ? error.message : String(error)}\n` +
+      "See node scripts/runtime-eval-harness.mjs --help.",
+  );
+  process.exit(1);
+}
 
 ensureAnalysisSandboxImage(evalName);
 ensureNotebookRendererAssets(evalName);
@@ -462,6 +505,7 @@ const child = spawn(
     cwd: path.resolve("."),
     env: {
       ...evalEnv,
+      ...runtimeEnv,
       RUN_AGENT_EVALS: "1",
       EVAL_ARTIFACT_DIR: artifactDir,
     },

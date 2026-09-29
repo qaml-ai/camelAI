@@ -24,8 +24,8 @@ import {
   getEvalTimeoutMs,
   type EvalModelEnv,
 } from "./model-config";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import { succeededWithTool, usedTool } from "./project-eval-helpers";
+import { runRuntimeEval } from "./runtime-eval";
 
 // This eval exercises the custom-domain tools (get_custom_domain). Those tools live in
 // the "domains" category, which the lean tool surface (now the default) drops from the
@@ -35,7 +35,6 @@ import { succeededWithTool, usedTool } from "./project-eval-helpers";
 // the discriminating signal is whether the agent found and called the dropped tool.
 
 type CustomDomainEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   RUN_AGENT_EVALS?: string;
 };
 
@@ -70,10 +69,7 @@ describe("custom domain agent eval", () => {
         testEnv.EVAL_MODEL,
       );
 
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

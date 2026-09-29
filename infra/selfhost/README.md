@@ -427,10 +427,16 @@ it to localhost by default; never widen its host allowlist on a shared VM.
 
 ## Operations
 
+Chat threads run on the bundled agent runtime (`agent-runtime` and
+`agent-runtime-postgres`, private on loopback); see "Upgrading to the
+runtime" in [SELF_HOSTING.md](../../SELF_HOSTING.md) for what it adds and how
+existing installs move to it.
+
 Health and logs:
 
 ```bash
 curl --fail http://127.0.0.1:3001/api/selfhost/health
+curl --fail http://127.0.0.1:8790/healthz
 docker compose --env-file .env.selfhost -f docker-compose.selfhost.yml ps
 docker compose --env-file .env.selfhost \
   -f docker-compose.selfhost.yml \

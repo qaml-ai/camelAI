@@ -5,7 +5,7 @@ import { LLM_MODEL_OPTIONS } from "../../../src/lib/llm-provider-config";
 import { PiModelMapping } from "../src/pi-model-resolution";
 import { runtimeModelRoute } from "../src/agent-runtime/model-routes";
 import type { PiResolvedModelConfig } from "../src/chat-thread/pi-model-config";
-import { hostedModelHeaders, hostedScopeProviders, orgScopeProviders, syncKeyScope, syncOrgKeyScope, type KeyScopeEnv } from "../src/agent-runtime/key-scopes";
+import { customEndpointRunsOnRuntime, hostedModelHeaders, hostedScopeProviders, orgScopeProviders, selfhostOperatorEndpointOrigin, syncKeyScope, syncOrgKeyScope, type KeyScopeEnv } from "../src/agent-runtime/key-scopes";
 
 const SECRET = "test-integration-secret-key-for-key-scope-tests";
 
@@ -286,5 +286,72 @@ describe("syncKeyScope", () => {
       "PUT /v1/key-scopes/org_org10/model-providers/bedrock-openai-us-east-2",
     ]);
     expect(runtime.calls[1].body).toMatchObject({ type: "openai-responses", baseUrl: "https://bedrock-mantle.us-east-2.api.aws/openai/v1", apiKey: "bedrock-key" });
+  });
+});
+
+describe("self-host key scopes", () => {
+  const selfhost = (extra: Record<string, string>) => ({ CF_ACCOUNT_ID: "selfhost", CF_DISPATCH_NAMESPACE: "selfhost", ...extra });
+
+  it("syncs every org's scope from the operator's provider (SELFHOST_AI_*), whatever the org stored", async () => {
+    const { kv } = memoryKv();
+    const runtime = fakeRuntime();
+    const stored = await record("openai", { api_key: "sk-org-own" });
+    await syncOrgKeyScope(env(kv, selfhost({ SELFHOST_AI_PROVIDER: "anthropic", SELFHOST_AI_API_KEY: "sk-ant-operator" })), "org11", stored, runtime.fetch);
+    expect(runtime.calls).toMatchObject([
+      { method: "PUT", path: "/v1/key-scopes/org_org11/providers/anthropic", body: { apiKey: "sk-ant-operator" } },
+    ]);
+  });
+
+  it("declares a self-host custom endpoint on the private network over plain http, which the bundled runtime may call", async () => {
+    const { kv } = memoryKv();
+    const runtime = fakeRuntime();
+    await syncOrgKeyScope(env(kv, selfhost({
+      SELFHOST_AI_PROVIDER: "custom",
+      SELFHOST_AI_API_KEY: "sk-vllm",
+      SELFHOST_AI_BASE_URL: "http://10.1.2.3:8000/v1",
+      SELFHOST_AI_MODEL: "qwen-coder",
+      SELFHOST_AI_API: "openai-completions",
+    })), "org12", null, runtime.fetch);
+    expect(runtime.calls).toMatchObject([{ method: "PUT", path: "/v1/key-scopes/org_org12/model-providers/custom" }]);
+    expect(runtime.calls[0].body).toMatchObject({ type: "openai-completions", baseUrl: "http://10.1.2.3:8000/v1", apiKey: "sk-vllm" });
+    // Outside self-host, custom endpoints still need https.
+    expect(await orgScopeProviders(env(kv), await record("custom", { api_key: "k" }, {
+      custom_api: "openai-completions", custom_base_url: "http://10.1.2.3:8000/v1", custom_model_id: "qwen-coder",
+    }))).toEqual({ providers: {}, modelProviders: {} });
+  });
+
+  it("routes an http custom endpoint to the runtime only when it is the operator's own (SELFHOST_AI_*)", () => {
+    const config = (baseUrl: string) => ({
+      model: { provider: "custom", api: "openai-completions", id: "qwen-coder", baseUrl },
+      apiKey: "sk-vllm",
+      billingSource: "byok",
+      usageProvider: "custom",
+      headers: { Authorization: "Bearer sk-vllm" },
+    } as unknown as PiResolvedModelConfig);
+    const operator = selfhostOperatorEndpointOrigin(selfhost({
+      SELFHOST_AI_PROVIDER: "custom", SELFHOST_AI_API_KEY: "sk-vllm", SELFHOST_AI_BASE_URL: "http://10.1.2.3:8000/v1", SELFHOST_AI_MODEL: "qwen-coder",
+    }) as never);
+    expect(operator).toBe("http://10.1.2.3:8000");
+    expect(runtimeModelRoute(config("http://10.1.2.3:8000/v1"), { orgId: "o1", operatorEndpointOrigin: operator }))
+      .toEqual({ kind: "scope", model: "custom/qwen-coder", keyScope: "org_o1" });
+    // Any other http endpoint (an org's own) is not the operator's.
+    expect(runtimeModelRoute(config("http://10.9.9.9:8000/v1"), { orgId: "o1", operatorEndpointOrigin: operator })).toBeNull();
+    expect(runtimeModelRoute(config("http://10.1.2.3:8000/v1"), { orgId: "o1" })).toBeNull();
+    // Outside self-host there is no operator endpoint.
+    expect(selfhostOperatorEndpointOrigin({ SELFHOST_AI_PROVIDER: "custom", SELFHOST_AI_BASE_URL: "http://10.1.2.3:8000/v1" } as never)).toBeNull();
+  });
+
+  it("refuses org-supplied endpoints on loopback, even over https, and keeps them to https on self-host", async () => {
+    const { kv } = memoryKv();
+    for (const baseUrl of ["https://127.0.0.1:8790/v1", "https://localhost/v1", "https://[::1]:3001/v1", "https://api.localhost/v1", "https://0.0.0.0/v1"]) {
+      expect(customEndpointRunsOnRuntime("openai-completions", "bearer", baseUrl)).toBe(false);
+    }
+    expect(customEndpointRunsOnRuntime("openai-completions", "bearer", "https://llm.example.com/v1")).toBe(true);
+    // An org's own settings on a self-host install without an operator provider: no plain http.
+    expect(await orgScopeProviders(env(kv, selfhost({})), await record("custom", { api_key: "k" }, {
+      custom_api: "openai-completions", custom_base_url: "http://10.1.2.3:8000/v1", custom_model_id: "qwen-coder",
+    }))).toEqual({ providers: {}, modelProviders: {} });
+    // The operator's own endpoint may be on loopback (a vLLM beside the app).
+    expect(customEndpointRunsOnRuntime("openai-completions", "bearer", "http://127.0.0.1:8000/v1", "http://127.0.0.1:8000")).toBe(true);
   });
 });

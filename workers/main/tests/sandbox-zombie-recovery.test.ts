@@ -5,6 +5,8 @@ import {
   createSandboxZombieHealState,
   forceSandboxZombieRestart,
   healZombieSandboxContainer,
+  LEGACY_SANDBOX_ZOMBIE_RESTART_EVENT,
+  sandboxInstanceName,
   SandboxSessionDeathTracker,
   withZombieSelfHeal,
   SANDBOX_ZOMBIE_EXEC_DEATH_THRESHOLD,
@@ -350,7 +352,7 @@ describe("wedged teardown escalation", () => {
 });
 
 describe("healZombieSandboxContainer", () => {
-  it("emits build_sandbox_zombie_restart with the trigger and operation", async () => {
+  it("emits sandbox_zombie_restart (and the legacy name) with the trigger and operation", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const { sandbox, destroy, writeDataPoint } = createSandbox();
@@ -363,15 +365,62 @@ describe("healZombieSandboxContainer", () => {
 
       expect(outcome.restarted).toBe(true);
       expect(destroy).toHaveBeenCalledTimes(1);
-      expect(writeDataPoint).toHaveBeenCalledTimes(1);
+      expect(writeDataPoint).toHaveBeenCalledTimes(2);
+      const names = writeDataPoint.mock.calls.map((call) => (call[0].blobs as string[])[0]);
+      expect(names).toEqual([SANDBOX_ZOMBIE_RESTART_EVENT, LEGACY_SANDBOX_ZOMBIE_RESTART_EVENT]);
+      expect(SANDBOX_ZOMBIE_RESTART_EVENT).toBe("sandbox_zombie_restart");
+      expect(LEGACY_SANDBOX_ZOMBIE_RESTART_EVENT).toBe("build_sandbox_zombie_restart");
       const blobs = writeDataPoint.mock.calls[0][0].blobs as string[];
-      expect(blobs).toContain(SANDBOX_ZOMBIE_RESTART_EVENT);
       expect(blobs).toContain("ProjectBuildSandbox");
       expect(blobs).toContain("readiness_probe");
       expect(blobs).toContain("probe_session_death");
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it("stamps the tenant from the sandbox scope", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { sandbox, writeDataPoint } = createSandbox();
+
+      await healZombieSandboxContainer(
+        { ...sandbox, scope: () => ({ workspaceId: "ws-123", orgId: "org-9" }) },
+        "AnalysisSandbox",
+        { operation: "ensure_mounted", trigger: "mount_io_error" },
+      );
+
+      for (const [point] of writeDataPoint.mock.calls) {
+        expect(point.blobs).toContain("ws-123");
+        expect(point.blobs).toContain("org-9");
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("still heals when the scope lookup throws", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { sandbox, destroy } = createSandbox();
+
+      const outcome = await healZombieSandboxContainer(
+        { ...sandbox, scope: () => { throw new Error("no name yet"); } },
+        "AnalysisSandbox",
+        { operation: "exec", trigger: "exec_session_death" },
+      );
+
+      expect(outcome.restarted).toBe(true);
+      expect(destroy).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("reads the sandbox name the SDK recorded, else the DO id name", () => {
+    expect(sandboxInstanceName({ sandboxName: "ws-1" })).toBe("ws-1");
+    expect(sandboxInstanceName({ sandboxName: null, ctx: { id: { name: "org-acme" } } })).toBe("org-acme");
+    expect(sandboxInstanceName({ ctx: { id: {} } })).toBeUndefined();
   });
 
   it("emits the same event for a DbQuerySandbox setup-deadline restart", async () => {
@@ -434,7 +483,8 @@ describe("healZombieSandboxContainer destroy bound", () => {
       // The cooldown was stamped before the destroy, so abandoning the wait
       // cannot become a restart loop.
       expect(store.get(SANDBOX_ZOMBIE_RESTART_AT_KEY)).toBeGreaterThan(0);
-      expect(writeDataPoint).toHaveBeenCalledTimes(1);
+      // One restart, written under the new and the legacy event name.
+      expect(writeDataPoint).toHaveBeenCalledTimes(2);
     } finally {
       warn.mockRestore();
       vi.useRealTimers();

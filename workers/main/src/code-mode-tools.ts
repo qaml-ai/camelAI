@@ -2326,7 +2326,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     // A permanently broken container is a configuration problem, not a slow
     // boot — it gets its own event so cold-start dashboards stay boot-shaped.
     // Same for a zombie: the wait is real, but the cause is a dead shell layer,
-    // and the DO's own build_sandbox_zombie_restart records what was done.
+    // and the DO's own sandbox_zombie_restart records what was done.
     const eventName = event.type === "cold_start"
       ? "build_sandbox_cold_start"
       : event.type === "zombie_detected"

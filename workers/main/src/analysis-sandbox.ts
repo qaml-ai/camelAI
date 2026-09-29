@@ -19,9 +19,11 @@ import {
   createSandboxZombieHealState,
   createZombieHealTarget,
   healZombieSandboxContainer,
+  sandboxInstanceName,
   SandboxSessionDeathTracker,
   SANDBOX_ZOMBIE_EXEC_DEATH_THRESHOLD,
   withZombieSelfHeal,
+  type SandboxTelemetryScope,
   type SandboxZombieRestartOutcome,
   type SandboxZombieRestartRequest,
   type SandboxZombieRestartTrigger,
@@ -367,6 +369,8 @@ export interface MountSelfHealHost {
   /** The sandbox's cooldown-fenced container restart. */
   heal(request: SandboxZombieRestartRequest): Promise<SandboxZombieRestartOutcome>;
   env: ObservabilityEnv;
+  /** Tenant for the recovery event. */
+  scope?: SandboxTelemetryScope;
 }
 
 /**
@@ -398,6 +402,8 @@ export async function mountWithSelfHeal(
       status,
       path: mountPath,
       errorName: trigger ?? null,
+      workspaceId: host.scope?.workspaceId,
+      orgId: host.scope?.orgId,
       ...(failed ? { errorMessage: errorToObservabilityFields(error).errorMessage } : {}),
     });
   };
@@ -634,7 +640,14 @@ export class AnalysisSandbox extends Sandbox<Env> {
       destroy: () => this.destroy(),
       healState: this.zombieHealState,
       onContainerDestroyed: () => this.forgetDestroyedContainerState(),
+      scope: () => this.telemetryScope,
     });
+  }
+
+  /** The workspace this container serves (`<ws>` or `app-<ws>`), for telemetry. */
+  private get telemetryScope(): SandboxTelemetryScope {
+    const name = sandboxInstanceName(this);
+    return name ? { workspaceId: name.replace(/^app-/, "") } : {};
   }
 
   /**
@@ -740,6 +753,7 @@ export class AnalysisSandbox extends Sandbox<Env> {
           component: "AnalysisSandbox",
           heal: (request) => healZombieSandboxContainer(this.zombieHealTarget, "AnalysisSandbox", request),
           env: this.env,
+          scope: this.telemetryScope,
         },
         bucketBinding,
         actualMountPath,

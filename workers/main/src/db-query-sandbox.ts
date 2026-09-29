@@ -15,6 +15,8 @@ import {
   createSandboxZombieHealState,
   createZombieHealTarget,
   healZombieSandboxContainer,
+  sandboxInstanceName,
+  type SandboxTelemetryScope,
   type SandboxZombieRestartOutcome,
   type ZombieHealableSandbox,
 } from "./sandbox-zombie-recovery.js";
@@ -142,7 +144,14 @@ export class DbQuerySandbox extends Sandbox<Env> {
       // `destroy()` does not synchronously run `onStop`; drop the mount
       // verdicts for the dead container here too.
       onContainerDestroyed: () => this.clearMountBookkeeping(),
+      scope: () => this.telemetryScope,
     });
+  }
+
+  /** The workspace this container serves (`ws-<ws>`), for telemetry. */
+  private get telemetryScope(): SandboxTelemetryScope {
+    const name = sandboxInstanceName(this);
+    return name ? { workspaceId: name.replace(/^ws-/, "") } : {};
   }
 
   /**
@@ -208,6 +217,7 @@ export class DbQuerySandbox extends Sandbox<Env> {
           component: "DbQuerySandbox",
           heal: (request) => healZombieSandboxContainer(this.zombieHealTarget, "DbQuerySandbox", request),
           env: this.env,
+          scope: this.telemetryScope,
         },
         WAREHOUSE_EXPORT_BUCKET_BINDING,
         actualMountPath,

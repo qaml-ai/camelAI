@@ -14,8 +14,10 @@ import {
   createSandboxZombieHealState,
   createZombieHealTarget,
   healZombieSandboxContainer,
+  sandboxInstanceName,
   withZombieSelfHeal,
   type SandboxZombieRestartOutcome,
+  type SandboxTelemetryScope,
   type SandboxZombieRestartRequest,
   type ZombieHealableSandbox,
 } from "./sandbox-zombie-recovery.js";
@@ -91,7 +93,18 @@ export class ProjectBuildSandbox extends Sandbox<Env> {
       env: this.env,
       destroy: () => this.destroy(),
       healState: this.zombieHealState,
+      scope: () => this.telemetryScope,
     });
+  }
+
+  /**
+   * The org this container serves (`org-<org>`, see projectBuildSandboxKey),
+   * for telemetry. Very long org ids are hashed into the key, so this is the
+   * key's org part rather than a guaranteed org id.
+   */
+  private get telemetryScope(): SandboxTelemetryScope {
+    const name = sandboxInstanceName(this);
+    return name?.startsWith("org-") ? { orgId: name.slice("org-".length) } : {};
   }
 
   /**

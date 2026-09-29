@@ -522,7 +522,7 @@ async function requestWedgedContainerRestart(
 ): Promise<boolean> {
   if (typeof deps.sandbox.restartWedgedContainer !== "function") return false;
   try {
-    // The DO records `build_sandbox_zombie_restart` (component DbQuerySandbox,
+    // The DO records `sandbox_zombie_restart` (component DbQuerySandbox,
     // trigger setup_deadline) itself; nothing to emit on this side.
     const outcome = await deps.sandbox.restartWedgedContainer({
       operation: error.operation,

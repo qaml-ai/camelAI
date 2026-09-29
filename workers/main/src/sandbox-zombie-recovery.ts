@@ -119,7 +119,7 @@ export interface SandboxZombieRestartHost {
    * teardown itself was wedged and the DO instance was evicted instead.
    */
   destroyContainer(): Promise<{ escalated?: boolean } | void>;
-  /** Emits `build_sandbox_zombie_restart`. Never throws. */
+  /** Emits `sandbox_zombie_restart` (plus the legacy name). Never throws. */
   recordRestart(event: {
     request: SandboxZombieRestartRequest;
     outcome: SandboxZombieRestartOutcome;
@@ -219,8 +219,36 @@ export async function forceSandboxZombieRestart(
   return outcome;
 }
 
-/** Telemetry event name for a forced zombie restart (both sandbox classes). */
-export const SANDBOX_ZOMBIE_RESTART_EVENT = "build_sandbox_zombie_restart";
+/**
+ * Telemetry event for a forced zombie restart, from any sandbox class
+ * (`blob3` component tells them apart).
+ */
+export const SANDBOX_ZOMBIE_RESTART_EVENT = "sandbox_zombie_restart";
+
+/**
+ * The event's old name, from when only the build sandbox healed. Every restart
+ * is still written under it too, so saved queries and alerts keep working
+ * during the switch; drop it once they read the new name.
+ */
+export const LEGACY_SANDBOX_ZOMBIE_RESTART_EVENT = "build_sandbox_zombie_restart";
+
+/** Which tenant a sandbox DO serves, stamped on its telemetry. */
+export interface SandboxTelemetryScope {
+  workspaceId?: string;
+  orgId?: string;
+}
+
+/**
+ * The name the sandbox DO was addressed by (`getSandbox(ns, name)`), when it
+ * is known: the SDK records it on the instance, and the runtime exposes it on
+ * `ctx.id` for ids made with `idFromName`. `normalizeId` stubs lowercase it.
+ */
+export function sandboxInstanceName(sandbox: object): string | undefined {
+  const sdkName = (sandbox as { sandboxName?: unknown }).sandboxName;
+  if (typeof sdkName === "string" && sdkName) return sdkName;
+  const idName = (sandbox as { ctx?: { id?: { name?: unknown } } }).ctx?.id?.name;
+  return typeof idName === "string" && idName ? idName : undefined;
+}
 
 /**
  * Bound on `destroy()`. The SDK is explicit that it does not bound its own
@@ -322,6 +350,8 @@ export interface ZombieHealableSandbox {
   onContainerDestroyed?(): void | Promise<void>;
   /** DO-instance heal bookkeeping (wedged teardown). */
   healState?: SandboxZombieHealState;
+  /** Tenant for the restart event. */
+  scope?: () => SandboxTelemetryScope;
   /**
    * `ctx.abort()`. The only escalation that clears a wedged
    * `Sandbox.destroy()`: evicting the DO instance discards the coalesced
@@ -345,6 +375,7 @@ export function createZombieHealTarget(input: {
   destroy: () => Promise<void>;
   healState: SandboxZombieHealState;
   onContainerDestroyed?: () => void | Promise<void>;
+  scope?: () => SandboxTelemetryScope;
 }): ZombieHealableSandbox {
   const abort = input.ctx.abort;
   return {
@@ -352,6 +383,7 @@ export function createZombieHealTarget(input: {
     env: input.env,
     destroy: input.destroy,
     healState: input.healState,
+    ...(input.scope ? { scope: input.scope } : {}),
     ...(input.onContainerDestroyed
       ? { onContainerDestroyed: input.onContainerDestroyed }
       : {}),
@@ -448,21 +480,35 @@ export async function healZombieSandboxContainer(
         reason: outcome.reason,
         error: fields.errorMessage,
       });
-      recordObservabilityEvent(sandbox.env, {
-        event: SANDBOX_ZOMBIE_RESTART_EVENT,
-        severity: outcome.restarted ? "warn" : "error",
-        component,
-        operation: recorded.operation,
-        status: outcome.restarted && outcome.reason === "forced" ? "restarted" : outcome.reason,
-        // `trigger` is the low-cardinality dimension the dashboards slice on;
-        // errorName is the only string column that keeps its cardinality.
-        errorName: recorded.trigger,
-        errorMessage: fields.errorMessage,
-        durationMs: outcome.sinceLastRestartMs,
-      });
+      const scope = safeScope(sandbox);
+      for (const event of [SANDBOX_ZOMBIE_RESTART_EVENT, LEGACY_SANDBOX_ZOMBIE_RESTART_EVENT]) {
+        recordObservabilityEvent(sandbox.env, {
+          event,
+          severity: outcome.restarted ? "warn" : "error",
+          component,
+          operation: recorded.operation,
+          status: outcome.restarted && outcome.reason === "forced" ? "restarted" : outcome.reason,
+          // `trigger` is the low-cardinality dimension the dashboards slice on;
+          // errorName is the only string column that keeps its cardinality.
+          errorName: recorded.trigger,
+          errorMessage: fields.errorMessage,
+          durationMs: outcome.sinceLastRestartMs,
+          workspaceId: scope.workspaceId,
+          orgId: scope.orgId,
+        });
+      }
     },
   };
   return forceSandboxZombieRestart(host, request, options);
+}
+
+/** Telemetry must never fail a heal. */
+function safeScope(sandbox: ZombieHealableSandbox): SandboxTelemetryScope {
+  try {
+    return sandbox.scope?.() ?? {};
+  } catch {
+    return {};
+  }
 }
 
 /**

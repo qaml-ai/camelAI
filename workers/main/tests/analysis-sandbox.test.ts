@@ -359,6 +359,7 @@ describe('AnalysisSandbox zombie self-heal', () => {
       expect(sandbox.mountedPaths.has('/warehouse/ws-1')).toBe(true);
       // The forced restart, then the mount recovery it produced.
       expect(recordedEvents(sandbox)).toEqual([
+        ['sandbox_zombie_restart', 'restarted'],
         ['build_sandbox_zombie_restart', 'restarted'],
         ['sandbox_mount_recovery', 'restarted'],
       ]);
@@ -764,6 +765,7 @@ describe('AnalysisSandbox.ensureMounted self-heal', () => {
       expect(sandbox.mountedPaths.has('/uploads')).toBe(false);
 
       expect(recordedEvents(sandbox)).toEqual([
+        ['sandbox_zombie_restart', 'restarted'],
         ['build_sandbox_zombie_restart', 'restarted'],
         ['sandbox_mount_recovery', 'failed_after_restart'],
         ['sandbox_mount_recovery', 'restart_rate_limited'],
@@ -785,6 +787,7 @@ describe('AnalysisSandbox.ensureMounted self-heal', () => {
       const { sandbox, destroy } = healableSandbox();
       sandbox.containerGeneration = 1;
       sandbox.mountedContainerGeneration = 1;
+      sandbox.sandboxName = 'app-ws-1';
       let restarted = false;
       destroy.mockImplementation(async () => { restarted = true; });
       sandbox.mountBucket = vi.fn(async () => {
@@ -804,12 +807,18 @@ describe('AnalysisSandbox.ensureMounted self-heal', () => {
       expect(sandbox.mountBucket).toHaveBeenCalledTimes(2);
       expect(sandbox.mountedPaths.has('/uploads')).toBe(true);
       expect(recordedEvents(sandbox)).toEqual([
+        ['sandbox_zombie_restart', 'restarted'],
         ['build_sandbox_zombie_restart', 'restarted'],
         ['sandbox_mount_recovery', 'restarted'],
       ]);
       // blob16 carries the restart trigger.
       const lastPoint = sandbox.env.OBSERVABILITY_EVENTS.writeDataPoint.mock.calls.at(-1)[0];
       expect(lastPoint.blobs[15]).toBe('mount_session_timeout');
+      // blob10 is the workspace, read from the name the SDK recorded for this
+      // DO (`app-<ws>` for the deployed-app container).
+      for (const [point] of sandbox.env.OBSERVABILITY_EVENTS.writeDataPoint.mock.calls) {
+        expect(point.blobs[9]).toBe('ws-1');
+      }
     } finally {
       warn.mockRestore();
     }

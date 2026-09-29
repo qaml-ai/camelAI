@@ -414,26 +414,43 @@ describe("useRuntimeThread", () => {
   describe("a run whose end the watcher missed", () => {
     const reply = { role: "assistant", content: [{ type: "text", text: "pong" }], stopReason: "stop", timestamp: 4 };
     const prompt = { role: "user", content: [{ type: "text", text: "ping" }], timestamp: 3 };
+    const setVisibility = (state: "visible" | "hidden") => {
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+      document.dispatchEvent(new Event("visibilitychange"));
+    };
+    afterEach(() => setVisibility("visible"));
 
-    it("says so, and fills the view from the newest history page", async () => {
-      responses["/api/threads/t1/token"] = { token: "abt_new", expiresAt: Date.now() + 900_000, url: "https://agents.test", agentId: "agt_1" };
-      responses["https://agents.test/v1/agents/agt_1/history"] = {
-        entries: [...seed.page!.entries, { index: 2, message: prompt }, { index: 3, message: reply }],
-        next: null,
-      };
-      const { result } = mount();
+    it("says so in a visible page, reading nothing", async () => {
+      mount();
       await waitFor(() => expect(watchers).toHaveLength(1));
       const base = seed.page!.entries.map((entry) => entry.message);
       act(() => watchers[0].emit({ messages: base, indexes: [0, 1], running: true }));
       await new Promise((resolve) => setTimeout(resolve, 10));
       // The run ends, and the watcher never delivered its messages.
       act(() => watchers[0].emit({ messages: base, indexes: [0, 1], running: false }));
-      await waitFor(() => expect(result.current.chat.messages.map((message) => message.id)).toContain("rt:3"), { timeout: 5_000 });
-      expect(fetchCalls.filter((call) => call.url.startsWith("https://agents.test/v1/agents/agt_1/history"))).toHaveLength(1);
-      expect(missedReply).toHaveBeenCalledWith("t1", expect.objectContaining({ reason: "run_ended", knownMaxIndex: 1, viewMaxIndex: 1, recovered: 2 }));
-      // The watcher catching up later changes nothing.
-      act(() => watchers[0].emit({ messages: [...base, prompt, reply], indexes: [0, 1, 2, 3] }));
-      await waitFor(() => expect(result.current.chat.messages.filter((message) => message.id === "rt:3")).toHaveLength(1));
+      await waitFor(() => expect(missedReply).toHaveBeenCalledWith("t1", expect.objectContaining({ reason: "run_ended", knownMaxIndex: 1, viewMaxIndex: 1 })), { timeout: 5_000 });
+      expect(fetchCalls.some((call) => call.url.includes("/history"))).toBe(false);
+    }, 10_000);
+
+    it("says nothing for a hidden page, whose watcher pauses, and does not watch again meanwhile", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        mount();
+        await waitFor(() => expect(watchers).toHaveLength(1));
+        const base = seed.page!.entries.map((entry) => entry.message);
+        act(() => watchers[0].emit({ messages: base, indexes: [0, 1], running: true }));
+        act(() => setVisibility("hidden"));
+        act(() => watchers[0].emit({ messages: base, indexes: [0, 1], running: false, connected: false }));
+        await act(async () => { await vi.advanceTimersByTimeAsync(65_000); });
+        expect(missedReply).not.toHaveBeenCalled();
+        expect(watchers).toHaveLength(1);
+        // Shown again with the watcher still down: it is watched again after the stall.
+        act(() => setVisibility("visible"));
+        await act(async () => { await vi.advanceTimersByTimeAsync(25_000); });
+        await waitFor(() => expect(watchers.length).toBeGreaterThan(1));
+      } finally {
+        vi.useRealTimers();
+      }
     }, 10_000);
 
     it("reads nothing when the run's messages arrived", async () => {

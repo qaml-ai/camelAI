@@ -590,9 +590,8 @@ export function trackRuntimeWatchLifecycle(
 }
 
 /**
- * `runtime_view_missed_reply`: a run ended (or a send's submitted window ran
- * out) with no new message on screen, so the page re-read the newest history
- * page. `reason` says which; `recovered` how many messages the read added.
+ * `runtime_view_missed_reply`: in a visible page, a run ended (or a send's
+ * submitted window ran out) with no new message on screen. `reason` says which.
  */
 export function trackRuntimeViewMissedReply(
   threadId: string,
@@ -603,7 +602,6 @@ export function trackRuntimeViewMissedReply(
     viewMaxIndex: number;
     connected: boolean;
     transport: string | null;
-    recovered: number | null;
   },
 ): void {
   reportClientEvent({
@@ -613,7 +611,6 @@ export function trackRuntimeViewMissedReply(
     status: details.reason,
     message: `Runtime thread view showed no new message after a run (${details.reason}).`,
     threadId,
-    count: details.recovered ?? undefined,
     details: { ...connectionContext(), ...details, visibility: typeof document === "undefined" ? null : document.visibilityState },
   });
 }

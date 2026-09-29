@@ -115,6 +115,19 @@ function resolveDbQueryDeps(env: DataProxyEnv, context: DataProxyContext): DbQue
         orgId: context.orgId,
       });
     },
+    onTransientRetry: (event) => {
+      recordObservabilityEvent(env, {
+        event: 'db_query_transient_retry',
+        severity: 'warn',
+        component: 'DataProxy',
+        operation: event.operation,
+        status: event.dispatched ? 'retried_after_dispatch' : 'retried_before_dispatch',
+        errorName: event.error instanceof Error ? event.error.name : 'Error',
+        errorMessage: event.error instanceof Error ? event.error.message : String(event.error),
+        workspaceId: context.workspaceId,
+        orgId: context.orgId,
+      });
+    },
   };
 }
 

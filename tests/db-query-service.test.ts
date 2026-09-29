@@ -269,3 +269,113 @@ describe('runDbExport — mount + exec straight to R2', () => {
     expect(result).toMatchObject({ ok: false, error: { status: 502 } });
   });
 });
+
+describe('transient sandbox failures', () => {
+  const OK = JSON.stringify({ ok: true, rows: [{ ok: 1 }], fields: [{ name: 'ok' }], rowCount: 1, truncated: false, durationMs: 3 });
+  const isProbe = (command: unknown) => String(command).includes('/dev/tcp/');
+  const runnerCalls = (exec: ReturnType<typeof vi.fn>) => exec.mock.calls.filter(([command]) => !isProbe(command));
+
+  function flakyRunner(error: Error, failures = 1, stdout = OK) {
+    let remaining = failures;
+    return vi.fn(async (command: string) => {
+      if (isProbe(command)) return { stdout: 'up', stderr: '', exitCode: 0 };
+      if (remaining > 0) {
+        remaining -= 1;
+        throw error;
+      }
+      return { stdout, stderr: '', exitCode: 0 };
+    });
+  }
+
+  function harness(sandbox: Partial<Record<keyof DbQuerySandboxStub, unknown>>) {
+    const onTransientRetry = vi.fn();
+    const sleep = vi.fn(async () => {});
+    const deps = {
+      relay: RELAY,
+      onTransientRetry,
+      sleep,
+      sandbox: {
+        ensureReady: vi.fn(async () => {}),
+        ensureRelayEgress: vi.fn(async () => {}),
+        ensureWarehouseExportMount: vi.fn(async () => {}),
+        startProcess: vi.fn(async () => ({})),
+        exec: flakyRunner(new Error('unused'), 0),
+        ...sandbox,
+      } as DbQuerySandboxStub,
+    };
+    return { deps, onTransientRetry, sleep };
+  }
+
+  it.each([
+    'The container is not running, consider calling start()',
+    'Network connection lost.',
+    'Runtime signalled the container to exit due to a new version rollout: 0',
+  ])('retries a read once after "%s"', async (message) => {
+    const exec = flakyRunner(new Error(message));
+    const t = harness({ exec });
+    const result = await runDbQuery(t.deps, REQUEST);
+
+    expect(result).toMatchObject({ ok: true, rowCount: 1 });
+    expect(runnerCalls(exec)).toHaveLength(2);
+    expect(t.sleep).toHaveBeenCalledTimes(1);
+    expect(t.onTransientRetry).toHaveBeenCalledWith(
+      expect.objectContaining({ operation: 'db_query', dispatched: true }),
+    );
+  });
+
+  it('retries a modify when the failure hit before the SQL was dispatched', async () => {
+    const ensureReady = vi.fn()
+      .mockRejectedValueOnce(new Error('The container is not running, consider calling start()'))
+      .mockResolvedValue(undefined);
+    const t = harness({ ensureReady });
+    const result = await runDbQuery(t.deps, { ...REQUEST, mode: 'modify' });
+
+    expect(result.ok).toBe(true);
+    expect(ensureReady).toHaveBeenCalledTimes(2);
+    expect(t.onTransientRetry).toHaveBeenCalledWith(expect.objectContaining({ dispatched: false }));
+  });
+
+  it('never re-runs a modify whose runner exec was already dispatched', async () => {
+    const exec = flakyRunner(new Error('Network connection lost.'));
+    const t = harness({ exec });
+
+    await expect(runDbQuery(t.deps, { ...REQUEST, mode: 'modify' })).rejects.toThrow('Network connection lost.');
+    expect(runnerCalls(exec)).toHaveLength(1);
+    expect(t.onTransientRetry).not.toHaveBeenCalled();
+  });
+
+  it('retries at most once', async () => {
+    const exec = flakyRunner(new Error('Network connection lost.'), 2);
+    const t = harness({ exec });
+
+    await expect(runDbQuery(t.deps, REQUEST)).rejects.toThrow('Network connection lost.');
+    expect(runnerCalls(exec)).toHaveLength(2);
+  });
+
+  it('does not retry other failures', async () => {
+    const exec = flakyRunner(new Error('relation "nope" does not exist'));
+    const t = harness({ exec });
+
+    await expect(runDbQuery(t.deps, REQUEST)).rejects.toThrow('does not exist');
+    expect(t.onTransientRetry).not.toHaveBeenCalled();
+  });
+
+  it('retries an export only before its runner is dispatched', async () => {
+    const exportOk = JSON.stringify({ ok: true, rowCount: 1, bytes: 10, durationMs: 1 });
+    const mount = vi.fn()
+      .mockRejectedValueOnce(new Error('The container is not running, consider calling start()'))
+      .mockResolvedValue(undefined);
+    const beforeDispatch = harness({
+      ensureWarehouseExportMount: mount,
+      exec: flakyRunner(new Error('unused'), 0, exportOk),
+    });
+    await expect(runDbExport(beforeDispatch.deps, REQUEST, 'warehouse/ws-1', '/warehouse/ws-1/x.parquet'))
+      .resolves.toMatchObject({ ok: true });
+    expect(mount).toHaveBeenCalledTimes(2);
+
+    const midExport = harness({ exec: flakyRunner(new Error('Network connection lost.'), 1, exportOk) });
+    await expect(runDbExport(midExport.deps, REQUEST, 'warehouse/ws-1', '/warehouse/ws-1/x.parquet'))
+      .rejects.toThrow('Network connection lost.');
+    expect(midExport.onTransientRetry).not.toHaveBeenCalled();
+  });
+});

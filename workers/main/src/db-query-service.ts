@@ -223,6 +223,76 @@ export interface DbQueryDeps {
   relay: DbEgressRelayConfig | null;
   /** Max ms to wait for the cloudflared forwarder to come up (default 30s). */
   readinessTimeoutMs?: number;
+  /**
+   * Telemetry sink for a call retried after a transient sandbox failure
+   * (see isTransientDbSandboxError). The error is the one we retried past.
+   */
+  onTransientRetry?: (event: { operation: "db_query" | "db_export"; dispatched: boolean; error: unknown }) => void;
+  /** Test seam for the pause before the transient retry. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Failures of the sandbox/DO transport itself, as opposed to the database or
+ * the SQL: the container was stopped under the call (a worker version rollout
+ * signals every container to exit), or the RPC hop to the DO dropped. Prod saw
+ * "The container is not running, consider calling start()" right after a
+ * rollout and "Network connection lost." 142ms into a call; the next call
+ * worked both times.
+ *
+ * Deliberately excludes SandboxDeadlineExceededError: a deadline means the
+ * container is slow or wedged, and a retry would double the wait.
+ */
+const TRANSIENT_SANDBOX_ERROR_PATTERNS: readonly RegExp[] = [
+  /container is not running/i,
+  /network connection lost/i,
+  /signalled the container to exit/i,
+  /container crashed/i,
+  /durable object (?:reset|storage operation exceeded)|durable object's code has been updated/i,
+];
+
+export function isTransientDbSandboxError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (isSandboxDeadlineExceededError(error)) return false;
+  return TRANSIENT_SANDBOX_ERROR_PATTERNS.some((pattern) => pattern.test(error.message));
+}
+
+/** Pause before the one transient retry, so a rolling container can come back. */
+export const DB_QUERY_TRANSIENT_RETRY_DELAY_MS = 1_000;
+
+/**
+ * Run `attempt` and, on a transient sandbox failure, run it exactly once more.
+ *
+ * `attempt` calls `markDispatched()` right before it hands the SQL to the
+ * container. Before that point nothing has touched the database and a retry
+ * is always safe. After it, only a caller that can safely run the work twice
+ * (a read, which the runner rolls back) may retry: a `modify` statement may
+ * already have committed.
+ */
+async function withTransientRetry<T>(
+  deps: DbQueryDeps,
+  operation: "db_query" | "db_export",
+  retryAfterDispatch: boolean,
+  attempt: (markDispatched: () => void) => Promise<T>,
+): Promise<T> {
+  let dispatched = false;
+  try {
+    return await attempt(() => {
+      dispatched = true;
+    });
+  } catch (error) {
+    if (!isTransientDbSandboxError(error) || (dispatched && !retryAfterDispatch)) throw error;
+    console.warn("[db-query] retrying after a transient sandbox failure", {
+      operation,
+      dispatched,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    deps.onTransientRetry?.({ operation, dispatched, error });
+    await (deps.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms))))(
+      DB_QUERY_TRANSIENT_RETRY_DELAY_MS,
+    );
+    return await attempt(() => {});
+  }
 }
 
 const DEFAULT_READINESS_TIMEOUT_MS = 30_000;
@@ -381,7 +451,8 @@ async function ensureRelayForwarder(
  * runner exec's own deadline is a slow QUERY, the forwarder's "never became
  * ready" (probes answer, port stays down) is relay configuration, and the
  * export mount has its own in-place recovery (mountOrRecover) — none of those
- * is fixed by destroying a container other calls may be using. The original error is always re-thrown and
+ * is fixed by destroying a container other calls may be using. The call still
+ * fails, as a DbQuerySandboxNotReadyError that tells the agent nothing ran, and
  * there is no in-call retry: the caller has already spent a setup budget of up
  * to 135s, and a second cold start inside the same call would double that.
  */
@@ -393,30 +464,61 @@ async function withWedgedSetupRecovery(deps: DbQueryDeps, run: () => Promise<voi
     // local class (never the name-only RPC shape isSandboxDeadlineExceededError
     // also accepts).
     if (error instanceof SandboxDeadlineExceededError) {
-      await requestWedgedContainerRestart(deps, error);
+      const restarted = await requestWedgedContainerRestart(deps, error);
+      throw new DbQuerySandboxNotReadyError(error, restarted);
     }
     throw error;
   }
 }
 
-/** Best-effort: a failed heal request must never mask the deadline error. */
+/**
+ * A setup deadline, reworded for the agent. The generic
+ * SandboxDeadlineExceededError text says the work "may already have run" and
+ * not to repeat it, which is wrong here: setup finished before the SQL was
+ * handed to the container, so nothing reached the database and a retry is safe.
+ */
+export class DbQuerySandboxNotReadyError extends Error {
+  readonly operation: string;
+  readonly budgetMs: number;
+
+  constructor(cause: SandboxDeadlineExceededError, restarted: boolean) {
+    super(
+      `The database query sandbox did not become ready: ${cause.operation} did not return within ` +
+        `its ${Math.round(cause.budgetMs / 1000)}s budget, so the query was NOT sent to the database. This is a temporary ` +
+        `infrastructure problem, not a problem with the SQL or the database. ` +
+        (restarted ? "The sandbox has been restarted; " : "") +
+        `retrying the same query is safe.`,
+      { cause },
+    );
+    this.name = "DbQuerySandboxNotReadyError";
+    this.operation = cause.operation;
+    this.budgetMs = cause.budgetMs;
+  }
+}
+
+/**
+ * Best-effort: a failed heal request must never mask the deadline error.
+ * Resolves true only when the DO actually restarted the container.
+ */
 async function requestWedgedContainerRestart(
   deps: DbQueryDeps,
   error: SandboxDeadlineExceededError,
-): Promise<void> {
-  if (typeof deps.sandbox.restartWedgedContainer !== "function") return;
+): Promise<boolean> {
+  if (typeof deps.sandbox.restartWedgedContainer !== "function") return false;
   try {
     // The DO records `build_sandbox_zombie_restart` (component DbQuerySandbox,
     // trigger setup_deadline) itself; nothing to emit on this side.
-    await deps.sandbox.restartWedgedContainer({
+    const outcome = await deps.sandbox.restartWedgedContainer({
       operation: error.operation,
       error: `${error.name}: ${error.message}`,
     });
+    return outcome?.restarted === true;
   } catch (restartError) {
     console.warn("[db-query] wedged container restart request failed", {
       operation: error.operation,
       error: restartError instanceof Error ? restartError.message : String(restartError),
     });
+    return false;
   }
 }
 
@@ -468,22 +570,27 @@ function parseRunnerOutput(exec: SandboxExecResult): DbQueryResult {
  * bare `import "pg"` resolves against the baked node_modules.
  */
 export async function runDbQuery(deps: DbQueryDeps, request: DbQueryRequest): Promise<DbQueryResult> {
-  await withWedgedSetupRecovery(deps, async () => {
-    await ensureDbQuerySandboxReady(deps);
-    await ensureRelayPrelude(deps, dbQuerySetupDeadline(deps, "db_query_setup"));
-  });
+  // A read runs in a rolled-back transaction, so running it twice is harmless.
+  const retryAfterDispatch = request.mode !== "modify";
+  return await withTransientRetry(deps, "db_query", retryAfterDispatch, async (markDispatched) => {
+    await withWedgedSetupRecovery(deps, async () => {
+      await ensureDbQuerySandboxReady(deps);
+      await ensureRelayPrelude(deps, dbQuerySetupDeadline(deps, "db_query_setup"));
+    });
 
-  const containerTimeoutMs = (request.timeoutMs ?? DEFAULT_QUERY_TIMEOUT_MS) + EXEC_OVERHEAD_MS;
-  const exec = await dbQueryDeadline(deps, "db_query", containerTimeoutMs).run(() =>
-    deps.sandbox.exec(
-      `bash -c 'printf %s "$DB_RUNNER_SRC" | node --input-type=module'`,
-      {
-        cwd: DB_QUERY_RUNNER_DIR,
-        timeout: containerTimeoutMs,
-        env: runnerEnv(deps, request),
-      },
-    ));
-  return parseRunnerOutput(exec);
+    const containerTimeoutMs = (request.timeoutMs ?? DEFAULT_QUERY_TIMEOUT_MS) + EXEC_OVERHEAD_MS;
+    markDispatched();
+    const exec = await dbQueryDeadline(deps, "db_query", containerTimeoutMs).run(() =>
+      deps.sandbox.exec(
+        `bash -c 'printf %s "$DB_RUNNER_SRC" | node --input-type=module'`,
+        {
+          cwd: DB_QUERY_RUNNER_DIR,
+          timeout: containerTimeoutMs,
+          env: runnerEnv(deps, request),
+        },
+      ));
+    return parseRunnerOutput(exec);
+  });
 }
 
 /** Env for a runner invocation: source + request + optional relay creds. */
@@ -529,32 +636,37 @@ export async function runDbExport(
   mountPrefix: string,
   exportPath: string,
 ): Promise<DbExportResult> {
-  await withWedgedSetupRecovery(deps, async () => {
-    await ensureDbQuerySandboxReady(deps);
-    await ensureRelayPrelude(deps, dbQuerySetupDeadline(deps, "db_export_setup"));
-  });
-  // The mount is an exec-class container call too: unbounded, it hung exports
-  // exactly like the readiness probes did. Its OWN budget, not a share of the
-  // forwarder's — a slow-but-healthy mount must not be cut short by however
-  // long the relay took to come up.
-  await dbQuerySetupDeadline(deps, "db_export_mount")
-    .run(() => deps.sandbox.ensureWarehouseExportMount(mountPrefix));
+  // Retry only before the runner is dispatched: an export can run for minutes,
+  // and a second full run is not worth hiding a mid-export failure.
+  const exec = await withTransientRetry(deps, "db_export", false, async (markDispatched) => {
+    await withWedgedSetupRecovery(deps, async () => {
+      await ensureDbQuerySandboxReady(deps);
+      await ensureRelayPrelude(deps, dbQuerySetupDeadline(deps, "db_export_setup"));
+    });
+    // The mount is an exec-class container call too: unbounded, it hung exports
+    // exactly like the readiness probes did. Its OWN budget, not a share of the
+    // forwarder's — a slow-but-healthy mount must not be cut short by however
+    // long the relay took to come up.
+    await dbQuerySetupDeadline(deps, "db_export_mount")
+      .run(() => deps.sandbox.ensureWarehouseExportMount(mountPrefix));
 
-  const exportRequest: DbQueryRequest = { ...request, op: "export" };
-  const containerTimeoutMs =
-    (request.timeoutMs ?? DEFAULT_EXPORT_TIMEOUT_MS) + EXPORT_EXEC_OVERHEAD_MS;
-  const exec = await dbQueryDeadline(deps, "db_export", containerTimeoutMs).run(() =>
-    deps.sandbox.exec(
-      `bash -c 'printf %s "$DB_RUNNER_SRC" | node --input-type=module'`,
-      {
-        cwd: DB_QUERY_RUNNER_DIR,
-        timeout: containerTimeoutMs,
-        env: {
-          ...runnerEnv(deps, exportRequest),
-          DB_EXPORT_PATH: exportPath,
+    const exportRequest: DbQueryRequest = { ...request, op: "export" };
+    const containerTimeoutMs =
+      (request.timeoutMs ?? DEFAULT_EXPORT_TIMEOUT_MS) + EXPORT_EXEC_OVERHEAD_MS;
+    markDispatched();
+    return await dbQueryDeadline(deps, "db_export", containerTimeoutMs).run(() =>
+      deps.sandbox.exec(
+        `bash -c 'printf %s "$DB_RUNNER_SRC" | node --input-type=module'`,
+        {
+          cwd: DB_QUERY_RUNNER_DIR,
+          timeout: containerTimeoutMs,
+          env: {
+            ...runnerEnv(deps, exportRequest),
+            DB_EXPORT_PATH: exportPath,
+          },
         },
-      },
-    ));
+      ));
+  });
   const parsed = parseRunnerOutput(exec) as unknown as DbExportResult;
   if (parsed.ok && (typeof parsed.rowCount !== "number" || typeof parsed.bytes !== "number")) {
     return { ok: false, error: { message: "export runner returned a malformed result", status: 502 } };

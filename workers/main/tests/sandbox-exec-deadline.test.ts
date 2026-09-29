@@ -24,6 +24,7 @@ import {
   withProjectBuildServiceErrorMapping,
 } from '../src/project-build-readiness';
 import {
+  DbQuerySandboxNotReadyError,
   runDbExport,
   runDbQuery,
   type DbQueryDeps,
@@ -707,6 +708,23 @@ describe('db-query wedged-container recovery', () => {
     expect(relayDown.sandbox.restartWedgedContainer).not.toHaveBeenCalled();
   });
 
+  it('tells the agent nothing ran and a retry is safe after a setup deadline', async () => {
+    vi.useFakeTimers();
+    const deps = wedgeDeps({ exec: vi.fn(() => new Promise<never>(() => {})) });
+
+    const promise = runDbQuery(deps, { engine: 'postgres', sql: 'select 1' } as DbQueryRequest)
+      .catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(45_001);
+    const error = await promise;
+
+    expect(error).toBeInstanceOf(DbQuerySandboxNotReadyError);
+    expect((error as Error).message).toMatch(/query was NOT sent to the database/);
+    expect((error as Error).message).toMatch(/restarted; retrying the same query is safe/);
+    // The generic "may already have run, do NOT repeat" advice is wrong here.
+    expect((error as Error).message).not.toMatch(/do NOT simply repeat/);
+    expect((error as Error).cause).toBeInstanceOf(SandboxDeadlineExceededError);
+  });
+
   it('surfaces the original deadline error when the heal request itself fails', async () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -719,7 +737,10 @@ describe('db-query wedged-container recovery', () => {
       });
 
       const promise = runDbQuery(deps, { engine: 'postgres', sql: 'select 1' } as DbQueryRequest);
-      const assertion = expect(promise).rejects.toBeInstanceOf(SandboxDeadlineExceededError);
+      const assertion = expect(promise).rejects.toMatchObject({
+        name: 'DbQuerySandboxNotReadyError',
+        cause: expect.any(SandboxDeadlineExceededError),
+      });
       await vi.advanceTimersByTimeAsync(135_001);
       await assertion;
       expect(deps.sandbox.restartWedgedContainer).toHaveBeenCalledTimes(1);

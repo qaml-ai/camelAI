@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -16,6 +16,16 @@ import {
 } from "../scripts/selfhost-agent-runtime.mjs";
 import { ensureSelfhostSecrets } from "../scripts/selfhost-secret-migrations.mjs";
 
+/** The app's check of a runtime delivery (workers/main/src/agent-runtime/webhooks.ts), in Node. */
+async function verifyStandardWebhook(secret: string, headers: Headers, body: string) {
+  const id = headers.get("webhook-id");
+  const timestamp = headers.get("webhook-timestamp");
+  const signatures = headers.get("webhook-signature") ?? "";
+  if (!id || !timestamp || Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return false;
+  const expected = createHmac("sha256", Buffer.from(secret.replace(/^whsec_/, ""), "base64")).update(`${id}.${timestamp}.${body}`).digest("base64");
+  return signatures.split(" ").includes(`v1,${expected}`);
+}
+
 const RUNTIME = "http://127.0.0.1:8790";
 const TOKEN = "art_operator-token-of-at-least-24-chars";
 const temporaryDirectories: string[] = [];
@@ -30,7 +40,7 @@ afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true })));
 });
 
-type Webhook = { id: string; url: string; events: string[]; secret: string };
+type Webhook = { id: string; url: string; events: string[]; secret: string; description?: string };
 
 /** The runtime's tenant API as the provisioner and doctor use it: definitions, webhooks, /v1/me. */
 function fakeRuntime(options: { tenant?: string; healthy?: boolean; webhooks?: Webhook[] } = {}) {
@@ -68,17 +78,21 @@ function fakeRuntime(options: { tenant?: string; healthy?: boolean; webhooks?: W
       return Response.json(webhooks.map(({ secret: _secret, ...endpoint }) => endpoint));
     }
     if (method === "POST" && url.pathname === "/v1/webhooks") {
-      const endpoint = { id: `we_${webhooks.length + 1}`, url: body.url, events: body.events, secret: `whsec_${++secrets}` };
+      const endpoint = { id: `we_${webhooks.length + 1}`, url: body.url, events: body.events, description: body.description, secret: `whsec_${Buffer.from(`secret-${++secrets}`).toString("base64")}` };
       webhooks.push(endpoint);
       return Response.json({ ...endpoint, createdAt: 1 }, { status: 201 });
     }
     const rotate = /^\/v1\/webhooks\/([^/]+)\/secret$/.exec(url.pathname);
     if (method === "POST" && rotate) {
       const endpoint = webhooks.find((entry) => entry.id === rotate[1])!;
-      endpoint.secret = `whsec_${++secrets}`;
+      endpoint.secret = `whsec_${Buffer.from(`secret-${++secrets}`).toString("base64")}`;
       return Response.json({ secret: endpoint.secret });
     }
     const patch = /^\/v1\/webhooks\/([^/]+)$/.exec(url.pathname);
+    if (method === "DELETE" && patch) {
+      webhooks.splice(webhooks.findIndex((entry) => entry.id === patch[1]), 1);
+      return new Response(null, { status: 204 });
+    }
     if (method === "PATCH" && patch) {
       const endpoint = webhooks.find((entry) => entry.id === patch[1])!;
       endpoint.events = body.events;
@@ -103,7 +117,7 @@ describe("selfhost agent runtime provisioning", () => {
     const stateDir = await temporaryDirectory();
     const runtime = fakeRuntime();
     const result = await provisionSelfhostAgentRuntime({ env, stateDir, fetchImpl: runtime.fetchImpl, log: quiet });
-    expect(result).toEqual({ definitionId: threadDefinitionId("camelai-selfhost"), webhookSecret: "whsec_1", fresh: true });
+    expect(result).toEqual({ definitionId: threadDefinitionId("camelai-selfhost"), webhookSecret: runtime.webhooks[0].secret, fresh: true });
 
     const upsert = runtime.calls.find((call) => call.path === "/v1/definitions")!;
     expect(upsert.headers.get("idempotency-key")).toBe("camelai-thread");
@@ -116,7 +130,7 @@ describe("selfhost agent runtime provisioning", () => {
       expect.objectContaining({ url: "http://127.0.0.1:3001/agent-runtime/events", events: RUNTIME_WEBHOOK_EVENTS }),
     ]);
     const state = await readAgentRuntimeState(stateDir);
-    expect(state).toMatchObject({ definitionId: result!.definitionId, webhookId: "we_1", webhookSecret: "whsec_1" });
+    expect(state).toMatchObject({ definitionId: result!.definitionId, webhookId: "we_1", webhookSecret: runtime.webhooks[0].secret });
     expect((await fs.stat(path.join(stateDir, "agent-runtime.json"))).mode % 0o1000).toBe(0o600);
   });
 
@@ -163,11 +177,38 @@ describe("selfhost agent runtime provisioning", () => {
       .toBeNull();
   });
 
-  it("calls the app back on its loopback socket", () => {
+  it("calls the app back at http://127.0.0.1:<port>, the exact origin the runtime allows", async () => {
     expect(chiridionLoopbackUrl({ SELFHOST_WORKERD_SOCKET: "127.0.0.1:3001" })).toBe("http://127.0.0.1:3001");
     expect(chiridionLoopbackUrl({ SELFHOST_WORKERD_SOCKET: "*:3001" })).toBe("http://127.0.0.1:3001");
-    expect(chiridionLoopbackUrl({ SELFHOST_WORKERD_SOCKET: "::1:4000" })).toBe("http://[::1]:4000");
+    expect(chiridionLoopbackUrl({ SELFHOST_WORKERD_SOCKET: "::1:4000" })).toBe("http://127.0.0.1:4000");
     expect(chiridionLoopbackUrl({ AGENT_RUNTIME_CHIRIDION_URL: "http://10.0.0.2:3001/" })).toBe("http://10.0.0.2:3001");
+    // Compose allows exactly this origin (AGENT_OUTBOUND_ALLOW_ORIGINS), and nothing else on loopback.
+    const compose = await fs.readFile(path.join(import.meta.dirname, "..", "docker-compose.selfhost.yml"), "utf8");
+    expect(compose).toContain("AGENT_OUTBOUND_ALLOW_ORIGINS: http://127.0.0.1:${SELFHOST_APP_PORT:-3001}");
+    expect(compose).not.toMatch(/AGENT_OUTBOUND_ALLOW_(HTTP|CIDRS)/);
+  });
+
+  it("does not fall back to the last state when the runtime refuses the token or it is another tenant's", async () => {
+    const stateDir = await temporaryDirectory();
+    await provisionSelfhostAgentRuntime({ env, stateDir, fetchImpl: fakeRuntime().fetchImpl, log: quiet });
+    await expect(provisionSelfhostAgentRuntime({ env: { ...env, AGENT_RUNTIME_API_TOKEN: "art_rotated-but-not-on-the-runtime" }, stateDir, fetchImpl: fakeRuntime().fetchImpl, log: quiet }))
+      .rejects.toThrow(/HTTP 401/);
+    await expect(provisionSelfhostAgentRuntime({ env, stateDir, fetchImpl: fakeRuntime({ tenant: "someone-else" }).fetchImpl, log: quiet }))
+      .rejects.toThrow(/someone-else/);
+  });
+
+  it("removes this app's other events webhooks (an old port, a duplicate), and no one else's", async () => {
+    const description = "camelAI self-host: chat threads (runs, inputs, usage)";
+    const runtime = fakeRuntime({
+      webhooks: [
+        { id: "we_oldport", url: "http://127.0.0.1:3000/agent-runtime/events", events: RUNTIME_WEBHOOK_EVENTS, secret: "whsec_a", description },
+        { id: "we_dup", url: "http://127.0.0.1:3001/agent-runtime/events", events: RUNTIME_WEBHOOK_EVENTS, secret: "whsec_b" },
+        { id: "we_dup2", url: "http://127.0.0.1:3001/agent-runtime/events", events: RUNTIME_WEBHOOK_EVENTS, secret: "whsec_c" },
+        { id: "we_theirs", url: "https://elsewhere.example/hook", events: ["run.completed"], secret: "whsec_d", description: "billing" },
+      ],
+    });
+    await provisionSelfhostAgentRuntime({ env, stateDir: await temporaryDirectory(), fetchImpl: runtime.fetchImpl, log: quiet });
+    expect(runtime.webhooks.map((entry) => entry.id)).toEqual(["we_dup", "we_theirs"]);
   });
 });
 
@@ -189,6 +230,29 @@ describe("selfhost doctor: agent runtime", () => {
     expect(JSON.stringify(after)).not.toContain("whsec_");
   });
 
+  it("sends the app a signed test event with the provisioned secret, and fails when the app refuses it", async () => {
+    const stateDir = await temporaryDirectory();
+    const runtime = fakeRuntime();
+    const provisioned = await provisionSelfhostAgentRuntime({ env, stateDir, fetchImpl: runtime.fetchImpl, log: quiet });
+    const received: Array<{ type: string }> = [];
+    const app = (bound: string) => vi.fn(async (input: string, init: RequestInit = {}) => {
+      if (!String(input).startsWith("http://127.0.0.1:3001/agent-runtime/events")) return runtime.fetchImpl(input, init);
+      const body = String(init.body);
+      if (!await verifyStandardWebhook(bound, new Headers(init.headers), body)) return Response.json({ error: "Invalid webhook signature" }, { status: 401 });
+      received.push(JSON.parse(body));
+      return new Response(null, { status: 204 });
+    }) as unknown as typeof fetch;
+    const doctorEnv = { AGENT_RUNTIME_TENANT: "camelai-selfhost", AGENT_RUNTIME_API_TOKEN: TOKEN };
+
+    const good = await inspectSelfhostAgentRuntime({ env: doctorEnv, fetchImpl: app(provisioned!.webhookSecret), webhookSecret: provisioned!.webhookSecret });
+    expect(good.findings.at(-1)).toMatchObject({ level: "pass", message: expect.stringMatching(/accepts events signed/) });
+    expect(received).toEqual([expect.objectContaining({ type: "selfhost.doctor" })]);
+    expect(JSON.stringify(good)).not.toContain(provisioned!.webhookSecret);
+
+    const stale = await inspectSelfhostAgentRuntime({ env: doctorEnv, fetchImpl: app("whsec_c29tZXRoaW5nLWVsc2U="), webhookSecret: provisioned!.webhookSecret });
+    expect(stale.findings.at(-1)).toMatchObject({ level: "fail", message: expect.stringMatching(/HTTP 401/) });
+  });
+
   it("fails on a token the runtime refuses, and reports a stopped runtime as not listening", async () => {
     const runtime = fakeRuntime();
     const wrongToken = await inspectSelfhostAgentRuntime({ env: { AGENT_RUNTIME_TENANT: "camelai-selfhost", AGENT_RUNTIME_API_TOKEN: "wrong" }, fetchImpl: runtime.fetchImpl });
@@ -203,7 +267,7 @@ describe("selfhost secret migrations: agent runtime", () => {
     const directory = await temporaryDirectory();
     const envPath = path.join(directory, ".env.selfhost");
     await fs.writeFile(envPath, "TOKEN_SIGNING_SECRET=existing\nADMIN_API_KEY=kept\n", { mode: 0o644 });
-    const first = await ensureSelfhostSecrets(envPath);
+    const first = await ensureSelfhostSecrets(envPath, { existingVolumes: async () => [] });
     expect(first.created).toEqual(AGENT_RUNTIME_ENV_DEFAULTS.map((entry) => entry[0]));
     const text = await fs.readFile(envPath, "utf8");
     expect(text).toContain("TOKEN_SIGNING_SECRET=existing\nADMIN_API_KEY=kept\n");
@@ -215,8 +279,25 @@ describe("selfhost secret migrations: agent runtime", () => {
     }
     expect((await fs.stat(envPath)).mode % 0o1000).toBe(0o600);
 
-    const second = await ensureSelfhostSecrets(envPath);
+    const second = await ensureSelfhostSecrets(envPath, { existingVolumes: async (names) => names });
     expect(second.created).toEqual([]);
     expect(await fs.readFile(envPath, "utf8")).toBe(text);
+  });
+
+  it("refuses to generate the runtime's stateful secrets while its volumes exist", async () => {
+    const directory = await temporaryDirectory();
+    const envPath = path.join(directory, ".env.selfhost");
+    const before = "COMPOSE_PROJECT_NAME=acme\nADMIN_API_KEY=kept\nAGENT_RUNTIME_SESSION_SECRET=kept\n";
+    await fs.writeFile(envPath, before, { mode: 0o600 });
+    const asked: string[][] = [];
+    const existingVolumes = async (names: string[]) => { asked.push(names); return names.slice(0, 1); };
+    await expect(ensureSelfhostSecrets(envPath, { existingVolumes }))
+      .rejects.toThrow(/Refusing to generate AGENT_RUNTIME_SECRETS_KEY, AGENT_RUNTIME_POSTGRES_PASSWORD: the agent runtime's volumes \(acme_agent-runtime-postgres\) exist/);
+    expect(asked).toEqual([["acme_agent-runtime-postgres", "acme_agent-runtime-data"]]);
+    // Nothing written: not even the values that are safe to add.
+    expect(await fs.readFile(envPath, "utf8")).toBe(before);
+    // Without the volumes (a new install), they are generated.
+    const created = await ensureSelfhostSecrets(envPath, { existingVolumes: async () => [] });
+    expect(created.created).toEqual(expect.arrayContaining(["AGENT_RUNTIME_SECRETS_KEY", "AGENT_RUNTIME_POSTGRES_PASSWORD"]));
   });
 });

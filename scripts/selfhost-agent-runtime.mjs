@@ -20,7 +20,7 @@
  * The runtime is private: it listens on the VM's loopback only (as the app
  * does), and browsers read threads through the app (routes/api/threads.$id.runtime.ts).
  */
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -44,6 +44,10 @@ export const RUNTIME_WEBHOOK_EVENTS = [
   "input.resolved",
   "usage.recorded",
 ];
+/** How this app's events webhook is tagged on the runtime: endpoints with it that are not the current one are removed. */
+export const RUNTIME_WEBHOOK_DESCRIPTION = "camelAI self-host: chat threads (runs, inputs, usage)";
+/** The runtime's volumes: the data AGENT_RUNTIME_PRIVATE_KEYS encrypt, sign or guard. */
+export const AGENT_RUNTIME_VOLUMES = Object.freeze(["agent-runtime-postgres", "agent-runtime-data"]);
 /** Where the provisioned state (definition id, webhook secret) is kept, under the app's state directory. */
 export const AGENT_RUNTIME_STATE_FILE = "agent-runtime.json";
 
@@ -68,7 +72,13 @@ export const AGENT_RUNTIME_ENV_DEFAULTS = Object.freeze([
   ["AGENT_RUNTIME_POSTGRES_PASSWORD", hex],
 ]);
 
-/** The runtime's secrets, which only the runtime's containers need (never Worker bindings). */
+/**
+ * The runtime's secrets, which only the runtime's containers need (never
+ * Worker bindings). Each guards data on the runtime's volumes (signed agent
+ * tokens, encrypted keys, the database's password), so none is generated
+ * while those volumes exist: a new one would lock the install out of them
+ * (refuseStatefulSecretRegeneration).
+ */
 export const AGENT_RUNTIME_PRIVATE_KEYS = Object.freeze([
   "AGENT_RUNTIME_SESSION_SECRET",
   "AGENT_RUNTIME_SECRETS_KEY",
@@ -76,18 +86,35 @@ export const AGENT_RUNTIME_PRIVATE_KEYS = Object.freeze([
 ]);
 
 /**
+ * Throw instead of generating any of `keys` (AGENT_RUNTIME_PRIVATE_KEYS)
+ * while `existingVolumes` (the runtime's, as Docker names them) exist.
+ */
+export function refuseStatefulSecretRegeneration(keys, existingVolumes) {
+  const stateful = keys.filter((key) => AGENT_RUNTIME_PRIVATE_KEYS.includes(key));
+  if (stateful.length === 0 || existingVolumes.length === 0) return;
+  throw new Error(
+    `Refusing to generate ${stateful.join(", ")}: the agent runtime's volumes (${existingVolumes.join(", ")}) exist, ` +
+      "and new values would lock the install out of their data (the database password, encrypted keys, signed tokens). " +
+      "Restore these values in .env.selfhost from a backup of it. Only if that data is to be discarded, remove the volumes " +
+      "(docker volume rm) and run the command again.",
+  );
+}
+
+/**
  * Where the runtime calls the app back (MCP tools, events): the app's own
- * loopback socket (SELFHOST_WORKERD_SOCKET), which the runtime shares the
- * network namespace of.
+ * port on IPv4 loopback, which the runtime shares the network namespace of.
+ * Always `http://127.0.0.1:<port>`, spelled exactly as the runtime's
+ * AGENT_OUTBOUND_ALLOW_ORIGINS names it (docker-compose.selfhost.yml): the
+ * runtime lets that one origin through its outbound guard and nothing else
+ * on loopback. AGENT_RUNTIME_CHIRIDION_URL overrides it (then allow that
+ * origin on the runtime too).
  */
 export function chiridionLoopbackUrl(env) {
   const explicit = String(env.AGENT_RUNTIME_CHIRIDION_URL ?? "").trim();
   if (explicit) return explicit.replace(/\/+$/, "");
   const socket = String(env.SELFHOST_WORKERD_SOCKET ?? "").trim() || "127.0.0.1:3001";
-  const match = /^(.*):(\d+)$/.exec(socket);
-  const [host, port] = match ? [match[1], match[2]] : [socket, "3001"];
-  const loopback = !host || host === "*" || host === "0.0.0.0" ? "127.0.0.1" : host === "::" ? "::1" : host;
-  return `http://${loopback.includes(":") && !loopback.startsWith("[") ? `[${loopback}]` : loopback}:${port}`;
+  const port = /:(\d+)$/.exec(socket)?.[1] ?? "3001";
+  return `http://127.0.0.1:${port}`;
 }
 
 /** The camelai-thread definition for this install (plans/agent-runtime-migration.md §12). */
@@ -121,9 +148,11 @@ export function threadDefinitionId(tenant) {
  * operator token is the tenant's, the thread definition calls the app's
  * tools, and the events webhook is registered with every event. Findings are
  * `{ level: "pass" | "warn" | "fail", message }`; nothing secret is in them.
+ * With `webhookSecret` (the provisioned one, from the app's state volume), it
+ * also sends the app a signed test event, as the runtime delivers them.
  * `listening: false` when the runtime is not up (the stack is stopped).
  */
-export async function inspectSelfhostAgentRuntime({ env, fetchImpl = globalThis.fetch }) {
+export async function inspectSelfhostAgentRuntime({ env, fetchImpl = globalThis.fetch, webhookSecret = null }) {
   const port = String(env.SELFHOST_AGENT_RUNTIME_PORT || DEFAULT_AGENT_RUNTIME_PORT).trim();
   const url = `http://127.0.0.1:${port}`;
   const tenant = String(env.AGENT_RUNTIME_TENANT ?? "").trim();
@@ -178,17 +207,52 @@ export async function inspectSelfhostAgentRuntime({ env, fetchImpl = globalThis.
     if (!endpoint) add("warn", `no events webhook for ${webhookUrl} yet (the app registers it as it starts)`);
     else if (missing.length > 0) add("fail", `events webhook ${endpoint.id} lacks ${missing.join(", ")}; restart the app to update it`);
     else add("pass", `events webhook ${endpoint.id} -> ${webhookUrl}`);
+    const others = (Array.isArray(endpoints) ? endpoints : []).filter((entry) =>
+      entry?.id && entry.id !== endpoint?.id && (entry.url === webhookUrl || entry.description === RUNTIME_WEBHOOK_DESCRIPTION));
+    if (others.length > 0) add("warn", `other events webhooks of this app (${others.map((entry) => entry.id).join(", ")}) deliver every event again; restart the app to remove them`);
   } catch (error) {
     add("fail", `could not list webhooks: ${error.message}`);
+  }
+  if (webhookSecret) {
+    // What the runtime's deliveries rely on: the app takes an event signed
+    // with the provisioned secret. The event's type is one the app ignores.
+    try {
+      const response = await sendSignedEvent({ url: `${chiridionUrl}/agent-runtime/events`, secret: webhookSecret, fetchImpl });
+      if (response.ok) add("pass", `the app accepts events signed with the provisioned webhook secret`);
+      else if (response.status === 401) add("fail", "the app refuses events signed with the provisioned webhook secret (HTTP 401); restart the app to bind it again");
+      else if (response.status === 503) add("fail", "the app has no events webhook secret bound (HTTP 503); restart the app to provision the runtime");
+      else add("warn", `a signed test event got HTTP ${response.status} from the app`);
+    } catch (error) {
+      add("warn", `could not send the app a signed test event: ${error.message}`);
+    }
   }
   return { listening: true, url, findings };
 }
 
+/** A Standard Webhooks delivery (`v1,` HMAC-SHA256 of `<id>.<timestamp>.<body>`), as the runtime signs its events. */
+export async function sendSignedEvent({ url, secret, fetchImpl = globalThis.fetch, now = Date.now() }) {
+  const id = `evt_selfhost_doctor_${randomBytes(8).toString("hex")}`;
+  const timestamp = String(Math.floor(now / 1000));
+  const body = JSON.stringify({ id, type: "selfhost.doctor", created: now, data: {} });
+  const key = Buffer.from(secret.startsWith("whsec_") ? secret.slice("whsec_".length) : secret, "base64");
+  const signature = createHmac("sha256", key).update(`${id}.${timestamp}.${body}`).digest("base64");
+  const response = await fetchImpl(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "webhook-id": id, "webhook-timestamp": timestamp, "webhook-signature": `v1,${signature}` },
+    body,
+    signal: AbortSignal.timeout(10_000),
+  });
+  await response.body?.cancel?.();
+  return response;
+}
+
 export class AgentRuntimeProvisionError extends Error {
-  constructor(message, status) {
+  /** `fatal`: a misconfiguration (another tenant's token) that falling back to the last state would hide. */
+  constructor(message, status, { fatal = false } = {}) {
     super(message);
     this.name = "AgentRuntimeProvisionError";
     this.status = status;
+    this.fatal = fatal;
   }
 }
 
@@ -282,7 +346,7 @@ export async function provisionSelfhostAgentRuntime({
     const call = runtimeClient({ url, token, fetchImpl });
     const me = await call("GET", "/v1/me");
     if (me && typeof me.tenant === "string" && me.tenant !== tenant) {
-      throw new AgentRuntimeProvisionError(`AGENT_RUNTIME_API_TOKEN is tenant ${me.tenant}'s, not ${tenant}'s`);
+      throw new AgentRuntimeProvisionError(`AGENT_RUNTIME_API_TOKEN is tenant ${me.tenant}'s, not ${tenant}'s`, undefined, { fatal: true });
     }
     // The upsert answers with the listing of its MCP server; the app is not
     // up yet, so that listing fails softly and the runtime lists it again later.
@@ -293,13 +357,14 @@ export async function provisionSelfhostAgentRuntime({
 
     const webhookUrl = `${chiridionUrl}/agent-runtime/events`;
     const endpoints = await call("GET", "/v1/webhooks");
-    const existing = (Array.isArray(endpoints) ? endpoints : []).find((endpoint) => endpoint?.url === webhookUrl);
+    const listed = Array.isArray(endpoints) ? endpoints : [];
+    const existing = listed.find((endpoint) => endpoint?.url === webhookUrl);
     let webhook;
     if (!existing) {
       const created = await call("POST", "/v1/webhooks", {
         url: webhookUrl,
         events: RUNTIME_WEBHOOK_EVENTS,
-        description: "camelAI self-host: chat threads (runs, inputs, usage)",
+        description: RUNTIME_WEBHOOK_DESCRIPTION,
       });
       webhook = { id: created.id, secret: created.secret };
       log.log?.(`[selfhost:agent-runtime] Registered the events webhook ${created.id}`);
@@ -322,6 +387,13 @@ export async function provisionSelfhostAgentRuntime({
     if (typeof webhook.secret !== "string" || !webhook.secret.startsWith("whsec_")) {
       throw new AgentRuntimeProvisionError("The runtime returned no webhook signing secret");
     }
+    // This app's other endpoints (an old port or URL, a duplicate) would
+    // deliver every event again, signed with secrets the app no longer has.
+    for (const stale of listed.filter((endpoint) =>
+      endpoint?.id && endpoint.id !== webhook.id && (endpoint.url === webhookUrl || endpoint.description === RUNTIME_WEBHOOK_DESCRIPTION))) {
+      await call("DELETE", `/v1/webhooks/${encodeURIComponent(stale.id)}`);
+      log.log?.(`[selfhost:agent-runtime] Removed the stale events webhook ${stale.id} (${stale.url})`);
+    }
     const state = {
       runtimeUrl: url,
       tenant,
@@ -336,6 +408,10 @@ export async function provisionSelfhostAgentRuntime({
     log.log?.(`[selfhost:agent-runtime] Tenant ${tenant}: definition ${definition.id} (revision ${definition.revision ?? "?"}), events at ${webhookUrl}`);
     return { definitionId: state.definitionId, webhookSecret: state.webhookSecret, fresh: true };
   } catch (error) {
+    // A token the runtime refuses, or another tenant's, is a misconfiguration:
+    // the last state would only hide it until threads fail. Only an
+    // unreachable or failing runtime falls back.
+    if (error instanceof AgentRuntimeProvisionError && (error.fatal || error.status === 401 || error.status === 403)) throw error;
     if (previous?.definitionId && previous?.webhookSecret && previous.tenant === tenant) {
       log.error?.(`[selfhost:agent-runtime] Could not provision the runtime (${error.message}); using the last provisioned definition ${previous.definitionId}`);
       return { definitionId: previous.definitionId, webhookSecret: previous.webhookSecret, fresh: false };

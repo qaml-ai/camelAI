@@ -31,6 +31,7 @@ import {
 } from "./selfhost-pomerium-config.mjs";
 import {
   AGENT_RUNTIME_ENV_DEFAULTS,
+  AGENT_RUNTIME_STATE_FILE,
   inspectSelfhostAgentRuntime,
 } from "./selfhost-agent-runtime.mjs";
 
@@ -555,7 +556,32 @@ await check("agent runtime", async () => {
         "so keep local authentication to smoke tests",
     );
   }
-  const inspection = await inspectSelfhostAgentRuntime({ env: effectiveEnv });
+  // An operator endpoint on a private network needs its exact origin allowed on the runtime.
+  const aiBaseUrl = (env.SELFHOST_AI_PROVIDER || "").trim() === "custom" ? (env.SELFHOST_AI_BASE_URL || "").trim() : "";
+  if (aiBaseUrl) {
+    let origin = "";
+    try {
+      origin = new URL(aiBaseUrl).origin;
+    } catch {}
+    const allowed = (env.SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS || "").split(",").map((entry) => entry.trim()).filter(Boolean);
+    const privateHost = /^(http:|https:\/\/(10\.|127\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|localhost|\[))/i.test(aiBaseUrl);
+    if (origin && privateHost && !allowed.includes(origin)) {
+      warn(`SELFHOST_AI_BASE_URL looks private or plain http; the runtime reaches it only if SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS includes ${origin}`);
+    }
+  }
+  // The provisioned webhook secret, from the app's state volume, for a signed test event.
+  let webhookSecret = null;
+  const state = await capture(
+    "docker",
+    composeArgs(env, ["exec", "-T", "app", "cat", `/workspace/.selfhost/workerd/state/${AGENT_RUNTIME_STATE_FILE}`]),
+    { env: scriptEnv(env) },
+  ).catch(() => null);
+  if (state?.code === 0) {
+    try {
+      webhookSecret = JSON.parse(state.stdout).webhookSecret || null;
+    } catch {}
+  }
+  const inspection = await inspectSelfhostAgentRuntime({ env: effectiveEnv, webhookSecret });
   if (!inspection.listening) {
     warn("stack is not running; live agent runtime checks skipped");
     note(`agent runtime: not listening at ${inspection.url}`);

@@ -1,7 +1,13 @@
 import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { AGENT_RUNTIME_ENV_DEFAULTS } from "./selfhost-agent-runtime.mjs";
+import { spawn } from "node:child_process";
+import {
+  AGENT_RUNTIME_ENV_DEFAULTS,
+  AGENT_RUNTIME_PRIVATE_KEYS,
+  AGENT_RUNTIME_VOLUMES,
+  refuseStatefulSecretRegeneration,
+} from "./selfhost-agent-runtime.mjs";
 
 function decodeEnvValue(value) {
   const trimmed = value.trim();
@@ -24,16 +30,28 @@ function escapeRegExp(text) {
  * pairs) it lacks (absent, or empty in its last definition), in one atomic
  * write. A value it has is never rotated or rewritten; duplicate definitions
  * of a key that is filled in are collapsed to one. The file ends up 0600.
+ * `beforeCreate(keys, values)`, given the keys about to be generated and the
+ * file's current values, may throw to write nothing.
  */
-export async function ensureSelfhostEnvValues(envPath, defaults) {
+export async function ensureSelfhostEnvValues(envPath, defaults, { beforeCreate } = {}) {
   let lines = (await fs.readFile(envPath, "utf8")).split(/\r?\n/);
-  const created = [];
-  for (const [key, generate] of defaults) {
+  const definitionsOf = (key) => {
     const pattern = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=(.*)$`);
-    const definitions = lines.flatMap((line, index) => {
+    return lines.flatMap((line, index) => {
       const match = line.match(pattern);
       return match ? [{ index, value: decodeEnvValue(match[1]) }] : [];
     });
+  };
+  if (beforeCreate) {
+    const missing = defaults.map(([key]) => key).filter((key) => !definitionsOf(key).at(-1)?.value);
+    if (missing.length > 0) {
+      const value = (key) => definitionsOf(key).at(-1)?.value ?? "";
+      await beforeCreate(missing, value);
+    }
+  }
+  const created = [];
+  for (const [key, generate] of defaults) {
+    const definitions = definitionsOf(key);
     if (definitions.at(-1)?.value) continue;
     const line = `${key}=${generate()}`;
     if (definitions.length > 0) {
@@ -73,8 +91,31 @@ export async function ensureSelfhostAdminApiKey(envPath) {
  * snapshots, doctor and Compose (selfhost:up, selfhost:upgrade,
  * selfhost:migrate-secrets), so the values are generated once and kept.
  */
-export async function ensureSelfhostSecrets(envPath) {
-  return await ensureSelfhostEnvValues(envPath, [ADMIN_API_KEY_DEFAULT, ...AGENT_RUNTIME_ENV_DEFAULTS]);
+export async function ensureSelfhostSecrets(envPath, { existingVolumes = existingDockerVolumes } = {}) {
+  return await ensureSelfhostEnvValues(envPath, [ADMIN_API_KEY_DEFAULT, ...AGENT_RUNTIME_ENV_DEFAULTS], {
+    // Never a new database password, secrets key or session secret over the
+    // runtime's existing data: it would lock the install out of it.
+    beforeCreate: async (keys, value) => {
+      if (!keys.some((key) => AGENT_RUNTIME_PRIVATE_KEYS.includes(key))) return;
+      const project = value("COMPOSE_PROJECT_NAME") || process.env.COMPOSE_PROJECT_NAME || "camelai-selfhost";
+      refuseStatefulSecretRegeneration(keys, await existingVolumes(AGENT_RUNTIME_VOLUMES.map((name) => `${project}_${name}`)));
+    },
+  });
+}
+
+/**
+ * Which of `names` exist as Docker volumes on this host. Without the Docker
+ * CLI, none can: the stack cannot have run here.
+ */
+export async function existingDockerVolumes(names) {
+  const exists = (name) => new Promise((resolve) => {
+    const child = spawn("docker", ["volume", "inspect", name], { stdio: "ignore" });
+    child.on("error", () => resolve(false));
+    child.on("exit", (code) => resolve(code === 0));
+  });
+  const found = [];
+  for (const name of names) if (await exists(name)) found.push(name);
+  return found;
 }
 
 async function atomicWritePrivateFile(filePath, contents) {

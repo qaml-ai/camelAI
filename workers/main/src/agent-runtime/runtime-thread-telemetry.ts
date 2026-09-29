@@ -69,6 +69,44 @@ export function recordRuntimeSendTiming(
 }
 
 /**
+ * `runtime_thread_agent_prewarm`: a new thread's agent created ahead of its
+ * first send (prewarmThreadAgent). Status `created`, `exists` (the send, or
+ * another prewarm, made it first), `refused` (a run gate refused: the send
+ * will say why; errorName is its code) or the class of a thrown error.
+ * durationMs is the whole prewarm; double6 the runtime's create call.
+ */
+export function recordRuntimeAgentPrewarm(
+  env: ObservabilityEnv | undefined,
+  context: RuntimeThreadTelemetryContext,
+  outcome: { status: string; code?: string | null; durationMs: number; createMs?: number; error?: unknown },
+): void {
+  if (outcome.error !== undefined) {
+    const failure = classifyRuntimeFailure(outcome.error);
+    recordErrorEvent(env, {
+      event: "runtime_thread_agent_prewarm",
+      component: "runtime_thread",
+      operation: "prewarm",
+      ...ids(context),
+      status: failure.status,
+      statusCode: failure.statusCode ?? undefined,
+      durationMs: outcome.durationMs,
+      error: outcome.error,
+    });
+    return;
+  }
+  recordObservabilityEvent(env, {
+    event: "runtime_thread_agent_prewarm",
+    component: "runtime_thread",
+    operation: "prewarm",
+    ...ids(context),
+    status: outcome.status,
+    errorName: outcome.code ?? null,
+    durationMs: outcome.durationMs,
+    extraCounts: [outcome.createMs ?? 0],
+  });
+}
+
+/**
  * `runtime_thread_send_failed`: a message the runtime did not accept. Status
  * `refused` (chiridion's gates; errorName is the refusal's code), `busy`, or
  * the class of a thrown error. Nothing for an accepted send.

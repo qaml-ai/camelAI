@@ -17,6 +17,7 @@ import {
   answerRuntimeInput,
   mintRuntimeBrowserToken,
   pinNewThreadToRuntime,
+  prewarmThreadAgent,
   runtimeAgentThreadKey,
   threadScratchVolume,
   startRuntimeTurn,
@@ -111,6 +112,42 @@ async function send(setup: Awaited<ReturnType<typeof runtimeThread>>, text: stri
   await Promise.allSettled(pending);
   return result;
 }
+
+describe("prewarmThreadAgent", () => {
+  it("makes a new thread's agent ahead of its first send, which then only prompts it", async () => {
+    const setup = await runtimeThread();
+    const agent = { "POST /v1/agents": () => Response.json({ id: "agt_prewarm" }, { status: 201 }) };
+    const calls = fakeRuntime(agent);
+    expect(await prewarmThreadAgent(runtimeEnv, setup.context, setup.sender.userId)).toBe("agt_prewarm");
+    const create = calls.find((call) => call.method === "POST" && call.path === "/v1/agents")!;
+    expect(create.headers.get("idempotency-key")).toBe(`thread_${setup.threadId}`);
+    expect(await setup.orgStub.getThreadRuntime(setup.threadId)).toMatchObject({
+      agentId: "agt_prewarm",
+      configured: { promptVersion: RUNTIME_PROMPT_VERSION },
+    });
+    // Once made, a second prewarm does nothing, and the first send makes no agent.
+    expect(await prewarmThreadAgent(runtimeEnv, setup.context, setup.sender.userId)).toBe("agt_prewarm");
+    calls.length = 0;
+    expect(await send(setup, "Hello runtime", "cm_prewarm")).toMatchObject({ status: "accepted", agentId: "agt_prewarm" });
+    expect(calls.map((call) => `${call.method} ${call.path}`)).toEqual(["POST /v1/agents/agt_prewarm/prompt"]);
+  });
+
+  it("keeps the agent a send recorded first", async () => {
+    const setup = await runtimeThread();
+    await setup.orgStub.setThreadRuntimeAgent(setup.threadId, { agentId: "agt_sent", model: "m", keyScope: null, configured: { scratchVolumeId: "vol_1" } });
+    const calls = fakeRuntime();
+    expect(await prewarmThreadAgent(runtimeEnv, setup.context, setup.sender.userId)).toBe("agt_sent");
+    expect(calls).toHaveLength(0);
+    expect(await setup.orgStub.getThreadRuntime(setup.threadId)).toMatchObject({ agentId: "agt_sent", configured: { scratchVolumeId: "vol_1" } });
+  });
+
+  it("never throws: a runtime failure leaves the agent to the send", async () => {
+    const setup = await runtimeThread();
+    fakeRuntime({ "POST /v1/agents": () => Response.json({ error: "down" }, { status: 503 }) });
+    expect(await prewarmThreadAgent(runtimeEnv, setup.context, setup.sender.userId)).toBeNull();
+    expect(await setup.orgStub.getThreadRuntime(setup.threadId)).toMatchObject({ agentId: null });
+  });
+});
 
 describe("startRuntimeTurn", () => {
   it("clears a new thread's pending first message once a send is accepted, and not on a refusal", async () => {

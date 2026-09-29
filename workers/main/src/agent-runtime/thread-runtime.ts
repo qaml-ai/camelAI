@@ -35,7 +35,7 @@ import {
   type SendTimings,
   type ThreadModelFallback,
 } from "./run-gates";
-import { recordRuntimeSendTiming } from "./runtime-thread-telemetry";
+import { recordRuntimeAgentPrewarm, recordRuntimeSendTiming } from "./runtime-thread-telemetry";
 import { recordWorkspaceThreadStreaming } from "../thread-status";
 
 /** How long a browser token lives; the watcher renews it a minute before. */
@@ -106,6 +106,11 @@ function orgStub(env: ChatEnv, orgId: string) {
     getThreadRuntime(threadId: string): Promise<ThreadRuntimeRecord | null>;
     pinThreadRuntime(threadId: string, pendingFirstMessage?: string | null): Promise<boolean>;
     clearThreadPendingFirstMessage(threadId: string): Promise<void>;
+    claimThreadRuntimeAgent(threadId: string, agentId: string, configuration?: {
+      model: string | null;
+      keyScope: string | null;
+      configured?: Record<string, unknown> | null;
+    }): Promise<{ row: ThreadRuntimeRecord; claimed: boolean } | null>;
     setThreadRuntimeAgent(threadId: string, update: {
       agentId: string;
       model: string | null;
@@ -258,6 +263,68 @@ async function createThreadAgent(
   }
 }
 
+/** The configuration recorded for an agent made for `run` (see ensureConfiguredAgent). */
+function madeConfiguration(run: PreparedRuntimeRun) {
+  return {
+    model: run.model,
+    keyScope: run.keyScope,
+    configured: {
+      thinkingLevel: run.thinkingLevel,
+      promptVersion: RUNTIME_PROMPT_VERSION,
+    },
+  };
+}
+
+/**
+ * Create a new thread's agent ahead of its first send, so the send finds it
+ * made (plans/runtime-threads-direct.md §4.2: configure is most of a first
+ * send). Started by the new-chat action, in the background, as the thread's
+ * page loads. It runs the same run gates as a send (as `userId`), and makes
+ * nothing when they refuse: the send says why. Creating is idempotent per
+ * thread (the agent's Idempotency-Key), so a send that races it makes, or
+ * finds, the same agent, and records the same row. Never throws.
+ */
+export async function prewarmThreadAgent(
+  env: ChatEnv,
+  context: ChatContextState,
+  userId: string | null,
+): Promise<string | null> {
+  const startedAt = Date.now();
+  let createMs = 0;
+  try {
+    const org = orgStub(env, context.orgId);
+    const row = await org.getThreadRuntime(context.threadId);
+    if (!row || row.agentId) {
+      recordRuntimeAgentPrewarm(env, context, { status: row ? "exists" : "no_row", durationMs: Date.now() - startedAt });
+      return row?.agentId ?? null;
+    }
+    let run: PreparedRuntimeRun;
+    try {
+      run = await prepareThreadRuntimeRun(env, context, userId);
+    } catch (error) {
+      if (!(error instanceof RuntimeRunRefused)) throw error;
+      recordRuntimeAgentPrewarm(env, context, { status: "refused", code: error.code, durationMs: Date.now() - startedAt });
+      return null;
+    }
+    const createStartedAt = Date.now();
+    const made = await onceMore("prewarm_agent", () => createThreadAgent(env, context, run));
+    createMs = Date.now() - createStartedAt;
+    // An adopted agent (made under an earlier configuration) is left for the
+    // send, which brings it up to date. Recorded compare-and-set: a send that
+    // recorded the agent first keeps its row as it wrote it.
+    if (!made.adopted) {
+      await onceMore("prewarm_record_agent", () =>
+        org.claimThreadRuntimeAgent(context.threadId, made.agentId, madeConfiguration(run)));
+    }
+    recordRuntimeAgentPrewarm(env, context, { status: made.adopted ? "adopted" : "created", durationMs: Date.now() - startedAt, createMs });
+    return made.adopted ? null : made.agentId;
+  } catch (error) {
+    console.warn("[runtime-thread] could not create a new thread's agent ahead of its first send", error);
+    recordRuntimeAgentPrewarm(env, context, { status: "exception", durationMs: Date.now() - startedAt, createMs, error });
+    return null;
+  }
+}
+
 /** Whether the agent already has `requestId`: a retried send, which changes nothing. */
 async function retriedRequest(env: ChatEnv, agentId: string, requestId: string): Promise<boolean> {
   return await runtimeApi(env, "GET", `/v1/agents/${encodeURIComponent(agentId)}/requests/${encodeURIComponent(requestId)}`).then(() => true, (error) => {
@@ -289,15 +356,7 @@ async function ensureConfiguredAgent(
     const made = await createThreadAgent(env, context, run);
     agentId = made.agentId;
     if (!made.adopted) {
-      await org.setThreadRuntimeAgent(context.threadId, {
-        agentId,
-        model: run.model,
-        keyScope: run.keyScope,
-        configured: {
-          thinkingLevel: run.thinkingLevel,
-          promptVersion: RUNTIME_PROMPT_VERSION,
-        },
-      });
+      await org.setThreadRuntimeAgent(context.threadId, { agentId, ...madeConfiguration(run) });
       return agentId;
     }
     stale = true;

@@ -14,6 +14,7 @@ const addThreadToExistingGroupMock = vi.fn();
 const addThreadToExistingGroupLightweightMock = vi.fn();
 const startInitialUserMessageMock = vi.fn();
 const pinNewWebThreadMock = vi.fn();
+const prewarmNewWebThreadAgentMock = vi.fn();
 const CLIENT_BUILD_ID = 'development';
 
 vi.mock('@/lib/wait-until', () => ({
@@ -53,6 +54,7 @@ vi.mock('@/lib/chat-do.server', () => ({
 
 vi.mock('@/lib/runtime-threads.server', () => ({
   pinNewWebThread: pinNewWebThreadMock,
+  prewarmNewWebThreadAgent: prewarmNewWebThreadAgentMock,
 }));
 
 vi.mock('@/lib/chat-groups.server', () => ({
@@ -194,6 +196,7 @@ describe('new chat create action', () => {
 
     expect(response.status).toBeGreaterThanOrEqual(400);
     expect(deleteThreadMock).toHaveBeenCalledWith({}, 'thread_123', 'ws_123', { orgId: 'org_123' });
+    expect(prewarmNewWebThreadAgentMock).not.toHaveBeenCalled();
     expect(startInitialUserMessageMock).not.toHaveBeenCalled();
   });
 
@@ -223,6 +226,8 @@ describe('new chat create action', () => {
     expect(pinNewWebThreadMock).toHaveBeenCalledWith({}, threadContext, {
       pendingFirstMessage: 'Build an analytics dashboard',
     });
+    // Its agent is made in the background, as the page loads.
+    expect(prewarmNewWebThreadAgentMock).toHaveBeenCalledWith({}, threadContext, waitUntilMock);
     expect(startInitialUserMessageMock).not.toHaveBeenCalled();
     // The runtime turn's own bookkeeping generates the title.
     expect(generateThreadTitleMock).not.toHaveBeenCalled();

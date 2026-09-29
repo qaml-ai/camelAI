@@ -14,6 +14,7 @@ import {
   mintRuntimeBrowserToken,
   pinNewThreadToRuntime,
   runtimeHistoryPage,
+  prewarmThreadAgent,
   type RuntimeThreadSender,
 } from "../../workers/main/src/agent-runtime/thread-runtime";
 import type { RuntimeThreadSeed } from "@/lib/use-runtime-thread";
@@ -255,4 +256,16 @@ export async function pinNewWebThread(
   options: { pendingFirstMessage?: string | null } = {},
 ): Promise<ThreadRuntimeRecord | null> {
   return await pinNewThreadToRuntime(getEnv(loadContext) as unknown as ChatEnv, context, options);
+}
+
+/**
+ * Create a new web thread's agent in the background, as its page loads, so
+ * its first send does not wait on the runtime to make it.
+ */
+export function prewarmNewWebThreadAgent(
+  loadContext: AppLoadContext,
+  context: ChatContextState,
+  waitUntil: (promise: Promise<unknown>) => void,
+): void {
+  waitUntil(prewarmThreadAgent(getEnv(loadContext) as unknown as ChatEnv, context, context.userId));
 }

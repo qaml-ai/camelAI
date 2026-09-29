@@ -23,6 +23,7 @@ import {
   getDevBillingCreditStatus,
   getDevChatInitialError,
 } from "@/lib/chat-credit-status";
+import { waitUntil } from "@/lib/wait-until";
 import { getAuthEnv } from "@/lib/auth-helpers";
 import type { MentionableProject } from "@/lib/mentions";
 import { getWorkerScript } from "@/lib/auth-do";
@@ -804,6 +805,11 @@ export async function action({ request, context }: Route.ActionArgs) {
       if (!runtimeRow) {
         await chatDO.deleteThread(context, thread.id, workspaceId, { orgId }).catch(() => {});
         throw new Error("This chat's model is not available right now. Pick another model and try again.");
+      }
+      if (shouldStartAndRedirect) {
+        // The thread's agent is made now, in the background, while the rest
+        // of the action and the redirect run: the page's first send finds it.
+        runtimeThreads.prewarmNewWebThreadAgent(context, threadContext, waitUntil);
       }
 
       // Set preview apps if provided (for "chat with this app" flow)

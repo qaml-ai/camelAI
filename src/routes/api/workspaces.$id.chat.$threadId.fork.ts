@@ -6,6 +6,7 @@ import * as chatDO from '@/lib/chat-do.server';
 import { addThreadToExistingGroup } from '@/lib/chat-groups.server';
 import { normalizeLlmModel } from '@/lib/llm-provider-config';
 import type { ChatThreadPiCoreForkResult } from '../../../workers/main/src/chat-thread-do';
+import type { ThreadRuntimeRecord } from '../../../workers/main/src/identity/org-do';
 
 function forkThreadTitle(title: string | null | undefined): string {
   const trimmed = title?.trim();
@@ -148,6 +149,33 @@ export async function action({ request, context, params }: Route.ActionArgs) {
         ? 400
         : 500;
     return Response.json({ error: message }, { status });
+  }
+
+  // A runtime thread forks on the runtime: a new agent with its history.
+  const sourceRuntime = await orgStub.getThreadRuntime(sourceThreadId) as ThreadRuntimeRecord | null;
+  if (sourceRuntime) {
+    const failed = async (status: number, error: string) => {
+      await chatDO.deleteThread(context, targetThread.id, workspaceId, { orgId }).catch(() => {});
+      return Response.json({ error }, { status });
+    };
+    if (!sourceRuntime.agentId) return await failed(404, 'Fork target not found in the thread\'s history');
+    const { forkRuntimeThread } = await import('../../../workers/main/src/agent-runtime/thread-fork');
+    const forked = await forkRuntimeThread(env as never, {
+      source: { ...sourceRuntime, agentId: sourceRuntime.agentId },
+      target: { orgId, workspaceId, threadId: targetThread.id, userId, userName: null, userEmail: null },
+      forkEntryId: messageId,
+    }).catch((error: unknown) => ({ status: 'failed' as const, error: normalizeForkError(error) }));
+    if (forked.status !== 'forked') return await failed(forked.status === 'not_found' ? 404 : 500, forked.error);
+    if (targetGroupId) {
+      await addThreadToExistingGroup(context, {
+        userId,
+        orgId,
+        workspaceId,
+        groupId: targetGroupId,
+        threadId: targetThread.id,
+      }).catch((error: unknown) => console.error('Failed to add the fork to its group:', error));
+    }
+    return Response.json({ thread: targetThread, groupId: targetGroupId });
   }
 
   try {

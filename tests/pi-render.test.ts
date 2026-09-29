@@ -35,6 +35,21 @@ function render(messages: AgentMessage[], extra: Partial<Parameters<typeof piRen
 const blocks = (content: unknown) => content as ContentBlock[];
 
 describe("piRender", () => {
+  it("gives each settled message its fork point: the last history message it shows", () => {
+    const { messages } = render([
+      user("Build it", 1000),
+      assistant([{ type: "toolCall", id: "c1", name: "camel__read", arguments: {} }], 2000),
+      toolResult("c1", "camel__read", "file text", 2500),
+      assistant([{ type: "text", text: "Done." }], 3000),
+      user("Again", 4000),
+    ], { clientMessageIds: new Map([[4, "client-1"]]) });
+    expect(messages.map((message) => [message.id, message.forkEntryId])).toEqual([
+      ["rt:0", "rt:0"],
+      ["rt:1", "rt:3"],
+      ["client-1", "rt:4"],
+    ]);
+  });
+
   it("makes a turn one assistant message, each tool result after its call, with chiridion's tool names", () => {
     const { messages, streamingMessageId } = render([
       user("Build it", 1000, { id: "u1", name: "Ada" }),

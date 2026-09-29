@@ -13,6 +13,12 @@ const getPiCoreForkMessagesMock = vi.fn();
 const replacePiCoreForkMessagesMock = vi.fn();
 const getForkStateSnapshotMock = vi.fn();
 const applyForkStateSnapshotMock = vi.fn();
+const orgGetThreadRuntimeMock = vi.fn();
+const forkRuntimeThreadMock = vi.fn();
+
+vi.mock('../workers/main/src/agent-runtime/thread-fork', () => ({
+  forkRuntimeThread: forkRuntimeThreadMock,
+}));
 
 vi.mock('@/lib/auth.server', () => ({
   requireSessionWorkspaceAccess: requireSessionWorkspaceAccessMock,
@@ -66,6 +72,7 @@ describe('chat fork route', () => {
         idFromName: (id: string) => id,
         get: () => ({
           getThread: orgGetThreadMock,
+          getThreadRuntime: orgGetThreadRuntimeMock,
         }),
       },
       USER: {
@@ -76,6 +83,7 @@ describe('chat fork route', () => {
         }),
       },
     });
+    orgGetThreadRuntimeMock.mockResolvedValue(null);
     orgGetThreadMock.mockResolvedValue({
       id: 'thread_source',
       workspace_id: 'ws_123',
@@ -137,6 +145,47 @@ describe('chat fork route', () => {
       open_thread_ids: ['thread_source'],
       closed_thread_ids: [],
     });
+  });
+
+  it('forks a runtime thread on the runtime, from its history', async () => {
+    const source = { threadId: 'thread_source', agentId: 'agt_src', model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
+    orgGetThreadRuntimeMock.mockResolvedValue(source);
+    forkRuntimeThreadMock.mockResolvedValue({ status: 'forked', row: { ...source, threadId: 'thread_fork', agentId: 'agt_fork' } });
+    const response = await action({
+      request: new Request('https://camelai.com/api/workspaces/ws_123/chat/thread_source/fork', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messageId: 'rt:3', renderedMessageId: 'rt:1' }),
+      }),
+      context: {},
+      params: { id: 'ws_123', threadId: 'thread_source' },
+    } as never);
+
+    expect(response.status).toBe(200);
+    expect(forkRuntimeThreadMock).toHaveBeenCalledWith(expect.anything(), {
+      source,
+      target: { orgId: 'org_123', workspaceId: 'ws_123', threadId: 'thread_fork', userId: 'user_123', userName: null, userEmail: null },
+      forkEntryId: 'rt:3',
+    });
+    expect(getPiCoreForkMessagesMock).not.toHaveBeenCalled();
+    expect(deleteThreadMock).not.toHaveBeenCalled();
+  });
+
+  it('deletes the new thread when a runtime fork point is not found', async () => {
+    orgGetThreadRuntimeMock.mockResolvedValue({ threadId: 'thread_source', agentId: 'agt_src', model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 });
+    forkRuntimeThreadMock.mockResolvedValue({ status: 'not_found', error: 'Fork target not found in the thread\'s history' });
+    const response = await action({
+      request: new Request('https://camelai.com/api/workspaces/ws_123/chat/thread_source/fork', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messageId: 'client-1' }),
+      }),
+      context: {},
+      params: { id: 'ws_123', threadId: 'thread_source' },
+    } as never);
+
+    expect(response.status).toBe(404);
+    expect(deleteThreadMock).toHaveBeenCalledWith({}, 'thread_fork', 'ws_123', { orgId: 'org_123' });
   });
 
   it('remaps legacy source models before creating the forked thread', async () => {

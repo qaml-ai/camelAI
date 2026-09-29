@@ -13,6 +13,7 @@ export default [
     route("forgot-password", "routes/_auth.forgot-password.tsx"),
     route("reset-password", "routes/_auth.reset-password.tsx"),
   ]),
+  route("signup.", "routes/signup-dot.ts"),
   route("banned", "routes/banned.tsx"),
   // Per-organization direct OIDC authorization entry point.
   route("sso/:slug", "routes/sso.$slug.ts"),

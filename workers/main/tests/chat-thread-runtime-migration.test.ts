@@ -643,7 +643,7 @@ describe("ChatThreadDO turn guard", () => {
     // The move begins during the send's first await (the org ban check).
     fake.env = { APP_KV: { get: async () => { fake.store.set(RUNTIME_MIGRATION_KEY, leased()); return null; } } };
     expect(await call(fake, "enqueueRunnerUserMessage", { type: "message", content: "hello" }))
-      .toEqual({ status: "busy", error: "This conversation is moving; try again in a moment." });
+      .toEqual({ status: "busy", code: "thread_moving", error: expect.stringContaining("is moving") });
     expect(fake.sendRunnerCommand).not.toHaveBeenCalled();
   });
 
@@ -653,7 +653,7 @@ describe("ChatThreadDO turn guard", () => {
     expect(await call(fake, "enqueueRunnerUserMessage", { type: "message", content: "hello" })).toMatchObject({ status: "busy" });
     fake.store.set(RUNTIME_MIGRATION_KEY, { phase: "moved", leaseId: "l", agentId: "a", movedAt: 1 });
     expect(await call(fake, "enqueueRunnerUserMessage", { type: "message", content: "hello" }))
-      .toEqual({ status: "error", error: "This conversation moved; reload the page to continue it." });
+      .toEqual({ status: "error", code: "thread_moved", error: expect.stringContaining("moved") });
     expect(fake.sendRunnerCommand).not.toHaveBeenCalled();
   });
 

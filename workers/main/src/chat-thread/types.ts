@@ -298,6 +298,8 @@ export interface InitialUserMessageResult {
   /** "moved": the thread runs on the agent runtime now; the caller sends it there. */
   status: "accepted" | "busy" | "error" | "moved";
   error?: string;
+  /** A web send refused because the thread moved (or is moving) to the runtime: its page reopens it there. */
+  code?: "thread_moved" | "thread_moving";
 }
 
 export interface AgentEvalParsedMessage {

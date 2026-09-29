@@ -4361,8 +4361,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   /** The answer to a message while the thread is moving to the runtime or moved; null when it may run here. */
   private runtimeMigrationRefusal(): InitialUserMessageResult | null {
     const migration = this.runtimeMigrationState();
-    if (migration === "moved") return { status: "error", error: "This conversation moved; reload the page to continue it." };
-    if (migration === "moving") return { status: "busy", error: "This conversation is moving; try again in a moment." };
+    if (migration === "moved") return { status: "error", code: "thread_moved", error: "This conversation moved to the new chat engine. Reopening it; send your message again." };
+    if (migration === "moving") return { status: "busy", code: "thread_moving", error: "This conversation is moving to the new chat engine. Reopening it in a moment; send your message again." };
     return null;
   }
 

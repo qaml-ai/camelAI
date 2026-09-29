@@ -277,7 +277,12 @@ type ChatAgentClient = {
 type SendMessageResult = {
   status: "accepted" | "busy" | "error";
   error?: string;
+  /** The thread moved (or is moving) to the agent runtime while this page showed it from ChatThreadDO. */
+  code?: "thread_moved" | "thread_moving";
 };
+
+/** How long after a "moving" refusal the page asks its loader again (the move commits within seconds). */
+const MOVING_REOPEN_DELAY_MS = 3_000;
 
 type ChatBillingAccessMode =
   | "enterprise"
@@ -794,6 +799,10 @@ export default function Chat({
   const locationHash = location.hash;
   const navigation = useNavigation();
   const revalidator = useRevalidator();
+  const revalidateRef = useRef<() => void>(() => {});
+  revalidateRef.current = () => {
+    void revalidator.revalidate();
+  };
   const submit = useSubmit();
   const chatGroupsContext = useOptionalChatGroups();
   const updateThreadModelFetcher = useFetcher<{
@@ -3044,6 +3053,14 @@ export default function Chat({
                 : "Failed to send message"),
             { preserveReady: agent.readyState === SSE_READY_STATE_OPEN },
           );
+          // The thread moved to the runtime after this page loaded it from
+          // ChatThreadDO (a move that outlasted the loader's wait): load it
+          // again, which opens it on the runtime; the message stays in the composer.
+          if (result.code === "thread_moved") {
+            revalidateRef.current();
+          } else if (result.code === "thread_moving") {
+            window.setTimeout(() => revalidateRef.current(), MOVING_REOPEN_DELAY_MS);
+          }
         })
         .catch((error) => {
           sendTracker.failed(error);

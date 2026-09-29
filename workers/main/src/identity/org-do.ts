@@ -8679,6 +8679,27 @@ export class OrgDO extends DurableObject<DOEnv> {
     return this.getThreadRuntime(threadId);
   }
 
+  /**
+   * Give a thread moving off ChatThreadDO its runtime agent, compare-and-set:
+   * only a thread with no runtime row takes it, so a move re-driven or raced
+   * never replaces the agent a thread already has. `claimed` says whether the
+   * row is this agent's (now, or from an earlier claim of the same agent).
+   * Null when the thread does not exist.
+   */
+  claimThreadRuntimeAgent(threadId: string, agentId: string): { row: ThreadRuntimeRecord; claimed: boolean } | null {
+    if (!this.getThread(threadId)) return null;
+    const now = Date.now();
+    this.sql.exec(
+      "INSERT OR IGNORE INTO thread_runtime (thread_id, agent_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+      threadId,
+      agentId,
+      now,
+      now,
+    );
+    const row = this.getThreadRuntime(threadId);
+    return row ? { row, claimed: row.agentId === agentId } : null;
+  }
+
   /** A direct runtime thread's preview tabs, or null when none were saved. */
   getThreadUiState(threadId: string): ThreadUiStateRecord | null {
     const row = this.sql

@@ -1,43 +1,25 @@
 /**
- * Moving a ChatThreadDO thread to the agent runtime: its whole pi transcript
- * becomes the history of a new runtime agent (`initialMessages` on create),
- * its UI state moves to OrgDO, and its thread_runtime row (the commit point:
- * every entry path routes by it) makes it a direct runtime thread. A thread
- * the DO relays to a runtime agent is adopted instead (channel-turns.ts).
+ * Moving a ChatThreadDO thread to the agent runtime: its pi history becomes
+ * the history of a new runtime agent (`initialMessages` on create), its UI
+ * state moves to OrgDO, and its thread_runtime row (the commit point: every
+ * entry path routes by it) makes it a direct runtime thread. A thread the DO
+ * relays to a runtime agent is adopted instead (channel-turns.ts).
  *
- * Nothing is half-moved: until the row is written the DO holds the thread (no
- * new turns) under a lease, and any failure before it releases the lease and
- * deletes the agent it made, so the thread carries on on the DO.
+ * The DO drives the move itself (chat-thread/runtime-migration.ts), so the
+ * transcript never crosses an RPC and an alarm finishes or undoes a move its
+ * caller abandoned. This module is the worker's side: which threads may move,
+ * who the agent acts for, and turning a DO transcript into a runtime import.
  *
- * Anything the import cannot carry whole (a huge tool result, an image, a
- * history over the runtime's cap) is shortened, and the full original
- * transcript is saved to the agent's workspace; the imported history opens
- * with a note that says where.
+ * Anything the import cannot carry whole (a huge tool result, a stored image,
+ * a history over the runtime's cap) is shortened, and the full original
+ * transcript is saved to the agent's workspace; the import says where.
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
-import type { ThreadRuntimeRecord } from "../identity/org-do.js";
-import type { PreviewTarget } from "../../../../src/types.js";
-import { RuntimeApiError, runtimeApi, runtimeUrl } from "./runtime-api.js";
+import type { OrgMember, OrgThread, ThreadRuntimeRecord } from "../identity/org-do.js";
 import { directRuntimeRow } from "./channel-turns.js";
-import { resolveThreadRuntimeRoute, runtimeSystemPromptAppend } from "./run-gates.js";
+import { resolveThreadRuntimeRoute } from "./run-gates.js";
 import { runtimeDirectThreadsEnabled } from "./thread-runtime.js";
-
-/** What a DO hands over when a move begins. */
-export type RuntimeMigrationExport =
-  | { status: "ok"; leaseId: string; messages: AgentMessage[]; previewTabs: PreviewTarget[]; previewActiveTabId: string | null }
-  | { status: "busy"; reason: "moving" | "running" | "automation" | "question" }
-  | { status: "relay" }
-  | { status: "moved" };
-
-/** A DO's record of a move: in progress under a lease, or done. */
-export interface RuntimeMigrationRecord {
-  leaseId: string;
-  startedAt: number;
-  expiresAt: number;
-  movedAt?: number;
-  agentId?: string;
-}
 
 /** Tool results longer than this are shortened (their head and tail kept). */
 export const MAX_TOOL_RESULT_CHARS = 64 * 1024;
@@ -63,6 +45,8 @@ export interface ConvertedTranscript {
   messages: AgentMessage[];
   /** Something was shortened or left out: the original is archived. */
   lossy: boolean;
+  /** Not even the newest turn fits the runtime's cap: the thread cannot move. */
+  tooLarge: boolean;
   stats: { total: number; imported: number; droppedRoles: number; shortenedResults: number; omittedImages: number; tail: boolean };
 }
 
@@ -102,24 +86,44 @@ function preview(value: unknown, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`;
 }
 
+const encoder = new TextEncoder();
+
+function byteLength(value: unknown): number {
+  return encoder.encode(JSON.stringify(value)).length;
+}
+
+function findLastIndex<T>(items: T[], test: (item: T) => boolean): number {
+  for (let index = items.length - 1; index >= 0; index--) if (test(items[index])) return index;
+  return -1;
+}
+
+const roleOf = (message: AgentMessage | undefined) => (message as { role?: string } | undefined)?.role;
+/** Where an import may start: a user message or a summary, never mid-turn (a toolResult whose call is cut off). */
+const opensTurn = (message: AgentMessage) => roleOf(message) === "user" || roleOf(message) === "compactionSummary";
+
 /**
- * A DO transcript as a runtime import: the user, assistant and tool messages
+ * A DO history as a runtime import: the user, assistant and tool messages
  * (other kinds left out), compaction summaries as the runtime's, thinking
  * unsigned, long tool results shortened, stored images left out (inline ones
- * kept), and, over the cap, the latest context (from the last compaction
- * summary, else the newest messages that fit).
+ * kept). Over the cap, the model's part (the last summary and what follows)
+ * is kept first and the history before it fills what room is left, newest
+ * turns first; when the model's part alone is over, it keeps its summary and
+ * the newest turns that fit. Deterministic: the same history always converts
+ * to the same import.
  */
 export function convertTranscript(source: AgentMessage[], options: { rewriteToolCalls?: boolean } = {}): ConvertedTranscript {
   const rewrite = options.rewriteToolCalls ?? REWRITE_TOOL_CALLS;
   const stats = { total: source.length, imported: 0, droppedRoles: 0, shortenedResults: 0, omittedImages: 0, tail: false };
   const names = new Map<string, string>();
   const out: AgentMessage[] = [];
+  let lastTimestamp = 0;
   for (const raw of source) {
     const message = raw as unknown as Record<string, unknown> & { role?: string; content?: unknown };
     if (!message || !IMPORTED_ROLES.has(String(message.role))) {
       stats.droppedRoles++;
       continue;
     }
+    if (typeof message.timestamp === "number") lastTimestamp = message.timestamp;
     if (message.role === "user") {
       // The DO's compaction summary, as the runtime's: it stands in for all before it.
       const text = typeof message.content === "string" ? message.content : null;
@@ -163,7 +167,7 @@ export function convertTranscript(source: AgentMessage[], options: { rewriteTool
       out.push({
         role: "user",
         content: `[${name} ${message.isError ? "error" : "result"}] ${preview(shortened, RESULT_PREVIEW_CHARS)}`,
-        timestamp: typeof message.timestamp === "number" ? message.timestamp : Date.now(),
+        timestamp: typeof message.timestamp === "number" ? message.timestamp : lastTimestamp,
       } as AgentMessage);
       if (text.length > RESULT_PREVIEW_CHARS) stats.shortenedResults++;
     } else {
@@ -172,38 +176,69 @@ export function convertTranscript(source: AgentMessage[], options: { rewriteTool
       out.push({ ...message, content: [{ type: "text", text: shortened }, ...images] } as unknown as AgentMessage);
     }
   }
-  let messages = out;
-  if (byteLength(messages) > MAX_IMPORT_BYTES) {
-    stats.tail = true;
-    const summaryAt = findLastIndex(messages, (message) => (message.role as string) === "compactionSummary");
-    if (summaryAt > 0) messages = messages.slice(summaryAt);
-    while (messages.length > 1 && byteLength(messages) > MAX_IMPORT_BYTES) messages = messages.slice(Math.ceil(messages.length / 10));
-  }
-  stats.imported = messages.length;
+
+  const fitted = fitImport(out);
+  if (!fitted) return { messages: [], lossy: true, tooLarge: true, stats: { ...stats, tail: true } };
+  stats.tail = fitted.length < out.length;
+  stats.imported = fitted.length;
   const lossy = stats.droppedRoles > 0 || stats.shortenedResults > 0 || stats.omittedImages > 0 || stats.tail;
-  return { messages, lossy, stats };
+  return { messages: fitted, lossy, tooLarge: false, stats };
 }
 
-function byteLength(value: unknown): number {
-  return new TextEncoder().encode(JSON.stringify(value)).length;
+/**
+ * The messages that fit MAX_IMPORT_BYTES (the array as JSON), or null when
+ * not even the newest turn does. Each message is measured once.
+ */
+function fitImport(messages: AgentMessage[]): AgentMessage[] | null {
+  const sizes = messages.map((message) => byteLength(message));
+  // suffix[i]: the JSON bytes of messages[i..] as an array.
+  const suffix = Array.from({ length: messages.length + 1 }, () => 2);
+  for (let index = messages.length - 1; index >= 0; index--) {
+    suffix[index] = suffix[index + 1] + sizes[index] + (index < messages.length - 1 ? 1 : 0);
+  }
+  if (suffix[0] <= MAX_IMPORT_BYTES) return messages;
+
+  const summaryAt = findLastIndex(messages, (message) => roleOf(message) === "compactionSummary");
+  const modelFrom = Math.max(summaryAt, 0);
+  if (suffix[modelFrom] <= MAX_IMPORT_BYTES && summaryAt >= 0) {
+    // The model's part fits: fill the rest with the newest earlier turns that do.
+    let start = modelFrom;
+    for (let index = modelFrom - 1; index >= 0; index--) {
+      if (suffix[index] > MAX_IMPORT_BYTES) break;
+      if (opensTurn(messages[index])) start = index;
+    }
+    return messages.slice(start);
+  }
+  // The model's part alone is over: its summary, then the newest turns that fit.
+  const summary = summaryAt >= 0 ? messages[summaryAt] : null;
+  const budget = MAX_IMPORT_BYTES - (summary ? sizes[summaryAt] + 1 : 0);
+  for (let index = modelFrom + (summary ? 1 : 0); index < messages.length; index++) {
+    if (opensTurn(messages[index]) && suffix[index] <= budget) {
+      return summary ? [summary, ...messages.slice(index)] : messages.slice(index);
+    }
+  }
+  return null;
 }
 
-function findLastIndex<T>(items: T[], test: (item: T) => boolean): number {
-  for (let index = items.length - 1; index >= 0; index--) if (test(items[index])) return index;
-  return -1;
+/**
+ * The note a moved thread's model reads, after the last compaction summary
+ * (or first): the conversation came from the old engine, and where the full
+ * original is when the import is not all of it.
+ */
+export function importNote(archived: boolean, timestamp: number): AgentMessage {
+  const text = archived
+    ? `[This conversation was moved here from camelAI's previous chat engine. Some of its earlier messages were shortened or left out in the move; the full original transcript is at ${ARCHIVE_PATH}.]`
+    : "[This conversation was moved here from camelAI's previous chat engine, with all of its messages.]";
+  return { role: "user", content: `<camelai system message>${text}</camelai system message>`, timestamp } as AgentMessage;
 }
 
-/** The note that opens an import: where it came from, and where the original is when this is not all of it. */
-export function importNote(lossy: boolean, importedAt: number): AgentMessage {
-  const text = lossy
-    ? `[This conversation was moved from camelAI's previous chat engine. Some of its earlier history was shortened or left out here; the full original transcript is at ${ARCHIVE_PATH}.]`
-    : "[This conversation was moved from camelAI's previous chat engine; its history continues below.]";
-  return { role: "user", content: `<camelai system message>${text}</camelai system message>`, timestamp: importedAt } as AgentMessage;
-}
-
-async function sha256Hex(text: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+/** The import with its note, after the last compaction summary; stamped from its neighbours, so it never changes. */
+export function withImportNote(messages: AgentMessage[], archived: boolean): AgentMessage[] {
+  if (messages.length === 0) return [];
+  const noteAt = findLastIndex(messages, (message) => roleOf(message) === "compactionSummary") + 1;
+  const neighbour = (messages[noteAt] ?? messages[noteAt - 1]) as { timestamp?: unknown } | undefined;
+  const timestamp = typeof neighbour?.timestamp === "number" ? neighbour.timestamp : 0;
+  return [...messages.slice(0, noteAt), importNote(archived, timestamp), ...messages.slice(noteAt)];
 }
 
 export type RuntimeMigrationResult =
@@ -214,49 +249,50 @@ export type RuntimeMigrationResult =
   | { status: "failed"; error: string }
   | { status: "dry_run"; stats: ConvertedTranscript["stats"]; lossy: boolean; bytes: number };
 
+/** What ChatThreadDO#migrateToRuntime answers: a result, or "relay" (the worker adopts its agent). */
+export type DoMigrationResult = RuntimeMigrationResult | { status: "relay" };
+
+export interface DoMigrationRequest {
+  context: ChatContextState;
+  /** Who the agent acts for (its `subject`). */
+  subject: string | null;
+  dryRun?: boolean;
+}
+
 function orgStub(env: ChatEnv, orgId: string) {
   return env.ORG.get(env.ORG.idFromName(orgId)) as unknown as {
-    getThread(id: string): Promise<{ created_by?: string | null } | null>;
+    getThread(id: string): Promise<OrgThread | null>;
     getThreadRuntime(threadId: string): Promise<ThreadRuntimeRecord | null>;
-    setThreadRuntimeAgent(threadId: string, update: {
-      agentId: string;
-      model: string | null;
-      keyScope: string | null;
-      configured?: Record<string, unknown> | null;
-    }): Promise<ThreadRuntimeRecord | null>;
-    setThreadUiState(threadId: string, preview: Record<string, unknown> | null): Promise<unknown>;
+    getMember(userId: string): Promise<OrgMember | null>;
+    getMembers(): Promise<OrgMember[]>;
   };
-}
-
-function doStub(env: ChatEnv, threadId: string) {
-  return env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId)) as unknown as {
-    beginRuntimeMigration(): Promise<RuntimeMigrationExport>;
-    abortRuntimeMigration(leaseId: string): Promise<boolean>;
-    completeRuntimeMigration(leaseId: string, agentId: string): Promise<boolean>;
-  };
-}
-
-async function archiveTranscript(env: ChatEnv, agentId: string, messages: AgentMessage[]): Promise<void> {
-  const body = messages.map((message) => JSON.stringify(message)).join("\n");
-  const response = await fetch(
-    `${runtimeUrl(env)}/v1/agents/${encodeURIComponent(agentId)}/uploads/${ARCHIVE_REQUEST_ID}/${ARCHIVE_FILE_NAME}`,
-    {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${env.AGENT_RUNTIME_API_TOKEN ?? ""}`,
-        "Content-Type": "application/x-ndjson",
-      },
-      body,
-    },
-  );
-  await response.body?.cancel();
-  if (!response.ok) throw new Error(`Could not save the original transcript: HTTP ${response.status}`);
 }
 
 /**
- * Move a thread to the runtime (see the module comment), or say why not. A
- * thread already on the runtime, or one the DO relays (adopted), needs no
- * import. `dryRun` converts and reports without moving anything.
+ * Who a moved thread's agent acts for: its creator when that is a member;
+ * for a channel thread (created by "slack", "telegram", …) the member who
+ * connected the channel; else (a "system" scheduled thread) the org's owner.
+ */
+async function migrationSubject(env: ChatEnv, thread: OrgThread, context: ChatContextState): Promise<string | null> {
+  const org = orgStub(env, context.orgId);
+  const creator = thread.created_by?.trim();
+  if (creator && await org.getMember(creator)) return creator;
+  if (thread.channel_connection_id && env.WORKSPACE) {
+    const integration = await env.WORKSPACE.get(env.WORKSPACE.idFromName(context.workspaceId))
+      .getIntegration(thread.channel_connection_id)
+      .catch(() => null);
+    const owner = integration?.created_by?.trim();
+    if (owner) return owner;
+  }
+  const members = await org.getMembers();
+  return members.find((member) => member.role === "owner")?.user_id ?? context.userId ?? null;
+}
+
+/**
+ * Move a thread to the runtime, or say why not. Only a thread of
+ * `context.workspaceId` moves; one already on the runtime, or one the DO
+ * relays (adopted), needs no import. `dryRun` converts and reports without
+ * moving anything.
  */
 export async function migrateThreadToRuntime(
   env: ChatEnv,
@@ -265,6 +301,8 @@ export async function migrateThreadToRuntime(
 ): Promise<RuntimeMigrationResult> {
   if (!runtimeDirectThreadsEnabled(env)) return { status: "skipped", reason: "direct threads are off" };
   const org = orgStub(env, context.orgId);
+  const thread = await org.getThread(context.threadId);
+  if (!thread || thread.workspace_id !== context.workspaceId) return { status: "skipped", reason: "not a thread of this workspace" };
   const existing = await org.getThreadRuntime(context.threadId);
   if (existing) return { status: "runtime", row: existing };
   // A model the runtime cannot run yet (a custom endpoint, Bedrock's OpenAI models) stays here.
@@ -274,69 +312,13 @@ export async function migrateThreadToRuntime(
   } catch (error) {
     return { status: "skipped", reason: `its model did not resolve: ${error instanceof Error ? error.message : String(error)}` };
   }
-  const handover = await doStub(env, context.threadId).beginRuntimeMigration();
-  if (handover.status === "relay") {
-    if (options.dryRun) return { status: "skipped", reason: "relay (adopted, no import)" };
-    const row = await directRuntimeRow(env, context.orgId, context.threadId, { adopt: true });
-    return row ? { status: "adopted", row } : { status: "busy", reason: "relay turn running" };
-  }
-  if (handover.status === "moved") return { status: "skipped", reason: "moved" };
-  if (handover.status === "busy") return { status: "busy", reason: handover.reason };
-
-  const dostub = doStub(env, context.threadId);
-  const { leaseId } = handover;
-  let agentId: string | null = null;
-  try {
-    const converted = convertTranscript(handover.messages);
-    const importedAt = Date.now();
-    // After the last compaction summary: the model sees nothing before it.
-    const noteAt = findLastIndex(converted.messages, (message) => (message.role as string) === "compactionSummary") + 1;
-    const initialMessages = handover.messages.length
-      ? [...converted.messages.slice(0, noteAt), importNote(converted.lossy, importedAt), ...converted.messages.slice(noteAt)]
-      : [];
-    if (options.dryRun) {
-      await dostub.abortRuntimeMigration(leaseId);
-      return { status: "dry_run", stats: converted.stats, lossy: converted.lossy, bytes: byteLength(initialMessages) };
-    }
-    const thread = await org.getThread(context.threadId);
-    const subject = thread?.created_by?.trim() || context.userId || "";
-    const payload = JSON.stringify(initialMessages);
-    // The same transcript always makes the same agent (a retried move adopts
-    // it); a changed one makes a new one, never an agent with stale history.
-    const key = `migrate_${context.threadId}_${(await sha256Hex(payload)).slice(0, 16)}`;
-    const created = await runtimeApi(env, "POST", "/v1/agents", {
-      definition: env.AGENT_RUNTIME_DEFINITION,
-      name: context.threadId,
-      type: "camelai-thread",
-      ttlSeconds: null,
-      systemPromptAppend: runtimeSystemPromptAppend(env, context),
-      fileTools: false,
-      ...(subject ? { subject } : {}),
-      context: { org: context.orgId, workspace: context.workspaceId, thread: context.threadId },
-      ...(initialMessages.length ? { initialMessages } : {}),
-    }, { "Idempotency-Key": key }) as { id?: unknown };
-    if (typeof created?.id !== "string") throw new Error("Agent runtime returned no agent id");
-    agentId = created.id;
-    if (converted.lossy) await archiveTranscript(env, agentId, handover.messages);
-    if (handover.previewTabs.length) {
-      await org.setThreadUiState(context.threadId, { tabs: handover.previewTabs, activeTabId: handover.previewActiveTabId });
-    }
-    // The commit: from here every entry path runs the thread on the runtime.
-    // No model or configuration is recorded, so the first send configures the
-    // agent for the thread's model, key scope and instructions.
-    const row = await org.setThreadRuntimeAgent(context.threadId, { agentId, model: null, keyScope: null, configured: null });
-    if (!row) throw new Error("Thread not found");
-    await dostub.completeRuntimeMigration(leaseId, agentId).catch((error: unknown) =>
-      console.warn("[runtime-migration] the DO did not record the move; its lease runs out", error));
-    return { status: "migrated", row, stats: converted.stats, archived: converted.lossy };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (agentId) {
-      await runtimeApi(env, "DELETE", `/v1/agents/${encodeURIComponent(agentId)}`).catch((cause: unknown) => {
-        if (!(cause instanceof RuntimeApiError && cause.status === 404)) console.warn("[runtime-migration] could not delete the agent of a failed move", cause);
-      });
-    }
-    await dostub.abortRuntimeMigration(leaseId).catch(() => false);
-    return { status: "failed", error: message };
-  }
+  const subject = await migrationSubject(env, thread, context);
+  const chat = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(context.threadId)) as unknown as {
+    migrateToRuntime(request: DoMigrationRequest): Promise<DoMigrationResult>;
+  };
+  const result = await chat.migrateToRuntime({ context, subject, dryRun: options.dryRun });
+  if (result.status !== "relay") return result;
+  if (options.dryRun) return { status: "skipped", reason: "relay (adopted, no import)" };
+  const row = await directRuntimeRow(env, context.orgId, context.threadId, { adopt: true });
+  return row ? { status: "adopted", row } : { status: "busy", reason: "relay turn running" };
 }

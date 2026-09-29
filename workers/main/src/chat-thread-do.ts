@@ -385,7 +385,8 @@ import {
   type RuntimeRunRecord,
 } from "./chat-thread/runtime-agent";
 import { formatChannelHistoryNote, type RelayRuntimeAgent } from "./agent-runtime/channel-turns";
-import type { RuntimeMigrationExport, RuntimeMigrationRecord } from "./agent-runtime/thread-migration";
+import type { DoMigrationRequest, DoMigrationResult } from "./agent-runtime/thread-migration";
+import { ChatThreadRuntimeMigration } from "./chat-thread/runtime-migration";
 import {
   codexError,
   codexRoute,
@@ -568,10 +569,6 @@ type AutomationOutcomeStatus = (typeof AUTOMATION_OUTCOME_STATUSES)[number];
 const CHAT_AGENT_BACKEND_KEY = "agentBackend";
 const RUNTIME_AGENT_KEY = "runtimeAgent";
 const RUNTIME_AGENT_RUN_KEY = "runtimeAgentRun";
-/** A move of this thread to the runtime (agent-runtime/thread-migration.ts): in progress, or done. */
-const RUNTIME_MIGRATION_KEY = "runtimeMigration";
-/** How long a begun move holds the thread before it counts as abandoned. */
-const RUNTIME_MIGRATION_LEASE_MS = 2 * 60_000;
 // Durable resume of an interrupted Pi turn (e.g. the DO is evicted mid-turn by a
 // deploy). ai-chat's `chatRecovery` owns recovery now: a turn runs through
 // saveMessages -> _runProgrammaticChatTurn -> onChatMessage, wrapped by ai-chat's
@@ -4327,63 +4324,57 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     });
   }
 
-  /** Whether this thread is being moved to the runtime, or was. */
+  private runtimeMigrationInstance: ChatThreadRuntimeMigration | null = null;
+
+  /** This thread's move to the runtime, which the DO drives (chat-thread/runtime-migration.ts). */
+  private get runtimeMigration(): ChatThreadRuntimeMigration {
+    return (this.runtimeMigrationInstance ??= new ChatThreadRuntimeMigration({
+      env: this.env as unknown as ChatEnv,
+      kv: this.ctx.storage.kv,
+      busyReason: () => {
+        if (this.isThreadStreaming()) return "running";
+        if (this.activeAutomationRun) return "automation";
+        if (this.browserPrompts.pendingQuestionCount > 0) return "question";
+        return null;
+      },
+      hasRelayAgent: () => Boolean(this.ctx.storage.kv.get(RUNTIME_AGENT_KEY)),
+      revision: () => this.piCoreStore.getPiCoreRevision(),
+      loadHistory: (maxChars) => this.piCoreStore.loadPiCoreHistoryForMigration(maxChars),
+      payloadBatches: () => this.piCoreStore.piCorePayloadBatches(),
+      preview: () => ({ tabs: cloneDurableState(this.previewTabs), activeTabId: this.previewActiveTabId }),
+      scheduleAlarm: (at) => {
+        this.ctx.waitUntil(this.schedule(new Date(at), "runtimeMigrationAlarm").catch((error: unknown) =>
+          console.warn("[ChatThreadDO] could not schedule the runtime move's alarm", error)));
+      },
+      waitUntil: (promise) => this.ctx.waitUntil(promise),
+    }));
+  }
+
+  /** Whether turns are refused here: the thread is moving to the runtime, or moved. */
   private runtimeMigrationState(): "moving" | "moved" | null {
-    const record = this.ctx.storage.kv.get<RuntimeMigrationRecord>(RUNTIME_MIGRATION_KEY);
-    if (!record) return null;
-    if (record.movedAt) return "moved";
-    return record.expiresAt > Date.now() ? "moving" : null;
+    return this.runtimeMigration.state();
+  }
+
+  /** The answer to a message while the thread is moving to the runtime or moved; null when it may run here. */
+  private runtimeMigrationRefusal(): InitialUserMessageResult | null {
+    const migration = this.runtimeMigrationState();
+    if (migration === "moved") return { status: "error", error: "This conversation moved; reload the page to continue it." };
+    if (migration === "moving") return { status: "busy", error: "This conversation is moving; try again in a moment." };
+    return null;
   }
 
   /**
-   * Begin moving this thread to the runtime (agent-runtime/thread-migration.ts):
-   * hand over its whole transcript and UI state, and hold the thread (no new
-   * turns here) until the move completes or aborts, or its lease runs out.
-   * Busy while a turn runs, an automation run is active or a question waits.
+   * Move this thread to the runtime (agent-runtime/thread-migration.ts
+   * decides it may): export, make the agent, commit, all here. Busy while a
+   * turn runs, an automation run is active or a question waits.
    */
-  async beginRuntimeMigration(): Promise<RuntimeMigrationExport> {
-    const state = this.runtimeMigrationState();
-    if (state === "moved") return { status: "moved" };
-    if (state === "moving") return { status: "busy", reason: "moving" };
-    if (this.isThreadStreaming()) return { status: "busy", reason: "running" };
-    if (this.activeAutomationRun) return { status: "busy", reason: "automation" };
-    if (this.browserPrompts.pendingQuestionCount > 0) return { status: "busy", reason: "question" };
-    if (this.ctx.storage.kv.get(RUNTIME_AGENT_KEY)) return { status: "relay" };
-    const leaseId = crypto.randomUUID();
-    this.ctx.storage.kv.put(RUNTIME_MIGRATION_KEY, {
-      leaseId,
-      startedAt: Date.now(),
-      expiresAt: Date.now() + RUNTIME_MIGRATION_LEASE_MS,
-    } satisfies RuntimeMigrationRecord);
-    try {
-      const messages = await this.loadFullPiCoreTranscriptUnbounded({ imagePolicy: "reference" });
-      return {
-        status: "ok",
-        leaseId,
-        messages: cloneDurableState(messages),
-        previewTabs: cloneDurableState(this.previewTabs),
-        previewActiveTabId: this.previewActiveTabId,
-      };
-    } catch (error) {
-      this.ctx.storage.kv.delete(RUNTIME_MIGRATION_KEY);
-      throw error;
-    }
+  async migrateToRuntime(request: DoMigrationRequest): Promise<DoMigrationResult> {
+    return await this.runtimeMigration.migrate(request);
   }
 
-  /** Release a move that did not happen: the thread keeps running here. */
-  abortRuntimeMigration(leaseId: string): boolean {
-    const record = this.ctx.storage.kv.get<RuntimeMigrationRecord>(RUNTIME_MIGRATION_KEY);
-    if (!record || record.leaseId !== leaseId || record.movedAt) return false;
-    this.ctx.storage.kv.delete(RUNTIME_MIGRATION_KEY);
-    return true;
-  }
-
-  /** The thread now runs on the runtime (its thread_runtime row is written): no more turns here. */
-  completeRuntimeMigration(leaseId: string, agentId: string): boolean {
-    const record = this.ctx.storage.kv.get<RuntimeMigrationRecord>(RUNTIME_MIGRATION_KEY);
-    if (!record || record.leaseId !== leaseId) return false;
-    this.ctx.storage.kv.put(RUNTIME_MIGRATION_KEY, { ...record, movedAt: Date.now(), agentId } satisfies RuntimeMigrationRecord);
-    return true;
+  /** The move's alarm (scheduled by the move): undo an abandoned one, finish a commit. */
+  async runtimeMigrationAlarm(): Promise<void> {
+    await this.runtimeMigration.onAlarm();
   }
 
   /**
@@ -4542,6 +4533,10 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     forkEntryId: string;
     renderedMessageId?: string;
   }): Promise<ChatThreadPiCoreForkResult> {
+    // A thread moving to the runtime, or moved, is forked from its runtime history.
+    if (this.runtimeMigrationState()) {
+      return { success: false, code: "THREAD_MOVED", error: "This conversation moved; reload the page to fork it." };
+    }
     const messages = await this.loadFullPiCoreTranscriptUnbounded({ imagePolicy: "reference" });
     if (messages.length === 0) {
       return {
@@ -6565,13 +6560,8 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     if (!rawContent) {
       return { status: "error", error: "Empty message" };
     }
-    const migration = this.runtimeMigrationState();
-    if (migration === "moved") {
-      return { status: "error", error: "This conversation moved; reload the page to continue it." };
-    }
-    if (migration === "moving") {
-      return { status: "busy", error: "This conversation is moving; try again in a moment." };
-    }
+    const refusal = this.runtimeMigrationRefusal();
+    if (refusal) return refusal;
 
     const orgBan = await isOrgBanned(this.env.APP_KV, {
       orgId: context.orgId,
@@ -6591,6 +6581,12 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     if (!attributedContent) {
       return { status: "error", error: "Empty message" };
     }
+
+    // Again, with nothing awaited between here and the turn: a move to the
+    // runtime may have begun during the awaits above, and a turn started now
+    // would land in a transcript that has already been exported.
+    const refusalAfterAwaits = this.runtimeMigrationRefusal();
+    if (refusalAfterAwaits) return refusalAfterAwaits;
 
     // A new turn (the user is prompting, not steering an in-flight run) is given a
     // single canonical timestamp shared by the message we persist below and the
@@ -10197,6 +10193,10 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       if (type === "message") {
           const content = typeof message.content === "string" ? message.content : "";
           if (!content.trim()) {
+            return false;
+          }
+          // No turn starts on a thread moving to the runtime, or moved there.
+          if (this.runtimeMigrationState()) {
             return false;
           }
           // Cold admission must not wait for Pi session construction. An

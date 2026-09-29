@@ -1322,6 +1322,70 @@ export class PiCoreMessageStore {
   }
 
   /**
+   * A thread's history for its move to the agent runtime
+   * (agent-runtime/thread-migration.ts). When every stored row fits
+   * `maxChars`: all of them in order (`whole`), with the compaction summary
+   * where its cut falls, so the moved thread shows its full history and its
+   * model sees the summary and what follows. Past it: the bounded session
+   * window (the model's view only). The totals are read first, so a whale
+   * never materializes. Deterministic for an unchanged thread: a retried move
+   * sends the same import.
+   */
+  async loadPiCoreHistoryForMigration(maxChars: number): Promise<{ messages: AgentMessage[]; whole: boolean; totalRows: number }> {
+    this.ensurePiCoreTables();
+    const totals = this.piCoreVisibleWindowTotals(0);
+    if (totals.chars > maxChars) {
+      const { messages } = await this.loadBoundedPiCoreSessionWindow({ maxChars });
+      // A capped window's placeholder summary is stamped with the load time.
+      const [first, next] = messages as Array<AgentMessage & { timestamp?: number }>;
+      if (first && typeof next?.timestamp === "number" && (first.timestamp ?? 0) > next.timestamp) {
+        messages[0] = { ...first, timestamp: next.timestamp } as AgentMessage;
+      }
+      return { messages, whole: false, totalRows: totals.rows };
+    }
+    const compaction = this.loadPiCoreCompaction();
+    const cutAt = compaction && compaction.firstKeptIndex > 0 ? compaction.firstKeptIndex : null;
+    const rows = this.deps.sql()
+      .exec<{ idx: number; payload: string }>("SELECT idx, payload FROM pi_core_messages ORDER BY idx ASC")
+      .toArray();
+    const messages: AgentMessage[] = [];
+    const hydrationState: PiImageHydrationState = { count: 0, declaredChars: 0 };
+    let summarized = cutAt === null;
+    for (const row of rows) {
+      if (!summarized && Number(row.idx) >= (cutAt ?? 0)) {
+        messages.push(createPiSummaryMessage(compaction!.summary, compaction!.updatedAt));
+        summarized = true;
+      }
+      const message = await this.materializePiCoreRow(row.payload, { imagePolicy: "reference" }, hydrationState);
+      if (message) messages.push(message);
+    }
+    if (!summarized) messages.push(createPiSummaryMessage(compaction!.summary, compaction!.updatedAt));
+    return { messages, whole: true, totalRows: totals.rows };
+  }
+
+  /**
+   * Every stored row's payload as stored, oldest first, `batchSize` rows at a
+   * time: a whole transcript streamed out (a moved thread's archive) without
+   * ever holding it.
+   */
+  *piCorePayloadBatches(batchSize = PI_SESSION_LOAD_ROW_BATCH_SIZE): Generator<string[]> {
+    this.ensurePiCoreTables();
+    let afterIdx = -1;
+    for (;;) {
+      const rows = this.deps.sql()
+        .exec<{ idx: number; payload: string }>(
+          "SELECT idx, payload FROM pi_core_messages WHERE idx > ? ORDER BY idx ASC LIMIT ?",
+          afterIdx,
+          Math.max(1, Math.floor(batchSize)),
+        )
+        .toArray();
+      if (rows.length === 0) return;
+      afterIdx = Number(rows[rows.length - 1].idx);
+      yield rows.map((row) => row.payload);
+    }
+  }
+
+  /**
    * Oldest-first row metadata from `fromIdx` up, payload never selected. The
    * ascending twin of {@link listPiCoreRowMeta}: the render pager walks history
    * backwards, but the render MIRROR walks it forwards from its high-water mark,

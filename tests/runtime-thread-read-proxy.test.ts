@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runtimeReadProxyBase } from "@/lib/agent-runtime-shared";
 
 const requireRuntimeThreadMock = vi.fn();
+const getEnvMock = vi.fn();
+vi.mock("@/lib/cloudflare.server", () => ({ getEnv: getEnvMock }));
 const mintRuntimeBrowserTokenMock = vi.fn();
 vi.mock("@/lib/runtime-threads.server", () => ({
   requestWorkspaceId: (request: Request) => new URL(request.url).searchParams.get("workspaceId"),
@@ -31,6 +33,7 @@ function read(path: string, headers: Record<string, string> = { authorization: "
 
 beforeEach(() => {
   vi.clearAllMocks();
+  getEnvMock.mockReturnValue({ CF_ACCOUNT_ID: "selfhost", CF_DISPATCH_NAMESPACE: "selfhost" });
   requireRuntimeThreadMock.mockResolvedValue({
     env: { AGENT_RUNTIME_URL: RUNTIME },
     context: { threadId: "t1", workspaceId: "ws_1" },
@@ -94,6 +97,7 @@ describe("GET /api/threads/:id/runtime/:workspaceId/v1/agents/:agentId/:read", (
     expect(response.headers.get("content-type")).toBe("text/event-stream");
     expect(response.headers.get("cache-control")).toBe("no-cache, no-transform");
     expect(response.headers.get("set-cookie")).toBeNull();
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect(await response.text()).toBe("event: frame\ndata: {}\n\n");
   });
 
@@ -116,5 +120,23 @@ describe("GET /api/threads/:id/runtime/:workspaceId/v1/agents/:agentId/:read", (
     fetchMock.mockRejectedValue(new TypeError("connect ECONNREFUSED"));
     vi.spyOn(console, "error").mockImplementation(() => {});
     expect((await read("ws_1/v1/agents/agt_1/state")).status).toBe(502);
+  });
+
+  it("is not there unless the runtime is private (self-host): the hosted runtime is read directly", async () => {
+    getEnvMock.mockReturnValue({ CF_ACCOUNT_ID: "acct", AGENT_RUNTIME_URL: "https://agents.camelai.dev" });
+    expect((await read("ws_1/v1/agents/agt_1/events")).status).toBe(404);
+    expect(requireRuntimeThreadMock).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("passes only JSON and event streams as what they are, never a type the browser would render", async () => {
+    fetchMock.mockResolvedValue(new Response("{}", { headers: { "Content-Type": "application/json; charset=utf-8" } }));
+    expect((await read("ws_1/v1/agents/agt_1/state")).headers.get("content-type")).toBe("application/json; charset=utf-8");
+    for (const type of ["text/html; charset=utf-8", "image/svg+xml", "application/javascript"]) {
+      fetchMock.mockResolvedValue(new Response("<script>alert(1)</script>", { headers: { "Content-Type": type } }));
+      const response = await read("ws_1/v1/agents/agt_1/state");
+      expect(response.headers.get("content-type")).toBe("application/octet-stream");
+      expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    }
   });
 });

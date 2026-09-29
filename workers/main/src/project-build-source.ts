@@ -9,6 +9,12 @@ import type {
 import type { ProjectBuildSandboxLike } from "./project-worker-bundle.js";
 
 export const PROJECT_BUILD_ROOT = "/workspace";
+/**
+ * Bound for the source materialize exec (archive check, stale-file removal,
+ * extract). It had none, so a hung command held the build until the tool's
+ * outer deadline. Materializing even a cold 21 MB source takes seconds.
+ */
+export const PROJECT_BUILD_MATERIALIZE_TIMEOUT_MS = 120_000;
 // A streamed WorkspaceFilesystemDO read occupies an outbound Worker connection
 // until its body is consumed. Workers allow six simultaneous connections per
 // invocation; using all of them here can strand the Sandbox RPC transport that
@@ -288,14 +294,24 @@ export async function materializeProjectSourceFiles(
   const archiveWriteMs = Date.now() - archiveWriteStartedAt;
 
   const materializeExecStartedAt = Date.now();
-  await sandbox.exec(materializeCommand({
+  const materialized = await sandbox.exec(materializeCommand({
     workdir,
     currentManifestPath,
     manifestPath,
     archives: archiveLanes.map(({ path, compressed }) => ({ path, compressed })),
     forceClean: source.previousManifest === null,
-  }), { cwd: PROJECT_BUILD_ROOT });
+  }), { cwd: PROJECT_BUILD_ROOT, timeout: PROJECT_BUILD_MATERIALIZE_TIMEOUT_MS });
   const materializeExecMs = Date.now() - materializeExecStartedAt;
+  // The steps are chained with `&&`, so a non-zero exit means the tree is only
+  // partly updated (a corrupt archive, a full disk). Building on it would fail
+  // later with a confusing error, or succeed against stale files.
+  if (typeof materialized?.exitCode === "number" && materialized.exitCode !== 0) {
+    const detail = (materialized.stderr || materialized.stdout || "").trim().slice(-500);
+    throw new Error(
+      `Failed to materialize project source in the build sandbox (exit ${materialized.exitCode})` +
+        (detail ? `: ${detail}` : ""),
+    );
+  }
 
   return {
     materializeMs: Date.now() - startedAt,

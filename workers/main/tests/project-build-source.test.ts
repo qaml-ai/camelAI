@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   collectProjectSourceFiles,
   materializeProjectSourceFiles,
+  PROJECT_BUILD_MATERIALIZE_TIMEOUT_MS,
   shellQuote,
   validateDoSqliteApiUsage,
   validatePackageJson,
@@ -246,7 +247,7 @@ describe("project build source owner", () => {
       "/workspace/demo.source.0.tar",
       "/workspace/demo.next-source-manifest.json",
     ]);
-    expect(sandbox.exec).toHaveBeenCalledWith(expect.any(String), { cwd: "/workspace" });
+    expect(sandbox.exec).toHaveBeenCalledWith(expect.any(String), { cwd: "/workspace", timeout: PROJECT_BUILD_MATERIALIZE_TIMEOUT_MS });
     const command = sandbox.exec.mock.calls[0]?.[0] as string;
     expect(command).toContain("CAMELAI_FORCE_CLEAN=0");
     expect(command).toContain("tar -tf '/workspace/demo.source.0.tar'");
@@ -397,6 +398,31 @@ describe("project build source owner", () => {
 
     await expect(materializeProjectSourceFiles(sandbox, "/workspace/demo", source)).rejects.toThrow("upload failed");
     expect(sandbox.exec).not.toHaveBeenCalled();
+  });
+
+  it("fails loudly instead of building on a partly materialized tree", async () => {
+    const source: ProjectSourceCollection = {
+      entries: [{ path: "package.json", size: 2, modifiedAt: new Date(0).toISOString(), sha256: SHA_A }],
+      changedFiles: [sourceFile("package.json", "{}", SHA_A)],
+      validationFiles: [],
+      previousManifest: null,
+      previousManifestReadMs: 0,
+      timings: { collectSourceMs: 1, sourceListMs: 1, sourceReadMs: 1, sourceHashMs: 1 },
+      totalBytes: 2,
+    };
+    const sandbox = {
+      mkdir: vi.fn(async () => undefined),
+      writeFile: vi.fn(async () => undefined),
+      exec: vi.fn(async () => ({
+        success: false,
+        stdout: "",
+        stderr: "tar: Unexpected EOF in archive",
+        exitCode: 2,
+      })),
+    } as unknown as ProjectBuildSandboxLike;
+
+    await expect(materializeProjectSourceFiles(sandbox, "/workspace/demo", source))
+      .rejects.toThrow("Failed to materialize project source in the build sandbox (exit 2): tar: Unexpected EOF in archive");
   });
 
   it("quotes shell values without exposing a second command", () => {

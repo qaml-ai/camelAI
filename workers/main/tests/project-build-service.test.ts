@@ -98,7 +98,7 @@ describe("runProjectBuild", () => {
       "/workspace/demo-project.source-manifest.json",
       { encoding: "base64" },
     );
-    expect(sandbox.exec).toHaveBeenCalledWith(expect.stringContaining("tar -xf '/workspace/demo-project.source.0.tar'"), { cwd: "/workspace" });
+    expect(sandbox.exec).toHaveBeenCalledWith(expect.stringContaining("tar -xf '/workspace/demo-project.source.0.tar'"), { cwd: "/workspace", timeout: 120_000 });
     expect(sandbox.exec).toHaveBeenCalledWith("bun install && bun run build", {
       cwd: "/workspace/demo-project",
       timeout: 15_000,

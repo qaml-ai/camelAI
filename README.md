@@ -14,7 +14,7 @@
   <a href="https://camelai.com">Website</a> ·
   <a href="https://camelai.dev">Open camelAI</a> ·
   <a href="https://github.com/qaml-ai/camelAI/actions/workflows/ci.yml">CI</a> ·
-  <a href="LICENSE">MIT License</a>
+  <a href="LICENSE">AGPL-3.0 License</a>
 </p>
 
 ## What camelAI does
@@ -259,4 +259,4 @@ feature-specific documentation close to the code it describes.
 
 ## License
 
-camelAI is available under the [MIT License](LICENSE).
+camelAI is available under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0).

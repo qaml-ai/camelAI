@@ -71,6 +71,28 @@ describe("runtimeModelRoute", () => {
       .toEqual({ kind: "scope", model: "amazon-bedrock/eu.anthropic.claude-opus-5-5", keyScope: scope });
   });
 
+  // Each id is one the runtime's catalog (Pi 0.87.1) lists and Bedrock serves in that region (2026-09-28).
+  it.each([
+    ["us-east-1", "anthropic.claude-opus-5-5", "us.anthropic.claude-opus-5-5"],
+    ["us-west-2", "anthropic.claude-fable-5-1", "us.anthropic.claude-fable-5-1"],
+    ["us-east-1", "anthropic.claude-haiku-4-5", "us.anthropic.claude-haiku-4-5-20251001-v1:0"],
+    ["eu-west-1", "anthropic.claude-opus-5-5", "eu.anthropic.claude-opus-5-5"],
+    ["eu-central-1", "anthropic.claude-haiku-4-5", "eu.anthropic.claude-haiku-4-5-20251001-v1:0"],
+    ["eu-west-1", "anthropic.claude-fable-5-1", "global.anthropic.claude-fable-5-1"],
+    ["ap-northeast-1", "anthropic.claude-opus-5-5", "jp.anthropic.claude-opus-5-5"],
+    ["ap-northeast-3", "anthropic.claude-haiku-4-5", "jp.anthropic.claude-haiku-4-5-20251001-v1:0"],
+    ["ap-northeast-1", "anthropic.claude-fable-5-1", "global.anthropic.claude-fable-5-1"],
+    ["ap-southeast-2", "anthropic.claude-opus-5-5", "au.anthropic.claude-opus-5-5"],
+    ["ap-southeast-4", "anthropic.claude-haiku-4-5", "au.anthropic.claude-haiku-4-5-20251001-v1:0"],
+    ["ap-southeast-1", "anthropic.claude-opus-5-5", "global.anthropic.claude-opus-5-5"],
+    ["ap-south-1", "anthropic.claude-haiku-4-5", "global.anthropic.claude-haiku-4-5-20251001-v1:0"],
+    ["ap-northeast-1", "anthropic.claude-sonnet-5-5", "global.anthropic.claude-sonnet-5-5"],
+    ["sa-east-1", "anthropic.claude-opus-5-5", "global.anthropic.claude-opus-5-5"],
+  ])("runs Bedrock in %s: %s as %s", (region, id, profile) => {
+    expect(runtimeModelRoute(config({ usageProvider: "bedrock", model: { provider: "custom", api: "anthropic-messages", id, baseUrl: `https://bedrock-mantle.${region}.api.aws/anthropic` } }), org))
+      .toEqual({ kind: "scope", model: `amazon-bedrock/${profile}`, keyScope: "org_org1" });
+  });
+
   it("sends the ChatGPT subscription through chiridion's Codex forwarder", () => {
     expect(runtimeModelRoute(config({ usageProvider: "openai", apiKey: CODEX_TOKEN, model: { provider: "openai-codex", id: "gpt-6-luna", baseUrl: "https://chatgpt.com/backend-api/codex" } }), org))
       .toEqual({ kind: "codex", model: "chiridion/openai-codex/gpt-6-luna" });

@@ -30,22 +30,46 @@ export const RUNTIME_MODEL_ENDPOINT = "chiridion";
  */
 export const FREE_TIER_RUNTIME_MODEL = "openrouter/openai/gpt-6-luna";
 
-/** Claude models Bedrock offers only through the global profile (no `us.`/`eu.` ones yet, 2026-09-28). */
-const GLOBAL_ONLY_BEDROCK_MODELS = new Set(["anthropic.claude-sonnet-5-5"]);
+/**
+ * Bedrock's Converse ids for the bare ids chiridion's resolver names (bedrock-mantle's), where they
+ * differ: Haiku 4.5 keeps its dated, versioned id there.
+ */
+const BEDROCK_CONVERSE_IDS: Record<string, string> = {
+  "anthropic.claude-haiku-4-5": "anthropic.claude-haiku-4-5-20251001-v1:0",
+};
 
 /**
- * Converse on bedrock-runtime takes Claude through a cross-region inference
- * profile (`us.`/`eu.`/`apac.` + the model id; `global.` elsewhere), where the
- * bedrock-mantle endpoint chiridion's own loop uses takes the bare id.
+ * The geographic cross-region inference profiles Bedrock offers for each Claude model chiridion
+ * resolves, as the runtime's catalog (Pi 0.87.1) lists them and `aws bedrock
+ * list-inference-profiles` showed them on 2026-09-28. APAC has no `apac.` profile for any current
+ * Claude (only 3.x and Sonnet 4): Tokyo and Osaka have `jp.`, Sydney and Melbourne `au.`, each for
+ * some models. A model or region not listed here takes the `global.` profile, which every
+ * commercial region offers for every current Claude; Sonnet 5.5 has only that one so far.
+ */
+const BEDROCK_GEO_PROFILES: Record<string, ReadonlySet<string>> = {
+  "anthropic.claude-opus-5-5": new Set(["us", "eu", "jp", "au"]),
+  "anthropic.claude-haiku-4-5-20251001-v1:0": new Set(["us", "eu", "jp", "au"]),
+  "anthropic.claude-fable-5-1": new Set(["us"]),
+};
+
+function bedrockGeo(region: string): string | undefined {
+  if (region.startsWith("us-")) return "us";
+  if (region.startsWith("eu-")) return "eu";
+  if (region === "ap-northeast-1" || region === "ap-northeast-3") return "jp";
+  if (region === "ap-southeast-2" || region === "ap-southeast-4") return "au";
+  return undefined;
+}
+
+/**
+ * Converse on bedrock-runtime takes Claude through a cross-region inference profile: the region's
+ * geography (`us.`/`eu.`/`jp.`/`au.`) + the model id where Bedrock has one, `global.` otherwise.
+ * The bedrock-mantle endpoint chiridion's own loop uses takes the bare id.
  */
 export function bedrockInferenceProfileId(modelId: string, region: string): string {
-  if (/^(us|eu|apac|global)\./.test(modelId)) return modelId;
-  if (GLOBAL_ONLY_BEDROCK_MODELS.has(modelId)) return `global.${modelId}`;
-  const geo = region.startsWith("us-") ? "us"
-    : region.startsWith("eu-") ? "eu"
-    : region.startsWith("ap-") ? "apac"
-    : "global";
-  return `${geo}.${modelId}`;
+  if (/^(us|eu|apac|jp|au|global)\./.test(modelId)) return modelId;
+  const id = BEDROCK_CONVERSE_IDS[modelId] ?? modelId;
+  const geo = bedrockGeo(region);
+  return geo && BEDROCK_GEO_PROFILES[id]?.has(geo) ? `${geo}.${id}` : `global.${id}`;
 }
 
 export function runtimeModelRoute(

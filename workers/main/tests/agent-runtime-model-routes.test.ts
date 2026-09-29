@@ -104,6 +104,10 @@ describe("runtimeModelRoute", () => {
       headers,
     }) as PiResolvedModelConfig;
     expect(runtimeModelRoute(custom(), org)).toEqual({ kind: "scope", model: "custom/acme-70b", keyScope: "org_org1" });
+    // Anthropic Messages behind Authorization: Bearer (the provider's `auth: "bearer"`).
+    if (api === "anthropic-messages") {
+      expect(runtimeModelRoute(custom({ "x-api-key": null, Authorization: "Bearer key" }), org)).toEqual({ kind: "scope", model: "custom/acme-70b", keyScope: "org_org1" });
+    }
     // An OpenAI endpoint that takes x-api-key gets it as a header.
     if (api !== "anthropic-messages") {
       expect(runtimeModelRoute(custom({ Authorization: null, "x-api-key": "key" }), org)).toEqual({ kind: "scope", model: "custom/acme-70b", keyScope: "org_org1" });
@@ -117,8 +121,6 @@ describe("runtimeModelRoute", () => {
     }) as PiResolvedModelConfig;
     // Not https.
     expect(runtimeModelRoute(custom({ baseUrl: "http://llm.acme.example/v1" }), org)).toBeNull();
-    // Anthropic Messages behind Authorization: Bearer (the runtime sets Authorization itself).
-    expect(runtimeModelRoute(custom({ api: "anthropic-messages" }, { "x-api-key": null, Authorization: "Bearer key" }), org)).toBeNull();
     // A model id the runtime refuses.
     expect(runtimeModelRoute(custom({ id: "acme 70b" }), org)).toBeNull();
     // Without a key, or not BYOK.

@@ -138,12 +138,24 @@ describe("key scope providers", () => {
     });
   });
 
+  it("has the runtime send an Anthropic Messages endpoint's key as Bearer unless the org chose x-api-key", async () => {
+    const { kv } = memoryKv();
+    const custom = (extra: Record<string, string>) =>
+      record("custom", { api_key: "sk-acme" }, { custom_api: "anthropic-messages", custom_base_url: "https://llm.acme.example", ...extra });
+    // Bearer is the in-DO loop's default for a custom endpoint.
+    for (const extra of [{}, { custom_auth_type: "bearer" }]) {
+      expect((await orgScopeProviders(env(kv), await custom(extra))).modelProviders?.custom)
+        .toMatchObject({ type: "anthropic-messages", apiKey: "sk-acme", headers: null, auth: "bearer" });
+    }
+    expect((await orgScopeProviders(env(kv), await custom({ custom_auth_type: "x-api-key" }))).modelProviders?.custom)
+      .not.toHaveProperty("auth");
+  });
+
   it("has no model provider for a custom endpoint the runtime cannot call", async () => {
     const { kv } = memoryKv();
     const custom = (extra: Record<string, string>) =>
       record("custom", { api_key: "sk-acme" }, { custom_api: "openai-completions", custom_base_url: "https://llm.acme.example/v1", ...extra });
     expect(await orgScopeProviders(env(kv), await custom({ custom_base_url: "http://llm.acme.example/v1" }))).toEqual({ providers: {}, modelProviders: {} });
-    expect(await orgScopeProviders(env(kv), await custom({ custom_api: "anthropic-messages" }))).toEqual({ providers: {}, modelProviders: {} });
     expect(await orgScopeProviders(env(kv), await custom({ custom_model_id: "acme 70b" }))).toEqual({ providers: {}, modelProviders: {} });
   });
 

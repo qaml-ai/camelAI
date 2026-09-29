@@ -9,9 +9,8 @@
  *   authenticate: `chiridion/openai-codex/<model>` through chiridion's
  *   forwarder (agent-runtime/codex-forwarder.ts);
  * - null: no runtime route (self-host providers, the gateway's other dynamic
- *   routes, a custom endpoint the runtime cannot call: not `https`, or
- *   Anthropic Messages behind `Authorization: Bearer`). Such a thread stays on
- *   the in-DO loop.
+ *   routes, a custom endpoint the runtime cannot call: not `https`). Such a
+ *   thread stays on the in-DO loop.
  *
  * An org's own endpoints are model providers of its key scope (key-scopes.ts):
  * its custom endpoint `custom/<model id>`, Bedrock's OpenAI models

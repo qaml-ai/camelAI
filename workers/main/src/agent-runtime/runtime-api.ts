@@ -115,6 +115,8 @@ export interface KeyScopeModelProvider {
   baseUrl: string;
   apiKey: string | null;
   headers: Record<string, string> | null;
+  /** Anthropic Messages only: send the key as `Authorization: Bearer` instead of x-api-key. */
+  auth?: "bearer";
   models: KeyScopeModel[];
 }
 

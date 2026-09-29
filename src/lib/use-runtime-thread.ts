@@ -22,7 +22,7 @@ import { latestRuntimeTodos, piRender, type PiRenderMemo } from "@/lib/pi-render
 import { getPreviewTabId } from "@/components/preview-panel/preview-utils";
 import { watchAgent, type AgentView, type Watcher } from "@camelai/agent-runtime/watch";
 import { stripSystemMessageTags } from "@/lib/turn-utils";
-import { trackRuntimeWatchError } from "@/lib/chat-sse-telemetry";
+import { trackRuntimeViewMissedReply, trackRuntimeWatchError, trackRuntimeWatchLifecycle } from "@/lib/chat-sse-telemetry";
 import { toast } from "sonner";
 
 /** What the loader read server-side for first paint: a token, and the newest page of history. */
@@ -90,6 +90,8 @@ const MAX_RECONNECT_DELAY_MS = 30_000;
 const WATCH_STALL_MS = 20_000;
 /** A drop shorter than this is a routine reconnect, not worth showing. */
 const RECONNECTING_NOTICE_MS = 3_000;
+/** How long after a run ends its messages may take to reach the view before the newest history page is read. */
+const MISSED_REPLY_GRACE_MS = 3_000;
 
 // The watcher's messages are Pi's (the SDK declares its own structural copy
 // of them); the view keeps Pi's types for pi-render.
@@ -112,6 +114,18 @@ function seedView(seed: RuntimeThreadSeed | null | undefined): View {
     hasOlder: Boolean(seed?.page?.next),
   };
 }
+
+/** The watcher's view with messages a history re-read found that it lacks (its own win). */
+function withRecovered(watched: View, recovered: ReadonlyMap<number, AgentMessage>): View {
+  if (recovered.size === 0) return watched;
+  const byIndex = new Map<number, AgentMessage>(recovered);
+  watched.indexes.forEach((index, position) => byIndex.set(index, watched.messages[position]));
+  if (byIndex.size === watched.indexes.length) return watched;
+  const indexes = [...byIndex.keys()].sort((a, b) => a - b);
+  return { ...watched, indexes, messages: indexes.map((index) => byIndex.get(index)!) };
+}
+
+const maxIndex = (indexes: number[]) => (indexes.length > 0 ? indexes[indexes.length - 1] : -1);
 
 function snapshot(state: AgentView): View {
   return {
@@ -185,7 +199,10 @@ export function useRuntimeThread(options: {
   reconnecting: boolean;
 } {
   const { threadId, workspaceId, seed, enabled, callbacks } = options;
-  const [view, setView] = useState<View>(() => seedView(seed));
+  const [watched, setView] = useState<View>(() => seedView(seed));
+  /** Messages a history re-read found after a run the watcher did not show (see `recoverMissedReply`). */
+  const [recovered, setRecovered] = useState<ReadonlyMap<number, AgentMessage>>(() => new Map());
+  const view = useMemo(() => withRecovered(watched, recovered), [watched, recovered]);
   const [agentId, setAgentId] = useState<string | null>(seed?.agentId ?? null);
   const [submittedAt, setSubmittedAt] = useState<number | null>(null);
   const [reconnecting, setReconnecting] = useState(false);
@@ -262,6 +279,7 @@ export function useRuntimeThread(options: {
         : await getToken();
       if (cancelled) return;
       const mine = ++generation;
+      let opened = false;
       watcherRef.current = watchAgent({
         url: initial.url,
         agentId,
@@ -277,6 +295,7 @@ export function useRuntimeThread(options: {
           // The watcher stops when its token cannot be renewed: watch again
           // with a new one, backing off while the token route keeps failing.
           if (state.expired) {
+            trackRuntimeWatchLifecycle(threadId, "expired", { transport: state.transport, agentId, generation: mine });
             if (stall !== null) window.clearTimeout(stall);
             stall = null;
             setReconnecting(true);
@@ -285,6 +304,10 @@ export function useRuntimeThread(options: {
             return;
           }
           if (state.connected) {
+            if (!opened) {
+              opened = true;
+              trackRuntimeWatchLifecycle(threadId, "open", { transport: state.transport, agentId, generation: mine });
+            }
             if (stall !== null) window.clearTimeout(stall);
             stall = null;
             if (notice !== null) window.clearTimeout(notice);
@@ -385,11 +408,81 @@ export function useRuntimeThread(options: {
   useEffect(() => {
     if (view.running || view.lastOutcome) setSubmittedAt(null);
   }, [view.running, view.lastOutcome]);
+
+  const latestViewRef = useRef(view);
+  latestViewRef.current = view;
+  const agentIdRef = useRef(agentId);
+  agentIdRef.current = agentId;
+  /**
+   * A run ended, or a send's submitted window ran out, and no message past
+   * `knownMax` is on screen: the watcher missed the end of the stream (a
+   * backgrounded tab's throttled poll, say). Say so, and read the newest
+   * history page once, whose messages fill in what the view lacks.
+   */
+  const recoverMissedReply = useCallback((reason: "run_ended" | "submitted_expired", knownMax: number) => {
+    const shown = latestViewRef.current;
+    if (!threadId || maxIndex(shown.indexes) > knownMax || shown.running) return;
+    const watcher = watcherRef.current;
+    const report = (recoveredCount: number | null) => trackRuntimeViewMissedReply(threadId, {
+      reason,
+      agentId: agentIdRef.current,
+      knownMaxIndex: knownMax,
+      viewMaxIndex: maxIndex(shown.indexes),
+      connected: watcher?.state.connected ?? false,
+      transport: watcher?.state.transport ?? null,
+      recovered: recoveredCount,
+    });
+    const agent = agentIdRef.current;
+    if (!agent) {
+      report(null);
+      return;
+    }
+    getToken()
+      .then(async (minted) => {
+        const response = await fetch(`${minted.url.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(agent)}/history?limit=50`, {
+          headers: { Authorization: `Bearer ${minted.token}` },
+        });
+        if (!response.ok) throw Object.assign(new Error(`history: HTTP ${response.status}`), { status: response.status });
+        const page = await response.json() as { entries?: Array<{ index: number; message: unknown }> };
+        const found = (page.entries ?? []).filter((entry) => entry.index > knownMax);
+        report(found.length);
+        if (found.length === 0 || agentIdRef.current !== agent) return;
+        setRecovered((current) => {
+          const next = new Map(current);
+          for (const entry of found) next.set(entry.index, entry.message as AgentMessage);
+          return next;
+        });
+      })
+      .catch((error: unknown) => {
+        report(null);
+        trackRuntimeWatchError(threadId, error, "watch");
+      });
+  }, [threadId, getToken]);
+
+  // The newest index on screen when a run starts: a run adds at least its
+  // prompt, so one that ends without passing it is a missed reply.
+  const runFromRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (view.running) {
+      runFromRef.current ??= maxIndex(latestViewRef.current.indexes);
+      return;
+    }
+    const from = runFromRef.current;
+    if (from === null) return;
+    runFromRef.current = null;
+    const timer = window.setTimeout(() => recoverMissedReply("run_ended", from), MISSED_REPLY_GRACE_MS);
+    return () => window.clearTimeout(timer);
+  }, [view.running, recoverMissedReply]);
   useEffect(() => {
     if (submittedAt === null) return;
-    const timer = window.setTimeout(() => setSubmittedAt(null), SUBMITTED_WINDOW_MS);
+    // What was on screen when the message went: its run adds past it.
+    const from = maxIndex(latestViewRef.current.indexes);
+    const timer = window.setTimeout(() => {
+      setSubmittedAt(null);
+      recoverMissedReply("submitted_expired", from);
+    }, SUBMITTED_WINDOW_MS);
     return () => window.clearTimeout(timer);
-  }, [submittedAt]);
+  }, [submittedAt, recoverMissedReply]);
 
   // A set_preview the agent runs while the page watches opens its tab.
   useEffect(() => {

@@ -37,6 +37,12 @@ vi.mock("@camelai/agent-runtime/watch", () => ({
 
 const toastError = vi.fn();
 vi.mock("sonner", () => ({ toast: { error: (...args: unknown[]) => toastError(...args) } }));
+const { missedReply, watchLifecycle } = vi.hoisted(() => ({ missedReply: vi.fn(), watchLifecycle: vi.fn() }));
+vi.mock("@/lib/chat-sse-telemetry", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  trackRuntimeViewMissedReply: missedReply,
+  trackRuntimeWatchLifecycle: watchLifecycle,
+}));
 
 import { useRuntimeThread, type RuntimeThreadSeed } from "@/lib/use-runtime-thread";
 
@@ -47,6 +53,8 @@ let statuses: Record<string, number> = {};
 beforeEach(() => {
   watchers.length = 0;
   fetchCalls.length = 0;
+  missedReply.mockReset();
+  watchLifecycle.mockReset();
   responses = {};
   statuses = {};
   toastError.mockReset();
@@ -401,5 +409,53 @@ describe("useRuntimeThread", () => {
       previewActiveTabId: "app:dash",
     })));
     expect(fetchCalls.some((call) => call.url.startsWith("/api/threads/t1/preview") && call.method === "GET")).toBe(true);
+  });
+
+  describe("a run whose end the watcher missed", () => {
+    const reply = { role: "assistant", content: [{ type: "text", text: "pong" }], stopReason: "stop", timestamp: 4 };
+    const prompt = { role: "user", content: [{ type: "text", text: "ping" }], timestamp: 3 };
+
+    it("says so, and fills the view from the newest history page", async () => {
+      responses["/api/threads/t1/token"] = { token: "abt_new", expiresAt: Date.now() + 900_000, url: "https://agents.test", agentId: "agt_1" };
+      responses["https://agents.test/v1/agents/agt_1/history"] = {
+        entries: [...seed.page!.entries, { index: 2, message: prompt }, { index: 3, message: reply }],
+        next: null,
+      };
+      const { result } = mount();
+      await waitFor(() => expect(watchers).toHaveLength(1));
+      const base = seed.page!.entries.map((entry) => entry.message);
+      act(() => watchers[0].emit({ messages: base, indexes: [0, 1], running: true }));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      // The run ends, and the watcher never delivered its messages.
+      act(() => watchers[0].emit({ messages: base, indexes: [0, 1], running: false }));
+      await waitFor(() => expect(result.current.chat.messages.map((message) => message.id)).toContain("rt:3"), { timeout: 5_000 });
+      expect(fetchCalls.filter((call) => call.url.startsWith("https://agents.test/v1/agents/agt_1/history"))).toHaveLength(1);
+      expect(missedReply).toHaveBeenCalledWith("t1", expect.objectContaining({ reason: "run_ended", knownMaxIndex: 1, viewMaxIndex: 1, recovered: 2 }));
+      // The watcher catching up later changes nothing.
+      act(() => watchers[0].emit({ messages: [...base, prompt, reply], indexes: [0, 1, 2, 3] }));
+      await waitFor(() => expect(result.current.chat.messages.filter((message) => message.id === "rt:3")).toHaveLength(1));
+    }, 10_000);
+
+    it("reads nothing when the run's messages arrived", async () => {
+      const { result } = mount();
+      await waitFor(() => expect(watchers).toHaveLength(1));
+      const base = seed.page!.entries.map((entry) => entry.message);
+      act(() => watchers[0].emit({ messages: base, indexes: [0, 1], running: true }));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      act(() => watchers[0].emit({ messages: [...base, prompt, reply], indexes: [0, 1, 2, 3], running: false }));
+      await waitFor(() => expect(result.current.chat.messages.map((message) => message.id)).toContain("rt:3"));
+      await new Promise((resolve) => setTimeout(resolve, 3_200));
+      expect(missedReply).not.toHaveBeenCalled();
+      expect(fetchCalls.some((call) => call.url.includes("/history"))).toBe(false);
+    }, 10_000);
+
+    it("reports when a watcher first connects", async () => {
+      mount();
+      await waitFor(() => expect(watchers).toHaveLength(1));
+      act(() => watchers[0].emit({ connected: true }));
+      act(() => watchers[0].emit({ connected: true, running: true }));
+      expect(watchLifecycle).toHaveBeenCalledTimes(1);
+      expect(watchLifecycle).toHaveBeenCalledWith("t1", "open", expect.objectContaining({ agentId: "agt_1", generation: 1 }));
+    });
   });
 });

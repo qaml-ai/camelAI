@@ -5,7 +5,9 @@
  * (actor, else subject), idempotent by the event id. Billing follows the key
  * scope: `hosted` is camelAI's (credit-chargeable unless the org is enterprise
  * or it is the free tier's model), an org scope or the Codex forwarder is the
- * org's own (BYOK).
+ * org's own (BYOK), its model providers (custom endpoint, Bedrock's OpenAI
+ * models) included: their declared price is only the estimate the in-DO loop
+ * records too.
  */
 import type { Env } from "../types.js";
 import { FREE_TIER_RUNTIME_MODEL, RUNTIME_MODEL_ENDPOINT } from "./model-routes.js";
@@ -45,8 +47,9 @@ export function usageRowFor(eventId: string, data: RuntimeUsageRecorded, org: { 
     provider = "openai";
     model = model.slice("openai-codex/".length);
   }
-  // chiridion's usage and pricing name Bedrock `bedrock`.
-  if (provider === "amazon-bedrock") provider = "bedrock";
+  // chiridion's usage and pricing name Bedrock `bedrock`, its OpenAI models'
+  // scope model providers (`bedrock-openai-<region>`) included.
+  if (provider === "amazon-bedrock" || provider.startsWith("bedrock-openai-")) provider = "bedrock";
   const freeTier = `${provider}/${model}` === FREE_TIER_RUNTIME_MODEL;
   const context = data.context ?? {};
   return {

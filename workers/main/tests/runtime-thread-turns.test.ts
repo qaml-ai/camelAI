@@ -178,6 +178,31 @@ describe("startRuntimeTurn", () => {
     expect(order.indexOf("/v1/agents/agt_1/configuration")).toBeLessThan(order.indexOf("/v1/agents/agt_1/prompt"));
   });
 
+  it("rides out a connection lost under the agent's configuration once, and nothing else", async () => {
+    const setup = await runtimeThread();
+    let creates = 0;
+    const calls = fakeRuntime({
+      "POST /v1/agents": () => {
+        creates += 1;
+        if (creates === 1) throw new Error("Network connection lost.");
+        return Response.json({ id: "agt_1", token: "agent-token" }, { status: 201 });
+      },
+    });
+    expect(await send(setup, "Hello after a deploy", "cm_retry")).toMatchObject({ status: "accepted", agentId: "agt_1" });
+    expect(calls.filter((call) => call.method === "POST" && call.path === "/v1/agents")).toHaveLength(2);
+
+    const other = await runtimeThread();
+    let otherCreates = 0;
+    fakeRuntime({
+      "POST /v1/agents": () => {
+        otherCreates += 1;
+        throw new Error("boom");
+      },
+    });
+    await expect(send(other, "Hello", "cm_boom")).rejects.toThrow("boom");
+    expect(otherCreates).toBe(1);
+  });
+
   it("refuses an empty message without calling the runtime", async () => {
     const setup = await runtimeThread();
     const calls = fakeRuntime();
@@ -214,6 +239,23 @@ describe("runtime thread reads and writes", () => {
     expect(hosted[0].body.redact).toEqual(["usage.cost"]);
   });
 
+  it("points the browser at chiridion's read proxy when the runtime is private (AGENT_BROWSER_URL empty: its token names no URL)", async () => {
+    const setup = await runtimeThread();
+    fakeRuntime();
+    await send(setup, "hi", "cm_p");
+    const row = (await setup.orgStub.getThreadRuntime(setup.threadId))!;
+    const proxy = `/api/threads/${setup.threadId}/runtime/${setup.context.workspaceId}`;
+    fakeRuntime({
+      "POST /v1/agents/agt_1/browser-tokens": () => Response.json({ token: "abt_2", expiresAt: 1_900_000_000_000, agentId: "agt_1" }, { status: 201 }),
+    });
+    expect(await mintRuntimeBrowserToken(runtimeEnv, { ...row, agentId: row.agentId! }, setup.sender.userId, proxy))
+      .toMatchObject({ token: "abt_2", url: proxy });
+    // A runtime that names its URL (hosted) is read directly, whatever proxy the caller offers.
+    fakeRuntime();
+    expect(await mintRuntimeBrowserToken(runtimeEnv, { ...row, agentId: row.agentId! }, setup.sender.userId, proxy))
+      .toMatchObject({ url: "https://agents.test" });
+  });
+
   it("answers an input as the user, passes the runtime's refusals through, and aborts", async () => {
     const setup = await runtimeThread();
     let calls = fakeRuntime({
@@ -244,19 +286,31 @@ describe("pinNewThreadToRuntime", () => {
     expect(await setup.orgStub.getThreadRuntime(thread.id)).toMatchObject({ threadId: thread.id });
   });
 
-  it("leaves a thread whose model has no runtime route on ChatThreadDO", async () => {
+  async function customThread(baseUrl: string) {
     const setup = await runtimeThread();
     const encrypted = await encryptCredentials({ api_key: "sk-custom" }, testEnv.INTEGRATION_SECRET_KEY ?? "test-secret");
     await setup.orgStub.setLlmProviderConfig(
       "custom",
       encrypted,
-      stringifyStoredLlmProviderConfig({ custom_base_url: "https://llm.example.test/v1", custom_api: "openai-completions", custom_model_id: "house-model" }),
+      stringifyStoredLlmProviderConfig({ custom_base_url: baseUrl, custom_api: "openai-completions", custom_model_id: "house-model" }),
       setup.sender.userId,
     );
     const thread = await setup.orgStub.createThread(setup.context.workspaceId, "Custom", setup.sender.userId);
-    const context = { ...setup.context, threadId: thread.id };
+    return { setup, thread, context: { ...setup.context, threadId: thread.id } };
+  }
+
+  it("leaves a thread whose model has no runtime route on ChatThreadDO", async () => {
+    // A custom endpoint the runtime cannot call (not https).
+    const { setup, thread, context } = await customThread("http://llm.example.test/v1");
     expect(await pinNewThreadToRuntime({ ...runtimeEnv, AGENT_RUNTIME_DIRECT_THREADS: "1" } as ChatEnv, context)).toBeNull();
     expect(await setup.orgStub.getThreadRuntime(thread.id)).toBeNull();
+  });
+
+  it("pins a thread on the org's custom endpoint (the org scope's custom provider)", async () => {
+    const { setup, thread, context } = await customThread("https://llm.example.test/v1");
+    expect(await pinNewThreadToRuntime({ ...runtimeEnv, AGENT_RUNTIME_DIRECT_THREADS: "1" } as ChatEnv, context))
+      .toMatchObject({ threadId: thread.id });
+    expect(await setup.orgStub.getThreadRuntime(thread.id)).toMatchObject({ threadId: thread.id });
   });
 });
 

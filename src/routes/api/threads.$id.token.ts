@@ -1,5 +1,6 @@
 import type { ActionFunctionArgs } from "react-router";
 import { requestWorkspaceId, requireRuntimeThread } from "@/lib/runtime-threads.server";
+import { runtimeReadProxyBase } from "@/lib/agent-runtime-shared";
 import { mintRuntimeBrowserToken } from "../../../workers/main/src/agent-runtime/thread-runtime";
 import { recordRuntimeTokenMintFailure } from "../../../workers/main/src/agent-runtime/runtime-thread-telemetry";
 
@@ -18,7 +19,12 @@ export async function action({ request, context, params }: ActionFunctionArgs) {
     return Response.json({ error: "The thread has no agent yet" }, { status: 404 });
   }
   try {
-    const token = await mintRuntimeBrowserToken(env, { ...row, agentId: row.agentId }, sender.userId);
+    const token = await mintRuntimeBrowserToken(
+      env,
+      { ...row, agentId: row.agentId },
+      sender.userId,
+      runtimeReadProxyBase(threadContext.threadId, threadContext.workspaceId),
+    );
     return Response.json(token, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     recordRuntimeTokenMintFailure(env, threadContext, "token_route", { error });

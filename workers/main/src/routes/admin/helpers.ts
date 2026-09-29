@@ -9,6 +9,8 @@ import {
   getAppIndexReadDatabase,
 } from '../../app-index-db.js';
 import { ensureAdminIndexReady } from '../../admin-index-bootstrap.js';
+import { parsedThreadTranscript } from '../../agent-runtime/thread-transcript.js';
+import type { ChatEnv } from '../../chat-thread/types.js';
 
 // ---------------------------------------------------------------------------
 // Shared data access helpers
@@ -27,9 +29,6 @@ type OrgThreadLookup = {
   getThread(threadId: string): Promise<{
     workspace_id: string;
   } | null>;
-};
-type ChatThreadLookup = {
-  getPiCoreParsedMessages(threadId: string): Promise<unknown[]> | unknown[];
 };
 
 export function getAdminIndexStub(env: AdminIndexEnv) {
@@ -96,18 +95,12 @@ export async function loadAdminThreadMessagesResponse(
     return Response.json({ error: 'Thread not found' }, { status: 404 });
   }
 
-  let messages: unknown[] = [];
-  if ('CHAT_THREAD' in env && env.CHAT_THREAD) {
-    const chatThread = env.CHAT_THREAD.get(
-      env.CHAT_THREAD.idFromName(trimmedThreadId),
-    ) as unknown as Partial<ChatThreadLookup>;
-    if (typeof chatThread.getPiCoreParsedMessages === 'function') {
-      messages = await Promise.resolve(
-        chatThread.getPiCoreParsedMessages(trimmedThreadId),
-      ).catch(() => []);
-      if (!Array.isArray(messages)) messages = [];
-    }
-  }
+  // Wherever the thread runs: a runtime thread's messages are its agent's history.
+  const messages: unknown[] = await parsedThreadTranscript(
+    env as unknown as ChatEnv,
+    threadContext.org_id,
+    trimmedThreadId,
+  ).catch(() => []);
 
   return Response.json(
     { success: true, messages },

@@ -105,6 +105,11 @@ describe("usageRowFor", () => {
     expect(row({ kind: "compaction" }).usage_surface).toBe("compaction");
     expect(row({ keyScope: "org_org1", provider: "amazon-bedrock", model: "us.anthropic.claude-sonnet-5" }))
       .toMatchObject({ provider: "bedrock", model: "us.anthropic.claude-sonnet-5", billing_source: "byok" });
+    // An org scope's model providers are the org's own: BYOK, never credit, priced as the in-DO loop estimates.
+    expect(row({ keyScope: "org_org1", provider: "bedrock-openai-us-east-1", model: "openai.gpt-5.6-terra", cost: { usd: 0.02, source: "catalog" } }))
+      .toMatchObject({ provider: "bedrock", model: "openai.gpt-5.6-terra", billing_source: "byok", credit_chargeable: false, estimated_cost_usd: 0.02 });
+    expect(row({ keyScope: "org_org1", provider: "custom", model: "acme-70b" }))
+      .toMatchObject({ provider: "custom", model: "acme-70b", billing_source: "byok", credit_chargeable: false });
     // The runtime reports the agent as subject when it has none: no user then.
     expect(row({ actor: null, subject: "client_1" }).user_id).toBe("");
   });

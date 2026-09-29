@@ -39,8 +39,17 @@ import {
   type DashboardWorkspaceMetricsRow,
 } from './admin-dashboard-metrics.js';
 import { truncateThreadPreviewText } from '../../../src/lib/thread-preview';
+import { recordErrorEvent, type ObservabilityEnv } from './observability.js';
 
-type AppIndexEnv = { APP_DB?: D1Database };
+type AppIndexEnv = { APP_DB?: D1Database } & ObservabilityEnv;
+
+/** An ensureSchema statement that failed: the statement itself, and D1's error. */
+export class AppIndexSchemaError extends Error {
+  constructor(readonly statement: string, readonly cause: unknown) {
+    super(`D1 app index schema statement failed: ${statement.replace(/\s+/g, ' ').slice(0, 300)}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'AppIndexSchemaError';
+  }
+}
 
 type D1Binding = D1Database | D1DatabaseSession;
 
@@ -481,7 +490,33 @@ function mirrorDeleteGuard(entity: MirrorEntity, key: string, version: number | 
 export class AppIndexDatabase {
   private schemaReady: Promise<void> | null = null;
 
-  constructor(private readonly db: D1Binding) {}
+  constructor(
+    private readonly db: D1Binding,
+    private readonly observability?: ObservabilityEnv,
+  ) {}
+
+  /** One schema statement, failing as an AppIndexSchemaError that names it. */
+  private async runSchemaStatement(statement: string): Promise<void> {
+    try {
+      await this.db.prepare(statement).run();
+    } catch (error) {
+      throw new AppIndexSchemaError(statement, error);
+    }
+  }
+
+  /**
+   * The CREATE statements in one batch. D1 fails a batch as a whole without
+   * saying which statement broke it, so on failure they run again one at a
+   * time (each is IF NOT EXISTS) to find it.
+   */
+  private async runSchemaBatch(statements: string[]): Promise<void> {
+    try {
+      await this.db.batch(statements.map((statement) => this.db.prepare(statement)));
+    } catch (error) {
+      for (const statement of statements) await this.runSchemaStatement(statement);
+      throw new AppIndexSchemaError('(batch)', error);
+    }
+  }
 
   async ensureSchema(): Promise<void> {
     const statements = `
@@ -650,14 +685,12 @@ export class AppIndexDatabase {
       CREATE INDEX IF NOT EXISTS idx_org_memberships_user_id ON org_memberships(user_id);
       CREATE INDEX IF NOT EXISTS idx_org_memberships_org_joined_at ON org_memberships(org_id, joined_at DESC);
     `;
-    this.schemaReady ??= this.db
-      .batch(
-        statements
-          .split(';')
-          .map((statement) => statement.trim())
-          .filter(Boolean)
-          .map((statement) => this.db.prepare(statement)),
-      )
+    this.schemaReady ??= this.runSchemaBatch(
+      statements
+        .split(';')
+        .map((statement) => statement.trim())
+        .filter(Boolean),
+    )
       .then(async () => {
         try {
           await this.db.prepare("ALTER TABLE apps ADD COLUMN project_id TEXT").run();
@@ -719,30 +752,18 @@ export class AppIndexDatabase {
             await this.db.prepare(statement).run();
           } catch {}
         }
-        await this.db
-          .prepare("CREATE INDEX IF NOT EXISTS idx_apps_project_updated_at ON apps(project_id, updated_at DESC)")
-          .run();
-        await this.db
-          .prepare("CREATE INDEX IF NOT EXISTS idx_threads_updated_at ON threads(updated_at DESC)")
-          .run();
-        await this.db
-          .prepare("CREATE INDEX IF NOT EXISTS idx_threads_created_at ON threads(created_at DESC)")
-          .run();
-        await this.db
-          .prepare("CREATE INDEX IF NOT EXISTS idx_threads_created_by_created_at ON threads(created_by, created_at, id)")
-          .run();
-        await this.db
-          .prepare("CREATE INDEX IF NOT EXISTS idx_threads_chat_error_updated_at ON threads(chat_error_count, updated_at DESC)")
-          .run();
-        await this.db
-          .prepare("CREATE INDEX IF NOT EXISTS idx_chat_error_events_created_at ON chat_error_events(created_at DESC)")
-          .run();
-        await this.db
-          .prepare("CREATE INDEX IF NOT EXISTS idx_chat_error_events_fingerprint_created_at ON chat_error_events(fingerprint, created_at DESC)")
-          .run();
-        await this.db
-          .prepare("CREATE INDEX IF NOT EXISTS idx_chat_error_events_thread_created_at ON chat_error_events(thread_id, created_at DESC)")
-          .run();
+        for (const statement of [
+          "CREATE INDEX IF NOT EXISTS idx_apps_project_updated_at ON apps(project_id, updated_at DESC)",
+          "CREATE INDEX IF NOT EXISTS idx_threads_updated_at ON threads(updated_at DESC)",
+          "CREATE INDEX IF NOT EXISTS idx_threads_created_at ON threads(created_at DESC)",
+          "CREATE INDEX IF NOT EXISTS idx_threads_created_by_created_at ON threads(created_by, created_at, id)",
+          "CREATE INDEX IF NOT EXISTS idx_threads_chat_error_updated_at ON threads(chat_error_count, updated_at DESC)",
+          "CREATE INDEX IF NOT EXISTS idx_chat_error_events_created_at ON chat_error_events(created_at DESC)",
+          "CREATE INDEX IF NOT EXISTS idx_chat_error_events_fingerprint_created_at ON chat_error_events(fingerprint, created_at DESC)",
+          "CREATE INDEX IF NOT EXISTS idx_chat_error_events_thread_created_at ON chat_error_events(thread_id, created_at DESC)",
+        ]) {
+          await this.runSchemaStatement(statement);
+        }
         const version = await first<{ value: string }>(
           this.db.prepare("SELECT value FROM app_index_metadata WHERE key = ? LIMIT 1").bind(THREADS_INDEX_VERSION_KEY),
         );
@@ -762,7 +783,27 @@ export class AppIndexDatabase {
           ]);
         }
       })
-      .then(() => undefined);
+      .then(
+        () => undefined,
+        (error: unknown) => {
+          // Loudly, once per failed attempt, naming the statement: otherwise
+          // every caller fails downstream on a table that was never created
+          // (2026-09-29: an old workspace_members without org_id failed
+          // CREATE INDEX, so mirror_rows never existed and every mirror
+          // drain failed). The next call tries again.
+          this.schemaReady = null;
+          const statement = error instanceof AppIndexSchemaError ? error.statement : null;
+          console.error('[app-index] ensureSchema failed', statement ?? '', error);
+          recordErrorEvent(this.observability, {
+            event: 'app_index_schema_failed',
+            component: 'app_index_db',
+            operation: 'ensure_schema',
+            status: 'error',
+            error,
+          });
+          throw error;
+        },
+      );
     await this.schemaReady;
   }
 
@@ -2538,9 +2579,9 @@ export class AppIndexDatabase {
 }
 
 export function getAppIndexDatabase(env: AppIndexEnv): AppIndexDatabase | null {
-  return env.APP_DB ? new AppIndexDatabase(env.APP_DB) : null;
+  return env.APP_DB ? new AppIndexDatabase(env.APP_DB, env) : null;
 }
 
 export function getAppIndexReadDatabase(env: AppIndexEnv): AppIndexDatabase | null {
-  return env.APP_DB ? new AppIndexDatabase(env.APP_DB.withSession('first-primary')) : null;
+  return env.APP_DB ? new AppIndexDatabase(env.APP_DB.withSession('first-primary'), env) : null;
 }

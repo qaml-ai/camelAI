@@ -164,6 +164,8 @@ export const PI_DURABLE_CUT_MAX_VISIBLE_CHARS = Math.floor(
 
 /** Rows per metadata probe while choosing the capped window's cut. */
 const PI_SESSION_LOAD_ROW_BATCH_SIZE = 256;
+/** Stored characters one batch of an export walk holds (a larger row alone). */
+export const PI_CORE_EXPORT_BATCH_CHARS = 4_000_000;
 /**
  * Rows inspected per legacy message-key migration step. Payloads are still
  * fetched one at a time; this only bounds the tiny idx metadata array.
@@ -1345,43 +1347,53 @@ export class PiCoreMessageStore {
     }
     const compaction = this.loadPiCoreCompaction();
     const cutAt = compaction && compaction.firstKeptIndex > 0 ? compaction.firstKeptIndex : null;
-    const rows = this.deps.sql()
-      .exec<{ idx: number; payload: string }>("SELECT idx, payload FROM pi_core_messages ORDER BY idx ASC")
-      .toArray();
     const messages: AgentMessage[] = [];
     const hydrationState: PiImageHydrationState = { count: 0, declaredChars: 0 };
     let summarized = cutAt === null;
-    for (const row of rows) {
-      if (!summarized && Number(row.idx) >= (cutAt ?? 0)) {
-        messages.push(createPiSummaryMessage(compaction!.summary, compaction!.updatedAt));
-        summarized = true;
+    // A batch of payloads at a time, so each row's stored string is released
+    // once it is materialized rather than all of them held until the end.
+    for (const batch of this.piCoreRowBatches()) {
+      for (const row of batch) {
+        if (!summarized && row.idx >= (cutAt ?? 0)) {
+          messages.push(createPiSummaryMessage(compaction!.summary, compaction!.updatedAt));
+          summarized = true;
+        }
+        const message = await this.materializePiCoreRow(row.payload, { imagePolicy: "reference" }, hydrationState);
+        if (message) messages.push(message);
       }
-      const message = await this.materializePiCoreRow(row.payload, { imagePolicy: "reference" }, hydrationState);
-      if (message) messages.push(message);
     }
     if (!summarized) messages.push(createPiSummaryMessage(compaction!.summary, compaction!.updatedAt));
     return { messages, whole: true, totalRows: totals.rows };
   }
 
   /**
-   * Every stored row's payload as stored, oldest first, `batchSize` rows at a
-   * time: a whole transcript streamed out (a moved thread's archive) without
-   * ever holding it.
+   * Every stored row, oldest first, a batch of at most `maxChars` stored
+   * characters at a time (a row larger than that alone): a whole transcript
+   * walked, or streamed out, without ever holding it.
    */
-  *piCorePayloadBatches(batchSize = PI_SESSION_LOAD_ROW_BATCH_SIZE): Generator<string[]> {
+  *piCoreRowBatches(maxChars = PI_CORE_EXPORT_BATCH_CHARS): Generator<Array<{ idx: number; payload: string }>> {
     this.ensurePiCoreTables();
-    let afterIdx = -1;
+    let fromIdx = 0;
     for (;;) {
+      const meta = this.listPiCoreRowMetaAscending({ fromIdx, limit: PI_SESSION_LOAD_ROW_BATCH_SIZE });
+      if (meta.length === 0) return;
+      let chars = 0;
+      let lastIdx = meta[0].idx;
+      for (const row of meta) {
+        if (chars > 0 && chars + row.chars > maxChars) break;
+        chars += row.chars;
+        lastIdx = row.idx;
+      }
       const rows = this.deps.sql()
         .exec<{ idx: number; payload: string }>(
-          "SELECT idx, payload FROM pi_core_messages WHERE idx > ? ORDER BY idx ASC LIMIT ?",
-          afterIdx,
-          Math.max(1, Math.floor(batchSize)),
+          "SELECT idx, payload FROM pi_core_messages WHERE idx >= ? AND idx <= ? ORDER BY idx ASC",
+          fromIdx,
+          lastIdx,
         )
-        .toArray();
-      if (rows.length === 0) return;
-      afterIdx = Number(rows[rows.length - 1].idx);
-      yield rows.map((row) => row.payload);
+        .toArray()
+        .map((row) => ({ idx: Number(row.idx), payload: row.payload }));
+      fromIdx = lastIdx + 1;
+      if (rows.length) yield rows;
     }
   }
 

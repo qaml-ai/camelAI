@@ -19,7 +19,7 @@ import {
   SELFHOST_IMAGE_ENV_BY_MANIFEST_KEY,
 } from "./selfhost-latest-release.mjs";
 import { writePomeriumConfig } from "./selfhost-pomerium-config.mjs";
-import { ensureSelfhostAdminApiKey } from "./selfhost-secret-migrations.mjs";
+import { ensureSelfhostSecrets } from "./selfhost-secret-migrations.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 const skipBackup = args.flags.has("skip-backup");
@@ -58,7 +58,7 @@ if (Boolean(releaseRef) !== Boolean(manifestArg)) {
 // not have. Migrate before snapshots, environment reads, doctor, or Compose so
 // rollback captures the exact effective value and repeated upgrades never
 // rotate it.
-await ensureSelfhostAdminApiKey(envFile);
+await ensureSelfhostSecrets(envFile);
 
 if (resumeUpgradeArg) {
   await resumeReleaseUpgrade(path.resolve(repoRoot, resumeUpgradeArg));

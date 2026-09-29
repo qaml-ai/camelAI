@@ -990,10 +990,10 @@ export class ChannelTools {
     const org = this.env.ORG.get(this.env.ORG.idFromName(context.orgId)) as unknown as {
       getThreadRuntime(threadId: string): Promise<unknown>;
     };
-    if (await org.getThreadRuntime(channelThread.threadId)) {
-      // A direct runtime thread has no transcript here: its next prompt
-      // carries the note (agent-runtime/channel-turns.ts).
-      if (!args.text?.trim() && args.attachmentCount <= 0) return "skipped";
+    // A direct runtime thread has no transcript here: its next prompt
+    // carries the note (agent-runtime/channel-turns.ts).
+    const queueNote = async () => {
+      if (!args.text?.trim() && args.attachmentCount <= 0) return "skipped" as const;
       await queueChannelHistoryNote(this.env, channelThread.threadId, {
         channelKind: args.kind,
         sentAt: Date.now(),
@@ -1007,8 +1007,9 @@ export class ChannelTools {
         attachmentCount: args.attachmentCount,
         text: args.text,
       });
-      return "recorded";
-    }
+      return "recorded" as const;
+    };
+    if (await org.getThreadRuntime(channelThread.threadId)) return await queueNote();
     const stub = this.env.CHAT_THREAD.get(
       this.env.CHAT_THREAD.idFromName(channelThread.threadId),
     ) as unknown as {
@@ -1033,6 +1034,8 @@ export class ChannelTools {
     if (result.status === "error") {
       throw new Error(result.error || `Failed to record ${args.kind} channel history`);
     }
+    // The thread is moving to the runtime, or moved: its next runtime prompt carries the note.
+    if (result.status === "moved") return await queueNote();
     return result.status === "appended" ? "recorded" : "skipped";
   }
 

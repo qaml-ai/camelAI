@@ -24,8 +24,8 @@ import {
   getEvalTimeoutMs,
   type EvalModelEnv,
 } from "./model-config";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import { succeededWithTool, usedTool } from "./project-eval-helpers";
+import { runRuntimeEval } from "./runtime-eval";
 
 // This eval exercises connection discovery through the lean code-mode surface.
 // The specialized analysis listing and the general connections listing both
@@ -33,7 +33,6 @@ import { succeededWithTool, usedTool } from "./project-eval-helpers";
 // listing behavior rather than overfitting to one internal alias.
 
 type WarehouseEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   RUN_AGENT_EVALS?: string;
 };
 
@@ -68,10 +67,7 @@ describe("warehouse list connections agent eval", () => {
         testEnv.EVAL_MODEL,
       );
 
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

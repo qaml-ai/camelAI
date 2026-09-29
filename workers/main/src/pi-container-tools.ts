@@ -31,6 +31,14 @@ const GREP_MAX_FILE_BYTES = 2 * 1024 * 1024;
 // A caller-supplied match limit has to have a ceiling; without one a large
 // enough limit rebuilds the same oversized payload.
 const GREP_MAX_MATCHES = 1000;
+// Each read is an RPC to the filesystem DO (and often an R2 GET): reading one
+// file at a time made a search of a few hundred files take ~10 s. A small
+// window keeps memory bounded (at most this many files, each under
+// GREP_MAX_FILE_BYTES, in flight).
+const GREP_READ_CONCURRENCY = 8;
+// Directories a recursive search skips below its root, as ripgrep does
+// (they are gitignored in any project): dependencies and git internals.
+const GREP_SKIPPED_DIRS = new Set(["node_modules", ".git"]);
 
 type ToolContent =
   | { type: "text"; text: string }
@@ -582,15 +590,34 @@ export class PiContainerTools {
     const matches: string[] = [];
     let lineTruncated = false;
     let skippedLargeFiles = 0;
+    const candidates: Array<{ absolutePath: string; displayPath: string }> = [];
     for (const entry of listing.files) {
       if (entry.type !== "file") continue;
       const displayPath = relativeTo(path, entry.absolutePath).replace(/\\/g, "/");
+      if (displayPath.split("/").some((segment) => GREP_SKIPPED_DIRS.has(segment))) continue;
       if (globRegex && !globRegex.test(displayPath)) continue;
       if (typeof entry.size === "number" && entry.size > GREP_MAX_FILE_BYTES) {
         skippedLargeFiles += 1;
         continue;
       }
-      const file = await this.workspace.readFile(entry.absolutePath);
+      candidates.push({ absolutePath: entry.absolutePath, displayPath });
+    }
+    // Reads run ahead in a window of GREP_READ_CONCURRENCY; matches are taken
+    // in listing order, and no new read starts once the limit is reached.
+    const reads = new Map<number, ReturnType<WorkspaceFileStoreLike["readFile"]>>();
+    const startRead = (index: number) => {
+      if (index >= candidates.length) return;
+      const read = Promise.resolve(this.workspace.readFile(candidates[index].absolutePath));
+      // Handled here too, so a read left behind at the limit is never an unhandled rejection.
+      read.catch(() => {});
+      reads.set(index, read);
+    };
+    for (let index = 0; index < GREP_READ_CONCURRENCY; index += 1) startRead(index);
+    for (let fileIndex = 0; fileIndex < candidates.length; fileIndex += 1) {
+      const { displayPath } = candidates[fileIndex];
+      const file = await reads.get(fileIndex)!;
+      reads.delete(fileIndex);
+      startRead(fileIndex + GREP_READ_CONCURRENCY);
       if (!file.success || file.isBinary) continue;
       const lines = String(file.content ?? "").split("\n");
       for (let index = 0; index < lines.length; index += 1) {

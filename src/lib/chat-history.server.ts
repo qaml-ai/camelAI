@@ -27,7 +27,7 @@ export async function readThreadMessages(
   const env = getEnv(context);
   const startedAt = Date.now();
   try {
-    const piMessages = await chatDO.getPiCoreMessages(context, threadId);
+    const piMessages = await chatDO.getThreadTranscript(context, { orgId, threadId });
     recordObservabilityEvent(env, {
       event: "chat_history_read",
       component: "react_router",

@@ -251,6 +251,66 @@ describe("PiContainerTools grep bounds", () => {
     expect(JSON.stringify(output)).toContain("1000 matches limit reached");
   });
 
+  it("reads files a few at a time, and reports matches in listing order", async () => {
+    // Each read is an RPC to the filesystem DO (and often an R2 GET): one at a time made grep take seconds.
+    const files = Array.from({ length: 40 }, (_, index) => ({
+      path: `/workspace/f${String(index).padStart(2, "0")}.ts`,
+      size: 20,
+      content: index % 2 ? "nothing" : `needle ${index}`,
+    }));
+    let inflight = 0;
+    let peak = 0;
+    const readFile = vi.fn(async (absolutePath: string) => {
+      inflight += 1;
+      peak = Math.max(peak, inflight);
+      // Later files answer first, so order must come from the listing, not arrival.
+      await new Promise((resolve) => setTimeout(resolve, 40 - Number(absolutePath.slice(-5, -3))));
+      inflight -= 1;
+      return { success: true, content: files.find((file) => file.path === absolutePath)!.content, isBinary: false };
+    });
+    const listFiles = vi.fn(async () => ({
+      success: true,
+      files: files.map((file) => ({ type: "file", absolutePath: file.path, size: file.size })),
+    }));
+    const tools = new PiContainerTools({ readFile, listFiles } as unknown as WorkspaceFilesystemLike);
+
+    const output = await tools.callTool("grep", { pattern: "needle", location: "workspace" });
+
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(16);
+    const paths = output.text.split("\n").map((line) => line.split(":")[0]);
+    expect(paths).toEqual(files.filter((_, index) => index % 2 === 0).map((file) => file.path.slice("/workspace/".length)));
+  });
+
+  it("stops reading once the match limit is reached", async () => {
+    const files = Array.from({ length: 200 }, (_, index) => ({ path: `/workspace/f${index}.ts`, size: 10, content: "needle" }));
+    const { workspace, readFile } = workspaceWith(files);
+    const tools = new PiContainerTools(workspace);
+
+    const output = await tools.callTool("grep", { pattern: "needle", location: "workspace", limit: 3 });
+
+    expect(output.text).toContain("3 matches limit reached");
+    expect(readFile.mock.calls.length).toBeLessThan(40);
+  });
+
+  it("skips node_modules and .git unless the search is inside them", async () => {
+    const { workspace, readFile } = workspaceWith([
+      { path: "/workspace/app/node_modules/pkg/index.js", size: 10, content: "needle" },
+      { path: "/workspace/app/.git/HEAD", size: 10, content: "needle" },
+      { path: "/workspace/app/src/index.ts", size: 10, content: "needle" },
+    ]);
+    const tools = new PiContainerTools(workspace);
+
+    const output = await tools.callTool("grep", { pattern: "needle", location: "workspace" });
+    expect(output.text).toContain("app/src/index.ts");
+    expect(output.text).not.toContain("node_modules");
+    expect(output.text).not.toContain(".git");
+    expect(readFile).toHaveBeenCalledTimes(1);
+
+    const inside = await tools.callTool("grep", { pattern: "needle", location: "workspace", path: "/workspace/app/node_modules" });
+    expect(inside.text).toContain("pkg/index.js");
+  });
+
   it("honours a leading (?i) inline flag that JavaScript regex rejects", async () => {
     const { workspace } = workspaceWith([
       { path: "/workspace/notes.md", size: 40, content: "Persistent MEMORY note" },

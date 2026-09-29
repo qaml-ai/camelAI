@@ -132,6 +132,8 @@ export function recordRuntimeMigration(
   result: RuntimeMigrationResult,
   /** blob4: who asked, "migrate" (an open or a send) or "sweep". */
   operation: "migrate" | "sweep" = "migrate",
+  /** double1: how long the move took (export, agent create, archive, commit), where the caller timed it. */
+  durationMs?: number,
 ): void {
   const stats = "stats" in result ? result.stats : null;
   recordObservabilityEvent(env, {
@@ -143,6 +145,7 @@ export function recordRuntimeMigration(
     status: result.status,
     errorName: "reason" in result ? result.reason : null,
     errorMessage: result.status === "failed" ? result.error : null,
+    ...(durationMs !== undefined ? { durationMs } : {}),
     count: stats?.total ?? 0,
     size: result.status === "dry_run" ? result.bytes : 0,
     extraCounts: stats

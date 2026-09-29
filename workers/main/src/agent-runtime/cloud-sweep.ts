@@ -482,6 +482,7 @@ export async function runCloudSweepStep(env: SweepEnv, options: CloudSweepOption
         };
         try {
           let result: RuntimeMigrationResult | "timed out";
+          const moveStarted = Date.now();
           try {
             result = await withMoveTimeout(migrate(env, context, { dryRun: state.dryRun }), moveTimeoutMs);
           } catch (error) {
@@ -491,7 +492,7 @@ export async function runCloudSweepStep(env: SweepEnv, options: CloudSweepOption
             await settle(thread, { kind: "retry", reason: "busy: the move is still going" });
             return true;
           }
-          recordRuntimeMigration(env, context, result, "sweep");
+          recordRuntimeMigration(env, context, result, "sweep", Date.now() - moveStarted);
           if (result.status === "dry_run") {
             state.counts.wouldMove += 1;
             if (result.lossy) state.counts.wouldBeLossy += 1;

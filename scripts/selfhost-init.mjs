@@ -12,6 +12,11 @@ import {
 } from "./selfhost-common.mjs";
 import { writeCaddyConfig } from "./selfhost-caddy-config.mjs";
 import { writePomeriumConfig } from "./selfhost-pomerium-config.mjs";
+import {
+  AGENT_RUNTIME_ENV_DEFAULTS,
+  DEFAULT_AGENT_RUNTIME_PORT,
+  DEFAULT_AGENT_RUNTIME_POSTGRES_PORT,
+} from "./selfhost-agent-runtime.mjs";
 
 const force = process.argv.includes("--force");
 
@@ -120,6 +125,17 @@ const values = {
   // connection-backed data out of published apps. Chat/agent connections stay
   // available either way.
   CONNECTIONS_BINDING_ENABLED: "true",
+  // The bundled agent runtime chat threads run on: its image, tenant,
+  // operator token (AGENT_RUNTIME_API_TOKEN), session secret, secrets key and
+  // database password. See SELF_HOSTING.md, "Upgrading to the runtime".
+  ...Object.fromEntries(AGENT_RUNTIME_ENV_DEFAULTS.map(([key, generate]) => [key, generate()])),
+  SELFHOST_AGENT_RUNTIME_PORT: DEFAULT_AGENT_RUNTIME_PORT,
+  SELFHOST_AGENT_RUNTIME_POSTGRES_PORT: DEFAULT_AGENT_RUNTIME_POSTGRES_PORT,
+  // 1: new threads run on the runtime. 0 creates them on the in-app loop
+  // again (existing runtime threads keep working).
+  SELFHOST_AGENT_RUNTIME_DIRECT_THREADS: "1",
+  // Private model endpoints the runtime may call (CIDRs, comma-separated).
+  SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_CIDRS: "",
 };
 
 const content = `# camelAI self-host configuration.

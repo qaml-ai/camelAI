@@ -7,6 +7,10 @@ import {
   tlsTerminatesOnVm,
   usesCaddy,
 } from "./selfhost-tls-mode.mjs";
+import {
+  SELFHOST_AGENT_RUNTIME_IMAGE,
+  SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE,
+} from "./selfhost-agent-runtime.mjs";
 
 export const repoRoot = path.resolve(import.meta.dirname, "..");
 export const composeFile = path.join(repoRoot, "docker-compose.selfhost.yml");
@@ -35,7 +39,17 @@ export const envFile = path.resolve(
   process.env.SELFHOST_ENV_FILE || ".env.selfhost",
 );
 export const defaultProjectName = "camelai-selfhost";
-export const volumeNames = ["app-state", "local-artifacts-repos"];
+export const volumeNames = [
+  "app-state",
+  "local-artifacts-repos",
+  "agent-runtime-postgres",
+  "agent-runtime-data",
+];
+/**
+ * Volumes an install may not have yet: the agent runtime's, before the first
+ * start of a release that bundles it. A backup taken then skips them.
+ */
+export const optionalVolumeNames = new Set(["agent-runtime-postgres", "agent-runtime-data"]);
 
 export function volumeNamesForEnv(env = {}) {
   const names =
@@ -180,6 +194,16 @@ export function scriptEnv(env = {}, extra = {}) {
           env.SELFHOST_CADDY_IMAGE ||
           process.env.SELFHOST_CADDY_IMAGE ||
           "camelai-selfhost-caddy:source",
+        // The runtime is not built from this checkout: source mode runs the
+        // same pinned release image.
+        SELFHOST_AGENT_RUNTIME_IMAGE:
+          env.SELFHOST_AGENT_RUNTIME_IMAGE ||
+          process.env.SELFHOST_AGENT_RUNTIME_IMAGE ||
+          SELFHOST_AGENT_RUNTIME_IMAGE,
+        SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE:
+          env.SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE ||
+          process.env.SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE ||
+          SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE,
       }
     : {};
   return {

@@ -99,6 +99,72 @@ includesAll(
   ],
   "production self-host Compose",
 );
+// The bundled agent runtime is private: loopback only, browsers read through the app.
+const runtimeService = compose.slice(
+  compose.indexOf("\n  agent-runtime:\n"),
+  compose.indexOf("\n  agent-runtime-postgres:\n"),
+);
+const runtimePostgresService = compose.slice(
+  compose.indexOf("\n  agent-runtime-postgres:\n"),
+  compose.indexOf("\n  local-artifacts:\n"),
+);
+assert(runtimeService.length > 0 && runtimePostgresService.length > 0, "self-host Compose must run the agent runtime and its Postgres");
+includesAll(
+  runtimeService,
+  [
+    "${SELFHOST_AGENT_RUNTIME_IMAGE:?",
+    "network_mode: host",
+    "HOST: 127.0.0.1",
+    'AGENT_BROWSER_URL: ""',
+    "AGENT_PUBLIC_URL: http://127.0.0.1:",
+    "AGENT_OPERATOR_TOKEN: ${AGENT_RUNTIME_API_TOKEN:?",
+    "AGENT_SESSION_SECRET: ${AGENT_RUNTIME_SESSION_SECRET:?",
+    "AGENT_SECRETS_KEY: ${AGENT_RUNTIME_SECRETS_KEY:?",
+    "AGENT_OUTBOUND_ALLOW_CIDRS: 127.0.0.1/32",
+    "agent-runtime-data:/data",
+    "stop_grace_period",
+  ],
+  "self-host agent runtime service",
+);
+assert(!/^\s+ports:/m.test(runtimeService), "the agent runtime must publish no port");
+includesAll(
+  runtimePostgresService,
+  ["${SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE:?", '"127.0.0.1:${SELFHOST_AGENT_RUNTIME_POSTGRES_PORT:-15432}:5432"', "pg_isready"],
+  "self-host agent runtime Postgres",
+);
+includesAll(
+  compose,
+  [
+    "AGENT_RUNTIME_URL: http://127.0.0.1:${SELFHOST_AGENT_RUNTIME_PORT:-8790}",
+    "AGENT_RUNTIME_DIRECT_THREADS: ${SELFHOST_AGENT_RUNTIME_DIRECT_THREADS:-1}",
+    "agent-runtime:\n        condition: service_healthy",
+  ],
+  "self-host app on the agent runtime",
+);
+includesAll(
+  imageWorkflow,
+  ['.images["agent-runtime"]', '.images["agent-runtime-postgres"]', "selfhost-agent-runtime.mjs"],
+  "self-host release manifest pins the agent runtime",
+);
+includesAll(
+  latestReleaseScript,
+  ["SELFHOST_AGENT_RUNTIME_IMAGE", "SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE"],
+  "latest self-host release resolver (agent runtime)",
+);
+includesAll(
+  doctorScript,
+  ["inspectSelfhostAgentRuntime", "AGENT_RUNTIME_ENV_DEFAULTS"],
+  "self-host doctor (agent runtime)",
+);
+includesAll(
+  initScript,
+  ["AGENT_RUNTIME_ENV_DEFAULTS", "SELFHOST_AGENT_RUNTIME_DIRECT_THREADS"],
+  "self-host init (agent runtime)",
+);
+assert(
+  compose.indexOf("AGENT_RUNTIME_SESSION_SECRET") > compose.indexOf("\n  agent-runtime:\n"),
+  "the runtime's own secrets must reach only the runtime's containers",
+);
 assert(
   !compose.includes("LOCAL_ARTIFACTS_BASE_URL: http://local-artifacts:7001"),
   "host-networked app must reach local-artifacts through the VM loopback",
@@ -266,7 +332,7 @@ includesAll(
 );
 includesAll(
   upScript,
-  ["ensureSelfhostAdminApiKey(envFile)", "loadCaddyConfig", "{ build: sourceMode }"],
+  ["ensureSelfhostSecrets(envFile)", "loadCaddyConfig", "{ build: sourceMode }"],
   "self-host startup Caddy configuration reload",
 );
 for (const [name, env, expectedFiles] of [
@@ -428,7 +494,7 @@ includesAll(
 includesAll(
   upgradeScript,
   [
-    "ensureSelfhostAdminApiKey(envFile)",
+    "ensureSelfhostSecrets(envFile)",
     "downloadLatestReleaseManifest",
     "--latest",
     "--refresh",

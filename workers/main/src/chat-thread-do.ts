@@ -7927,6 +7927,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     return runtimeModelRoute(config, {
       orgId: this.chatContext?.orgId ?? "",
       freeTier: isCreditFreeHostedModel(this.currentThreadModel),
+      allowHttpEndpoints: isSelfhostRuntime(this.env),
     });
   }
 

@@ -8,10 +8,12 @@
  * - `codex`: the org's ChatGPT subscription, which only chiridion can
  *   authenticate: `chiridion/openai-codex/<model>` through chiridion's
  *   forwarder (agent-runtime/codex-forwarder.ts);
- * - null: no runtime route (self-host providers, the gateway's other dynamic
- *   routes, a custom endpoint the runtime cannot call: not `https`, or
+ * - null: no runtime route (the gateway's other dynamic routes, a custom
+ *   endpoint the runtime cannot call: not `https` outside self-host, or
  *   Anthropic Messages behind `Authorization: Bearer`). Such a thread stays on
- *   the in-DO loop.
+ *   the in-DO loop. A self-host install's operator provider (SELFHOST_AI_*)
+ *   routes as the BYOK provider it is, with the org's scope holding its key
+ *   (key-scopes.ts, selfhostScopeProviders).
  *
  * An org's own endpoints are model providers of its key scope (key-scopes.ts):
  * its custom endpoint `custom/<model id>`, Bedrock's OpenAI models
@@ -87,7 +89,12 @@ export function bedrockInferenceProfileId(modelId: string, region: string): stri
 
 export function runtimeModelRoute(
   config: PiResolvedModelConfig,
-  context: { orgId: string; freeTier?: boolean },
+  context: {
+    orgId: string;
+    freeTier?: boolean;
+    /** A self-host install's own runtime may call `http` custom endpoints its operator allowed. */
+    allowHttpEndpoints?: boolean;
+  },
 ): RuntimeModelRoute | null {
   const { model } = config;
   if (model.provider === "cloudflare-ai-gateway") {
@@ -116,7 +123,7 @@ export function runtimeModelRoute(
     // Anthropic Messages takes x-api-key unless the org chose Bearer.
     const bearer = typeof config.headers?.Authorization === "string";
     const authType = model.api === "anthropic-messages" && !bearer ? "x-api-key" : "bearer";
-    if (model.provider !== "custom" || !runtimeModelId(model.id) || !customEndpointRunsOnRuntime(model.api, authType, model.baseUrl)) return null;
+    if (model.provider !== "custom" || !runtimeModelId(model.id) || !customEndpointRunsOnRuntime(model.api, authType, model.baseUrl, context.allowHttpEndpoints)) return null;
     return { kind: "scope", model: `${CUSTOM_MODEL_PROVIDER}/${model.id}`, keyScope: scope };
   }
   if (config.usageProvider === "openrouter") {

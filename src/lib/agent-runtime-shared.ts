@@ -31,6 +31,22 @@ export function runtimeDirectThreadsEnabled(env: {
   );
 }
 
+/** The agent reads a browser token allows, which chiridion's read proxy passes through. */
+export const RUNTIME_BROWSER_READS: ReadonlySet<string> = new Set(["events", "history", "state", "inputs"]);
+
+/**
+ * Where the browser reads a runtime thread's agent when the runtime is
+ * private (self-host): through chiridion, at this base on its own origin
+ * (routes/api/threads.$id.runtime.ts), which the watcher appends
+ * `/v1/agents/:id/<read>` to. The workspace is a path segment because the
+ * watcher adds its own query string. A runtime says it is private by minting
+ * browser tokens that name no URL (its AGENT_BROWSER_URL is empty); the
+ * hosted runtime names its own, and browsers read it directly.
+ */
+export function runtimeReadProxyBase(threadId: string, workspaceId: string): string {
+  return `/api/threads/${encodeURIComponent(threadId)}/runtime/${encodeURIComponent(workspaceId)}`;
+}
+
 /** The request id of a new thread's first message, sent by the new-chat action. */
 export function initialRuntimeRequestId(threadId: string): string {
   return `initial_${threadId}`;

@@ -18,6 +18,12 @@ import {
   type LlmProviderStoredConfig,
 } from "../../../../src/lib/llm-provider-config";
 import { buildCloudflareGatewayUrl } from "../../../../src/lib/cloudflare-ai-gateway";
+import {
+  getSelfhostAiProviderCredentials,
+  getSelfhostAiProviderRecord,
+  isSelfhostRuntime,
+  type SelfhostAiProviderEnv,
+} from "../../../../src/lib/selfhost-ai-provider";
 import type { LlmModel } from "../../../../src/types";
 import { piCatalogModel } from "../chat-thread/pi-model-config";
 import { PiModelMapping } from "../pi-model-resolution";
@@ -39,7 +45,7 @@ export function orgKeyScope(orgId: string): string {
   return `org_${orgId}`;
 }
 
-export interface KeyScopeEnv extends RuntimeApiEnv {
+export interface KeyScopeEnv extends RuntimeApiEnv, SelfhostAiProviderEnv {
   APP_KV: KVNamespace;
   ORG: DurableObjectNamespace;
   INTEGRATION_SECRET_KEY: string;
@@ -128,11 +134,34 @@ export async function orgScopeProviders(
 ): Promise<ScopeEntries> {
   if (!record) return { providers: {} };
   const creds = await decryptCredentials<Record<string, string>>(record.credentials_encrypted, env.INTEGRATION_SECRET_KEY);
-  const config = parseStoredLlmProviderConfig(record.config);
-  switch (record.provider) {
+  return await scopeEntries(record.provider, creds, parseStoredLlmProviderConfig(record.config), { allowHttp: isSelfhostRuntime(env) });
+}
+
+/**
+ * A self-host install's key scope: the AI provider its operator configured
+ * (SELFHOST_AI_*), which every org of the install runs on, as the in-DO loop
+ * does (resolvePiRequestConfig prefers it to an org's own settings). Null when
+ * none is configured (orgs then use their own settings, or the gateway).
+ */
+export async function selfhostScopeProviders(env: KeyScopeEnv): Promise<ScopeEntries | null> {
+  if (!isSelfhostRuntime(env)) return null;
+  const credentials = getSelfhostAiProviderCredentials(env);
+  const record = getSelfhostAiProviderRecord(env);
+  if (!credentials || !record) return null;
+  const creds: Record<string, string> = credentials.provider === "bedrock" ? { bearer_token: credentials.apiKey } : { api_key: credentials.apiKey };
+  return await scopeEntries(record.provider, creds, parseStoredLlmProviderConfig(record.config), { allowHttp: true });
+}
+
+async function scopeEntries(
+  provider: string,
+  creds: Record<string, string>,
+  config: LlmProviderStoredConfig,
+  options: { allowHttp: boolean },
+): Promise<ScopeEntries> {
+  switch (provider) {
     case "anthropic":
     case "openai":
-      return { providers: creds.api_key ? { [record.provider]: { apiKey: creds.api_key } } : {} };
+      return { providers: creds.api_key ? { [provider]: { apiKey: creds.api_key } } : {} };
     case "openrouter":
       return { providers: creds.api_key ? { openrouter: { apiKey: creds.api_key, headers: OPENROUTER_ATTRIBUTION } } : {} };
     case "bedrock": {
@@ -144,7 +173,7 @@ export async function orgScopeProviders(
       };
     }
     case "custom": {
-      const provider = creds.api_key ? await customModelProvider(creds.api_key, config) : null;
+      const provider = creds.api_key ? await customModelProvider(creds.api_key, config, options.allowHttp) : null;
       return { providers: {}, modelProviders: provider ? { [CUSTOM_MODEL_PROVIDER]: provider } : {} };
     }
     default:
@@ -195,13 +224,16 @@ function declaredModel(id: string, catalog: Model<any> | null): KeyScopeModel | 
  * (Bearer; x-api-key for Anthropic Messages) or as another header. Anthropic
  * Messages behind `Authorization: Bearer` cannot be said (the runtime sets
  * Authorization itself), so such an endpoint stays on the in-DO loop.
+ * `allowHttp`: a self-host install's bundled runtime, whose operator allows
+ * plain `http` model endpoints on their network (SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_CIDRS).
  */
 export function customEndpointRunsOnRuntime(
   api: string | undefined,
   authType: LlmProviderStoredConfig["custom_auth_type"],
   baseUrl: string | undefined,
+  allowHttp = false,
 ): boolean {
-  if (!api || !CUSTOM_APIS.has(api) || !baseUrl || !/^https:\/\//i.test(baseUrl)) return false;
+  if (!api || !CUSTOM_APIS.has(api) || !baseUrl || !(allowHttp ? /^https?:\/\//i : /^https:\/\//i).test(baseUrl)) return false;
   return api !== "anthropic-messages" || authType === "x-api-key";
 }
 
@@ -217,9 +249,9 @@ export const runtimeModelId = (id: string) => /^\S{1,200}$/.test(id);
  * own model id, or chiridion's models of the endpoint's API by the ids the
  * loop sends.
  */
-async function customModelProvider(apiKey: string, config: LlmProviderStoredConfig): Promise<KeyScopeModelProvider | null> {
+async function customModelProvider(apiKey: string, config: LlmProviderStoredConfig, allowHttp: boolean): Promise<KeyScopeModelProvider | null> {
   const { custom_api: api, custom_base_url: baseUrl, custom_auth_type: authType, custom_model_id: customModelId } = config;
-  if (!api || !baseUrl || !customEndpointRunsOnRuntime(api, authType, baseUrl)) return null;
+  if (!api || !baseUrl || !customEndpointRunsOnRuntime(api, authType, baseUrl, allowHttp)) return null;
   const mapping = new PiModelMapping();
   const getModel = await catalogGetModel();
   const models = new Map<string, KeyScopeModel>();
@@ -351,13 +383,22 @@ export async function syncKeyScope(
 
 type ProviderRecord = { provider: string; credentials_encrypted: string; config: string } | null;
 
-/** Sync an org's BYOK scope from its current AI provider settings (read from OrgDO unless given). */
+/**
+ * Sync an org's BYOK scope from its current AI provider settings (read from
+ * OrgDO unless given); on a self-host install with an operator-configured
+ * provider, from that provider, which its threads run on whatever the org set.
+ */
 export async function syncOrgKeyScope(
   env: KeyScopeEnv,
   orgId: string,
   record?: ProviderRecord,
   fetcher?: typeof globalThis.fetch,
 ): Promise<void> {
+  const selfhost = await selfhostScopeProviders(env);
+  if (selfhost) {
+    await syncKeyScope(env, orgKeyScope(orgId), selfhost, fetcher);
+    return;
+  }
   const current = record !== undefined
     ? record
     : await (env.ORG.get(env.ORG.idFromName(orgId)) as unknown as { getLlmProviderConfig(): Promise<ProviderRecord> })

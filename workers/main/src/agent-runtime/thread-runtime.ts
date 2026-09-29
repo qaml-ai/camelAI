@@ -509,6 +509,12 @@ export async function mintRuntimeBrowserToken(
   env: ChatEnv,
   row: ThreadRuntimeRecord & { agentId: string },
   userId: string,
+  /**
+   * Where the browser reads through chiridion instead (runtimeReadProxyBase),
+   * used when the runtime's token names no URL: a private runtime (self-host,
+   * AGENT_BROWSER_URL empty) that browsers cannot reach.
+   */
+  readProxy?: string,
 ): Promise<BrowserToken> {
   const minted = await runtimeApi(env, "POST", `/v1/agents/${encodeURIComponent(row.agentId)}/browser-tokens`, {
     ttlSeconds: BROWSER_TOKEN_TTL_SECONDS,
@@ -521,7 +527,7 @@ export async function mintRuntimeBrowserToken(
     token: minted.token,
     expiresAt: minted.expiresAt,
     agentId: row.agentId,
-    url: (minted.url || runtimeUrl(env)).replace(/\/+$/, ""),
+    url: (minted.url || readProxy || runtimeUrl(env)).replace(/\/+$/, ""),
   };
 }
 

@@ -214,6 +214,23 @@ describe("runtime thread reads and writes", () => {
     expect(hosted[0].body.redact).toEqual(["usage.cost"]);
   });
 
+  it("points the browser at chiridion's read proxy when the runtime is private (AGENT_BROWSER_URL empty: its token names no URL)", async () => {
+    const setup = await runtimeThread();
+    fakeRuntime();
+    await send(setup, "hi", "cm_p");
+    const row = (await setup.orgStub.getThreadRuntime(setup.threadId))!;
+    const proxy = `/api/threads/${setup.threadId}/runtime/${setup.context.workspaceId}`;
+    fakeRuntime({
+      "POST /v1/agents/agt_1/browser-tokens": () => Response.json({ token: "abt_2", expiresAt: 1_900_000_000_000, agentId: "agt_1" }, { status: 201 }),
+    });
+    expect(await mintRuntimeBrowserToken(runtimeEnv, { ...row, agentId: row.agentId! }, setup.sender.userId, proxy))
+      .toMatchObject({ token: "abt_2", url: proxy });
+    // A runtime that names its URL (hosted) is read directly, whatever proxy the caller offers.
+    fakeRuntime();
+    expect(await mintRuntimeBrowserToken(runtimeEnv, { ...row, agentId: row.agentId! }, setup.sender.userId, proxy))
+      .toMatchObject({ url: "https://agents.test" });
+  });
+
   it("answers an input as the user, passes the runtime's refusals through, and aborts", async () => {
     const setup = await runtimeThread();
     let calls = fakeRuntime({

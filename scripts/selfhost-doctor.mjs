@@ -29,6 +29,10 @@ import {
   previewContentSecurityPolicy,
   writePomeriumConfig,
 } from "./selfhost-pomerium-config.mjs";
+import {
+  AGENT_RUNTIME_ENV_DEFAULTS,
+  inspectSelfhostAgentRuntime,
+} from "./selfhost-agent-runtime.mjs";
 
 const checks = [];
 const env = await readSelfhostEnv(false);
@@ -67,6 +71,13 @@ await check("env file", async () => {
     }
     if (env[key].includes("change-me")) fail(`${key} still uses a development default`);
   }
+  const missingRuntime = AGENT_RUNTIME_ENV_DEFAULTS.map(([key]) => key).filter((key) => !env[key]);
+  if (missingRuntime.length > 0) {
+    fail(`missing ${missingRuntime.join(", ")}; run \`bun run selfhost:migrate-secrets\``);
+  }
+  if ((env.AGENT_RUNTIME_API_TOKEN || "").length < 24) {
+    fail("AGENT_RUNTIME_API_TOKEN must be at least 24 characters");
+  }
 });
 
 await check("required CLIs", async () => {
@@ -96,6 +107,8 @@ const imageKeys = [
   "SELFHOST_ANALYSIS_IMAGE",
   "SELFHOST_DB_QUERY_IMAGE",
   "SELFHOST_CONTAINER_EGRESS_IMAGE",
+  "SELFHOST_AGENT_RUNTIME_IMAGE",
+  "SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE",
   ...(usesCaddy(env) ? ["SELFHOST_CADDY_IMAGE"] : []),
 ];
 
@@ -524,6 +537,36 @@ await check("volume names", async () => {
 await check("local services", async () => {
   await optionalHttp(`http://127.0.0.1:${appPort}/api/selfhost/health`, "app self-host health");
   await optionalHttp("http://127.0.0.1:7001/health", "local Artifacts");
+});
+
+await check("agent runtime", async () => {
+  for (const key of ["SELFHOST_AGENT_RUNTIME_IMAGE", "SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE"]) {
+    const image = (effectiveEnv[key] || "").trim();
+    if (deploymentMode === "release" && !/@sha256:[0-9a-f]{64}$/i.test(image)) {
+      warn(`${key} is pinned by tag, not digest; selfhost:upgrade pins it from the release manifest`);
+    }
+  }
+  if ((env.SELFHOST_AGENT_RUNTIME_DIRECT_THREADS ?? "1").trim() === "0") {
+    note("SELFHOST_AGENT_RUNTIME_DIRECT_THREADS=0: new threads run on the in-app loop");
+  }
+  if ((env.LOCAL_AUTH_BYPASS || "").trim()) {
+    warn(
+      "LOCAL_AUTH_BYPASS is set: agents may call the app on loopback (the runtime reaches its tools there), " +
+        "so keep local authentication to smoke tests",
+    );
+  }
+  const inspection = await inspectSelfhostAgentRuntime({ env: effectiveEnv });
+  if (!inspection.listening) {
+    warn("stack is not running; live agent runtime checks skipped");
+    note(`agent runtime: not listening at ${inspection.url}`);
+    return;
+  }
+  for (const finding of inspection.findings) {
+    note(finding.message);
+    if (finding.level === "warn") warn(finding.message);
+  }
+  const failed = inspection.findings.find((finding) => finding.level === "fail");
+  if (failed) fail(failed.message);
 });
 
 for (const item of checks) {

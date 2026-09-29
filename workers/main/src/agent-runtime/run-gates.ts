@@ -179,7 +179,11 @@ export async function resolveThreadRuntimeRoute(env: ChatEnv, context: ChatConte
     getModel as unknown as (provider: never, modelId: never) => Model<any>,
   );
   if (ranOn) threadModel = ranOn as LlmModel;
-  const route = runtimeModelRoute(config, { orgId: context.orgId, freeTier: isCreditFreeHostedModel(threadModel) });
+  const route = runtimeModelRoute(config, {
+    orgId: context.orgId,
+    freeTier: isCreditFreeHostedModel(threadModel),
+    allowHttpEndpoints: isSelfhostRuntime(env),
+  });
   return { threadModel, config, route, fallback, llmProviderRecord };
 }
 

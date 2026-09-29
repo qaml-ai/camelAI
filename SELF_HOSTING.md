@@ -519,6 +519,93 @@ Rules:
 
 `GET /api/selfhost/health` reports an `agent-pack` check summarizing what loaded.
 
+## Upgrading to the runtime
+
+Chat threads run on the camelAI agent runtime, which self-host installs now
+run themselves: the runtime keeps each thread's agent (its model loop,
+history and sandbox) and calls camelAI's tools over MCP, instead of the
+thread's own loop inside the app.
+
+### What changes
+
+- **New containers.** `agent-runtime` (image `SELFHOST_AGENT_RUNTIME_IMAGE`,
+  `ghcr.io/qaml-ai/agent-runtime:<version>`, pinned by digest in release
+  manifests) and `agent-runtime-postgres` (`postgres:16`, pinned by digest).
+  The app starts after the runtime is healthy.
+- **New volumes.** `agent-runtime-data` (agents' transcripts, files and
+  volumes) and `agent-runtime-postgres` (the runtime's index). Both are in
+  `selfhost:backup`/`selfhost:restore`; a backup taken before the first start
+  of this release skips them. Budget about 1 vCPU and 2 GB of memory more.
+- **Private by design.** Like the app, the runtime shares the VM's network
+  namespace and listens on loopback only (`127.0.0.1:8790`, and Postgres on
+  `127.0.0.1:15432`); nothing is published. The app reaches it on loopback,
+  and it calls the app's `/mcp/agent` tools and `/agent-runtime/events`
+  webhook on the app's loopback socket. Browsers never reach the runtime: the
+  runtime mints browser tokens with no URL (`AGENT_BROWSER_URL` is empty), so
+  the app hands the browser its own read route
+  (`/api/threads/:id/runtime/...`) and passes each read through, with the
+  user's session checked first and the browser token checked by the runtime.
+- **New secrets and settings in `.env.selfhost`.** `selfhost:init` writes
+  them; on an existing install `selfhost:migrate-secrets` (which
+  `selfhost:up` and `selfhost:upgrade` also run) adds whichever are missing
+  and never rotates one that exists:
+  `AGENT_RUNTIME_TENANT` (the install's single tenant, `camelai-selfhost`),
+  `AGENT_RUNTIME_API_TOKEN` (its operator token, the app's credential on the
+  runtime), `AGENT_RUNTIME_SESSION_SECRET` and `AGENT_RUNTIME_SECRETS_KEY`
+  (the runtime's token signing and stored-key encryption: keep them, changing
+  either breaks existing agents or stored keys), `AGENT_RUNTIME_POSTGRES_PASSWORD`,
+  and the two image references. Optional: `SELFHOST_AGENT_RUNTIME_PORT`,
+  `SELFHOST_AGENT_RUNTIME_POSTGRES_PORT`, `SELFHOST_AGENT_RUNTIME_DIRECT_THREADS`
+  and `SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_CIDRS`.
+- **Provisioned at every start.** Before workerd starts, the app waits for the
+  runtime, upserts the `camelai-thread` definition (stable id; a changed spec
+  is a new revision) and registers its events webhook once, keeping the
+  webhook's signing secret on the `app-state` volume. If the runtime cannot
+  be reached, the last provisioned state is used; on a first start without
+  one, new threads run on the in-app loop and the log says so.
+- **Models.** Threads run on the provider in `SELFHOST_AI_*`, which the app
+  syncs into each organization's key scope on the runtime. A `custom`
+  endpoint on your network (vLLM, a gateway) may be plain `http`, but the
+  runtime refuses private addresses unless allowed: add its range, e.g.
+  `SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_CIDRS=10.1.2.0/24`. Keep the range
+  narrow; agents' `web_fetch` can reach whatever it allows. A model with no
+  runtime route (for example Anthropic Messages behind `Authorization:
+  Bearer`) keeps its threads on the in-app loop.
+- **Loopback is reachable by agents.** The runtime may call `127.0.0.1` over
+  `http` (it has to, for the app's tools), so an agent's `web_fetch` can reach
+  loopback services too. They all require credentials, except the app itself
+  under `SELFHOST_AUTH_MODE=local` with `LOCAL_AUTH_BYPASS`, which the doctor
+  warns about: keep that mode to smoke tests.
+
+`bun run selfhost:doctor` checks the runtime: its secrets and image pins, and
+while the stack runs, that it is healthy, the operator token is the tenant's,
+the definition calls the app's tools, and the events webhook has every event.
+
+### New and existing threads
+
+With `SELFHOST_AGENT_RUNTIME_DIRECT_THREADS=1` (the default) every new thread
+runs on the runtime. Threads created before the upgrade stay on the in-app
+loop and keep working until they are moved to the runtime; the automatic
+thread sweep that moves them is described in
+[Moving existing threads](#moving-existing-threads).
+
+### Moving existing threads
+
+Not yet automatic in this release: existing threads keep running on the
+in-app loop.
+
+### Rollback
+
+Set `SELFHOST_AGENT_RUNTIME_DIRECT_THREADS=0` and run `bun run selfhost:up`
+to create new threads on the in-app loop again. Threads already on the runtime
+keep working (their agents live in the runtime), so leave the runtime
+containers, their volumes and the `AGENT_RUNTIME_*` secrets in place.
+`selfhost:upgrade --rollback <snapshot>` restores the previous release's
+images; the runtime's volumes are left as they are, and a later upgrade picks
+them up again. A release without the runtime cannot open threads that were
+created on it, so prefer the setting above to a release rollback once users
+have runtime threads.
+
 ## Operational validation
 
 After startup, verify:

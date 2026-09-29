@@ -276,3 +276,47 @@ describe("syncKeyScope", () => {
     expect(runtime.calls[1].body).toMatchObject({ type: "openai-responses", baseUrl: "https://bedrock-mantle.us-east-2.api.aws/openai/v1", apiKey: "bedrock-key" });
   });
 });
+
+describe("self-host key scopes", () => {
+  const selfhost = (extra: Record<string, string>) => ({ CF_ACCOUNT_ID: "selfhost", CF_DISPATCH_NAMESPACE: "selfhost", ...extra });
+
+  it("syncs every org's scope from the operator's provider (SELFHOST_AI_*), whatever the org stored", async () => {
+    const { kv } = memoryKv();
+    const runtime = fakeRuntime();
+    const stored = await record("openai", { api_key: "sk-org-own" });
+    await syncOrgKeyScope(env(kv, selfhost({ SELFHOST_AI_PROVIDER: "anthropic", SELFHOST_AI_API_KEY: "sk-ant-operator" })), "org11", stored, runtime.fetch);
+    expect(runtime.calls).toMatchObject([
+      { method: "PUT", path: "/v1/key-scopes/org_org11/providers/anthropic", body: { apiKey: "sk-ant-operator" } },
+    ]);
+  });
+
+  it("declares a self-host custom endpoint on the private network over plain http, which the bundled runtime may call", async () => {
+    const { kv } = memoryKv();
+    const runtime = fakeRuntime();
+    await syncOrgKeyScope(env(kv, selfhost({
+      SELFHOST_AI_PROVIDER: "custom",
+      SELFHOST_AI_API_KEY: "sk-vllm",
+      SELFHOST_AI_BASE_URL: "http://10.1.2.3:8000/v1",
+      SELFHOST_AI_MODEL: "qwen-coder",
+      SELFHOST_AI_API: "openai-completions",
+    })), "org12", null, runtime.fetch);
+    expect(runtime.calls).toMatchObject([{ method: "PUT", path: "/v1/key-scopes/org_org12/model-providers/custom" }]);
+    expect(runtime.calls[0].body).toMatchObject({ type: "openai-completions", baseUrl: "http://10.1.2.3:8000/v1", apiKey: "sk-vllm" });
+    // Outside self-host, custom endpoints still need https.
+    expect(await orgScopeProviders(env(kv), await record("custom", { api_key: "k" }, {
+      custom_api: "openai-completions", custom_base_url: "http://10.1.2.3:8000/v1", custom_model_id: "qwen-coder",
+    }))).toEqual({ providers: {}, modelProviders: {} });
+  });
+
+  it("routes a self-host http custom endpoint to the runtime only where it is allowed", () => {
+    const config = {
+      model: { provider: "custom", api: "openai-completions", id: "qwen-coder", baseUrl: "http://10.1.2.3:8000/v1" },
+      apiKey: "sk-vllm",
+      billingSource: "byok",
+      usageProvider: "custom",
+      headers: { Authorization: "Bearer sk-vllm" },
+    } as unknown as PiResolvedModelConfig;
+    expect(runtimeModelRoute(config, { orgId: "o1", allowHttpEndpoints: true })).toEqual({ kind: "scope", model: "custom/qwen-coder", keyScope: "org_o1" });
+    expect(runtimeModelRoute(config, { orgId: "o1" })).toBeNull();
+  });
+});

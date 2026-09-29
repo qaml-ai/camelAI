@@ -37,6 +37,8 @@ import {
   importNote,
   migrateThreadToRuntime,
   reconcileRuntimeMigrationOrphans,
+  runtimeMigrationKey,
+  runtimeMigrationKeyThread,
   withImportNote,
   type DoMigrationResult,
 } from "../src/agent-runtime/thread-migration";
@@ -217,6 +219,16 @@ describe("convertTranscript: messages a provider refuses (review 3)", () => {
   });
 });
 
+describe("runtimeMigrationKey", () => {
+  it("is a key the runtime takes for real (UUID) thread and lease ids, and names its thread", () => {
+    const threadId = crypto.randomUUID();
+    const key = runtimeMigrationKey(threadId, crypto.randomUUID());
+    expect(key).toMatch(/^[A-Za-z0-9_-]{1,80}$/);
+    expect(runtimeMigrationKeyThread(key)).toBe(threadId);
+    expect(runtimeMigrationKey(threadId, crypto.randomUUID())).not.toBe(key);
+  });
+});
+
 describe("reconcileRuntimeMigrationOrphans", () => {
   const ORG_ROW = { threadId: "t1", agentId: "agt_row", model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
 
@@ -235,12 +247,16 @@ describe("reconcileRuntimeMigrationOrphans", () => {
       CHAT_THREAD: { idFromName: (name: string) => name, get: () => ({ runtimeMigrationHolds: holds }) },
     } as unknown as ChatEnv;
     const dry = await reconcileRuntimeMigrationOrphans(env, { dryRun: true });
-    expect(dry).toEqual({ scanned: 4, kept: 2, orphans: ["agt_lost"], deleted: [], unverifiable: ["agt_unknown_org"] });
-    expect(runtimeApiMock).not.toHaveBeenCalledWith(expect.anything(), "DELETE", expect.anything());
+    expect(dry).toEqual({ scanned: 4, kept: 2, orphans: ["agt_lost"], deleted: [], unverifiable: ["agt_unknown_org"], next: null });
+    expect(runtimeApiMock.mock.calls.some((call) => call[1] === "DELETE")).toBe(false);
     const real = await reconcileRuntimeMigrationOrphans(env);
     expect(real.deleted).toEqual(["agt_lost"]);
-    expect(runtimeApiMock).toHaveBeenCalledWith(expect.anything(), "DELETE", "/v1/agents/agt_lost");
+    expect(runtimeApiMock).toHaveBeenCalledWith(expect.anything(), "DELETE", "/v1/agents/agt_lost", undefined, {}, expect.any(Function));
     expect(holds).toHaveBeenCalledWith("agt_moving", "migrate_t1_lease-a");
+    // A page at a time, in agent id order.
+    const first = await reconcileRuntimeMigrationOrphans(env, { dryRun: true, limit: 2 });
+    expect(first).toMatchObject({ scanned: 2, next: "agt_moving" });
+    expect(await reconcileRuntimeMigrationOrphans(env, { dryRun: true, limit: 2, after: first.next })).toMatchObject({ scanned: 2, next: null });
   });
 });
 

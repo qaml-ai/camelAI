@@ -411,7 +411,9 @@ export async function migrateThreadToRuntime(
 
 /** An attempt's Idempotency-Key: the thread and the attempt's lease, never reused. */
 export function runtimeMigrationKey(threadId: string, leaseId: string): string {
-  return `migrate_${threadId}_${leaseId}`;
+  // The runtime takes keys of at most 80 of [A-Za-z0-9_-]: with a UUID thread
+  // id, 16 hex characters of the lease leave room (61 in all).
+  return `migrate_${threadId}_${leaseId.replace(/-/g, "").slice(0, 16)}`;
 }
 
 /** The thread a move's Idempotency-Key names, or null for any other key. */
@@ -429,53 +431,82 @@ interface RuntimeAgentSummary {
 }
 
 export interface OrphanReconcileReport {
-  /** Agents made by a move (migrate_ keys). */
+  /** Agents made by a move (migrate_ keys) looked at in this page. */
   scanned: number;
   /** Held by their thread's move or runtime row. */
   kept: number;
   /** Held by nothing: deleted, or listed on a dry run. */
   orphans: string[];
   deleted: string[];
-  /** Their thread's org is not known here, so their runtime row cannot be checked: left alone. */
+  /** Their thread's org is not known here, or a check did not answer: left alone. */
   unverifiable: string[];
+  /** Pass as `after` for the next page; null when this was the last. */
+  next: string | null;
 }
+
+/** Deadline for each call the reconciler makes. */
+const RECONCILE_CALL_TIMEOUT_MS = 10_000;
+
+function withDeadline<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("the call timed out")), RECONCILE_CALL_TIMEOUT_MS);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
+const deadlineFetch: typeof fetch = (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(RECONCILE_CALL_TIMEOUT_MS) });
 
 /**
  * The backstop against agents a move made and lost track of (a create the
- * runtime finished after chiridion stopped waiting, a cleanup cut off): every
+ * runtime finished after chiridion stopped waiting, a cleanup cut off): each
  * tenant agent made under a move's key that neither its thread's move nor its
- * thread's runtime row holds is deleted. `dryRun` only lists them.
+ * thread's runtime row holds is deleted. A page at a time: at most `limit`
+ * move agents (about three calls each) after the agent id `after`, in id
+ * order. `dryRun` only lists them.
  */
 export async function reconcileRuntimeMigrationOrphans(
   env: ChatEnv,
-  options: { dryRun?: boolean } = {},
+  options: { dryRun?: boolean; limit?: number; after?: string | null } = {},
 ): Promise<OrphanReconcileReport> {
-  const agents = await runtimeApi(env, "GET", "/v1/agents") as RuntimeAgentSummary[];
-  const report: OrphanReconcileReport = { scanned: 0, kept: 0, orphans: [], deleted: [], unverifiable: [] };
-  for (const agent of agents ?? []) {
-    const threadId = runtimeMigrationKeyThread(agent.key);
-    if (!threadId) continue;
+  const limit = Math.max(1, Math.min(200, Math.floor(options.limit ?? 50)));
+  const agents = (await runtimeApi(env, "GET", "/v1/agents", undefined, {}, deadlineFetch) as RuntimeAgentSummary[] ?? [])
+    .filter((agent) => runtimeMigrationKeyThread(agent.key) && (!options.after || agent.id > options.after))
+    .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+  const page = agents.slice(0, limit);
+  const report: OrphanReconcileReport = {
+    scanned: 0, kept: 0, orphans: [], deleted: [], unverifiable: [],
+    next: agents.length > limit ? page[page.length - 1].id : null,
+  };
+  for (const agent of page) {
+    const threadId = runtimeMigrationKeyThread(agent.key)!;
     report.scanned++;
     const chat = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId)) as unknown as {
       runtimeMigrationHolds(agentId: string, key: string | null): Promise<{ holds: boolean; orgId?: string }>;
     };
-    const { holds, orgId } = await chat.runtimeMigrationHolds(agent.id, agent.key);
-    if (holds) {
-      report.kept++;
-      continue;
-    }
-    if (!orgId) {
+    try {
+      const { holds, orgId } = await withDeadline(chat.runtimeMigrationHolds(agent.id, agent.key));
+      if (holds) {
+        report.kept++;
+        continue;
+      }
+      if (!orgId) {
+        report.unverifiable.push(agent.id);
+        continue;
+      }
+      const row = await withDeadline(orgStub(env, orgId).getThreadRuntime(threadId));
+      if (row?.agentId === agent.id) {
+        report.kept++;
+        continue;
+      }
+    } catch (error) {
+      console.warn("[runtime-migration] could not check an agent a move made", { agentId: agent.id, error });
       report.unverifiable.push(agent.id);
-      continue;
-    }
-    const row = await orgStub(env, orgId).getThreadRuntime(threadId);
-    if (row?.agentId === agent.id) {
-      report.kept++;
       continue;
     }
     report.orphans.push(agent.id);
     if (options.dryRun) continue;
-    await runtimeApi(env, "DELETE", `/v1/agents/${encodeURIComponent(agent.id)}`).then(
+    await runtimeApi(env, "DELETE", `/v1/agents/${encodeURIComponent(agent.id)}`, undefined, {}, deadlineFetch).then(
       () => report.deleted.push(agent.id),
       (error: unknown) => console.warn("[runtime-migration] could not delete an orphaned agent", { agentId: agent.id, error }),
     );

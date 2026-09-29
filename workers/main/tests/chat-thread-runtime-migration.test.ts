@@ -42,6 +42,7 @@ function harness() {
     revision: { generation: 1, count: 1 },
     history: [user("hi")] as unknown[],
     whole: true,
+    openingRenderMessageId: null as string | null,
     renderPages: [] as unknown[][],
     payloads: [['{"role":"user","content":"hi"}'], ['{"role":"assistant"}']] as string[][],
   };
@@ -52,7 +53,7 @@ function harness() {
   };
   const alarms: number[] = [];
   const pending: Promise<unknown>[] = [];
-  const loadHistory = vi.fn(async (_maxChars: number) => ({ messages: state.history as never[], whole: state.whole }));
+  const loadHistory = vi.fn(async (_maxChars: number) => ({ messages: state.history as never[], whole: state.whole, openingRenderMessageId: state.openingRenderMessageId }));
   const onUndone = vi.fn();
   const migration = new ChatThreadRuntimeMigration({
     env: {
@@ -129,7 +130,7 @@ describe("ChatThreadRuntimeMigration", () => {
     expect(body.initialMessages[0].content).toContain("with all of its messages");
     expect(body.initialMessages[1]).toEqual(user("hi"));
     // This attempt's own key: the thread and its lease.
-    expect(header(create, "Idempotency-Key")).toBe(`migrate_t1_${(h.record() as { leaseId: string }).leaseId}`);
+    expect(header(create, "Idempotency-Key")).toBe(`migrate_t1_${(h.record() as { leaseId: string }).leaseId.replace(/-/g, "").slice(0, 16)}`);
     expect(create.init.signal).toBeInstanceOf(AbortSignal);
     expect(h.org.claimThreadRuntimeAgent).toHaveBeenCalledWith("t1", "agt_new");
     expect(h.org.setThreadUiState).toHaveBeenCalledWith("t1", { tabs: [{ kind: "app", scriptName: "shop", isPublic: true }], activeTabId: "app:shop" });
@@ -273,6 +274,18 @@ describe("ChatThreadRuntimeMigration", () => {
       expect(String(imported[3].content)).toContain(ARCHIVE_PATH);
       expect(archived[0]).toContain('"archivedRenderMessage"');
       expect(archived[0]).toContain("build a shop");
+    });
+
+    it("keeps the previous turn's reply when the export opens mid-turn on another render message (H-B2)", async () => {
+      const h = harness();
+      h.state.history = [user("[Context Summary]\n\nEarlier.", 50), { role: "assistant", content: [{ type: "text", text: "tail of turn 2" }], timestamp: 60 }];
+      h.state.openingRenderMessageId = "turn2";
+      h.state.renderPages = [[
+        { id: "q1", role: "user", parts: [{ type: "text", text: "question 1" }], metadata: { pi: { createdAtMs: 10 } } },
+        { id: "turn1", role: "assistant", parts: [{ type: "text", text: "answer 1" }], metadata: { pi: { createdAtMs: 11 } } },
+      ]];
+      await h.migration.migrate({ context, subject: "u1" });
+      expect(JSON.stringify((await createBody()).initialMessages)).toContain("answer 1");
     });
 
     it("counts a thread whose rows open on a summary as not whole, even with no render archive", async () => {
@@ -473,7 +486,7 @@ describe("ChatThreadRuntimeMigration", () => {
       // The same import, under each attempt's own key: no two attempts share an agent.
       expect(await bodyText(creates()[1])).toBe(await bodyText(creates()[0]));
       expect(header(creates()[1], "Idempotency-Key")).not.toBe(header(creates()[0], "Idempotency-Key"));
-      expect(header(creates()[1], "Idempotency-Key")).toMatch(/^migrate_t1_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+      expect(header(creates()[1], "Idempotency-Key")).toMatch(/^migrate_t1_[0-9a-f]{16}$/);
     });
   });
 

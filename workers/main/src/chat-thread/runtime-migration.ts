@@ -40,7 +40,6 @@ import {
   type DoMigrationResult,
 } from "../agent-runtime/thread-migration.js";
 import { renderArchiveToPiMessages } from "./render-archive-export.js";
-import { uiMessageCreatedAtMs } from "../../../../src/lib/ui-message-adapter.js";
 
 export const RUNTIME_MIGRATION_KEY = "runtimeMigration";
 /** How long a move holds the thread without progress before the alarm undoes it. */
@@ -124,7 +123,7 @@ export interface RuntimeMigrationDeps {
   /** The thread relays to a runtime agent (adopted, not imported). */
   hasRelayAgent(): boolean;
   revision(): PiCoreRevision;
-  loadHistory(maxChars: number): Promise<{ messages: AgentMessage[]; whole: boolean }>;
+  loadHistory(maxChars: number): Promise<{ messages: AgentMessage[]; whole: boolean; openingRenderMessageId?: string | null }>;
   /** The render rows older than `beforeMs` (a compaction's only copy of history below its cut), newest page first. */
   renderArchivePages(beforeMs: number): Iterable<UIMessage[]>;
   /** When stored history begins: the oldest stored message that is no compaction summary. */
@@ -361,11 +360,11 @@ export class ChatThreadRuntimeMigration {
   /**
    * The history to import: the pi_core export and, before it, the render rows
    * older than anything it holds (what a rewrite compaction left as the only
-   * copy of history below its cut), rebuilt as pi messages. A render row the
-   * export already holds is left out, as the chat page's pager leaves it out
-   * (its role and time), and so is the part of a turn the cut split that the
-   * export's first rows repeat. `archived`: the import is not the whole
-   * history as stored.
+   * copy of history below its cut), rebuilt as pi messages. Only rows older
+   * than the export's oldest message come (the chat page's archive seam), and
+   * of a turn the cut split (the render message the export's first row
+   * belongs to) only the part the export does not repeat. `archived`: the
+   * import is not the whole history as stored.
    */
   private async history(): Promise<{ messages: AgentMessage[]; archived: boolean }> {
     const history = await this.deps.loadHistory(RUNTIME_MIGRATION_EXPORT_MAX_CHARS);
@@ -375,14 +374,12 @@ export class ChatThreadRuntimeMigration {
     const held = exported.filter((message) => !isSummary(message));
     const seam = held.reduce<number | undefined>((oldest, message) =>
       typeof message.timestamp === "number" && (oldest === undefined || message.timestamp < oldest) ? message.timestamp : oldest, undefined);
-    const heldKeys = new Set(held.filter((message) => message.role === "user" || message.role === "assistant")
-      .map((message) => `${message.role}:${String(message.timestamp)}`));
 
     const pages: UIMessage[][] = [];
     let chars = 0;
     let complete = true;
     for (const page of seam === undefined ? [] : this.deps.renderArchivePages(seam)) {
-      const kept = page.filter((message) => !heldKeys.has(`${message.role}:${String(uiMessageCreatedAtMs(message))}`));
+      const kept = page;
       const size = kept.reduce((sum, message) => sum + JSON.stringify(message).length, 0);
       if (chars + size > RUNTIME_MIGRATION_RENDER_ARCHIVE_MAX_CHARS) {
         complete = false;
@@ -394,9 +391,9 @@ export class ChatThreadRuntimeMigration {
     const archivedRows = pages.reverse().flat();
 
     // A cut inside a turn: the export opens on that turn's later rows, and the
-    // newest archived message is the whole turn. Its rebuilt tail that the
-    // export repeats goes; if the two do not line up, the archived turn goes
-    // (the archive file keeps it).
+    // archived render message of the same id is the whole turn. Its rebuilt
+    // tail that the export repeats goes; if the two do not line up, the
+    // archived turn goes (the archive file keeps it).
     const firstHeld = exported.findIndex((message) => !isSummary(message));
     const opening: string[] = [];
     for (let index = firstHeld; index >= 0 && index < exported.length && exported[index].role !== "user"; index++) {
@@ -404,7 +401,7 @@ export class ChatThreadRuntimeMigration {
     }
     let before: AgentMessage[];
     const fold = archivedRows.at(-1);
-    if (opening.length && fold?.role === "assistant") {
+    if (opening.length && fold?.role === "assistant" && history.openingRenderMessageId && fold.id === history.openingRenderMessageId) {
       const rebuilt = renderArchiveToPiMessages([fold]) as unknown as Array<{ role?: string }>;
       const tail = rebuilt.slice(-opening.length).map((message) => String(message.role));
       const lined = tail.length === opening.length && tail.every((role, index) => role === opening[index]);

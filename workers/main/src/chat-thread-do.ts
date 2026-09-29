@@ -4305,7 +4305,9 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   }
 
   private runtimeMigrationInstance: ChatThreadRuntimeMigration | null = null;
-  private runtimeMigrationAlarmChain: Promise<void> = Promise.resolve();
+  /** The move's alarm: the time last asked for and not yet set, and the setting in progress. */
+  private runtimeMigrationAlarmWanted: number | null = null;
+  private runtimeMigrationAlarmSetting: Promise<void> | null = null;
 
   /** This thread's move to the runtime, which the DO drives (chat-thread/runtime-migration.ts). */
   private get runtimeMigration(): ChatThreadRuntimeMigration {
@@ -4326,14 +4328,23 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
       payloadBatches: () => mapIterable(this.piCoreStore.piCoreRowBatches(), (batch) => batch.map((row) => row.payload)),
       preview: () => ({ tabs: cloneDurableState(this.previewTabs), activeTabId: this.previewActiveTabId }),
       scheduleAlarm: (at) => {
-        // One alarm for the move at a time: every lease renewal replaces the last.
-        this.runtimeMigrationAlarmChain = this.runtimeMigrationAlarmChain.then(async () => {
-          for (const schedule of await this.listSchedules()) {
-            if (schedule.callback === "runtimeMigrationAlarm") await this.cancelSchedule(schedule.id);
+        // One alarm for the move at a time, at the latest time asked for: a
+        // burst of lease renewals is one reschedule, not one per renewal.
+        this.runtimeMigrationAlarmWanted = at;
+        if (this.runtimeMigrationAlarmSetting) return;
+        this.runtimeMigrationAlarmSetting = (async () => {
+          while (this.runtimeMigrationAlarmWanted !== null) {
+            const wanted = this.runtimeMigrationAlarmWanted;
+            this.runtimeMigrationAlarmWanted = null;
+            for (const schedule of await this.listSchedules()) {
+              if (schedule.callback === "runtimeMigrationAlarm") await this.cancelSchedule(schedule.id);
+            }
+            await this.schedule(new Date(wanted), "runtimeMigrationAlarm");
           }
-          await this.schedule(new Date(at), "runtimeMigrationAlarm");
-        }).catch((error: unknown) => console.warn("[ChatThreadDO] could not schedule the runtime move's alarm", error));
-        this.ctx.waitUntil(this.runtimeMigrationAlarmChain);
+        })()
+          .catch((error: unknown) => console.warn("[ChatThreadDO] could not schedule the runtime move's alarm", error))
+          .finally(() => { this.runtimeMigrationAlarmSetting = null; });
+        this.ctx.waitUntil(this.runtimeMigrationAlarmSetting);
       },
       waitUntil: (promise) => this.ctx.waitUntil(promise),
       orgId: () => this.chatContext?.orgId,

@@ -53,3 +53,19 @@ describe("moving a thread compacted by rewrite", () => {
     });
   }, 60_000);
 });
+
+describe("the move's alarm", () => {
+  it("is one schedule, at the latest time asked for, however many renewals ask", async () => {
+    const thread = "runtime-migration-alarm";
+    await runInDurableObject(threadStub(thread), async (instance: any) => {
+      instance.chatContext = { threadId: thread, workspaceId: "ws1", orgId: "org1", userId: "u1", userName: "Ada", userEmail: null };
+      const schedule = instance.runtimeMigration.deps.scheduleAlarm;
+      const base = Date.now() + 60_000;
+      for (let index = 0; index < 5; index++) schedule(base + index * 1_000);
+      while (instance.runtimeMigrationAlarmSetting) await instance.runtimeMigrationAlarmSetting;
+      const alarms = (await instance.listSchedules()).filter((item: { callback: string }) => item.callback === "runtimeMigrationAlarm");
+      expect(alarms).toHaveLength(1);
+      expect(alarms[0].time * 1000).toBeGreaterThanOrEqual(base + 4_000 - 1_000);
+    });
+  }, 60_000);
+});

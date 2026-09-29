@@ -585,14 +585,10 @@ the definition calls the app's tools, and the events webhook has every event.
 
 With `SELFHOST_AGENT_RUNTIME_DIRECT_THREADS=1` (the default) every new thread
 runs on the runtime. Threads created before the upgrade stay on the in-app
-loop and keep working until they are moved to the runtime; the automatic
-thread sweep that moves them is described in
-[Moving existing threads](#moving-existing-threads).
-
-### Moving existing threads
-
-Not yet automatic in this release: existing threads keep running on the
-in-app loop.
+loop and keep working there. They are moved to the runtime by the automatic
+thread sweep (its own section, "Moving existing threads", arrives with the
+sweep), which a later release that removes the in-app loop requires to have
+finished.
 
 ### Rollback
 

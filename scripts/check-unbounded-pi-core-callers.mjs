@@ -60,11 +60,10 @@ export const ALLOWLIST = {
   },
   "workers/main/src/chat-thread-do.ts": {
     loadFullPiCoreTranscriptUnbounded: {
-      count: 5,
+      count: 4,
       why:
-        "1 declaration + 1 delegate body; getAdminExplorerSummary (admin tooling); " +
-        "getPiCoreForkMessages (fork seeding genuinely needs every row); and the parsed " +
-        "transcript load below.",
+        "1 declaration + 1 delegate body; getPiCoreForkMessages (fork seeding genuinely " +
+        "needs every row); and the parsed transcript load below.",
     },
     loadFullPiCoreParsedTranscriptUnbounded: {
       count: 2,

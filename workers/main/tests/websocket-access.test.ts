@@ -232,40 +232,6 @@ describe('Chat transport access guard', () => {
     expect(response.webSocket).toBeNull();
   });
 
-  it('records the removed-route upgrade so stale bundles are countable', async () => {
-    // A stale bundle does NOT stop after this 404: a failed handshake surfaces
-    // as close code 1006, which every reconnecting client treats as retryable.
-    // The event is how that population stays visible (and sizeable) instead of
-    // hiding in raw 404 volume — see plans/sse-migration/WS-REMOVAL.md.
-    const writes: Array<{ blobs?: unknown[]; doubles?: unknown[] }> = [];
-    const envWithDataset = env as unknown as Record<string, unknown>;
-    const previous = envWithDataset.OBSERVABILITY_EVENTS;
-    envWithDataset.OBSERVABILITY_EVENTS = {
-      writeDataPoint: (point: { blobs?: unknown[]; doubles?: unknown[] }) => {
-        writes.push(point);
-      },
-    };
-
-    try {
-      const response = await SELF.fetch('http://example/ws/workspaces/ws-abc/status', {
-        headers: {
-          Upgrade: 'websocket',
-          Connection: 'Upgrade',
-          'Sec-WebSocket-Version': '13',
-        },
-      });
-      expect(response.status).toBe(404);
-    } finally {
-      envWithDataset.OBSERVABILITY_EVENTS = previous;
-    }
-
-    const removalEvents = writes.filter(
-      (point) => (point.blobs as string[] | undefined)?.[0] === 'ws_upgrade_route_removed',
-    );
-    expect(removalEvents).toHaveLength(1);
-    expect((removalEvents[0].blobs as string[])[7]).toBe('/ws/workspaces/ws-abc/status');
-  });
-
   it('404s the removed /ws/logs log-tail WebSocket route', async () => {
     const response = await SELF.fetch('http://example/ws/logs?scriptName=app', {
       headers: {

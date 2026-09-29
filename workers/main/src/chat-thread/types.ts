@@ -227,16 +227,6 @@ export type ChatThreadAgentState = ChatAgentStatePayload<
   LlmModel
 >;
 
-export interface AdminExplorerThreadSummary {
-  userMessageCount: number;
-  userMessageCountCapped: boolean;
-  hasError: boolean;
-  errorCount: number;
-  lastErrorAt: number | null;
-  lastErrorMessage: string | null;
-  models: string[];
-}
-
 export interface ChatThreadPiCoreForkResult {
   success: boolean;
   messages?: AgentMessage[];

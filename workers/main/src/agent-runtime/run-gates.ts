@@ -117,7 +117,7 @@ type OrgStub = {
   getLlmProviderConfig(): Promise<LlmProviderConfigRecord>;
   getInfo(): Promise<OrgInfoLike & Record<string, unknown>>;
   updateThreadModel(id: string, model: LlmModel, actorId?: string, expectedModel?: LlmModel): Promise<{ model: string } | null>;
-  getUsageLogSum(from: number, to: number, creditChargeableOnly: boolean): Promise<{ total_cost_usd?: number }>;
+  getCreditChargeableSpendUsd(): Promise<number>;
   getUserLlmUsageLimits(userId: string): Promise<{ status: { limits?: Array<{ remaining_usd: number }> } }>;
   checkUserLlmUsageAccess: Parameters<typeof assertUserLlmUsageAccess>[0]["checkUserLlmUsageAccess"];
 };
@@ -291,13 +291,13 @@ export async function prepareThreadRuntimeRun(
 
 /**
  * The org's hosted credit left, in USD (checkHostedPiModelAccess's
- * arithmetic); null when unmetered. The usage sum is all-time: it walks every
- * chargeable usage row of the org (by index, but row by row).
+ * arithmetic); null when unmetered. Spend is OrgDO's running all-time
+ * credit-chargeable total, so this is O(1).
  */
 async function hostedCreditRemainingUsd(org: OrgStub): Promise<number | null> {
-  const [info, usage] = await Promise.all([org.getInfo(), org.getUsageLogSum(0, Date.now(), true)]);
+  const [info, spentUsd] = await Promise.all([org.getInfo(), org.getCreditChargeableSpendUsd()]);
   if (!info || info.billing_status === "enterprise") return null;
-  const spentCents = Math.round(Number(usage.total_cost_usd ?? 0) * 100);
+  const spentCents = Math.round(Number(spentUsd ?? 0) * 100);
   const totalCents = Number(info.billing_credit_purchase_total_cents ?? 0) + Number(info.billing_credit_grant_total_cents ?? 0);
   return Math.max(0, totalCents - spentCents) / 100;
 }

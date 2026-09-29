@@ -13,7 +13,7 @@ vi.mock("../src/agent-runtime/runtime-api.js", async (importOriginal) => ({
   runtimeApi: runtimeApiMock,
 }));
 
-import { parsedThreadTranscript, threadExplorerSummary, threadRecentSource } from "../src/agent-runtime/thread-transcript";
+import { parsedThreadTranscript, threadRecentSource } from "../src/agent-runtime/thread-transcript";
 import { piMessagesToParsedMessages } from "../src/pi-message-export";
 import type { ChatEnv } from "../src/chat-thread/types";
 
@@ -25,13 +25,12 @@ const history = [
 
 function fakeEnv(row: { agentId: string | null } | null) {
   const getPiCoreParsedMessages = vi.fn(async () => [{ id: "do-1", role: "user" }]);
-  const getAdminExplorerSummary = vi.fn(async () => ({ userMessageCount: 9 }));
   const getGroupNewChatRecentSource = vi.fn(async () => ({ messages: [{ id: "do-1" }], projectActivity: [{ project: "shop" }] }));
   const env = {
     ORG: { idFromName: (name: string) => name, get: () => ({ getThreadRuntime: async () => row }) },
-    CHAT_THREAD: { idFromName: (name: string) => name, get: () => ({ getPiCoreParsedMessages, getAdminExplorerSummary, getGroupNewChatRecentSource }) },
+    CHAT_THREAD: { idFromName: (name: string) => name, get: () => ({ getPiCoreParsedMessages, getGroupNewChatRecentSource }) },
   } as unknown as ChatEnv;
-  return { env, getPiCoreParsedMessages, getAdminExplorerSummary, getGroupNewChatRecentSource };
+  return { env, getPiCoreParsedMessages, getGroupNewChatRecentSource };
 }
 
 beforeEach(() => {
@@ -65,21 +64,6 @@ describe("parsedThreadTranscript", () => {
     const { env, getPiCoreParsedMessages } = fakeEnv(null);
     expect(await parsedThreadTranscript(env, "org1", "t1")).toEqual([{ id: "do-1", role: "user" }]);
     expect(getPiCoreParsedMessages).toHaveBeenCalledWith("t1");
-  });
-});
-
-describe("threadExplorerSummary", () => {
-  it("counts a runtime thread's messages and models from its history", async () => {
-    runtimeApiMock.mockResolvedValue({ messages: [...history, { role: "user", content: "again", timestamp: 4 }, { role: "assistant", content: [{ type: "text", text: "ok" }], model: "claude-sonnet-5-5", timestamp: 5 }] });
-    const summary = await threadExplorerSummary(fakeEnv({ agentId: "agt_1" }).env, "org1", "t1", { userMessageCap: 20 });
-    expect(summary).toMatchObject({ userMessageCount: 2, userMessageCountCapped: false });
-    expect(summary.models).toContain("claude-sonnet-5-5");
-  });
-
-  it("asks ChatThreadDO for a thread still there", async () => {
-    const { env, getAdminExplorerSummary } = fakeEnv(null);
-    expect(await threadExplorerSummary(env, "org1", "t1", { userMessageCap: 5 })).toEqual({ userMessageCount: 9 });
-    expect(getAdminExplorerSummary).toHaveBeenCalledWith({ userMessageCap: 5 });
   });
 });
 

@@ -10,7 +10,7 @@ import { getEnv } from "@/lib/cloudflare.server";
 import {
   createSessionCookieHeader,
   getRemainingSessionCookieMaxAge,
-  parseCookies,
+  getCookie,
 } from "@/lib/cookies.server";
 import {
   PaywallTakeover,
@@ -83,8 +83,7 @@ export async function loader({ request, context }: Route.LoaderArgs) {
   }
 
   // Get sidebar state from cookies
-  const cookies = parseCookies(request);
-  const sidebarValue = cookies[SIDEBAR_COOKIE_NAME];
+  const sidebarValue = getCookie(request, SIDEBAR_COOKIE_NAME);
   let defaultSidebarOpen = true;
   if (sidebarValue === "false") {
     defaultSidebarOpen = false;
@@ -92,7 +91,7 @@ export async function loader({ request, context }: Route.LoaderArgs) {
   const currentWorkspaceId = authContext.currentWorkspace?.id ?? null;
   const pinnedGroupCountHint = currentWorkspaceId
     ? readPinnedGroupCountHint(
-        cookies[PINNED_GROUPS_COOKIE_NAME],
+        getCookie(request, PINNED_GROUPS_COOKIE_NAME) ?? undefined,
         currentWorkspaceId,
       )
     : 0;

@@ -208,7 +208,6 @@ import {
   piCoreMessageToParsedChatMessage,
   attachPiToolResultToParsedMessages,
   piMessagesToParsedMessages,
-  summarizeAdminExplorerThread,
 } from "./pi-message-export";
 
 // Pure Pi model/provider mapping helpers live in ./pi-model-resolution.
@@ -386,6 +385,7 @@ import {
   type RuntimeRunRecord,
 } from "./chat-thread/runtime-agent";
 import { formatChannelHistoryNote, type RelayRuntimeAgent } from "./agent-runtime/channel-turns";
+import { AUTOMATION_OUTCOME_INSTRUCTION } from "./agent-runtime/scheduled-turns";
 import {
   codexError,
   codexRoute,
@@ -429,7 +429,6 @@ import type {
 // use and re-exported below so existing `from "./chat-thread-do"` import paths
 // keep working for external callers.
 import type {
-  AdminExplorerThreadSummary,
   AgentEvalParsedMessage,
   AgentEvalSessionRequest,
   AgentEvalSessionResult,
@@ -454,7 +453,6 @@ import type {
   PreviewTarget,
 } from "./chat-thread/types";
 export type {
-  AdminExplorerThreadSummary,
   AgentEvalDeployedApp,
   AgentEvalParsedMessage,
   AgentEvalSessionRequest,
@@ -4300,19 +4298,6 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
     };
   }
 
-  async getAdminExplorerSummary(input: {
-    userMessageCap?: number;
-  } = {}): Promise<AdminExplorerThreadSummary> {
-    const messages = await this.loadFullPiCoreTranscriptUnbounded({
-      includeUiMetadata: true,
-      imagePolicy: "render",
-    });
-    return summarizeAdminExplorerThread(messages, {
-      userMessageCap: input.userMessageCap,
-      sessionModelId: this.piSession?.state.model?.id,
-    });
-  }
-
   /**
    * The runtime agent this thread relays to, for the direct path to adopt
    * (agent-runtime/channel-turns.ts). Null when the thread has none, or while
@@ -8091,14 +8076,7 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
 
   /** Per-run instructions for a scheduled automation that must report its outcome. */
   private automationOutcomeInstruction(): string | null {
-    return this.activeAutomationRun?.requiresExplicitOutcome
-      ? [
-          "## Scheduled Automation Outcome",
-          "Before your final response, you MUST call `report_automation_outcome` exactly once.",
-          "Use `success` only when the requested business objective was actually completed and verified. A clean turn, partial data extraction, or a decision not to deploy is not success.",
-          "Use `failed` when the objective was not completed, `partial` when only part completed, and `needs_attention` when operator action is required. Give a concise factual summary.",
-        ].join("\n")
-      : null;
+    return this.activeAutomationRun?.requiresExplicitOutcome ? AUTOMATION_OUTCOME_INSTRUCTION : null;
   }
 
   private createPiSystemPrompt(

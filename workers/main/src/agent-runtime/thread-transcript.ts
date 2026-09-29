@@ -6,9 +6,9 @@
  * chat page, which pages.
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AdminExplorerThreadSummary, AgentEvalParsedMessage, ChatEnv } from "../chat-thread/types.js";
+import type { AgentEvalParsedMessage, ChatEnv } from "../chat-thread/types.js";
 import type { ThreadRuntimeRecord } from "../identity/org-do.js";
-import { piMessagesToParsedMessages, summarizeAdminExplorerThread } from "../pi-message-export.js";
+import { piMessagesToParsedMessages } from "../pi-message-export.js";
 import { runtimeApi } from "./runtime-api.js";
 
 export interface ThreadRecentSource {
@@ -35,7 +35,6 @@ async function threadRuntimeRow(env: ChatEnv, orgId: string, threadId: string): 
 function chatThread(env: ChatEnv, threadId: string) {
   return env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId)) as unknown as {
     getPiCoreParsedMessages(threadId: string): Promise<AgentEvalParsedMessage[]>;
-    getAdminExplorerSummary(input: { userMessageCap?: number }): Promise<AdminExplorerThreadSummary>;
     getGroupNewChatRecentSource(threadId: string): Promise<ThreadRecentSource>;
   };
 }
@@ -44,21 +43,6 @@ export async function parsedThreadTranscript(env: ChatEnv, orgId: string, thread
   const row = await threadRuntimeRow(env, orgId, threadId);
   if (row) return row.agentId ? piMessagesToParsedMessages(await runtimeTranscript(env, row.agentId), threadId) : [];
   return await chatThread(env, threadId).getPiCoreParsedMessages(threadId);
-}
-
-/** The admin chat explorer's counts for a thread (user messages, models, errors). */
-export async function threadExplorerSummary(
-  env: ChatEnv,
-  orgId: string,
-  threadId: string,
-  options: { userMessageCap?: number },
-): Promise<AdminExplorerThreadSummary> {
-  const row = await threadRuntimeRow(env, orgId, threadId);
-  if (row) {
-    const messages = row.agentId ? await runtimeTranscript(env, row.agentId) : [];
-    return summarizeAdminExplorerThread(messages, { userMessageCap: options.userMessageCap });
-  }
-  return await chatThread(env, threadId).getAdminExplorerSummary({ userMessageCap: options.userMessageCap });
 }
 
 /**

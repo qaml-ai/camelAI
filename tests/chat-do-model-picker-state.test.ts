@@ -10,6 +10,11 @@ vi.mock('@/lib/thread-title-generation.server', () => ({
   generateThreadTitleWithOpenAI: vi.fn(),
 }));
 
+const generateRuntimeGroupAvatarMock = vi.fn();
+vi.mock('../workers/main/src/agent-runtime/thread-metadata', () => ({
+  generateRuntimeThreadGroupAvatar: generateRuntimeGroupAvatarMock,
+}));
+
 const {
   applyHostedCreditPause,
   createThread,
@@ -911,6 +916,7 @@ describe('getWorkspaceModelPickerState rollout compatibility', () => {
     };
     const orgStub = {
       updateThread: vi.fn().mockResolvedValue({ updated_at: 123 }),
+      getThreadRuntime: vi.fn().mockResolvedValue(null),
     };
     const userStub = {
       renameEmptySingleThreadGroupForThread: vi.fn().mockResolvedValue(undefined),
@@ -966,6 +972,38 @@ describe('getWorkspaceModelPickerState rollout compatibility', () => {
       workspaceId: 'ws_123',
       orgId: 'org_123',
       userId: 'user_123',
+    });
+  });
+
+  it('titles a runtime thread without waking ChatThreadDO, and makes its group avatar outside it', async () => {
+    vi.mocked(generateThreadTitleWithOpenAI).mockResolvedValue('Database Migrations');
+    const orgStub = {
+      updateThread: vi.fn().mockResolvedValue({ updated_at: 123 }),
+      getThreadRuntime: vi.fn().mockResolvedValue({ threadId: 'thread_123', agentId: 'agt_1' }),
+    };
+    const userStub = { renameEmptySingleThreadGroupForThread: vi.fn().mockResolvedValue(undefined) };
+    const threadStub = { setTitle: vi.fn(), generateChatGroupAvatarForThread: vi.fn() };
+    const env = {
+      AI: { run: vi.fn() },
+      WORKSPACE: { idFromName: (id: string) => id, get: () => ({ getInfo: vi.fn().mockResolvedValue({ org_id: 'org_123' }) }) },
+      ORG: { idFromName: (id: string) => id, get: () => orgStub },
+      USER: { idFromName: (id: string) => id, get: () => userStub },
+      CHAT_THREAD: { idFromName: (id: string) => id, get: () => threadStub },
+    };
+    getEnvMock.mockReturnValue(env);
+
+    await generateThreadTitle({}, 'thread_123', 'ws_123', 'help me plan database migrations', 'user_123');
+
+    expect(orgStub.updateThread).toHaveBeenCalledWith('thread_123', 'Database Migrations');
+    expect(threadStub.setTitle).not.toHaveBeenCalled();
+    expect(threadStub.generateChatGroupAvatarForThread).not.toHaveBeenCalled();
+    expect(generateRuntimeGroupAvatarMock).toHaveBeenCalledWith(env, {
+      threadId: 'thread_123',
+      workspaceId: 'ws_123',
+      orgId: 'org_123',
+      userId: 'user_123',
+      userName: null,
+      userEmail: null,
     });
   });
 

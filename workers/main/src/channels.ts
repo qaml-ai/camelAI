@@ -20,6 +20,7 @@ import { isSelfhostRuntime } from "../../../src/lib/selfhost-runtime.js";
 import type { LlmModel } from "../../../src/types.js";
 import type { Env } from "./types.js";
 import type { ChatEnv } from "./chat-thread/types.js";
+import { RUNTIME_TOOL_PREFIX } from "../../../src/lib/agent-runtime-shared.js";
 import { startChannelRuntimeTurn } from "./agent-runtime/channel-turns.js";
 import { pinNewThreadToRuntime } from "./agent-runtime/thread-runtime.js";
 import {
@@ -214,9 +215,12 @@ export function getChannelReplyToolName(kind: ChannelKind): string | null {
 export function buildChannelReplySystemMessage(
   kind: ChannelKind,
   request: Pick<InitialUserMessageRequest, "userEmail">,
+  options: { runtime?: boolean } = {},
 ): string {
   const safeKind = safeChannelKeyPart(kind) || "unknown";
-  const toolName = getChannelReplyToolName(kind);
+  const localToolName = getChannelReplyToolName(kind);
+  // The agent runtime names chiridion's tools camel__<tool>, in js_exec too.
+  const toolName = localToolName && options.runtime ? `${RUNTIME_TOOL_PREFIX}${localToolName}` : localToolName;
   const emailHint =
     safeKind === "email" && request.userEmail?.trim()
       ? ` The sender email is ${request.userEmail.trim()}; use it as the to value if replying to the sender.`
@@ -395,6 +399,7 @@ export async function enqueueChannelMessage(
     if (owner) messageRequest.userId = owner;
   }
   const systemMessage = buildChannelReplySystemMessage(channelKind, request);
+  const runtimeSystemMessage = buildChannelReplySystemMessage(channelKind, request, { runtime: true });
 
   try {
     if (messageRequest.workspaceId && messageRequest.orgId) {
@@ -406,7 +411,7 @@ export async function enqueueChannelMessage(
         userId: messageRequest.userId ?? null,
         userName: messageRequest.userName,
         userEmail: messageRequest.userEmail,
-        systemMessage,
+        systemMessage: runtimeSystemMessage,
         message: request.message ?? "",
         clientMessageId: messageRequest.clientMessageId,
       });

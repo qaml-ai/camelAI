@@ -285,6 +285,28 @@ export async function pauseCloudSweep(env: SweepEnv, now = Date.now()): Promise<
   return paused;
 }
 
+/** A step's sweep was restarted or paused while it ran: it stops, and saves nothing more. */
+class StepSuperseded extends Error {
+  constructor(readonly state: CloudSweepState) {
+    super("the sweep was restarted or paused during this step");
+  }
+}
+
+/**
+ * Save a step's progress only onto the sweep it began with: a sweep
+ * restarted meanwhile (another startedAt) is left as it is, and a pause
+ * made meanwhile stands (the progress is kept, paused). Throws
+ * StepSuperseded in either case, so the step stops.
+ */
+async function saveStepState(env: SweepEnv, next: CloudSweepState): Promise<CloudSweepState> {
+  const stored = await getCloudSweepState(env);
+  if (stored.startedAt !== next.startedAt) throw new StepSuperseded(stored);
+  const saved: CloudSweepState = stored.status === "paused" ? { ...next, status: "paused" } : next;
+  await saveState(env, saved);
+  if (saved.status === "paused") throw new StepSuperseded(saved);
+  return saved;
+}
+
 /** The next page of the scan: threads updated since the cutoff, after the cursor, newest first. */
 async function scanPage(env: SweepEnv, state: CloudSweepState): Promise<SweepThread[]> {
   const since = state.activeSince ?? 0;
@@ -353,11 +375,12 @@ export async function runCloudSweepStep(env: SweepEnv, options: CloudSweepOption
     return { ...state, stepInProgress: true };
   }
   const before = { ...state.counts };
+  let superseded = false;
   try {
     const pause = async (reason: string, until: number, trip: boolean): Promise<CloudSweepState> => {
       state = { ...state, pausedUntil: until, error: reason, updatedAt: now(), breakerTrips: trip ? state.breakerTrips + 1 : state.breakerTrips };
       console.warn("[runtime-migration-sweep] paused", { reason, until });
-      await saveState(env, state);
+      state = await saveStepState(env, state);
       return state;
     };
     if (!state.dryRun && !await probe(env)) {
@@ -370,11 +393,10 @@ export async function runCloudSweepStep(env: SweepEnv, options: CloudSweepOption
       const page: Array<SweepThread & { record?: CloudSweepThreadRecord }> = scanning ? await scanPage(env, state) : await duePage(env, now());
       if (page.length === 0) {
         if (scanning) {
-          state = { ...state, phase: "retry", cursor: null, updatedAt: now() };
-          await saveState(env, state);
+          state = await saveStepState(env, { ...state, phase: "retry", cursor: null, updatedAt: now() });
           continue;
         }
-        state = await finish(env, state, now());
+        state = await finish(env, state, now(), saveStepState);
         break;
       }
       const known = new Map<string, CloudSweepThreadRecord>();
@@ -507,7 +529,7 @@ export async function runCloudSweepStep(env: SweepEnv, options: CloudSweepOption
       }));
       if (state.status === "blocked") {
         state.updatedAt = now();
-        await saveState(env, state);
+        state = await saveStepState(env, state);
         return state;
       }
       if (scanning) {
@@ -521,12 +543,18 @@ export async function runCloudSweepStep(env: SweepEnv, options: CloudSweepOption
       if (failures >= BREAKER_FAILURES) return await pause(`${failures} moves failed in one step`, now() + breakerPauseMs(state.breakerTrips + 1), true);
       state.pausedUntil = null;
       state.error = null;
-      await saveState(env, state);
+      state = await saveStepState(env, state);
       if (tried.size < page.length) break;
     }
     return state;
+  } catch (error) {
+    if (!(error instanceof StepSuperseded)) throw error;
+    console.warn("[runtime-migration-sweep] step stopped:", error.message);
+    superseded = true;
+    state = error.state;
+    return state;
   } finally {
-    recordObservabilityEvent(env, {
+    if (!superseded) recordObservabilityEvent(env, {
       event: "runtime_migration_sweep_step",
       component: "runtime_thread",
       operation: "sweep",
@@ -548,16 +576,21 @@ export async function runCloudSweepStep(env: SweepEnv, options: CloudSweepOption
 }
 
 /** The scan is done and nothing is due: waiting for the next retry, or complete. */
-async function finish(env: SweepEnv, state: CloudSweepState, at: number): Promise<CloudSweepState> {
+async function finish(
+  env: SweepEnv,
+  state: CloudSweepState,
+  at: number,
+  save: (env: SweepEnv, next: CloudSweepState) => Promise<CloudSweepState>,
+): Promise<CloudSweepState> {
   const pending = await db(env)
     .prepare(`SELECT COUNT(*) AS retrying, MIN(next_attempt_at) AS next_at FROM ${THREADS_TABLE} WHERE outcome = 'retry'`)
     .first<{ retrying: number | null; next_at: number | null }>();
   const done: CloudSweepState = Number(pending?.retrying ?? 0) > 0
     ? { ...state, status: "waiting", nextAttemptAt: Math.max(at, Number(pending?.next_at ?? at)), updatedAt: at }
     : { ...state, status: "complete", completedAt: at, nextAttemptAt: null, updatedAt: at };
-  await saveState(env, done);
+  const saved = await save(env, done);
   console.log("[runtime-migration-sweep] pass finished", { status: done.status, ...state.counts });
-  return done;
+  return saved;
 }
 
 /** The cron's turn: a step of a running (or due) sweep; nothing otherwise. */

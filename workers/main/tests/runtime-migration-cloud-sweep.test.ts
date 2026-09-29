@@ -231,4 +231,52 @@ describe("the cloud sweep", () => {
     expect((await runCloudSweepStep(env, h.step)).status).toBe("complete");
     expect(h.starts).toHaveLength(1);
   });
+
+  it("never saves a step's progress over a sweep restarted while it ran (prod, 2026-09-29)", async () => {
+    await install([["t-1", "org-a", 1], ["t-2", "org-a", 2]]);
+    const env = sweepEnv();
+    const h = harness();
+    await startCloudSweep(env, { now: h.step.now, restart: true, dryRun: true });
+    // While the dry run's step moves its first thread, an operator starts the real sweep.
+    const migrate = h.step.migrate!;
+    let restarted = false;
+    const step = runCloudSweepStep(env, {
+      ...h.step,
+      concurrency: 1,
+      migrate: async (stepEnv, context, options) => {
+        if (!restarted) {
+          restarted = true;
+          h.advance(1_000);
+          await startCloudSweep(env, { now: h.step.now, restart: true, dryRun: false });
+        }
+        return await migrate(stepEnv, context, options);
+      },
+    });
+    expect(await step).toMatchObject({ dryRun: false, status: "running", counts: { checked: 0 } });
+    expect(await getCloudSweepState(env)).toMatchObject({ dryRun: false, status: "running", cursor: null, counts: { checked: 0 } });
+  });
+
+  it("keeps a pause made while a step ran, with the step's progress", async () => {
+    await install([["t-1", "org-a", 1], ["t-2", "org-a", 2]]);
+    const env = sweepEnv();
+    const h = harness();
+    await startCloudSweep(env, { now: h.step.now, restart: true });
+    const migrate = h.step.migrate!;
+    let paused = false;
+    const state = await runCloudSweepStep(env, {
+      ...h.step,
+      migrate: async (stepEnv, context, options) => {
+        if (!paused) {
+          paused = true;
+          await pauseCloudSweep(env, h.now());
+        }
+        return await migrate(stepEnv, context, options);
+      },
+    });
+    expect(state.status).toBe("paused");
+    expect(await getCloudSweepState(env)).toMatchObject({ status: "paused", counts: { migrated: 2 } });
+    // Nothing more moves until the next start.
+    await runCloudSweepStep(env, h.step);
+    expect(h.starts).toHaveLength(2);
+  });
 });

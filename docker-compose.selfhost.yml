@@ -146,11 +146,14 @@ services:
       AGENT_PUBLIC_URL: http://127.0.0.1:${SELFHOST_AGENT_RUNTIME_PORT:-8790}
       # Empty: browser tokens name no URL, and the app proxies browser reads.
       AGENT_BROWSER_URL: ""
-      # The app's MCP tools and events webhook are on loopback over plain
-      # http. Add private model endpoints (a vLLM or gateway on your network)
-      # with SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_CIDRS, e.g. 10.1.2.0/24.
-      AGENT_OUTBOUND_ALLOW_HTTP: "true"
-      AGENT_OUTBOUND_ALLOW_CIDRS: 127.0.0.1/32,::1/128${SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_CIDRS:+,${SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_CIDRS}}
+      # Exact origins the runtime may reach despite its outbound guard, over
+      # plain http too: the app's MCP tools and events webhook on loopback
+      # (spelled exactly as the app provisions them: http://127.0.0.1:<port>),
+      # plus private model endpoints (a vLLM or gateway on your network) from
+      # SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS, e.g. http://10.1.2.3:8000.
+      # Nothing else on loopback is reachable, and agents' web_fetch never
+      # gets these origins. Needs a runtime release with ALLOW_ORIGINS.
+      AGENT_OUTBOUND_ALLOW_ORIGINS: http://127.0.0.1:${SELFHOST_APP_PORT:-3001}${SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS:+,${SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS}}
     volumes:
       - agent-runtime-data:/data
     depends_on:

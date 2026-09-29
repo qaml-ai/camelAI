@@ -248,7 +248,7 @@ function declaredModel(id: string, catalog: Model<any> | null): KeyScopeModel | 
  * self-host runtime can reach the app and its own API there). Only the
  * endpoint at `operatorOrigin`, a self-host operator's own (SELFHOST_AI_*;
  * selfhostOperatorEndpointOrigin), may be plain `http` or on loopback: the
- * operator allows its network with SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_CIDRS.
+ * operator allows its origin with SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS.
  */
 export function customEndpointRunsOnRuntime(
   api: string | undefined,

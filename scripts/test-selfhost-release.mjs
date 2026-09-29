@@ -120,13 +120,17 @@ includesAll(
     "AGENT_OPERATOR_TOKEN: ${AGENT_RUNTIME_API_TOKEN:?",
     "AGENT_SESSION_SECRET: ${AGENT_RUNTIME_SESSION_SECRET:?",
     "AGENT_SECRETS_KEY: ${AGENT_RUNTIME_SECRETS_KEY:?",
-    "AGENT_OUTBOUND_ALLOW_CIDRS: 127.0.0.1/32",
+    "AGENT_OUTBOUND_ALLOW_ORIGINS: http://127.0.0.1:${SELFHOST_APP_PORT:-3001}",
     "agent-runtime-data:/data",
     "stop_grace_period",
   ],
   "self-host agent runtime service",
 );
 assert(!/^\s+ports:/m.test(runtimeService), "the agent runtime must publish no port");
+assert(
+  !/AGENT_OUTBOUND_ALLOW_(HTTP|CIDRS)/.test(runtimeService),
+  "the agent runtime must reach loopback only at the app's exact origin (AGENT_OUTBOUND_ALLOW_ORIGINS), never by address range",
+);
 includesAll(
   runtimePostgresService,
   ["${SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE:?", '"127.0.0.1:${SELFHOST_AGENT_RUNTIME_POSTGRES_PORT:-15432}:5432"', "pg_isready"],
@@ -285,8 +289,18 @@ includesAll(
     "/run/camelai-secrets/tls.crt",
     "SELFHOST_TLS_EXTERNAL_BIND_ADDRESS",
     "http://127.0.0.1:5444",
+    "unix//config/caddy-admin.sock|0600",
   ],
   "Caddy configuration generator",
+);
+assert(
+  !/admin\s+127\.0\.0\.1|:2019/.test(caddyConfig) && !caddyOverride.includes(":2019"),
+  "Caddy's admin API must not listen on TCP (loopback included): a unix socket only",
+);
+assert(caddyOverride.includes("--unix-socket"), "the Caddy healthcheck must read the admin API over its unix socket");
+assert(
+  (await read("scripts/selfhost-workerd-config.mjs")).includes("await fs.chmod(outPath, 0o600)"),
+  "the generated workerd config holds secret bindings and must be owner-only (0600)",
 );
 includesAll(
   tlsModeScript,

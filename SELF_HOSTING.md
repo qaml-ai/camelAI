@@ -537,10 +537,12 @@ thread's own loop inside the app.
   `selfhost:backup`/`selfhost:restore`; a backup taken before the first start
   of this release skips them. Budget about 1 vCPU and 2 GB of memory more.
 - **Private by design.** Like the app, the runtime shares the VM's network
-  namespace and listens on loopback only (`127.0.0.1:8790`, and Postgres on
-  `127.0.0.1:15432`); nothing is published. The app reaches it on loopback,
-  and it calls the app's `/mcp/agent` tools and `/agent-runtime/events`
-  webhook on the app's loopback socket. Browsers never reach the runtime: the
+  namespace and listens on loopback only (`127.0.0.1:8790`). Its Postgres runs
+  in its own container, published to the VM's loopback only
+  (`127.0.0.1:15432`, where the runtime reaches it, password-protected);
+  neither is reachable from other hosts. The app reaches the runtime on
+  loopback, and the runtime calls the app's `/mcp/agent` tools and
+  `/agent-runtime/events` webhook at `http://127.0.0.1:<SELFHOST_APP_PORT>`. Browsers never reach the runtime: the
   runtime mints browser tokens with no URL (`AGENT_BROWSER_URL` is empty), so
   the app hands the browser its own read route
   (`/api/threads/:id/runtime/...`) and passes each read through, with the
@@ -556,7 +558,11 @@ thread's own loop inside the app.
   either breaks existing agents or stored keys), `AGENT_RUNTIME_POSTGRES_PASSWORD`,
   and the two image references. Optional: `SELFHOST_AGENT_RUNTIME_PORT`,
   `SELFHOST_AGENT_RUNTIME_POSTGRES_PORT`, `SELFHOST_AGENT_RUNTIME_DIRECT_THREADS`
-  and `SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_CIDRS`.
+  and `SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS`. The session secret,
+  secrets key and database password guard the runtime's volumes, so
+  `selfhost:migrate-secrets` and `selfhost:init` (with `--force` too) refuse to
+  generate them while `agent-runtime-postgres` or `agent-runtime-data` exist:
+  restore them from a backup of `.env.selfhost` instead.
 - **Provisioned at every start.** Before workerd starts, the app waits for the
   runtime, upserts the `camelai-thread` definition (stable id; a changed spec
   is a new revision) and registers its events webhook once, keeping the
@@ -564,22 +570,34 @@ thread's own loop inside the app.
   be reached, the last provisioned state is used; on a first start without
   one, new threads run on the in-app loop and the log says so.
 - **Models.** Threads run on the provider in `SELFHOST_AI_*`, which the app
-  syncs into each organization's key scope on the runtime. A `custom`
-  endpoint on your network (vLLM, a gateway) may be plain `http`, but the
-  runtime refuses private addresses unless allowed: add its range, e.g.
-  `SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_CIDRS=10.1.2.0/24`. Keep the range
-  narrow; agents' `web_fetch` can reach whatever it allows. A model with no
-  runtime route (for example Anthropic Messages behind `Authorization:
-  Bearer`) keeps its threads on the in-app loop.
-- **Loopback is reachable by agents.** The runtime may call `127.0.0.1` over
-  `http` (it has to, for the app's tools), so an agent's `web_fetch` can reach
-  loopback services too. They all require credentials, except the app itself
-  under `SELFHOST_AUTH_MODE=local` with `LOCAL_AUTH_BYPASS`, which the doctor
-  warns about: keep that mode to smoke tests.
+  syncs into each organization's key scope on the runtime. That operator
+  endpoint (`custom` on your network: vLLM, a gateway) may be plain `http`,
+  but the runtime reaches private addresses only at origins you allow,
+  exactly (`scheme://host:port`):
+  `SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS=http://10.1.2.3:8000`
+  (`selfhost:doctor` warns when `SELFHOST_AI_BASE_URL` needs one). Endpoints
+  organizations set themselves must be `https` and never on loopback. A model
+  with no runtime route (for example Anthropic Messages behind
+  `Authorization: Bearer`) keeps its threads on the in-app loop.
+- **What agents can reach on the VM.** The runtime's outbound guard blocks
+  loopback and private addresses except the exact origins it is given
+  (`AGENT_OUTBOUND_ALLOW_ORIGINS`): the app's own `http://127.0.0.1:<port>`
+  (for its tools and events) and the ones above. Those are for the runtime's
+  own calls (MCP tools, model providers, webhooks); agents' `web_fetch` never
+  gets them, so an agent cannot fetch the app, the runtime's API, Postgres or
+  Caddy on loopback. Caddy's admin API listens on a private unix socket, not
+  on TCP. This needs a runtime release with `AGENT_OUTBOUND_ALLOW_ORIGINS`.
+  Under `SELFHOST_AUTH_MODE=local` with `LOCAL_AUTH_BYPASS` the app itself
+  needs no credentials, which the doctor warns about: keep that mode to smoke
+  tests.
 
 `bun run selfhost:doctor` checks the runtime: its secrets and image pins, and
 while the stack runs, that it is healthy, the operator token is the tenant's,
-the definition calls the app's tools, and the events webhook has every event.
+the definition calls the app's tools, the events webhook has every event (and
+is this app's only one), and the app accepts an event signed with the
+provisioned webhook secret. At start, the app refuses to fall back to its last
+provisioned state when the runtime rejects the operator token or it belongs
+to another tenant: fix `AGENT_RUNTIME_API_TOKEN` instead.
 
 ### New and existing threads
 

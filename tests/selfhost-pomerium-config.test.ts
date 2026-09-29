@@ -95,4 +95,13 @@ describe("self-host Pomerium configuration", () => {
         "frame-ancestors 'self' https://camel.example.com:8443",
     });
   });
+
+  it("keeps long-lived event streams open: no request timeout, a generous idle timeout", () => {
+    const config = buildPomeriumConfig(bundledPomeriumEnv());
+    const appRoute = config!.routes.find((route) => route.from === "https://camel.example.com");
+    // Pomerium's 30 s default request timeout would cut the chat's event
+    // streams (the runtime read proxy's text/event-stream) every 30 s.
+    expect(appRoute).toMatchObject({ timeout: "0s", idle_timeout: "10m" });
+    for (const route of config!.routes) expect(route).toMatchObject({ timeout: "0s", idle_timeout: "10m" });
+  });
 });

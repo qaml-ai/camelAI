@@ -1157,7 +1157,10 @@ const camelai :Workerd.Config = (
 );
 `;
 
-  await fs.writeFile(outPath, config);
+  // The config carries every secret binding (the runtime's operator token and
+  // webhook secret among them): owner-only, also when the file already existed.
+  await fs.writeFile(outPath, config, { mode: 0o600 });
+  await fs.chmod(outPath, 0o600);
   const manifest = {
     generatedAt: new Date().toISOString(),
     source: path.relative(repoRoot, wranglerPath),

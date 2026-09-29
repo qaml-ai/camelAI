@@ -58,4 +58,13 @@ describe("migrateThreadOnOpen", () => {
     expect(await migrateThreadOnOpen({} as never, context, vi.fn())).toBeNull();
     expect(migrate).not.toHaveBeenCalled();
   });
+
+  it("moves only a listed org's threads when the flag names a cohort", async () => {
+    migrate.mockResolvedValue({ status: "migrated", row: ROW, archived: false });
+    env = { ...CONFIGURED, AGENT_RUNTIME_MIGRATE_DO_THREADS: "org_other" };
+    expect(await migrateThreadOnOpen({} as never, context, vi.fn())).toBeNull();
+    expect(migrate).not.toHaveBeenCalled();
+    env = { ...CONFIGURED, AGENT_RUNTIME_MIGRATE_DO_THREADS: `org_other,${context.orgId}` };
+    expect(await migrateThreadOnOpen({} as never, context, vi.fn())).toEqual(ROW);
+  });
 });

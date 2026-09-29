@@ -5,6 +5,7 @@ import {
   requireSameOriginJson,
   initialRuntimeRequestId,
   runtimeDirectThreadsEnabled,
+  runtimeThreadMigrationEnabled,
   startErrorStillCurrent,
 } from "@/lib/agent-runtime-shared";
 
@@ -35,6 +36,27 @@ describe("runtimeDirectThreadsEnabled", () => {
     expect(runtimeDirectThreadsEnabled({ ...tenant, AGENT_RUNTIME_DIRECT_THREADS: "1" })).toBe(true);
     expect(runtimeDirectThreadsEnabled(tenant)).toBe(false);
     expect(runtimeDirectThreadsEnabled({ AGENT_RUNTIME_DIRECT_THREADS: "1" })).toBe(false);
+  });
+});
+
+describe("runtimeThreadMigrationEnabled", () => {
+  const direct = { AGENT_RUNTIME_API_TOKEN: "t", AGENT_RUNTIME_TENANT: "x", AGENT_RUNTIME_DEFINITION: "d", AGENT_RUNTIME_DIRECT_THREADS: "1" };
+  it("moves every org's threads on \"1\", only the listed orgs' on a list, and none when unset", () => {
+    expect(runtimeThreadMigrationEnabled({ ...direct, AGENT_RUNTIME_MIGRATE_DO_THREADS: "1" }, "org_a")).toBe(true);
+    const cohort = { ...direct, AGENT_RUNTIME_MIGRATE_DO_THREADS: " org_a, org_b ,," };
+    expect(runtimeThreadMigrationEnabled(cohort, "org_a")).toBe(true);
+    expect(runtimeThreadMigrationEnabled(cohort, "org_b")).toBe(true);
+    expect(runtimeThreadMigrationEnabled(cohort, "org_c")).toBe(false);
+    // No org matches an empty entry, and a prefix is not the org.
+    expect(runtimeThreadMigrationEnabled(cohort, "")).toBe(false);
+    expect(runtimeThreadMigrationEnabled(cohort, "org")).toBe(false);
+    expect(runtimeThreadMigrationEnabled(direct, "org_a")).toBe(false);
+    expect(runtimeThreadMigrationEnabled({ ...direct, AGENT_RUNTIME_MIGRATE_DO_THREADS: "" }, "org_a")).toBe(false);
+    expect(runtimeThreadMigrationEnabled({ ...direct, AGENT_RUNTIME_MIGRATE_DO_THREADS: "0" }, "org_a")).toBe(false);
+  });
+
+  it("is off where direct threads are", () => {
+    expect(runtimeThreadMigrationEnabled({ ...direct, AGENT_RUNTIME_DIRECT_THREADS: "", AGENT_RUNTIME_MIGRATE_DO_THREADS: "1" }, "org_a")).toBe(false);
   });
 });
 

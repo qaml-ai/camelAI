@@ -170,7 +170,7 @@ const MIGRATE_ON_OPEN_WAIT_MS = 8_000;
 
 /**
  * A thread still on ChatThreadDO, moved to the runtime as it is opened
- * (AGENT_RUNTIME_MIGRATE_DO_THREADS). Null when it stays on the DO for now:
+ * (AGENT_RUNTIME_MIGRATE_DO_THREADS, for all orgs or this one). Null when it stays on the DO for now:
  * the move was refused, failed, or is still going after a few seconds (it
  * finishes in the background, and the next open finds the thread moved).
  */
@@ -180,7 +180,7 @@ export async function migrateThreadOnOpen(
   waitUntil: (promise: Promise<unknown>) => void,
 ): Promise<ThreadRuntimeRecord | null> {
   const env = getEnv(loadContext) as unknown as ChatEnv;
-  if (!runtimeThreadMigrationEnabled(env)) return null;
+  if (!runtimeThreadMigrationEnabled(env, context.orgId)) return null;
   const move = migrateThreadToRuntime(env, context).then((result) => {
     recordRuntimeMigration(env, context, result);
     return "row" in result ? result.row : null;

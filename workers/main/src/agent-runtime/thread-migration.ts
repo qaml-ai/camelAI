@@ -567,12 +567,12 @@ const MOVING_POLL_MS = 500;
 
 /**
  * The runtime row for a message on a thread that may still be on
- * ChatThreadDO: moved first where AGENT_RUNTIME_MIGRATE_DO_THREADS is on.
+ * ChatThreadDO: moved first where AGENT_RUNTIME_MIGRATE_DO_THREADS is on for its org.
  * Null when it stays on the DO for now (busy there, no runtime route, or the
  * move failed), and the DO runs the message.
  */
 export async function migrateThreadOnSend(env: ChatEnv, context: ChatContextState): Promise<ThreadRuntimeRecord | null> {
-  if (!runtimeThreadMigrationEnabled(env)) return null;
+  if (!runtimeThreadMigrationEnabled(env, context.orgId)) return null;
   const result = await migrateThreadToRuntime(env, context).catch((error: unknown): RuntimeMigrationResult => ({
     status: "failed",
     error: error instanceof Error ? error.message : String(error),

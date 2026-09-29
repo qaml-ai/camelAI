@@ -485,5 +485,11 @@ describe("migrateThreadOnSend", () => {
     const off = fakeEnv({ status: "skipped", reason: "moved" }, [null], { ...FLAGS, AGENT_RUNTIME_MIGRATE_DO_THREADS: "" });
     expect(await migrateThreadOnSend(off.env, context)).toBeNull();
     expect(off.getThreadRuntime).not.toHaveBeenCalled();
+    // A cohort that does not name the thread's org.
+    const elsewhere = fakeEnv({ status: "skipped", reason: "moved" }, [null], { ...FLAGS, AGENT_RUNTIME_MIGRATE_DO_THREADS: "org_other" });
+    expect(await migrateThreadOnSend(elsewhere.env, context)).toBeNull();
+    expect(elsewhere.getThreadRuntime).not.toHaveBeenCalled();
+    const listed = fakeEnv({ status: "migrated", row: ROW, archived: false, stats: {} } as never, [null], { ...FLAGS, AGENT_RUNTIME_MIGRATE_DO_THREADS: "org_other,org1" });
+    expect(await migrateThreadOnSend(listed.env, context)).toEqual(ROW);
   });
 });

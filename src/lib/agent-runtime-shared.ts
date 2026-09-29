@@ -32,14 +32,20 @@ export function runtimeDirectThreadsEnabled(env: {
 }
 
 /**
- * Whether threads still on ChatThreadDO move to the runtime when they are next
- * used (agent-runtime/thread-migration.ts): direct threads are on and
- * AGENT_RUNTIME_MIGRATE_DO_THREADS is "1".
+ * Whether `orgId`'s threads still on ChatThreadDO move to the runtime when
+ * they are next used (agent-runtime/thread-migration.ts): direct threads are
+ * on and AGENT_RUNTIME_MIGRATE_DO_THREADS is "1" (every org) or a comma list
+ * of org ids that names this one (a cohort). Unset or empty: off.
  */
-export function runtimeThreadMigrationEnabled(env: Parameters<typeof runtimeDirectThreadsEnabled>[0] & {
-  AGENT_RUNTIME_MIGRATE_DO_THREADS?: string;
-}): boolean {
-  return runtimeDirectThreadsEnabled(env) && env.AGENT_RUNTIME_MIGRATE_DO_THREADS?.trim() === "1";
+export function runtimeThreadMigrationEnabled(
+  env: Parameters<typeof runtimeDirectThreadsEnabled>[0] & { AGENT_RUNTIME_MIGRATE_DO_THREADS?: string },
+  orgId: string,
+): boolean {
+  if (!runtimeDirectThreadsEnabled(env)) return false;
+  const value = env.AGENT_RUNTIME_MIGRATE_DO_THREADS?.trim() ?? "";
+  if (value === "1") return true;
+  const id = orgId.trim();
+  return Boolean(id) && value.split(",").some((entry) => entry.trim() === id);
 }
 
 /** The agent reads a browser token allows, which chiridion's read proxy passes through. */

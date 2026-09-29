@@ -8004,12 +8004,11 @@ export class ChatThreadDO extends AIChatAgent<ChatAgentEnv, ChatThreadAgentState
   private async hostedCreditRemainingUsd(orgId: string): Promise<number | null> {
     const org = this.env.ORG.get(this.env.ORG.idFromName(orgId)) as unknown as {
       getInfo(): Promise<Record<string, unknown> | null>;
-      getUsageLogSum(from: number, to: number, creditChargeableOnly: boolean): Promise<{ total_cost_usd?: number }>;
+      getCreditChargeableSpendUsd(): Promise<number>;
     };
     const info = await org.getInfo();
     if (!info || info.billing_status === "enterprise") return null;
-    const usage = await org.getUsageLogSum(0, Date.now(), true);
-    const spentCents = Math.round(Number(usage.total_cost_usd ?? 0) * 100);
+    const spentCents = Math.round(Number(await org.getCreditChargeableSpendUsd()) * 100);
     const totalCents = Number(info.billing_credit_purchase_total_cents ?? 0) + Number(info.billing_credit_grant_total_cents ?? 0);
     return Math.max(0, totalCents - spentCents) / 100;
   }

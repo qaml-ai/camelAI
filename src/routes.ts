@@ -193,6 +193,7 @@ export default [
   ),
   route("api/threads/:id/stop", "routes/api/threads.$id.stop.ts"),
   route("api/threads/:id/preview", "routes/api/threads.$id.preview.ts"),
+  route("api/threads/:id/move", "routes/api/threads.$id.move.ts"),
   route("api/threads/:id/files/save", "routes/api/threads.$id.files.save.ts"),
   route("api/threads/:id/files/*", "routes/api/threads.$id.files.$.ts"),
   route("api/dev/sent-emails", "routes/api/dev.sent-emails.ts"),

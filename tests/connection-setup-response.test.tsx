@@ -1,7 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { useConnectionSetupResponse } from "@/components/chat-preview/use-connection-setup-response";
-import { SSE_READY_STATE_OPEN } from "@/lib/sse-agent-client";
+import { CLIENT_OPEN } from "@/lib/use-runtime-thread";
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -17,7 +17,7 @@ describe("useConnectionSetupResponse", () => {
   it("clears the submitted connection setup prompt after a successful save", async () => {
     const call = vi.fn().mockResolvedValue(undefined);
     const chatAgentRef = {
-      current: { readyState: SSE_READY_STATE_OPEN, call },
+      current: { readyState: CLIENT_OPEN, call },
     };
     const { result } = renderHook(() =>
       useConnectionSetupResponse({ chatAgentRef }),
@@ -53,7 +53,7 @@ describe("useConnectionSetupResponse", () => {
     const pendingSave = deferred();
     const call = vi.fn().mockReturnValue(pendingSave.promise);
     const chatAgentRef = {
-      current: { readyState: SSE_READY_STATE_OPEN, call },
+      current: { readyState: CLIENT_OPEN, call },
     };
     const { result } = renderHook(() =>
       useConnectionSetupResponse({ chatAgentRef }),

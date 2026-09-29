@@ -1,6 +1,4 @@
 import type { AppLoadContext } from "react-router";
-import type { UIMessage } from "ai";
-import type { ChatRenderHistoryPage } from "./chat-render-history";
 import { getEnv, type CloudflareEnv } from "./cloudflare.server";
 import type {
   Thread,
@@ -91,13 +89,6 @@ interface ParsedThreadMessage {
   isMeta?: boolean;
   sourceToolUseID?: string;
   isCompactSummary?: boolean;
-}
-
-export interface ThreadPreviewState {
-  target: PreviewTarget | null;
-  tabs: PreviewTarget[];
-  activeTabId: string | null;
-  version: number;
 }
 
 export interface RawThreadCreator {
@@ -1061,38 +1052,22 @@ export async function generateThreadTitle(
     if (!title) return;
 
     const orgStub = env.ORG.get(env.ORG.idFromName(wsInfo.org_id));
-    const updated = await orgStub.updateThread(threadId, title);
+    await orgStub.updateThread(threadId, title);
     if (userId) {
       await env.USER.get(env.USER.idFromName(userId))
         .renameEmptySingleThreadGroupForThread(threadId, title);
     }
 
-    // A runtime thread has no ChatThreadDO to tell (its page reads the title
-    // from OrgDO); its group avatar is made outside the DO.
-    if (await orgStub.getThreadRuntime(threadId)) {
-      if (userId) {
-        const { generateRuntimeThreadGroupAvatar } = await import("../../workers/main/src/agent-runtime/thread-metadata");
-        await generateRuntimeThreadGroupAvatar(env, {
-          threadId,
-          workspaceId,
-          orgId: wsInfo.org_id,
-          userId,
-          userName: null,
-          userEmail: null,
-        });
-      }
-      return;
-    }
-    const threadStub = env.CHAT_THREAD.get(
-      env.CHAT_THREAD.idFromName(threadId),
-    );
-    await threadStub.setTitle(title, updated?.updated_at);
+    // The page reads the title from OrgDO; the group avatar is made here.
     if (userId) {
-      await threadStub.generateChatGroupAvatarForThread({
+      const { generateRuntimeThreadGroupAvatar } = await import("../../workers/main/src/agent-runtime/thread-metadata");
+      await generateRuntimeThreadGroupAvatar(env, {
         threadId,
         workspaceId,
         orgId: wsInfo.org_id,
         userId,
+        userName: null,
+        userEmail: null,
       });
     }
   } catch (e) {
@@ -1134,112 +1109,25 @@ export async function getGroupNewChatRecentSource(
   };
 }
 
-export async function getUiMessages(
-  context: AppLoadContext,
-  threadId: string,
-): Promise<UIMessage[]> {
-  return (await getUiMessagePage(context, threadId)).messages;
-}
-
-export async function getUiMessagePage(
-  context: AppLoadContext,
-  threadId: string,
-): Promise<ChatRenderHistoryPage> {
-  const env = getEnv(context);
-  if (
-    !env ||
-    typeof env !== "object" ||
-    !("CHAT_THREAD" in env) ||
-    !env.CHAT_THREAD
-  ) {
-    throw new Error("CHAT_THREAD binding is not available");
-  }
-  const threadStub = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId));
-  const page = await Promise.resolve(
-    (
-      threadStub as unknown as {
-        getUiMessagePage():
-          | Promise<ChatRenderHistoryPage>
-          | ChatRenderHistoryPage;
-      }
-    ).getUiMessagePage(),
-  );
-  return {
-    messages: Array.isArray(page?.messages) ? page.messages : [],
-    nextCursor:
-      typeof page?.nextCursor === "string" && page.nextCursor
-        ? page.nextCursor
-        : null,
-    hasMore: page?.hasMore === true,
-  };
-}
-
-export async function getTodoState(
-  context: AppLoadContext,
-  threadId: string,
-): Promise<unknown[]> {
-  const env = getEnv(context);
-  if (
-    !env ||
-    typeof env !== "object" ||
-    !("CHAT_THREAD" in env) ||
-    !env.CHAT_THREAD
-  ) {
-    return [];
-  }
-  const threadStub = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId));
-  const todos = await Promise.resolve(
-    (
-      threadStub as unknown as {
-        getTodoState(): Promise<unknown[]> | unknown[];
-      }
-    ).getTodoState(),
-  ).catch(() => []);
-  return Array.isArray(todos) ? todos : [];
-}
-
+/** Open `target` in the thread's preview panel (its UI state lives in OrgDO). */
 export async function setThreadPreviewTarget(
   context: AppLoadContext,
+  orgId: string,
   threadId: string,
-  target: PreviewTarget | null,
-): Promise<PreviewTarget | null> {
+  target: PreviewTarget,
+): Promise<void> {
   const env = getEnv(context);
-  const stub = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId));
-  await stub.setPreviewTarget(target);
-  return stub.getPreviewTarget();
+  await env.ORG.get(env.ORG.idFromName(orgId)).upsertThreadPreviewTarget(threadId, target);
 }
 
+/** An app's visibility changed: update it in the thread's preview tabs. */
 export async function setThreadPreviewAppVisibility(
   context: AppLoadContext,
+  orgId: string,
   threadId: string,
   scriptName: string,
   isPublic: boolean,
 ): Promise<void> {
   const env = getEnv(context);
-  const stub = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId));
-  await stub.setPreviewAppVisibility(scriptName, isPublic);
-}
-
-export async function getThreadPreviewTarget(
-  context: AppLoadContext,
-  threadId: string,
-): Promise<PreviewTarget | null> {
-  const state = await getThreadPreviewState(context, threadId);
-  return state.target;
-}
-
-export async function getThreadPreviewState(
-  context: AppLoadContext,
-  threadId: string,
-): Promise<ThreadPreviewState> {
-  const env = getEnv(context);
-  const stub = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId));
-  const state = await stub.getPreviewState() as ThreadPreviewState | null | undefined;
-  return {
-    target: state?.target ?? null,
-    tabs: Array.isArray(state?.tabs) ? state.tabs : [],
-    activeTabId:
-      typeof state?.activeTabId === "string" ? state.activeTabId : null,
-    version: typeof state?.version === "number" ? state.version : 0,
-  };
+  await env.ORG.get(env.ORG.idFromName(orgId)).setThreadPreviewAppVisibility(threadId, scriptName, isPublic);
 }

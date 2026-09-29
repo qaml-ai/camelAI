@@ -22,15 +22,14 @@
  * this call holds, so no await can let a stale write undo another's. No
  * agent the thread's runtime row holds is ever deleted.
  */
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { UIMessage } from "ai";
+import type { AgentMessage } from "../../../../src/lib/agent-messages.js";
 import type { ChatEnv } from "./types.js";
 import type { PreviewTarget } from "../../../../src/types.js";
 import type { ThreadRuntimeRecord } from "../identity/org-do.js";
 import type { PiCoreRevision } from "./pi-core-store.js";
 import { RuntimeApiError, provisionedAgentId, retryAfterMs, runtimeApi, runtimeUrl } from "../agent-runtime/runtime-api.js";
 import { runtimeSystemPromptAppend, type RuntimeAgentModel } from "../agent-runtime/run-gates.js";
-import { RUNTIME_PROMPT_VERSION } from "./runtime-agent.js";
+import { RUNTIME_PROMPT_VERSION } from "../agent-runtime/runtime-prompt.js";
 import {
   ARCHIVE_FILE_NAME,
   ARCHIVE_REQUEST_ID,
@@ -40,7 +39,7 @@ import {
   type DoMigrationRequest,
   type DoMigrationResult,
 } from "../agent-runtime/thread-migration.js";
-import { renderArchiveToPiMessages } from "./render-archive-export.js";
+import { renderArchiveToPiMessages, type RenderMessage } from "./render-archive-export.js";
 
 export const RUNTIME_MIGRATION_KEY = "runtimeMigration";
 /** How long a move holds the thread without progress before the alarm undoes it. */
@@ -111,6 +110,13 @@ export type RuntimeMigrationRecord =
     orphanKeyAt?: number;
   });
 
+/** Where a move stands; `error` is why the last attempt failed (while backing off). */
+export interface RuntimeMigrationStatus {
+  state: "moving" | "committing" | "moved" | "backoff" | null;
+  retryAt?: number;
+  error?: string;
+}
+
 type Leased = Extract<RuntimeMigrationRecord, { phase: "leased" }>;
 type Committing = Extract<RuntimeMigrationRecord, { phase: "committing" }>;
 type Failed = Extract<RuntimeMigrationRecord, { phase: "failed" }>;
@@ -128,7 +134,7 @@ export interface RuntimeMigrationDeps {
   revision(): PiCoreRevision;
   loadHistory(maxChars: number): Promise<{ messages: AgentMessage[]; whole: boolean; openingRenderMessageId?: string | null }>;
   /** The render rows older than `beforeMs` (a compaction's only copy of history below its cut), newest page first. */
-  renderArchivePages(beforeMs: number): Iterable<UIMessage[]>;
+  renderArchivePages(beforeMs: number): Iterable<RenderMessage[]>;
   /** When stored history begins: the oldest stored message that is no compaction summary. */
   firstStoredAtMs(): number | undefined;
   /** Every stored transcript row as stored, a bounded batch at a time. */
@@ -241,13 +247,13 @@ export class ChatThreadRuntimeMigration {
   }
 
   /** Where the move stands, for a caller deciding whether to ask for one (and do the work to). */
-  status(now = Date.now()): { state: "moving" | "committing" | "moved" | "backoff" | null; retryAt?: number } {
+  status(now = Date.now()): RuntimeMigrationStatus {
     // A commit the caller should re-drive (migrate() does), not wait out.
     if (this.read()?.phase === "committing") return { state: "committing" };
     const state = this.state(now);
     if (state) return { state };
     const record = this.read();
-    if (record?.phase === "failed" && record.retryAt > now) return { state: "backoff", retryAt: record.retryAt };
+    if (record?.phase === "failed" && record.retryAt > now) return { state: "backoff", retryAt: record.retryAt, error: record.error };
     return { state: null };
   }
 
@@ -377,6 +383,19 @@ export class ChatThreadRuntimeMigration {
     }
   }
 
+  /**
+   * When the record next needs the alarm (a lease to expire, a commit to
+   * re-drive, a failed attempt's agent to delete), or null. For re-arming an
+   * alarm that was lost.
+   */
+  alarmDue(now = Date.now()): number | null {
+    const record = this.read();
+    if (record?.phase === "leased") return record.expiresAt + 1_000;
+    if (record?.phase === "committing") return now;
+    if (record?.phase === "failed" && (record.orphanAgentId || record.orphanKey)) return now;
+    return null;
+  }
+
   /** The alarm: undo a move whose lease ran out, re-drive a commit, delete a failed attempt's agent. */
   async onAlarm(): Promise<void> {
     const record = this.read();
@@ -409,7 +428,7 @@ export class ChatThreadRuntimeMigration {
     const seam = held.reduce<number | undefined>((oldest, message) =>
       typeof message.timestamp === "number" && (oldest === undefined || message.timestamp < oldest) ? message.timestamp : oldest, undefined);
 
-    const pages: UIMessage[][] = [];
+    const pages: RenderMessage[][] = [];
     let chars = 0;
     let complete = true;
     for (const page of seam === undefined ? [] : this.deps.renderArchivePages(seam)) {

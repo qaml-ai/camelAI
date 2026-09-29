@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { AgentMessage } from '@earendil-works/pi-agent-core';
+import type { AgentMessage } from '../../../src/lib/agent-messages';
 import {
   PI_TOOL_DETAILS_MAX_BYTES,
   preparePiMessageForSqlStorage,

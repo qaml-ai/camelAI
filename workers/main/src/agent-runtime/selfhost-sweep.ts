@@ -261,7 +261,9 @@ export function classifyMigration(result: RuntimeMigrationResult): Classified {
       return { outcome: "retry", reason: "dry run" };
     case "skipped":
       if (result.reason === "moved") return { outcome: "migrated" };
-      if (result.reason === "direct threads are off") return { outcome: "blocked", reason: result.reason };
+      if (result.reason === "the agent runtime is not configured") return { outcome: "blocked", reason: result.reason };
+      // A history the runtime refuses every time (backing off for a day): skipped, with its reason.
+      if (/^backoff: (too_large|invalid_history)\b/.test(result.reason)) return { outcome: "skipped", reason: result.reason };
       // The DO's own backoff after a failed attempt, or a model that did not
       // resolve just now (a provider setting being changed): try again later.
       if (result.reason.startsWith("backoff") || result.reason.startsWith("its model did not resolve")) {

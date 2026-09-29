@@ -12,7 +12,7 @@ import { SCRATCH_MOUNT, runtimeDirectThreadsEnabled as directThreadsEnabled, typ
 import type { ChatContextState, ChatEnv } from "../chat-thread/types";
 import type { ThreadRuntimeRecord } from "../identity/org-do";
 import { ChatThreadMetadata, type ChatThreadMetadataEnv } from "../chat-thread/metadata";
-import { RUNTIME_PROMPT_VERSION, runtimeConfigured } from "../chat-thread/runtime-agent";
+import { RUNTIME_PROMPT_VERSION, runtimeConfigured } from "./runtime-prompt";
 import { isOrgBanned } from "../ban-list";
 import { injectFileSafetyMessage, isUnsafeUploadPath } from "../file-safety";
 import { parseUploadRefs } from "../../../../src/lib/chat-attachment-refs";

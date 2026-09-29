@@ -1,189 +1,44 @@
-// pi_core message persistence for ChatThreadDO, extracted as a collaborator:
-// table DDL, R2 externalization of oversized images/tool results, the async
-// SQLite serializer, and the pi_core_messages / pi_core_compaction row CRUD.
-// All state lives in the DO's SQLite storage and R2; the class itself is
-// stateless and is cached by the owning DO with closures over its live deps
-// (ChatThreadDO keeps thin same-named private delegates as its internal API).
-// Cross-operation calls stay on this instance, keeping the dependency surface
-// limited to the storage and context capabilities the store actually needs.
-// Recursive value traversal likewise stays on this instance so nested payloads
-// do not repeatedly cross the DO facade or rebuild collaborator graphs.
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+/**
+ * Reads of a ChatThreadDO's stored transcript, as the old in-DO chat loop
+ * wrote it (the exporter's only source; chat-thread-do.ts):
+ *
+ *   pi_core_messages   one pi message per row (idx, JSON payload), images over
+ *                      the storage limit replaced by R2 references;
+ *   pi_core_compaction the last compaction: its summary and the first row the
+ *                      model still saw (rows below it stay, unseen);
+ *   pi_core_state      a generation and row count, bumped by every write: a
+ *                      move checks nothing changed since it began.
+ *
+ * Nothing here writes a row. The one side effect is the working-set image
+ * policy of the old session load, kept so a move imports what the old model
+ * saw: an inline image over PI_SESSION_INLINE_IMAGE_MAX_CHARS is put to its
+ * content-addressed R2 key and referenced (the row keeps its bytes).
+ */
+import type { AgentMessage } from "../../../../src/lib/agent-messages";
 import {
   PI_PROVIDER_SUPPORTED_IMAGE_MIME_TYPES,
-  PI_SQLITE_STORAGE_SOFT_LIMIT_CHARS,
-  PI_MAX_PERSISTED_IMAGE_DATA_CHARS,
   PI_R2_IMAGE_REF_METADATA_KEY,
-  emptyPiSqlStorageStats,
   normalizePiImageMimeType,
-  sanitizePiProviderMessage,
   sanitizePiModelMessage,
-  shrinkPiValueForSqlStorage,
-  preparePiMessageForSqlStorage,
+  sanitizePiProviderMessage,
+  type PiR2ImageReference,
 } from "../pi-message-storage";
-import type {
-  PiR2ImageReference,
-  PiR2ToolResultReference,
-  PiSqlStorageStats,
-  PiSqlStorageSerialization,
-} from "../pi-message-storage";
-import { piTextBytes, piCoreMessageKey } from "./pi-message-helpers";
-import { normalizePiUiMetadata } from "../../../../src/lib/runtime-artifacts";
-import { createPiSummaryMessage } from "./pi-compaction";
 import { buildWorkspaceScopedR2Key } from "../../../../src/lib/workspace-r2-paths";
 import type { ChatContextState } from "./types";
 
-export type PiCoreImagePolicy = "reference" | "render" | "provider";
+/** How a read resolves images: R2 references kept (the model's view), or shown as a note (the page's). */
+export type PiCoreImagePolicy = "reference" | "render";
 
-/**
- * How many DURABLY externalized images this request will pull back out of R2. A
- * count, because the cost being bounded is I/O plus a freshly materialized
- * base64 string per object; inline images are already resident and are not
- * charged against it.
- *
- * A `origin: "session"` reference is NOT charged against this. It stands for an
- * image whose row still holds its bytes and which was inline in the provider
- * context before the working-set trim existed, so counting it here would let a
- * residency optimization silently delete history from the model's view: the
- * third and later historical screenshots of a thread would come back as
- * "(image omitted from provider context)" purely because the session was
- * loaded rather than produced in-turn. Session references are charged against
- * {@link PI_PROVIDER_IMAGE_HYDRATION_MAX_DECLARED_CHARS} instead — exactly what
- * they cost when they were inline — which also bounds the R2 GETs one request
- * can make at `maxDeclaredChars / PI_SESSION_INLINE_IMAGE_MAX_CHARS`.
- */
-export const PI_PROVIDER_IMAGE_HYDRATION_MAX_COUNT = 2;
-/**
- * How much image base64 the provider context may carry in TOTAL — hydrated from
- * R2 or already inline. Inline used to escape this entirely: the budget was
- * enforced only inside the R2 branch, and an image at or under
- * `PI_MAX_PERSISTED_IMAGE_DATA_CHARS` is never externalized, so a screenshot
- * thread put an unbounded amount of base64 into every one of the ~25 provider
- * bodies of a turn with nothing anywhere to stop it. A live turn's own tool
- * results are worse still — up to `INLINE_IMAGE_MAX_BASE64_CHARS` (4.5 MB) each.
- * The budget now means what its name says regardless of where the bytes came
- * from, which is also what makes the degraded rung's 500 KB an honest cap
- * instead of a cap on R2 images only.
- */
-export const PI_PROVIDER_IMAGE_HYDRATION_MAX_DECLARED_CHARS = 6_000_000;
-
-/**
- * Inline base64 a SESSION copy of a message may keep resident, independent of
- * what the ROW keeps.
- *
- * `PI_MAX_PERSISTED_IMAGE_DATA_CHARS` (512_000) is a STORAGE rule and must not
- * move: `renderPiStoredImageReferences` replaces every externalized image with a
- * fixed text marker, so lowering the storage threshold retroactively deletes
- * images from users' visible history (WHALE-WORKINGSET-PROPOSAL §4). That leaves
- * every screenshot under 512 KB of base64 inline in its payload forever — twenty
- * of them is 6 MB of base64 resident for the life of the isolate, before any
- * per-request copy of the transcript.
- *
- * This is the working-set half of the same question, and it is free to be much
- * lower ONLY because it changes nothing durable — a property that has to be
- * enforced on both sides of the session copy, not just asserted here:
- *
- *  - WRITE. `serializePiMessageForSqlStorageDetailed` re-inlines every
- *    `origin: "session"` reference before a row is written
- *    ({@link PiCoreMessageStore.restoreSessionExternalizedImages}). Without
- *    that, any rewrite of a LOADED list — post-turn preserve compaction, fork
- *    seeding — persists `data: ""` and `renderPiStoredImageReferences` then
- *    replaces the image with a text marker forever, which is precisely the
- *    retroactive history deletion this comment's own §4 reference forbids.
- *  - READ (provider). `hydratePiStoredImages` charges a session reference
- *    against the DECLARED-CHAR budget only, never against
- *    {@link PI_PROVIDER_IMAGE_HYDRATION_MAX_COUNT}, so the model sees the same
- *    images it saw when they were inline.
- *
- * 128 KB of base64 ≈ 96 KB of image, which is a small screenshot or a large
- * icon: below this the round trip costs more than the residency.
- */
+/** An inline image larger than this is referenced from R2 in a model-view read (the row keeps it). */
 export const PI_SESSION_INLINE_IMAGE_MAX_CHARS = 128_000;
-
-/**
- * Per-ROW bound on re-inlining session-trimmed images on the write path.
- *
- * `restoreSessionExternalizedImages` runs inside the serializer, once per
- * message, so the bound is naturally per row: a single pi_core row holds one
- * tool answer, i.e. a handful of screenshots at most. A row over either limit
- * keeps its references rather than stalling a rewrite on unbounded R2 I/O — the
- * bytes are still in R2 and the model still gets them, only that row's render
- * degrades, and the store reports it so the loss is never silent.
- */
-export const PI_SESSION_IMAGE_RESTORE_MAX_COUNT = 8;
-export const PI_SESSION_IMAGE_RESTORE_MAX_CHARS = 4_000_000;
-
-/**
- * Stored payload chars one session load may materialize.
- *
- * `loadFullPiCoreTranscriptUnbounded` is O(thread): it reads and parses every visible row
- * before any bound applies. A thread with a durable compaction row is already
- * bounded by the `idx >= first_kept_index` predicate, but a thread that never
- * compacted — the observed whale — has no watermark at all, so the load is the
- * whole transcript and the isolate dies before the turn starts. Past this cap
- * {@link PiCoreMessageStore.loadBoundedPiCoreSessionWindow} loads the newest
- * turn-aligned tail that fits and hands the model a placeholder summary for the
- * prefix, which the first completed turn turns into a real compaction row.
- *
- * 12 MB, i.e. under `PI_CONTEXT_MAX_WORKING_SET_BYTES` (16 MB) so a capped load
- * lands inside the byte trigger rather than tripping it on arrival, and far
- * enough above an ordinary thread that nothing normal ever sees it.
- *
- * That ordering used to be the whole follow-through argument, and it was wrong:
- * landing UNDER both triggers means an image-dominated capped load runs a turn
- * without compacting at all, so the durable row that ends the capped state is
- * never written and the thread is capped forever. The follow-through is now
- * forced explicitly by `ChatThreadDO#piCappedLoadNeedsWatermark`, which is where
- * that invariant lives; this constant is once again just a residency cap and no
- * longer carries the correctness argument on the relationship between the two
- * numbers.
- */
-export const PI_SESSION_LOAD_MAX_CHARS = 12_000_000;
-
-/**
- * The stored-char ceiling the DURABLE post-turn cut fires at, in the same units
- * as {@link PI_SESSION_LOAD_MAX_CHARS} and deliberately BELOW it.
- *
- * The post-turn trigger's other two dimensions measure an in-memory estimate,
- * and neither is comparable to a `SUM(length(payload))` over the visible window
- * — an inline image is bigger in the row than in the estimate, an
- * R2-externalized one is far smaller. So an image-dominated thread can cross
- * this cap with both estimate dimensions quiet, get loaded capped, and only then
- * acquire a watermark whose summary is the "earlier messages were NOT loaded"
- * placeholder: a permanent hole in model context where a real summarization
- * would have preserved the prefix.
- *
- * Firing the durable cut at 75% of the cap closes that gap in the cap's own
- * units: the last turn before a thread would be capped ends with a real
- * summarization instead. The 25% margin covers the growth one more turn can add
- * between the probe and the next cold load.
- */
-export const PI_DURABLE_CUT_MAX_VISIBLE_CHARS = Math.floor(
-  PI_SESSION_LOAD_MAX_CHARS * 0.75,
-);
-
-/** Rows per metadata probe while choosing the capped window's cut. */
-const PI_SESSION_LOAD_ROW_BATCH_SIZE = 256;
 /** Stored characters one batch of an export walk holds (a larger row alone). */
 export const PI_CORE_EXPORT_BATCH_CHARS = 4_000_000;
-/**
- * Rows inspected per legacy message-key migration step. Payloads are still
- * fetched one at a time; this only bounds the tiny idx metadata array.
- */
-const PI_MESSAGE_KEY_BACKFILL_BATCH_SIZE = 64;
-/** SQLite bind count kept comfortably below platform limits. */
-const PI_MESSAGE_KEY_QUERY_BATCH_SIZE = 64;
+/** Rows per metadata probe while choosing a bounded window's cut. */
+const PI_SESSION_LOAD_ROW_BATCH_SIZE = 256;
 
-export interface PiImageHydrationBudget {
-  /** Maximum images hydrated from R2. Inline images do not consume it. */
-  maxCount: number;
-  /** Maximum total base64 chars in the provider context, inline or hydrated. */
-  maxDeclaredChars: number;
-}
-
-interface PiImageHydrationState {
-  count: number;
-  declaredChars: number;
+/** A compaction summary as the old loop stored and loaded it: a user message. */
+export function createPiSummaryMessage(summary: string, timestamp = Date.now()): AgentMessage {
+  return { role: "user", content: `[Context Summary]\n\n${summary}`, timestamp };
 }
 
 export interface PiCoreRevision {
@@ -222,9 +77,8 @@ export interface PiSessionLoadWindow {
 }
 
 /**
- * Where a context window may open. `findPiCompactionCutIndex` uses exactly this
- * rule to move a cut forward off a toolResult, and a capped load has the same
- * problem for the same reason: an answer whose call is not in the context.
+ * Where a context window may open. A window that opens on a toolResult would
+ * hand a model an answer to a call it cannot see.
  */
 function isPiTurnBoundaryRole(role: unknown): boolean {
   return role === "user" || role === "assistant";
@@ -269,134 +123,27 @@ export function piCappedSessionLoadPlaceholder(args: {
 
 export interface PiCoreMessageStoreDeps {
   sql(): SqlStorage;
-  transactionSync<T>(callback: () => T): T;
   r2(): R2Bucket;
   chatContext(): ChatContextState | null;
-  /** Privacy-safe allocation counters used by focused tests and diagnostics. */
-  recordReadOperation?(
-    operation:
-      | "payload_row_parsed"
-      | "r2_image_hydrated"
-      | "session_image_externalized"
-      /** A session-trimmed image was re-inlined before its row was rewritten. */
-      | "session_image_restored"
-      /**
-       * A session-trimmed image could NOT be re-inlined and its row was written
-       * carrying the reference — that row's render is degraded until repaired.
-       */
-      | "session_image_restore_failed"
-      /** An image was replaced by a marker in the provider context. */
-      | "provider_image_omitted",
-  ): void;
-  /**
-   * Wall-clock duration measured for a settled tool call, consumed once as its
-   * toolResult row is committed. Optional so tests and non-agent callers can
-   * construct the store without a timing source.
-   */
-  takeToolDurationMs?(toolCallId: string): number | undefined;
 }
 
 export class PiCoreMessageStore {
   constructor(private readonly deps: PiCoreMessageStoreDeps) {}
 
-  /**
-   * Content-addressed keys this store has already proven present in R2, so the
-   * second and later loads of the same thread in one isolate externalize with
-   * zero R2 calls at all. Correctness never depends on it (the key is a sha256
-   * of the bytes, so a repeat `put` is a no-op rewrite of identical content);
-   * it exists only to keep a warm reload cheap.
-   */
+  /** R2 keys this store has proven present, so a repeat read makes no R2 call. */
   private readonly sessionExternalizedImageKeys = new Set<string>();
 
+  /**
+   * The tables a read needs, created empty on a thread the old loop never
+   * ran (every read then finds nothing). pi_core_state is initialized from
+   * the rows, as the old loop did for histories written before it existed.
+   */
   ensurePiCoreTables(): void {
-    this.deps.sql().exec(
-      `CREATE TABLE IF NOT EXISTS pi_core_messages (
-        idx INTEGER PRIMARY KEY,
-        payload TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-      )`,
-    );
-    this.deps.sql().exec(
-      `CREATE TABLE IF NOT EXISTS pi_core_compaction (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        summary TEXT NOT NULL,
-        first_kept_index INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      )`,
-    );
-    // A scalar preflight lets image-blind/render readers prove that nothing
-    // changed without selecting or parsing any payload rows. INSERT...SELECT
-    // initializes old databases from their existing durable history.
-    this.deps.sql().exec(
-      `CREATE TABLE IF NOT EXISTS pi_core_state (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        generation INTEGER NOT NULL,
-        row_count INTEGER NOT NULL
-      )`,
-    );
-    this.deps.sql().exec(
-      `INSERT OR IGNORE INTO pi_core_state (id, generation, row_count)
-       SELECT 1, 1, COUNT(*) FROM pi_core_messages`,
-    );
-    // Durable content identities make turn-end resume dedup proportional to
-    // the incoming tail instead of materializing the entire transcript. `idx`
-    // is the primary key because old histories may already contain duplicate
-    // messages; the lookup hash deliberately has a non-unique covering index.
-    this.deps.sql().exec(
-      `CREATE TABLE IF NOT EXISTS pi_core_message_keys (
-        idx INTEGER PRIMARY KEY,
-        key_hash TEXT NOT NULL
-      )`,
-    );
-    this.deps.sql().exec(
-      `CREATE INDEX IF NOT EXISTS pi_core_message_keys_by_hash
-       ON pi_core_message_keys (key_hash, idx)`,
-    );
-    // Admin repair and wholesale compaction still write pi_core_messages
-    // directly. Invalidate their identity row automatically; a subsequent
-    // keyed write repairs only missing mappings. Triggers avoid stale hashes
-    // when an idx is reused after a rewrite.
-    this.deps.sql().exec(
-      `CREATE TRIGGER IF NOT EXISTS pi_core_message_keys_after_delete
-       AFTER DELETE ON pi_core_messages
-       BEGIN
-         DELETE FROM pi_core_message_keys WHERE idx = OLD.idx;
-       END`,
-    );
-    this.deps.sql().exec(
-      `CREATE TRIGGER IF NOT EXISTS pi_core_message_keys_after_payload_update
-       AFTER UPDATE OF payload ON pi_core_messages
-       BEGIN
-         DELETE FROM pi_core_message_keys WHERE idx = NEW.idx;
-       END`,
-    );
-    // Whole-history rewrites serialize here incrementally, then swap into the
-    // live table with synchronous INSERT...SELECT statements. This keeps the
-    // old history visible across serializer awaits without retaining every new
-    // payload string in the isolate at once.
-    this.deps.sql().exec(
-      `CREATE TABLE IF NOT EXISTS pi_core_rewrite_staging (
-        rewrite_id TEXT NOT NULL,
-        idx INTEGER NOT NULL,
-        payload TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        key_hash TEXT NOT NULL,
-        PRIMARY KEY (rewrite_id, idx)
-      )`,
-    );
-    // Staging buffer for the in-flight turn's not-yet-committed tail. It is a
-    // discardable mirror of `agent.state.messages.slice(piMainBaselineIndex)`:
-    // filled at message_end/tool_execution_end, drained (committed to
-    // pi_core_messages) at turn_end, and dropped wholesale on a failed/aborted
-    // turn. On a cold load with `piActiveTurn` set, it is folded back in to
-    // resume the interrupted turn.
-    this.deps.sql().exec(
-      `CREATE TABLE IF NOT EXISTS pi_turn_journal (
-        seq INTEGER PRIMARY KEY,
-        payload TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-      )`,
-    );
+    const sql = this.deps.sql();
+    sql.exec("CREATE TABLE IF NOT EXISTS pi_core_messages (idx INTEGER PRIMARY KEY, payload TEXT NOT NULL, created_at INTEGER NOT NULL)");
+    sql.exec("CREATE TABLE IF NOT EXISTS pi_core_compaction (id INTEGER PRIMARY KEY CHECK (id = 1), summary TEXT NOT NULL, first_kept_index INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
+    sql.exec("CREATE TABLE IF NOT EXISTS pi_core_state (id INTEGER PRIMARY KEY CHECK (id = 1), generation INTEGER NOT NULL, row_count INTEGER NOT NULL)");
+    sql.exec("INSERT OR IGNORE INTO pi_core_state (id, generation, row_count) SELECT 1, 1, COUNT(*) FROM pi_core_messages");
   }
 
   async sha256Hex(value: string): Promise<string> {
@@ -422,62 +169,6 @@ export class PiCoreMessageStore {
     );
   }
 
-  piStoredToolResultR2Location(
-    toolName: string,
-    toolCallId: string,
-    sha256: string,
-  ): { key: string; path: string } | null {
-    const context = this.deps.chatContext();
-    if (!context?.orgId || !context.workspaceId || !context.threadId) {
-      return null;
-    }
-    const safeSessionId = context.threadId.replace(/[^a-zA-Z0-9_-]/g, "_");
-    const safeToolName = (toolName || "tool")
-      .replace(/[^a-zA-Z0-9_-]/g, "_")
-      .slice(0, 48) || "tool";
-    const safeToolCallId = (toolCallId || "call")
-      .replace(/[^a-zA-Z0-9_-]/g, "_")
-      .slice(0, 64) || "call";
-    const filename = `${Date.now()}-${safeToolName}-${safeToolCallId}-${sha256.slice(0, 16)}.txt`;
-    return {
-      key: buildWorkspaceScopedR2Key(
-        context.orgId,
-        context.workspaceId,
-        `chat-sessions/${safeSessionId}/pi-tool-results/tmp/${filename}`,
-      ),
-      path: `tmp/${filename}`,
-    };
-  }
-
-  async storePiFullToolResultInR2(
-    toolName: string,
-    toolCallId: string,
-    text: string,
-  ): Promise<PiR2ToolResultReference | undefined> {
-    const sha256 = await this.sha256Hex(text);
-    const location = this.piStoredToolResultR2Location(toolName, toolCallId, sha256);
-    if (!location) return undefined;
-    await this.deps.r2().put(location.key, text, {
-      httpMetadata: { contentType: "text/plain; charset=utf-8" },
-      customMetadata: {
-        type: "pi-tool-result-text",
-        toolName,
-        toolCallId,
-        sessionId: this.deps.chatContext()?.threadId ?? "",
-        threadId: this.deps.chatContext()?.threadId ?? "",
-        workspaceId: this.deps.chatContext()?.workspaceId ?? "",
-        orgId: this.deps.chatContext()?.orgId ?? "",
-        sha256,
-      },
-    });
-    return {
-      path: location.path,
-      sha256,
-      size: piTextBytes(text),
-      storedAt: Date.now(),
-    };
-  }
-
   readPiR2ImageReference(part: Record<string, unknown>): PiR2ImageReference | null {
     const metadata = part.metadata;
     if (!metadata || typeof metadata !== "object") return null;
@@ -499,72 +190,6 @@ export class PiCoreMessageStore {
       // reference is never re-inlined and is never exempt from the count budget.
       origin: record.origin === "session" ? "session" : "storage",
     };
-  }
-
-  async externalizePiImagesForSqlStorage(value: unknown, stats: PiSqlStorageStats): Promise<unknown> {
-    if (value === null || value === undefined || typeof value !== "object") return value;
-    if (Array.isArray(value)) {
-      return Promise.all(value.map((item) => this.externalizePiImagesForSqlStorage(item, stats)));
-    }
-    const record = value as Record<string, unknown>;
-    if (record.type === "image" && typeof record.data === "string") {
-      const data = record.data;
-      const mimeType = typeof record.mimeType === "string"
-        ? normalizePiImageMimeType(record.mimeType)
-        : "";
-      if (
-        data.length > PI_MAX_PERSISTED_IMAGE_DATA_CHARS &&
-        mimeType &&
-        PI_PROVIDER_SUPPORTED_IMAGE_MIME_TYPES.has(mimeType)
-      ) {
-        const sha256 = await this.sha256Hex(data);
-        const key = this.piStoredImageR2Key(sha256);
-        if (key) {
-          try {
-            await this.deps.r2().put(key, data, {
-              httpMetadata: { contentType: "text/plain; charset=utf-8" },
-              customMetadata: {
-                type: "pi-message-image-base64",
-                mimeType,
-                sessionId: this.deps.chatContext()?.threadId ?? "",
-                threadId: this.deps.chatContext()?.threadId ?? "",
-                workspaceId: this.deps.chatContext()?.workspaceId ?? "",
-                orgId: this.deps.chatContext()?.orgId ?? "",
-                sha256,
-              },
-            });
-            stats.externalizedImages += 1;
-            const metadata = record.metadata && typeof record.metadata === "object"
-              ? { ...(record.metadata as Record<string, unknown>) }
-              : {};
-            metadata[PI_R2_IMAGE_REF_METADATA_KEY] = {
-              key,
-              mimeType,
-              size: data.length,
-              sha256,
-              storedAt: Date.now(),
-              // Durable: this row genuinely has no bytes from here on.
-              origin: "storage",
-            } satisfies PiR2ImageReference;
-            return {
-              ...record,
-              mimeType,
-              data: "",
-              metadata,
-            };
-          } catch (error) {
-            console.warn("[pi-core] failed to externalize stored image", {
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
-        }
-      }
-    }
-    const next: Record<string, unknown> = {};
-    for (const [key, nested] of Object.entries(record)) {
-      next[key] = await this.externalizePiImagesForSqlStorage(nested, stats);
-    }
-    return next;
   }
 
   /**
@@ -623,8 +248,7 @@ export class PiCoreMessageStore {
       ) {
         const reference = await this.putSessionImageReference(data, mimeType);
         if (reference) {
-          this.deps.recordReadOperation?.("session_image_externalized");
-          const metadata = record.metadata && typeof record.metadata === "object"
+              const metadata = record.metadata && typeof record.metadata === "object"
             ? { ...(record.metadata as Record<string, unknown>) }
             : {};
           metadata[PI_R2_IMAGE_REF_METADATA_KEY] = reference;
@@ -688,103 +312,6 @@ export class PiCoreMessageStore {
     return reference;
   }
 
-  /**
-   * Undo {@link externalizeOversizedInlineSessionImages} on the WRITE path.
-   *
-   * The session trim is a residency optimization over an in-memory copy, but
-   * that copy is an input to two wholesale rewrites — post-turn preserve
-   * compaction (`replacePiCoreMessages(compacted, { uiRender: "preserve" })`)
-   * and fork seeding — and nothing downstream would strip the reference:
-   * `sanitizePiProviderContent` deliberately PRESERVES a zero-data image part
-   * that carries R2 metadata, and `externalizePiImagesForSqlStorage` no-ops on
-   * `"".length`. The row would therefore be stored with `data: ""` and
-   * `renderPiStoredImageReferences` would replace the image with a fixed text
-   * marker in the user's visible history, permanently, for every image between
-   * {@link PI_SESSION_INLINE_IMAGE_MAX_CHARS} and
-   * `PI_MAX_PERSISTED_IMAGE_DATA_CHARS`.
-   *
-   * So the bytes go back first. They are recoverable by construction: the key
-   * is `sha256(data)` and `putSessionImageReference` proves the object present
-   * (head, then put) before it mints a reference. What is written from here is
-   * the pre-trim shape, so `externalizePiImagesForSqlStorage` immediately after
-   * makes the ordinary storage decision on the ordinary storage threshold.
-   *
-   * Durable (`origin: "storage"`) references are untouched: their rows really
-   * do have no bytes, and re-inlining one would undo storage externalization.
-   */
-  private async restoreSessionExternalizedImages(
-    value: unknown,
-    state: PiImageHydrationState = { count: 0, declaredChars: 0 },
-  ): Promise<unknown> {
-    if (value === null || value === undefined || typeof value !== "object") return value;
-    if (Array.isArray(value)) {
-      const next = Array.from<unknown>({ length: value.length });
-      let changed = false;
-      for (let index = 0; index < value.length; index += 1) {
-        next[index] = await this.restoreSessionExternalizedImages(value[index], state);
-        if (next[index] !== value[index]) changed = true;
-      }
-      return changed ? next : value;
-    }
-    const record = value as Record<string, unknown>;
-    if (record.type === "image" && typeof record.data === "string" && record.data.length === 0) {
-      const ref = this.readPiR2ImageReference(record);
-      if (ref && ref.origin === "session") {
-        const overBudget =
-          state.count >= PI_SESSION_IMAGE_RESTORE_MAX_COUNT ||
-          state.declaredChars + ref.size > PI_SESSION_IMAGE_RESTORE_MAX_CHARS;
-        // Charge admission before the I/O, exactly like hydration, so one row's
-        // maximum work is deterministic whatever R2 does.
-        if (!overBudget) {
-          state.count += 1;
-          state.declaredChars += ref.size;
-        }
-        let data = "";
-        if (!overBudget) {
-          try {
-            const object = await this.deps.r2().get(ref.key);
-            data = object ? await object.text() : "";
-          } catch (error) {
-            console.warn("[pi-core] failed to restore session image for storage", {
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
-        }
-        if (data) {
-          this.deps.recordReadOperation?.("session_image_restored");
-          const metadata = record.metadata && typeof record.metadata === "object"
-            ? { ...(record.metadata as Record<string, unknown>) }
-            : null;
-          if (metadata) delete metadata[PI_R2_IMAGE_REF_METADATA_KEY];
-          const restored: Record<string, unknown> = { ...record, data };
-          if (metadata && Object.keys(metadata).length > 0) {
-            restored.metadata = metadata;
-          } else {
-            delete restored.metadata;
-          }
-          return restored;
-        }
-        // Keeping the reference is strictly better than writing a part with no
-        // bytes AND no way back, but it does degrade that row's render until a
-        // repair pass runs, so it must never be silent.
-        this.deps.recordReadOperation?.("session_image_restore_failed");
-        console.warn("[pi-core] session image could not be re-inlined before rewrite", {
-          sha256: ref.sha256,
-          size: ref.size,
-          overBudget,
-        });
-      }
-      return value;
-    }
-    const next: Record<string, unknown> = {};
-    let changed = false;
-    for (const [key, nested] of Object.entries(record)) {
-      next[key] = await this.restoreSessionExternalizedImages(nested, state);
-      if (next[key] !== nested) changed = true;
-    }
-    return changed ? next : value;
-  }
-
   private renderSafeExternalImageMarker(ref: PiR2ImageReference): Record<string, string> {
     const normalizedMime = normalizePiImageMimeType(ref.mimeType);
     const mimeType = PI_PROVIDER_SUPPORTED_IMAGE_MIME_TYPES.has(normalizedMime)
@@ -827,160 +354,6 @@ export class PiCoreMessageStore {
     return next;
   }
 
-  async hydratePiStoredImages(
-    value: unknown,
-    budget: PiImageHydrationBudget = {
-      maxCount: PI_PROVIDER_IMAGE_HYDRATION_MAX_COUNT,
-      maxDeclaredChars: PI_PROVIDER_IMAGE_HYDRATION_MAX_DECLARED_CHARS,
-    },
-    state: PiImageHydrationState = { count: 0, declaredChars: 0 },
-  ): Promise<unknown> {
-    if (value === null || value === undefined || typeof value !== "object") return value;
-    if (Array.isArray(value)) {
-      const hydrated = Array.from<unknown>({ length: value.length });
-      // Prefer recent provider context and avoid concurrently materializing
-      // several R2 bodies/base64 strings. The source/session graph is untouched.
-      let changed = false;
-      for (let index = value.length - 1; index >= 0; index -= 1) {
-        hydrated[index] = await this.hydratePiStoredImages(value[index], budget, state);
-        if (hydrated[index] !== value[index]) changed = true;
-      }
-      // Return the original when nothing below it hydrated. This runs from
-      // transformContext, i.e. once per provider request and 25+ times in a
-      // single agent-loop turn, and threads with no stored images at all — the
-      // common case, and every thread in the OOM sample — were paying a full
-      // clone of the message graph each time for no change. Strings are shared
-      // by reference either way, so the waste was the spine, but the spine of a
-      // long transcript is not nothing in a 128MB isolate.
-      return changed ? hydrated : value;
-    }
-    const record = value as Record<string, unknown>;
-    if (record.type === "image") {
-      const ref = this.readPiR2ImageReference(record);
-      const inlineChars = typeof record.data === "string" ? record.data.length : 0;
-      if (inlineChars > 0) {
-        // An INLINE image: nothing to fetch, but it still lands in the provider
-        // body, so it is charged against the same shared budget as a hydrated
-        // one. Same reverse walk, so the most recent images win the budget and
-        // older ones degrade to the same text marker. The source graph is
-        // untouched — this is a per-request view, exactly like the R2 branch.
-        const availableChars = Math.max(0, budget.maxDeclaredChars - state.declaredChars);
-        if (inlineChars > availableChars) {
-          const mimeType = typeof record.mimeType === "string" ? record.mimeType : "image/unknown";
-          this.deps.recordReadOperation?.("provider_image_omitted");
-          return {
-            type: "text",
-            text: `(image omitted from provider context: hydration budget exceeded; ${mimeType}, ${inlineChars} base64 chars)`,
-          };
-        }
-        state.declaredChars += inlineChars;
-        return value;
-      }
-      if (ref && inlineChars === 0) {
-        const availableChars = Math.max(0, budget.maxDeclaredChars - state.declaredChars);
-        // A session-trimmed reference stands for bytes the ROW still holds and
-        // that were inline in this very context before stage 1b existed. It is
-        // charged exactly what it was charged then — declared chars — and never
-        // against `maxCount`, or a residency optimization would silently cap a
-        // thread's visual history at `maxCount` historical screenshots. See
-        // PI_PROVIDER_IMAGE_HYDRATION_MAX_COUNT.
-        const chargesCount = ref.origin !== "session";
-        if ((chargesCount && state.count >= budget.maxCount) || ref.size > availableChars) {
-          this.deps.recordReadOperation?.("provider_image_omitted");
-          return {
-            type: "text",
-            text: `(image omitted from provider context: hydration budget exceeded; ${ref.mimeType}, ${ref.size} base64 chars)`,
-          };
-        }
-
-        // Charge admission before I/O. A missing/corrupt object remains charged,
-        // keeping the request's maximum work deterministic.
-        if (chargesCount) state.count += 1;
-        state.declaredChars += ref.size;
-        let data = "";
-        try {
-          const object = await this.deps.r2().get(ref.key);
-          const objectSize = object
-            ? Math.max(0, Math.floor(Number(object.size) || 0))
-            : 0;
-          if (object && (objectSize > ref.size || objectSize > availableChars)) {
-            object.body?.cancel().catch(() => undefined);
-            this.deps.recordReadOperation?.("provider_image_omitted");
-            return {
-              type: "text",
-              text: `(image omitted from provider context: stored object exceeds hydration budget; ${ref.mimeType}, ${objectSize} base64 chars)`,
-            };
-          }
-          // R2 exposes size before body materialization, so the aggregate limit
-          // is enforced before object.text() allocates the base64 string.
-          data = object ? await object.text() : "";
-        } catch (error) {
-          console.warn("[pi-core] failed to hydrate stored image", {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-        if (data) {
-          this.deps.recordReadOperation?.("r2_image_hydrated");
-          return {
-            ...record,
-            data,
-            mimeType: ref.mimeType,
-          };
-        }
-        this.deps.recordReadOperation?.("provider_image_omitted");
-        return {
-          type: "text",
-          text: `(image data unavailable from persisted transcript: ${ref.mimeType}, ${ref.size} base64 chars)`,
-        };
-      }
-    }
-    const next: Record<string, unknown> = {};
-    let changed = false;
-    for (const [key, nested] of Object.entries(record)) {
-      next[key] = await this.hydratePiStoredImages(nested, budget, state);
-      if (next[key] !== nested) changed = true;
-    }
-    return changed ? next : value;
-  }
-
-  async serializePiMessageForSqlStorageDetailed(message: AgentMessage): Promise<PiSqlStorageSerialization> {
-    const stats = emptyPiSqlStorageStats();
-    const providerSanitized = sanitizePiProviderMessage(message);
-    // Put back anything the LOAD trimmed before the storage rules get a say —
-    // otherwise a rewrite of a loaded list persists the working-set shape and
-    // deletes the image from render forever (see restoreSessionExternalizedImages).
-    const restored = await this.restoreSessionExternalizedImages(providerSanitized);
-    const externalized = await this.externalizePiImagesForSqlStorage(restored, stats);
-    let prepared = preparePiMessageForSqlStorage(externalized as AgentMessage, stats);
-    let serialized = JSON.stringify(prepared);
-    // Never stringify the unprojected source solely for diagnostics.
-    stats.originalChars = serialized.length;
-    if (serialized.length <= PI_SQLITE_STORAGE_SOFT_LIMIT_CHARS) {
-      stats.storedChars = serialized.length;
-      return { payload: serialized, stats };
-    }
-
-    prepared = shrinkPiValueForSqlStorage(prepared, 4, stats) as AgentMessage;
-    serialized = JSON.stringify(prepared);
-    if (serialized.length <= PI_SQLITE_STORAGE_SOFT_LIMIT_CHARS) {
-      stats.storedChars = serialized.length;
-      return { payload: serialized, stats };
-    }
-
-    stats.omittedWholeMessage = true;
-    const payload = JSON.stringify({
-      role: (message as unknown as Record<string, unknown>).role ?? "user",
-      content: `[message omitted from persisted transcript: serialized size ${serialized.length} chars exceeded storage safety limit]`,
-      timestamp:
-        typeof (message as unknown as Record<string, unknown>).timestamp === "number"
-          ? (message as unknown as Record<string, unknown>).timestamp
-          : Date.now(),
-      metadata: { storageOmitted: true },
-    });
-    stats.storedChars = payload.length;
-    return { payload, stats };
-  }
-
   getPiCoreRevision(): PiCoreRevision {
     this.ensurePiCoreTables();
     const row = this.deps.sql()
@@ -994,20 +367,9 @@ export class PiCoreMessageStore {
     };
   }
 
-  markPiCoreChanged(rowCount: number): void {
-    this.ensurePiCoreTables();
-    this.deps.sql().exec(
-      `UPDATE pi_core_state
-       SET generation = generation + 1, row_count = ?
-       WHERE id = 1`,
-      Math.max(0, Math.floor(rowCount)),
-    );
-  }
-
   async loadFullPiCoreTranscriptUnbounded(options: {
     includeUiMetadata?: boolean;
     imagePolicy?: PiCoreImagePolicy;
-    imageHydrationBudget?: PiImageHydrationBudget;
   } = {}): Promise<AgentMessage[]> {
     this.ensurePiCoreTables();
     const compaction = this.loadPiCoreCompaction();
@@ -1025,9 +387,8 @@ export class PiCoreMessageStore {
         )
         .toArray();
     const messages: AgentMessage[] = [];
-    const hydrationState: PiImageHydrationState = { count: 0, declaredChars: 0 };
     for (const row of rows) {
-      const message = await this.materializePiCoreRow(row.payload, options, hydrationState);
+      const message = await this.materializePiCoreRow(row.payload, options);
       if (message) messages.push(message);
     }
     if (!compaction || firstKeptIndex <= 0) return messages;
@@ -1039,41 +400,23 @@ export class PiCoreMessageStore {
 
   /**
    * One stored payload through the read policy: parse, resolve images per
-   * `imagePolicy`, sanitize. Returns null for a corrupt row — the whole-thread
-   * load has always skipped those rather than failing the thread, and the
-   * bounded window keeps the same rule.
+   * `imagePolicy`, sanitize. Null for a corrupt row, which every read skips
+   * rather than failing the thread.
    */
   private async materializePiCoreRow(
     payload: string,
-    options: {
-      includeUiMetadata?: boolean;
-      imagePolicy?: PiCoreImagePolicy;
-      imageHydrationBudget?: PiImageHydrationBudget;
-    },
-    hydrationState: PiImageHydrationState,
+    options: { includeUiMetadata?: boolean; imagePolicy?: PiCoreImagePolicy },
   ): Promise<AgentMessage | null> {
     try {
-      this.deps.recordReadOperation?.("payload_row_parsed");
       const parsed = JSON.parse(payload) as AgentMessage;
       if (!parsed || typeof parsed !== "object" || !("role" in parsed)) return null;
-      const imagePolicy = options.imagePolicy ?? "reference";
-      const resolved = imagePolicy === "render"
+      const resolved = (options.imagePolicy ?? "reference") === "render"
         ? this.renderPiStoredImageReferences(parsed)
-        : imagePolicy === "provider"
-          ? await this.hydratePiStoredImages(
-              parsed,
-              options.imageHydrationBudget,
-              hydrationState,
-            )
-          // The working-set policy: the session keeps references, never
-          // multi-hundred-KB inline base64 (see
-          // {@link PI_SESSION_INLINE_IMAGE_MAX_CHARS}). The row is untouched.
-          : await this.externalizeOversizedInlineSessionImages(parsed);
+        : await this.externalizeOversizedInlineSessionImages(parsed);
       return options.includeUiMetadata
         ? sanitizePiProviderMessage(resolved as AgentMessage)
         : sanitizePiModelMessage(resolved as AgentMessage);
     } catch {
-      // Skip corrupt rows rather than failing the whole thread.
       return null;
     }
   }
@@ -1186,7 +529,6 @@ export class PiCoreMessageStore {
         cutIdx,
       )
       .toArray();
-    const hydrationState: PiImageHydrationState = { count: 0, declaredChars: 0 };
     const loadOptions = {
       imagePolicy: "reference" as const,
       includeUiMetadata: options.includeUiMetadata,
@@ -1197,7 +539,6 @@ export class PiCoreMessageStore {
       const message = await this.materializePiCoreRow(
         row.payload,
         loadOptions,
-        hydrationState,
       );
       if (!message) continue;
       tail.push(message);
@@ -1268,26 +609,42 @@ export class PiCoreMessageStore {
   }
 
   /**
-   * The visible pi_core row range, plus the index shift the legacy full load
-   * applies. {@link loadFullPiCoreTranscriptUnbounded} returns rows `idx >= firstKeptIndex` in
-   * idx order, prefixed by the compaction summary when one is cut — and the
-   * parsed render id of a row (`pi_user_<ts>_<index>`) is derived from its
-   * position in THAT array. A windowed reader has to reproduce the same position
-   * or it renames history, so it needs both numbers.
+   * The newest stored messages whose payloads fit `maxChars`, oldest first,
+   * as a person reads the thread: every stored row (a compaction's watermark
+   * hides nothing here), images as notes (nothing is fetched or written), and
+   * the window opening on a turn, not on a tool result. `truncated`: older
+   * rows were left out.
    */
-  piCoreVisibleWindow(): {
-    firstKeptIndex: number;
-    summaryOffset: number;
-    endIdx: number;
-  } {
+  async loadRecentStoredMessages(maxChars: number): Promise<{ messages: AgentMessage[]; truncated: boolean }> {
     this.ensurePiCoreTables();
-    const compaction = this.loadPiCoreCompaction();
-    const firstKeptIndex = compaction?.firstKeptIndex ?? 0;
-    return {
-      firstKeptIndex,
-      summaryOffset: compaction && firstKeptIndex > 0 ? 1 : 0,
-      endIdx: this.piCoreRowCount(),
-    };
+    const budget = Math.max(1, Math.floor(maxChars));
+    let cutIdx = this.piCoreRowCount();
+    let loaded = 0;
+    let truncated = false;
+    for (;;) {
+      const batch = this.listPiCoreRowMeta({ minIdx: 0, beforeIdx: cutIdx, limit: PI_SESSION_LOAD_ROW_BATCH_SIZE });
+      if (batch.length === 0) break;
+      for (const meta of batch) {
+        if (loaded > 0 && loaded + meta.chars > budget) {
+          truncated = true;
+          break;
+        }
+        loaded += meta.chars;
+        cutIdx = meta.idx;
+      }
+      if (truncated) break;
+    }
+    const rows = this.deps.sql()
+      .exec<{ payload: string }>("SELECT payload FROM pi_core_messages WHERE idx >= ? ORDER BY idx ASC", cutIdx)
+      .toArray();
+    const messages: AgentMessage[] = [];
+    for (const row of rows) {
+      const message = await this.materializePiCoreRow(row.payload, { includeUiMetadata: true, imagePolicy: "render" });
+      if (message) messages.push(message);
+    }
+    let head = 0;
+    while (truncated && head < messages.length && !isPiTurnBoundaryRole((messages[head] as { role?: unknown }).role)) head++;
+    return { messages: head < messages.length ? messages.slice(head) : messages, truncated };
   }
 
   /**
@@ -1354,7 +711,6 @@ export class PiCoreMessageStore {
     const compaction = this.loadPiCoreCompaction();
     const cutAt = compaction && compaction.firstKeptIndex > 0 ? compaction.firstKeptIndex : null;
     const messages: AgentMessage[] = [];
-    const hydrationState: PiImageHydrationState = { count: 0, declaredChars: 0 };
     let summarized = cutAt === null;
     // A batch of payloads at a time, so each row's stored string is released
     // once it is materialized rather than all of them held until the end.
@@ -1364,7 +720,7 @@ export class PiCoreMessageStore {
           messages.push(createPiSummaryMessage(compaction!.summary, compaction!.updatedAt));
           summarized = true;
         }
-        const message = await this.materializePiCoreRow(row.payload, { imagePolicy: "reference" }, hydrationState);
+        const message = await this.materializePiCoreRow(row.payload, { imagePolicy: "reference" });
         if (message) messages.push(message);
       }
     }
@@ -1493,7 +849,6 @@ export class PiCoreMessageStore {
       .toArray()[0];
     if (!row || typeof row.payload !== "string") return null;
     try {
-      this.deps.recordReadOperation?.("payload_row_parsed");
       const parsed = JSON.parse(row.payload) as AgentMessage;
       if (!parsed || typeof parsed !== "object" || !("role" in parsed)) {
         return null;
@@ -1504,222 +859,6 @@ export class PiCoreMessageStore {
     } catch {
       return null;
     }
-  }
-
-  /**
-   * Stamp a toolResult row with the wall-clock duration measured live between
-   * its tool_execution_start/end pair. Pi persists no start timestamp, and an
-   * assistant row's `timestamp` marks when the model request opened, so a
-   * duration derived after the fact from adjacent message timestamps would
-   * silently include model latency. Recording it at commit time is the only
-   * point where the real value is still known. UI-only metadata:
-   * sanitizePiModelMessage strips it before anything reaches the provider.
-   */
-  private stampPiToolDuration(message: AgentMessage): AgentMessage {
-    const take = this.deps.takeToolDurationMs;
-    if (!take) return message;
-    const record = message as unknown as Record<string, unknown>;
-    if (record.role !== "toolResult") return message;
-    const toolCallId =
-      typeof record.toolCallId === "string" ? record.toolCallId.trim() : "";
-    if (!toolCallId) return message;
-    const durationMs = take.call(this.deps, toolCallId);
-    if (typeof durationMs !== "number") return message;
-    const existing = normalizePiUiMetadata(record.uiMetadata);
-    return {
-      ...record,
-      uiMetadata: { ...existing, toolDurationMs: durationMs },
-    } as unknown as AgentMessage;
-  }
-
-  async piCoreMessageKeyHash(message: AgentMessage): Promise<string> {
-    return this.sha256Hex(piCoreMessageKey(message));
-  }
-
-  private putPiCoreMessageKeyHash(idx: number, keyHash: string): void {
-    this.deps.sql().exec(
-      `INSERT INTO pi_core_message_keys (idx, key_hash)
-       VALUES (?, ?)
-       ON CONFLICT(idx) DO UPDATE SET key_hash = excluded.key_hash`,
-      idx,
-      keyHash,
-    );
-  }
-
-  private putPiCoreMessageKeyHashIfPayloadMatches(
-    idx: number,
-    payload: string,
-    keyHash: string,
-  ): void {
-    // Hashing uses WebCrypto and therefore yields. An admin repair or rewrite
-    // can replace this idx while that promise is pending; only publish the hash
-    // if the live row still contains the exact bytes we inspected. Otherwise
-    // the next backfill pass sees the mapping as missing and hashes the new row.
-    this.deps.sql().exec(
-      `INSERT INTO pi_core_message_keys (idx, key_hash)
-       SELECT idx, ?
-         FROM pi_core_messages
-        WHERE idx = ? AND payload = ?
-       ON CONFLICT(idx) DO UPDATE SET key_hash = excluded.key_hash`,
-      keyHash,
-      idx,
-      payload,
-    );
-  }
-
-  /**
-   * Lazily index rows written before `pi_core_message_keys` existed.
-   *
-   * This migration can perform O(thread) storage work once for a legacy
-   * thread, but its peak heap is O(one payload): the metadata query selects
-   * only idxs, then each payload is fetched, parsed, hashed, and released
-   * before the next. Progress is durable after every row, so an isolate reset
-   * resumes rather than starts over. New histories never enter this loop.
-   */
-  private async backfillVisiblePiCoreMessageKeys(
-    firstKeptIndex: number,
-  ): Promise<void> {
-    for (;;) {
-      const missing = this.deps.sql()
-        .exec<{ idx: number }>(
-          `SELECT messages.idx
-             FROM pi_core_messages AS messages
-             LEFT JOIN pi_core_message_keys AS keys ON keys.idx = messages.idx
-            WHERE messages.idx >= ? AND keys.idx IS NULL
-            ORDER BY messages.idx ASC
-            LIMIT ?`,
-          firstKeptIndex,
-          PI_MESSAGE_KEY_BACKFILL_BATCH_SIZE,
-        )
-        .toArray();
-      if (missing.length === 0) return;
-
-      for (const candidate of missing) {
-        const idx = Math.max(0, Math.floor(Number(candidate.idx) || 0));
-        const row = this.deps.sql()
-          .exec<{ payload: string }>(
-            "SELECT payload FROM pi_core_messages WHERE idx = ? LIMIT 1",
-            idx,
-          )
-          .toArray()[0];
-        if (!row || typeof row.payload !== "string") continue;
-        let keyHash: string;
-        try {
-          this.deps.recordReadOperation?.("payload_row_parsed");
-          const parsed = JSON.parse(row.payload) as AgentMessage;
-          if (!parsed || typeof parsed !== "object" || !("role" in parsed)) {
-            keyHash = `invalid:${idx}`;
-          } else {
-            keyHash = await this.piCoreMessageKeyHash(parsed);
-          }
-        } catch {
-          // Mark corrupt rows as visited so every future append does not retry
-          // them. They never match a valid incoming SHA-256 identity.
-          keyHash = `invalid:${idx}`;
-        }
-        this.putPiCoreMessageKeyHashIfPayloadMatches(idx, row.payload, keyHash);
-      }
-    }
-  }
-
-  private findExistingPiCoreMessageKeyHashes(
-    keyHashes: readonly string[],
-    firstKeptIndex: number,
-  ): Set<string> {
-    const existing = new Set<string>();
-    for (
-      let offset = 0;
-      offset < keyHashes.length;
-      offset += PI_MESSAGE_KEY_QUERY_BATCH_SIZE
-    ) {
-      const batch = keyHashes.slice(
-        offset,
-        offset + PI_MESSAGE_KEY_QUERY_BATCH_SIZE,
-      );
-      if (batch.length === 0) continue;
-      const placeholders = batch.map(() => "?").join(", ");
-      const rows = this.deps.sql()
-        .exec<{ key_hash: string }>(
-          `SELECT DISTINCT keys.key_hash
-             FROM pi_core_message_keys AS keys
-             INNER JOIN pi_core_messages AS messages ON messages.idx = keys.idx
-            WHERE messages.idx >= ? AND keys.key_hash IN (${placeholders})`,
-          firstKeptIndex,
-          ...batch,
-        )
-        .toArray();
-      for (const row of rows) {
-        if (typeof row.key_hash === "string") existing.add(row.key_hash);
-      }
-    }
-    return existing;
-  }
-
-  async appendPiCoreMessages(messages: AgentMessage[]): Promise<void> {
-    if (messages.length === 0) return;
-    this.ensurePiCoreTables();
-    const revisionBeforeAppend = this.getPiCoreRevision();
-    const rows = this.deps.sql()
-      .exec<{ next_idx: number }>(
-        "SELECT COALESCE(MAX(idx) + 1, 0) AS next_idx FROM pi_core_messages",
-      )
-      .toArray();
-    const startIndex = Math.max(0, Math.floor(Number(rows[0]?.next_idx) || 0));
-    const now = Date.now();
-    for (let offset = 0; offset < messages.length; offset += 1) {
-      const message = this.stampPiToolDuration(messages[offset]);
-      const keyHash = await this.piCoreMessageKeyHash(message);
-      const serialized = await this.serializePiMessageForSqlStorageDetailed(message);
-      const idx = startIndex + offset;
-      // The payload, its identity index, and the scalar preflight are one
-      // durable fact. Keep them rollback-atomic so a quota/constraint failure
-      // cannot strand a row without its key or revision before the next await.
-      this.deps.transactionSync(() => {
-        this.deps.sql().exec(
-          "INSERT INTO pi_core_messages (idx, payload, created_at) VALUES (?, ?, ?)",
-          idx,
-          serialized.payload,
-          now,
-        );
-        this.putPiCoreMessageKeyHash(idx, keyHash);
-        this.markPiCoreChanged(revisionBeforeAppend.count + offset + 1);
-      });
-    }
-  }
-
-  async appendPiCoreMessagesIfMissing(messages: AgentMessage[]): Promise<void> {
-    if (messages.length === 0) return;
-    this.ensurePiCoreTables();
-    const compaction = this.loadPiCoreCompaction();
-    const firstKeptIndex = compaction?.firstKeptIndex ?? 0;
-    await this.backfillVisiblePiCoreMessageKeys(firstKeptIndex);
-
-    const incoming: Array<{ message: AgentMessage; keyHash: string }> = [];
-    for (const message of messages) {
-      incoming.push({
-        message,
-        keyHash: await this.piCoreMessageKeyHash(message),
-      });
-    }
-    const existingKeys = this.findExistingPiCoreMessageKeyHashes(
-      incoming.map(({ keyHash }) => keyHash),
-      firstKeptIndex,
-    );
-    // A compaction summary is synthetic rather than a pi_core_messages row, but
-    // the legacy full-transcript dedup included it. Preserve that edge case.
-    if (compaction && firstKeptIndex > 0) {
-      existingKeys.add(
-        await this.piCoreMessageKeyHash(
-          createPiSummaryMessage(compaction.summary, compaction.updatedAt),
-        ),
-      );
-    }
-    const missing = incoming.flatMap(({ message, keyHash }) => {
-      if (existingKeys.has(keyHash)) return [];
-      existingKeys.add(keyHash);
-      return [message];
-    });
-    await this.appendPiCoreMessages(missing);
   }
 
   /** Committed row count — the exclusive upper bound of a valid `first_kept_index`
@@ -1754,30 +893,5 @@ export class PiCoreMessageStore {
       firstKeptIndex,
       updatedAt: Math.max(0, Math.floor(Number(row.updated_at) || 0)),
     };
-  }
-
-  persistPiCoreCompaction(summary: string, firstKeptIndex: number): void {
-    this.ensurePiCoreTables();
-    const normalized = Math.max(0, Math.floor(firstKeptIndex));
-    // Backstop for the caller's own committed-bound check: a cut that names rows
-    // pi_core does not have cannot be expressed as an `idx >= ?` predicate, and
-    // writing it anyway would truncate the thread to the summary alone. Dropping
-    // the write costs one uncompacted request; writing it costs the history.
-    if (normalized > this.piCoreRowCount()) return;
-    this.deps.sql().exec(
-      `INSERT OR REPLACE INTO pi_core_compaction (id, summary, first_kept_index, updated_at)
-       VALUES (1, ?, ?, ?)`,
-      summary,
-      normalized,
-      Date.now(),
-    );
-    this.markPiCoreChanged(this.getPiCoreRevision().count);
-  }
-
-  clearPiCoreCompaction(): void {
-    this.ensurePiCoreTables();
-    const changed = this.loadPiCoreCompaction() !== null;
-    this.deps.sql().exec("DELETE FROM pi_core_compaction");
-    if (changed) this.markPiCoreChanged(this.getPiCoreRevision().count);
   }
 }

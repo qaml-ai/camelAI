@@ -1,17 +1,25 @@
 /**
  * The pre-compaction render archive as pi messages, for a thread moving to
  * the agent runtime (chat-thread/runtime-migration.ts). A post-turn
- * compaction deletes the pi_core rows below its cut and keeps them visible
- * only as ai-chat render rows (render-archive-preserve.ts), so the move
+ * compaction deleted the pi_core rows below its cut and kept them visible
+ * only as ai-chat render rows (cf_ai_chat_agent_messages), so the move
  * rebuilds that history from them: shown to the user on the runtime, never
  * to its model (it sits before the compaction summary). The rebuild is
  * approximate (tool results as their text, files and errors as notes), so a
  * move that uses it is always archived and says so.
+ *
+ * The rows are AI SDK UIMessages as the old chat loop stored them; only the
+ * parts read here are typed.
  */
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { UIMessage } from "ai";
-import type { ContentBlock } from "../../../../src/types";
-import { uiMessageToMessage } from "../../../../src/lib/ui-message-adapter";
+import type { AgentMessage } from "../../../../src/lib/agent-messages.js";
+
+/** A stored render row (an AI SDK UIMessage), as far as the export reads it. */
+export interface RenderMessage {
+  id: string;
+  role: "system" | "user" | "assistant";
+  metadata?: unknown;
+  parts: Array<{ type: string; [key: string]: unknown }>;
+}
 
 type PiBlock = Record<string, unknown> & { type: string };
 
@@ -23,9 +31,41 @@ const ARCHIVED_ASSISTANT = {
   usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 };
 
-function resultText(content: string | ContentBlock[]): string {
+function positive(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/** When a render row was made: its backfill stamp, its turn-end stamp, or its legacy pi_core key; 0 when none. */
+export function renderMessageCreatedAtMs(message: RenderMessage): number | undefined {
+  const metadata = message.metadata as { pi?: { createdAtMs?: unknown; completedAtMs?: unknown }; piCoreMessageKey?: unknown } | undefined;
+  return positive(metadata?.pi?.createdAtMs)
+    ?? positive(metadata?.pi?.completedAtMs)
+    ?? (typeof metadata?.piCoreMessageKey === "string" ? positive(Number(metadata.piCoreMessageKey)) : undefined);
+}
+
+/** A row as stored is a render message: an id, a role, and parts. */
+export function isRenderMessage(value: unknown): value is RenderMessage {
+  const message = value as Partial<RenderMessage> | null;
+  return Boolean(message) && typeof message === "object" && typeof message!.id === "string"
+    && (message!.role === "user" || message!.role === "assistant" || message!.role === "system")
+    && Array.isArray(message!.parts);
+}
+
+function text(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+/** A tool output's text: a string, or the text blocks of a content list. */
+function outputText(output: unknown): string {
+  const content = (output as { content?: unknown } | null)?.content ?? output;
   if (typeof content === "string") return content;
-  return content.map((block) => (block.type === "text" ? block.text : "")).join("");
+  if (!Array.isArray(content)) return content === undefined || content === null ? "" : JSON.stringify(content);
+  return content.map((block) => (block && typeof block === "object" && (block as { type?: unknown }).type === "text" ? text((block as { text?: unknown }).text) : "")).join("");
+}
+
+function toolName(part: { type: string; toolName?: unknown }): string {
+  if (typeof part.toolName === "string" && part.toolName) return part.toolName;
+  return part.type.startsWith("tool-") ? part.type.slice("tool-".length) : "tool";
 }
 
 /**
@@ -34,21 +74,17 @@ function resultText(content: string | ContentBlock[]): string {
  * assistant message that made it, and a new assistant message where the
  * model went on after results.
  */
-export function renderMessageToPiMessages(ui: UIMessage): AgentMessage[] {
-  const message = uiMessageToMessage(ui);
-  const timestamp = message.created_at;
-  const content: ContentBlock[] = typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content;
+export function renderMessageToPiMessages(message: RenderMessage): AgentMessage[] {
+  const timestamp = renderMessageCreatedAtMs(message) ?? 0;
   if (message.role !== "assistant") {
-    const text = content
-      .map((block) => (block.type === "text" ? block.text : block.type === "file" ? "[a file was attached here]" : ""))
-      .filter(Boolean)
-      .join("\n");
-    return text ? [{ role: "user", content: text, timestamp } as AgentMessage] : [];
+    const lines = message.parts
+      .map((part) => (part.type === "text" ? text(part.text) : part.type === "file" ? "[a file was attached here]" : ""))
+      .filter(Boolean);
+    return lines.length ? [{ role: "user", content: lines.join("\n"), timestamp } as AgentMessage] : [];
   }
   const out: AgentMessage[] = [];
   let blocks: PiBlock[] = [];
   let results: AgentMessage[] = [];
-  const names = new Map<string, string>();
   const flush = () => {
     if (blocks.length) {
       const calls = blocks.some((block) => block.type === "toolCall");
@@ -58,27 +94,38 @@ export function renderMessageToPiMessages(ui: UIMessage): AgentMessage[] {
     blocks = [];
     results = [];
   };
-  for (const block of content) {
-    if (block.type === "tool_result") {
-      results.push({
-        role: "toolResult",
-        toolCallId: block.tool_use_id,
-        toolName: names.get(block.tool_use_id) ?? "tool",
-        content: [{ type: "text", text: resultText(block.content) }],
-        isError: block.is_error === true,
-        timestamp,
-      } as unknown as AgentMessage);
+  for (const part of message.parts) {
+    const isTool = (part.type.startsWith("tool-") || part.type === "dynamic-tool") && typeof part.toolCallId === "string";
+    if (isTool) {
+      // The model went on after its tool results: that is its next message.
+      if (results.length) flush();
+      const id = part.toolCallId as string;
+      const name = toolName(part);
+      const input = part.input && typeof part.input === "object" && !Array.isArray(part.input) ? part.input : {};
+      blocks.push({ type: "toolCall", id, name, arguments: input });
+      const state = part.state;
+      if (state === "output-available" || state === "output-error") {
+        const output = part.output as { isError?: unknown } | undefined;
+        results.push({
+          role: "toolResult",
+          toolCallId: id,
+          toolName: name,
+          content: [{ type: "text", text: state === "output-error" ? text(part.errorText) : outputText(output) }],
+          isError: state === "output-error" || output?.isError === true,
+          timestamp,
+        } as unknown as AgentMessage);
+      }
       continue;
     }
-    // The model went on after its tool results: that is its next message.
     if (results.length) flush();
-    if (block.type === "text" && block.text) blocks.push({ type: "text", text: block.text });
-    else if (block.type === "thinking" && block.thinking) blocks.push({ type: "thinking", thinking: block.thinking });
-    else if (block.type === "tool_use") {
-      names.set(block.id, block.name);
-      blocks.push({ type: "toolCall", id: block.id, name: block.name, arguments: block.input ?? {} });
-    } else if (block.type === "error" && "error" in block && block.error) {
-      blocks.push({ type: "text", text: `[error: ${String(block.error)}]` });
+    if (part.type === "text" && text(part.text)) blocks.push({ type: "text", text: text(part.text) });
+    else if (part.type === "reasoning" && text(part.text)) blocks.push({ type: "thinking", thinking: text(part.text) });
+    else if (part.type === "data-pi-error") {
+      const error = text((part.data as { error?: unknown } | undefined)?.error);
+      if (error) blocks.push({ type: "text", text: `[error: ${error}]` });
+    } else if (part.type === "data-pi-user-stop" || part.type === "data-pi-turn-notice") {
+      const note = text((part.data as { text?: unknown } | undefined)?.text);
+      if (note) blocks.push({ type: "text", text: note });
     }
   }
   flush();
@@ -86,6 +133,6 @@ export function renderMessageToPiMessages(ui: UIMessage): AgentMessage[] {
 }
 
 /** Render messages, oldest first, as pi messages. */
-export function renderArchiveToPiMessages(messages: readonly UIMessage[]): AgentMessage[] {
+export function renderArchiveToPiMessages(messages: readonly RenderMessage[]): AgentMessage[] {
   return messages.flatMap((message) => renderMessageToPiMessages(message));
 }

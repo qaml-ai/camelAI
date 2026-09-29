@@ -462,51 +462,6 @@ async function getAdminOrgLlmProviderMap(env: Env, orgIds: string[]) {
   return new Map(entries);
 }
 
-async function notifyThreadMetadataChange(
-  env: Env,
-  threadId: string,
-  updates: {
-    title?: string;
-    model?: LlmModel;
-  },
-  updatedAt?: number,
-): Promise<void> {
-  if (
-    !env.CHAT_THREAD ||
-    typeof env.CHAT_THREAD.get !== "function" ||
-    typeof env.CHAT_THREAD.idFromName !== "function"
-  ) {
-    return;
-  }
-
-  try {
-    const chatThread = env.CHAT_THREAD.get(
-      env.CHAT_THREAD.idFromName(threadId),
-    ) as unknown as {
-      setTitle(title: string): Promise<void>;
-      setModel(model: LlmModel, updatedAt?: number): Promise<void>;
-      refreshRunnerConfig(): Promise<void>;
-    };
-
-    if (updates.title) {
-      await chatThread.setTitle(updates.title, updatedAt);
-    }
-    if (updates.model) {
-      await chatThread.setModel(updates.model, updatedAt);
-      await chatThread.refreshRunnerConfig();
-    }
-  } catch (error) {
-    console.error(
-      "[admin api] failed to notify ChatThreadDO of thread metadata change",
-      {
-        threadId,
-        updates,
-        error: error instanceof Error ? error.message : String(error),
-      },
-    );
-  }
-}
-
 function toDailySpendBillingPlan(status: string | null | undefined): string {
   return status === "paying" ||
     status === "active" ||
@@ -2128,7 +2083,6 @@ routes.patch(
         throw error;
       }
       if (result) {
-        await notifyThreadMetadataChange(env, threadId, body, result.updated_at);
         return c.json(normalizeAdminThreadResponse(result));
       }
     }
@@ -2155,7 +2109,6 @@ routes.patch(
         throw error;
       }
       if (result) {
-        await notifyThreadMetadataChange(env, threadId, body, result.updated_at);
         return c.json(normalizeAdminThreadResponse(result));
       }
     }

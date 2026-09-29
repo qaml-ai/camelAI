@@ -15,5 +15,3 @@ export const getOrgStub = (env: Env, id: string) =>
 export const getWorkspaceStub = (env: Env, id: string) =>
   env.WORKSPACE.get(env.WORKSPACE.idFromName(id)) as unknown as WorkspaceDO;
 
-export const getThreadStub = (env: Env, id: string) =>
-  env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(id));

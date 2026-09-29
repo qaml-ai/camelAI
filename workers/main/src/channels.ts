@@ -1,7 +1,7 @@
 import type {
   InitialUserMessageRequest,
   InitialUserMessageResult,
-} from "./chat-thread-do.js";
+} from "./chat-thread/types.js";
 import { getOrgStub, getWorkspaceStub } from "./helpers/stubs.js";
 import {
   getDefaultLlmModel,
@@ -352,12 +352,6 @@ function ttlOptions(
   return ttlSeconds ? { expirationTtl: ttlSeconds } : undefined;
 }
 
-type InitialUserMessageRpc = {
-  startInitialUserMessage: (
-    body: InitialUserMessageRequest,
-  ) => Promise<InitialUserMessageResult>;
-};
-
 type ChannelInitialUserMessageRequest = InitialUserMessageRequest & {
   threadId: string;
   channelKind: ChannelKind;
@@ -386,8 +380,8 @@ async function channelConnectionOwner(
 }
 
 /**
- * Start a channel message's turn: on the runtime when the thread runs there
- * directly (agent-runtime/channel-turns.ts), else through ChatThreadDO.
+ * Start a channel message's turn on the agent runtime
+ * (agent-runtime/channel-turns.ts); a thread still on ChatThreadDO moves there first.
  */
 export async function enqueueChannelMessage(
   env: Env,
@@ -398,7 +392,6 @@ export async function enqueueChannelMessage(
     const owner = await channelConnectionOwner(env, messageRequest.workspaceId, connectionId);
     if (owner) messageRequest.userId = owner;
   }
-  const systemMessage = buildChannelReplySystemMessage(channelKind, request);
   const runtimeSystemMessage = buildChannelReplySystemMessage(channelKind, request, { runtime: true });
 
   const startDirect = async (): Promise<InitialUserMessageResult | null> => {
@@ -420,28 +413,10 @@ export async function enqueueChannelMessage(
   };
 
   try {
-    const direct = await startDirect();
-    if (direct) return direct;
-    const stub = env.CHAT_THREAD.get(
-      env.CHAT_THREAD.idFromName(request.threadId),
-    ) as unknown as InitialUserMessageRpc;
-    const result = await stub.startInitialUserMessage({
-      ...messageRequest,
-      messageSource: channelKind,
-      message: `${systemMessage}\n\n${request.message}`,
-    });
-    // The thread moved to the runtime meanwhile: send it there.
-    if (result.status === "moved") {
-      return await startDirect() ?? { status: "error", error: result.error ?? "The conversation moved" };
-    }
-    if (
-      result.status === "accepted" ||
-      result.status === "busy" ||
-      result.status === "error"
-    ) {
-      return result;
-    }
-    return { status: "error", error: "Invalid response from chat thread" };
+    return await startDirect() ?? {
+      status: "error",
+      error: "This conversation could not move to the new chat engine; start a new one.",
+    };
   } catch (error) {
     return {
       status: "error",

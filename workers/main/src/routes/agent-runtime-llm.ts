@@ -4,8 +4,8 @@
  * which now serves one route: `openai-codex`, the org's ChatGPT subscription.
  * Every other provider the runtime calls itself with a key scope's keys.
  * This verifies the runtime identity token (in `X-Agent-Runtime-Identity`),
- * authorizes the caller like the MCP server, and hands the call to the
- * thread's ChatThreadDO (`runtimeProviderRequest`, agent-runtime/codex-forwarder.ts).
+ * authorizes the caller like the MCP server, and forwards the call
+ * (agent-runtime/codex-forwarder.ts, as the thread's acting user).
  */
 import { RuntimeTokenError, verifyRuntimeToken } from "@camelai/agent-runtime/server";
 import type { Env, RouteContext } from "../types.js";
@@ -63,35 +63,15 @@ export async function handleAgentRuntimeLlmRequest(
     threadId: props.threadId ?? "",
     userId: props.userId ?? "",
   };
-  if (props.directRuntime) {
-    // A runtime thread has no ChatThreadDO: the Worker forwards the call itself.
-    return forwardRuntimeThreadCodexCall(env, {
-      provider,
-      path,
-      search: url.search,
-      method: req.method,
-      headers: [...req.headers],
-      body: req.method === "GET" || req.method === "HEAD" ? null : await req.arrayBuffer(),
-    }, caller);
-  }
-  const stub = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(props.threadId ?? "")) as unknown as {
-    runtimeProviderRequest(
-      request: { provider: string; path: string; search: string; method: string; headers: [string, string][]; body: ArrayBuffer | null },
-      caller: { orgId: string; workspaceId: string; threadId: string; userId: string },
-    ): Promise<Response>;
-  };
-  return stub.runtimeProviderRequest(
-    {
-      provider,
-      path,
-      search: url.search,
-      method: req.method,
-      headers: [...req.headers],
-      // Bytes, untouched: a Codex body arrives zstd-compressed.
-      body: req.method === "GET" || req.method === "HEAD" ? null : await req.arrayBuffer(),
-    },
-    caller,
-  );
+  return forwardRuntimeThreadCodexCall(env, {
+    provider,
+    path,
+    search: url.search,
+    method: req.method,
+    headers: [...req.headers],
+    // Bytes, untouched: a Codex body arrives zstd-compressed.
+    body: req.method === "GET" || req.method === "HEAD" ? null : await req.arrayBuffer(),
+  }, caller);
 }
 
 export async function handleAgentRuntimeLlm({ req, env }: RouteContext): Promise<Response> {

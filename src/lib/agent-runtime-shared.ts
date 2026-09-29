@@ -13,39 +13,21 @@
 export const RUNTIME_REQUEST_ID = /^[A-Za-z0-9_-]{1,80}$/;
 
 /**
- * Whether new web threads run directly on the runtime in this deployment: its
- * runtime tenant (operator token, tenant id, agent definition) is set and
- * AGENT_RUNTIME_DIRECT_THREADS is on.
+ * Whether this deployment runs threads on the hosted agent runtime: its
+ * runtime tenant (operator token, tenant id, agent definition) is set. Every
+ * thread runs there (ChatThreadDO's own loop is gone); a thread still on
+ * ChatThreadDO moves there when it is next opened or sent to.
  */
 export function runtimeDirectThreadsEnabled(env: {
   AGENT_RUNTIME_API_TOKEN?: string;
   AGENT_RUNTIME_TENANT?: string;
   AGENT_RUNTIME_DEFINITION?: string;
-  AGENT_RUNTIME_DIRECT_THREADS?: string;
 }): boolean {
   return Boolean(
     env.AGENT_RUNTIME_API_TOKEN?.trim() &&
       env.AGENT_RUNTIME_TENANT?.trim() &&
-      env.AGENT_RUNTIME_DEFINITION?.trim() &&
-      env.AGENT_RUNTIME_DIRECT_THREADS?.trim() === "1",
+      env.AGENT_RUNTIME_DEFINITION?.trim(),
   );
-}
-
-/**
- * Whether `orgId`'s threads still on ChatThreadDO move to the runtime when
- * they are next used (agent-runtime/thread-migration.ts): direct threads are
- * on and AGENT_RUNTIME_MIGRATE_DO_THREADS is "1" (every org) or a comma list
- * of org ids that names this one (a cohort). Unset or empty: off.
- */
-export function runtimeThreadMigrationEnabled(
-  env: Parameters<typeof runtimeDirectThreadsEnabled>[0] & { AGENT_RUNTIME_MIGRATE_DO_THREADS?: string },
-  orgId: string,
-): boolean {
-  if (!runtimeDirectThreadsEnabled(env)) return false;
-  const value = env.AGENT_RUNTIME_MIGRATE_DO_THREADS?.trim() ?? "";
-  if (value === "1") return true;
-  const id = orgId.trim();
-  return Boolean(id) && value.split(",").some((entry) => entry.trim() === id);
 }
 
 /** The agent reads a browser token allows, which chiridion's read proxy passes through. */

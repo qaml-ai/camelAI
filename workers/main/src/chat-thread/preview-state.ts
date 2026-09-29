@@ -1,19 +1,6 @@
-// Preview-state primitives for ChatThreadDO: preview-target/tab normalization
-// and preview session persistence. The public preview RPCs (getPreviewTarget /
-// getPreviewState / setPreviewTarget / setPreviewTabsState / clearPreviewTarget
-// / setPreviewAppVisibility) stay on the DO; only the normalization and
-// persistence primitives live here. `getPreviewTabId` and
-// `normalizePreviewTarget` are pure and exported as plain module functions.
-// `ChatThreadPreviewState` holds the two members that touch DO state or
-// siblings; it is stateless itself and is cached for the owning DO's lifetime
-// with closures over its live deps (ChatThreadDO keeps thin same-named private
-// delegates as its internal API). Sibling-method calls route back through the
-// deps callbacks — i.e. through the DO's delegates — so dynamic dispatch (and
-// every `ChatThreadDO.prototype['method'].call(fake)` test seam that stubs a
-// sibling on the fake) behaves exactly as it did when the bodies lived on the
-// DO.
+// A thread's preview tabs: their ids and normalization (OrgDO keeps a
+// thread's tabs; the preview route and the runtime page read them).
 import { normalizeRuntimeCallArtifacts } from "../../../../src/lib/runtime-artifacts";
-import type { SyncKvStorage } from "./pi-turn-journal";
 import type { PreviewTarget } from "./types";
 
 export function getPreviewTabId(target: PreviewTarget): string {
@@ -139,85 +126,4 @@ export function normalizePreviewTabs(
     ? activeTabId
     : (byId.keys().next().value ?? null);
   return { tabs: [...byId.values()], activeTabId: active };
-}
-
-export interface ChatThreadPreviewStateDeps {
-  kv(): SyncKvStorage;
-  // Read-only views of the DO's in-memory preview session fields (the DO owns
-  // the mutations; persistPreviewState only snapshots them into KV).
-  previewTabs(): PreviewTarget[];
-  previewActiveTabId(): string | null;
-  previewTarget(): PreviewTarget | null;
-  previewVersion(): number;
-  // Sibling routing back through the owning DO's same-named delegates, so a
-  // stubbed sibling on a fake (or a subclass override) is honored exactly as
-  // it was when these methods lived on ChatThreadDO itself.
-  getPreviewTabId(target: PreviewTarget): string;
-  normalizePreviewTarget(
-    target: PreviewTarget | null | undefined,
-  ): PreviewTarget | null;
-}
-
-export class ChatThreadPreviewState {
-  constructor(private readonly deps: ChatThreadPreviewStateDeps) {}
-
-  normalizePreviewTabsState(
-    tabs: PreviewTarget[] | null | undefined,
-    activeTabId: string | null | undefined,
-    expectedWorkspaceId?: string,
-  ): {
-    tabs: PreviewTarget[];
-    activeTabId: string | null;
-    target: PreviewTarget | null;
-  } | null {
-    const deduped: Array<{ id: string; target: PreviewTarget }> = [];
-    const dedupedById = new Map<string, number>();
-
-    if (Array.isArray(tabs)) {
-      for (const tabTarget of tabs) {
-        const normalized = this.deps.normalizePreviewTarget(tabTarget);
-        if (!normalized) continue;
-        if (
-          expectedWorkspaceId &&
-          normalized.kind === "file" &&
-          normalized.workspaceId !== expectedWorkspaceId
-        ) {
-          return null;
-        }
-
-        const tabId = this.deps.getPreviewTabId(normalized);
-        const existingIndex = dedupedById.get(tabId);
-        if (existingIndex === undefined) {
-          dedupedById.set(tabId, deduped.length);
-          deduped.push({ id: tabId, target: normalized });
-          continue;
-        }
-        deduped[existingIndex] = { id: tabId, target: normalized };
-      }
-    }
-
-    const nextActiveTabId =
-      typeof activeTabId === "string" && dedupedById.has(activeTabId)
-        ? activeTabId
-        : (deduped[0]?.id ?? null);
-
-    const nextTarget = nextActiveTabId
-      ? (deduped.find((tab) => tab.id === nextActiveTabId)?.target ?? null)
-      : null;
-
-    return {
-      tabs: deduped.map((tab) => tab.target),
-      activeTabId: nextActiveTabId,
-      target: nextTarget,
-    };
-  }
-
-  persistPreviewState(includeVersion = true): void {
-    this.deps.kv().put("previewTabs", this.deps.previewTabs());
-    this.deps.kv().put("previewActiveTabId", this.deps.previewActiveTabId());
-    this.deps.kv().put("previewTarget", this.deps.previewTarget());
-    if (includeVersion) {
-      this.deps.kv().put("previewVersion", this.deps.previewVersion());
-    }
-  }
 }

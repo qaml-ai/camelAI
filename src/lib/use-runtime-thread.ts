@@ -3,19 +3,17 @@
  * (plans/runtime-threads-direct.md §5.2). The runtime SDK's watcher reads the
  * agent itself (SSE, then long polls) with a browser token chiridion mints;
  * writes go through chiridion's routes (/api/threads/:id/{messages,inputs,stop,
- * preview}). No ChatThreadDO, no UIMessage.
+ * preview}).
  *
- * To keep Chat.tsx's machinery (send recovery, optimistic bubbles, question
- * card, preview panel) unchanged, the hook answers the same two seams the DO
- * path does: a `client` shaped like the agent connection (`call(method)`), and
- * a `chat` shaped like usePiChatStream's result, whose `messages` are the Pi
+ * Chat.tsx's machinery (send recovery, optimistic bubbles, question card,
+ * preview panel) reads the thread through two seams: a `client` shaped like a
+ * connection (`call(method)`), and a `chat` whose `messages` are the Pi
  * messages projected by pi-render. Agent state (pending question, todos,
  * errors, preview) is derived here and handed to Chat's `onStateUpdate`.
  */
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type { UIMessage } from "ai";
+import type { AgentMessage } from "@/lib/agent-messages";
+import type { AssistantMessage } from "@/lib/agent-messages";
 import type { Message, PreviewTarget } from "@/types";
 import { localToolName, runtimeInputQuestions, type RuntimeInput } from "@/lib/agent-runtime-shared";
 import { latestRuntimeTodos, piRender, type PiRenderMemo } from "@/lib/pi-render";
@@ -49,12 +47,10 @@ export interface RuntimeThreadClient {
 
 export interface RuntimeThreadChat {
   messages: Message[];
-  uiMessages: UIMessage[];
   status: "ready" | "submitted" | "streaming";
   isStreaming: boolean;
   isStallClamped: boolean;
   streamingMessageId: string | null;
-  setUiMessages(messages: UIMessage[]): void;
 }
 
 export interface RuntimeThreadState {
@@ -75,9 +71,10 @@ export interface RuntimeThreadCallbacks {
   onStateUpdate(state: RuntimeThreadState): void;
 }
 
-const OPEN = 1;
+/** A connection's readyState while it takes calls (as a WebSocket's OPEN). */
+export const CLIENT_OPEN = 1;
+const OPEN = CLIENT_OPEN;
 const CLOSED = 3;
-const EMPTY_UI_MESSAGES: UIMessage[] = [];
 /** How long a sent message counts as "submitted" without its run appearing on the stream. */
 const SUBMITTED_WINDOW_MS = 60_000;
 const RECONNECT_DELAY_MS = 1_000;
@@ -696,14 +693,12 @@ export function useRuntimeThread(options: {
   const streaming = view.running || view.partial !== null;
   const chat = useMemo<RuntimeThreadChat>(() => ({
     messages: rendered.messages,
-    uiMessages: EMPTY_UI_MESSAGES,
     // Streaming once a turn row streams; before its first token the run (or
     // this tab's send) is submitted.
     status: rendered.streamingMessageId !== null ? "streaming" : streaming || submittedAt !== null ? "submitted" : "ready",
     isStreaming: streaming,
     isStallClamped: false,
     streamingMessageId: rendered.streamingMessageId,
-    setUiMessages: () => {},
   }), [rendered, streaming, submittedAt]);
 
   const loadOlder = useCallback(async () => {

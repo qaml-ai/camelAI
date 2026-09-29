@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "../src/lib/agent-messages";
+import type { AssistantMessage } from "../src/lib/agent-messages";
 import { latestRuntimeTodos, piRender, type PiRenderMemo } from "@/lib/pi-render";
 import type { ContentBlock, ToolResultBlock, ToolUseBlock } from "@/types";
 

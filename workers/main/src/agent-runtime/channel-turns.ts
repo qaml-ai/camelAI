@@ -1,10 +1,10 @@
 /**
- * Channel threads (Discord, Slack, Telegram, email) on the direct runtime
- * path: their messages start turns with startRuntimeTurn instead of going
- * through ChatThreadDO. A thread is direct when it has a thread_runtime row:
- * new channel threads are pinned when created, and a thread the DO relays to
- * a runtime agent is adopted (the row points at that agent; its history is
- * already in the runtime). Threads on the DO's own loop stay there.
+ * Channel threads (Discord, Slack, Telegram, email) on the agent runtime:
+ * their messages start turns with startRuntimeTurn. A thread runs there by its
+ * thread_runtime row: new channel threads are pinned when created, a thread
+ * the old in-DO loop relayed to a runtime agent is adopted (the row points at
+ * that agent; its history is already in the runtime), and any other thread
+ * still on ChatThreadDO moves there first.
  *
  * The reply is the agent's to send (tools.send_<kind>_message, the channel
  * system message says so), and the runtime authorizes that tool call as the
@@ -109,14 +109,14 @@ export function channelRequestId(clientMessageId: string | null | undefined): st
 }
 
 /**
- * Start a channel message's turn on the direct path; null when the thread is
- * not a direct runtime thread (it stays on ChatThreadDO).
+ * Start a channel message's turn on the runtime; null when the thread cannot
+ * run there (its move is under way elsewhere, failed, or cannot happen).
  */
 export async function startChannelRuntimeTurn(env: ChatEnv, request: ChannelTurnRequest): Promise<ChannelTurnResult | null> {
   if (!runtimeDirectThreadsEnabled(env)) return null;
-  // A relay thread is adopted only with a member to act for it; without
-  // one it stays on ChatThreadDO, and a direct thread cannot run the turn
-  // (every tool call, the reply's included, is authorized as a member).
+  // A relay thread is adopted, and a thread still on ChatThreadDO moved, only
+  // with a member to act for it: every tool call, the reply's included, is
+  // authorized as a member.
   const context: ChatContextState | null = request.userId
     ? {
       orgId: request.orgId,
@@ -127,7 +127,7 @@ export async function startChannelRuntimeTurn(env: ChatEnv, request: ChannelTurn
       userEmail: request.userEmail ?? null,
     }
     : null;
-  // A thread on the DO's own loop moves to the runtime first, where that is on.
+  // A thread still on ChatThreadDO moves to the runtime first.
   const row = await directRuntimeRow(env, request.orgId, request.threadId, { adopt: Boolean(context) })
     ?? (context ? await migrateThreadOnSend(env, context) : null);
   if (!row) return null;

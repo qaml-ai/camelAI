@@ -5,7 +5,6 @@ import { getAuthEnv } from '@/lib/auth-helpers';
 import * as chatDO from '@/lib/chat-do.server';
 import { addThreadToExistingGroup } from '@/lib/chat-groups.server';
 import { normalizeLlmModel } from '@/lib/llm-provider-config';
-import type { ChatThreadPiCoreForkResult } from '../../../workers/main/src/chat-thread-do';
 import type { ThreadRuntimeRecord } from '../../../workers/main/src/identity/org-do';
 
 function forkThreadTitle(title: string | null | undefined): string {
@@ -17,17 +16,6 @@ function normalizeForkError(error: unknown): string {
   const message =
     error instanceof Error ? error.message : String(error || 'Failed to fork chat');
   return message;
-}
-
-function forkMessagesFailureStatus(result: ChatThreadPiCoreForkResult): number {
-  if (
-    result.code === 'TARGET_NOT_FOUND' ||
-    result.error === 'Fork target not found in Durable Object Pi messages'
-  ) {
-    return 404;
-  }
-  if (result.code === 'THREAD_MOVED') return 409;
-  return 500;
 }
 
 export async function action({ request, context, params }: Route.ActionArgs) {
@@ -66,10 +54,6 @@ export async function action({ request, context, params }: Route.ActionArgs) {
 
   const messageId =
     typeof body.messageId === 'string' ? body.messageId.trim() : '';
-  const renderedMessageId =
-    typeof body.renderedMessageId === 'string'
-      ? body.renderedMessageId.trim()
-      : '';
   if (!messageId) {
     return Response.json({ error: 'messageId is required' }, { status: 400 });
   }
@@ -84,6 +68,15 @@ export async function action({ request, context, params }: Route.ActionArgs) {
     return Response.json({ error: 'Thread not found' }, { status: 404 });
   }
   const sourceModel = normalizeLlmModel(sourceThread.model);
+  // Threads fork on the runtime: a new agent with the source's history. A
+  // thread still on ChatThreadDO forks once it has moved (opening it moves it).
+  const sourceRuntime = await orgStub.getThreadRuntime(sourceThreadId) as ThreadRuntimeRecord | null;
+  if (!sourceRuntime) {
+    return Response.json(
+      { error: 'This conversation is moving to the new chat engine; open it, then fork it once it has moved.' },
+      { status: 409 },
+    );
+  }
 
   let targetGroupId: string | null = null;
   if (groupId) {
@@ -151,95 +144,26 @@ export async function action({ request, context, params }: Route.ActionArgs) {
     return Response.json({ error: message }, { status });
   }
 
-  // A runtime thread forks on the runtime: a new agent with its history.
-  const sourceRuntime = await orgStub.getThreadRuntime(sourceThreadId) as ThreadRuntimeRecord | null;
-  if (sourceRuntime) {
-    const failed = async (status: number, error: string) => {
-      await chatDO.deleteThread(context, targetThread.id, workspaceId, { orgId }).catch(() => {});
-      return Response.json({ error }, { status });
-    };
-    if (!sourceRuntime.agentId) return await failed(404, 'Fork target not found in the thread\'s history');
-    const { forkRuntimeThread } = await import('../../../workers/main/src/agent-runtime/thread-fork');
-    const forked = await forkRuntimeThread(env as never, {
-      source: { ...sourceRuntime, agentId: sourceRuntime.agentId },
-      target: { orgId, workspaceId, threadId: targetThread.id, userId, userName: null, userEmail: null },
-      forkEntryId: messageId,
-    }).catch((error: unknown) => ({ status: 'failed' as const, error: normalizeForkError(error) }));
-    if (forked.status !== 'forked') return await failed(forked.status === 'not_found' ? 404 : 500, forked.error);
-    if (targetGroupId) {
-      await addThreadToExistingGroup(context, {
-        userId,
-        orgId,
-        workspaceId,
-        groupId: targetGroupId,
-        threadId: targetThread.id,
-      }).catch((error: unknown) => console.error('Failed to add the fork to its group:', error));
-    }
-    return Response.json({ thread: targetThread, groupId: targetGroupId });
-  }
-
-  try {
-    const sourceChatStub = env.CHAT_THREAD.get(
-      env.CHAT_THREAD.idFromName(sourceThreadId),
-    );
-    const targetChatStub = env.CHAT_THREAD.get(
-      env.CHAT_THREAD.idFromName(targetThread.id),
-    );
-    const sourceChat = sourceChatStub as unknown as {
-      getPiCoreForkMessages(options: {
-        forkEntryId: string;
-        renderedMessageId?: string;
-      }): Promise<ChatThreadPiCoreForkResult> | ChatThreadPiCoreForkResult;
-    };
-    const targetChat = targetChatStub as unknown as {
-      replacePiCoreForkMessages(messages: NonNullable<ChatThreadPiCoreForkResult['messages']>): Promise<void> | void;
-      getForkStateSnapshot: typeof targetChatStub.getForkStateSnapshot;
-      applyForkStateSnapshot: typeof targetChatStub.applyForkStateSnapshot;
-    };
-    const forkMessages = await Promise.resolve(
-      sourceChat.getPiCoreForkMessages({
-        forkEntryId: messageId,
-        renderedMessageId,
-      }),
-    );
-    if (!forkMessages.success || !forkMessages.messages?.length) {
-      await chatDO.deleteThread(context, targetThread.id, workspaceId, {
-        orgId,
-      }).catch(() => {});
-      return Response.json(
-        {
-          error:
-            forkMessages.error ||
-            'Fork target not found in Durable Object Pi messages',
-        },
-        { status: forkMessagesFailureStatus(forkMessages) },
-      );
-    }
-
-    await targetChat.replacePiCoreForkMessages(forkMessages.messages);
-    const snapshot = await sourceChatStub.getForkStateSnapshot();
-    await targetChat.applyForkStateSnapshot(snapshot, {
-      threadId: targetThread.id,
-      workspaceId,
-      orgId,
+  const failed = async (status: number, error: string) => {
+    await chatDO.deleteThread(context, targetThread.id, workspaceId, { orgId }).catch(() => {});
+    return Response.json({ error }, { status });
+  };
+  if (!sourceRuntime.agentId) return await failed(404, 'Fork target not found in the thread\'s history');
+  const { forkRuntimeThread } = await import('../../../workers/main/src/agent-runtime/thread-fork');
+  const forked = await forkRuntimeThread(env as never, {
+    source: { ...sourceRuntime, agentId: sourceRuntime.agentId },
+    target: { orgId, workspaceId, threadId: targetThread.id, userId, userName: null, userEmail: null },
+    forkEntryId: messageId,
+  }).catch((error: unknown) => ({ status: 'failed' as const, error: normalizeForkError(error) }));
+  if (forked.status !== 'forked') return await failed(forked.status === 'not_found' ? 404 : 500, forked.error);
+  if (targetGroupId) {
+    await addThreadToExistingGroup(context, {
       userId,
-    });
-    if (targetGroupId) {
-      await addThreadToExistingGroup(context, {
-        userId,
-        orgId,
-        workspaceId,
-        groupId: targetGroupId,
-        threadId: targetThread.id,
-      });
-    }
-  } catch (error) {
-    await chatDO.deleteThread(context, targetThread.id, workspaceId, {
       orgId,
-    }).catch(() => {});
-    const message = normalizeForkError(error);
-    return Response.json({ error: message }, { status: 500 });
+      workspaceId,
+      groupId: targetGroupId,
+      threadId: targetThread.id,
+    }).catch((error: unknown) => console.error('Failed to add the fork to its group:', error));
   }
-
   return Response.json({ thread: targetThread, groupId: targetGroupId });
 }

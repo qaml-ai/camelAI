@@ -13,11 +13,12 @@
  * while it lasts: the vitest workers pool listens on no port of its own.
  */
 import { exports as workerExports } from "cloudflare:workers";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "../../../../src/lib/agent-messages";
 import type { RuntimeInputAnswer } from "../../../../src/lib/agent-runtime-shared";
 import { runtimeDirectThreadsEnabled } from "../../../../src/lib/agent-runtime-shared";
-import { collectAgentEvalDeployedApps } from "../../src/chat-thread/agent-eval";
+import { getPreferredAppUrl } from "../../../../src/lib/app-url";
 import type {
+  AgentEvalDeployedApp,
   AgentEvalSessionRequest,
   AgentEvalSessionResult,
   ChatContextState,
@@ -40,6 +41,48 @@ import {
   type RuntimeRequestRecord,
   type RuntimeRunOutcome,
 } from "./runtime-eval-shape";
+
+/** The apps the eval deployed, as the eval judge reads them (their authoritative URLs). */
+export async function collectAgentEvalDeployedApps(
+  env: ChatEnv,
+  ids: { orgId?: string | null; workspaceId?: string | null },
+): Promise<AgentEvalDeployedApp[] | undefined> {
+  const workspaceId = ids.workspaceId ?? "";
+  const orgId = ids.orgId ?? "";
+  if (!workspaceId || !orgId) return undefined;
+  const orgStub = env.ORG.get(env.ORG.idFromName(orgId));
+  const scripts = await orgStub.listWorkerScriptsByWorkspace(workspaceId);
+  if (!scripts.length) return undefined;
+  // Build the app URL the same way the tools' getAppUrl does (the eval env pins the
+  // testing-grounds host via WORKER_BASE_URL/LOCAL_APP_VANITY_DOMAIN), so the result
+  // carries the authoritative *.evals.camelai.app URL with no eval-specific code.
+  let appHostname = "camelai.dev";
+  const workerBaseUrl = (env as { WORKER_BASE_URL?: string }).WORKER_BASE_URL;
+  if (workerBaseUrl) {
+    try {
+      appHostname = new URL(workerBaseUrl).host;
+    } catch {
+      appHostname = "camelai.dev";
+    }
+  }
+  const orgSlug = (await orgStub.getSlug()) ?? undefined;
+  return scripts
+    .sort((a, b) => b.updated_at - a.updated_at)
+    .map((script) => ({
+      name: script.script_name,
+      url: getPreferredAppUrl(script, {
+        hostname: {
+          hostname: appHostname,
+          vanityDomain: env.LOCAL_APP_VANITY_DOMAIN,
+          iframeDomain: env.LOCAL_APP_IFRAME_DOMAIN,
+        },
+        orgSlug,
+        orgCustomDomain: null,
+      }),
+      isPublic: script.is_public,
+    }));
+}
+
 
 export interface RuntimeEvalEnv {
   /** The eval relay on this machine (scripts/lib/eval-runtime-relay.mjs). */

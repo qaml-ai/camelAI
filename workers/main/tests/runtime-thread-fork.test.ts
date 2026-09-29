@@ -15,7 +15,7 @@ vi.mock("../src/agent-runtime/runtime-api.js", async (importOriginal) => ({
 import { forkRuntimeThread } from "../src/agent-runtime/thread-fork";
 import type { ChatEnv } from "../src/chat-thread/types";
 import { hostedModelHeaders } from "../src/agent-runtime/key-scopes";
-import { RUNTIME_PROMPT_VERSION } from "../src/chat-thread/runtime-agent";
+import { RUNTIME_PROMPT_VERSION } from "../src/agent-runtime/runtime-prompt";
 
 const history = [
   { role: "user", content: "build it", timestamp: 1 },

@@ -1,5 +1,4 @@
 import type { OrgDO } from "./auth";
-import type { ConnectionSetupResponse } from "./chat-thread-browser-prompts";
 import type { IntegrationCategory } from "../../../src/types";
 import { encryptCredentials } from "../../../src/lib/integration-crypto";
 import {
@@ -23,6 +22,18 @@ import {
   discordChannelCatalogAvailable,
   type DiscordBridgeFetcher,
 } from "./discord-types";
+
+/** What a connection setup prompt answers (the user's form, or a cancel). */
+export interface ConnectionSetupResponse {
+  requestId: string;
+  cancelled: boolean;
+  integration?: {
+    type: string;
+    name: string;
+    config: Record<string, unknown>;
+    credentials: Record<string, unknown>;
+  };
+}
 
 interface CodeModeIntegrationsEnv {
   INTEGRATION_SECRET_KEY: string;

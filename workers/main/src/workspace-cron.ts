@@ -1,11 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { wrapWorkflowBinding } from "@cloudflare/dynamic-workflows";
 import type { OrgDO, OrgThread } from "./auth";
-import type {
-  ChatThreadDO,
-  InitialUserMessageRequest,
-  InitialUserMessageResult,
-} from "./chat-thread-do";
+import type { ChatThreadDO } from "./chat-thread-do";
 import {
   getCronMinimumIntervalMs,
   getNextCronRunAt,
@@ -170,12 +166,6 @@ interface DispatchResult {
   threadId: string;
   accepted?: boolean;
 }
-
-type InitialUserMessageRpc = {
-  startInitialUserMessage: (
-    body: InitialUserMessageRequest,
-  ) => Promise<InitialUserMessageResult>;
-};
 
 interface DeterministicAutomationDispatchResult {
   status: DeterministicAutomationRunStatus;
@@ -497,8 +487,7 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       this.ctx.storage.kv.put("schemaVersion", 6);
     }
 
-    // The outcome a direct runtime thread's run reports
-    // (report_automation_outcome), where ChatThreadDO kept its own.
+    // The outcome a runtime thread's run reports (report_automation_outcome).
     if (version < 7) {
       this.sql.exec("ALTER TABLE automation_runs ADD COLUMN reported_status TEXT");
       this.sql.exec("ALTER TABLE automation_runs ADD COLUMN reported_summary TEXT");
@@ -1158,7 +1147,7 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       userId: null,
       userName: null,
       userEmail: null,
-    }).catch((error) => console.warn("[WorkspaceCronDO] new prompt thread stays on ChatThreadDO", error));
+    }).catch((error) => console.warn("[WorkspaceCronDO] could not pin a new prompt thread to the agent runtime", error));
   }
 
   private async ensureRunnableThread(
@@ -1224,96 +1213,26 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     });
     try {
       const actor = await this.scheduledRunActor(prompt, workspace);
-      if (actor) {
-        const direct = await startScheduledRuntimeTurn(this.env as unknown as ChatEnv, {
-          orgId: workspace.org_id,
-          workspaceId: workspace.id,
-          threadId,
-          userId: actor,
-          runId,
-          message: this.buildScheduledMessage(prompt, scheduledForMs),
-        });
-        if (direct) {
-          if (direct.status === "accepted") return { status: "success", threadId, accepted: true };
-          return {
-            status: direct.status,
-            error: direct.error ?? (direct.status === "busy" ? "Thread is busy with another run" : "Unknown chat error"),
-            threadId,
-          };
-        }
+      if (!actor) return { status: "error", error: "No workspace member to run this scheduled prompt as", threadId };
+      const direct = await startScheduledRuntimeTurn(this.env as unknown as ChatEnv, {
+        orgId: workspace.org_id,
+        workspaceId: workspace.id,
+        threadId,
+        userId: actor,
+        runId,
+        message: this.buildScheduledMessage(prompt, scheduledForMs),
+      });
+      if (!direct) {
+        return { status: "error", error: "The scheduled prompt's thread could not move to the agent runtime", threadId };
       }
+      if (direct.status === "accepted") return { status: "success", threadId, accepted: true };
+      return {
+        status: direct.status,
+        error: direct.error ?? (direct.status === "busy" ? "Thread is busy with another run" : "Unknown chat error"),
+        threadId,
+      };
     } catch (error) {
       return { status: "error", error: error instanceof Error ? error.message : String(error), threadId };
-    }
-    if (!this.env.CHAT_THREAD) {
-      return {
-        status: "error",
-        error: "Chat thread binding is not configured",
-        threadId,
-      };
-    }
-    const chatThreadStub = this.env.CHAT_THREAD.get(
-      this.env.CHAT_THREAD.idFromName(threadId),
-    ) as unknown as InitialUserMessageRpc;
-
-    try {
-      const payload = await chatThreadStub.startInitialUserMessage({
-        threadId,
-        workspaceId: workspace.id,
-        orgId: workspace.org_id,
-        userId: prompt.created_by,
-        userName: "Scheduler",
-        messageSource: "scheduled prompt",
-        message: this.buildScheduledMessage(prompt, scheduledForMs),
-        automationRun: {
-          workspaceId: workspace.id,
-          automationId: prompt.id,
-          runId,
-          requiresExplicitOutcome: true,
-        },
-      });
-      switch (payload.status) {
-        case "accepted":
-          return {
-            status: "success",
-            threadId,
-            accepted: true,
-          };
-        case "busy":
-          return {
-            status: "busy",
-            error: "Thread is busy with another run",
-            threadId,
-          };
-        case "moved":
-          // Moved to the runtime since this dispatch looked: the next run goes there.
-          return {
-            status: "busy",
-            error: "The thread moved to the agent runtime; the next run goes there",
-            threadId,
-          };
-        case "error":
-          return {
-            status: "error",
-            error:
-              typeof payload.error === "string"
-                ? payload.error
-                : "Unknown chat error",
-            threadId,
-          };
-        default:
-          return {
-            status: "error",
-            error: "Unexpected response from chat thread",
-            threadId,
-          };
-      }
-    } catch (error) {
-      return {
-        status: "error",
-        error: error instanceof Error ? error.message : String(error),
-        threadId,
-      };
     }
   }
 

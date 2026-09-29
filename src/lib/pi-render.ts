@@ -13,8 +13,7 @@
  * - An aborted response ends with "Stopped by user"; a failed one with an
  *   error block.
  */
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AgentMessage, AssistantMessage } from "@/lib/agent-messages";
 import type { ContentBlock, ErrorBlock, FileBlock, Message, ToolResultBlock } from "@/types";
 import { localToolName, readableProviderError } from "@/lib/agent-runtime-shared";
 import { parseUploadRefs } from "@/lib/chat-attachment-refs";
@@ -23,7 +22,47 @@ import {
   buildToolUseFromPiItem,
   type PiThreadItem,
 } from "@/lib/pi-tool-builders";
-import { mergeLiveToolOutput } from "@/lib/use-pi-chat-stream";
+
+function isAgentProgressTool(name: string): boolean {
+  return name === "Task" || name === "Agent" || name === "agent" ||
+    name === "Explore" || name === "explore" || name === "Research" ||
+    name === "Oracle";
+}
+
+/** Splice a running tool's live output after its tool_use, until its settled
+ * tool_result replaces it. Returns the message unchanged (same identity) when
+ * nothing merges. */
+export function mergeLiveToolOutput(
+  message: Message,
+  toolStream: Map<string, string>,
+): Message {
+  if (typeof message.content === "string") return message;
+  const settled = new Set<string>();
+  for (const block of message.content) {
+    if (block.type === "tool_result") settled.add(block.tool_use_id);
+  }
+  const next: ContentBlock[] = [];
+  let changed = false;
+  for (const block of message.content) {
+    next.push(block);
+    if (block.type === "tool_use" && !settled.has(block.id)) {
+      const liveText = toolStream.get(block.id);
+      if (liveText) {
+        next.push({
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: liveText,
+          status: "succeeded",
+          ...(isAgentProgressTool(block.name) ? { isTaskUpdate: true } : {}),
+          itemId: block.id,
+          ...(block.itemKind ? { itemKind: block.itemKind } : {}),
+        });
+        changed = true;
+      }
+    }
+  }
+  return changed ? { ...message, content: next } : message;
+}
 
 const STOPPED_BY_USER_TEXT = "Stopped by user";
 

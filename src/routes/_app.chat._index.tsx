@@ -53,10 +53,6 @@ import {
   sanitizeSalesPrompt,
 } from "@/lib/sales-prompt.server";
 import {
-  isTransientDurableObjectRpcError,
-  retryTransientDurableObjectRpc,
-} from "@/lib/do-rpc-retry.server";
-import {
   saveChatGroupRename,
   type ChatGroupRenameInput,
 } from "@/lib/chat-group-rename.client";
@@ -757,9 +753,8 @@ export async function action({ request, context }: Route.ActionArgs) {
         },
       );
 
-      // Where the thread runs: on the hosted agent runtime directly (no
-      // ChatThreadDO) when this deployment runs new threads there and the
-      // thread's model can, else on ChatThreadDO.
+      // The thread runs on the hosted agent runtime; a model the runtime has
+      // no route for cannot start one.
       const runtimeThreads = await import("@/lib/runtime-threads.server");
       const threadContext = {
         threadId: thread.id,
@@ -775,6 +770,10 @@ export async function action({ request, context }: Route.ActionArgs) {
           console.error("Failed to pin a new thread to the agent runtime:", error);
           return null;
         });
+      if (!runtimeRow) {
+        await chatDO.deleteThread(context, thread.id, workspaceId, { orgId }).catch(() => {});
+        throw new Error("This chat's model is not available right now. Pick another model and try again.");
+      }
 
       // Set preview apps if provided (for "chat with this app" flow)
       if (previewAppsRaw) {
@@ -788,12 +787,7 @@ export async function action({ request, context }: Route.ActionArgs) {
             scriptName,
             isPublic: script?.is_public ?? false,
           };
-          if (runtimeRow) {
-            await env.ORG.get(env.ORG.idFromName(orgId))
-              .upsertThreadPreviewTarget(thread.id, target);
-          } else {
-            await chatDO.setThreadPreviewTarget(context, thread.id, target);
-          }
+          await chatDO.setThreadPreviewTarget(context, orgId, thread.id, target);
         }
         recordChatCreateThreadStage(
           env,
@@ -897,7 +891,7 @@ export async function action({ request, context }: Route.ActionArgs) {
         },
       );
 
-      if (shouldStartAndRedirect && firstMessage && runtimeRow) {
+      if (shouldStartAndRedirect && firstMessage) {
         // Sent before the redirect, so the thread page finds the agent and the
         // message on its first read.
         const initialStartStartedAt = Date.now();
@@ -936,83 +930,6 @@ export async function action({ request, context }: Route.ActionArgs) {
             { model: thread.model, size: firstMessage.length },
           );
         }
-      } else if (shouldStartAndRedirect && firstMessage) {
-        const initialStartStartedAt = Date.now();
-        const chatThreadStub = env.CHAT_THREAD.get(
-          env.CHAT_THREAD.idFromName(thread.id),
-        );
-        const initialMessageRequest = {
-          threadId: thread.id,
-          workspaceId,
-          orgId,
-          userId,
-          userName: session.user_name ?? null,
-          userEmail: session.user_email ?? null,
-          message: firstMessage,
-          clientMessageId: `initial:${thread.id}`,
-        };
-        // Start the turn in the background and redirect immediately. The thread
-        // page seeds its normal transcript from the persisted thread record while
-        // durable render history and live running state connect.
-        waitUntil(
-          retryTransientDurableObjectRpc(
-            "ChatThreadDO.startInitialUserMessage",
-            async () => {
-              const result =
-                await chatThreadStub.startInitialUserMessage(
-                  initialMessageRequest,
-                );
-              if (
-                result.status === "error" &&
-                isTransientDurableObjectRpcError(
-                  new Error(result.error ?? "Transient Durable Object error"),
-                )
-              ) {
-                throw new Error(result.error);
-              }
-              return result;
-            },
-            {
-              attempts: 4,
-              initialDelayMs: 150,
-            },
-          )
-            .then((result) => {
-              recordChatCreateThreadStage(
-                env,
-                traceContext,
-                traceIds,
-                "initial_message_start_completed",
-                initialStartStartedAt,
-                {
-                  model: thread.model,
-                  status: result.status,
-                  size: firstMessage.length,
-                },
-              );
-              if (result.status !== "accepted") {
-                console.error(
-                  "Failed to start initial user message:",
-                  result.error ?? result.status,
-                );
-              }
-            })
-            .catch((error) => {
-              console.error("Failed to start initial user message:", error);
-              recordChatCreateThreadError(
-                env,
-                traceContext,
-                traceIds,
-                "initial_message_start_completed",
-                initialStartStartedAt,
-                error,
-                {
-                  model: thread.model,
-                  size: firstMessage.length,
-                },
-              );
-            }),
-        );
       }
 
       if (shouldStartAndRedirect) {

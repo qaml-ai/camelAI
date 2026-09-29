@@ -8,7 +8,6 @@ import {
   useRevalidator,
 } from "react-router";
 import type { Route } from "./+types/_app.chat.$id";
-import type { UIMessage } from "ai";
 import {
   requireAuthContext,
   requireSuperuser,
@@ -45,14 +44,13 @@ import {
 import { getEffectiveLlmProviderConfig } from "@/lib/selfhost-ai-provider";
 import { isSelfhostRuntime } from "@/lib/selfhost-runtime";
 import { modelCatalogEntriesForIds } from "@/lib/model-catalog";
-import { getOrg, getWorkerScript } from "@/lib/auth-do";
+import { getOrg } from "@/lib/auth-do";
 import { switchSessionOrg, switchSessionWorkspace } from "@/lib/auth-do";
 import { validateSessionIdentityMapsToOrg } from "../../workers/main/src/helpers/proxy-auth-providers";
 import type { ProxyAuthValidationEnv } from "../../workers/main/src/helpers/proxy-auth-core";
 import { getChatDebugFlags } from "@/lib/chat-debug-flags";
 import { shouldRevalidateActiveChatRoute } from "@/lib/chat-route-revalidation";
 import { resolveMessageAuthorDisplayName } from "@/lib/message-author";
-import { messageToUiMessage } from "@/lib/ui-message-adapter";
 import {
   saveChatGroupRename,
   type ChatGroupRenameInput,
@@ -66,11 +64,12 @@ import {
 } from "@/lib/chat-groups.server";
 import { readThreadMessages } from "@/lib/chat-history.server";
 import type { RuntimeThreadSeed } from "@/lib/use-runtime-thread";
-import { runtimeDirectThreadsEnabled } from "@/lib/agent-runtime-shared";
 import type { ThreadRuntimeRecord } from "../../workers/main/src/identity/org-do";
+import type { UnmovedThreadOpen } from "@/lib/runtime-threads.server";
 import Chat from "@/components/Chat";
 import { ChatTabBar } from "@/components/chat-tab-bar";
 import { ChatLoadingSkeleton } from "@/components/chat/chat-loading";
+import { ChatMovingNotice, readOnlyMoveNotice } from "@/components/chat/chat-moving-notice";
 import { NoWorkspacesError } from "@/components/no-workspaces-error";
 import {
   getCloseGroupRedirect,
@@ -263,43 +262,27 @@ export async function action({ request, context, params }: Route.ActionArgs) {
     if (!updated) {
       return { error: "Thread not found" };
     }
-    try {
-      const env = getEnv(context);
-      // A runtime thread has no ChatThreadDO: its next send configures the
-      // agent with the new model.
-      const runtime = await chatDO.getThreadRuntime(context, params.id, orgId);
-      if (runtime) return { thread: updated };
-      const chatThread = env.CHAT_THREAD.get(
-        env.CHAT_THREAD.idFromName(params.id),
-      ) as unknown as {
-        setModel(model: LlmModel, updatedAt?: number): Promise<void>;
-        refreshRunnerConfig(): Promise<void>;
-      };
-      await chatThread.setModel(updated.model, updated.updated_at);
-      await chatThread.refreshRunnerConfig();
-    } catch (error) {
-      console.error("Failed to broadcast thread model update:", error);
-    }
-
+    // The thread's next send configures its runtime agent with the new model.
     return { thread: updated };
   }
 
   return { error: "Unknown action" };
 }
 
+/** A thread still on ChatThreadDO: moving to the runtime, or shown read-only because it cannot move. */
+type ChatMoveState =
+  | { state: "moving" }
+  | { state: "readonly"; reason: string; truncated: boolean };
+
 interface ChatData {
   messages: Message[];
   messagesError: string | null;
-  // ai-chat-owned durable render history (commit 4). The live-user loader branch
-  // fetches this via getUiMessages(); useAgentChat mounts it as its initial
-  // messages. The admin-readonly branch leaves it empty (it renders pi_core).
-  initialUiMessages: UIMessage[];
-  olderUiMessagesCursor: string | null;
   todos: TodoItem[];
   previewTabs: PreviewTarget[];
   activeTabId: string | null;
-  /** A thread on the agent runtime: what the browser watches it from (no DO). */
+  /** A thread on the agent runtime: what the browser watches it from. */
   runtime?: RuntimeThreadSeed | null;
+  move?: ChatMoveState | null;
 }
 
 type ChatDataValue = ChatData | Promise<ChatData>;
@@ -307,25 +290,17 @@ type ChatDataValue = ChatData | Promise<ChatData>;
 const EMPTY_CHAT_DATA: ChatData = {
   messages: [],
   messagesError: null,
-  initialUiMessages: [],
-  olderUiMessagesCursor: null,
   todos: [],
   previewTabs: [],
   activeTabId: null,
 };
 
 /**
- * Which backend each thread this tab has loaded runs on: a runtime thread
- * never connects to ChatThreadDO, so a thread whose backend is not known yet
- * waits for its loader before connecting.
+ * Threads this tab has loaded that run on the runtime: a thread switched to in
+ * the tab bar connects at once when it is one, and otherwise waits for its
+ * loader (it may still be moving there).
  */
-const threadBackends = new Map<string, "runtime" | "do">();
-function rememberThreadBackend(threadId: string, backend: "runtime" | "do") {
-  threadBackends.set(threadId, backend);
-}
-function knownThreadBackend(threadId: string): "runtime" | "do" | undefined {
-  return threadBackends.get(threadId);
-}
+const runtimeThreadIds = new Set<string>();
 
 function isPromiseLike<T>(value: T | Promise<T>): value is Promise<T> {
   return typeof (value as Promise<T>).then === "function";
@@ -357,7 +332,6 @@ function buildChatDataError(error: unknown): ChatData {
   console.error("Failed to load chat data:", error);
   return {
     ...EMPTY_CHAT_DATA,
-    initialUiMessages: [],
     messagesError: "Failed to load chat messages",
   };
 }
@@ -458,34 +432,31 @@ function useDeferredChatData(
   };
 }
 
-function getPreviewTabId(target: PreviewTarget): string {
-  if (target.kind === "app") return `app:${target.scriptName}`;
-  if (target.kind === "runtime_artifact") return `artifact:${target.artifact.id}`;
-  return `file:${target.workspaceId}:${target.source}:${target.project ?? ""}:${target.path}`;
-}
-
 async function buildChatData(
   context: Route.LoaderArgs["context"],
-  authEnv: ReturnType<typeof getAuthEnv>,
   threadId: string,
   options: {
     orgId: string;
     workspaceId: string;
-    // Admin-readonly branch only: fetch the legacy pi_core transcript
-    // (readThreadMessages) it renders directly. The live branch leaves it off —
-    // its transcript is the ai-chat render history, so a normal chat load makes
-    // exactly ONE transcript RPC (Chat.tsx derives any fallback Message view
-    // from initialUiMessages).
-    loadLegacyMessages: boolean;
-    // Live-user branch only: fetch the ai-chat render history (getUiMessages)
-    // that useAgentChat mounts. Admin-readonly leaves it off (renders pi_core).
-    loadUiMessages: boolean;
+    /** The admin viewer: the whole transcript, wherever the thread runs. */
+    adminTranscript?: boolean;
     skipBanCheck?: boolean;
-    /** The thread's runtime row: its page loads from the runtime, not the DO. */
+    /** The thread's runtime row: its page loads from the runtime. */
     runtime?: ThreadRuntimeRecord | null;
+    /** A thread still on ChatThreadDO: moving, or read-only (its history from the DO's exporter). */
+    move?: Exclude<UnmovedThreadOpen, { state: "runtime" }> | null;
     userId?: string | null;
   },
 ): Promise<ChatData> {
+  if (options.adminTranscript) {
+    const messages = await readThreadMessages(context, {
+      workspaceId: options.workspaceId,
+      orgId: options.orgId,
+      threadId,
+      skipBanCheck: options.skipBanCheck,
+    });
+    return { ...EMPTY_CHAT_DATA, messages };
+  }
   if (options.runtime && options.userId) {
     // Loaded on demand: the runtime client reaches Worker-only modules.
     const { loadRuntimeThreadSeed } = await import("@/lib/runtime-threads.server");
@@ -504,107 +475,16 @@ async function buildChatData(
       runtime: seed,
     };
   }
-  const previewDataPromise = (async () => {
-    const previewStateRaw = await chatDO
-      .getThreadPreviewState(context, threadId)
-      .catch(() => ({
-        target: null,
-        tabs: [],
-        activeTabId: null,
-        version: 0,
-      }));
-
-    const applyAppVisibility = async (
-      target: PreviewTarget,
-    ): Promise<PreviewTarget> => {
-      if (target.kind !== "app") {
-        return target;
-      }
-      const script = await getWorkerScript(
-        authEnv,
-        options.orgId,
-        target.scriptName,
-      );
-      if (!script) {
-        return target;
-      }
-      return {
-        ...target,
-        isPublic: script.is_public,
-      };
-    };
-
-    const previewTabs = await Promise.all(
-      previewStateRaw.tabs.map(applyAppVisibility),
-    );
-    const tabIds = new Set(previewTabs.map(getPreviewTabId));
-
-    let activeTabId = previewStateRaw.activeTabId;
-    if (!activeTabId || !tabIds.has(activeTabId)) {
-      activeTabId = previewTabs[0] ? getPreviewTabId(previewTabs[0]) : null;
-    }
-
+  if (options.move?.state === "readonly") {
+    const { readOnlyThreadHistory } = await import("@/lib/runtime-threads.server");
+    const history = await readOnlyThreadHistory(context, threadId);
     return {
-      previewTabs,
-      activeTabId,
+      ...EMPTY_CHAT_DATA,
+      messages: history.messages as unknown as Message[],
+      move: { state: "readonly", reason: options.move.reason, truncated: history.truncated },
     };
-  })();
-
-  const messagesPromise = options.loadLegacyMessages
-    ? readThreadMessages(context, {
-        workspaceId: options.workspaceId,
-        orgId: options.orgId,
-        threadId,
-        skipBanCheck: options.skipBanCheck,
-      })
-        .then((messages) => ({ messages, messagesError: null }))
-    : Promise.resolve({ messages: [], messagesError: null });
-  // The live branch has no legacy transcript to fall back on, so a failed
-  // render-history read must surface as messagesError instead of silently
-  // rendering an empty thread.
-  const uiMessagesPromise = options.loadUiMessages
-    ? chatDO
-        .getUiMessagePage(context, threadId)
-        .then((page) => ({ page, uiMessagesError: null }))
-        .catch((error) => {
-          console.error("Failed to load ai-chat render history:", error);
-          return {
-            page: {
-              messages: [] as UIMessage[],
-              nextCursor: null,
-              hasMore: false,
-            },
-            uiMessagesError: "Failed to load chat messages",
-          };
-        })
-    : Promise.resolve({
-        page: {
-          messages: [] as UIMessage[],
-          nextCursor: null,
-          hasMore: false,
-        },
-        uiMessagesError: null,
-      });
-  const todosPromise = chatDO
-    .getTodoState(context, threadId)
-    .catch(() => [] as unknown[]);
-
-  const [previewData, messageData, uiMessageData, todos] = await Promise.all([
-    previewDataPromise,
-    messagesPromise,
-    uiMessagesPromise,
-    todosPromise,
-  ]);
-  return {
-    ...previewData,
-    messages: messageData.messages,
-    messagesError: messageData.messagesError ?? uiMessageData.uiMessagesError,
-    initialUiMessages: uiMessageData.page.messages,
-    olderUiMessagesCursor: uiMessageData.page.hasMore
-      ? uiMessageData.page.nextCursor
-      : null,
-    todos: Array.isArray(todos) ? (todos as TodoItem[]) : [],
-  };
+  }
+  return { ...EMPTY_CHAT_DATA, move: { state: "moving" } };
 }
 
 async function findAccessibleGroupWorkspace(
@@ -625,6 +505,9 @@ async function findAccessibleGroupWorkspace(
     ) ?? null
   );
 }
+
+/** How long opening a thread still on ChatThreadDO waits for its move before the page shows it moving. */
+const OPEN_MOVE_WAIT_MS = 3_000;
 
 export async function loader({ request, context, params }: Route.LoaderArgs) {
   const loaderStartedAt = Date.now();
@@ -662,11 +545,10 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
     return {
       threadId: params.id,
       workspaceId: threadContext.workspace_id,
-      chatData: await buildChatData(context, authEnv, params.id, {
+      chatData: await buildChatData(context, params.id, {
         orgId: threadContext.org_id,
         workspaceId: threadContext.workspace_id,
-        loadLegacyMessages: true,
-        loadUiMessages: false,
+        adminTranscript: true,
         skipBanCheck: true,
       }),
       threadTitle: thread?.title ?? threadContext.title ?? null,
@@ -804,34 +686,33 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
   const threadPromise = chatDO.getThread(context, params.id, workspaceId, {
     orgId: authContext.currentOrg.id,
   });
-  // A thread on the agent runtime loads from the runtime; this decides which
-  // path the page takes before anything connects.
-  const runtimePromise = chatDO
+  // Where the thread is, decided before anything connects: on the runtime,
+  // or still on ChatThreadDO, which moves it as it is opened (the page waits
+  // for the move, or shows the thread read-only when it cannot move). Only
+  // once the thread has resolved for this workspace: a thread id from
+  // elsewhere is never touched.
+  const backendPromise: Promise<UnmovedThreadOpen | null> = chatDO
     .getThreadRuntime(context, params.id, authContext.currentOrg.id)
     .catch((error: unknown) => {
       console.error("Failed to read the thread's runtime row:", error);
       return null;
     })
-    // A thread still on ChatThreadDO moves to the runtime as it is opened,
-    // where AGENT_RUNTIME_MIGRATE_DO_THREADS is on; otherwise it shows from the
-    // DO. Only once the thread has resolved for this workspace: a thread id
-    // from elsewhere is never touched.
-    .then(async (row) => {
-      if (row) return row;
+    .then(async (row): Promise<UnmovedThreadOpen | null> => {
+      if (row) return { state: "runtime", row };
       const resolved = await threadPromise.catch(() => null);
       if (!resolved) return null;
       return await (await import("@/lib/runtime-threads.server"))
-        .migrateThreadOnOpen(context, {
+        .openUnmovedThread(context, {
           orgId: authContext.currentOrg.id,
           workspaceId,
           threadId: params.id,
           userId: authContext.user?.id ?? null,
           userName: authContext.user?.name ?? null,
           userEmail: authContext.user?.email ?? null,
-        }, waitUntil)
-        .catch((error: unknown) => {
+        }, waitUntil, OPEN_MOVE_WAIT_MS)
+        .catch((error: unknown): UnmovedThreadOpen => {
           console.error("Failed to move the thread to the runtime:", error);
-          return null;
+          return { state: "moving" };
         });
     });
   const pickerStatePromise = chatDO
@@ -854,13 +735,15 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
     billingOverview,
     thread,
     pickerState,
-    runtime,
+    backend,
   ] = await Promise.all([
     billingOverviewPromise,
     threadPromise,
     pickerStatePromise,
-    runtimePromise,
+    backendPromise,
   ]);
+  const runtime = backend?.state === "runtime" ? backend.row : null;
+  const move = backend && backend.state !== "runtime" ? backend : null;
   const devCreditStatus = getDevBillingCreditStatus(url.searchParams);
   const pausedPickerState = pickerState
     ? chatDO.applyHostedCreditPause(
@@ -919,10 +802,10 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
     },
   ).map((option) => option.value);
 
-  // Seed the ordinary transcript path from the warm thread record while the
-  // durable ai-chat render history resolves. This applies uniformly to new,
-  // existing, API-created, forked, and reloaded threads; it is paint data only,
-  // never a signal that a turn is running.
+  // Seed the transcript from the warm thread record while the runtime's
+  // history resolves. This applies uniformly to new, existing, API-created,
+  // forked, and reloaded threads; it is paint data only, never a signal that
+  // a turn is running.
   const firstMessage = thread.first_user_message?.trim();
   const seededFirstMessage = firstMessage
     ? threadRecordFirstUserMessage(
@@ -931,20 +814,16 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
         thread.created_by === authContext.user.id ? authContext.user : null,
       )
     : null;
-  const chatDataSeed: ChatData = seededFirstMessage
-    ? {
-        ...EMPTY_CHAT_DATA,
-        initialUiMessages: [messageToUiMessage(seededFirstMessage)],
-      }
+  const chatDataSeed: ChatData = seededFirstMessage && runtime
+    ? { ...EMPTY_CHAT_DATA, messages: [seededFirstMessage] }
     : EMPTY_CHAT_DATA;
   const chatDataStartedAt = Date.now();
   const chatData: ChatDataValue = thread
-    ? buildChatData(context, authEnv, params.id, {
+    ? buildChatData(context, params.id, {
         orgId,
         workspaceId,
-        loadLegacyMessages: false,
-        loadUiMessages: true,
         runtime,
+        move,
         userId: actingUserId,
       })
         .then((resolvedChatData) => {
@@ -957,7 +836,7 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
             {
               status: "loaded",
               model: thread.model,
-              count: resolvedChatData.initialUiMessages.length,
+              count: resolvedChatData.messages.length,
               size: resolvedChatData.previewTabs.length,
             },
           );
@@ -1069,7 +948,6 @@ export async function loader({ request, context, params }: Route.LoaderArgs) {
     moveChatGroups,
     chatDataSeed,
     runtimeThread: Boolean(runtime),
-    directRuntimeThreads: runtimeDirectThreadsEnabled(env as never),
   };
 }
 
@@ -1103,7 +981,6 @@ export default function ChatPage() {
     moveChatGroups = [],
     chatDataSeed = EMPTY_CHAT_DATA,
     runtimeThread = false,
-    directRuntimeThreads = false,
   } = useLoaderData<typeof loader>();
   const {
     chatData: resolvedChatData,
@@ -1185,16 +1062,13 @@ export default function ChatPage() {
       : threadModel;
   const displayAllowedThreadModels = allowedThreadModels;
   // A thread switched to in the tab bar before its loader answers connects
-  // once its backend is known (remembered from an earlier load, or this one's).
-  const loaderBackend = runtimeThread ? "runtime" : "do";
-  // Where no thread runs on the runtime, every thread is a DO thread: never wait.
-  const displayBackend = isDisplayingLoaderThread
-    ? loaderBackend
-    : (displayThreadId && knownThreadBackend(displayThreadId)) ||
-      (directRuntimeThreads ? "pending" : "do");
+  // once it is known to run on the runtime (from an earlier load, or this one).
+  const displayBackend: "runtime" | "pending" = isDisplayingLoaderThread
+    ? runtimeThread ? "runtime" : "pending"
+    : displayThreadId && runtimeThreadIds.has(displayThreadId) ? "runtime" : "pending";
   useEffect(() => {
-    if (threadId) rememberThreadBackend(threadId, loaderBackend);
-  }, [threadId, loaderBackend]);
+    if (threadId && runtimeThread) runtimeThreadIds.add(threadId);
+  }, [threadId, runtimeThread]);
   const cachedSnapshot = displayThreadId ? getSnapshot(displayThreadId) : null;
   const shouldUseCachedSnapshot = Boolean(
     cachedSnapshot && (!isDisplayingLoaderThread || isLoadingChatData),
@@ -1208,6 +1082,11 @@ export default function ChatPage() {
     isLoadingChatData &&
     !shouldUseCachedSnapshot &&
     displayChatData.messages.length === 0;
+  // A thread that could not move to the runtime: its history, read-only.
+  const readOnlyMove =
+    isDisplayingLoaderThread && displayChatData.move?.state === "readonly"
+      ? displayChatData.move
+      : null;
 
   useEffect(() => {
     markThreadIdleRef.current = markThreadIdle;
@@ -1399,7 +1278,6 @@ export default function ChatPage() {
   const handleSnapshotChange = useCallback(
     (snapshot: {
       messages: Message[];
-      uiMessages: UIMessage[];
       streamingMessageId: string | null;
       todos: TodoItem[];
     }) => {
@@ -1442,43 +1320,50 @@ export default function ChatPage() {
           />
         ) : null}
         <div className="flex min-h-0 flex-1 flex-col">
-          <Chat
-            key={`${displayThreadId}:${displayBackend}`}
-            threadId={displayThreadId}
-            workspaceId={workspaceId}
-            chatGroupId={liveActiveChatGroup?.id ?? resolvedActiveGroupId}
-            initialMessages={displayChatData.messages}
-            initialUiMessages={displayChatData.initialUiMessages}
-            olderUiMessagesCursor={displayChatData.olderUiMessagesCursor}
-            bridgedStreamingMessageId={displayChatData.bridgedStreamingMessageId}
-            initialTodos={displayChatData.todos}
-            threadModel={displayThreadModel}
-            llmProvider={llmProvider}
-            allowedThreadModels={displayAllowedThreadModels}
-            modelOptions={modelOptions ?? undefined}
-            effectivePickerDefaultModel={effectivePickerDefaultModel}
-            hasEffectivePickerDefault={hasEffectivePickerDefault}
-            billingAccessMode={billingAccessMode}
-            canUnlockPremiumModels={canUnlockPremiumModels}
-            hostedCreditsPaused={hostedCreditsPaused}
-            modelPickerSettingsHref={modelPickerSettingsHref}
-            allowOpenAiSubscription={allowOpenAiSubscription}
-            billingCreditStatus={billingCreditStatus}
-            initialError={initialChatError ?? displayChatData.messagesError}
-            initialPreviewTabs={displayChatData.previewTabs}
-            initialActiveTabId={displayChatData.activeTabId}
-            hostname={hostname}
-            orgSlug={orgSlug}
-            connections={connections}
-            projects={projects}
-            onSnapshotChange={handleSnapshotChange}
-            isOrgAdmin={isOrgAdmin}
-            recentModelScope={recentModelScope}
-            isLoadingMessages={isLoadingDisplayMessages}
-            readOnly={readOnly}
-            backend={displayBackend}
-            runtimeSeed={isDisplayingLoaderThread ? resolvedChatData.runtime ?? null : null}
-          />
+          {isDisplayingLoaderThread && displayChatData.move?.state === "moving" ? (
+            <ChatMovingNotice
+              key={displayThreadId}
+              threadId={displayThreadId}
+              workspaceId={workspaceId}
+              onSettled={() => revalidator.revalidate()}
+            />
+          ) : (
+            <Chat
+              key={`${displayThreadId}:${displayBackend}`}
+              threadId={displayThreadId}
+              workspaceId={workspaceId}
+              chatGroupId={liveActiveChatGroup?.id ?? resolvedActiveGroupId}
+              initialMessages={displayChatData.messages}
+              initialTodos={displayChatData.todos}
+              threadModel={displayThreadModel}
+              llmProvider={llmProvider}
+              allowedThreadModels={displayAllowedThreadModels}
+              modelOptions={modelOptions ?? undefined}
+              effectivePickerDefaultModel={effectivePickerDefaultModel}
+              hasEffectivePickerDefault={hasEffectivePickerDefault}
+              billingAccessMode={billingAccessMode}
+              canUnlockPremiumModels={canUnlockPremiumModels}
+              hostedCreditsPaused={hostedCreditsPaused}
+              modelPickerSettingsHref={modelPickerSettingsHref}
+              allowOpenAiSubscription={allowOpenAiSubscription}
+              billingCreditStatus={billingCreditStatus}
+              initialError={initialChatError ?? displayChatData.messagesError}
+              initialPreviewTabs={displayChatData.previewTabs}
+              initialActiveTabId={displayChatData.activeTabId}
+              hostname={hostname}
+              orgSlug={orgSlug}
+              connections={connections}
+              projects={projects}
+              onSnapshotChange={handleSnapshotChange}
+              isOrgAdmin={isOrgAdmin}
+              recentModelScope={recentModelScope}
+              isLoadingMessages={isLoadingDisplayMessages}
+              readOnly={readOnly || readOnlyMove !== null}
+              readOnlyNotice={readOnlyMove ? readOnlyMoveNotice(readOnlyMove.reason, readOnlyMove.truncated) : null}
+              backend={displayBackend}
+              runtimeSeed={isDisplayingLoaderThread ? resolvedChatData.runtime ?? null : null}
+            />
+          )}
         </div>
       </div>
     </>

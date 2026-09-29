@@ -1,5 +1,5 @@
 import { WorkerEntrypoint, env as cloudflareEnv } from 'cloudflare:workers';
-import type { CodeModeToolsProps } from './chat-thread-do.js';
+import type { CodeModeToolsProps } from './code-mode-tools.js';
 import {
   buildWorkspaceAppHostIndex,
   performSecureFetch,

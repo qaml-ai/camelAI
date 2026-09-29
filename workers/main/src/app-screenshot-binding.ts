@@ -1,5 +1,5 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
-import type { CodeModeToolsProps } from './chat-thread-do.js';
+import type { CodeModeToolsProps } from './code-mode-tools.js';
 import type { OrgDO } from './auth.js';
 import {
   bufferToImageDataUrl,

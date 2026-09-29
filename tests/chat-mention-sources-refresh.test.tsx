@@ -2,33 +2,29 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
 
-// Chat connects through the SSE transport (`useSseAgent`). This test does not
-// exercise the live connection, so mock the hook with an inert client.
-vi.mock('@/lib/use-sse-agent', () => {
+// Chat reads a thread through the runtime connection (`useRuntimeThread`).
+// This test does not exercise the live connection, so mock the hook with an
+// inert client and an empty transcript (Chat then paints `initialMessages`).
+vi.mock('@/lib/use-runtime-thread', () => {
   const client = {
     readyState: 0,
+    transport: 'poll',
     send: vi.fn(),
     call: vi.fn(() => Promise.resolve()),
     reconnect: vi.fn(),
-    start: vi.fn(),
-    close: vi.fn(),
   };
-  return { useSseAgent: () => client };
-});
-
-// Chat owns its transcript through ai-chat (useAgentChat) now; this test does
-// not exercise the live stream, so stub the projection hook. An empty history
-// makes Chat fall back to `initialMessages`, matching the pre-cutover behavior.
-vi.mock('@/lib/use-pi-chat-stream', () => ({
-  usePiChatStream: () => ({
+  const chat = {
     messages: [],
-    uiMessages: [],
     status: 'ready',
     isStreaming: false,
+    isStallClamped: false,
     streamingMessageId: null,
-    setUiMessages: vi.fn(),
-  }),
-}));
+  };
+  return {
+    CLIENT_OPEN: 1,
+    useRuntimeThread: () => ({ client, chat, hasOlder: false, loadOlder: async () => false, reconnecting: false }),
+  };
+});
 
 import Chat from '@/components/Chat';
 import type {

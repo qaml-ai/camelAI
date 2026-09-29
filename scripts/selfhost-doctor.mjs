@@ -549,7 +549,7 @@ await check("agent runtime", async () => {
     }
   }
   if ((env.SELFHOST_AGENT_RUNTIME_DIRECT_THREADS ?? "1").trim() === "0") {
-    note("SELFHOST_AGENT_RUNTIME_DIRECT_THREADS=0: new threads run on the in-app loop");
+    note("SELFHOST_AGENT_RUNTIME_DIRECT_THREADS=0 no longer does anything: every thread runs on the agent runtime");
   }
   if ((env.LOCAL_AUTH_BYPASS || "").trim()) {
     warn(

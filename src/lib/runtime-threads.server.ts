@@ -20,15 +20,16 @@ import {
 } from "../../workers/main/src/agent-runtime/thread-runtime";
 import type { RuntimeThreadSeed } from "@/lib/use-runtime-thread";
 import { recordRuntimeMigration, recordRuntimeSendFailure, recordRuntimeTokenMintFailure } from "../../workers/main/src/agent-runtime/runtime-thread-telemetry";
-import { migrateThreadToRuntime } from "../../workers/main/src/agent-runtime/thread-migration";
+import { migrateThreadToRuntime, permanentMoveSkip } from "../../workers/main/src/agent-runtime/thread-migration";
+import type { ChatThreadReadOnlyHistory } from "../../workers/main/src/chat-thread-do";
 import { normalizePreviewTabs } from "../../workers/main/src/chat-thread/preview-state";
-import { initialRuntimeRequestId, requireSameOriginJson, runtimeReadProxyBase, runtimeThreadMigrationEnabled, startErrorStillCurrent } from "@/lib/agent-runtime-shared";
+import { initialRuntimeRequestId, requireSameOriginJson, runtimeReadProxyBase, startErrorStillCurrent } from "@/lib/agent-runtime-shared";
 
 export interface RuntimeThreadAccess {
   env: ChatEnv;
   context: ChatContextState;
   sender: RuntimeThreadSender;
-  /** Null for a thread that runs on ChatThreadDO. */
+  /** Null for a thread still on ChatThreadDO (not moved to the runtime yet). */
   row: ThreadRuntimeRecord | null;
 }
 
@@ -165,32 +166,44 @@ async function runtimeStartError(
   return { id: `rt-start:${at}`, error: message, at };
 }
 
-/** How long opening a thread waits for its move to the runtime before showing it from ChatThreadDO. */
+/** How long opening a thread waits for its move to the runtime before the page shows it moving. */
 const MIGRATE_ON_OPEN_WAIT_MS = 8_000;
 
 /**
- * A thread still on ChatThreadDO, moved to the runtime as it is opened
- * (AGENT_RUNTIME_MIGRATE_DO_THREADS, for all orgs or this one). Null when it stays on the DO for now:
- * the move was refused, failed, or is still going after a few seconds (it
- * finishes in the background, and the next open finds the thread moved).
+ * A thread still on ChatThreadDO, as its page finds it when opened:
+ * `runtime` (moved now, or already), `moving` (the move is under way or will
+ * be retried: the page waits and polls), or `readonly` (it cannot move, for
+ * good: the page shows its history read-only, with the reason).
  */
-export async function migrateThreadOnOpen(
+export type UnmovedThreadOpen =
+  | { state: "runtime"; row: ThreadRuntimeRecord }
+  | { state: "moving" }
+  | { state: "readonly"; reason: string };
+
+/**
+ * Move a thread still on ChatThreadDO to the runtime as it is opened, waiting
+ * at most `waitMs` for the move (it finishes in the background otherwise, and
+ * the page's poll finds it moved).
+ */
+export async function openUnmovedThread(
   loadContext: AppLoadContext,
   context: ChatContextState,
   waitUntil: (promise: Promise<unknown>) => void,
-): Promise<ThreadRuntimeRecord | null> {
+  waitMs = MIGRATE_ON_OPEN_WAIT_MS,
+): Promise<UnmovedThreadOpen> {
   const env = getEnv(loadContext) as unknown as ChatEnv;
-  if (!runtimeThreadMigrationEnabled(env, context.orgId)) return null;
-  const move = migrateThreadToRuntime(env, context).then((result) => {
+  const move = migrateThreadToRuntime(env, context).then((result): UnmovedThreadOpen => {
     recordRuntimeMigration(env, context, result);
-    return "row" in result ? result.row : null;
-  }, (error: unknown) => {
+    if ("row" in result) return { state: "runtime", row: result.row };
+    const permanent = permanentMoveSkip(result);
+    return permanent ? { state: "readonly", reason: permanent } : { state: "moving" };
+  }, (error: unknown): UnmovedThreadOpen => {
     recordRuntimeMigration(env, context, { status: "failed", error: error instanceof Error ? error.message : String(error) });
-    return null;
+    return { state: "moving" };
   });
   waitUntil(move);
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const wait = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), MIGRATE_ON_OPEN_WAIT_MS); });
+  const wait = new Promise<UnmovedThreadOpen>((resolve) => { timer = setTimeout(() => resolve({ state: "moving" }), waitMs); });
   try {
     return await Promise.race([move, wait]);
   } finally {
@@ -198,9 +211,18 @@ export async function migrateThreadOnOpen(
   }
 }
 
+/** The history of a thread that cannot move, read-only from ChatThreadDO (bounded: its newest part). */
+export async function readOnlyThreadHistory(
+  loadContext: AppLoadContext,
+  threadId: string,
+): Promise<ChatThreadReadOnlyHistory> {
+  const env = getEnv(loadContext);
+  return await env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId)).readOnlyHistory(threadId);
+}
+
 /**
- * A new web thread, just created: pinned to the runtime when this deployment
- * runs new threads there and its model can. Null: it runs on ChatThreadDO.
+ * A new web thread, just created: pinned to the runtime (its model must have
+ * a runtime route). Null: it cannot run.
  */
 export async function pinNewWebThread(
   loadContext: AppLoadContext,

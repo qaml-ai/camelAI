@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { CodeModeToolsBinding } from "../src/code-mode-tools.js";
-import { buildJsExecDescription } from "../src/chat-thread/pi-tools.js";
 
 describe("hidden warehouse tool aliases", () => {
   it("keeps the aliases callable but hidden from discovery", async () => {
@@ -16,8 +15,6 @@ describe("hidden warehouse tool aliases", () => {
       "warehouse_list_connections",
       "warehouse_run_code",
     ]);
-    expect(buildJsExecDescription(false)).not.toContain("warehouse_run_code");
-    expect(buildJsExecDescription(false)).not.toContain("warehouse_list_connections");
   });
 
   it("delegates both aliases to the canonical implementations", async () => {

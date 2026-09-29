@@ -557,8 +557,8 @@ thread's own loop inside the app.
   (the runtime's token signing and stored-key encryption: keep them, changing
   either breaks existing agents or stored keys), `AGENT_RUNTIME_POSTGRES_PASSWORD`,
   and the two image references. Optional: `SELFHOST_AGENT_RUNTIME_PORT`,
-  `SELFHOST_AGENT_RUNTIME_POSTGRES_PORT`, `SELFHOST_AGENT_RUNTIME_DIRECT_THREADS`
-  and `SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS`. The session secret,
+  `SELFHOST_AGENT_RUNTIME_POSTGRES_PORT` and
+  `SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS`. The session secret,
   secrets key and database password guard the runtime's volumes, so
   `selfhost:migrate-secrets` and `selfhost:init` (with `--force` too) refuse to
   generate them while `agent-runtime-postgres` or `agent-runtime-data` exist:
@@ -568,7 +568,7 @@ thread's own loop inside the app.
   is a new revision) and registers its events webhook once, keeping the
   webhook's signing secret on the `app-state` volume. If the runtime cannot
   be reached, the last provisioned state is used; on a first start without
-  one, new threads run on the in-app loop and the log says so.
+  one, chats cannot run until it can, and the log says so.
 - **Models.** Threads run on the provider in `SELFHOST_AI_*`, which the app
   syncs into each organization's key scope on the runtime. That operator
   endpoint (`custom` on your network: vLLM, a gateway) may be plain `http`,
@@ -577,7 +577,7 @@ thread's own loop inside the app.
   `SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS=http://10.1.2.3:8000`
   (`selfhost:doctor` warns when `SELFHOST_AI_BASE_URL` needs one). Endpoints
   organizations set themselves must be `https` and never on loopback. A model
-  with no runtime route keeps its threads on the in-app loop.
+  with no runtime route cannot start a chat.
 - **What agents can reach on the VM.** The runtime's outbound guard blocks
   loopback and private addresses except the exact origins it is given
   (`AGENT_OUTBOUND_ALLOW_ORIGINS`): the app's own `http://127.0.0.1:<port>`
@@ -600,38 +600,52 @@ to another tenant: fix `AGENT_RUNTIME_API_TOKEN` instead.
 
 ### New and existing threads
 
-With `SELFHOST_AGENT_RUNTIME_DIRECT_THREADS=1` (the default) every new thread
-runs on the runtime. Threads created before the upgrade stay on the in-app
-loop and keep working there. They are moved to the runtime by the automatic
-thread sweep ("Moving existing threads" below), which a later release that
-removes the in-app loop requires to have finished.
+Every thread runs on the runtime; the app no longer runs chats itself (its
+in-app loop is gone). Threads created before an install had the runtime are
+moved there: when they are opened, and by the automatic thread sweep ("Moving
+existing threads" below). `SELFHOST_AGENT_RUNTIME_DIRECT_THREADS` no longer
+does anything.
 
 ### Rollback
 
-Set `SELFHOST_AGENT_RUNTIME_DIRECT_THREADS=0` and run `bun run selfhost:up`
-to create new threads on the in-app loop again. Threads already on the runtime
-keep working (their agents live in the runtime), so leave the runtime
-containers, their volumes and the `AGENT_RUNTIME_*` secrets in place.
 `selfhost:upgrade --rollback <snapshot>` restores the previous release's
 images; the runtime's volumes are left as they are, and a later upgrade picks
-them up again. A release without the runtime cannot open threads that were
-created on it, so prefer the setting above to a release rollback once users
-have runtime threads.
+them up again. Threads already on the runtime keep working (their agents live
+in the runtime), so leave the runtime containers, their volumes and the
+`AGENT_RUNTIME_*` secrets in place. A release without the runtime cannot open
+threads that were created on it.
 
 ## Moving existing threads
 
-Threads created before an install ran on the agent runtime still run inside
-the app (on ChatThreadDO). The app moves them to the runtime by itself, in the
-background, with no downtime: every start of the app begins a pass of the
-**thread sweep**, which walks every organization's threads still on the
-in-app loop and moves each with its history (the same move a thread makes
-when it is opened; a very long history is imported up to the runtime's limit,
-and the full original transcript is kept in the thread's files).
+Threads created before an install ran on the agent runtime were stored
+inside the app (in ChatThreadDO). The app no longer runs them there: it keeps
+their storage, read-only, and moves each to the runtime with its history, by
+itself and with no downtime:
+
+- **When it is opened.** Opening a thread that has not moved yet moves it
+  (its page says "Moving this conversation…" for the moment that takes), and
+  a message sent to it from a channel or a schedule moves it first. A very
+  long history is imported up to the runtime's limit, and the full original
+  transcript is kept in the thread's files.
+- **By the thread sweep**, in the background: every start of the app begins a
+  pass, which walks every organization's threads not yet moved and moves each.
+
+A thread that cannot move (its history is over what the runtime imports,
+`too_large`, or refused by it, `invalid_history`, or its model has no runtime
+route) opens read-only: its most recent history, with a note, and no
+composer. Start a new chat to continue it.
+
+**Support window.** The part of the app that exports these threads is kept
+for at least 6 months (until 2027-04) after the release that removed the
+in-app loop. After that, a later release may remove it: to upgrade past it,
+first upgrade through a release that still has it and let the sweep report
+complete (`bun run selfhost:doctor`), so every thread has moved.
+
+The sweep:
 
 - **Bounded.** A few threads move at once, one short step at a time (never
-  two steps together), so users keep working; a thread with a turn running is
-  left alone and retried later, and a move that takes minutes (a very long
-  history) finishes on its own while the sweep goes on.
+  two steps together), so users keep working; a move that takes minutes (a
+  very long history) finishes on its own while the sweep goes on.
 - **Paused when the runtime fails.** If the runtime does not answer, or
   several moves fail in one step, the sweep pauses (1 minute, doubling, at
   most 30) rather than burn through every thread; the doctor and the log say
@@ -655,41 +669,19 @@ and the full original transcript is kept in the thread's files).
   or `{"action": "reset"}` to forget its records.
 - **What it skips.** A thread whose model has no runtime route (for example
   a custom endpoint the runtime may not call; see "Upgrading to the runtime"),
-  or whose
-  history cannot be imported at all (`too_large`), stays on the in-app loop
-  and keeps working there. Busy threads and failed attempts are retried with a
-  growing delay (1 minute, doubling, at most an hour); one still failing after
-  12 tries or 3 days is skipped ("gave up after …"). A skipped thread is tried
-  again at the next start, after you fixed its cause (allowed the endpoint's
-  origin, changed the thread's model), except one the runtime will never take
-  (`too_large`, `invalid_history`). An organization the app cannot read is
-  passed over, recorded, and tried again with the retries.
+  or whose history the runtime will not take (`too_large`,
+  `invalid_history`); such a thread opens read-only. Failed attempts are
+  retried with a growing delay (1 minute, doubling, at most an hour); one
+  still failing after 12 tries or 3 days is skipped ("gave up after …"). A
+  skipped thread is tried again at the next start, after you fixed its cause
+  (allowed the endpoint's origin, changed the thread's model), except one the
+  runtime will never take. An organization the app cannot read is passed
+  over, recorded, and tried again with the retries.
 - **Complete means counted.** Before it reports complete, the sweep counts
-  every organization's threads still on the in-app loop; threads that came
-  while it ran start another pass.
-- `SELFHOST_RUNTIME_SWEEP=0` turns the sweep off.
-
-### The version gate
-
-A later release removes the in-app loop. It cannot run or move threads that
-are still on it, so it refuses to start on an install whose sweep has not
-completed, and prints what is left and a pointer here:
-
-- **Upgrade through a release with the sweep.** An install that skips from a
-  release before the runtime straight to one without the in-app loop is
-  refused: install the last release with the sweep first, let
-  `selfhost:doctor` report the sweep complete, then upgrade. A new install,
-  with no organizations yet, is never refused.
-- **Threads the sweep skipped.** They also stop the upgrade, since they would
-  no longer open. Fix their cause and restart the app (the sweep tries them
-  again), or accept losing them with `SELFHOST_ALLOW_UNMIGRATED_THREADS=1`
-  (which also accepts a sweep still waiting on retries).
-- **A recheck under way.** The sweep looks again at every start and every six
-  hours; while it does, the gate goes by its last complete pass.
-
-The gate runs before the app's web server starts (in the D1 migration step),
-so a refused upgrade serves nothing; `selfhost:upgrade --rollback` returns to
-the previous release, whose sweep then finishes the job.
+  every organization's threads not yet moved; threads that came while it ran
+  start another pass.
+- `SELFHOST_RUNTIME_SWEEP=0` turns the sweep off (threads still move when
+  they are opened).
 
 ## Operational validation
 

@@ -4,14 +4,14 @@
  * The fork point is a history index (`rt:<index>`, pi-render's forkEntryId);
  * a turn's tool results after it come along, so no call is left unanswered.
  */
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "../../../../src/lib/agent-messages";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import type { ThreadRuntimeRecord } from "../identity/org-do.js";
 import { ARCHIVE_FILE_NAME, ARCHIVE_REQUEST_ID, convertTranscript, withImportNote } from "./thread-migration.js";
 import { RuntimeApiError, runtimeApi, runtimeUrl } from "./runtime-api.js";
 import { runtimeSystemPromptAppend, type RuntimeAgentModel } from "./run-gates.js";
 import { HOSTED_KEY_SCOPE, hostedModelHeaders } from "./key-scopes.js";
-import { RUNTIME_PROMPT_VERSION } from "../chat-thread/runtime-agent.js";
+import { RUNTIME_PROMPT_VERSION } from "./runtime-prompt.js";
 
 export type RuntimeForkResult =
   | { status: "forked"; row: ThreadRuntimeRecord }

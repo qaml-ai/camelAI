@@ -1,7 +1,7 @@
 // Conversion of stored Pi-core messages into the parsed chat-message shape used
 // by agent-eval and the admin explorer. Pure transforms extracted from
 // chat-thread-do.ts — a leaf module with no Durable Object state.
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "../../../src/lib/agent-messages";
 import { normalizePiUiMetadata } from "../../../src/lib/runtime-artifacts";
 import type { ToolResultBlock } from "../../../src/types";
 import type { AgentEvalParsedMessage } from "./chat-thread/types";

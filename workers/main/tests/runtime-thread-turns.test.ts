@@ -11,7 +11,7 @@ import { encryptCredentials } from "../../../src/lib/integration-crypto";
 import { stringifyStoredLlmProviderConfig } from "../../../src/lib/llm-provider-config";
 import { buildWorkspaceScopedR2Key } from "../../../src/lib/workspace-r2-paths";
 import type { ChatEnv } from "../src/chat-thread/types";
-import { RUNTIME_PROMPT_VERSION } from "../src/chat-thread/runtime-agent";
+import { RUNTIME_PROMPT_VERSION } from "../src/agent-runtime/runtime-prompt";
 import {
   abortRuntimeThread,
   answerRuntimeInput,

@@ -1,7 +1,6 @@
 import type { AppLoadContext } from "react-router";
 import { getEnv, type CloudflareEnv } from "@/lib/cloudflare.server";
 import { getAuthEnv } from "@/lib/auth-helpers";
-import type { ChatThreadDO, ChatThreadRuntimeStatus } from "../../workers/main/src/chat-thread-do";
 import type { OrgDO, OrgThread } from "../../workers/main/src/auth";
 import type { WorkspaceDO, WorkspaceRunningThreadStatus } from "../../workers/main/src/workspace";
 import type {
@@ -87,24 +86,6 @@ async function listStreamingThreadStatuses(
   }
 }
 
-async function getRuntimeStatus(
-  env: CloudflareEnv,
-  threadId: string,
-): Promise<ChatThreadRuntimeStatus | null> {
-  try {
-    const stub = env.CHAT_THREAD.get(
-      env.CHAT_THREAD.idFromName(threadId),
-    ) as DurableObjectStub<ChatThreadDO>;
-    return await stub.getRuntimeStatus();
-  } catch (error) {
-    console.error("[automations] Failed to load chat runtime status", {
-      threadId,
-      error,
-    });
-    return null;
-  }
-}
-
 type AutomationCreator = UserProfileSummary;
 
 async function getCreators(
@@ -170,23 +151,19 @@ function normalizeScheduledPrompt(input: {
   thread: OrgThread | null;
   latestRun: AutomationRunRecord | null;
   streamingStatus: WorkspaceRunningThreadStatus | null;
-  runtimeStatus: ChatThreadRuntimeStatus | null;
 }): AutomationListItem {
-  const { prompt, latestRun, streamingStatus, runtimeStatus } = input;
-  const pendingQuestionCount = runtimeStatus?.pendingQuestionCount ?? 0;
+  const { prompt, latestRun, streamingStatus } = input;
   const isStreaming =
     Boolean(streamingStatus) ||
-    runtimeStatus?.isStreaming === true ||
     latestRun?.status === "started";
   const needsInput =
-    pendingQuestionCount > 0 ||
     prompt.last_run_status === "question" ||
     latestRun?.status === "question";
   const runtime_status =
     needsInput ? "needs_input" : isStreaming ? "running" : "idle";
   const runtime_message =
     needsInput
-      ? runtimeStatus?.oldestPendingQuestion ?? "Waiting for your input"
+      ? "Waiting for your input"
       : isStreaming
         ? streamingStatus?.latestActivityText ?? "Running now"
         : null;
@@ -208,7 +185,6 @@ function normalizeScheduledPrompt(input: {
     runtime_status,
     runtime_message,
     runtime_updated_at:
-      runtimeStatus?.updatedAt ??
       streamingStatus?.updatedAt ??
       (latestRun?.status === "started" ? latestRun.started_at : null),
     thread_id: prompt.thread_id,
@@ -288,26 +264,6 @@ export async function buildAutomationsPageData({
       latestRunsByAutomation[`scheduled_prompt:${prompt.id}`]?.[0] ?? null,
     ] as const),
   );
-  const runtimePromptThreadIds = Array.from(
-    new Set(
-      prompts
-        .filter(
-          (prompt) =>
-            streamingByThreadId.has(prompt.thread_id) ||
-            prompt.last_run_status === "question" ||
-            latestScheduledRunByPromptId.get(prompt.id)?.status === "started",
-        )
-        .map((prompt) => prompt.thread_id),
-    ),
-  );
-  const runtimeEntries = await Promise.all(
-    runtimePromptThreadIds.map(async (threadId) => [
-      threadId,
-      await getRuntimeStatus(env, threadId),
-    ] as const),
-  );
-  const runtimeByThreadId = new Map(runtimeEntries);
-
   const threadIds = prompts.map((prompt) => prompt.thread_id);
   const orgStub = getOrgStub(env, orgId);
   const threads = threadIds.length > 0
@@ -331,7 +287,6 @@ export async function buildAutomationsPageData({
       thread: threadById.get(prompt.thread_id) ?? null,
       latestRun: latestScheduledRunByPromptId.get(prompt.id) ?? null,
       streamingStatus: streamingByThreadId.get(prompt.thread_id) ?? null,
-      runtimeStatus: runtimeByThreadId.get(prompt.thread_id) ?? null,
     }),
   );
   const normalizedWorkflows = workflows.map((automation) =>

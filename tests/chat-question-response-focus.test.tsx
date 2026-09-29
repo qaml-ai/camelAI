@@ -194,22 +194,14 @@ vi.mock("@/components/ui/dropdown-menu", () => ({
   ),
 }));
 
-// Chat connects through the SSE transport (`useSseAgent`). Mock the hook so tests
-// can drive the connection directly instead of scripting fetch/SSE frames.
+// Chat reads a thread through the runtime connection (`useRuntimeThread`).
+// Mock the hook so tests can drive the connection directly.
 const agentRuntime = vi.hoisted(() => {
   type AgentOptions = {
     agent: string;
     name: string;
     enabled?: boolean;
-    query?: Record<string, string | null | undefined>;
     onOpen?: () => void;
-    onMessage?: (event: { data: string }) => void;
-    onClose?: (event?: unknown) => void;
-    onConnectionError?: (error: {
-      code?: number;
-      reason?: string;
-      wasClean?: boolean;
-    }) => void;
     onStateUpdate?: (state: unknown) => void;
   };
 
@@ -217,8 +209,9 @@ const agentRuntime = vi.hoisted(() => {
     static instances: MockAgentClient[] = [];
 
     options: AgentOptions;
-    // 0 = CONNECTING, 1 = OPEN, 3 = CLOSED (SseAgentClient keeps the numbers).
+    // 0 = CONNECTING, 1 = OPEN, 3 = CLOSED.
     readyState = 0;
+    readonly transport = "poll" as const;
     send = vi.fn();
     call = vi.fn(
       async (
@@ -228,8 +221,6 @@ const agentRuntime = vi.hoisted(() => {
       ): Promise<unknown> => undefined,
     );
     reconnect = vi.fn();
-    start = vi.fn();
-    close = vi.fn();
 
     constructor(options: AgentOptions) {
       this.options = options;
@@ -241,54 +232,46 @@ const agentRuntime = vi.hoisted(() => {
       this.options.onOpen?.();
     }
 
-    emitMessage(payload: unknown) {
-      this.options.onMessage?.({ data: JSON.stringify(payload) });
-    }
-
     emitStateUpdate(state: unknown) {
       this.options.onStateUpdate?.(state);
     }
 
-    emitClose(event?: unknown) {
+    emitClose() {
       this.readyState = 3;
-      this.options.onClose?.(event);
-    }
-
-    /** Server parked the stream (`bye {"reason":"idle"}`): still OPEN for sends. */
-    emitIdlePark() {
-      this.readyState = 1;
-      this.options.onClose?.({
-        byeReason: "idle",
-        status: null,
-        reason: "idle",
-        aborted: false,
-        wasClean: true,
-      });
-    }
-
-    emitConnectionError(error: {
-      code?: number;
-      reason?: string;
-      wasClean?: boolean;
-    }) {
-      this.readyState = 3;
-      this.options.onConnectionError?.(error);
     }
   }
 
   const registry = new Map<string, MockAgentClient>();
+  const chat = {
+    messages: [],
+    status: "ready",
+    isStreaming: false,
+    isStallClamped: false,
+    streamingMessageId: null,
+  };
 
-  function useSseAgent(options: AgentOptions) {
-    const key = `${options.agent}:${options.name}`;
+  function useRuntimeThread(options: {
+    threadId?: string;
+    enabled: boolean;
+    callbacks: { current: { onOpen(): void; onStateUpdate(state: unknown): void } };
+  }) {
+    const key = options.threadId ?? "none";
+    const clientOptions: AgentOptions = {
+      agent: "chat-thread",
+      name: key,
+      enabled: options.enabled,
+      onOpen: () => options.callbacks.current.onOpen(),
+      onStateUpdate: (state) => options.callbacks.current.onStateUpdate(state),
+    };
     let instance = registry.get(key);
     if (!instance) {
-      instance = new MockAgentClient(options);
+      instance = new MockAgentClient(clientOptions);
       registry.set(key, instance);
     } else {
       // Refresh the captured callbacks so emits run the latest handlers.
-      instance.options = options;
+      instance.options = clientOptions;
     }
-    return instance;
+    return { client: instance, chat, hasOlder: false, loadOlder: async () => false, reconnecting: false };
   }
 
   function reset() {
@@ -296,28 +279,16 @@ const agentRuntime = vi.hoisted(() => {
     MockAgentClient.instances = [];
   }
 
-  return { useSseAgent, reset, MockAgentClient };
+  return { useRuntimeThread, reset, MockAgentClient };
 });
 
-vi.mock("@/lib/use-sse-agent", () => ({
-  useSseAgent: agentRuntime.useSseAgent,
-}));
-
-// Chat owns its transcript through ai-chat (useAgentChat) now; this test drives
-// pendingQuestion via Agent state, not the live stream, so stub the projection
-// hook to keep the real ai-chat client out of the render.
-vi.mock("@/lib/use-pi-chat-stream", () => ({
-  usePiChatStream: () => ({
-    messages: [],
-    uiMessages: [],
-    status: "ready",
-    isStreaming: false,
-    streamingMessageId: null,
-    setUiMessages: vi.fn(),
-  }),
+vi.mock("@/lib/use-runtime-thread", () => ({
+  CLIENT_OPEN: 1,
+  useRuntimeThread: agentRuntime.useRuntimeThread,
 }));
 
 import Chat from "@/components/Chat";
+import { readOnlyMoveNotice } from "@/components/chat/chat-moving-notice";
 
 const RATE_LIMIT_ERROR =
   '429 {"error":{"type":"rate_limit_error","message":"Type 2b rate limited. Please try again later."}}';
@@ -569,66 +540,25 @@ describe("Chat AskUserQuestion composer focus", () => {
     expect(screen.queryByRole("link", { name: /Bedrock console/ })).toBeNull();
   });
 
-  it("mounts the SSE transport for the thread without the WebSocket timing knobs", () => {
+  it("shows a thread that could not move read-only: its note, no composer, and no connection", () => {
     render(
-      <Chat threadId="thread-1" workspaceId="ws-1" initialMessages={[]} />,
+      <Chat
+        threadId="thread-1"
+        workspaceId="ws-1"
+        initialMessages={[
+          { id: "m1", thread_id: "thread-1", role: "user", content: "hello", created_at: 1 },
+        ]}
+        readOnly
+        readOnlyNotice={readOnlyMoveNotice("too_large", true)}
+      />,
     );
 
-    const agent = getMainAgent();
-    expect(agent.options.enabled).toBe(true);
-    expect(agent.options.query).toEqual({
-      threadId: "thread-1",
-      workspaceId: "ws-1",
-    });
-    // PartySocket knobs have no meaning for fetch+SSE; passing them through
-    // would silently do nothing.
-    expect(agent.options).not.toHaveProperty("connectionTimeout");
-    expect(agent.options).not.toHaveProperty("minReconnectionDelay");
-    expect(agent.options).not.toHaveProperty("maxReconnectionDelay");
-  });
-
-  it("still dispatches a send while the server has parked the stream as idle", async () => {
-    const user = userEvent.setup();
-
-    render(
-      <Chat threadId="thread-1" workspaceId="ws-1" initialMessages={[]} />,
+    expect(
+      screen.getByRole("note"),
+    ).toHaveTextContent(
+      "It is too large to move to camelAI's new chat engine, so it is read-only. Start a new chat to continue. Only its most recent messages are shown.",
     );
-
-    const agent = getMainAgent();
-    agent.call.mockResolvedValue({ status: "accepted" });
-    act(() => {
-      agent.emitOpen();
-      agent.emitIdlePark();
-    });
-
-    await user.type(screen.getByLabelText("Prompt"), "wake the stream");
-    await user.click(screen.getByRole("button", { name: "Send message" }));
-
-    expect(agent.call).toHaveBeenCalledWith(
-      "sendMessage",
-      ["wake the stream", expect.stringMatching(/^client_/)],
-      { timeout: 15_000 },
-    );
-  });
-
-  it("surfaces the SSE terminal-close copy when the transport gives up", () => {
-    render(
-      <Chat threadId="thread-1" workspaceId="ws-1" initialMessages={[]} />,
-    );
-
-    const agent = getMainAgent();
-    act(() => {
-      agent.emitOpen();
-      agent.emitConnectionError({
-        code: CHAT_SSE_CLOSE_UNAUTHORIZED,
-        reason: "Unauthorized",
-        wasClean: false,
-      });
-    });
-
-    expect(mockToast.error).toHaveBeenCalledWith(
-      expect.stringMatching(/session expired/i),
-      expect.objectContaining({ id: "chat-sse-terminal-close" }),
-    );
+    expect(screen.queryByLabelText("Prompt")).not.toBeInTheDocument();
+    expect(getMainAgent().options.enabled).toBe(false);
   });
 });

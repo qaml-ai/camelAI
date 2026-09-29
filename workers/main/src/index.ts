@@ -7,9 +7,7 @@
  * - /api/integrations/slack/events → Slack Events API webhook
  * - /api/integrations/telegram/webhook → Telegram Bot API webhook
  * - email() → Workspace email ingress (Cloudflare Email Routing)
- * - /agents/chat-thread/:thread → ChatThreadDO WebSocket chat
- * - /agents/chat-thread/:thread/sse → HTTP polling fallback / legacy SSE
- * - /agents/chat-thread/:thread/call → ChatThreadDO chat frames (POST)
+ * - /agents/chat-thread/* → 410: the old in-DO chat transport (threads run on the agent runtime)
  * - * → React Router SSR
  */
 
@@ -54,18 +52,15 @@ import { handleWorkspaceStatusStream } from './routes/status-stream.js';
 import { handleOAuthMetadata, handleResourceMetadata } from './routes/well-known.js';
 import { handleStripeWebhook } from './routes/billing.js';
 import { handleWorkerAuth } from './routes/worker-auth.js';
-import { requireChatWebSocketAccess } from './helpers/auth.js';
-import { stripReservedTransportHeaders } from './chat-thread/transport-headers.js';
-import { getThreadStub } from './helpers/stubs.js';
 import { text } from './helpers/response.js';
-import { recordObservabilityEvent } from './observability.js';
 
 // Re-exports for wrangler
 export {
   AdminJsExecDoBinding,
   AdminJsExecRuntimeBinding,
 } from './routes/admin-mcp.js';
-export { ChatThreadDO, CodeModeToolsBinding } from './chat-thread-do.js';
+export { ChatThreadDO } from './chat-thread-do.js';
+export { CodeModeToolsBinding } from './code-mode-tools.js';
 export { UserDO, OrgDO } from './auth.js';
 export { EmailHandleDO } from './email-handle-registry.js';
 export { SignupDO } from './signup-do.js';
@@ -239,26 +234,11 @@ const routes: Route[] = [
   { method: 'GET', path: /^\/api\/integrations\/remote_mcp\/oauth$/, handler: handleRemoteMcpOAuthStart },
   { method: 'GET', path: /^\/api\/integrations\/remote_mcp\/callback$/, handler: handleRemoteMcpOAuthCallback },
 
-  {
-    method: 'GET',
-    path: /^\/agents\/chat-thread\/([^/]+)$/,
-    handler: (context) => handleChatTransportRequest(context, 'websocket'),
-    websocket: true,
-  },
-  // HTTP polling/POST fallback and SSE for already-open older clients.
-  // Plain HTTP: `websocket: true`
-  // would make the route loop skip them, and React Router would answer an
-  // /agents/* miss with the SPA shell, so misses 404 here instead.
-  {
-    method: 'GET',
-    path: /^\/agents\/chat-thread\/([^/]+)\/sse$/,
-    handler: (context) => handleChatTransportRequest(context, 'sse'),
-  },
-  {
-    method: 'POST',
-    path: /^\/agents\/chat-thread\/([^/]+)\/call$/,
-    handler: (context) => handleChatTransportRequest(context, 'call'),
-  },
+  // The old in-DO chat transport (WebSocket, SSE, polling, calls): every
+  // thread runs on the agent runtime now, so a page still open from before
+  // is told the thread moved (it reloads).
+  { method: 'GET', path: /^\/agents\/chat-thread\/[^/]+$/, handler: async () => chatThreadMoved(), websocket: true },
+  { method: 'ALL', path: /^\/agents\/chat-thread\//, handler: async () => chatThreadMoved() },
   { method: 'ALL', path: /^\/agents\//, handler: async () => text('Not Found', 404) },
 
   // Workspace thread-status SSE stream (replaces the status WebSocket).
@@ -279,182 +259,12 @@ const reactRouterHandler = createRequestHandler(
 // Main Router
 // =============================================================================
 
-/**
- * Chat transports sharing one authorization unit. The telemetry event NAMES are
- * unchanged for dashboard continuity; `operation` distinguishes WebSocket,
- * HTTP receive and POST calls.
- */
-type ChatTransport = 'sse' | 'call' | 'websocket';
-
-const CHAT_TRANSPORT_AUTH_OPERATIONS: Record<ChatTransport, string> = {
-  websocket: 'authorizeChatTransportRequest:websocket',
-  sse: 'authorizeChatTransportRequest:sse',
-  call: 'authorizeChatTransportRequest:call',
-};
-
-async function authorizeChatTransportRequest(
-  req: Request,
-  env: Env,
-  threadId: string,
-  transport: ChatTransport,
-): Promise<Request | Response> {
-  // Browsers do not apply CORS to WebSocket upgrades. A foreign page must not
-  // use a session cookie to open a chat socket on the user's behalf.
-  const origin = req.headers.get('Origin');
-  if (transport === 'websocket' && origin !== null && origin !== new URL(req.url).origin) {
-    return text('Forbidden origin', 403);
-  }
-  const startedAt = Date.now();
-  const operation = CHAT_TRANSPORT_AUTH_OPERATIONS[transport];
-  const url = new URL(req.url);
-  const workspaceIdParam = url.searchParams.get('workspaceId');
-  let access: Awaited<ReturnType<typeof requireChatWebSocketAccess>>;
-  try {
-    access = await requireChatWebSocketAccess(
-      req,
-      env,
-      threadId,
-      workspaceIdParam,
-    );
-  } catch (error) {
-    recordObservabilityEvent(env, {
-      event: 'chat_ws_auth_completed',
-      severity: 'error',
-      component: 'chat_ws_auth',
-      operation,
-      status: 'exception',
-      durationMs: Date.now() - startedAt,
-      route: '/agents/chat-thread/:threadId',
-      method: req.method,
-      path: url.pathname,
-      threadId,
-      workspaceId: workspaceIdParam,
-      errorName: error instanceof Error ? error.name : 'Error',
-      sampleIndex: threadId,
-    });
-    // requireChatWebSocketAccess throws on a non-transient session-invalidation
-    // check failure. An HTTP transport must render that itself: an uncaught
-    // throw is an opaque 500 the client would retry against forever.
-    return text('Authorization temporarily unavailable', 503);
-  }
-  if ('error' in access) {
-    const status = access.error.status || 403;
-    const reasonText = (await access.error.clone().text().catch(() => '')) ||
-      access.error.statusText ||
-      'forbidden';
-    recordObservabilityEvent(env, {
-      event: 'chat_ws_upgrade_rejected',
-      severity: status >= 500 ? 'error' : 'warn',
-      component: 'chat_ws_auth',
-      operation,
-      status: String(status),
-      statusCode: status,
-      durationMs: Date.now() - startedAt,
-      route: '/agents/chat-thread/:threadId',
-      method: req.method,
-      path: url.pathname,
-      threadId,
-      workspaceId: workspaceIdParam,
-      errorMessage: reasonText.slice(0, 200),
-      sampleIndex: threadId,
-    });
-    // The denial goes back as-is — the statuses already carry the
-    // terminal/retryable split the client classifies on (400/401/403/404
-    // terminal, 409/429/5xx retryable).
-    return access.error;
-  }
-
-  const { session, userId } = access;
-  const fullAccess = 'degraded' in access ? null : access;
-
-  if ('degraded' in access) {
-    recordObservabilityEvent(env, {
-      event: 'chat_ws_upgrade_degraded',
-      severity: 'warn',
-      component: 'chat_ws_auth',
-      operation,
-      status: 'degraded',
-      durationMs: Date.now() - startedAt,
-      route: '/agents/chat-thread/:threadId',
-      method: req.method,
-      path: url.pathname,
-      threadId,
-      workspaceId: workspaceIdParam,
-      userId,
-      sampleIndex: threadId,
-    });
-  }
-
-  const headers = new Headers(req.headers);
-  headers.delete('X-Chiridion-User-Id');
-  headers.delete('X-Chiridion-User-Name');
-  headers.delete('X-Chiridion-User-Email');
-  headers.delete('X-Chiridion-Auth-Degraded');
-  // Hand-rolled routes bypass routePartykitRequest, which would overwrite the
-  // partyserver headers, and nothing overwrites the Agents SDK's sub-agent
-  // routing header — over HTTP a browser can set both, unlike on a WS handshake.
-  stripReservedTransportHeaders(headers);
-  headers.set('X-Chiridion-User-Id', userId);
-  if (session.user_name) headers.set('X-Chiridion-User-Name', session.user_name);
-  if (session.user_email) headers.set('X-Chiridion-User-Email', session.user_email);
-
-  url.searchParams.set('threadId', fullAccess?.threadId ?? threadId);
-  if (fullAccess) {
-    url.searchParams.set('workspaceId', fullAccess.workspaceId);
-    url.searchParams.set('orgId', fullAccess.orgId);
-  } else {
-    // Never forward client-controlled scope on degraded admits — ChatThreadDO
-    // must keep its stored workspace/org context rather than trusting query.
-    url.searchParams.delete('workspaceId');
-    url.searchParams.delete('orgId');
-    headers.set('X-Chiridion-Auth-Degraded', '1');
-  }
-
-  recordObservabilityEvent(env, {
-    event: 'chat_ws_auth_completed',
-    severity: 'info',
-    component: 'chat_ws_auth',
-    operation,
-    status: fullAccess ? 'authorized' : 'degraded_authorized',
-    durationMs: Date.now() - startedAt,
-    route: '/agents/chat-thread/:threadId',
-    method: req.method,
-    path: url.pathname,
-    threadId,
-    workspaceId: fullAccess?.workspaceId ?? workspaceIdParam,
-    orgId: fullAccess?.orgId,
-    userId,
-    sampleIndex: threadId,
-  });
-
-  const forwardInit: RequestInit = { method: req.method, headers };
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    // The POST frame body must survive the rewrite; leaving it out authenticates
-    // the request perfectly and then delivers an empty message.
-    forwardInit.body = req.body;
-    // @ts-expect-error - duplex is required for streaming bodies
-    forwardInit.duplex = 'half';
-  }
-  return new Request(url.toString(), forwardInit);
-}
-
-async function handleChatTransportRequest(
-  { req, env, match }: RouteContext,
-  transport: ChatTransport,
-): Promise<Response> {
-  // Raw, undecoded path segment: partyserver derives the DO name the same way,
-  // so an escapable character must not address a different Durable Object.
-  const threadId = match[1] ?? '';
-  if (!threadId) return text('Missing threadId', 400);
-  const authorized = await authorizeChatTransportRequest(
-    req,
-    env,
-    threadId,
-    transport,
+/** The old chat transport's answer: the thread moved to the agent runtime. */
+function chatThreadMoved(): Response {
+  return Response.json(
+    { status: 'moved', error: 'This conversation moved to the new chat engine; reload the page to continue it.' },
+    { status: 410 },
   );
-  if (authorized instanceof Response) return authorized;
-  // Returned unmodified: an SSE body must never be buffered here.
-  return getThreadStub(env, threadId).fetch(authorized);
 }
 
 export default {

@@ -6,23 +6,13 @@ import {
   useRef,
   type ReactNode,
 } from "react";
-import type { UIMessage } from "ai";
 import type { TodoItem } from "@/components/floating-todo";
 import type { Message } from "@/types";
 
 export interface ChatThreadSnapshot {
   messages: Message[];
-  // ai-chat render history captured alongside the legacy `messages` view, so an
-  // instant tab switch seeds the remounted Chat/useAgentChat with THIS thread's
-  // UIMessages. Without it, the cached-snapshot render would reuse the previous
-  // loader result's `initialUiMessages` and briefly paint another thread's
-  // transcript (Chat prefers non-empty piChat.messages over the legacy fallback).
-  uiMessages: UIMessage[];
   // Id of the assistant message that was mid-stream when this snapshot was
-  // captured (null when idle). The seed derived from this snapshot EXCLUDES
-  // that message (resolveDisplayChatData): the resumed stream owns the
-  // in-flight turn exclusively and rebuilds it from scratch — seeding a
-  // hydrated copy underneath the replay is what used to duplicate parts.
+  // captured (null when idle).
   streamingMessageId: string | null;
   todos: TodoItem[];
   updatedAt: number;

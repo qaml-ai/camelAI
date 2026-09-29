@@ -69,9 +69,7 @@ beforeEach(() => {
 /** Chat's pipeline from the hook's stream to the rendered rows. */
 function Transcript({ live, optimistic }: { live: { messages: Message[]; streamingMessageId: string | null }; optimistic: Message[] }) {
   const { visibleMessages } = useChatTranscriptProjection({
-    threadId: "t1",
     liveMessages: live.messages,
-    liveUiMessages: [],
     optimisticMessages: optimistic,
     parsedInitialMessages: [],
     readOnly: false,

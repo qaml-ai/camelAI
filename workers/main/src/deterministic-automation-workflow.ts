@@ -10,7 +10,7 @@ import {
   type WorkflowStep,
 } from "cloudflare:workers";
 import type { AIVirtualBindingProps } from "./ai-virtual-binding";
-import type { CodeModeToolsProps } from "./chat-thread-do";
+import type { CodeModeToolsProps } from "./code-mode-tools";
 import type { WorkspaceCronDO } from "./workspace-cron";
 
 const AUTOMATION_WORKFLOW_ENTRYPOINT = "AutomationWorkflow";

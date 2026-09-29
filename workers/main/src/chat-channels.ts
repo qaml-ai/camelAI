@@ -1,10 +1,7 @@
-// Outbound channel tooling (email / Slack / Telegram) extracted from
-// chat-thread-do.ts. Implemented as a small ChannelTools class constructed with
-// the worker env — the only Durable Object state these paths ever needed. Both
-// ChatThreadDO and CodeModeToolsBinding construct a ChannelTools to send on a
-// channel, which removed the previous Object.create(ChatThreadDO.prototype)
-// hack and the chat-thread-do <-> code-mode-tools runtime import cycle.
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+// Outbound channel tooling (email / Slack / Telegram / Discord): a small
+// ChannelTools class constructed with the worker env, which
+// CodeModeToolsBinding uses to send on a channel.
+import type { AgentToolResult } from "../../../src/lib/agent-messages";
 import type { OrgDO, OrgThread } from "./auth";
 import { decryptCredentials } from "../../../src/lib/integration-crypto";
 import { buildWorkspaceScopedR2Key } from "../../../src/lib/workspace-r2-paths";
@@ -30,9 +27,7 @@ import type {
   ChatEnv,
   ChatContextState,
   CloudflareEmailSender,
-  ChannelHistoryEventRequest,
-  ChannelHistoryEventResult,
-} from "./chat-thread-do";
+} from "./chat-thread/types";
 
 export interface ChannelToolAttachmentInput {
   path: string;
@@ -987,56 +982,23 @@ export class ChannelTools {
       },
     );
     if (channelThread.threadId === context.threadId) return "skipped";
-    const org = this.env.ORG.get(this.env.ORG.idFromName(context.orgId)) as unknown as {
-      getThreadRuntime(threadId: string): Promise<unknown>;
-    };
-    // A direct runtime thread has no transcript here: its next prompt
-    // carries the note (agent-runtime/channel-turns.ts).
-    const queueNote = async () => {
-      if (!args.text?.trim() && args.attachmentCount <= 0) return "skipped" as const;
-      await queueChannelHistoryNote(this.env, channelThread.threadId, {
-        channelKind: args.kind,
-        sentAt: Date.now(),
-        direction: "outbound",
-        sourceThreadId: context.threadId,
-        connectionId: args.integrationId,
-        remoteConversationId: args.remoteConversationId,
-        providerMessageIds: args.providerMessageIds
-          .map((id) => (id === undefined ? "" : String(id).trim()))
-          .filter(Boolean),
-        attachmentCount: args.attachmentCount,
-        text: args.text,
-      });
-      return "recorded" as const;
-    };
-    if (await org.getThreadRuntime(channelThread.threadId)) return await queueNote();
-    const stub = this.env.CHAT_THREAD.get(
-      this.env.CHAT_THREAD.idFromName(channelThread.threadId),
-    ) as unknown as {
-      appendChannelHistoryEvent: (
-        input: ChannelHistoryEventRequest,
-      ) => Promise<ChannelHistoryEventResult> | ChannelHistoryEventResult;
-    };
-    const result = await stub.appendChannelHistoryEvent({
-      threadId: channelThread.threadId,
-      workspaceId: context.workspaceId,
-      orgId: context.orgId,
+    // The channel thread's next runtime prompt carries the note (a thread not
+    // yet moved to the runtime gets it once it moves).
+    if (!args.text?.trim() && args.attachmentCount <= 0) return "skipped";
+    await queueChannelHistoryNote(this.env, channelThread.threadId, {
       channelKind: args.kind,
+      sentAt: Date.now(),
+      direction: "outbound",
+      sourceThreadId: context.threadId,
       connectionId: args.integrationId,
       remoteConversationId: args.remoteConversationId,
-      sourceThreadId: context.threadId,
-      direction: "outbound",
-      text: args.text,
-      providerMessageIds: args.providerMessageIds,
+      providerMessageIds: args.providerMessageIds
+        .map((id) => (id === undefined ? "" : String(id).trim()))
+        .filter(Boolean),
       attachmentCount: args.attachmentCount,
-      sentAt: Date.now(),
+      text: args.text,
     });
-    if (result.status === "error") {
-      throw new Error(result.error || `Failed to record ${args.kind} channel history`);
-    }
-    // The thread is moving to the runtime, or moved: its next runtime prompt carries the note.
-    if (result.status === "moved") return await queueNote();
-    return result.status === "appended" ? "recorded" : "skipped";
+    return "recorded";
   }
 
   private async fetchTelegramBotApi(

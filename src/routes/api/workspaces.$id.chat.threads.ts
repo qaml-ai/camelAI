@@ -73,13 +73,34 @@ export async function action({ request, context, params }: Route.ActionArgs) {
     return Response.json({ error: message || 'Failed to create thread' }, { status });
   }
 
+  // The thread runs on the agent runtime: pinned now (its page opens it there).
+  const { pinNewWebThread } = await import('@/lib/runtime-threads.server');
+  const runtimeRow = await pinNewWebThread(context, {
+    threadId: thread.id,
+    workspaceId,
+    orgId,
+    userId,
+    userName: session.user_name ?? null,
+    userEmail: session.user_email ?? null,
+  }).catch((error: unknown) => {
+    console.error('Failed to pin a new thread to the agent runtime:', error);
+    return null;
+  });
+  if (!runtimeRow) {
+    await chatDO.deleteThread(context, thread.id, workspaceId, { orgId }).catch(() => {});
+    return Response.json(
+      { error: "This chat's model is not available right now. Pick another model and try again." },
+      { status: 503 },
+    );
+  }
+
   // Set preview apps if provided
   if (body.previewApps) {
     const previewApps = body.previewApps.split(',').filter(Boolean);
     if (previewApps.length > 0) {
       const scriptName = previewApps[0];
       const script = await getWorkerScript(authEnv, orgId, scriptName);
-      await chatDO.setThreadPreviewTarget(context, thread.id, {
+      await chatDO.setThreadPreviewTarget(context, orgId, thread.id, {
         kind: 'app',
         scriptName,
         isPublic: script?.is_public ?? false,

@@ -1,16 +1,14 @@
 /**
- * Scheduled prompts on the direct runtime path: a run's turn starts with
- * startRuntimeTurn instead of going through ChatThreadDO, as the prompt's
- * creator (the scheduler acts for them). The run's id is the turn's request
+ * Scheduled prompts on the agent runtime: a run's turn starts with
+ * startRuntimeTurn, as the prompt's creator (the scheduler acts for them). The run's id is the turn's request
  * id, so its run.completed / run.failed webhook finds the run
  * (routes/agent-runtime-events.ts), and the outcome the agent reports with
- * report_automation_outcome is kept on the run in WorkspaceCronDO, where
- * ChatThreadDO kept it in its own state.
+ * report_automation_outcome is kept on the run in WorkspaceCronDO.
  */
 import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import { RUNTIME_TOOL_PREFIX } from "../../../../src/lib/agent-runtime-shared.js";
 import { runtimeApi } from "./runtime-api.js";
-import { directRuntimeRow } from "./thread-migration.js";
+import { directRuntimeRow, migrateThreadOnSend } from "./thread-migration.js";
 import { runtimeDirectThreadsEnabled, startRuntimeTurn } from "./thread-runtime.js";
 
 /** What a scheduled run must do before it ends, naming the outcome tool as the run's agent has it. */
@@ -22,9 +20,6 @@ export function automationOutcomeInstruction(toolName: string, howToCall = ""): 
     "Use `failed` when the objective was not completed, `partial` when only part completed, and `needs_attention` when operator action is required. Give a concise factual summary.",
   ].join("\n");
 }
-
-/** As ChatThreadDO puts it in its system prompt. */
-export const AUTOMATION_OUTCOME_INSTRUCTION = automationOutcomeInstruction("report_automation_outcome");
 
 /** As a runtime agent has the tool (camel__<tool>, in js_exec too). */
 const RUNTIME_OUTCOME_TOOL = `${RUNTIME_TOOL_PREFIX}report_automation_outcome`;
@@ -56,17 +51,13 @@ async function agentRunning(env: ChatEnv, agentId: string): Promise<boolean> {
 }
 
 /**
- * Start a scheduled run's turn on the direct path; null when its thread is
- * not a direct runtime thread (it stays on ChatThreadDO). A thread
- * ChatThreadDO relays to a runtime agent is adopted between turns.
+ * Start a scheduled run's turn on the runtime; null when its thread cannot run
+ * there (its move is under way elsewhere, failed, or cannot happen). A thread
+ * the old in-DO loop relayed to a runtime agent is adopted between turns, and
+ * any other thread still on ChatThreadDO moves first.
  */
 export async function startScheduledRuntimeTurn(env: ChatEnv, request: ScheduledTurnRequest): Promise<ScheduledTurnResult | null> {
   if (!runtimeDirectThreadsEnabled(env)) return null;
-  const row = await directRuntimeRow(env, request.orgId, request.threadId, { adopt: true });
-  if (!row) return null;
-  if (row.agentId && await agentRunning(env, row.agentId)) {
-    return { status: "busy", error: "Thread is busy with another run" };
-  }
   const context: ChatContextState = {
     orgId: request.orgId,
     workspaceId: request.workspaceId,
@@ -75,6 +66,12 @@ export async function startScheduledRuntimeTurn(env: ChatEnv, request: Scheduled
     userName: "Scheduler",
     userEmail: null,
   };
+  const row = await directRuntimeRow(env, request.orgId, request.threadId, { adopt: true })
+    ?? await migrateThreadOnSend(env, context);
+  if (!row) return null;
+  if (row.agentId && await agentRunning(env, row.agentId)) {
+    return { status: "busy", error: "Thread is busy with another run" };
+  }
   const pending: Promise<unknown>[] = [];
   const result = await startRuntimeTurn(env, {
     context,

@@ -42,7 +42,6 @@ export async function action({ request, context, params }: ActionFunctionArgs) {
       workspaceId: threadContext.workspaceId,
       threadId: threadContext.threadId,
       userId: threadContext.userId ?? undefined,
-      directRuntime: true,
     },
   });
   const saved = await tools.callToolEnvelope("import_file", {

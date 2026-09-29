@@ -5,7 +5,7 @@
  * thread (the admin views, the JSONL export, condensed transcripts), not the
  * chat page, which pages.
  */
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "../../../../src/lib/agent-messages";
 import type { AgentEvalParsedMessage, ChatEnv } from "../chat-thread/types.js";
 import type { ThreadRuntimeRecord } from "../identity/org-do.js";
 import { piMessagesToParsedMessages } from "../pi-message-export.js";

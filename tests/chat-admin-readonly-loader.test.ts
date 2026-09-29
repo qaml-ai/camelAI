@@ -7,9 +7,6 @@ const getAuthEnvMock = vi.fn();
 const getEnvMock = vi.fn();
 const adminGetThreadContextByIdMock = vi.fn();
 const getThreadMock = vi.fn();
-const getThreadPreviewStateMock = vi.fn();
-const getTodoStateMock = vi.fn();
-const getUiMessagesMock = vi.fn();
 const getWorkspaceModelPickerStateMock = vi.fn();
 const getOrgBillingOverviewMock = vi.fn();
 const getOrgMock = vi.fn();
@@ -22,7 +19,8 @@ const listGroupsForMoveMock = vi.fn();
 const loadWorkspaceMentionSourcesMock = vi.fn();
 const getThreadRuntimeMock = vi.fn(async () => null as unknown);
 const loadRuntimeThreadSeedMock = vi.fn();
-const migrateThreadOnOpenMock = vi.fn(async () => null as unknown);
+const openUnmovedThreadMock = vi.fn(async () => ({ state: 'moving' }) as unknown);
+const readOnlyThreadHistoryMock = vi.fn();
 
 vi.mock('@/lib/auth.server', () => ({
   requireSuperuser: requireSuperuserMock,
@@ -47,15 +45,13 @@ vi.mock('@/lib/chat-do.server', () => ({
   applyHostedCreditPause: (state: unknown) => state,
   getThread: getThreadMock,
   getThreadRuntime: getThreadRuntimeMock,
-  getThreadPreviewState: getThreadPreviewStateMock,
-  getTodoState: getTodoStateMock,
-  getUiMessagePage: getUiMessagesMock,
   getWorkspaceModelPickerState: getWorkspaceModelPickerStateMock,
 }));
 
 vi.mock('@/lib/runtime-threads.server', () => ({
   loadRuntimeThreadSeed: loadRuntimeThreadSeedMock,
-  migrateThreadOnOpen: migrateThreadOnOpenMock,
+  openUnmovedThread: openUnmovedThreadMock,
+  readOnlyThreadHistory: readOnlyThreadHistoryMock,
 }));
 vi.mock('@/lib/wait-until', () => ({ waitUntil: vi.fn() }));
 
@@ -100,18 +96,6 @@ describe('chat loader admin readonly mode', () => {
           getInfo: async () => ({ id: 'org_active', slug: 'acme' }),
         }),
       },
-    });
-    getThreadPreviewStateMock.mockResolvedValue({
-      target: null,
-      tabs: [],
-      activeTabId: null,
-      version: 0,
-    });
-    getTodoStateMock.mockResolvedValue([]);
-    getUiMessagesMock.mockResolvedValue({
-      messages: [],
-      nextCursor: null,
-      hasMore: false,
     });
     getWorkspaceModelPickerStateMock.mockResolvedValue({
       llmProvider: null,
@@ -195,12 +179,11 @@ describe('chat loader admin readonly mode', () => {
     expect(await result.chatData).toEqual({
       messages: [],
       messagesError: null,
-      initialUiMessages: [],
-      olderUiMessagesCursor: null,
       todos: [],
       previewTabs: [],
       activeTabId: null,
     });
+    expect(readThreadMessagesMock).toHaveBeenCalledWith({}, expect.objectContaining({ threadId: 'thread_123', skipBanCheck: true }));
   });
 });
 
@@ -216,18 +199,6 @@ describe('chat loader workspace mismatch handling', () => {
       },
     });
     getAuthEnvMock.mockReturnValue({});
-    getThreadPreviewStateMock.mockResolvedValue({
-      target: null,
-      tabs: [],
-      activeTabId: null,
-      version: 0,
-    });
-    getTodoStateMock.mockResolvedValue([]);
-    getUiMessagesMock.mockResolvedValue({
-      messages: [],
-      nextCursor: null,
-      hasMore: false,
-    });
     requireSessionWorkspaceAccessMock.mockResolvedValue({
       orgId: 'org_active',
       workspaceId: 'ws_active',
@@ -274,7 +245,7 @@ describe('chat loader workspace mismatch handling', () => {
       orgId: 'org_active',
     });
     // A thread id from another workspace is never moved to the runtime.
-    expect(migrateThreadOnOpenMock).not.toHaveBeenCalled();
+    expect(openUnmovedThreadMock).not.toHaveBeenCalled();
   });
 
   it('moves a thread to the runtime only once it resolves for the active workspace', async () => {
@@ -293,15 +264,15 @@ describe('chat loader workspace mismatch handling', () => {
       params: { id: 'thread_123' },
     } as never);
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(migrateThreadOnOpenMock).not.toHaveBeenCalled();
+    expect(openUnmovedThreadMock).not.toHaveBeenCalled();
     resolveThread({ id: 'thread_123', workspace_id: 'ws_active', title: 'Workspace Thread' });
     await loading;
-    expect(migrateThreadOnOpenMock).toHaveBeenCalledWith({}, expect.objectContaining({
+    expect(openUnmovedThreadMock).toHaveBeenCalledWith({}, expect.objectContaining({
       orgId: 'org_active', workspaceId: 'ws_active', threadId: 'thread_123',
-    }), expect.any(Function));
+    }), expect.any(Function), expect.any(Number));
   });
 
-  it('returns chat payload when the thread belongs to the active workspace', async () => {
+  it('shows a thread still on ChatThreadDO moving, rendering nothing from the DO', async () => {
     requireAuthContextMock.mockResolvedValue({
       currentWorkspace: { id: 'ws_active' },
       currentOrg: { id: 'org_active', slug: 'acme' },
@@ -320,17 +291,68 @@ describe('chat loader workspace mismatch handling', () => {
     } as never);
 
     expect(result.readOnly).toBe(false);
+    expect(result.runtimeThread).toBe(false);
     expect(result.workspaceId).toBe('ws_active');
     expect(result.threadTitle).toBe('Workspace Thread');
     expect(await result.chatData).toEqual({
       messages: [],
       messagesError: null,
-      initialUiMessages: [],
-      olderUiMessagesCursor: null,
       todos: [],
       previewTabs: [],
       activeTabId: null,
+      move: { state: 'moving' },
     });
+    expect(readOnlyThreadHistoryMock).not.toHaveBeenCalled();
+    expect(readThreadMessagesMock).not.toHaveBeenCalled();
+  });
+
+  it('opens a thread its move just finished on the runtime', async () => {
+    requireAuthContextMock.mockResolvedValue({
+      currentWorkspace: { id: 'ws_active' },
+      currentOrg: { id: 'org_active', slug: 'acme' },
+      orgs: [{ org_id: 'org_active', role: 'admin' }],
+      user: { id: 'user_1' },
+    });
+    getThreadMock.mockResolvedValue({ id: 'thread_123', workspace_id: 'ws_active', title: 'Workspace Thread' });
+    const row = { threadId: 'thread_123', agentId: 'agt_1', model: 'm', keyScope: 'hosted', configured: null, createdAt: 1, updatedAt: 1 };
+    openUnmovedThreadMock.mockResolvedValueOnce({ state: 'runtime', row });
+    const seed = { agentId: 'agt_1', token: 't', expiresAt: 2, url: null, page: { entries: [], next: null }, previewTabs: [], activeTabId: null };
+    loadRuntimeThreadSeedMock.mockResolvedValue({ seed, error: null });
+
+    const result = await loader({
+      request: new Request('https://camelai.com/chat/thread_123'),
+      context: {},
+      params: { id: 'thread_123' },
+    } as never);
+
+    expect(result.runtimeThread).toBe(true);
+    expect(await result.chatData).toMatchObject({ runtime: seed });
+  });
+
+  it('shows a thread that cannot move read-only, from the exporter, with the reason', async () => {
+    requireAuthContextMock.mockResolvedValue({
+      currentWorkspace: { id: 'ws_active' },
+      currentOrg: { id: 'org_active', slug: 'acme' },
+      orgs: [{ org_id: 'org_active', role: 'admin' }],
+      user: { id: 'user_1' },
+    });
+    getThreadMock.mockResolvedValue({ id: 'thread_123', workspace_id: 'ws_active', title: 'Huge Thread' });
+    openUnmovedThreadMock.mockResolvedValueOnce({ state: 'readonly', reason: 'too_large' });
+    const messages = [{ id: 'm1', thread_id: 'thread_123', role: 'user', content: 'hello', created_at: 1, forkEntryId: 'm1' }];
+    readOnlyThreadHistoryMock.mockResolvedValue({ messages, truncated: true });
+
+    const result = await loader({
+      request: new Request('https://camelai.com/chat/thread_123'),
+      context: {},
+      params: { id: 'thread_123' },
+    } as never);
+
+    expect(result.runtimeThread).toBe(false);
+    expect(await result.chatData).toMatchObject({
+      messages,
+      move: { state: 'readonly', reason: 'too_large', truncated: true },
+    });
+    expect(readOnlyThreadHistoryMock).toHaveBeenCalledWith({}, 'thread_123');
   });
 
   it('loads a runtime thread from the runtime, without the thread DO', async () => {
@@ -356,12 +378,11 @@ describe('chat loader workspace mismatch handling', () => {
     } as never);
 
     expect(result.runtimeThread).toBe(true);
-    expect(await result.chatData).toMatchObject({ runtime: seed, initialUiMessages: [], messagesError: null });
+    expect(await result.chatData).toMatchObject({ runtime: seed, messagesError: null });
     expect(loadRuntimeThreadSeedMock).toHaveBeenCalledWith(expect.anything(), {
       orgId: 'org_active', workspaceId: 'ws_active', threadId: 'thread_rt', userId: 'user_1', row,
     });
-    expect(getUiMessagesMock).not.toHaveBeenCalled();
-    expect(getTodoStateMock).not.toHaveBeenCalled();
+    expect(openUnmovedThreadMock).not.toHaveBeenCalled();
   });
 
   it('preserves billing overview failures instead of exposing unpaused models', async () => {
@@ -387,7 +408,7 @@ describe('chat loader workspace mismatch handling', () => {
     ).rejects.toBe(billingError);
   });
 
-  it('seeds the normal transcript path from the thread record while durable history resolves', async () => {
+  it("seeds a runtime thread's transcript from the thread record while its history resolves", async () => {
     requireAuthContextMock.mockResolvedValue({
       currentWorkspace: { id: 'ws_active' },
       currentOrg: { id: 'org_active', slug: 'acme' },
@@ -403,6 +424,8 @@ describe('chat loader workspace mismatch handling', () => {
       user_message_count: 0,
       first_user_message: 'Build an analytics dashboard',
     });
+    getThreadRuntimeMock.mockResolvedValueOnce({ threadId: 'thread_123', agentId: null, model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 });
+    loadRuntimeThreadSeedMock.mockResolvedValue({ seed: { agentId: null, token: null, expiresAt: null, url: null, page: null, previewTabs: [], activeTabId: null }, error: null });
 
     const result = await loader({
       request: new Request('https://camelai.com/chat/thread_123'),
@@ -410,189 +433,17 @@ describe('chat loader workspace mismatch handling', () => {
       params: { id: 'thread_123' },
     } as never);
 
-    expect(result.chatDataSeed.initialUiMessages).toEqual([
+    expect(result.chatDataSeed.messages).toEqual([
       expect.objectContaining({
         id: 'thread-seed:thread_123',
         role: 'user',
-        parts: [{ type: 'text', text: 'Build an analytics dashboard', state: 'done' }],
-        metadata: expect.objectContaining({ authorDisplayName: 'Illiana Reed', source: 'web' }),
+        content: 'Build an analytics dashboard',
+        authorDisplayName: 'Illiana Reed',
+        messageSource: 'web',
       }),
     ]);
-    // The same deferred durable transcript path runs for every thread shape.
     await result.chatData;
-    expect(getUiMessagesMock).toHaveBeenCalled();
-  });
-
-  it('uses the same seed and transcript path for an API-created thread', async () => {
-    requireAuthContextMock.mockResolvedValue({
-      currentWorkspace: { id: 'ws_active' },
-      currentOrg: { id: 'org_active', slug: 'acme' },
-      orgs: [{ org_id: 'org_active', role: 'admin' }],
-      user: { id: 'viewer_456', name: 'Different Viewer', email: 'viewer@example.com' },
-    });
-    getThreadMock.mockResolvedValue({
-      id: 'thread_123',
-      workspace_id: 'ws_active',
-      created_by: 'creator_123',
-      title: 'New Chat',
-      model: 'sonnet',
-      user_message_count: 0,
-      first_user_message: 'Build an analytics dashboard',
-    });
-
-    const result = await loader({
-      request: new Request('https://camelai.com/chat/thread_123'),
-      context: {},
-      params: { id: 'thread_123' },
-    } as never);
-
-    expect(result.chatDataSeed.initialUiMessages[0]?.metadata).not.toHaveProperty('authorDisplayName');
-    await result.chatData;
-    expect(getUiMessagesMock).toHaveBeenCalled();
     expect(readThreadMessagesMock).not.toHaveBeenCalled();
-  });
-
-  it('does not block existing-thread navigation on chat data resolution', async () => {
-    let resolveMessages:
-      | ((page: { messages: []; nextCursor: null; hasMore: false }) => void)
-      | undefined;
-    const pendingMessages = new Promise<{
-      messages: [];
-      nextCursor: null;
-      hasMore: false;
-    }>((resolve) => {
-      resolveMessages = resolve;
-    });
-    requireAuthContextMock.mockResolvedValue({
-      currentWorkspace: { id: 'ws_active' },
-      currentOrg: { id: 'org_active', slug: 'acme' },
-      orgs: [{ org_id: 'org_active', role: 'admin' }],
-    });
-    getThreadMock.mockResolvedValue({
-      id: 'thread_123',
-      workspace_id: 'ws_active',
-      title: 'Workspace Thread',
-    });
-    getUiMessagesMock.mockReturnValue(pendingMessages);
-
-    const result = await loader({
-      request: new Request('https://camelai.com/chat/thread_123'),
-      context: {},
-      params: { id: 'thread_123' },
-    } as never);
-
-    expect(result.threadId).toBe('thread_123');
-    expect(typeof (result.chatData as Promise<unknown>).then).toBe('function');
-
-    let chatDataResolved = false;
-    void Promise.resolve(result.chatData).then(() => {
-      chatDataResolved = true;
-    });
-    await Promise.resolve();
-    expect(chatDataResolved).toBe(false);
-
-    resolveMessages?.({ messages: [], nextCursor: null, hasMore: false });
-    expect(await result.chatData).toEqual({
-      messages: [],
-      messagesError: null,
-      initialUiMessages: [],
-      olderUiMessagesCursor: null,
-      todos: [],
-      previewTabs: [],
-      activeTabId: null,
-    });
-  });
-
-  it('loads messages for explicit same-thread revalidation and thread navigation', async () => {
-    const context = {};
-    requireAuthContextMock.mockResolvedValue({
-      currentWorkspace: { id: 'ws_active' },
-      currentOrg: { id: 'org_active', slug: 'acme' },
-      orgs: [{ org_id: 'org_active', role: 'admin' }],
-    });
-    getThreadMock.mockImplementation(async (_context, threadId: string) => ({
-      id: threadId,
-      workspace_id: 'ws_active',
-      title: `Thread ${threadId}`,
-    }));
-
-    await loader({
-      request: new Request('https://camelai.com/chat/thread_123'),
-      context,
-      params: { id: 'thread_123' },
-    } as never);
-    expect(getUiMessagesMock).toHaveBeenCalledTimes(1);
-
-    getUiMessagesMock.mockClear();
-    const sameThreadShouldRevalidate = shouldRevalidate({
-      currentUrl: new URL('https://camelai.com/chat/thread_123'),
-      nextUrl: new URL('https://camelai.com/chat/thread_123'),
-      currentParams: { id: 'thread_123' },
-      nextParams: { id: 'thread_123' },
-      defaultShouldRevalidate: true,
-    });
-    if (sameThreadShouldRevalidate) {
-      await loader({
-        request: new Request('https://camelai.com/chat/thread_123'),
-        context,
-        params: { id: 'thread_123' },
-      } as never);
-    }
-    expect(getUiMessagesMock).toHaveBeenCalledTimes(1);
-    expect(getUiMessagesMock).toHaveBeenCalledWith(context, 'thread_123');
-    getUiMessagesMock.mockClear();
-
-    const threadChangeShouldRevalidate = shouldRevalidate({
-      currentUrl: new URL('https://camelai.com/chat/thread_123'),
-      nextUrl: new URL('https://camelai.com/chat/thread_456'),
-      currentParams: { id: 'thread_123' },
-      nextParams: { id: 'thread_456' },
-      defaultShouldRevalidate: false,
-    });
-    expect(threadChangeShouldRevalidate).toBe(true);
-
-    await loader({
-      request: new Request('https://camelai.com/chat/thread_456'),
-      context,
-      params: { id: 'thread_456' },
-    } as never);
-
-    expect(getUiMessagesMock).toHaveBeenCalledWith(context, 'thread_456');
-    // Live loads never touch the legacy pi_core transcript RPC.
-    expect(readThreadMessagesMock).not.toHaveBeenCalled();
-  });
-
-  it('loads todo state into chat data for existing threads', async () => {
-    const context = {};
-    const todos = [
-      {
-        content: 'Review results',
-        status: 'in_progress',
-        activeForm: 'Reviewing results',
-      },
-    ];
-    requireAuthContextMock.mockResolvedValue({
-      currentWorkspace: { id: 'ws_active' },
-      currentOrg: { id: 'org_active', slug: 'acme' },
-      orgs: [{ org_id: 'org_active', role: 'admin' }],
-    });
-    getThreadMock.mockResolvedValue({
-      id: 'thread_123',
-      workspace_id: 'ws_active',
-      title: 'Workspace Thread',
-    });
-    getTodoStateMock.mockResolvedValue(todos);
-
-    const result = await loader({
-      request: new Request('https://camelai.com/chat/thread_123'),
-      context,
-      params: { id: 'thread_123' },
-    } as never);
-
-    expect(getTodoStateMock).toHaveBeenCalledWith(context, 'thread_123');
-    expect(await result.chatData).toEqual(
-      expect.objectContaining({ todos }),
-    );
   });
 
   it('falls back to legacy visible models when picker state fails to load', async () => {

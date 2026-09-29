@@ -22,23 +22,13 @@ import { recordWorkspaceThreadStreaming } from "../thread-status.js";
 const DEFAULT_RUNTIME = "https://agents.camelai.dev";
 
 /**
- * CodeModeToolsBinding tools the runtime does NOT get. Everything else that is
- * not hidden (the warehouse_* compatibility aliases) is served; tools that
- * touch the thread's UI state (TodoWrite, set_preview, deploy_project...)
- * reach its ChatThreadDO by RPC with the threadId the runtime signs.
+ * CodeModeToolsBinding tools the runtime does NOT get (none now: the old
+ * loop's AskUserQuestion, web and subagent tools are gone, replaced by the
+ * runtime's builtins). Everything else that is not hidden (the warehouse_*
+ * compatibility aliases) is served; tools that touch the thread's UI state
+ * (TodoWrite, set_preview...) write it to OrgDO under the signed threadId.
  */
-export const AGENT_MCP_EXCLUDED_TOOL_NAMES: ReadonlySet<string> = new Set([
-  // The runtime's ask_user built-in replaces it.
-  "AskUserQuestion",
-  // The runtime's own web builtins replace these.
-  "WebSearch",
-  "WebFetch",
-  // Subagents are not carried over to the runtime.
-  "Agent",
-  "Explore",
-  "Research",
-  "Oracle",
-]);
+export const AGENT_MCP_EXCLUDED_TOOL_NAMES: ReadonlySet<string> = new Set<string>([]);
 
 /**
  * Destructive tools that confirm with the user first: over MCP the question
@@ -112,9 +102,6 @@ export async function authorizeRuntimeIdentity(
     workspaceId,
     threadId,
     userId,
-    allowWebTools: false,
-    // A thread with a runtime row has no ChatThreadDO (plans/runtime-threads-direct.md).
-    ...(access.runtime ? { directRuntime: true } : {}),
   };
 }
 
@@ -229,7 +216,7 @@ export function agentToolServer(env: Env, tools: ToolsFactory): ToolServer {
       // the thread's live UI, as it does for js_exec's calls in chiridion.
       const parentToolUseId = context.toolCallId;
       const scoped = parentToolUseId ? { ...props, parentToolUseId } : props;
-      const stopHeartbeat = props.directRuntime ? runningHeartbeat(env, props.workspaceId, props.threadId) : () => {};
+      const stopHeartbeat = runningHeartbeat(env, props.workspaceId, props.threadId);
       try {
         if (AGENT_MCP_CONFIRMED_TOOL_NAMES.has(name)) {
           // Ask first: everything before an ask runs again when the user answers.

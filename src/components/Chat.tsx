@@ -9,7 +9,6 @@ import {
   useLayoutEffect,
 } from "react";
 import type { CSSProperties } from "react";
-import type { UIMessage } from "ai";
 import {
   useNavigate,
   useFetcher,
@@ -55,14 +54,6 @@ import { useFreeTierUpgradePrompt } from "@/hooks/use-free-tier-upgrade-prompt";
 import { useBillingDialogPresence } from "@/hooks/use-billing-dialog-presence";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { APP_BUILD_ID } from "@/lib/app-build-id";
-import {
-  appendEvictedRenderMessages,
-  classifyResidentRenderHistoryUpdate,
-  isCurrentRenderHistoryGeneration,
-  prependOlderRenderMessages,
-  shouldHydrateRenderHistoryCursor,
-  type ChatRenderHistoryPage,
-} from "@/lib/chat-render-history";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { PromptInput } from "@/components/prompt-input";
 import { FloatingTodoList, type TodoItem } from "@/components/floating-todo";
@@ -124,7 +115,6 @@ import { CAMEL_CODE_LLM_MODEL } from "@/lib/llm-provider-config";
 import { resolveMessageAuthorDisplayName } from "@/lib/message-author";
 import { buildSlugMap, type MentionableProject } from "@/lib/mentions";
 import { isFileDrag } from "@/lib/file-drag";
-import { uiMessagesEquivalent } from "@/lib/ui-message-adapter";
 import {
   deriveIsAwaitingAssistant,
   deriveShowGlobalAssistantIndicator,
@@ -135,7 +125,6 @@ import {
   type ChatAgentModelFallbackNotice,
   type ChatAgentStatePayload,
 } from "@/lib/chat-agent-state";
-import { usePiChatStream } from "@/lib/use-pi-chat-stream";
 import {
   checkForVersionSkew,
   isReloadSafeNow,
@@ -159,19 +148,10 @@ import {
   trackChatReconnectFlush,
   trackChatSendDispatched,
   trackChatSendQueuedOffline,
-  trackChatStreamClose,
-  trackChatStreamError,
   trackChatStreamOpen,
-  trackChatStreamTerminalClose,
 } from "@/lib/chat-sse-telemetry";
-import { terminalChatSseUserMessage } from "@/lib/chat-sse-close";
 import {
-  SSE_READY_STATE_OPEN,
-  type SseAgentCloseEvent,
-  type SseAgentMessageEvent,
-} from "@/lib/sse-agent-client";
-import { useSseAgent } from "@/lib/use-sse-agent";
-import {
+  CLIENT_OPEN,
   useRuntimeThread,
   type RuntimeThreadCallbacks,
   type RuntimeThreadSeed,
@@ -338,21 +318,11 @@ interface ChatBaseProps {
   threadId?: string;
   workspaceId: string;
   /**
-   * Legacy `Message` transcript. Supplied by the admin read-only loader branch
-   * (pi_core, rendered directly) and the client snapshot cache. The live
-   * loader branch leaves it empty — its
-   * fallback view is derived from `initialUiMessages`.
+   * A transcript to paint: a read-only view's whole history (the admin
+   * viewer, a thread that could not move to the runtime), or the client
+   * snapshot cache's while a runtime thread's view loads.
    */
   initialMessages?: Message[];
-  /**
-   * ai-chat-owned durable render history (commit 4). Seeds `useAgentChat`; the
-   * live-user loader branch supplies it and the hook owns the transcript from
-   * there. The admin read-only branch leaves it empty and renders `initialMessages`
-   * (pi_core) directly.
-   */
-  initialUiMessages?: UIMessage[];
-  /** Cursor for fetching render messages older than the resident window. */
-  olderUiMessagesCursor?: string | null;
   initialTodos?: TodoItem[];
   threadModel?: LlmModel | null;
   llmProvider?: LlmProvider | null;
@@ -376,31 +346,24 @@ interface ChatBaseProps {
   hostname?: AppUrlInput;
   /** True when messages are still loading (deferred data) */
   isLoadingMessages?: boolean;
-  /** Superuser admin read-only viewer */
+  /** No composer or live connection: the admin viewer, or a thread that could not move to the runtime. */
   readOnly?: boolean;
+  /** What the read-only view says above the transcript (default: the admin viewer's note). */
+  readOnlyNotice?: string | null;
   chatGroupId?: string | null;
   initialWelcomeInput?: string | null;
   connections?: Integration[] | Promise<Integration[]>;
   projects?: MentionableProject[] | Promise<MentionableProject[]>;
   onSnapshotChange?: (snapshot: {
     messages: Message[];
-    uiMessages: UIMessage[];
     streamingMessageId: string | null;
     todos: TodoItem[];
   }) => void;
   /**
-   * Id of the assistant message the instant-paint snapshot captured mid-stream
-   * and EXCLUDED from `initialUiMessages` (see resolveDisplayChatData). Chat
-   * keeps painting it from the legacy snapshot view until the resumed stream
-   * re-delivers it (or a bounded window lapses — a turn that died renders
-   * whatever the loader/broadcast says instead).
+   * "runtime" reads the thread from the hosted agent runtime; "pending" waits,
+   * unconnected, until the loader says the thread is there.
    */
-  bridgedStreamingMessageId?: string | null;
-  /**
-   * Where the thread runs: "runtime" reads the hosted agent runtime directly
-   * (no ChatThreadDO); "pending" waits, unconnected, until the loader says.
-   */
-  backend?: "do" | "runtime" | "pending";
+  backend?: "runtime" | "pending";
   /** A runtime thread's first-paint data from the loader. */
   runtimeSeed?: RuntimeThreadSeed | null;
 }
@@ -585,49 +548,6 @@ function dispatchLocalThreadSummaryUpdate(
   );
 }
 
-function isChatGroupAvatarStatus(
-  value: unknown,
-): value is ChatGroupAvatarStatus {
-  return (
-    value === "pending" ||
-    value === "generated" ||
-    value === "user" ||
-    value === "default"
-  );
-}
-
-function isChatGroupAvatar(value: unknown): value is ChatGroupAvatar {
-  if (!value || typeof value !== "object") return false;
-  const avatar = value as {
-    color?: unknown;
-    content?: unknown;
-    status?: unknown;
-  };
-  return (
-    typeof avatar.color === "string" &&
-    typeof avatar.content === "string" &&
-    (avatar.status === undefined || isChatGroupAvatarStatus(avatar.status))
-  );
-}
-
-function dispatchLocalChatGroupAvatarUpdate(
-  threadId: string | null | undefined,
-  groupId: string | null | undefined,
-  avatar: ChatGroupAvatar | null | undefined,
-): void {
-  if (typeof window === "undefined" || !threadId || !groupId || !avatar) return;
-  window.dispatchEvent(
-    new CustomEvent("camelai:chat-group-avatar", {
-      detail: {
-        threadId,
-        groupId,
-        avatar,
-        updatedAt: Date.now(),
-      },
-    }),
-  );
-}
-
 function isComposerVisiblyEmpty(
   text: string,
   attachments: Attachment[],
@@ -738,8 +658,6 @@ export default function Chat({
   threadId,
   workspaceId,
   initialMessages,
-  initialUiMessages,
-  olderUiMessagesCursor = null,
   initialTodos = [],
   threadModel: providedThreadModel,
   llmProvider,
@@ -763,13 +681,13 @@ export default function Chat({
   orgSlug,
   isLoadingMessages = false,
   readOnly = false,
+  readOnlyNotice = null,
   chatGroupId = null,
   initialWelcomeInput,
   connections,
   projects,
   onSnapshotChange,
-  bridgedStreamingMessageId,
-  backend = "do",
+  backend = "runtime",
   runtimeSeed = null,
   welcomeData,
 }: ChatProps) {
@@ -836,15 +754,7 @@ export default function Chat({
   const isSubmittingNewThread =
     navigation.state !== "idle" &&
     navigation.formData?.get("intent") === "createThreadAndStart";
-  const {
-    loaderErrorIdsRef,
-    parsedInitialMessages,
-    stableInitialUiMessages,
-  } = useInitialChatTranscript({
-    threadId,
-    initialMessages,
-    initialUiMessages,
-  });
+  const { parsedInitialMessages } = useInitialChatTranscript({ initialMessages });
   const initialPreviewSession = useMemo(
     () =>
       normalizePreviewSessionState(
@@ -900,125 +810,36 @@ export default function Chat({
   const [currentTodos, setCurrentTodos] = useState<TodoItem[]>(initialTodos);
 
   const agentEnabled =
-    !readOnly && backend !== "pending" && Boolean(threadId && resolvedWorkspaceId);
-  const runtimeBackend = backend === "runtime";
-  // The transport's lifecycle callbacks reference many callbacks defined later in
-  // the component; stable wrappers read them from a ref so the connection can
-  // mount here, ahead of the render-history projection that depends on it.
+    !readOnly && backend === "runtime" && Boolean(threadId && resolvedWorkspaceId);
+  // The runtime connection's lifecycle callbacks reference many callbacks
+  // defined later in the component; stable wrappers read them from a ref so
+  // the connection can mount here.
   const agentCallbacksRef = useRef<{
     onOpen: () => void;
-    onMessage: (event: SseAgentMessageEvent) => void;
-    onClose: (event?: SseAgentCloseEvent) => void;
-    onError: (error?: unknown) => void;
-    onConnectionError: (error: {
-      code?: number;
-      reason?: string;
-      wasClean?: boolean;
-    }) => void;
     onStateUpdate: (state: ChatAgentState) => void;
   }>({
     onOpen: () => {},
-    onMessage: () => {},
-    onClose: () => {},
-    onError: () => {},
-    onConnectionError: () => {},
     onStateUpdate: () => {},
   });
-  const agentSocket = useSseAgent<ChatAgentState>({
-    agent: "chat-thread",
-    name: threadId ?? "disabled",
-    enabled: agentEnabled && !runtimeBackend,
-    query: {
-      threadId: threadId ?? null,
-      workspaceId: resolvedWorkspaceId ?? null,
-    },
-    onOpen: () => agentCallbacksRef.current.onOpen(),
-    onMessage: (event) => agentCallbacksRef.current.onMessage(event),
-    onClose: (event) => agentCallbacksRef.current.onClose(event),
-    onError: (error) => agentCallbacksRef.current.onError(error),
-    onConnectionError: (error) =>
-      agentCallbacksRef.current.onConnectionError(error),
-    onStateUpdate: (state) => agentCallbacksRef.current.onStateUpdate(state),
-  });
-  const doChat = usePiChatStream({
-    agent: agentSocket,
-    threadId,
-    initialUiMessages: stableInitialUiMessages,
-  });
-  // A runtime thread answers the same two seams (the connection's calls and
-  // the transcript stream) from the runtime's watcher.
+  // The runtime thread answers Chat's two seams: the connection's calls and
+  // the transcript stream, from the runtime's watcher.
   const runtimeThread = useRuntimeThread({
     threadId,
     workspaceId: resolvedWorkspaceId,
     seed: runtimeSeed,
-    enabled: agentEnabled && runtimeBackend,
+    enabled: agentEnabled,
     callbacks: agentCallbacksRef as unknown as {
       current: RuntimeThreadCallbacks;
     },
   });
-  const piChat = runtimeBackend ? runtimeThread.chat : doChat;
+  const piChat = runtimeThread.chat;
   const runtimeLoadOlder = runtimeThread.loadOlder;
-  const piChatRef = useRef(piChat);
-  piChatRef.current = piChat;
-  const [archivedUiMessages, setArchivedUiMessages] = useState<UIMessage[]>([]);
-  const [olderMessagesCursor, setOlderMessagesCursor] = useState<string | null>(
-    olderUiMessagesCursor,
-  );
+  // The watcher pages older history itself; this says whether there is more.
+  const hasOlderMessages = runtimeThread.hasOlder;
   const [isLoadingOlderMessages, setIsLoadingOlderMessages] = useState(false);
   const [olderMessagesError, setOlderMessagesError] = useState<string | null>(
     null,
   );
-  const renderHistoryGenerationRef = useRef(0);
-  const lastHydratedCursorPropRef = useRef(olderUiMessagesCursor);
-  const residentUiMessagesRef = useRef<UIMessage[]>(
-    piChat.uiMessages.length > 0
-      ? piChat.uiMessages
-      : (initialUiMessages ?? []),
-  );
-  const observedLiveResidentRef = useRef(piChat.uiMessages.length > 0);
-  useEffect(() => {
-    // Cached tab data can mount before its loader page resolves. Accept a later
-    // cursor prop only during that initial generation; an authoritative
-    // replacement permanently retires the old boundary.
-    if (shouldHydrateRenderHistoryCursor(
-      renderHistoryGenerationRef.current,
-      lastHydratedCursorPropRef.current,
-      olderUiMessagesCursor,
-    )) {
-      lastHydratedCursorPropRef.current = olderUiMessagesCursor;
-      setOlderMessagesCursor(olderUiMessagesCursor);
-    }
-  }, [olderUiMessagesCursor]);
-  // A runtime thread pages its history through the watcher; the cursor only
-  // says whether there is an older page.
-  const runtimeHasOlder = runtimeThread.hasOlder;
-  useEffect(() => {
-    if (runtimeBackend) setOlderMessagesCursor(runtimeHasOlder ? "runtime" : null);
-  }, [runtimeBackend, runtimeHasOlder]);
-  useLayoutEffect(() => {
-    const nextResident = piChat.uiMessages;
-    // Some hook versions briefly expose an empty live list before applying the
-    // loader seed. Do not mistake that hydration gap for an authoritative
-    // clear; after the first non-empty live state, empty is a real reset.
-    if (nextResident.length === 0 && !observedLiveResidentRef.current) return;
-    const update = classifyResidentRenderHistoryUpdate(
-      residentUiMessagesRef.current,
-      nextResident,
-    );
-    residentUiMessagesRef.current = nextResident;
-    observedLiveResidentRef.current = nextResident.length > 0;
-    if (update.kind === "replacement") {
-      renderHistoryGenerationRef.current += 1;
-      setArchivedUiMessages([]);
-      setOlderMessagesCursor(null);
-      setOlderMessagesError(null);
-      setIsLoadingOlderMessages(false);
-    } else if (update.evicted.length > 0) {
-      setArchivedUiMessages((current) =>
-        appendEvictedRenderMessages(current, update.evicted),
-      );
-    }
-  }, [piChat.uiMessages]);
   const isStreaming = piChat.isStreaming;
   const isStreamingRef = useRef(false);
   isStreamingRef.current = isStreaming;
@@ -1030,14 +851,12 @@ export default function Chat({
     if (!threadId || readOnly) return;
     onSnapshotChange?.({
       messages: displayMessagesRef.current,
-      uiMessages: piChat.uiMessages,
       streamingMessageId: piChat.streamingMessageId,
       todos: currentTodos,
     });
   }, [
     currentTodos,
     piChat.messages,
-    piChat.uiMessages,
     piChat.streamingMessageId,
     messages,
     onSnapshotChange,
@@ -1304,11 +1123,7 @@ export default function Chat({
     skillSheetsByToolId,
     visibleMessages,
   } = useChatTranscriptProjection({
-    archivedUiMessages,
-    bridgedStreamingMessageId,
-    threadId,
     liveMessages: piChat.messages,
-    liveUiMessages: piChat.uiMessages,
     optimisticMessages: messages,
     parsedInitialMessages,
     readOnly,
@@ -1349,8 +1164,6 @@ export default function Chat({
     readOnly,
   };
 
-  const prevInitialUiMessagesRef = useRef(stableInitialUiMessages);
-  const awaitingInitialHistoryRef = useRef(isLoadingMessages);
   const prevInitialTodosRef = useRef(initialTodos);
   const hasSyncedInitialPreviewRef = useRef(false);
   const previousPreviewThreadIdRef = useRef(threadId);
@@ -1366,42 +1179,6 @@ export default function Chat({
     },
     [],
   );
-
-  // Reconcile the loader's ai-chat render history into the hook. Covers the
-  // deferred initial load (hook seeded empty at mount, payload resolves after)
-  // and the missed-turn revalidation (a turn that finished while disconnected).
-  // The hook owns history once it has any, so we never clobber a live turn or
-  // overwrite a populated transcript with an empty loader result.
-  useEffect(() => {
-    const resolvedInitialHistory =
-      awaitingInitialHistoryRef.current && !isLoadingMessages;
-    if (!isLoadingMessages) awaitingInitialHistoryRef.current = false;
-    if (stableInitialUiMessages === prevInitialUiMessagesRef.current) return;
-    prevInitialUiMessagesRef.current = stableInitialUiMessages;
-    if (readOnly) return;
-    if (isStreamingRef.current || pendingMessagesRef.current.length > 0) return;
-    const currentUiMessages = piChatRef.current.uiMessages;
-    if (stableInitialUiMessages.length === 0 && currentUiMessages.length > 0) {
-      return;
-    }
-    // The deferred initial read can finish after the first live turn. Once
-    // streaming stops, the busy guard above no longer protects its response.
-    // Reject an initial snapshot that omits an assistant already delivered by
-    // the connection; subsequent revalidations still recover missed history.
-    if (resolvedInitialHistory) {
-      const snapshotIds = new Set(stableInitialUiMessages.map(({ id }) => id));
-      if (
-        currentUiMessages.some(
-          ({ id, role }) => role === "assistant" && !snapshotIds.has(id),
-        )
-      ) {
-        return;
-      }
-    }
-    if (uiMessagesEquivalent(currentUiMessages, stableInitialUiMessages))
-      return;
-    piChatRef.current.setUiMessages(stableInitialUiMessages);
-  }, [stableInitialUiMessages, readOnly, isLoadingMessages]);
 
   // Drop optimistic pending bubbles once their persisted skeleton has echoed
   // back through the hook (matched by id / clientMessageId), so the local list
@@ -1814,107 +1591,27 @@ export default function Chat({
   const chatAgentRef = useRef<ChatAgentClient | null>(null);
 
   const loadOlderMessages = useCallback(async () => {
-    const cursor = olderMessagesCursor;
-    if (!cursor || isLoadingOlderMessages) return;
-    if (runtimeBackend) {
-      // The watcher reads the older page straight from the runtime.
-      setIsLoadingOlderMessages(true);
-      setOlderMessagesError(null);
-      const container = scrollContainerRef.current;
-      if (container) {
-        olderPageScrollAnchorRef.current = {
-          scrollHeight: container.scrollHeight,
-          scrollTop: container.scrollTop,
-        };
-      }
-      try {
-        await runtimeLoadOlder();
-      } catch (error) {
-        console.error("Failed to load earlier chat messages:", error);
-        olderPageScrollAnchorRef.current = null;
-        setOlderMessagesError("Could not load earlier messages.");
-      } finally {
-        setIsLoadingOlderMessages(false);
-      }
-      return;
-    }
-    const requestGeneration = renderHistoryGenerationRef.current;
-
+    if (!hasOlderMessages || isLoadingOlderMessages) return;
+    // The watcher reads the older page straight from the runtime.
     setIsLoadingOlderMessages(true);
     setOlderMessagesError(null);
+    const container = scrollContainerRef.current;
+    if (container) {
+      olderPageScrollAnchorRef.current = {
+        scrollHeight: container.scrollHeight,
+        scrollTop: container.scrollTop,
+      };
+    }
     try {
-      const page = (await agentSocket.call("getOlderUiMessages", [
-        cursor,
-      ])) as ChatRenderHistoryPage;
-      if (!page || !Array.isArray(page.messages)) {
-        throw new Error("Invalid render-history page");
-      }
-      if (
-        !isCurrentRenderHistoryGeneration(
-          requestGeneration,
-          renderHistoryGenerationRef.current,
-        )
-      ) {
-        return;
-      }
-
-      const container = scrollContainerRef.current;
-      if (container) {
-        olderPageScrollAnchorRef.current = {
-          scrollHeight: container.scrollHeight,
-          scrollTop: container.scrollTop,
-        };
-      }
-      // A page can come back carrying a message that is neither archived nor
-      // resident — a legacy `d:` cursor rewinds the server to the NEWEST page,
-      // and another session's turn can land in it. Prepending that to the head
-      // of the archived array would render a brand-new message at the OLDEST end
-      // of the transcript, so drop anything already resident (the resident copy
-      // is authoritative and renders in its own place).
-      const residentIds = new Set(
-        residentUiMessagesRef.current.map((message) => message.id),
-      );
-      const olderOnly = page.messages.filter(
-        (message) => !residentIds.has(message.id),
-      );
-      setArchivedUiMessages((current) =>
-        prependOlderRenderMessages(current, olderOnly),
-      );
-      setOlderMessagesCursor(
-        page.hasMore &&
-          typeof page.nextCursor === "string" &&
-          page.nextCursor.length > 0
-          ? page.nextCursor
-          : null,
-      );
+      await runtimeLoadOlder();
     } catch (error) {
-      if (
-        !isCurrentRenderHistoryGeneration(
-          requestGeneration,
-          renderHistoryGenerationRef.current,
-        )
-      ) {
-        return;
-      }
       console.error("Failed to load earlier chat messages:", error);
+      olderPageScrollAnchorRef.current = null;
       setOlderMessagesError("Could not load earlier messages.");
     } finally {
-      if (
-        isCurrentRenderHistoryGeneration(
-          requestGeneration,
-          renderHistoryGenerationRef.current,
-        )
-      ) {
-        setIsLoadingOlderMessages(false);
-      }
+      setIsLoadingOlderMessages(false);
     }
-  }, [
-    agentSocket,
-    isLoadingOlderMessages,
-    olderMessagesCursor,
-    runtimeBackend,
-    runtimeLoadOlder,
-  ]);
+  }, [hasOlderMessages, isLoadingOlderMessages, runtimeLoadOlder]);
 
   useLayoutEffect(() => {
     const anchor = olderPageScrollAnchorRef.current;
@@ -1923,7 +1620,7 @@ export default function Chat({
     olderPageScrollAnchorRef.current = null;
     container.scrollTop =
       anchor.scrollTop + (container.scrollHeight - anchor.scrollHeight);
-  }, [archivedUiMessages, runtimeBackend ? piChat.messages : null]);
+  }, [piChat.messages]);
 
   const optimisticallyClearedConnectionSetupRequestIdRef = useRef<
     string | null
@@ -2758,7 +2455,7 @@ export default function Chat({
     (nextTabs: PreviewTab[], nextActiveTabId: string | null) => {
       if (!threadId) return;
       const agent = chatAgentRef.current;
-      if (!agent || agent.readyState !== SSE_READY_STATE_OPEN) return;
+      if (!agent || agent.readyState !== CLIENT_OPEN) return;
 
       void agent
         .call("setPreviewTabsState", [
@@ -3017,7 +2714,7 @@ export default function Chat({
           : JSON.stringify(message.content);
       const clientMessageId = message.clientMessageId ?? message.id;
 
-      if (!agent || agent.readyState !== SSE_READY_STATE_OPEN) {
+      if (!agent || agent.readyState !== CLIENT_OPEN) {
         return;
       }
 
@@ -3051,7 +2748,7 @@ export default function Chat({
               (result.status === "busy"
                 ? "The agent is busy. I restored your message as a draft so you can try again."
                 : "Failed to send message"),
-            { preserveReady: agent.readyState === SSE_READY_STATE_OPEN },
+            { preserveReady: agent.readyState === CLIENT_OPEN },
           );
           // The thread moved to the runtime after this page loaded it from
           // ChatThreadDO (a move that outlasted the loader's wait): load it
@@ -3080,7 +2777,7 @@ export default function Chat({
           // a lost send acknowledgement retains this message's deduplication
           // id across either transport.
           const transportOpen =
-            chatAgentRef.current?.readyState === SSE_READY_STATE_OPEN;
+            chatAgentRef.current?.readyState === CLIENT_OPEN;
           setReady(false);
           setLoading(true);
           if (transportOpen) {
@@ -3245,69 +2942,6 @@ export default function Chat({
     ],
   );
 
-  const handleAgentMessage = useCallback(
-    (event: SseAgentMessageEvent) => {
-      const id = threadId;
-      if (!id) return;
-      const data = JSON.parse(event.data);
-
-      // Reject messages stamped for a different thread (a late broadcast that
-      // arrives after switching threads must never apply to the new one).
-      if (typeof data?.threadId === "string" && data.threadId !== id) return;
-
-      // The transcript (streaming tokens, tool output, turn end) now rides
-      // ai-chat's native stream, consumed by useAgentChat. This raw handler only
-      // covers the remaining out-of-band broadcasts.
-      if (
-        data.type === "chat_group_avatar_updated" &&
-        typeof data.groupId === "string" &&
-        isChatGroupAvatar(data.avatar)
-      ) {
-        dispatchLocalChatGroupAvatarUpdate(id, data.groupId, data.avatar);
-      }
-    },
-    [threadId],
-  );
-
-  const handleAgentClose = useCallback(
-    (event?: SseAgentCloseEvent) => {
-      // `bye {"reason":"idle"}` parks the stream by design; the transport stays
-      // OPEN, sends are POSTs, and dispatching one wakes the stream. Clearing
-      // `ready` here would queue the next message with nothing to flush it.
-      if (event?.byeReason !== "idle") setReady(false);
-      if (threadId) trackChatStreamClose(threadId, event);
-    },
-    [threadId],
-  );
-
-  const handleAgentError = useCallback((event?: unknown) => {
-    if (threadId) trackChatStreamError(threadId, event);
-  }, [threadId]);
-
-  const handleAgentConnectionError = useCallback(
-    (error: { code?: number; reason?: string; wasClean?: boolean }) => {
-      const code = error.code ?? null;
-      if (threadId) {
-        trackChatStreamTerminalClose(threadId, {
-          code: error.code,
-          reason: error.reason,
-          wasClean: error.wasClean,
-        });
-      }
-      const message = terminalChatSseUserMessage(code, error.reason);
-      // Terminal closes do not reconnect, so a queued delivery cannot make
-      // progress. This is the one transport failure that should release the
-      // pending bubble and restore its durable draft.
-      if (!failPendingMessageDelivery(message)) {
-        toast.error(message, {
-          id: "chat-sse-terminal-close",
-          duration: 12_000,
-        });
-      }
-    },
-    [failPendingMessageDelivery, threadId],
-  );
-
   const handleAgentStateUpdate = useCallback(
     (state: ChatAgentState) => {
       // Streaming/loading and turn duration/completion badges are derived from the
@@ -3319,12 +2953,7 @@ export default function Chat({
       const lastError = state.lastError;
       if (lastError?.id && lastError.id !== lastAppliedErrorIdRef.current) {
         lastAppliedErrorIdRef.current = lastError.id;
-        // Suppress the banner when the error already renders as an inline
-        // block from the loader payload (reload-after-error); see
-        // loaderErrorIdsRef. Live/reconnect errors are new ids and still fire.
-        if (!loaderErrorIdsRef.current.has(lastError.id)) {
-          handleTerminalError(lastError);
-        }
+        handleTerminalError(lastError);
       }
       const fallbackNotice = state.modelFallbackNotice;
       const optimisticFallbackModel = resolveAgentFallbackOptimisticModel({
@@ -3456,10 +3085,6 @@ export default function Chat({
   // component) to the handlers defined above.
   agentCallbacksRef.current = {
     onOpen: handleAgentOpen,
-    onMessage: handleAgentMessage,
-    onClose: handleAgentClose,
-    onError: handleAgentError,
-    onConnectionError: handleAgentConnectionError,
     onStateUpdate: handleAgentStateUpdate,
   };
 
@@ -3503,12 +3128,12 @@ export default function Chat({
   ]);
 
   useEffect(() => {
-    const client = runtimeBackend ? runtimeThread.client : agentSocket;
+    const client = runtimeThread.client;
     chatAgentRef.current = agentEnabled ? client : null;
     return () => {
       if (chatAgentRef.current === client) chatAgentRef.current = null;
     };
-  }, [agentEnabled, agentSocket, runtimeBackend, runtimeThread.client]);
+  }, [agentEnabled, runtimeThread.client]);
 
   useLayoutEffect(() => {
     setReady(false);
@@ -4053,7 +3678,7 @@ export default function Chat({
       const agent = chatAgentRef.current;
       if (
         lastRunnerModelSelectionRef.current !== nextSelectionKey &&
-        agent?.readyState === SSE_READY_STATE_OPEN &&
+        agent?.readyState === CLIENT_OPEN &&
         ready
       ) {
         lastRunnerModelSelectionRef.current = nextSelectionKey;
@@ -4375,7 +4000,7 @@ export default function Chat({
   }
 
   function stopGeneration() {
-    if (chatAgentRef.current?.readyState !== SSE_READY_STATE_OPEN) return;
+    if (chatAgentRef.current?.readyState !== CLIENT_OPEN) return;
     void chatAgentRef.current.call("requestStop").catch(() => {});
   }
 
@@ -4385,7 +4010,7 @@ export default function Chat({
       if (
         !pendingQuestion ||
         !agent ||
-        agent.readyState !== SSE_READY_STATE_OPEN
+        agent.readyState !== CLIENT_OPEN
       ) {
         return;
       }
@@ -4426,7 +4051,7 @@ export default function Chat({
       }
 
       const agent = chatAgentRef.current;
-      if (!agent || agent.readyState !== SSE_READY_STATE_OPEN) {
+      if (!agent || agent.readyState !== CLIENT_OPEN) {
         if (target === null) {
           resetPreviewTabsState();
           setMobileView("chat");
@@ -4617,7 +4242,7 @@ export default function Chat({
       runningActivityAt: userMessageAt,
       runningStartedAt: userMessageAt,
     });
-    if (chatAgentRef.current?.readyState === SSE_READY_STATE_OPEN && ready) {
+    if (chatAgentRef.current?.readyState === CLIENT_OPEN && ready) {
       setLoading(true);
       sendPendingMessageToAgent(userMsg, threadId);
       setPendingMessages((prev) => prev);
@@ -4730,8 +4355,8 @@ export default function Chat({
     <>
       {readOnly && (
         <div className="mx-auto w-full max-w-3xl px-4 md:px-6 pt-3">
-          <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-            Read-only admin view. Messaging is disabled for this thread.
+          <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground" role="note">
+            {readOnlyNotice ?? "Read-only admin view. Messaging is disabled for this thread."}
           </div>
         </div>
       )}
@@ -4750,9 +4375,9 @@ export default function Chat({
           ref={messageColumnRef}
           className="max-w-3xl mx-auto w-full px-4 md:px-6 pt-2 pb-6 flex flex-col"
         >
-          {!readOnly && (olderMessagesCursor || olderMessagesError) ? (
+          {!readOnly && (hasOlderMessages || olderMessagesError) ? (
             <div className="flex flex-col items-center gap-1 pb-2">
-              {olderMessagesCursor ? (
+              {hasOlderMessages ? (
                 <Button
                   type="button"
                   variant="ghost"
@@ -4860,7 +4485,7 @@ export default function Chat({
                     {noModelsMessage}
                   </p>
                 ) : null}
-                {runtimeBackend && runtimeThread.reconnecting ? (
+                {runtimeThread.reconnecting ? (
                   <p
                     role="status"
                     className="mb-2 shrink-0 text-xs text-muted-foreground"

@@ -5,9 +5,68 @@
  * messages and chat events), so the graders, the signal and the LLM judge read
  * a runtime run as they read an in-DO one.
  */
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "../../../../src/lib/agent-messages";
 import { localToolName } from "../../../../src/lib/agent-runtime-shared";
-import { addPiRuntimeUsageSummaries, piRuntimeUsageSummary } from "../../src/chat-thread/pi-message-helpers";
+
+function piRuntimeUsageSummary(message: AgentMessage): Record<string, unknown> | null {
+  if (message.role !== "assistant") return null;
+  const usage = (message as AgentMessage & {
+    usage?: {
+      input?: number;
+      output?: number;
+      cacheRead?: number;
+      cacheWrite?: number;
+      totalTokens?: number;
+      cost?: { total?: number };
+    };
+  }).usage;
+  if (!usage) return null;
+
+  const input = Math.max(0, Math.floor(Number(usage.input ?? 0)));
+  const output = Math.max(0, Math.floor(Number(usage.output ?? 0)));
+  const cacheRead = Math.max(0, Math.floor(Number(usage.cacheRead ?? 0)));
+  const cacheWrite = Math.max(0, Math.floor(Number(usage.cacheWrite ?? 0)));
+  const totalTokens = Math.max(
+    input + output + cacheRead + cacheWrite,
+    Math.floor(Number(usage.totalTokens ?? 0)),
+  );
+  if (totalTokens <= 0) return null;
+
+  const costTotal = Number(usage.cost?.total);
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    totalTokens,
+    ...(Number.isFinite(costTotal) && costTotal > 0
+      ? { cost: { total: costTotal } }
+      : {}),
+  };
+}
+
+function addPiRuntimeUsageSummaries(
+  current: Record<string, unknown> | null,
+  next: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  if (!next) return current;
+  const sum = (key: string) =>
+    Math.max(0, Math.floor(Number(current?.[key] ?? 0))) +
+    Math.max(0, Math.floor(Number(next[key] ?? 0)));
+  const currentCost = Number((current?.cost as { total?: unknown } | undefined)?.total ?? 0);
+  const nextCost = Number((next.cost as { total?: unknown } | undefined)?.total ?? 0);
+  const costTotal =
+    (Number.isFinite(currentCost) && currentCost > 0 ? currentCost : 0) +
+    (Number.isFinite(nextCost) && nextCost > 0 ? nextCost : 0);
+  return {
+    input: sum("input"),
+    output: sum("output"),
+    cacheRead: sum("cacheRead"),
+    cacheWrite: sum("cacheWrite"),
+    totalTokens: sum("totalTokens"),
+    ...(costTotal > 0 ? { cost: { total: costTotal } } : {}),
+  };
+}
 
 /** The runtime's record of one request (GET /v1/agents/:id/requests/:requestId). */
 export interface RuntimeRequestRecord {

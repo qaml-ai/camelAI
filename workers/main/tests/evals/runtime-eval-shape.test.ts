@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "../../../../src/lib/agent-messages";
 import { describe, expect, it } from "vitest";
 
 import { piMessagesToParsedMessages } from "../../src/pi-message-export";

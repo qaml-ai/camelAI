@@ -1,10 +1,7 @@
-// Code-mode tool layer, extracted from chat-thread-do.ts to keep the
-// ChatThreadDO Durable Object file focused. Contains the code-mode
-// tool-definition registry/helpers and the CodeModeToolsBinding
-// WorkerEntrypoint. Behavior is unchanged by the extraction.
-//
-// ChatThreadDO is imported as a type only (for the chat-thread DO stub
-// signature), so there is no runtime import cycle with ./chat-thread-do.
+// camelAI's tools: the code-mode tool-definition registry and the
+// CodeModeToolsBinding WorkerEntrypoint that runs them, for runtime agents
+// (over MCP, routes/agent-mcp.ts) and deterministic workflows (env.TOOLS).
+// A thread's UI state (preview tabs, todos) lives in OrgDO or the result.
 import {
   buildWorkspaceAppHostIndex,
   isWorkspaceAppHostname,
@@ -14,11 +11,9 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import { getSandbox } from "@cloudflare/sandbox";
 import type { OrgDO, WorkerScript } from "./auth";
 import { Type, type TSchema } from "typebox";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { WorkspaceDO } from "./workspace";
 import type { ScheduledRunOutcomeStatus, WorkspaceCronDO } from "./workspace-cron";
 import { ProjectFilesystemClient, WorkspaceFilesystemClient, normalizeWorkspacePath as normalizeDurableWorkspacePath, type WorkspaceFileStoreLike, type WorkspaceProject, type WorkspaceProjectCloneSummary, projectNameKey } from "./workspace-filesystem-do";
-import type { RuntimeCallArtifact, RuntimeCallArtifactKind } from "../../../src/lib/runtime-artifacts";
 import { getPreferredAppUrl } from "../../../src/lib/app-url";
 import {
   deleteDeployedAppRuntime,
@@ -39,13 +34,11 @@ import {
 } from "./selfhost-agent-pack";
 import { PiContainerTools, PI_CONTAINER_TOOL_DEFINITIONS } from "./pi-container-tools";
 import { parseFilePreviewPath } from "./preview-paths";
-import type { ConnectionSetupResponse } from "./chat-thread-browser-prompts";
 import {
   boundLakeErrorMessage,
   sendToolCallRecords,
   toolBlocksOnHuman,
 } from "./lake-streams";
-import type { HostedCapability } from "../../../src/lib/capability-allowances";
 import { buildWorkspaceScopedR2Key } from "../../../src/lib/workspace-r2-paths";
 import { retryR2Read } from "../../../src/lib/r2-read-retry";
 import { buildWorkspaceEmailAddress, getWorkspaceEmailDomain } from "../../../src/lib/workspace-email";
@@ -56,10 +49,6 @@ import { detectImageMimeType as detectSharedImageMimeType, getSupportedImageMime
 import { CodeModeScheduledPrompts } from "./code-mode-scheduled-prompts";
 import { CodeModeDeterministicAutomations } from "./code-mode-deterministic-automations";
 import { CodeModeIntegrations } from "./code-mode-integrations";
-import {
-  deriveVerifiedWorkEvidence,
-  type VerifiedWorkEvidence,
-} from "./chat-thread/verified-work-state";
 import { PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS } from "./container-sizing";
 import { recordErrorEvent, recordObservabilityEvent } from "./observability";
 import { buildLogTail, cleanBuildLog, DEFAULT_BUILD_TIMEOUT_MS, projectBuildSandboxKey, runProjectAddDependency, runProjectBuild, type ProjectBuildResult } from "./project-build-service";
@@ -99,8 +88,6 @@ import { deployWorkerModulesDirect, rollbackWorkerDeployFromArtifactCache, type 
 import { handleDeploySideEffects } from "./services/deploy";
 import { editAutomationVirtualFile, listAutomationVirtualFiles, normalizeAutomationVirtualPath, readAutomationVirtualFile, writeAutomationVirtualFile } from "./deterministic-automation-virtual-files";
 import { applyTextEdits, normalizeTextEditArguments } from "./text-edit";
-import type { DynamicIntegrationSchema } from "../../../src/lib/integration-registry";
-import type { ChatThreadDO } from "./chat-thread-do";
 import { ChannelTools } from "./chat-channels";
 import {
   PI_TOOL_RESULT_MAX_BYTES,
@@ -112,7 +99,7 @@ import type {
   PreviewTarget,
   NormalizedTodoItem,
   NormalizedTodoStatus,
-} from "./chat-thread-do";
+} from "./chat-thread/types";
 
 export interface CodeModeToolsProps {
   orgId: string;
@@ -125,14 +112,6 @@ export interface CodeModeToolsProps {
    * confirmed this destructive call (ctx.confirm): skip the chat-UI question.
    */
   preconfirmed?: boolean;
-  /** Explicitly false for main-agent js_exec; Research opts in to web tools. */
-  allowWebTools?: boolean;
-  /**
-   * The thread runs directly on the agent runtime (a thread_runtime row) and
-   * has no ChatThreadDO: thread UI state goes to OrgDO or the tool's result,
-   * never to the DO (plans/runtime-threads-direct.md §4.4).
-   */
-  directRuntime?: boolean;
 }
 
 class DestructiveConfirmationRequired extends Error {
@@ -161,33 +140,6 @@ function measureResultChars(value: unknown): number {
   } catch {
     return 0;
   }
-}
-
-function simplifyAgentWebToolResult(name: string, value: unknown): unknown {
-  if (name !== "WebSearch" && name !== "WebFetch") return value;
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return name === "WebSearch" ? [] : "";
-  }
-  const record = value as Record<string, unknown>;
-  const results = Array.isArray(record.results)
-    ? record.results.filter((result): result is Record<string, unknown> => (
-      Boolean(result) && typeof result === "object" && !Array.isArray(result)
-    ))
-    : [];
-  if (name === "WebSearch") {
-    return results.map((result) => {
-      const compact: Record<string, string> = {};
-      for (const key of ["title", "url", "snippet"] as const) {
-        const field = result[key];
-        if (typeof field === "string" && field.trim()) compact[key] = field;
-      }
-      return compact;
-    }).filter((result) => Object.keys(result).length > 0);
-  }
-  const first = results[0];
-  if (!first) return "";
-  if (typeof first.text === "string" && first.text.trim()) return first.text;
-  return typeof first.snippet === "string" ? first.snippet : "";
 }
 
 interface CodeModeToolDefinition {
@@ -330,15 +282,10 @@ const JS_EXEC_EXCLUDED_TOOL_NAMES = new Set([
   "delete_connection",
   "delete_app",
   "delete_project",
-  // Blocks on human input the same way; keep it out of the js_exec catalog so
-  // tools.search() can't advertise burying a user prompt inside the sandbox
-  // timeout. It stays a top-level Pi tool.
-  "AskUserQuestion",
   // Backing tool for env.WORKSPACE.*. Keep the user-facing runtime facade in
   // tools.help(), not the implementation detail.
   "workspace_info",
-  // Copies a runtime thread's scratch file (served over MCP only); ChatThreadDO
-  // threads have no scratch space.
+  // Copies a runtime thread's scratch file (served over MCP only).
   "import_file",
 ]);
 
@@ -658,16 +605,6 @@ const MOVE_ENDPOINT_PARAMETERS = Type.Object({
   })),
 }, { additionalProperties: false });
 
-const ASK_USER_QUESTION_TOOL = codeModePassthroughTool(
-  "AskUserQuestion",
-  "Ask the user one or more multiple-choice questions in the chat UI and wait for answers. Arguments: { questions }.",
-  Type.Object({
-    questions: Type.Array(Type.Object({}, { additionalProperties: true })),
-  }),
-  {
-    category: "user_interaction",
-  },
-);
 const CHANNEL_ATTACHMENT_PARAMETERS = Type.Optional(Type.Array(Type.Object({
   path: Type.String(),
   filename: Type.Optional(Type.String()),
@@ -752,66 +689,6 @@ const SEND_DISCORD_MESSAGE_TOOL = codeModeTool(
     ],
     sideEffect: true,
     externalDelivery: true,
-  },
-);
-const WEB_SEARCH_TOOL = codeModePassthroughTool(
-  "WebSearch",
-  "Search the web. Arguments: { query, numResults?, maxCharacters? }. In js_exec, result.data is an array of { title?, url?, snippet? } results.",
-  Type.Object({
-    query: Type.String(),
-    numResults: Type.Optional(Type.Number()),
-    maxCharacters: Type.Optional(Type.Number()),
-    includeDomains: Type.Optional(Type.Array(Type.String())),
-    excludeDomains: Type.Optional(Type.Array(Type.String())),
-    startPublishedDate: Type.Optional(Type.String()),
-    endPublishedDate: Type.Optional(Type.String()),
-    searchType: Type.Optional(Type.String()),
-    category: Type.Optional(Type.String()),
-  }),
-  {
-    category: "web",
-    examples: [`await tools.WebSearch({ query: "Cloudflare Workers Durable Objects", numResults: 5 })`],
-  },
-);
-const WEB_FETCH_TOOL = codeModePassthroughTool(
-  "WebFetch",
-  "Fetch text from a URL. Arguments: { url, maxCharacters? }. In js_exec, result.data is the fetched markdown string.",
-  Type.Object({
-    url: Type.String(),
-    maxCharacters: Type.Optional(Type.Number()),
-    query: Type.Optional(Type.String()),
-    content: Type.Optional(Type.String()),
-  }),
-  {
-    category: "web",
-    examples: [`await tools.WebFetch({ url: "https://developers.cloudflare.com/workers/", maxCharacters: 12000 })`],
-  },
-);
-const AGENT_TOOL = codeModeTool(
-  "Agent",
-  "Run a focused subagent in the same workspace. Arguments: { prompt, description?, agent?, model? }.",
-  Type.Object({
-    prompt: Type.String(),
-    description: Type.Optional(Type.String()),
-    agent: Type.Optional(Type.String()),
-    model: Type.Optional(Type.String()),
-  }),
-  {
-    category: "agents",
-  },
-);
-const EXPLORE_TOOL = codeModeTool(
-  "Explore",
-  "Run a focused read-oriented exploration subagent in the same workspace. Arguments: { prompt? or query?, description?, agent?, model? }.",
-  Type.Object({
-    prompt: Type.Optional(Type.String()),
-    query: Type.Optional(Type.String()),
-    description: Type.Optional(Type.String()),
-    agent: Type.Optional(Type.String()),
-    model: Type.Optional(Type.String()),
-  }),
-  {
-    category: "agents",
   },
 );
 
@@ -987,7 +864,6 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
       sideEffect: true,
     },
   ),
-  ASK_USER_QUESTION_TOOL,
   SEND_EMAIL_TOOL,
   SEND_SLACK_MESSAGE_TOOL,
   SEND_TELEGRAM_MESSAGE_TOOL,
@@ -1428,10 +1304,6 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
       sideEffect: true,
     },
   ),
-  WEB_SEARCH_TOOL,
-  WEB_FETCH_TOOL,
-  AGENT_TOOL,
-  EXPLORE_TOOL,
   codeModeTool(
     "connections_list",
     "List workspace connections. Prefer calling this from js_exec as await env.CONNECTIONS.list().",
@@ -1625,7 +1497,6 @@ export const CODE_MODE_PI_PASSTHROUGH_TOOL_DEFINITIONS: CodeModeToolDefinition[]
     .map(codeModeDefinition);
 
 const FILE_TOOL_NAMES = new Set(["read", "write", "edit", "ls", "delete", "grep", "find"]);
-const AGENT_WEB_TOOL_NAMES = new Set(["WebSearch", "WebFetch"]);
 
 function requireFileLocation(toolName: string, args: Record<string, unknown>): CodeModeFileLocation {
   const location = args.location;
@@ -2251,7 +2122,6 @@ export async function serializeHttpToolResponse(
 
 export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeToolsProps> {
   private static readonly TOOL_CALL_HANDLERS: Record<string, CodeModeToolCallHandler> = {
-    AskUserQuestion: (binding, args) => binding.askUserQuestion(args),
     TodoWrite: (binding, args) => binding.updateTodos(args),
     set_preview: (binding, args) => binding.setPreview(args),
     list_apps: (binding, args) => binding.listApps(args),
@@ -2296,10 +2166,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     set_custom_domain: (binding, args) => binding.customDomains.set(args),
     remove_custom_domain: (binding, args) => binding.customDomains.remove(args),
     retry_custom_domain_hostnames: (binding) => binding.customDomains.retryHostnames(),
-    WebSearch: (binding, args) => binding.webSearch(args),
-    WebFetch: (binding, args) => binding.webFetch(args),
-    Agent: (binding, args, name) => binding.runSubagentTool(name, args),
-    Explore: (binding, args, name) => binding.runSubagentTool(name, args),
     connections_list: (binding) => listConnections(binding.env, binding.connectionsContext),
     connections_get: (binding, args) => {
       const connection = typeof args.connection === "string" ? args.connection : "";
@@ -2417,9 +2283,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           message,
           orgId: this.ctx?.props?.orgId,
         });
-        // User-facing: stream the same text as tool output so the person
-        // watching the turn sees "starting", not silence, for the whole boot.
-        void this.streamProjectBuildProgress(message);
       },
       onEvent: (event) => this.recordProjectBuildReadinessEvent(operation, event),
     });
@@ -2430,35 +2293,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         attempts: readiness.attempts,
         orgId: this.ctx?.props?.orgId,
       });
-      void this.streamProjectBuildProgress(
-        `Build environment ready after ${Math.round(readiness.waitedMs / 1000)}s; building…`,
-      );
     }
     return readiness;
-  }
-
-  /**
-   * Best-effort live progress for the human watching the turn.
-   *
-   * add_dependency and compatibility deploy_project calls can run inside
-   * js_exec, where the agent-loop `onUpdate` callback is not reachable. The
-   * ChatThreadDO stub is — the same seam recordCodeModeArtifact uses — and it
-   * can push the `item/commandExecution/outputDelta` runtime event the client
-   * already renders as streamed tool output, keyed by the parent js_exec call.
-   */
-  private async streamProjectBuildProgress(message: string): Promise<void> {
-    const parentToolUseId = this.ctx?.props?.parentToolUseId?.trim();
-    if (!parentToolUseId || this.directRuntime) return;
-    try {
-      await (this.chatThreadStub as unknown as {
-        streamToolProgress(parentToolUseId: string, delta: string): Promise<void>;
-      }).streamToolProgress(parentToolUseId, message);
-    } catch (error) {
-      console.warn("[project-build] failed to stream readiness progress", {
-        parentToolUseId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
   }
 
   /**
@@ -2583,18 +2419,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       throw new Error("Code mode tool binding is missing workspace scope");
     }
     return this.env.WORKSPACE.get(this.env.WORKSPACE.idFromName(workspaceId));
-  }
-
-  /** The thread runs on the agent runtime, with no ChatThreadDO. */
-  private get directRuntime(): boolean {
-    return this.ctx?.props?.directRuntime === true;
-  }
-
-  private get chatThreadStub(): DurableObjectStub<ChatThreadDO> {
-    const { threadId } = this.ctx.props;
-    if (!threadId) throw new Error("This tool requires chat thread scope");
-    if (this.directRuntime) throw new Error("This tool is not available on this thread");
-    return this.env.CHAT_THREAD.get(this.env.CHAT_THREAD.idFromName(threadId));
   }
 
   private get cronStub(): DurableObjectStub<WorkspaceCronDO> {
@@ -3406,9 +3230,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
    * to that file (its /v1/links route), the only source this reads.
    */
   private async importFile(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    if (this.ctx?.props?.directRuntime !== true) {
-      throw new Error("import_file is for runtime threads, whose scratch files live at /workspace");
-    }
     const runtimeOrigin = new URL((this.env as { AGENT_RUNTIME_URL?: string }).AGENT_RUNTIME_URL || "https://agents.camelai.dev").origin;
     let source: URL | null = null;
     try {
@@ -3477,9 +3298,6 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       .filter((definition) => !JS_EXEC_EXCLUDED_TOOL_NAMES.has(definition.name))
       .filter((definition) => (
         definition.name !== "send_email" || !isSelfhostRuntime(this.env)
-      ))
-      .filter((definition) => (
-        this.ctx?.props?.allowWebTools !== false || !AGENT_WEB_TOOL_NAMES.has(definition.name)
       ));
   }
 
@@ -3501,7 +3319,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const startedAtMs = Date.now();
     try {
       const result = await this.callTool(name, rawArgs);
-      const data = simplifyAgentWebToolResult(name, result);
+      const data = result;
       this.recordCodeModeToolCall(name, startedAtMs, true, "", data);
       // A tool that reports its own operational failure as a VALUE
       // (deploy_project's { success: false }) never reaches the catch below, so
@@ -3610,19 +3428,16 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (name === "send_email" && isSelfhostRuntime(this.env)) {
       throw new Error(SELFHOST_OUTBOUND_EMAIL_DISABLED_MESSAGE);
     }
-    if (this.ctx?.props?.allowWebTools === false && AGENT_WEB_TOOL_NAMES.has(name)) {
-      throw new Error(`${name} is reserved for the Research agent; delegate web lookup to Research instead`);
-    }
     if (rawArgs != null && (typeof rawArgs !== "object" || Array.isArray(rawArgs))) {
       throw new Error("tool arguments must be an object");
     }
     const args = rawArgs == null ? {} : rawArgs as Record<string, unknown>;
     const handler = CodeModeToolsBinding.TOOL_CALL_HANDLERS[name];
     if (handler) {
-      return this.callToolWithArtifactCapture(name, args, () => handler(this, args, name));
+      return await handler(this, args, name);
     }
 
-    return this.callToolWithArtifactCapture(name, args, async () => {
+    return await (async () => {
       if (FILE_TOOL_NAMES.has(name)) requireFileLocation(name, args);
       switch (name) {
         case "read_skill":
@@ -3780,314 +3595,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         default:
           throw new Error(`Unknown code mode tool: ${name}`);
       }
-    });
-  }
-
-  private async callToolWithArtifactCapture(
-    name: string,
-    args: Record<string, unknown>,
-    execute: () => Promise<unknown> | unknown,
-  ): Promise<unknown> {
-    try {
-      const result = await execute();
-      await Promise.all([
-        this.recordCodeModeArtifactBestEffort(name, args, result),
-        this.recordProjectActivityBestEffort(name, args, result),
-        this.recordVerifiedWorkEvidenceBestEffort(name, args, result),
-      ]);
-      return result;
-    } catch (error) {
-      await Promise.all([
-        this.recordCodeModeArtifactBestEffort(name, args, undefined, error),
-        this.recordVerifiedWorkEvidenceBestEffort(name, args, undefined, error),
-      ]);
-      throw error;
-    }
-  }
-
-  private async recordVerifiedWorkEvidenceBestEffort(
-    name: string,
-    args: Record<string, unknown>,
-    result?: unknown,
-    error?: unknown,
-  ): Promise<void> {
-    // Verified-work state lives in ChatThreadDO's prompt; runtime threads have none.
-    if (this.directRuntime) return;
-    const parentToolUseId = this.ctx?.props?.parentToolUseId?.trim();
-    const directToolUseId = typeof args.toolUseId === "string" ? args.toolUseId.trim() : "";
-    const threadId = this.ctx?.props?.threadId?.trim();
-    const evidenceId = parentToolUseId
-      ? `${parentToolUseId}:${name}:${crypto.randomUUID()}`
-      : directToolUseId;
-    if (!evidenceId || !threadId) return;
-    const evidence = deriveVerifiedWorkEvidence({
-      toolCallId: evidenceId,
-      toolName: name,
-      args,
-      result,
-      isError: error !== undefined,
-    });
-    if (!evidence) return;
-    try {
-      await (this.chatThreadStub as unknown as {
-        recordVerifiedWorkEvidence(evidence: VerifiedWorkEvidence): Promise<void>;
-      }).recordVerifiedWorkEvidence(evidence);
-    } catch (recordError) {
-      console.error("Failed to record verified work evidence", {
-        toolName: name,
-        threadId,
-        error: recordError instanceof Error ? recordError.message : String(recordError),
-      });
-    }
-  }
-
-  private async recordProjectActivityBestEffort(
-    name: string,
-    args: Record<string, unknown>,
-    result: unknown,
-  ): Promise<void> {
-    const props = this.ctx?.props;
-    const threadId = props?.threadId?.trim();
-    // Project activity is kept per ChatThreadDO; runtime threads have none yet.
-    if (!threadId || this.directRuntime) return;
-
-    try {
-      let projectName = '';
-      let activityType: 'created' | 'deployed' | null = null;
-      const resultRecord =
-        result && typeof result === 'object' && !Array.isArray(result)
-          ? (result as Record<string, unknown>)
-          : null;
-
-      if (name === 'create_project') {
-        projectName =
-          (typeof resultRecord?.name === 'string' && resultRecord.name.trim()) ||
-          (typeof args.name === 'string' && args.name.trim()) ||
-          '';
-        activityType = 'created';
-      } else if (
-        name === 'deploy_project' &&
-        resultRecord?.success === true &&
-        resultRecord.dryRun !== true
-      ) {
-        projectName =
-          (typeof resultRecord.project === 'string' &&
-            resultRecord.project.trim()) ||
-          (typeof args.project === 'string' && args.project.trim()) ||
-          '';
-        activityType = 'deployed';
-      }
-
-      if (!activityType) return;
-      if (!projectName) {
-        throw new Error(`Successful ${name} result did not identify a project`);
-      }
-
-      const project = await this.workspaceFs.getProjectByName(projectName);
-      if (!project) {
-        throw new Error('Project activity target was not found');
-      }
-      await (
-        this.chatThreadStub as unknown as {
-          recordProjectActivity(input: {
-            projectId: string;
-            activityType: 'created' | 'deployed';
-          }): Promise<void>;
-        }
-      ).recordProjectActivity({ projectId: project.id, activityType });
-    } catch (error) {
-      console.error('Failed to record thread project activity', {
-        toolName: name,
-        workspaceId: props?.workspaceId,
-        threadId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      recordErrorEvent(this.env, {
-        event: 'thread_project_activity_record_failed',
-        component: 'CodeModeToolsBinding',
-        operation: `recordProjectActivity:${name}`,
-        status: 'error',
-        workspaceId: props?.workspaceId,
-        threadId,
-        orgId: props?.orgId,
-        userId: props?.userId,
-        error,
-      });
-    }
-  }
-
-  private async recordCodeModeArtifactBestEffort(
-    name: string,
-    args: Record<string, unknown>,
-    result?: unknown,
-    error?: unknown,
-  ): Promise<void> {
-    try {
-      await this.maybeRecordCodeModeArtifact(name, args, result, error);
-    } catch (recordError) {
-      console.error("Failed to record code mode artifact", {
-        toolName: name,
-        threadId: this.ctx?.props?.threadId,
-        parentToolUseId: this.ctx?.props?.parentToolUseId,
-        error: recordError instanceof Error ? recordError.message : String(recordError),
-      });
-    }
-  }
-
-  private async maybeRecordCodeModeArtifact(
-    name: string,
-    args: Record<string, unknown>,
-    result?: unknown,
-    error?: unknown,
-  ): Promise<void> {
-    const props = this.ctx?.props;
-    const parentToolUseId = props?.parentToolUseId?.trim();
-    const threadId = props?.threadId?.trim();
-    if (!parentToolUseId || !threadId || this.directRuntime) return;
-    const artifact = this.buildCodeModeArtifact(name, args, result, error);
-    if (!artifact) return;
-    await (this.chatThreadStub as unknown as {
-      recordCodeModeArtifact(parentToolUseId: string, artifact: RuntimeCallArtifact): Promise<void>;
-    }).recordCodeModeArtifact(parentToolUseId, artifact);
-  }
-
-  private buildCodeModeArtifact(
-    name: string,
-    args: Record<string, unknown>,
-    result?: unknown,
-    error?: unknown,
-  ): RuntimeCallArtifact | null {
-    const kindByTool: Record<string, RuntimeCallArtifactKind> = {
-      send_email: "outbound_email",
-      send_slack_message: "outbound_slack_message",
-      send_telegram_message: "outbound_telegram_message",
-      send_discord_message: "outbound_discord_message",
-    };
-    const kind = kindByTool[name];
-    if (!kind) return null;
-    const now = Date.now();
-    const status = error ? "failed" : "sent";
-    const details = this.codeModeArtifactDetails(result);
-    const summary = this.summarizeCodeModeArtifactArgs(name, args);
-    const titleByKind: Record<RuntimeCallArtifactKind, string> = {
-      outbound_email: status === "sent" ? "Email sent" : "Email failed",
-      outbound_slack_message: status === "sent" ? "Slack message sent" : "Slack message failed",
-      outbound_telegram_message: status === "sent" ? "Telegram message sent" : "Telegram message failed",
-      outbound_discord_message: status === "sent" ? "Discord message sent" : "Discord message failed",
-    };
-    return {
-      id: `${this.ctx.props.parentToolUseId}:${name}:${crypto.randomUUID()}`,
-      kind,
-      toolName: name as RuntimeCallArtifact["toolName"],
-      status,
-      title: titleByKind[kind],
-      subtitle: this.codeModeArtifactSubtitle(kind, summary, details),
-      createdAt: now,
-      updatedAt: now,
-      summary,
-      ...(Object.keys(details).length > 0 ? { result: details } : {}),
-      ...(error ? { error: this.codeModeArtifactError(error) } : {}),
-    };
-  }
-
-  private summarizeCodeModeArtifactArgs(
-    name: string,
-    args: Record<string, unknown>,
-  ): Record<string, unknown> {
-    const attachmentCount = Array.isArray(args.attachments) ? args.attachments.length : 0;
-    const text = typeof args.text === "string" ? args.text : "";
-    switch (name) {
-      case "send_email": {
-        const to = typeof args.to === "string" ? args.to.trim() : "";
-        return {
-          to,
-          toDomain: to.includes("@") ? to.split("@").pop() : undefined,
-          subject: typeof args.subject === "string" ? args.subject : undefined,
-          hasText: typeof args.text === "string" && args.text.length > 0,
-          hasHtml: typeof args.html === "string" && args.html.length > 0,
-          attachmentCount,
-        };
-      }
-      case "send_slack_message":
-        return {
-          channelId: typeof args.channel_id === "string" ? args.channel_id : undefined,
-          teamId: typeof args.team_id === "string" ? args.team_id : undefined,
-          integrationId: typeof args.integration_id === "string" ? args.integration_id : undefined,
-          threadTs: typeof args.thread_ts === "string" ? args.thread_ts : undefined,
-          hasText: text.length > 0,
-          textPreview: text ? this.truncateArtifactPreviewText(text) : undefined,
-          attachmentCount,
-        };
-      case "send_telegram_message":
-        return {
-          chatId: typeof args.chat_id === "string" ? args.chat_id : undefined,
-          integrationId: typeof args.integration_id === "string" ? args.integration_id : undefined,
-          hasText: text.length > 0,
-          textPreview: text ? this.truncateArtifactPreviewText(text) : undefined,
-          attachmentCount,
-        };
-      case "send_discord_message":
-        return {
-          integrationId: typeof args.integration_id === "string" ? args.integration_id : undefined,
-          hasText: text.length > 0,
-          textPreview: text ? this.truncateArtifactPreviewText(text) : undefined,
-          attachmentCount,
-        };
-      default:
-        return { attachmentCount };
-    }
-  }
-
-  private codeModeArtifactDetails(result: unknown): Record<string, unknown> {
-    if (!result || typeof result !== "object" || Array.isArray(result)) return {};
-    const details = (result as { details?: unknown }).details;
-    return details && typeof details === "object" && !Array.isArray(details)
-      ? details as Record<string, unknown>
-      : {};
-  }
-
-  private codeModeArtifactSubtitle(
-    kind: RuntimeCallArtifactKind,
-    summary: Record<string, unknown>,
-    result: Record<string, unknown>,
-  ): string | undefined {
-    if (kind === "outbound_email") {
-      return typeof summary.to === "string" && summary.to ? summary.to : undefined;
-    }
-    if (kind === "outbound_slack_message") {
-      const channelId = typeof result.channelId === "string" ? result.channelId : summary.channelId;
-      return typeof channelId === "string" && channelId ? `Channel ${channelId}` : undefined;
-    }
-    if (kind === "outbound_discord_message") {
-      const threadId = typeof result.threadId === "string" ? result.threadId : undefined;
-      return threadId ? `Thread ${threadId}` : undefined;
-    }
-    const chatId = typeof result.chatId === "string" ? result.chatId : summary.chatId;
-    return typeof chatId === "string" && chatId ? `Chat ${chatId}` : undefined;
-  }
-
-  private codeModeArtifactError(error: unknown): { name: string; message: string } {
-    return error instanceof Error
-      ? { name: error.name || "Error", message: error.message || "Unknown error" }
-      : { name: "Error", message: String(error || "Unknown error") };
-  }
-
-  private truncateArtifactPreviewText(text: string): string {
-    const normalized = text.replace(/\s+/g, " ").trim();
-    return normalized.length > 160 ? `${normalized.slice(0, 157)}...` : normalized;
-  }
-
-  private askUserQuestion(args: Record<string, unknown>): Promise<unknown> {
-    return this.chatThreadStub.askUserQuestion({
-      questions: Array.isArray(args.questions) ? args.questions : [args],
-      toolUseId: typeof args.toolUseId === "string" ? args.toolUseId : undefined,
-    });
-  }
-
-  private runSubagentTool(name: string, args: Record<string, unknown>): Promise<AgentToolResult<unknown>> {
-    return (this.chatThreadStub as unknown as {
-      runCodeModeSubagent(toolName: "Agent" | "Explore", params: unknown): Promise<AgentToolResult<unknown>>;
-    }).runCodeModeSubagent(name as "Agent" | "Explore", args);
+    })();
   }
 
   private connectionQuery(args: Record<string, unknown>): string | Record<string, string> {
@@ -4104,8 +3612,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
           ? args.items
           : [],
     );
-    // A runtime thread's page reads its todos from this call.
-    if (!this.directRuntime) await this.chatThreadStub.setTodoState(todos);
+    // The thread's page reads its todos from this call.
     return { success: true, todos };
   }
 
@@ -4190,15 +3697,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return { success: true, target };
   }
 
-  /**
-   * Open a preview tab for the thread: on its ChatThreadDO, or for a runtime
-   * thread in OrgDO (its page opens the tab from this call's result live).
-   */
+  /** Open a preview tab for the thread in OrgDO (its page opens the tab from this call's result live). */
   private async recordPreviewTarget(target: PreviewTarget): Promise<void> {
-    if (!this.directRuntime) {
-      await this.chatThreadStub.setPreviewTarget(target);
-      return;
-    }
     const threadId = this.ctx.props.threadId;
     if (!threadId) throw new Error("This tool requires chat thread scope");
     await this.orgStub.upsertThreadPreviewTarget(threadId, target);
@@ -4338,11 +3838,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       this.ctx.props.userId || "system",
     );
     if (!updated) return { success: false, error: `Failed to update app '${scriptName}'` };
-    if (this.directRuntime) {
-      if (this.ctx.props.threadId) await this.orgStub.setThreadPreviewAppVisibility(this.ctx.props.threadId, scriptName, updated.is_public);
-    } else {
-      await this.chatThreadStub.setPreviewAppVisibility(scriptName, updated.is_public);
-    }
+    if (this.ctx.props.threadId) await this.orgStub.setThreadPreviewAppVisibility(this.ctx.props.threadId, scriptName, updated.is_public);
     return {
       success: true,
       app: {
@@ -4574,23 +4070,16 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     return { text: result.text, location: endpoint.location, path: file.path, bytes: file.bytes.byteLength };
   }
 
-  /** The thread's scheduled-run outcome, recorded on its ChatThreadDO (which validates it). */
+  /** The thread's scheduled-run outcome, kept on its WorkspaceCronDO run (which validates it). */
   private async reportAutomationOutcome(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (!this.ctx.props.threadId) throw new Error("report_automation_outcome requires chat thread scope");
-    if (this.directRuntime) {
-      // A direct runtime thread's run is kept on its WorkspaceCronDO run.
-      const recorded = await this.cronStub.reportScheduledRunOutcome({
-        workspaceId: this.ctx.props.workspaceId,
-        threadId: this.ctx.props.threadId,
-        status: args.status as ScheduledRunOutcomeStatus,
-        summary: typeof args.summary === "string" ? args.summary : "",
-      });
-      return { status: recorded.status, text: recorded.text };
-    }
-    const stub = this.chatThreadStub as unknown as {
-      recordAutomationOutcome(status: unknown, summary: unknown): Promise<{ status: string; text: string }>;
-    };
-    return await stub.recordAutomationOutcome(args.status, args.summary);
+    const recorded = await this.cronStub.reportScheduledRunOutcome({
+      workspaceId: this.ctx.props.workspaceId,
+      threadId: this.ctx.props.threadId,
+      status: args.status as ScheduledRunOutcomeStatus,
+      summary: typeof args.summary === "string" ? args.summary : "",
+    });
+    return { status: recorded.status, text: recorded.text };
   }
 
   /** Hostnames of this workspace's deployed apps (http_request's only targets). Test seam. */
@@ -5027,20 +4516,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       userId: this.ctx.props.userId,
       // A runtime thread has no chat form: the MCP server sends the user to
       // the connections page through the runtime instead.
-      promptConnectionSetup: (input) => this.directRuntime
-        ? Promise.resolve({ requestId: "", cancelled: true })
-        : (this.chatThreadStub as unknown as {
-          promptConnectionSetup(input: {
-            integrationId?: string;
-            integrationType: string;
-            suggestedName?: string;
-            message?: string;
-            instructions?: string;
-            initialConfig?: Record<string, unknown>;
-            initialCredentials?: Record<string, unknown>;
-            dynamicSchema?: DynamicIntegrationSchema;
-          }): Promise<ConnectionSetupResponse>;
-        }).promptConnectionSetup(input),
+      promptConnectionSetup: () => Promise.resolve({ requestId: "", cancelled: true }),
     });
   }
 
@@ -5048,16 +4524,19 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   private describingConfirmation = false;
 
   /**
-   * The confirmation a destructive tool asks before acting: the chat UI's
-   * question, already answered for a runtime call the user confirmed there
-   * (`preconfirmed`), or, while describing, the question itself.
+   * The confirmation a destructive tool asks before acting: answered for a
+   * runtime call the user confirmed through the runtime (`preconfirmed`), or,
+   * while describing, the question itself. Anywhere else (js_exec, a
+   * workflow) there is nobody to ask, and the tool does not act.
    */
   private async confirmDestructive(
     input: Parameters<typeof confirmDestructiveAction>[1],
   ): Promise<{ confirmed: boolean; unavailableReason?: string }> {
     if (this.describingConfirmation) throw new DestructiveConfirmationRequired(input.question);
     if (this.ctx.props.preconfirmed === true) return { confirmed: true };
-    return confirmDestructiveAction((questionArgs) => this.askUserQuestion(questionArgs), input);
+    return confirmDestructiveAction(async () => ({
+      unavailable_reason: "Confirmation is only available when the tool is called directly, not from code.",
+    }), input);
   }
 
   /**
@@ -5927,96 +5406,5 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       workspaceId: this.ctx.props.workspaceId,
       userId: this.ctx.props.userId,
     });
-  }
-
-  private async webSearchClient(
-    onProviderFailure?: (result: unknown) => Promise<void>,
-  ) {
-    // Web search pulls HTML parsing/readability dependencies into its module
-    // graph. Most coding turns never use it, so pay that heap cost on demand.
-    const { CodeModeWebSearch } = await import("./code-mode-web-search");
-    return new CodeModeWebSearch(
-      this.env,
-      this.ctx.props.threadId || this.ctx.props.workspaceId,
-      { onProviderFailure },
-    );
-  }
-
-  private async consumeHostedCapability(
-    capability: HostedCapability,
-    args: Record<string, unknown>,
-  ): Promise<string> {
-    const explicitKey = typeof args.toolUseId === "string"
-      ? args.toolUseId.trim()
-      : "";
-    const idempotencyKey = explicitKey || crypto.randomUUID();
-    const invocationScope = this.ctx.props.threadId || this.ctx.props.workspaceId;
-    const scopedIdempotencyKey = `${invocationScope}:${idempotencyKey}`;
-    const allowance = await this.orgStub.consumeCapabilityAllowance({
-      capability,
-      user_id: this.ctx.props.userId,
-      idempotency_key: scopedIdempotencyKey,
-    });
-    if (!allowance.allowed) {
-      throw new Error(
-        `Daily ${capability.replaceAll("_", " ")} allowance reached. ` +
-        `This allowance resets at ${new Date(allowance.reset_at_ms).toISOString()}.`,
-      );
-    }
-    return scopedIdempotencyKey;
-  }
-
-  private async recordHostedCapabilityCost(
-    capability: HostedCapability,
-    idempotencyKey: string,
-    result: unknown,
-  ): Promise<void> {
-    if (!result || typeof result !== "object" || Array.isArray(result)) return;
-    const record = result as Record<string, unknown>;
-    const costUsd = Number(record.costUSD ?? 0);
-    const provider = typeof record.provider === "string"
-      ? record.provider
-      : "unknown";
-    const durationMs = Number(record.durationMs ?? 0);
-    await this.orgStub.recordUsage({
-      workspace_id: this.ctx.props.workspaceId,
-      user_id: this.ctx.props.userId ?? "",
-      thread_id: this.ctx.props.threadId ?? "",
-      model: capability,
-      provider,
-      billing_source: "hosted_capability",
-      credit_chargeable: false,
-      usage_kind: "capability",
-      usage_surface: "capability",
-      cost_usd: Number.isFinite(costUsd) && costUsd > 0 ? costUsd : 0,
-      duration_ms: Number.isFinite(durationMs) && durationMs > 0 ? durationMs : undefined,
-      created_at_ms: Date.now(),
-      source: capability,
-      source_id: `${capability}:${idempotencyKey}`,
-    });
-  }
-
-  private async webFetch(args: Record<string, unknown>): Promise<unknown> {
-    const idempotencyKey = await this.consumeHostedCapability("web_fetch", args);
-    let failedAttempt = 0;
-    const client = await this.webSearchClient(async (failure) => {
-      failedAttempt += 1;
-      await this.recordHostedCapabilityCost(
-        "web_fetch",
-        `${idempotencyKey}:failed-attempt:${failedAttempt}`,
-        failure,
-      );
-    });
-    const result = await client.fetch(args);
-    await this.recordHostedCapabilityCost("web_fetch", idempotencyKey, result);
-    return result;
-  }
-
-  private async webSearch(args: Record<string, unknown>): Promise<unknown> {
-    const idempotencyKey = await this.consumeHostedCapability("web_search", args);
-    const client = await this.webSearchClient();
-    const result = await client.search(args);
-    await this.recordHostedCapabilityCost("web_search", idempotencyKey, result);
-    return result;
   }
 }

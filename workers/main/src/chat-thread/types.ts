@@ -1,15 +1,7 @@
-// Shared type/interface/env definitions for ChatThreadDO and its sibling
-// chat-thread-* modules (extracted from chat-thread-do.ts). Pure types only —
-// no runtime values live here, so every import below is type-only and the
-// module is fully erased at runtime (the type-only circular reference back to
-// ChatThreadDO in ChatEnv is therefore safe).
-//
-// chat-thread-do.ts re-exports every previously-exported symbol from this
-// module, so existing `import ... from "../chat-thread-do"` paths keep working
-// unchanged. Prefer importing from "../chat-thread-do" externally; this module
-// exists to keep the DO file smaller.
+// Shared types for the worker's chat surfaces: the worker env threads run
+// with (ChatEnv), a thread's identity (ChatContextState), preview targets, and
+// the parsed-message and eval shapes. Pure types only.
 
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type {
   LakeStream,
   PiMessageLakeRecord,
@@ -20,14 +12,8 @@ import type { WorkspaceDO } from "../workspace";
 import type { WorkspaceCronDO } from "../workspace-cron";
 import type { WorkerLogsDO } from "../worker-logs-do";
 import type { WorkspaceFilesystemEnv } from "../workspace-filesystem-do";
-import type {
-  PendingConnectionSetupPromptData,
-  PendingQuestionInfo,
-} from "../chat-thread-browser-prompts";
 import type { ChatThreadDO } from "../chat-thread-do";
-import type { ChatAgentStatePayload } from "../../../../src/lib/chat-agent-state";
 import type { RuntimeCallArtifact } from "../../../../src/lib/runtime-artifacts";
-import type { LlmModel } from "../../../../src/types";
 
 export type PreviewTarget =
   | {
@@ -111,20 +97,12 @@ export interface ChatEnv extends WorkspaceFilesystemEnv {
   WORKER_LOGS?: DurableObjectNamespace<WorkerLogsDO>;
   PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<import("../project-build-sandbox.js").ProjectBuildSandbox>;
   APP_KV: KVNamespace;
-  // Hosted agent runtime (plans/agent-runtime-migration.md): with the tenant's
-  // operator token, id and definition set, new threads whose model the runtime
-  // can call run there, as agents of AGENT_RUNTIME_DEFINITION.
+  // Hosted agent runtime: with the tenant's operator token, id and definition
+  // set, threads run there, as agents of AGENT_RUNTIME_DEFINITION.
   AGENT_RUNTIME_URL?: string;
   AGENT_RUNTIME_TENANT?: string;
   AGENT_RUNTIME_API_TOKEN?: string;
   AGENT_RUNTIME_DEFINITION?: string;
-  // "1": new web threads run directly on the runtime, with no ChatThreadDO
-  // (plans/runtime-threads-direct.md). Needs the runtime settings above.
-  AGENT_RUNTIME_DIRECT_THREADS?: string;
-  // "1": threads still on ChatThreadDO move to the runtime when next opened
-  // (agent-runtime/thread-migration.ts); a comma list of org ids: only those
-  // orgs' threads (a cohort). Needs AGENT_RUNTIME_DIRECT_THREADS.
-  AGENT_RUNTIME_MIGRATE_DO_THREADS?: string;
   R2_BUCKET: R2Bucket;
   IMAGES?: ImagesBinding;
   AI: Ai;
@@ -201,78 +179,12 @@ export interface ChatContextState {
   userEmail: string | null;
 }
 
-export interface ChatThreadForkState {
-  previewTarget: PreviewTarget | null;
-  previewTabs: PreviewTarget[];
-  previewActiveTabId: string | null;
-  previewVersion: number;
-  chatContext: ChatContextState | null;
-  currentTodos: unknown[];
-  contextUsedPercent: number | null;
-  usageIsPostCompaction: boolean;
-  cachedContextWindowByModel: Record<string, number>;
-}
-
-export interface ChatThreadForkStateTarget {
-  threadId: string;
-  workspaceId: string;
-  orgId: string;
-  userId?: string | null;
-}
-
-// The Agent-state payload synced to the browser. Structure (field set /
-// nullability / lastError shape) is fixed in the shared module so the DO and the
-// client can't drift; the DO instantiates the generic sub-types with its own
-// worker-side types.
-export type ChatThreadAgentState = ChatAgentStatePayload<
-  PreviewTarget,
-  PendingQuestionInfo,
-  PendingConnectionSetupPromptData,
-  LlmModel
->;
-
-export interface ChatThreadPiCoreForkResult {
-  success: boolean;
-  messages?: AgentMessage[];
-  messageCount?: number;
-  error?: string;
-  code?: "NO_PI_CORE_MESSAGES" | "TARGET_NOT_FOUND" | "THREAD_MOVED";
-}
-
-export interface PiCoreMessageRow {
-  idx: number;
-  payload: string;
-  created_at: number;
-}
-
-export interface PiCoreMessageHistoryRepairReport {
-  ok: true;
-  mode: "dry_run" | "repair";
-  persisted: boolean;
-  changed: boolean;
-  beforeCount: number;
-  validBeforeCount: number;
-  afterCount: number;
-  invalidRows: number;
-  repairedCount: number;
-  stats: {
-    droppedToolResults: number;
-    syntheticToolResults: number;
-    reorderedAssistantBlocks: number;
-  };
-}
-
 export type NormalizedTodoStatus = "pending" | "in_progress" | "completed";
 
 export interface NormalizedTodoItem {
   content: string;
   status: NormalizedTodoStatus;
   activeForm: string;
-}
-
-export interface ChatUserMessageInput {
-  content?: string;
-  clientMessageId?: string;
 }
 
 export interface InitialUserMessageRequest {
@@ -343,45 +255,3 @@ export interface AgentEvalSessionResult {
   deployedApps?: AgentEvalDeployedApp[];
 }
 
-export interface ChannelHistoryEventRequest {
-  threadId?: string;
-  workspaceId?: string;
-  orgId?: string;
-  channelKind?: string;
-  connectionId?: string | null;
-  remoteConversationId?: string | null;
-  sourceThreadId?: string | null;
-  direction?: "inbound" | "outbound";
-  text?: string | null;
-  providerMessageIds?: Array<string | number | null | undefined>;
-  attachmentCount?: number;
-  sentAt?: number;
-}
-
-export interface ChannelHistoryEventResult {
-  /** "moved": the thread is moving to the runtime, or moved; the caller queues the note for it. */
-  status: "appended" | "skipped" | "moved" | "error";
-  error?: string;
-}
-
-export interface ChatThreadRuntimeStatus {
-  isStreaming: boolean;
-  pendingQuestionCount: number;
-  oldestPendingQuestion: string | null;
-  updatedAt: number | null;
-}
-
-export interface CodeModeJavascriptRequest {
-  code: string;
-  orgId: string;
-  workspaceId: string;
-  threadId?: string;
-  userId?: string;
-  toolUseId?: string;
-  timeoutMs?: number | null;
-  maxOutputCharacters?: number | null;
-}
-
-export interface CodeModeJavascriptResult {
-  text: string;
-}

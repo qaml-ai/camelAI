@@ -9,15 +9,14 @@
  * number of orgs, before workerd starts, and refuses to go on when this gate
  * says so.
  *
- * A gate rather than a one-shot exporter: moving a thread needs the in-app
- * loop's transcript export and a live runtime, both of which the releases
- * with the sweep have and the deleting release does not; an exporter would
- * have to carry that code forward anyway. The gate keeps the deleting
- * release simple and points an install that skipped versions at the release
- * that moves its threads.
+ * The release that deleted the in-app loop kept a read-only exporter instead
+ * (ChatThreadDO still moves its threads, when opened and by the sweep), so
+ * this gate stays inert there: an install can jump any number of versions.
+ * It turns on only in a release that removes the exporter too (after its
+ * support window, SELF_HOSTING.md "Moving existing threads").
  */
 
-/** True in the release that removes the in-app loop; the gate only refuses there. */
+/** True in a release that can no longer move threads (the exporter removed); the gate only refuses there. */
 export const IN_APP_LOOP_REMOVED = false;
 
 export const RUNTIME_MIGRATION_DOC = "SELF_HOSTING.md#moving-existing-threads";

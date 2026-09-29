@@ -9305,22 +9305,8 @@ export class OrgDO extends DurableObject<DOEnv> {
     return true;
   }
 
-  getActiveThreadIdsForByokChange(): string[] {
-    this.ensureThreadSchemaColumns();
-
-    const activeSince = Date.now() - 30 * 60 * 1000;
-    return this.sql
-      .exec<{ id: string }>(
-        "SELECT id FROM threads WHERE updated_at > ? ORDER BY updated_at DESC",
-        activeSince,
-      )
-      .toArray()
-      .flatMap((row) => (row.id ? [row.id] : []));
-  }
-
+  /** The org's provider keys changed: keep the runtime's key scope in step (threads pick them up on their next run). */
   async notifyByokChanged(): Promise<number> {
-    const threadIds = this.getActiveThreadIdsForByokChange();
-    // Runtime agents call providers with the org's key scope: keep it in step.
     const env = this.env as unknown as KeyScopeEnv;
     const orgId = this.getInfoSync()?.id;
     if (orgId && env.AGENT_RUNTIME_API_TOKEN) {
@@ -9333,23 +9319,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         }),
       );
     }
-
-    for (let index = 0; index < threadIds.length; index += 50) {
-      const batch = threadIds.slice(index, index + 50);
-      await Promise.allSettled(
-        batch.map((threadId) => {
-          const chatThread = this.env.CHAT_THREAD.get(
-            this.env.CHAT_THREAD.idFromName(threadId),
-          ) as unknown as {
-            byokChanged(): Promise<void>;
-          };
-
-          return chatThread.byokChanged();
-        }),
-      );
-    }
-
-    return threadIds.length;
+    return 0;
   }
 
   hasLlmProviderConfig(): boolean {

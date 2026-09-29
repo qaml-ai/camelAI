@@ -1,6 +1,6 @@
 /**
  * ChatThreadDO's side of moving a thread to the agent runtime: the move the
- * DO drives (chat-thread/runtime-migration.ts) and the turn guard.
+ * DO drives (chat-thread/runtime-migration.ts).
  *
  * Run with: bun run test:workers
  */
@@ -16,7 +16,6 @@ vi.mock("../src/agent-runtime/run-gates.js", async (importOriginal) => ({
   runtimeSystemPromptAppend: () => "append",
 }));
 
-import { ChatThreadDO } from "../src/chat-thread-do";
 import {
   ChatThreadRuntimeMigration,
   RUNTIME_MIGRATION_KEY,
@@ -27,7 +26,7 @@ import {
   type RuntimeMigrationRecord,
 } from "../src/chat-thread/runtime-migration";
 import { RuntimeApiError, provisionedAgentId, retryAfterMs } from "../src/agent-runtime/runtime-api";
-import { RUNTIME_PROMPT_VERSION } from "../src/chat-thread/runtime-agent";
+import { RUNTIME_PROMPT_VERSION } from "../src/agent-runtime/runtime-prompt";
 import { ARCHIVE_PATH, MAX_IMPORT_BYTES, MAX_TOOL_RESULT_CHARS, convertTranscript } from "../src/agent-runtime/thread-migration";
 import { renderArchiveToPiMessages } from "../src/chat-thread/render-archive-export";
 
@@ -615,69 +614,6 @@ describe("ChatThreadRuntimeMigration", () => {
   });
 });
 
-type Fake = Record<string, unknown> & { store: Map<string, unknown> };
-
-function fakeThread(): Fake {
-  const store = new Map<string, unknown>();
-  const fake = Object.create(ChatThreadDO.prototype) as Fake;
-  fake.store = store;
-  fake.ctx = { storage: { kv: { get: (key: string) => store.get(key), put: (key: string, value: unknown) => { store.set(key, value); }, delete: (key: string) => store.delete(key) } }, waitUntil: () => {} };
-  fake.env = { APP_KV: { get: async () => null } };
-  fake.chatContext = { ...context };
-  fake.isThreadStreaming = () => false;
-  fake.applyMentionsForTurn = async (content: string) => content;
-  fake.sendRunnerCommand = vi.fn(() => true);
-  return fake;
-}
-
-const call = <T>(fake: Fake, method: string, ...args: unknown[]): Promise<T> =>
-  Promise.resolve((ChatThreadDO.prototype as unknown as Record<string, (...a: unknown[]) => T>)[method].call(fake, ...args));
-
-const leased = (): RuntimeMigrationRecord => ({
-  phase: "leased", leaseId: "lease-1", startedAt: Date.now(), expiresAt: Date.now() + RUNTIME_MIGRATION_LEASE_MS, revision: { generation: 1, count: 1 }, failures: 0,
-});
-
-describe("ChatThreadDO turn guard", () => {
-  it("refuses a message when a move began while it was being prepared (blocker 1)", async () => {
-    const fake = fakeThread();
-    // The move begins during the send's first await (the org ban check).
-    fake.env = { APP_KV: { get: async () => { fake.store.set(RUNTIME_MIGRATION_KEY, leased()); return null; } } };
-    expect(await call(fake, "enqueueRunnerUserMessage", { type: "message", content: "hello" }))
-      .toEqual({ status: "busy", code: "thread_moving", error: expect.stringContaining("is moving") });
-    expect(fake.sendRunnerCommand).not.toHaveBeenCalled();
-  });
-
-  it("refuses turns while a move commits, and for good once moved", async () => {
-    const fake = fakeThread();
-    fake.store.set(RUNTIME_MIGRATION_KEY, { phase: "committing", leaseId: "l", agentId: "a", orgId: "org1", threadId: "t1", previewTabs: [], previewActiveTabId: null, attempts: 0 });
-    expect(await call(fake, "enqueueRunnerUserMessage", { type: "message", content: "hello" })).toMatchObject({ status: "busy" });
-    fake.store.set(RUNTIME_MIGRATION_KEY, { phase: "moved", leaseId: "l", agentId: "a", movedAt: 1 });
-    expect(await call(fake, "enqueueRunnerUserMessage", { type: "message", content: "hello" }))
-      .toEqual({ status: "error", code: "thread_moved", error: expect.stringContaining("moved") });
-    expect(fake.sendRunnerCommand).not.toHaveBeenCalled();
-  });
-
-  it("starts no turn on a moved thread from any path", async () => {
-    const moved = fakeThread();
-    delete moved.sendRunnerCommand;
-    moved.store.set(RUNTIME_MIGRATION_KEY, { phase: "moved", leaseId: "l", agentId: "a", movedAt: 1 });
-    expect(await call(moved, "sendRunnerCommand", { type: "message", content: "hello" })).toBe(false);
-  });
-
-  it("tells a channel or schedule caller a moved thread moved, so it sends it to the runtime", async () => {
-    const fake = fakeThread();
-    fake.updateExternalChatContext = () => null;
-    fake.store.set(RUNTIME_MIGRATION_KEY, { phase: "moved", leaseId: "l", agentId: "a", movedAt: 1 });
-    expect(await call(fake, "startInitialUserMessage", { message: "hello", threadId: "t1" })).toMatchObject({ status: "moved" });
-  });
-
-  it("does not fork a moved thread from its stale transcript", async () => {
-    const fake = fakeThread();
-    fake.store.set(RUNTIME_MIGRATION_KEY, { phase: "moved", leaseId: "l", agentId: "a", movedAt: 1 });
-    expect(await call(fake, "getPiCoreForkMessages", { forkEntryId: "x" })).toMatchObject({ success: false, code: "THREAD_MOVED" });
-  });
-});
-
 describe("renderArchiveToPiMessages (H2)", () => {
   it("rebuilds a render turn as pi messages: calls, their results after them, and the reply after the results", () => {
     const messages = renderArchiveToPiMessages([
@@ -692,7 +628,7 @@ describe("renderArchiveToPiMessages (H2)", () => {
           { type: "text", text: "One file." },
         ],
       },
-    ] as never) as Array<Record<string, unknown>>;
+    ] as never) as unknown as Array<Record<string, unknown>>;
     expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "toolResult", "assistant"]);
     expect(messages[0]).toMatchObject({ content: "list files", timestamp: 10 });
     expect(messages[1]).toMatchObject({ stopReason: "toolUse", content: [{ type: "text", text: "Looking." }, { type: "toolCall", id: "c1", name: "Bash" }] });
@@ -701,14 +637,5 @@ describe("renderArchiveToPiMessages (H2)", () => {
     // What the runtime's import validator takes.
     const converted = convertTranscript(messages as never);
     expect(converted.stats.normalized).toBe(0);
-  });
-});
-
-describe("channel history on a moving thread (L3)", () => {
-  it("refuses to add history to a transcript that is moving or moved, so the caller queues it for the runtime", async () => {
-    const fake = fakeThread();
-    fake.store.set(RUNTIME_MIGRATION_KEY, leased());
-    expect(await call(fake, "appendChannelHistoryEvent", { threadId: "t1", channelKind: "slack", text: "sent", sentAt: 1 }))
-      .toEqual({ status: "moved" });
   });
 });

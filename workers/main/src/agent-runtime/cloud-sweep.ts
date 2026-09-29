@@ -27,7 +27,7 @@ import type { ThreadRuntimeRecord } from "../identity/org-do";
 import { migrateThreadToRuntime, type RuntimeMigrationResult } from "./thread-migration";
 import { recordRuntimeMigration } from "./runtime-thread-telemetry";
 import { recordObservabilityEvent } from "../observability";
-import { runtimeThreadMigrationEnabled } from "../../../../src/lib/agent-runtime-shared";
+import { runtimeDirectThreadsEnabled } from "../../../../src/lib/agent-runtime-shared";
 import {
   BREAKER_FAILURES,
   GIVE_UP_ATTEMPTS,
@@ -462,7 +462,7 @@ export async function runCloudSweepStep(env: SweepEnv, options: CloudSweepOption
         const record = known.get(thread.id);
         // Scanning past a thread this sweep already recorded: the retry phase owns it, or it was skipped.
         if (scanning && record) return true;
-        if (!state.dryRun && !runtimeThreadMigrationEnabled(env, thread.orgId)) {
+        if (!state.dryRun && !runtimeDirectThreadsEnabled(env)) {
           await settle(thread, { kind: "not_enabled" });
           return true;
         }

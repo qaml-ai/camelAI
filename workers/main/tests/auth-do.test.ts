@@ -1092,50 +1092,6 @@ describe('Auth flow (full-stack with DOs)', () => {
     });
   });
 
-  describe('BYOK refresh fan-out', () => {
-    it('targets all recently active threads when BYOK settings change', async () => {
-      const email = testEmail();
-      const { userId } = await createUser(testEnv, email, 'password123', 'BYOK Owner');
-      const { org, defaultWorkspaceId } = await createOrg(testEnv, 'BYOK Org', userId);
-      const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
-
-      const now = Date.now();
-      const dateNowSpy = vi.spyOn(Date, 'now');
-
-      try {
-        dateNowSpy.mockReturnValue(now - 31 * 60 * 1000);
-        await orgStub.createThread(defaultWorkspaceId, 'stale OpenAI', userId, undefined, 'gpt-5.4');
-
-        dateNowSpy.mockReturnValue(now);
-        await orgStub.createThread(defaultWorkspaceId, 'recent OpenAI', userId, undefined, 'gpt-5.4');
-        await orgStub.createThread(defaultWorkspaceId, 'recent Anthropic', userId, undefined, 'sonnet');
-      } finally {
-        dateNowSpy.mockRestore();
-      }
-
-      expect(await orgStub.getActiveThreadIdsForByokChange()).toHaveLength(2);
-    });
-
-    it('does not cap matching active threads at 100', async () => {
-      const email = testEmail();
-      const { userId } = await createUser(testEnv, email, 'password123', 'BYOK Owner');
-      const { org, defaultWorkspaceId } = await createOrg(testEnv, 'Large BYOK Org', userId);
-      const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
-
-      for (let index = 0; index < 101; index += 1) {
-        await orgStub.createThread(
-          defaultWorkspaceId,
-          `OpenAI thread ${index}`,
-          userId,
-          undefined,
-          'gpt-5.4'
-        );
-      }
-
-      expect(await orgStub.getActiveThreadIdsForByokChange()).toHaveLength(101);
-    });
-  });
-
   describe('Invitations', () => {
     it('should create an invitation', async () => {
       const email = testEmail();

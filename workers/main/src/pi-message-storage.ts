@@ -2,7 +2,7 @@
 // truncating Pi messages and tool results for SQLite/R2 storage. Extracted from
 // chat-thread-do.ts. This is a leaf module — no Durable Object state and no
 // import cycles.
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "../../../src/lib/agent-messages";
 import { stripPiUiMetadata } from "../../../src/lib/runtime-artifacts";
 
 export const PI_PROVIDER_SUPPORTED_IMAGE_MIME_TYPES = new Set([

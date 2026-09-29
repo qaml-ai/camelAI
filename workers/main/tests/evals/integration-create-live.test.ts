@@ -23,7 +23,7 @@ import {
   getEvalTimeoutMs,
   type EvalModelEnv,
 } from "./model-config";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
+import { runRuntimeEval } from "./runtime-eval";
 
 // This eval exercises the integration tools (create_integration / list_integrations).
 // Those tools live in the "integrations" category, which the lean tool surface (now the
@@ -33,7 +33,6 @@ import type { ChatThreadDO } from "../../src/chat-thread-do";
 // the integration must actually persist on the workspace.
 
 type IntegrationEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   RUN_AGENT_EVALS?: string;
 };
 
@@ -72,10 +71,7 @@ describe("integration create agent eval", () => {
         testEnv.EVAL_MODEL,
       );
 
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

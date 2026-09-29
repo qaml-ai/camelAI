@@ -129,7 +129,12 @@ to the eval's local workspace; self-contained apps render fully.
 Agent evals **run locally** (they need Docker + `.dev.vars`; Miniflare spawns the eval sandbox
 containers via the local Docker daemon): `bun run test:eval <id>` (or the `:dashboard` / `:deploy`
 / `:sandbox` shortcuts) wraps `scripts/run-agent-eval.mjs`; `scripts/run-eval-suite.sh` runs a
-list/`all`. There is no remote runner — the retired `qaml-ai/camelai-eval-runner` VM control plane
+list/`all`. Every eval's thread runs on a local agent runtime (Docker Compose from
+`qaml-ai/agent-runtime`'s `deploy/selfhost` with its dev override; `node scripts/runtime-eval-harness.mjs
+up|run|status|down`, started by `run-agent-eval.mjs` when it is not up): the tests call
+`runRuntimeEval` (`workers/main/tests/evals/runtime-eval.ts`), and the runtime reaches chiridion's
+`/mcp/agent` through the eval relay (`scripts/lib/eval-runtime-relay.mjs`). Needs `~/agent-runtime`
+(`AGENT_RUNTIME_DIR`) or `AGENT_RUNTIME_IMAGE`; see the `running-agent-evals` skill. There is no remote runner — the retired `qaml-ai/camelai-eval-runner` VM control plane
 was replaced by a shared results store + read-only viewer on Cloudflare (`workers/eval-reports/`,
 `evals.camelai.dev`: Worker + R2, everything behind Cloudflare Access, no worker secrets).
 

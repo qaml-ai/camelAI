@@ -421,6 +421,21 @@ function resolvePiModelCatalogFallback(
   return PI_MODEL_CATALOG_FALLBACKS[`${resolved.provider}/${resolved.modelId}`] ?? null;
 }
 
+/**
+ * A model as the in-DO loop looks it up for its context window, output limit,
+ * reasoning and input: Pi's catalog, else chiridion's fallbacks (models Pi's
+ * catalog predates).
+ */
+export function piCatalogModel(
+  getModelFn: (provider: never, modelId: never) => Model<any> | null | undefined,
+  provider: string,
+  modelId: string,
+): Model<any> | null {
+  return (getModelFn(provider as never, modelId as never) as Model<any> | null | undefined) ??
+    PI_MODEL_CATALOG_FALLBACKS[`${provider}/${modelId}`] ??
+    null;
+}
+
 export async function resolvePiModelConfig(
   deps: ResolvePiModelDeps,
   context: ChatContextState,
@@ -808,8 +823,7 @@ export async function checkHostedPiModelAccess(
     );
   }
 
-  const usage = await orgStub.getUsageLogSum(0, Date.now(), true);
-  const spentCents = Math.round(Number(usage.total_cost_usd ?? 0) * 100);
+  const spentCents = Math.round(Number(await orgStub.getCreditChargeableSpendUsd()) * 100);
   const totalCreditsCents =
     (org.billing_credit_purchase_total_cents ?? 0) +
     (org.billing_credit_grant_total_cents ?? 0);

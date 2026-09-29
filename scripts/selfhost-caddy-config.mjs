@@ -15,6 +15,9 @@ export const caddyDirectory = path.join(repoRoot, ".selfhost", "caddy");
 export const caddyConfigFile = path.join(caddyDirectory, "Caddyfile");
 export const caddySecretsDirectory = path.join(caddyDirectory, "secrets");
 
+/** Caddy's admin endpoint: a 0600 unix socket on the caddy-config volume (docker-compose.selfhost.caddy.yml). */
+export const CADDY_ADMIN_ADDRESS = "unix//config/caddy-admin.sock|0600";
+
 export async function writeCaddyConfig(env, { strict = true } = {}) {
   const tlsMode = selfhostTlsMode(env);
   if (!new Set(["automatic", "external", "provided"]).has(tlsMode)) {
@@ -80,7 +83,11 @@ export async function writeCaddyConfig(env, { strict = true } = {}) {
     ].join("\n");
   }
 
-  const globalOptions = ["{", "\tadmin 127.0.0.1:2019"];
+  // Caddy's admin API on a private unix socket in its config volume, never
+  // TCP: everything on the VM's loopback (the agent runtime's agents
+  // included) could otherwise reconfigure the front door. The Compose
+  // healthcheck reads it with curl --unix-socket.
+  const globalOptions = ["{", `\tadmin ${CADDY_ADMIN_ADDRESS}`];
   if ((env.SELFHOST_TLS_ACME_EMAIL || "").trim()) {
     globalOptions.push(
       `\temail ${caddyToken(env.SELFHOST_TLS_ACME_EMAIL, "SELFHOST_TLS_ACME_EMAIL")}`,

@@ -1,7 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, it } from "vitest";
 
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import { createOrg, createUser, type TestEnv } from "../test-helpers";
 import {
   assertPassFailCriteria,
@@ -24,9 +23,9 @@ import {
   capabilityChildUsedTools,
   usedTool,
 } from "./project-eval-helpers";
+import { runRuntimeEval } from "./runtime-eval";
 
 type ResearchKnownUrlEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   RUN_AGENT_EVALS?: string;
 };
 
@@ -75,10 +74,7 @@ describe("Research known-URL routing eval", () => {
         undefined,
         CAMEL_FREE_MODEL,
       );
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

@@ -24,8 +24,8 @@ import {
   getEvalTimeoutMs,
   type EvalModelEnv,
 } from "./model-config";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import { succeededWithTool, usedTool } from "./project-eval-helpers";
+import { runRuntimeEval } from "./runtime-eval";
 
 // Regression eval for analysis-tool reachability.
 //
@@ -41,7 +41,6 @@ import { succeededWithTool, usedTool } from "./project-eval-helpers";
 // them is a fine way to answer. It is that reaching for the analysis surface by
 // name must not dead-end in a not-found error.
 type AnalysisToolsEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   RUN_AGENT_EVALS?: string;
 };
 
@@ -105,10 +104,7 @@ describe("analysis tools reachable agent eval", () => {
         testEnv.EVAL_MODEL,
       );
 
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

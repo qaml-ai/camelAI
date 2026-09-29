@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const requireSessionWorkspaceAccessMock = vi.fn();
 const getThreadMock = vi.fn();
-const getPiCoreMessagesMock = vi.fn();
+const getThreadTranscriptMock = vi.fn();
 const getGroupForWorkspaceMock = vi.fn();
 
 vi.mock('@/lib/auth.server', () => ({
@@ -11,7 +11,7 @@ vi.mock('@/lib/auth.server', () => ({
 
 vi.mock('@/lib/chat-do.server', () => ({
   getThread: getThreadMock,
-  getPiCoreMessages: getPiCoreMessagesMock,
+  getThreadTranscript: getThreadTranscriptMock,
 }));
 
 vi.mock('@/lib/chat-groups.server', () => ({
@@ -46,7 +46,7 @@ describe('condensed transcript route', () => {
       open_thread_ids: ['thread_1'],
       closed_thread_ids: [],
     });
-    getPiCoreMessagesMock.mockResolvedValue([
+    getThreadTranscriptMock.mockResolvedValue([
       {
         id: 'u1',
         thread_id: 'thread_1',
@@ -80,6 +80,8 @@ describe('condensed transcript route', () => {
       ],
     });
     expect(requireSessionWorkspaceAccessMock).toHaveBeenCalled();
+    // Wherever the thread runs: a runtime thread's transcript is on the runtime.
+    expect(getThreadTranscriptMock).toHaveBeenCalledWith({}, { orgId: 'org_1', threadId: 'thread_1' });
     expect(getThreadMock).toHaveBeenCalledWith({}, 'thread_1', 'workspace_1', {
       orgId: 'org_1',
     });
@@ -118,6 +120,6 @@ describe('condensed transcript route', () => {
     await expect(response.json()).resolves.toEqual({
       error: 'Thread is not in this chat group',
     });
-    expect(getPiCoreMessagesMock).not.toHaveBeenCalled();
+    expect(getThreadTranscriptMock).not.toHaveBeenCalled();
   });
 });

@@ -9,6 +9,7 @@ import {
   resolveEvalConcurrency,
   runEvalWaves,
 } from "./lib/eval-concurrency.mjs";
+import { evalRuntimeUp } from "./lib/eval-runtime.mjs";
 
 const DEFAULT_MODELS = [
   "gpt-6-luna",
@@ -217,6 +218,16 @@ if (options.evals.length === 1 && options.evals[0] === "all") {
   options.evals = manifest.evals.map((entry) => entry.id);
 }
 validateEvals(options.evals);
+if (process.env.EVAL_RUN_BLOCKED !== "1") {
+  const blocked = manifest.evals.filter((entry) => entry.runtimeBlocked && options.evals.includes(entry.id));
+  for (const entry of blocked) {
+    console.log(`[eval-matrix] skipping ${entry.id}: blocked on the agent runtime (${entry.runtimeBlocked})`);
+  }
+  options.evals = options.evals.filter((id) => !blocked.some((entry) => entry.id === id));
+}
+// Every cell runs on the local agent runtime: start it once here, not in each
+// concurrent run-agent-eval (which would race to start it).
+if (!options.dryRun) await evalRuntimeUp();
 
 const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 const rootArtifactDir = path.resolve(

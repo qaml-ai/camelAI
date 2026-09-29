@@ -8,7 +8,8 @@
 #
 # Inputs (env): RUN_DIR (required, where status.json + artifacts/ are written), EVAL_TARGET
 # (required: an eval id, comma-separated list, "all", "hard", or "standard"), EVAL_ARGS_JSON,
-# INSTALL_COMMAND, plus the
+# INSTALL_COMMAND, AGENT_RUNTIME_DIR / AGENT_RUNTIME_REF / AGENT_RUNTIME_IMAGE (the local agent
+# runtime the evals run on; see scripts/runtime-eval-harness.mjs), plus the
 # usual EVAL_*/CUSTOM_EVAL_* knobs which flow through to vitest via the environment.
 set -uo pipefail
 
@@ -136,6 +137,13 @@ fi
 
 echo "[$(date -Is)] Installing dependencies with: $INSTALL_COMMAND"
 bash -lc "$INSTALL_COMMAND" || fail install $?
+
+# Every eval's thread runs on a local agent runtime (Docker Compose), which needs a
+# qaml-ai/agent-runtime checkout (AGENT_RUNTIME_DIR, default ~/agent-runtime; built at
+# AGENT_RUNTIME_REF, default origin/main) or a ready image (AGENT_RUNTIME_IMAGE).
+echo "[$(date -Is)] Starting the local agent runtime"
+node scripts/runtime-eval-harness.mjs up || fail agent-runtime $?
+trap 'node scripts/runtime-eval-harness.mjs down >/dev/null 2>&1 || true' EXIT
 
 echo "[$(date -Is)] Running eval target: $EVAL_TARGET"
 run_evals

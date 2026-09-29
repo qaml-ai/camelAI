@@ -1,7 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, it } from "vitest";
 
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import {
   type WorkspaceFilesystemDO,
 } from "../../src/workspace-filesystem-do";
@@ -33,9 +32,9 @@ import {
   toolCallReferences,
   usedTool,
 } from "./project-eval-helpers";
+import { runRuntimeEval } from "./runtime-eval";
 
 type SkillReferenceReadEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   RUN_AGENT_EVALS?: string;
 };
@@ -70,9 +69,6 @@ describe("skill reference read agent eval", () => {
         undefined,
         testEnv.EVAL_MODEL,
       );
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
       const workspaceFs = testEnv.WORKSPACE_FS.get(
         testEnv.WORKSPACE_FS.idFromName(defaultWorkspaceId),
       );
@@ -83,7 +79,7 @@ describe("skill reference read agent eval", () => {
         template: "vanilla",
         files: {},
       });
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

@@ -49,7 +49,8 @@ export interface ConvertedTranscript {
   lossy: boolean;
   /** Not even the newest turn fits the runtime's cap: the thread cannot move. */
   tooLarge: boolean;
-  stats: { total: number; imported: number; droppedRoles: number; shortenedResults: number; omittedImages: number; tail: boolean };
+  /** normalized: blocks or messages changed or left out to meet the runtime's import validator. */
+  stats: { total: number; imported: number; droppedRoles: number; shortenedResults: number; omittedImages: number; normalized: number; tail: boolean };
 }
 
 type Block = Record<string, unknown> & { type?: string };
@@ -67,20 +68,52 @@ function blockText(content: unknown): string {
   return (content as Block[]).map((block) => (block.type === "text" && typeof block.text === "string" ? block.text : "")).join("");
 }
 
+const isObject = (value: unknown): value is Block => !!value && typeof value === "object" && !Array.isArray(value);
+
+type ConvertStats = ConvertedTranscript["stats"];
+
 /**
- * Images with their bytes inline go as they are; ones the DO keeps in storage
- * (a reference, no bytes) become a note pointing at the archive.
+ * A user message's or tool result's blocks as the runtime's import takes them
+ * (its validator: text, and images with their bytes and type). Images the DO
+ * keeps in storage (a reference, no bytes) and any other block become a note
+ * pointing at the archive.
  */
-function inlineImages(blocks: Block[], stats: { omittedImages: number }): Block[] {
-  return blocks.map((block) => {
-    if (block.type !== "image") return block;
-    if (typeof block.data === "string" && block.data) {
-      const { metadata: _metadata, ...image } = block;
-      return image;
+function inputBlocks(blocks: unknown[], stats: ConvertStats): Block[] {
+  return blocks.flatMap((block): Block[] => {
+    if (!isObject(block)) {
+      stats.normalized++;
+      return [];
     }
-    stats.omittedImages++;
-    return { type: "text", text: `[image left out of the import; see ${ARCHIVE_PATH}]` };
+    if (block.type === "text") {
+      if (typeof block.text === "string") return [{ type: "text", text: block.text }];
+      stats.normalized++;
+      return [];
+    }
+    if (block.type === "image") {
+      if (typeof block.data === "string" && block.data && typeof block.mimeType === "string" && block.mimeType) {
+        return [{ type: "image", data: block.data, mimeType: block.mimeType }];
+      }
+      stats.omittedImages++;
+      return [{ type: "text", text: `[image left out of the import; see ${ARCHIVE_PATH}]` }];
+    }
+    stats.normalized++;
+    return [{ type: "text", text: `[${String(block.type ?? "content")} left out of the import; see ${ARCHIVE_PATH}]` }];
   });
+}
+
+/** A toolCall's arguments as the runtime takes them: an object (a JSON string parsed, anything else wrapped). */
+function toolArguments(value: unknown, stats: ConvertStats): Record<string, unknown> {
+  if (isObject(value)) return value;
+  stats.normalized++;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (isObject(parsed)) return parsed;
+    } catch {
+      // Not JSON: wrapped below.
+    }
+  }
+  return value === undefined || value === null ? {} : { value };
 }
 
 function preview(value: unknown, max: number): string {
@@ -115,13 +148,13 @@ const opensTurn = (message: AgentMessage) => roleOf(message) === "user" || roleO
  */
 export function convertTranscript(source: AgentMessage[], options: { rewriteToolCalls?: boolean } = {}): ConvertedTranscript {
   const rewrite = options.rewriteToolCalls ?? REWRITE_TOOL_CALLS;
-  const stats = { total: source.length, imported: 0, droppedRoles: 0, shortenedResults: 0, omittedImages: 0, tail: false };
+  const stats: ConvertStats = { total: source.length, imported: 0, droppedRoles: 0, shortenedResults: 0, omittedImages: 0, normalized: 0, tail: false };
   const names = new Map<string, string>();
   const out: AgentMessage[] = [];
   let lastTimestamp = 0;
   for (const raw of source) {
     const message = raw as unknown as Record<string, unknown> & { role?: string; content?: unknown };
-    if (!message || !IMPORTED_ROLES.has(String(message.role))) {
+    if (!isObject(message) || !IMPORTED_ROLES.has(String(message.role))) {
       stats.droppedRoles++;
       continue;
     }
@@ -137,25 +170,45 @@ export function convertTranscript(source: AgentMessage[], options: { rewriteTool
         } as unknown as AgentMessage);
         continue;
       }
-      const content = Array.isArray(message.content) ? inlineImages(message.content as Block[], stats) : message.content;
+      const content = typeof message.content === "string"
+        ? message.content
+        : inputBlocks(Array.isArray(message.content) ? message.content : [], stats);
       out.push({ ...message, content } as unknown as AgentMessage);
       continue;
     }
     if (message.role === "assistant") {
-      const blocks = Array.isArray(message.content) ? (message.content as Block[]) : [];
-      for (const block of blocks) {
-        if (block.type === "toolCall" && typeof block.id === "string" && typeof block.name === "string") names.set(block.id, block.name);
-      }
+      const blocks: unknown[] = typeof message.content === "string"
+        ? [{ type: "text", text: message.content }]
+        : Array.isArray(message.content) ? message.content : [];
       const content = blocks.flatMap((block): Block[] => {
-        if (rewrite && block.type === "toolCall") {
-          return [{ type: "text", text: `[called ${String(block.name)}(${preview(block.arguments, ARGS_PREVIEW_CHARS)})]` }];
+        if (!isObject(block)) {
+          stats.normalized++;
+          return [];
         }
-        if (block.type !== "thinking") return [block];
-        // A signature is checked by the model that made it, and an import can not
-        // vouch for one; unsigned, the thinking reaches the model as text.
-        if (block.redacted) return [];
-        const { thinkingSignature: _signature, ...unsigned } = block;
-        return [unsigned];
+        if (block.type === "text") {
+          if (typeof block.text === "string") return [block];
+          stats.normalized++;
+          return [];
+        }
+        if (block.type === "thinking") {
+          // A signature is checked by the model that made it, and an import can not
+          // vouch for one; unsigned, the thinking reaches the model as text.
+          if (block.redacted || typeof block.thinking !== "string") return [];
+          const { thinkingSignature: _signature, ...unsigned } = block;
+          return [unsigned];
+        }
+        if (block.type === "toolCall") {
+          const name = typeof block.name === "string" && block.name ? block.name : null;
+          if (typeof block.id !== "string" || !block.id || !name) {
+            stats.normalized++;
+            return [{ type: "text", text: `[called ${name ?? "a tool"}]` }];
+          }
+          names.set(block.id, name);
+          if (rewrite) return [{ type: "text", text: `[called ${name}(${preview(block.arguments, ARGS_PREVIEW_CHARS)})]` }];
+          return [{ ...block, arguments: toolArguments(block.arguments, stats) }];
+        }
+        stats.normalized++;
+        return [];
       });
       out.push({ ...message, content } as unknown as AgentMessage);
       continue;
@@ -163,27 +216,37 @@ export function convertTranscript(source: AgentMessage[], options: { rewriteTool
     // toolResult
     const text = blockText(message.content);
     const shortened = shorten(text, MAX_TOOL_RESULT_CHARS);
+    const toolCallId = typeof message.toolCallId === "string" && message.toolCallId ? message.toolCallId : null;
+    const toolName = typeof message.toolName === "string" && message.toolName
+      ? message.toolName
+      : (toolCallId && names.get(toolCallId)) || "tool";
     if (rewrite) {
-      if (Array.isArray(message.content)) stats.omittedImages += (message.content as Block[]).filter((block) => block.type === "image").length;
-      const name = typeof message.toolName === "string" ? message.toolName : names.get(String(message.toolCallId)) ?? "tool";
+      if (Array.isArray(message.content)) stats.omittedImages += (message.content as Block[]).filter((block) => isObject(block) && block.type === "image").length;
       out.push({
         role: "user",
-        content: `[${name} ${message.isError ? "error" : "result"}] ${preview(shortened, RESULT_PREVIEW_CHARS)}`,
+        content: `[${toolName} ${message.isError ? "error" : "result"}] ${preview(shortened, RESULT_PREVIEW_CHARS)}`,
         timestamp: typeof message.timestamp === "number" ? message.timestamp : lastTimestamp,
       } as AgentMessage);
       if (text.length > RESULT_PREVIEW_CHARS) stats.shortenedResults++;
-    } else {
-      if (shortened !== text) stats.shortenedResults++;
-      const images = Array.isArray(message.content) ? inlineImages((message.content as Block[]).filter((block) => block.type === "image"), stats) : [];
-      out.push({ ...message, content: [{ type: "text", text: shortened }, ...images] } as unknown as AgentMessage);
+      continue;
     }
+    // A result that answers no call cannot be imported as one.
+    if (!toolCallId) {
+      stats.normalized++;
+      continue;
+    }
+    if (shortened !== text) stats.shortenedResults++;
+    const images = Array.isArray(message.content)
+      ? inputBlocks((message.content as unknown[]).filter((block) => isObject(block) && block.type === "image"), stats)
+      : [];
+    out.push({ ...message, toolCallId, toolName, content: [{ type: "text", text: shortened }, ...images] } as unknown as AgentMessage);
   }
 
   const fitted = fitImport(out);
   if (!fitted) return { messages: [], lossy: true, tooLarge: true, stats: { ...stats, tail: true } };
   stats.tail = fitted.length < out.length;
   stats.imported = fitted.length;
-  const lossy = stats.droppedRoles > 0 || stats.shortenedResults > 0 || stats.omittedImages > 0 || stats.tail;
+  const lossy = stats.droppedRoles > 0 || stats.shortenedResults > 0 || stats.omittedImages > 0 || stats.normalized > 0 || stats.tail;
   return { messages: fitted, lossy, tooLarge: false, stats };
 }
 
@@ -336,6 +399,17 @@ export async function migrateThreadToRuntime(
   if (!thread || thread.workspace_id !== context.workspaceId) return { status: "skipped", reason: "not a thread of this workspace" };
   const existing = await org.getThreadRuntime(context.threadId);
   if (existing) return { status: "runtime", row: existing };
+  const chat = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(context.threadId)) as unknown as {
+    runtimeMigrationStatus(): Promise<{ state: "moving" | "moved" | "backoff" | null; retryAt?: number }>;
+    migrateToRuntime(request: DoMigrationRequest): Promise<DoMigrationResult>;
+  };
+  // One cheap question first: a thread moving, moved or backing off needs none of the reads below.
+  if (!options.dryRun) {
+    const { state } = await chat.runtimeMigrationStatus();
+    if (state === "moving") return { status: "busy", reason: "moving" };
+    if (state === "moved") return { status: "skipped", reason: "moved" };
+    if (state === "backoff") return { status: "skipped", reason: "backoff" };
+  }
   // A model the runtime cannot run yet (a custom endpoint, Bedrock's OpenAI models) stays here.
   try {
     const { route } = await resolveThreadRuntimeRoute(env, context, { persistFallback: false });
@@ -344,9 +418,6 @@ export async function migrateThreadToRuntime(
     return { status: "skipped", reason: `its model did not resolve: ${error instanceof Error ? error.message : String(error)}` };
   }
   const subject = await migrationSubject(env, thread, context);
-  const chat = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(context.threadId)) as unknown as {
-    migrateToRuntime(request: DoMigrationRequest): Promise<DoMigrationResult>;
-  };
   const result = await chat.migrateToRuntime({ context, subject, dryRun: options.dryRun });
   if (result.status !== "relay") return result;
   if (options.dryRun) return { status: "skipped", reason: "relay (adopted, no import)" };

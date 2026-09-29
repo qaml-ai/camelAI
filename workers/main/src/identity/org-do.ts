@@ -8682,10 +8682,10 @@ export class OrgDO extends DurableObject<DOEnv> {
 
   /**
    * Give a thread moving off ChatThreadDO its runtime agent, compare-and-set:
-   * only a thread with no runtime row takes it, so a move re-driven or raced
-   * never replaces the agent a thread already has. `claimed` says whether the
-   * row is this agent's (now, or from an earlier claim of the same agent).
-   * Null when the thread does not exist.
+   * only a thread with no agent yet takes it (no row, or a row pinned without
+   * one), so a move re-driven or raced never replaces the agent a thread
+   * already has. `claimed` says whether the row is this agent's (now, or from
+   * an earlier claim of the same agent). Null when the thread does not exist.
    */
   claimThreadRuntimeAgent(threadId: string, agentId: string): { row: ThreadRuntimeRecord; claimed: boolean } | null {
     if (!this.getThread(threadId)) return null;
@@ -8696,6 +8696,12 @@ export class OrgDO extends DurableObject<DOEnv> {
       agentId,
       now,
       now,
+    );
+    this.sql.exec(
+      "UPDATE thread_runtime SET agent_id = ?, updated_at = ? WHERE thread_id = ? AND agent_id IS NULL",
+      agentId,
+      now,
+      threadId,
     );
     const row = this.getThreadRuntime(threadId);
     return row ? { row, claimed: row.agentId === agentId } : null;

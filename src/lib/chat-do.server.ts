@@ -4,7 +4,6 @@ import type { ChatRenderHistoryPage } from "./chat-render-history";
 import { getEnv, type CloudflareEnv } from "./cloudflare.server";
 import type {
   Thread,
-  Message,
   PaginatedResult,
   PaginationParams,
   LlmProvider,
@@ -1101,28 +1100,17 @@ export async function generateThreadTitle(
   }
 }
 
-export async function getPiCoreMessages(
+/**
+ * A thread's whole transcript as parsed messages, wherever it runs (the
+ * runtime's history for a runtime thread, ChatThreadDO's pi_core otherwise).
+ */
+export async function getThreadTranscript(
   context: AppLoadContext,
-  threadId: string,
+  input: { orgId: string; threadId: string },
 ): Promise<ParsedThreadMessage[]> {
-  const env = getEnv(context);
-  if (
-    !env ||
-    typeof env !== "object" ||
-    !("CHAT_THREAD" in env) ||
-    !env.CHAT_THREAD
-  ) {
-    throw new Error("CHAT_THREAD binding is not available");
-  }
-  const threadStub = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId));
-  const messages = await Promise.resolve(
-    (
-      threadStub as unknown as {
-        getPiCoreParsedMessages(threadId: string): Promise<ParsedThreadMessage[]> | ParsedThreadMessage[];
-      }
-    ).getPiCoreParsedMessages(threadId),
-  );
-  return Array.isArray(messages) ? messages : [];
+  const { parsedThreadTranscript } = await import("../../workers/main/src/agent-runtime/thread-transcript");
+  const messages = await parsedThreadTranscript(getEnv(context) as never, input.orgId, input.threadId);
+  return messages as unknown as ParsedThreadMessage[];
 }
 
 export interface GroupNewChatRecentSource {
@@ -1134,31 +1122,14 @@ export interface GroupNewChatRecentSource {
 
 export async function getGroupNewChatRecentSource(
   context: AppLoadContext,
-  threadId: string,
+  input: { orgId: string; threadId: string },
 ): Promise<GroupNewChatRecentSource> {
-  const env = getEnv(context);
-  if (
-    !env ||
-    typeof env !== "object" ||
-    !("CHAT_THREAD" in env) ||
-    !env.CHAT_THREAD
-  ) {
-    throw new Error("CHAT_THREAD binding is not available");
-  }
-  const threadStub = env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId));
-  const source = await Promise.resolve(
-    (
-      threadStub as unknown as {
-        getGroupNewChatRecentSource(threadId: string):
-          | Promise<GroupNewChatRecentSource>
-          | GroupNewChatRecentSource;
-      }
-    ).getGroupNewChatRecentSource(threadId),
-  );
+  const { threadRecentSource } = await import("../../workers/main/src/agent-runtime/thread-transcript");
+  const source = await threadRecentSource(getEnv(context) as never, input.orgId, input.threadId);
   return {
-    messages: Array.isArray(source?.messages) ? source.messages : [],
+    messages: Array.isArray(source?.messages) ? source.messages as unknown as ParsedThreadMessage[] : [],
     projectActivity: Array.isArray(source?.projectActivity)
-      ? source.projectActivity
+      ? source.projectActivity as ThreadProjectActivity[]
       : [],
   };
 }
@@ -1225,26 +1196,6 @@ export async function getTodoState(
     ).getTodoState(),
   ).catch(() => []);
   return Array.isArray(todos) ? todos : [];
-}
-
-export async function getMessages(
-  context: AppLoadContext,
-  threadId: string,
-  _workspaceId: string,
-  options: { skipBanCheck?: boolean } = {},
-): Promise<Message[]> {
-  try {
-    void options;
-    const piMessages = await getPiCoreMessages(context, threadId);
-    if (piMessages.length > 0) {
-      return piMessages as Message[];
-    }
-
-    return [];
-  } catch (e) {
-    console.error("[getMessages] Error:", e);
-    return [];
-  }
 }
 
 export async function setThreadPreviewTarget(

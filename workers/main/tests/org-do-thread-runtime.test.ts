@@ -42,10 +42,11 @@ describe('OrgDO thread_runtime', () => {
     // A re-driven commit of the same agent still owns it; another agent never takes it.
     expect(await orgStub.claimThreadRuntimeAgent(threadId, 'agt_1')).toMatchObject({ claimed: true });
     expect(await orgStub.claimThreadRuntimeAgent(threadId, 'agt_2')).toMatchObject({ claimed: false, row: { agentId: 'agt_1' } });
-    // Nor one a thread was pinned with before it had an agent.
+    // A thread pinned before it had an agent takes one, once.
     const pinned = await freshThread();
     await pinned.orgStub.pinThreadRuntime(pinned.threadId);
-    expect(await pinned.orgStub.claimThreadRuntimeAgent(pinned.threadId, 'agt_3')).toMatchObject({ claimed: false, row: { agentId: null } });
+    expect(await pinned.orgStub.claimThreadRuntimeAgent(pinned.threadId, 'agt_3')).toMatchObject({ claimed: true, row: { agentId: 'agt_3' } });
+    expect(await pinned.orgStub.claimThreadRuntimeAgent(pinned.threadId, 'agt_4')).toMatchObject({ claimed: false, row: { agentId: 'agt_3' } });
     expect(await orgStub.claimThreadRuntimeAgent('missing-thread', 'agt_1')).toBeNull();
   });
 

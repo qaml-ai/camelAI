@@ -13,6 +13,7 @@ export default [
     route("forgot-password", "routes/_auth.forgot-password.tsx"),
     route("reset-password", "routes/_auth.reset-password.tsx"),
   ]),
+  route("signup.", "routes/signup-dot.ts"),
   route("banned", "routes/banned.tsx"),
   // Per-organization direct OIDC authorization entry point.
   route("sso/:slug", "routes/sso.$slug.ts"),
@@ -180,6 +181,11 @@ export default [
   ),
   // Threads on the hosted agent runtime (plans/runtime-threads-direct.md).
   route("api/threads/:id/token", "routes/api/threads.$id.token.ts"),
+  // Reads of a private runtime (self-host), passed through for the browser.
+  route(
+    "api/threads/:id/runtime/:workspaceId/v1/agents/:agentId/:read",
+    "routes/api/threads.$id.runtime.ts",
+  ),
   route("api/threads/:id/messages", "routes/api/threads.$id.messages.ts"),
   route(
     "api/threads/:id/inputs/:inputId",

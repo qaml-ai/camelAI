@@ -123,7 +123,8 @@ export function recordRuntimeTokenMintFailure(
  * double4 = transcript messages, double5 = imported bytes (dry runs),
  * double6 = messages imported, double7 = dropped roles, double8 = shortened
  * results, double9 = omitted images, double10 = 1 when only the latest
- * context was imported, double11 = 1 when the original was archived.
+ * context was imported, double11 = 1 when the original was archived,
+ * double12 = blocks or messages normalized for the runtime's validator.
  */
 export function recordRuntimeMigration(
   env: ObservabilityEnv | undefined,
@@ -143,7 +144,7 @@ export function recordRuntimeMigration(
     count: stats?.total ?? 0,
     size: result.status === "dry_run" ? result.bytes : 0,
     extraCounts: stats
-      ? [stats.imported, stats.droppedRoles, stats.shortenedResults, stats.omittedImages, stats.tail ? 1 : 0, "archived" in result && result.archived ? 1 : 0]
+      ? [stats.imported, stats.droppedRoles, stats.shortenedResults, stats.omittedImages, stats.tail ? 1 : 0, "archived" in result && result.archived ? 1 : 0, stats.normalized]
       : [],
   });
 }

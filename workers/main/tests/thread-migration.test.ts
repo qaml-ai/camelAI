@@ -167,6 +167,38 @@ describe("convertTranscript", () => {
   });
 });
 
+describe("convertTranscript: what the runtime's import validator takes (M4)", () => {
+  it("makes toolCall arguments objects, names every tool result, and keeps only text and typed images", () => {
+    const converted = convertTranscript([
+      { role: "user", content: [{ type: "text", text: "see" }, { type: "image", data: "AAAA" }, { type: "file", name: "a.pdf" }], timestamp: 1 },
+      { role: "assistant", content: [
+        { type: "toolCall", id: "c1", name: "read", arguments: '{"path":"a"}' },
+        { type: "toolCall", id: "c2", name: "list", arguments: "not json" },
+        { type: "toolCall", name: "nameless" },
+        { type: "weird" },
+        "stray",
+      ], timestamp: 2 },
+      { role: "toolResult", toolCallId: "c1", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 3 },
+      { role: "toolResult", content: "orphan", timestamp: 4 },
+    ] as never);
+    const [userMessage, assistant, result] = converted.messages as Array<{ content: unknown; toolName?: string }>;
+    expect(userMessage.content).toEqual([
+      { type: "text", text: "see" },
+      { type: "text", text: `[image left out of the import; see ${ARCHIVE_PATH}]` },
+      { type: "text", text: `[file left out of the import; see ${ARCHIVE_PATH}]` },
+    ]);
+    expect(assistant.content).toEqual([
+      { type: "toolCall", id: "c1", name: "read", arguments: { path: "a" } },
+      { type: "toolCall", id: "c2", name: "list", arguments: { value: "not json" } },
+      { type: "text", text: "[called nameless]" },
+    ]);
+    expect(result).toMatchObject({ toolCallId: "c1", toolName: "read" });
+    expect(converted.messages).toHaveLength(3);
+    expect(converted.lossy).toBe(true);
+    expect(converted.stats.normalized).toBeGreaterThan(0);
+  });
+});
+
 describe("migrateThreadToRuntime", () => {
   const context = { orgId: "org1", workspaceId: "ws1", threadId: "t1", userId: "u1", userName: "Ada", userEmail: null };
   const ROW = { threadId: "t1", agentId: "agt_new", model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
@@ -174,9 +206,13 @@ describe("migrateThreadToRuntime", () => {
 
   function fakeEnv(
     answer: DoMigrationResult,
-    options: { row?: typeof ROW | null; rows?: Array<typeof ROW | null>; thread?: Record<string, unknown> | null; connectionOwner?: string | null; relay?: object | null; flags?: Record<string, string> } = {},
+    options: { row?: typeof ROW | null; rows?: Array<typeof ROW | null>; thread?: Record<string, unknown> | null; connectionOwner?: string | null; relay?: object | null; flags?: Record<string, string>; status?: { state: string | null } } = {},
   ) {
-    const chat = { migrateToRuntime: vi.fn(async () => answer), relayRuntimeAgent: vi.fn(async () => options.relay ?? null) };
+    const chat = {
+      migrateToRuntime: vi.fn(async () => answer),
+      runtimeMigrationStatus: vi.fn(async () => options.status ?? { state: null }),
+      relayRuntimeAgent: vi.fn(async () => options.relay ?? null),
+    };
     const org = {
       getThread: vi.fn(async () => (options.thread === undefined ? { workspace_id: "ws1", created_by: "u1" } : options.thread)),
       getThreadRuntime: vi.fn(async () => (options.rows ? options.rows.shift() ?? null : options.row ?? null)),
@@ -216,6 +252,20 @@ describe("migrateThreadToRuntime", () => {
     const missing = fakeEnv({ status: "skipped", reason: "moved" }, { thread: null });
     expect(await migrateThreadToRuntime(missing.env, context)).toMatchObject({ status: "skipped" });
     expect(missing.chat.migrateToRuntime).not.toHaveBeenCalled();
+  });
+
+  it("asks the thread's DO where its move stands before doing the work to ask for one (L4)", async () => {
+    for (const [state, expected] of [
+      ["backoff", { status: "skipped", reason: "backoff" }],
+      ["moved", { status: "skipped", reason: "moved" }],
+      ["moving", { status: "busy", reason: "moving" }],
+    ] as const) {
+      const waiting = fakeEnv({ status: "relay" }, { status: { state } });
+      expect(await migrateThreadToRuntime(waiting.env, context)).toEqual(expected);
+      expect(waiting.chat.migrateToRuntime).not.toHaveBeenCalled();
+      expect(waiting.org.getMembers).not.toHaveBeenCalled();
+    }
+    expect(routeMock).not.toHaveBeenCalled();
   });
 
   it("acts for the channel's connection owner, or the org's owner, when the creator is no member", async () => {
@@ -267,7 +317,11 @@ describe("migrateThreadOnSend", () => {
       getMember: vi.fn(async () => ({ user_id: "u1", role: "member" })),
       getMembers: vi.fn(async () => []),
     };
-    const thread = { migrateToRuntime: vi.fn(async () => answer), relayRuntimeAgent: vi.fn(async () => null) };
+    const thread = {
+      migrateToRuntime: vi.fn(async () => answer),
+      runtimeMigrationStatus: vi.fn(async () => ({ state: null })),
+      relayRuntimeAgent: vi.fn(async () => null),
+    };
     return {
       env: { ...flags, AGENT_RUNTIME_DEFINITION: "def_1", ORG: { idFromName: (n: string) => n, get: () => org }, CHAT_THREAD: { idFromName: (n: string) => n, get: () => thread } } as unknown as ChatEnv,
       getThreadRuntime,

@@ -49,7 +49,7 @@ export async function loader({ request, context, params }: LoaderFunctionArgs) {
       return Response.json({ error: "Thread is not in this chat group" }, { status: 403 });
     }
 
-    const messages = await chatDO.getPiCoreMessages(context, threadId);
+    const messages = await chatDO.getThreadTranscript(context, { orgId, threadId });
     const transcript = buildCondensedTranscript({
       threadId,
       title: thread.title || "Untitled Chat",

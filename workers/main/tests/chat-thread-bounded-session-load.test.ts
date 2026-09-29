@@ -61,6 +61,18 @@ function createSqlHarness(rows: Array<{ idx: number; payload: string }>) {
         }],
       };
     }
+    if (text.includes('length(payload) AS chars') && text.includes('ORDER BY idx ASC')) {
+      counters.metadataQueries += 1;
+      const [fromIdx, limit] = params.map(Number);
+      return {
+        toArray: () =>
+          rows
+            .filter((row) => row.idx >= fromIdx)
+            .sort((left, right) => left.idx - right.idx)
+            .slice(0, limit)
+            .map((row) => ({ idx: row.idx, chars: row.payload.length })),
+      };
+    }
     if (text.includes('length(payload) AS chars')) {
       counters.metadataQueries += 1;
       const [minIdx, beforeIdx, limit] = params.map(Number);
@@ -74,8 +86,9 @@ function createSqlHarness(rows: Array<{ idx: number; payload: string }>) {
       };
     }
     if (text.includes('SELECT idx, payload FROM pi_core_messages')) {
+      const upTo = text.includes('idx <= ?') ? Number(params[1]) : Infinity;
       const selected = rows
-        .filter((row) => row.idx >= Number(params[0]))
+        .filter((row) => row.idx >= Number(params[0]) && row.idx <= upTo)
         .sort((left, right) => left.idx - right.idx);
       counters.payloadBodyRowsSelected += selected.length;
       return { toArray: () => selected };
@@ -1040,5 +1053,39 @@ describe('post-turn compaction under a capped session', () => {
       uiRender: 'preserve',
     });
     expect(fake.clearPiCoreCompaction).toHaveBeenCalled();
+  });
+});
+
+describe('history export for a move to the agent runtime', () => {
+  it('exports every row in order with the compaction summary where its cut falls, a bounded batch at a time', async () => {
+    const rows = salixShapedRows(40, 1_000);
+    const { store, sql } = createStoreHarness(rows);
+    sql.setCompaction({ summary: 'Earlier: built the shop.', firstKeptIndex: 30, updatedAt: 5 });
+    const { messages, whole, totalRows } = await store.loadPiCoreHistoryForMigration(12_000_000);
+    expect(whole).toBe(true);
+    expect(totalRows).toBe(40);
+    expect(messages).toHaveLength(41);
+    expect(messages[30]).toEqual(createPiSummaryMessage('Earlier: built the shop.', 5));
+    expect(JSON.stringify(messages[29])).toContain('turn 29');
+    expect((messages[31] as { content: unknown }).content).toEqual('turn 30 ' + 'x'.repeat(1_000));
+  });
+
+  it('batches rows by stored characters, a larger row on its own', () => {
+    const rows = [
+      textRow(0, 'user', 'a'.repeat(100)),
+      textRow(1, 'assistant', 'b'.repeat(100)),
+      textRow(2, 'user', 'c'.repeat(1_000)),
+      textRow(3, 'assistant', 'd'.repeat(100)),
+    ];
+    const { store } = createStoreHarness(rows);
+    const batches = [...store.piCoreRowBatches(500)].map((batch) => batch.map((row) => row.idx));
+    expect(batches).toEqual([[0, 1], [2], [3]]);
+  });
+
+  it('exports only the bounded window of a thread over the cap', async () => {
+    const { store } = createStoreHarness(salixShapedRows(100, 1_000));
+    const { messages, whole } = await store.loadPiCoreHistoryForMigration(20_000);
+    expect(whole).toBe(false);
+    expect(messages.length).toBeLessThan(100);
   });
 });

@@ -23,8 +23,8 @@ import {
   getEvalTimeoutMs,
   type EvalModelEnv,
 } from "./model-config";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import type { WorkspaceCronDO } from "../../src/workspace-cron";
+import { runRuntimeEval } from "./runtime-eval";
 
 // This eval exercises the workflow tools (validate_workflow / create_workflow /
 // list_workflows). Those tools live in the "workflows" category, which the lean tool
@@ -34,7 +34,6 @@ import type { WorkspaceCronDO } from "../../src/workspace-cron";
 // WorkflowEntrypoint module is part of the test (the agent should validate first).
 
 type WorkflowEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   WORKSPACE_CRON: DurableObjectNamespace<WorkspaceCronDO>;
   RUN_AGENT_EVALS?: string;
 };
@@ -73,10 +72,7 @@ describe("workflow agent eval", () => {
         testEnv.EVAL_MODEL,
       );
 
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

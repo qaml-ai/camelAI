@@ -1,7 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, it } from "vitest";
 
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import { createOrg, createUser, type TestEnv } from "../test-helpers";
 import {
   assertPassFailCriteria,
@@ -29,9 +28,9 @@ import {
   asString,
   usedTool,
 } from "./project-eval-helpers";
+import { runRuntimeEval } from "./runtime-eval";
 
 type ResearchEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   RUN_AGENT_EVALS?: string;
 };
 
@@ -112,16 +111,13 @@ describe("Research capability agent eval", () => {
         undefined,
         testEnv.EVAL_MODEL,
       );
-      const chatThread = testEnv.CHAT_THREAD.get(
-        testEnv.CHAT_THREAD.idFromName(thread.id),
-      );
       const researchQuestion = [
         "Investigate Cloudflare Browser Run Quick Actions using multiple sources.",
         "Identify which Quick Action converts a page to Markdown, explain why it is",
         "appropriate for one-off page fetching, and state the compatibility-date requirement.",
         "Include direct source URLs and distinguish documented facts from inference.",
       ].join(" ");
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

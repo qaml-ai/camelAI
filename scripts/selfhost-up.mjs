@@ -13,10 +13,10 @@ import {
 } from "./selfhost-common.mjs";
 import { writeCaddyConfig } from "./selfhost-caddy-config.mjs";
 import { writePomeriumConfig } from "./selfhost-pomerium-config.mjs";
-import { ensureSelfhostAdminApiKey } from "./selfhost-secret-migrations.mjs";
+import { ensureSelfhostSecrets } from "./selfhost-secret-migrations.mjs";
 
 await readSelfhostEnv(true);
-await ensureSelfhostAdminApiKey(envFile);
+await ensureSelfhostSecrets(envFile);
 const env = await readSelfhostEnv(true);
 await writePomeriumConfig(env);
 await writeCaddyConfig(env);

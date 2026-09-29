@@ -2,7 +2,6 @@ import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
 import { isRealEvalDeployEnabled } from "../../src/eval-deploy-context";
-import type { ChatThreadDO } from "../../src/chat-thread-do";
 import type { WorkspaceFilesystemDO } from "../../src/workspace-filesystem-do";
 import { createOrg, createUser, type TestEnv } from "../test-helpers";
 import {
@@ -31,7 +30,6 @@ import {
 } from "./project-eval-helpers";
 
 type BrokenAppRescueEvalEnv = TestEnv & EvalModelEnv & EvalSignalEnv & {
-  CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   R2_BUCKET: R2Bucket;
   RUN_AGENT_EVALS?: string;
@@ -77,6 +75,7 @@ export function summarizeExpenses() {
 
 const WORKER_SOURCE = `import { createRequestHandler } from "react-router";
 import { summarizeExpenses } from "../app/lib/expense";
+import { runRuntimeEval } from "./runtime-eval";
 
 interface Env { ASSETS?: { fetch(request: Request): Promise<Response> | Response } }
 const requestHandler = createRequestHandler(() => import("virtual:react-router/server-build"), import.meta.env.MODE);
@@ -412,8 +411,7 @@ describe("broken app rescue agent eval", () => {
       const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
       await configureEvalModel(testEnv, orgStub, userId);
       const thread = await orgStub.createThread(defaultWorkspaceId, "Broken app rescue eval", userId, undefined, testEnv.EVAL_MODEL);
-      const chatThread = testEnv.CHAT_THREAD.get(testEnv.CHAT_THREAD.idFromName(thread.id));
-      const result = await chatThread.runAgentEvalSession({
+      const result = await runRuntimeEval(testEnv, {
         threadId: thread.id,
         workspaceId: defaultWorkspaceId,
         orgId: org.id,

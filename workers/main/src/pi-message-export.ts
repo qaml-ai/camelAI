@@ -4,9 +4,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { normalizePiUiMetadata } from "../../../src/lib/runtime-artifacts";
 import type { ToolResultBlock } from "../../../src/types";
-import type { AdminExplorerThreadSummary } from "./chat-thread/types";
-import { getPiAssistantErrorMessage } from "./chat-thread/pi-message-helpers";
-import { normalizeModelHistoryValue } from "./chat-error-metadata";
+import type { AgentEvalParsedMessage } from "./chat-thread/types";
 
 export const PI_USER_STOP_METADATA_REASON = "user_stop";
 
@@ -308,75 +306,20 @@ export function safeLegacyString(value: unknown): string {
   }
 }
 
-/** Aggregate stats for the admin chat explorer, folded over stored pi_core
- * rows (plus the live session model, passed in by the DO). */
-export function summarizeAdminExplorerThread(
-  messages: AgentMessage[],
-  options: { userMessageCap?: number; sessionModelId?: string | null } = {},
-): AdminExplorerThreadSummary {
-  const cap = Number.isFinite(options.userMessageCap)
-    ? Math.max(1, Math.min(100, Math.floor(options.userMessageCap as number)))
-    : 20;
-  const models: string[] = [];
-  let userMessageCount = 0;
-  let userMessageCountCapped = false;
-  let errorCount = 0;
-  let lastErrorAt: number | null = null;
-  let lastErrorMessage: string | null = null;
-
-  const addModel = (value: unknown) => {
-    const model = normalizeModelHistoryValue(value);
-    if (model && !models.includes(model)) models.push(model);
-  };
-
-  for (const [index, message] of messages.entries()) {
+/**
+ * A whole transcript's Pi messages as parsed chat messages, each tool result
+ * folded into its call's message: ChatThreadDO's pi_core and a runtime agent's
+ * history alike.
+ */
+export function piMessagesToParsedMessages(messages: AgentMessage[], threadId: string): AgentEvalParsedMessage[] {
+  const parsed: AgentEvalParsedMessage[] = [];
+  messages.forEach((message, index) => {
     const record = message as unknown as Record<string, unknown>;
-    const timestamp = typeof record.timestamp === "number" && Number.isFinite(record.timestamp)
-      ? record.timestamp
-      : Date.now();
-
-    if (record.role === "user") {
-      if (
-        !isInternalPiClientMessage(record) &&
-        !isCompactSummaryPiMessage(record)
-      ) {
-        if (!userMessageCountCapped) {
-          userMessageCount += 1;
-          if (userMessageCount > cap) {
-            userMessageCount = cap;
-            userMessageCountCapped = true;
-          }
-        }
-      }
-      continue;
+    if (record.role === "toolResult") {
+      attachPiToolResultToParsedMessages(parsed, record);
+      return;
     }
-
-    if (record.role !== "assistant") continue;
-    addModel(record.responseModel);
-    addModel(record.model);
-    const errorMessage = getPiAssistantErrorMessage(message);
-    if (errorMessage) {
-      errorCount += 1;
-      if (lastErrorAt === null || timestamp >= lastErrorAt) {
-        lastErrorAt = timestamp;
-        lastErrorMessage = errorMessage;
-      }
-    }
-
-    if (index > 2000 && userMessageCountCapped) {
-      break;
-    }
-  }
-
-  addModel(options.sessionModelId);
-
-  return {
-    userMessageCount,
-    userMessageCountCapped,
-    hasError: errorCount > 0,
-    errorCount,
-    lastErrorAt,
-    lastErrorMessage,
-    models,
-  };
+    parsed.push(...piCoreMessageToParsedChatMessage(message, index, threadId));
+  });
+  return parsed;
 }

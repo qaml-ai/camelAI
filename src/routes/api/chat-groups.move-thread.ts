@@ -1,6 +1,7 @@
 import type { ActionFunctionArgs } from "react-router";
 import { requireSessionWorkspaceAccess } from "@/lib/auth.server";
 import { moveThreadToGroup } from "@/lib/chat-groups.server";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 function moveThreadErrorResponse(error: unknown): Response {
   const message =
@@ -15,6 +16,8 @@ function moveThreadErrorResponse(error: unknown): Response {
     { status: 409 },
   );
 }
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context }: ActionFunctionArgs) {
   if (request.method !== "POST") {

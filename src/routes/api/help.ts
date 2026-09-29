@@ -22,6 +22,7 @@ import {
 } from '@/lib/billing-plans';
 import { isSelfhostRuntime } from '@/lib/selfhost-runtime';
 import { SELFHOST_HELP_EMAIL_DISABLED_MESSAGE } from '@/lib/selfhost-capabilities';
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 function deriveFirstName(name: string | null | undefined): string {
   const firstName = name?.trim().split(/\s+/).find((token) => token.length > 0);
@@ -49,6 +50,8 @@ function logHelpDeliveryResult(
 
   console.warn('Help email delivery skipped:', payload);
 }
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context }: Route.ActionArgs) {
   if (request.method !== 'POST') {

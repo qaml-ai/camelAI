@@ -5,6 +5,9 @@ import { getAuthEnv } from "@/lib/auth-helpers";
 import { closeGroup } from "@/lib/chat-groups.server";
 import { normalizeChatGroupAvatar } from "@/lib/avatar";
 import type { Avatar } from "@/types";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
+
+export const loader = actionOnlyLoader('PATCH', 'DELETE');
 
 export async function action({ request, context, params }: ActionFunctionArgs) {
   const { orgId, workspaceId, userId } = await requireSessionWorkspaceAccess(

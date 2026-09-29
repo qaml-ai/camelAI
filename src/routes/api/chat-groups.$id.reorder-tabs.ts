@@ -2,6 +2,9 @@ import type { ActionFunctionArgs } from "react-router";
 import { requireSessionWorkspaceAccess } from "@/lib/auth.server";
 import { getEnv } from "@/lib/cloudflare.server";
 import { getAuthEnv } from "@/lib/auth-helpers";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context, params }: ActionFunctionArgs) {
   if (request.method !== "POST") {

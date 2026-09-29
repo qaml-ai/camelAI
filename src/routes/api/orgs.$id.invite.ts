@@ -15,6 +15,7 @@ import {
   sendOrgInvitationEmail,
 } from '@/lib/email.server';
 import { requireAccessMappedOrg } from '@/lib/cloudflare-access-auth.server';
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 const legacyInviteMemberFormSchema = z.object({
   email: inviteEmailSchema,
@@ -27,6 +28,8 @@ function isSeatCapacityError(error: unknown): error is Error {
     error.message.startsWith('Your current billing plan includes ')
   );
 }
+
+export const loader = actionOnlyLoader('POST', 'DELETE');
 
 export async function action({ request, context, params }: Route.ActionArgs) {
   const orgId = params.id;

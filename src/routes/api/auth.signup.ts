@@ -22,6 +22,10 @@ import { validateTurnstileToken } from "@/lib/turnstile.server";
 import { waitUntil } from "@/lib/wait-until";
 import { isSelfhostRuntime } from "@/lib/selfhost-runtime";
 import { SELFHOST_PASSWORD_SIGNUP_DISABLED_MESSAGE } from "@/lib/selfhost-capabilities";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
+
+export const loader = actionOnlyLoader('POST');
+
 export async function action({ request, context }: Route.ActionArgs) {
   if (request.method !== "POST") {
     return Response.json({ error: "Method not allowed" }, { status: 405 });

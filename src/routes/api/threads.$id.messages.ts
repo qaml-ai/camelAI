@@ -5,6 +5,9 @@ import { RUNTIME_REQUEST_ID } from "@/lib/agent-runtime-shared";
 import { startRuntimeTurn } from "../../../workers/main/src/agent-runtime/thread-runtime";
 import { RuntimeApiError } from "../../../workers/main/src/agent-runtime/runtime-api";
 import { recordRuntimeSendFailure } from "../../../workers/main/src/agent-runtime/runtime-thread-telemetry";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
+
+export const loader = actionOnlyLoader('POST');
 
 /**
  * POST /api/threads/:id/messages {text, clientMessageId}: send a message to a

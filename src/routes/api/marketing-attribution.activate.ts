@@ -5,6 +5,9 @@ import {
   associateAttributionWithUser,
   recordNewCamelActivation,
 } from "@/lib/marketing-attribution.server";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context }: Route.ActionArgs) {
   if (request.method !== "POST") {

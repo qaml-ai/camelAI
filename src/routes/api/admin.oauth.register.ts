@@ -1,12 +1,15 @@
 import type { Route } from "./+types/admin.oauth.register";
 import { getEnv } from "@/lib/cloudflare.server";
 import { getAdminMcpOAuth, OAuthError } from "@/lib/admin-mcp-oauth.server";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 type RegistrationMetadata = Parameters<ReturnType<typeof getAdminMcpOAuth>["registerClient"]>[0];
 
 function asRegistrationMetadata(value: unknown): RegistrationMetadata {
   return typeof value === "object" && value !== null ? value : {};
 }
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context }: Route.ActionArgs) {
   if (request.method !== "POST") {

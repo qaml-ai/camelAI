@@ -5,12 +5,15 @@ import { getUserByEmail } from "@/lib/auth-do";
 import { getBanForEmail } from "@/lib/ban.server";
 import { sendUserPasswordResetEmail } from "@/lib/password-reset.server";
 import { waitUntil } from "@/lib/wait-until";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 const GENERIC_SUCCESS = {
   success: true,
   message:
     "If an account exists for that email, you'll receive a password reset link shortly.",
 };
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context }: Route.ActionArgs) {
   if (request.method !== "POST") {

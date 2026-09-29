@@ -2,6 +2,9 @@ import type { Route } from "./+types/billing.start-payg";
 import { requireAuthContext, requireOrgAdmin } from "@/lib/auth.server";
 import { activatePayAsYouGoPlan } from "@/lib/billing.server";
 import { getEnv } from "@/lib/cloudflare.server";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context }: Route.ActionArgs) {
   if (request.method !== "POST") {

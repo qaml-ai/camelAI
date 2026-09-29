@@ -5,6 +5,9 @@ import { providerForAuthSource } from '../../../workers/main/src/helpers/proxy-a
 import type { ProxyAuthEnv } from '../../../workers/main/src/helpers/proxy-auth-core';
 import type { UserDO } from '../../../workers/main/src/auth';
 import { ENTERPRISE_OIDC_AUTH_SOURCE } from '../../../workers/main/src/signed-session';
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context }: Route.ActionArgs) {
   if (request.method !== 'POST') {

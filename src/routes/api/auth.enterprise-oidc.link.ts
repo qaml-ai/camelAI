@@ -4,6 +4,9 @@ import { requireAuthContext } from "@/lib/auth.server";
 import { getEnv } from "@/lib/cloudflare.server";
 import { createSsoLinkCookie } from "@/lib/org-sso-browser.server";
 import { createSignedEnterpriseSsoLink } from "../../../workers/main/src/signed-session";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context }: Route.ActionArgs) {
   if (request.method !== "POST") {

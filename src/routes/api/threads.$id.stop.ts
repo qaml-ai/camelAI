@@ -1,6 +1,9 @@
 import type { ActionFunctionArgs } from "react-router";
 import { requestWorkspaceId, requireRuntimeThread } from "@/lib/runtime-threads.server";
 import { abortRuntimeThread } from "../../../workers/main/src/agent-runtime/thread-runtime";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
+
+export const loader = actionOnlyLoader('POST');
 
 /** POST /api/threads/:id/stop: stop the runtime thread's running turn. */
 export async function action({ request, context, params }: ActionFunctionArgs) {

@@ -7,6 +7,7 @@ import {
 } from "@/lib/billing.server";
 import { getEffectiveLlmProviderConfig } from "@/lib/selfhost-ai-provider";
 import { associateAttributionWithUser } from "@/lib/marketing-attribution.server";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 type OnboardingAccessChoice = "byok" | "existing" | null;
 
@@ -33,6 +34,8 @@ async function readAccessChoice(
     ? accessChoice
     : null;
 }
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context }: Route.ActionArgs) {
   if (request.method !== "POST") {

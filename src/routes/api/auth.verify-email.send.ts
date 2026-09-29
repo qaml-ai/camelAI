@@ -4,6 +4,9 @@ import { getEnv } from "@/lib/cloudflare.server";
 import { sendUserVerificationEmail } from "@/lib/email-verification.server";
 import { isSelfhostRuntime } from "@/lib/selfhost-runtime";
 import { SELFHOST_EMAIL_VERIFICATION_DISABLED_MESSAGE } from "@/lib/selfhost-capabilities";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({
   request,

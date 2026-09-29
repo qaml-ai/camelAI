@@ -2,8 +2,11 @@ import type { Route } from "./+types/marketing-attribution.purchase";
 import { requireAuthContext } from "@/lib/auth.server";
 import { getEnv } from "@/lib/cloudflare.server";
 import { recordStreamPurchase } from "@/lib/marketing-attribution.server";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 const PURCHASE_STATUSES = new Set(["active", "trialing"]);
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context }: Route.ActionArgs) {
   if (request.method !== "POST") {

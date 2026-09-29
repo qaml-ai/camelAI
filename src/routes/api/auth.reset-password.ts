@@ -2,8 +2,11 @@ import type { Route } from "./+types/auth.reset-password";
 import { getEnv } from "@/lib/cloudflare.server";
 import { getBanForEmail } from "@/lib/ban.server";
 import { validatePasswordResetToken } from "@/lib/password-reset-token";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 const MIN_PASSWORD_LENGTH = 8;
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context }: Route.ActionArgs) {
   if (request.method !== "POST") {

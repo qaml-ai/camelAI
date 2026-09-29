@@ -1,8 +1,11 @@
 import type { ActionFunctionArgs } from "react-router";
 import { requestWorkspaceId, requireRuntimeThread } from "@/lib/runtime-threads.server";
 import { answerRuntimeInput } from "../../../workers/main/src/agent-runtime/thread-runtime";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 const ACTIONS = new Set(["accept", "decline", "cancel"]);
+
+export const loader = actionOnlyLoader('POST');
 
 /**
  * POST /api/threads/:id/inputs/:inputId {action, content?}: answer a human

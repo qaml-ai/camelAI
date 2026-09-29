@@ -11,6 +11,7 @@ import {
   createSession,
 } from "@/lib/auth-do";
 import { getBanForEmail } from "@/lib/ban.server";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 function getAuthEnv(env: CloudflareEnv): AuthEnv {
   return {
@@ -23,6 +24,8 @@ function getAuthEnv(env: CloudflareEnv): AuthEnv {
     TOKEN_SIGNING_SECRET: env.TOKEN_SIGNING_SECRET,
   };
 }
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context }: Route.ActionArgs) {
   if (request.method !== "POST") {

@@ -6,12 +6,15 @@ import {
 } from "@/lib/billing.server";
 import { isBillingPlan } from "@/lib/billing-plans";
 import { getEnv } from "@/lib/cloudflare.server";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 const SUBSCRIPTION_PLANS = new Set(["starter", "pro", "team"]);
 
 function isSubscriptionPlan(plan: string): plan is "starter" | "pro" | "team" {
   return isBillingPlan(plan) && SUBSCRIPTION_PLANS.has(plan);
 }
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context }: Route.ActionArgs) {
   if (request.method !== "POST") {

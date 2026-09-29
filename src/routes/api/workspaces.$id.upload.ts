@@ -3,6 +3,7 @@ import { requireWorkspaceAccess } from './workspaces.utils';
 import { getEnv } from '@/lib/cloudflare.server';
 import { isSelfhostRuntime } from '@/lib/selfhost-runtime';
 import { buildWorkspaceScopedR2Key } from '@/lib/workspace-r2-paths';
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 function generateUniqueFilename(originalName: string): string {
   const timestamp = Date.now();
@@ -266,6 +267,8 @@ async function handleMultipartAbort(
     return Response.json({ error: message }, { status: 400 });
   }
 }
+
+export const loader = actionOnlyLoader('POST', 'PUT', 'DELETE');
 
 export async function action({ request, context, params }: Route.ActionArgs) {
   try {

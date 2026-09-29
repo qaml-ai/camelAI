@@ -5,10 +5,13 @@ import {
   estimateBase64Bytes,
   transcribeAudioBase64,
 } from '../../../workers/main/src/audio-transcription';
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 // POST /api/speech/transcribe
 // Body: { audio: string (base64 encoded audio) }
 // Returns: { text: string }
+export const loader = actionOnlyLoader('POST');
+
 export async function action({ request, context }: Route.ActionArgs) {
   // Require authentication
   await requireAuthContext(request, context);

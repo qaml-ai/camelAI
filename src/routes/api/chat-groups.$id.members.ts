@@ -1,6 +1,7 @@
 import type { ActionFunctionArgs } from "react-router";
 import { requireSessionWorkspaceAccess } from "@/lib/auth.server";
 import { addThreadToExistingGroup } from "@/lib/chat-groups.server";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
 
 function addThreadErrorResponse(error: unknown): Response {
   const message =
@@ -14,6 +15,8 @@ function addThreadErrorResponse(error: unknown): Response {
     { status: 500 },
   );
 }
+
+export const loader = actionOnlyLoader('POST');
 
 export async function action({ request, context, params }: ActionFunctionArgs) {
   if (request.method !== "POST") {

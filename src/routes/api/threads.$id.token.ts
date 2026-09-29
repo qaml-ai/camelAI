@@ -3,6 +3,9 @@ import { requestWorkspaceId, requireRuntimeThread } from "@/lib/runtime-threads.
 import { runtimeReadProxyBase } from "@/lib/agent-runtime-shared";
 import { mintRuntimeBrowserToken } from "../../../workers/main/src/agent-runtime/thread-runtime";
 import { recordRuntimeTokenMintFailure } from "../../../workers/main/src/agent-runtime/runtime-thread-telemetry";
+import { actionOnlyLoader } from '@/lib/method-not-allowed';
+
+export const loader = actionOnlyLoader('POST');
 
 /**
  * POST /api/threads/:id/token: a short-lived, read-only token the browser

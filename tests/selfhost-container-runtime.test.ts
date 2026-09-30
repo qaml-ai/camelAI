@@ -55,7 +55,7 @@ describe("self-host Docker container runtime", () => {
     [
       "project-build-image",
       "workers/main",
-      "project-build-sandbox.Dockerfile",
+      "project-build-sandbox-v1.Dockerfile",
     ],
     ["analysis-image", "workers/main", "analysis-sandbox.Dockerfile"],
     ["db-query-image", "workers/main", "db-query-sandbox.Dockerfile"],

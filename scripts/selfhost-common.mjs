@@ -177,7 +177,7 @@ export function scriptEnv(env = {}, extra = {}) {
         SELFHOST_PROJECT_BUILD_IMAGE:
           env.SELFHOST_PROJECT_BUILD_IMAGE ||
           process.env.SELFHOST_PROJECT_BUILD_IMAGE ||
-          "camelai-selfhost-project-build:0.12.0",
+          "camelai-selfhost-project-build:1.0.0",
         SELFHOST_ANALYSIS_IMAGE:
           env.SELFHOST_ANALYSIS_IMAGE ||
           process.env.SELFHOST_ANALYSIS_IMAGE ||

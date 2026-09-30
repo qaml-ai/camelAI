@@ -43,6 +43,9 @@ const MINIFLARE_WORKERS_DIR = path.join(
 
 const SELFHOST_DEFAULT_VARS = {
   NODE_ENV: 'production',
+  // Project builds run on ProjectBuildSandboxV1 (native ctx.container, Sandbox
+  // SDK 1.0), the only project-build class self-host attaches a container to.
+  PROJECT_BUILD_SANDBOX_RUNTIME: 'v1',
   AI_VIRTUAL_MODEL: 'dynamic/auto',
   AI_GATEWAY_AUTH_TOKEN: '',
   CF_ACCOUNT_ID: 'selfhost',
@@ -153,10 +156,23 @@ const IMAGES_SERVICE_NAME = 'images:service';
 const DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE =
   'camelai-selfhost-container-egress:0.12.0';
 const DEFAULT_DOCKER_SOCKET_URI = 'unix:///var/run/docker.sock';
+// 0.12 container classes whose 1.0 successor serves self-host. Their Durable
+// Object namespaces stay bound (the Worker still exports them) but get no
+// container, so nothing can start the old image.
+const SELFHOST_SUPERSEDED_CONTAINER_CLASSES = {
+  ProjectBuildSandbox: 'ProjectBuildSandboxV1',
+};
 const SELFHOST_CONTAINER_IMAGES = {
-  ProjectBuildSandbox: {
-    env: 'SELFHOST_PROJECT_BUILD_IMAGE',
-    image: 'camelai-selfhost-project-build:0.12.0',
+  // Native Durable Object container (scheduling_policy "durable_object"): the
+  // Worker picks the image at start() from ctx.container.images, so workerd
+  // gets named images instead of one imageName.
+  ProjectBuildSandboxV1: {
+    images: {
+      'project-build': {
+        env: 'SELFHOST_PROJECT_BUILD_IMAGE',
+        image: 'camelai-selfhost-project-build:1.0.0',
+      },
+    },
   },
   AnalysisSandbox: {
     env: 'SELFHOST_ANALYSIS_IMAGE',
@@ -214,10 +230,16 @@ function bindingDurableObjectFromService(name, className, serviceName) {
   `))`;
 }
 
-function durableObjectNamespace(className, containerImage) {
-  const container = containerImage
-    ? `, container = (imageName = ${q(containerImage)})`
-    : '';
+function durableObjectNamespace(className, containerConfig) {
+  let container = '';
+  if (containerConfig?.images) {
+    const images = containerConfig.images
+      .map((entry) => `(name = ${q(entry.name)}, image = ${q(entry.image)})`)
+      .join(', ');
+    container = `, container = (images = [${images}])`;
+  } else if (containerConfig?.image) {
+    container = `, container = (imageName = ${q(containerConfig.image)})`;
+  }
   return `(className = ${q(className)}, ` +
     `uniqueKey = ${q(`camelai-selfhost-${className}`)}, ` +
     `enableSql = true${container})`;
@@ -329,8 +351,10 @@ function resolveContainerRuntime(wrangler, env) {
     (wrangler.durable_objects?.bindings ?? []).map((binding) => binding.class_name),
   );
   const seen = new Set();
-  const containers = (wrangler.containers ?? []).map((container) => {
+  const containers = [];
+  for (const container of wrangler.containers ?? []) {
     const className = container.class_name;
+    if (SELFHOST_SUPERSEDED_CONTAINER_CLASSES[className]) continue;
     const supported = SELFHOST_CONTAINER_IMAGES[className];
     if (!supported) {
       throw new Error(
@@ -347,10 +371,31 @@ function resolveContainerRuntime(wrangler, env) {
       );
     }
     seen.add(className);
+    if (supported.images) {
+      if (container.scheduling_policy !== 'durable_object') {
+        throw new Error(`Self-host container class ${className} must use scheduling_policy "durable_object"`);
+      }
+      const declared = Object.keys(container.images ?? {});
+      const missingImages = Object.keys(supported.images).filter((name) => !declared.includes(name));
+      const unknownImages = declared.filter((name) => !supported.images[name]);
+      if (missingImages.length > 0 || unknownImages.length > 0) {
+        throw new Error(
+          `Self-host container class ${className} images must be ` +
+          `${Object.keys(supported.images).join(', ')}; Wrangler declares ${declared.join(', ') || 'none'}`,
+        );
+      }
+      const images = Object.entries(supported.images).map(([name, entry]) => {
+        const image = configuredValue(env, entry.env, entry.image);
+        if (!image) throw new Error(`${entry.env} must not be empty`);
+        return { name, image, imageEnv: entry.env };
+      });
+      containers.push({ className, images });
+      continue;
+    }
     const image = configuredValue(env, supported.env, supported.image);
     if (!image) throw new Error(`${supported.env} must not be empty`);
-    return { className, image, imageEnv: supported.env };
-  });
+    containers.push({ className, image, imageEnv: supported.env });
+  }
 
   const expected = Object.keys(SELFHOST_CONTAINER_IMAGES);
   const missing = expected.filter((className) => !seen.has(className));
@@ -805,6 +850,15 @@ async function main() {
   for (const key of Object.keys(vars)) {
     if (process.env[key] !== undefined) vars[key] = process.env[key];
   }
+  // Only ProjectBuildSandboxV1 gets a container here (see
+  // SELFHOST_SUPERSEDED_CONTAINER_CLASSES), so any other value would route
+  // builds to a class that cannot start one. Roll back by pinning an earlier
+  // release instead.
+  if (String(vars.PROJECT_BUILD_SANDBOX_RUNTIME).trim().toLowerCase() !== 'v1') {
+    throw new Error(
+      'PROJECT_BUILD_SANDBOX_RUNTIME must be "v1" on self-host: project builds run on ProjectBuildSandboxV1',
+    );
+  }
 
   // Resolve `.selfhost/agent` (or env overrides) into Worker text bindings.
   // loadSelfhostAgentPack already prefers non-empty env values over files.
@@ -915,11 +969,8 @@ async function main() {
   }
 
   const containerRuntime = resolveContainerRuntime(wrangler, selfhostEnv);
-  const containerImageByClass = new Map(
-    containerRuntime.containers.map((container) => [
-      container.className,
-      container.image,
-    ]),
+  const containerByClass = new Map(
+    containerRuntime.containers.map((container) => [container.className, container]),
   );
   const durableObjectBindings = wrangler.durable_objects?.bindings ?? [];
 
@@ -1021,7 +1072,7 @@ async function main() {
     `durableObjectNamespaces = [` +
       durableObjectClasses.map((className) => durableObjectNamespace(
         className,
-        containerImageByClass.get(className),
+        containerByClass.get(className),
       )).join(', ') +
     `], ` +
     `durableObjectStorage = (localDisk = "do-storage"), ` +

@@ -17,7 +17,7 @@ services:
   project-build-image:
     build:
       context: workers/main
-      dockerfile: project-build-sandbox.Dockerfile
+      dockerfile: project-build-sandbox-v1.Dockerfile
 
   analysis-image:
     build:

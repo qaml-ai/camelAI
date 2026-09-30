@@ -115,6 +115,7 @@ description: Follow ACME runbooks. Use when shipping internal tools.
       'WorkspaceDO',
       'WorkspaceFilesystemDO',
       'ProjectBuildSandbox',
+      'ProjectBuildSandboxV1',
       'AnalysisSandbox',
       'DbQuerySandbox',
     ],
@@ -141,8 +142,29 @@ description: Follow ACME runbooks. Use when shipping internal tools.
   includesAll(manifest.omittedBindings.sendEmail, ['EMAIL'], 'omitted sendEmail bindings');
   includesAll(
     bindings.containers.map((container) => container.className),
-    ['ProjectBuildSandbox', 'AnalysisSandbox', 'DbQuerySandbox'],
+    ['ProjectBuildSandboxV1', 'AnalysisSandbox', 'DbQuerySandbox'],
     'container bindings',
+  );
+  assert(
+    !bindings.containers.some((container) => container.className === 'ProjectBuildSandbox'),
+    'the 0.12 ProjectBuildSandbox must not get a container: ProjectBuildSandboxV1 serves builds',
+  );
+  assert(
+    config.includes('(name = "PROJECT_BUILD_SANDBOX_RUNTIME", text = "v1")'),
+    'self-host routes project builds to ProjectBuildSandboxV1',
+  );
+  assert(
+    config.includes(
+      'className = "ProjectBuildSandboxV1", uniqueKey = "camelai-selfhost-ProjectBuildSandboxV1", ' +
+      'enableSql = true, container = (images = [(name = "project-build", image = "camelai-selfhost-project-build:1.0.0")])',
+    ),
+    'config should expose the project-build image to ProjectBuildSandboxV1 as ctx.container.images',
+  );
+  assert(
+    config.includes(
+      'className = "ProjectBuildSandbox", uniqueKey = "camelai-selfhost-ProjectBuildSandbox", enableSql = true)',
+    ),
+    'the 0.12 ProjectBuildSandbox namespace stays bound without a container',
   );
   assert(
     manifest.containerEngine?.kind === 'localDocker',
@@ -253,7 +275,6 @@ description: Follow ACME runbooks. Use when shipping internal tools.
     );
   }
   for (const [containerClass, image] of [
-    ['ProjectBuildSandbox', 'camelai-selfhost-project-build:0.12.0'],
     ['AnalysisSandbox', 'camelai-selfhost-analysis:0.12.0'],
     ['DbQuerySandbox', 'camelai-selfhost-db-query:0.12.0'],
   ]) {

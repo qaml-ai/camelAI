@@ -77,8 +77,8 @@ jobs:
           --load
           --cache-from type=gha,scope=selfhost-project-build
           --cache-to type=gha,mode=max,scope=selfhost-project-build
-          --tag camelai-selfhost-project-build:0.12.0
-          --file workers/main/project-build-sandbox.Dockerfile
+          --tag camelai-selfhost-project-build:1.0.0
+          --file workers/main/project-build-sandbox-v1.Dockerfile
           workers/main
       - name: Build self-host container egress interceptor
         run: >

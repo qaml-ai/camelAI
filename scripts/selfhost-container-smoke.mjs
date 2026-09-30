@@ -46,25 +46,27 @@ const notebook = Buffer.from(
 const archive =
   "UEsDBBQAAAAAAK9kCV0kaUB3GwAAABsAAAAJAAAAcHJvYmUudHh0Y2FtZWxhaS1hbmFseXNpcy1hcmNoaXZlLW9rUEsBAhQDFAAAAAAAr2QJXSRpQHcbAAAAGwAAAAkAAAAAAAAAAAAAAIABAAAAAHByb2JlLnR4dFBLBQYAAAAAAQABADcAAABCAAAAAAA=";
 const runtimes = {
+  // Local R2 sync (mountBucket localBucket) is a 0.12 sandbox-server feature,
+  // so it runs on the analysis image, whose 0.12 class still uses it.
   mount: {
-    className: "ProjectBuildSandbox",
+    className: "AnalysisSandbox",
     image:
-      process.env.SELFHOST_PROJECT_BUILD_IMAGE ||
-      selfhostEnv.SELFHOST_PROJECT_BUILD_IMAGE ||
-      "camelai-selfhost-project-build:0.12.0",
+      process.env.SELFHOST_ANALYSIS_IMAGE ||
+      selfhostEnv.SELFHOST_ANALYSIS_IMAGE ||
+      "camelai-selfhost-analysis:0.12.0",
     marker: "camelai-local-r2-sync-ok",
     mountTest: true,
   },
+  // The real ProjectBuildSandboxV1 (native ctx.container) against the
+  // project-build image, through the calls a build makes.
   project: {
-    className: "ProjectBuildSandbox",
+    className: "ProjectBuildSandboxV1",
+    native: true,
+    imageName: "project-build",
     image:
       process.env.SELFHOST_PROJECT_BUILD_IMAGE ||
       selfhostEnv.SELFHOST_PROJECT_BUILD_IMAGE ||
-      "camelai-selfhost-project-build:0.12.0",
-    command:
-      "printf 'console.log(\"camelai-project-build-ok\")' > /tmp/smoke.ts " +
-      "&& bun build /tmp/smoke.ts --outfile /tmp/smoke.js >/dev/null " +
-      "&& node /tmp/smoke.js",
+      "camelai-selfhost-project-build:1.0.0",
     marker: "camelai-project-build-ok",
   },
   analysis: {
@@ -205,9 +207,49 @@ try {
       const result = await sandbox.exec(${JSON.stringify(runtime.command)});
       return Response.json(result);
     `;
+  const nativeSource = `
+import { ProjectBuildSandboxV1 } from ${JSON.stringify(path.join(repoRoot, "workers/main/src/project-build-sandbox-v1.ts"))};
+
+export { ProjectBuildSandboxV1 };
+
+export default {
+  async fetch(_request, env) {
+    const sandbox = env.SANDBOX.getByName("org-selfhost-smoke");
+    try {
+      const workdir = "/workspace/smoke";
+      await sandbox.mkdir(workdir + "/src", { recursive: true });
+      await sandbox.writeFile(workdir + "/src/index.ts", 'console.log("' + ${JSON.stringify("camelai-project-build-ok")} + '")');
+      await sandbox.writeFile(workdir + "/archive.bin", new Blob(["streamed"]).stream());
+      const build = await sandbox.exec(
+        "bun build src/index.ts --outfile out/index.js >/dev/null && node out/index.js",
+        { cwd: workdir, timeout: 120000, env: { CI: "1" } },
+      );
+      if (build.exitCode !== 0) return Response.json({ ...build, success: false });
+      const listed = await sandbox.listFiles(workdir + "/out", { recursive: true, includeHidden: true });
+      const bundle = await sandbox.readFileBytes(workdir + "/out/index.js");
+      const streamed = await sandbox.readFile(workdir + "/archive.bin");
+      const missing = await sandbox.exists(workdir + "/missing");
+      const timedOut = await sandbox.exec("sleep 30", { timeout: 1000 });
+      const checks = [
+        listed.files.some((file) => file.relativePath === "index.js"),
+        bundle.byteLength > 0,
+        streamed.content === "streamed",
+        missing.exists === false,
+        timedOut.exitCode === 124,
+      ];
+      if (checks.includes(false)) {
+        return Response.json({ success: false, stdout: build.stdout, checks });
+      }
+      return Response.json({ success: true, stdout: build.stdout });
+    } finally {
+      await sandbox.restartZombieContainer({ operation: "smoke", trigger: "cleanup" });
+    }
+  },
+};
+`;
   await fs.writeFile(
     sourcePath,
-    `
+    runtime.native ? nativeSource : `
 import { ContainerProxy, getSandbox, Sandbox } from "@cloudflare/sandbox";
 
 export { ContainerProxy };
@@ -259,7 +301,9 @@ const smoke :Workerd.Config = (
         className = ${JSON.stringify(runtime.className)},
         uniqueKey = ${JSON.stringify(`camelai-selfhost-container-smoke-${runtimeName}`)},
         enableSql = true,
-        container = (imageName = ${JSON.stringify(runtime.image)})
+        container = ${runtime.native
+          ? `(images = [(name = ${JSON.stringify(runtime.imageName)}, image = ${JSON.stringify(runtime.image)})])`
+          : `(imageName = ${JSON.stringify(runtime.image)})`}
       )],
       durableObjectStorage = (localDisk = "do-storage"),
       containerEngine = (localDocker = (

@@ -240,6 +240,18 @@ mode. It does not require `/dev/fuse`, `SYS_ADMIN`, or an unconfined AppArmor
 profile. `selfhost:doctor` runs a bidirectional mount smoke whenever the images
 are already local; it must pass before treating app build/deploy as healthy.
 
+Project builds run on `ProjectBuildSandboxV1`, the same class Cloudflare runs:
+it drives its container through workerd's native Durable Object container API
+(`ctx.container`, Sandbox SDK 1.0). The generated workerd config exposes
+`SELFHOST_PROJECT_BUILD_IMAGE` to it as the named image `project-build`, and
+sets `PROJECT_BUILD_SANDBOX_RUNTIME=v1`; the older `ProjectBuildSandbox`
+namespace stays bound without a container. That image is built from
+`workers/main/project-build-sandbox-v1.Dockerfile` (amd64: it carries the
+Sandbox SDK's `sandbox-shim`). To roll back, pin the previous release's images
+rather than changing the runtime variable. `selfhost:container:smoke:project`
+exercises the real class against the image; the mount smoke uses the analysis
+image, which still runs the 0.12 sandbox server.
+
 Intentionally disabled capabilities do not make the service unhealthy. Failed
 runtime checks still return HTTP 503 and `status: "fail"`. In particular,
 `PROJECT_BUILD_SANDBOX`, `ANALYSIS_SANDBOX`, and `DB_QUERY_SANDBOX` are required

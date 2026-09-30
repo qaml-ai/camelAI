@@ -205,8 +205,9 @@ await check("Docker socket", async () => {
 });
 
 await check("sandbox storage synchronization", async () => {
+  // The mount smoke runs on the analysis image (0.12 sandbox server).
   const required = [
-    "SELFHOST_PROJECT_BUILD_IMAGE",
+    "SELFHOST_ANALYSIS_IMAGE",
     "SELFHOST_CONTAINER_EGRESS_IMAGE",
   ];
   const missing = required.filter((key) => !localImageKeys.has(key));

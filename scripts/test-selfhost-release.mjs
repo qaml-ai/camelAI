@@ -186,7 +186,7 @@ includesAll(
   [
     "infra/selfhost/app.Dockerfile",
     "infra/selfhost/local-artifacts.Dockerfile",
-    "project-build-sandbox.Dockerfile",
+    "project-build-sandbox-v1.Dockerfile",
     "analysis-sandbox.Dockerfile",
     "db-query-sandbox.Dockerfile",
     "workers/main/eval-egress-fix",

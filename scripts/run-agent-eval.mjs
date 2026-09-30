@@ -43,16 +43,11 @@ if (!process.env.MINIFLARE_CONTAINER_EGRESS_IMAGE) {
 // safe when this is the only eval on the host. A direct local run (`bun run test:eval:*`) is exactly
 // that. An orchestrator that runs evals concurrently would have a global sweep kill a sibling run's
 // container, so it sets EVAL_MANAGED_CLEANUP=1 to skip this and owns a concurrency-safe reaper instead.
-const EVAL_CONTAINER_CLASS_NAMES = ["AnalysisSandbox"];
+// AnalysisContainer and ProjectBuildContainer get no container under the
+// worker test pool yet (vitest.workers.config.ts), so no current eval starts
+// one; the sweep stays for the pool upgrade that brings them back.
+const EVAL_CONTAINER_CLASS_NAMES = ["AnalysisContainer", "ProjectBuildContainer"];
 const VITEST_CONTAINER_NAME_PREFIX = "workerd-vitest-pool-workers-runner--";
-const ANALYSIS_SANDBOX_IMAGE = "camelai-analysis-sandbox:latest";
-const ANALYSIS_SANDBOX_DOCKERFILE = "workers/main/analysis-sandbox.Dockerfile";
-const ANALYSIS_EVAL_IDS = new Set([
-  "data-analysis-report-live",
-  "notebook-fix-rerun-live",
-  "notebook-deploy-live",
-  "metrics-ground-truth-notebook-live",
-]);
 
 // Evals that publish a notebook as a static app need the pre-built renderer SPA
 // in public/notebook-renderer/ (served to the worker via the test ASSETS binding).
@@ -65,23 +60,6 @@ function ensureNotebookRendererAssets(evalId) {
   const build = spawnSync("bun", ["run", "build:renderer"], { stdio: "inherit" });
   if (build.status !== 0) {
     console.error("Failed to build notebook renderer assets (bun run build:renderer).");
-    process.exit(build.status ?? 1);
-  }
-}
-
-function ensureAnalysisSandboxImage(evalId) {
-  if (!ANALYSIS_EVAL_IDS.has(evalId)) return;
-  if (!existsSync(ANALYSIS_SANDBOX_DOCKERFILE)) return;
-  // Delegated: the script is a fast no-op when the image already exists with
-  // the host's architecture, and otherwise builds it natively (on arm64 hosts
-  // it first builds the amd64-only cloudflare/sandbox base from source —
-  // under Rosetta/QEMU the Jupyter kernel never answers its handshake, so an
-  // emulated image breaks every run_notebook call).
-  const build = spawnSync("node", ["scripts/build-analysis-sandbox-image.mjs"], {
-    stdio: "inherit",
-  });
-  if (build.status !== 0) {
-    console.error(`Failed to build ${ANALYSIS_SANDBOX_IMAGE}.`);
     process.exit(build.status ?? 1);
   }
 }
@@ -324,7 +302,6 @@ try {
   process.exit(1);
 }
 
-ensureAnalysisSandboxImage(evalName);
 ensureNotebookRendererAssets(evalName);
 
 const artifactDir = path.resolve(evalEnv.EVAL_ARTIFACT_DIR ?? ".eval-artifacts");

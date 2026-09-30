@@ -111,14 +111,6 @@ write_status running ',"startedAt":"'"$(date -Is)"'"'
 install_prereqs || true
 echo "[$(date -Is)] ref=$GIT_REF commit=$GIT_COMMIT node=$(node --version 2>/dev/null) bun=$(bun --version 2>/dev/null) docker=$(docker --version 2>/dev/null)"
 
-if [ -f workers/main/analysis-sandbox.Dockerfile ]; then
-  echo "[$(date -Is)] Building camelai-analysis-sandbox:latest (analysis stack, native arch)"
-  # Builds natively for the host arch; on arm64 hosts it first builds the
-  # amd64-only cloudflare/sandbox base from source (Rosetta/QEMU breaks the
-  # Jupyter kernel handshake, so an emulated image fails every run_notebook).
-  node scripts/build-analysis-sandbox-image.mjs || fail analysis-docker-build $?
-fi
-
 # Patched Cloudflare Containers egress interceptor (workerd#6793 workaround): the stock
 # proxy-everything sidecar's TPROXY rules intercept docker bridge control traffic on newer hosts
 # (e.g. kernel 6.17 / Docker 29.x), so the container never becomes ready and the eval fails with

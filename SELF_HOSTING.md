@@ -235,20 +235,33 @@ versioned `capabilities` object:
 }
 ```
 
-Self-hosted sandbox storage uses the Sandbox SDK's local R2 synchronization
-mode. It does not require `/dev/fuse`, `SYS_ADMIN`, or an unconfined AppArmor
-profile. `selfhost:doctor` runs a bidirectional mount smoke whenever the images
-are already local; it must pass before treating app build/deploy as healthy.
+Self-hosted sandbox storage is synchronized, not mounted: workerd's local R2
+has no S3 endpoint and containers get no `/dev/fuse`, so no `SYS_ADMIN` or
+unconfined AppArmor profile is needed. Before each analysis run the Worker
+copies what changed under the workspace's R2 prefixes into the container
+(`/uploads`, `/warehouse/<workspace>`, `/outputs`), and after it copies the
+run's writes and deletions under `/outputs` back
+(`workers/main/src/sandbox-mounts.ts`). `selfhost:doctor` runs this
+bidirectional mount smoke whenever the images are already local; it must pass
+before treating analysis as healthy.
 
-Project builds run on `ProjectBuildContainer`, the same class Cloudflare runs:
-it drives its container through workerd's native Durable Object container API
-(`ctx.container`, Sandbox SDK 1.0). The generated workerd config exposes
-`SELFHOST_PROJECT_BUILD_IMAGE` to it as the named image `project-build`. That
-image is built from `workers/main/project-build-container.Dockerfile` (amd64: it
-carries the Sandbox SDK's `sandbox-shim`). To roll back, pin the previous
-release's images. `selfhost:container:smoke:project` exercises the real class
-against the image; the mount smoke uses the analysis image, which still runs the
-0.12 sandbox server.
+Project builds and analysis run on `ProjectBuildContainer` and
+`AnalysisContainer`, the classes Cloudflare runs: they drive their containers
+through workerd's native Durable Object container API (`ctx.container`, Sandbox
+SDK 1.0). The generated workerd config exposes `SELFHOST_PROJECT_BUILD_IMAGE`
+and `SELFHOST_ANALYSIS_IMAGE` to them as the named images `project-build` and
+`analysis`. Those images are built from
+`workers/main/project-build-container.Dockerfile` and
+`workers/main/analysis-container.Dockerfile`; both carry the Sandbox SDK's
+amd64-only `sandbox-shim`. On an arm64 host, build the analysis image natively
+(`node scripts/build-analysis-sandbox-image.mjs --tag
+camelai-selfhost-analysis:1.0.0`, or source mode): Jupyter is unreliable under
+amd64 emulation, and the shim runs fine under it. The analysis container starts
+with the internet off; the Worker serves `connections.internal` and forwards
+only PyPI over HTTPS, the same as on Cloudflare. To roll back, pin the previous
+release's images. `selfhost:container:smoke:project`,
+`selfhost:container:smoke:analysis` and `selfhost:container:smoke:mount`
+exercise the real classes against the images.
 
 SQL queries and warehouse exports run on `DbQueryContainer`, the same class
 Cloudflare runs: the config exposes `SELFHOST_DB_QUERY_IMAGE` to it as the

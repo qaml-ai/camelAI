@@ -120,9 +120,6 @@ const SELFHOST_KV_IDS = {
 
 const SELFHOST_R2_BUCKETS = {
   R2_BUCKET: 'chiridion-selfhost',
-  // AnalysisSandbox mounts the same bucket twice: read-only uploads and
-  // writable outputs. Preserve that alias in local R2 storage.
-  R2_OUTPUTS_BUCKET: 'chiridion-selfhost',
   BACKUP_BUCKET: 'chiridion-selfhost-backups',
   WAREHOUSE_EXPORT_BUCKET: 'chiridion-selfhost-warehouse-exports',
 };
@@ -165,9 +162,13 @@ const SELFHOST_CONTAINER_IMAGES = {
       },
     },
   },
-  AnalysisSandbox: {
-    env: 'SELFHOST_ANALYSIS_IMAGE',
-    image: 'camelai-selfhost-analysis:0.12.0',
+  AnalysisContainer: {
+    images: {
+      analysis: {
+        env: 'SELFHOST_ANALYSIS_IMAGE',
+        image: 'camelai-selfhost-analysis:1.0.0',
+      },
+    },
   },
   DbQueryContainer: {
     images: {

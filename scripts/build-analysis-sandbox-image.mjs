@@ -1,65 +1,43 @@
 #!/usr/bin/env node
-// Build camelai-analysis-sandbox:latest for the HOST architecture.
+// Build the analysis container image (workers/main/analysis-container.Dockerfile)
+// for the HOST architecture, for local runs: self-host smokes and dev. Wrangler
+// builds the deployed (linux/amd64) image itself.
 //
-// Cloudflare publishes cloudflare/sandbox images for amd64 only. On Apple
-// Silicon (or any arm64 Docker host) the amd64 image runs under Rosetta/QEMU,
-// where the Jupyter kernel binds its sockets but never answers the client
-// handshake ("Kernel didn't respond in N seconds"), so run_notebook — and every
-// notebook eval — fails. The upstream Dockerfile is fully multi-arch, though:
-// on arm64 hosts this script builds the python base variant from the pinned
-// sandbox-sdk source tag and layers workers/main/analysis-sandbox.Dockerfile on
-// top of it via SANDBOX_BASE_IMAGE. On amd64 hosts it builds directly from the
-// published base image, same as before.
+// Every stage is multi-arch except the sandbox-shim donor, which the Dockerfile
+// pins to linux/amd64, so an arm64 host builds a native image. That matters for
+// notebooks: under Rosetta/QEMU the Jupyter kernel binds its sockets but never
+// answers the client handshake, so an emulated image fails every run_notebook.
+// (The static amd64 shim runs fine under the host's emulation.)
 //
-// Idempotent: exits fast when camelai-analysis-sandbox:latest already exists
-// with the host's architecture AND was built from the current Dockerfile +
-// analysis-sandbox-assets (a content hash is stamped on the image as a label,
-// so editing an asset — validate-notebook, the camelai package, the
-// execute-notebook runner — triggers a rebuild instead of silently running a
-// stale image). Pass --force to rebuild anyway.
+// Idempotent: exits fast when the image already exists with the host's
+// architecture AND was built from the current Dockerfile + analysis-sandbox-assets
+// (a content hash is stamped on the image as a label, so editing an asset —
+// validate-notebook, the camelai package, the execute-notebook runner —
+// triggers a rebuild instead of silently running a stale image).
+//
+// Usage: node scripts/build-analysis-sandbox-image.mjs [--force] [--tag <image>]
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
-const ANALYSIS_IMAGE = "camelai-analysis-sandbox:latest";
-const ANALYSIS_DOCKERFILE = "workers/main/analysis-sandbox.Dockerfile";
+const DEFAULT_IMAGE = "camelai-analysis-container:latest";
+const ANALYSIS_DOCKERFILE = "workers/main/analysis-container.Dockerfile";
 const ANALYSIS_ASSETS_DIR = "workers/main/analysis-sandbox-assets";
 const ASSETS_HASH_LABEL = "camelai.assets-hash";
-const SANDBOX_SDK_REPO = "https://github.com/cloudflare/sandbox-sdk.git";
 
-const force = process.argv.includes("--force");
+const args = process.argv.slice(2);
+const force = args.includes("--force");
+const tagIndex = args.indexOf("--tag");
+const image = tagIndex >= 0 && args[tagIndex + 1] ? args[tagIndex + 1] : DEFAULT_IMAGE;
 
-function run(command, args, options = {}) {
-  const result = spawnSync(command, args, { stdio: "inherit", ...options });
-  if (result.status !== 0) {
-    console.error(`[analysis-image] ${command} ${args.join(" ")} failed`);
-    process.exit(result.status ?? 1);
-  }
-  return result;
-}
-
-function capture(command, args) {
-  const result = spawnSync(command, args, { encoding: "utf8" });
+function capture(command, commandArgs) {
+  const result = spawnSync(command, commandArgs, { encoding: "utf8" });
   return result.status === 0 ? result.stdout.trim() : null;
 }
 
-// The @cloudflare/sandbox version is pinned in the Dockerfile's default base
-// tag; parse it so the source checkout can never drift from the base image.
-function sandboxVersionFromDockerfile() {
-  const dockerfile = readFileSync(ANALYSIS_DOCKERFILE, "utf8");
-  const match = dockerfile.match(/cloudflare\/sandbox:(\d+\.\d+\.\d+)-python/);
-  if (!match) {
-    console.error(`[analysis-image] Could not find cloudflare/sandbox version pin in ${ANALYSIS_DOCKERFILE}`);
-    process.exit(1);
-  }
-  return match[1];
-}
-
-// Content hash over the Dockerfile + every baked asset, stamped on the image
-// as a label so a cached image built from stale inputs is detected.
+// Content hash over the Dockerfile + every baked asset.
 function analysisAssetsHash() {
   const hash = createHash("sha256");
   hash.update(readFileSync(ANALYSIS_DOCKERFILE));
@@ -88,95 +66,39 @@ if (!dockerArch) {
   process.exit(1);
 }
 const hostArch = /aarch64|arm64/.test(dockerArch) ? "arm64" : "amd64";
-const existingArch = capture("docker", [
-  "image",
-  "inspect",
-  ANALYSIS_IMAGE,
-  "--format",
-  "{{.Architecture}}",
-]);
 const assetsHash = analysisAssetsHash();
-const existingAssetsHash = capture("docker", [
+const existing = capture("docker", [
   "image",
   "inspect",
-  ANALYSIS_IMAGE,
+  image,
   "--format",
-  `{{index .Config.Labels "${ASSETS_HASH_LABEL}"}}`,
+  `{{.Architecture}} {{index .Config.Labels "${ASSETS_HASH_LABEL}"}}`,
 ]);
 
-if (!force && existingArch === hostArch && existingAssetsHash === assetsHash) {
-  console.log(`[analysis-image] ${ANALYSIS_IMAGE} already built for ${hostArch} (assets ${assetsHash})`);
+if (!force && existing === `${hostArch} ${assetsHash}`) {
+  console.log(`[analysis-image] ${image} already built for ${hostArch} (assets ${assetsHash})`);
   process.exit(0);
 }
-if (existingArch && existingArch !== hostArch) {
-  console.log(
-    `[analysis-image] ${ANALYSIS_IMAGE} is ${existingArch} but host is ${hostArch}; rebuilding natively`,
-  );
-} else if (existingArch && existingAssetsHash !== assetsHash) {
-  console.log(
-    `[analysis-image] ${ANALYSIS_IMAGE} was built from stale assets (${existingAssetsHash || "unlabeled"} != ${assetsHash}); rebuilding`,
-  );
-}
 
-const buildArgs = [];
-if (hostArch === "arm64") {
-  const version = sandboxVersionFromDockerfile();
-  const baseImage = `cloudflare-sandbox-local:${version}-python`;
-  const baseArch = capture("docker", ["image", "inspect", baseImage, "--format", "{{.Architecture}}"]);
-  if (baseArch !== "arm64" || force) {
-    const tag = `@cloudflare/sandbox@${version}`;
-    const checkout = path.join(os.tmpdir(), `camelai-sandbox-sdk-${version}`);
-    if (!existsSync(path.join(checkout, "packages", "sandbox", "Dockerfile"))) {
-      mkdirSync(path.dirname(checkout), { recursive: true });
-      console.log(`[analysis-image] Cloning sandbox-sdk ${tag}`);
-      run("git", ["clone", "--quiet", "--depth", "1", "--branch", tag, SANDBOX_SDK_REPO, checkout]);
-    }
-    // Upstream hardcodes the standalone server binary to x64 Bun targets
-    // (packages/sandbox-container/build.ts); retarget them so /container-server/
-    // sandbox is a native arm64 binary instead of one Rosetta has to emulate.
-    const buildTsPath = path.join(checkout, "packages", "sandbox-container", "build.ts");
-    const buildTs = readFileSync(buildTsPath, "utf8");
-    const patched = buildTs
-      .replaceAll("bun-linux-x64-musl", "bun-linux-arm64-musl")
-      .replaceAll("bun-linux-x64", "bun-linux-arm64");
-    if (patched !== buildTs) {
-      writeFileSync(buildTsPath, patched);
-      console.log("[analysis-image] Retargeted sandbox-container build.ts to arm64 Bun binaries");
-    } else if (!buildTs.includes("bun-linux-arm64")) {
-      console.error("[analysis-image] Could not retarget build.ts to arm64 — upstream layout changed?");
-      process.exit(1);
-    }
-    const bunVersionFile = path.join(checkout, ".bun-version");
-    const bunVersion = existsSync(bunVersionFile)
-      ? readFileSync(bunVersionFile, "utf8").trim()
-      : "1";
-    console.log(`[analysis-image] Building ${baseImage} from source for arm64 (one-time, ~10 min)`);
-    run("docker", [
-      "build",
-      "--target",
-      "python",
-      "--build-arg",
-      `BUN_VERSION=${bunVersion}`,
-      "-t",
-      baseImage,
-      "-f",
-      path.join(checkout, "packages", "sandbox", "Dockerfile"),
-      checkout,
-    ]);
-  }
-  buildArgs.push("--build-arg", `SANDBOX_BASE_IMAGE=${baseImage}`);
+console.log(`[analysis-image] Building ${image} for ${hostArch} (assets ${assetsHash})`);
+const build = spawnSync(
+  "docker",
+  [
+    "build",
+    "--platform",
+    `linux/${hostArch}`,
+    "--label",
+    `${ASSETS_HASH_LABEL}=${assetsHash}`,
+    "-t",
+    image,
+    "-f",
+    ANALYSIS_DOCKERFILE,
+    "workers/main",
+  ],
+  { stdio: "inherit" },
+);
+if (build.status !== 0) {
+  console.error(`[analysis-image] docker build failed`);
+  process.exit(build.status ?? 1);
 }
-
-console.log(`[analysis-image] Building ${ANALYSIS_IMAGE} for ${hostArch} (assets ${assetsHash})`);
-run("docker", [
-  "build",
-  ...buildArgs,
-  "--label",
-  `${ASSETS_HASH_LABEL}=${assetsHash}`,
-  "-t",
-  ANALYSIS_IMAGE,
-  "-f",
-  ANALYSIS_DOCKERFILE,
-  "workers/main",
-]);
 console.log(`[analysis-image] Done`);

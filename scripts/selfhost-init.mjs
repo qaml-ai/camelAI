@@ -40,7 +40,7 @@ const values = {
   SELFHOST_APP_IMAGE: "camelai-selfhost-app:source",
   SELFHOST_LOCAL_ARTIFACTS_IMAGE: "camelai-selfhost-local-artifacts:source",
   SELFHOST_PROJECT_BUILD_IMAGE: "camelai-selfhost-project-build:1.0.0",
-  SELFHOST_ANALYSIS_IMAGE: "camelai-selfhost-analysis:0.12.0",
+  SELFHOST_ANALYSIS_IMAGE: "camelai-selfhost-analysis:1.0.0",
   SELFHOST_DB_QUERY_IMAGE: "camelai-selfhost-db-query:1.0.0",
   SELFHOST_CONTAINER_EGRESS_IMAGE:
     "camelai-selfhost-container-egress:0.12.0",

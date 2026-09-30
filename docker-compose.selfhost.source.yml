@@ -22,7 +22,7 @@ services:
   analysis-image:
     build:
       context: workers/main
-      dockerfile: analysis-sandbox.Dockerfile
+      dockerfile: analysis-container.Dockerfile
 
   db-query-image:
     build:

@@ -94,8 +94,8 @@ jobs:
           --load
           --cache-from type=gha,scope=selfhost-analysis
           --cache-to type=gha,mode=max,scope=selfhost-analysis
-          --tag camelai-selfhost-analysis:0.12.0
-          --file workers/main/analysis-sandbox.Dockerfile
+          --tag camelai-selfhost-analysis:1.0.0
+          --file workers/main/analysis-container.Dockerfile
           workers/main
       - name: Build self-host DB query sandbox
         run: >

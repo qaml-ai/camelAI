@@ -162,7 +162,8 @@ await check("Docker VM capacity", async () => {
   );
   if (architecture !== "x86_64" && architecture !== "amd64") {
     warnings.push(
-      `${architecture || "unknown"} Docker architecture may not run the analysis sandbox reliably; use x86_64 for full notebook support`,
+      `${architecture || "unknown"} Docker architecture: run notebooks on a natively built analysis image ` +
+        "(source mode builds one; released images are amd64, where Jupyter is unreliable under emulation)",
     );
   }
   if (cpus > 0 && cpus < 4) warnings.push("fewer than 4 Docker CPUs");
@@ -205,7 +206,8 @@ await check("Docker socket", async () => {
 });
 
 await check("sandbox storage synchronization", async () => {
-  // The mount smoke runs on the analysis image (0.12 sandbox server).
+  // The mount smoke drives the real AnalysisContainer against the analysis
+  // image: R2 -> container on prepare, container -> R2 on flush.
   const required = [
     "SELFHOST_ANALYSIS_IMAGE",
     "SELFHOST_CONTAINER_EGRESS_IMAGE",

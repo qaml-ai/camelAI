@@ -408,8 +408,14 @@ ${needsR2 ? `    (name = "r2:bucket:smoke", worker = (
   );
 } finally {
   if (child && child.exitCode === null) {
+    // workerd can keep serving while an attached container is still running,
+    // so SIGTERM alone may never end it. Escalate; cleanupSmokeContainers()
+    // removes whatever it left behind.
+    const exited = new Promise((resolve) => child.once("exit", resolve));
     child.kill("SIGTERM");
-    await new Promise((resolve) => child.once("exit", resolve));
+    const killTimer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+    await exited;
+    clearTimeout(killTimer);
   }
   await cleanupSmokeContainers();
   if (process.env.SELFHOST_SMOKE_KEEP === "1") {

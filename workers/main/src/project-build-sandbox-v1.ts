@@ -79,6 +79,11 @@ export type ProjectBuildFiles = Pick<Files, "readFile" | "writeFile" | "stat" | 
  * die — every exec is its own process), the SDK retry budget (exec waits for a
  * starting container), and onActivityExpired deferral (replaced by the
  * inactivity timeout, sized from the build-session window).
+ *
+ * The 0.x-shaped contracts here (exit 124 + "Command timed out" trailer, "File
+ * not found" / ContainerUnavailableError messages, the probeShell and
+ * restartZombieContainer names) exist only so callers don't branch on the
+ * runtime. Replace them with typed results when the 0.12 class is deleted.
  */
 export class ProjectBuildSandboxV1 extends DurableObject<Env> {
   private readonly files: ProjectBuildFiles | null;

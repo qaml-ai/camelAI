@@ -17,6 +17,7 @@
 		},
 		"types": [
 			"./cloudflare-env.d.ts",
+			"./cloudflare-container-native.d.ts",
 			"node",
 			"vite/client"
 		],

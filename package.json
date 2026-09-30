@@ -104,6 +104,7 @@
 		"@cloudflare/dynamic-workflows": "^0.1.1",
 		"@cloudflare/puppeteer": "^1.0.6",
 		"@cloudflare/sandbox": "^0.12.10",
+		"@cloudflare/sandbox-v1": "npm:@cloudflare/sandbox@1.0.0",
 		"@cloudflare/shell": "0.3.7",
 		"@cloudflare/vite-plugin": "1.46.0",
 		"@conform-to/react": "^1.15.1",
@@ -167,7 +168,7 @@
 		"typescript": "^7.0.2",
 		"vite": "8.0.16",
 		"vitest": "^4.1.8",
-		"wrangler": "^4.113.0"
+		"wrangler": "^4.145.0"
 	},
 	"overrides": {
 		"picomatch": "4.0.4",

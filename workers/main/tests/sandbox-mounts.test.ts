@@ -303,6 +303,37 @@ describe("SyncBucketMounts (self-host)", () => {
     expect(second.fs.text("/uploads/a.csv")).toBe("a");
   });
 
+  it("moves a write-only mount's files to the bucket without copying anything in", async () => {
+    const bucket = memoryBucket({ "warehouse/ws/old.parquet": "old" });
+    const fs = sandboxFs();
+    const mounts = new SyncBucketMounts(
+      fs.container as never,
+      fs.fileApi as never,
+      { CF_ACCOUNT_ID: "selfhost", WAREHOUSE_EXPORT_BUCKET: bucket as unknown as R2Bucket },
+    );
+    const mount: BucketMount = { binding: "WAREHOUSE_EXPORT_BUCKET", keyPrefix: "warehouse/ws", mountPath: "/warehouse/ws", access: "write-only" };
+
+    await mounts.mount(mount);
+    expect(bucket.get).not.toHaveBeenCalled();
+    expect(fs.text("/warehouse/ws/old.parquet")).toBeUndefined();
+
+    fs.write("/warehouse/ws/conn/q.parquet", "PAR1");
+    await mounts.flush(mount);
+    expect(bucket.text("warehouse/ws/conn/q.parquet")).toBe("PAR1");
+    expect(fs.text("/warehouse/ws/conn/q.parquet")).toBeUndefined();
+    // The local copy is gone, and that deletes nothing in the bucket.
+    await mounts.flush(mount);
+    expect(bucket.text("warehouse/ws/old.parquet")).toBe("old");
+    expect(bucket.text("warehouse/ws/conn/q.parquet")).toBe("PAR1");
+  });
+
+  it("mounts write-only as a read-write S3 mount on Cloudflare", async () => {
+    const s3 = { mount: vi.fn(async () => {}) };
+    const mounts = new S3BucketMounts({} as never, (() => ({})) as never, S3_ENV, s3);
+    await mounts.mount({ ...OUTPUTS, access: "write-only" });
+    expect(s3.mount).toHaveBeenCalledWith(expect.objectContaining({ access: "read-write" }));
+  });
+
   it("needs the binding", async () => {
     const fs = sandboxFs();
     const mounts = new SyncBucketMounts(fs.container as never, fs.fileApi as never, { CF_ACCOUNT_ID: "selfhost" });

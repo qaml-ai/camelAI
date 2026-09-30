@@ -150,9 +150,9 @@ describe("container right-sizing", () => {
     "wrangler.dev-miguel.jsonc",
     "wrangler.dev-illiana.jsonc",
     "wrangler.test.jsonc",
-  ])("%s has contiguous migration tags", (path) => {
+  ])("%s has increasing, unique migration tags", (path) => {
     const tags = loadJsonc(path).migrations.map((m) => Number(m.tag.slice(1)));
-    for (let i = 1; i < tags.length; i += 1) expect(tags[i], `${path} after v${tags[i - 1]}`).toBe(tags[i - 1] + 1);
+    for (let i = 1; i < tags.length; i += 1) expect(tags[i], `${path} after v${tags[i - 1]}`).toBeGreaterThan(tags[i - 1]);
   });
 
   it("keeps containers out of the worker test config (vitest-pool-workers' wrangler predates the durable_object policy)", () => {

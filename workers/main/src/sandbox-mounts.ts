@@ -19,9 +19,10 @@ import { isSelfhostRuntime, type SelfhostRuntimeEnv } from "../../../src/lib/sel
  *   `localBucket` sync did, done by the Worker instead of the sandbox server.
  *
  * Contract for callers: after `mount(m)`, an object at `<m.keyPrefix>/a/b`
- * reads at `<m.mountPath>/a/b`. For a read-write mount, a file written at
- * `<m.mountPath>/a/b` is in the bucket at `<m.keyPrefix>/a/b` once the file is
- * closed (live) or once `flush(m)` returns (sync).
+ * reads at `<m.mountPath>/a/b` (not for write-only). For a read-write or
+ * write-only mount, a file written at `<m.mountPath>/a/b` is in the bucket at
+ * `<m.keyPrefix>/a/b` once the file is closed (live) or once `flush(m)` returns
+ * (sync).
  */
 export interface SandboxBucketMounts {
   /**
@@ -48,7 +49,13 @@ export interface BucketMount {
   readonly keyPrefix: string;
   /** Absolute directory in the container. */
   readonly mountPath: string;
-  readonly access: "read-only" | "read-write";
+  /**
+   * "write-only" is for a container that only adds objects (e.g. export
+   * files): live, it is a read-write mount; sync, nothing is copied in and
+   * `flush()` MOVES each written file to the bucket (the local copy is
+   * removed, and a missing local file never deletes an object).
+   */
+  readonly access: "read-only" | "read-write" | "write-only";
 }
 
 export interface BucketMountEnv extends SelfhostRuntimeEnv {
@@ -125,7 +132,7 @@ export class S3BucketMounts implements SandboxBucketMounts {
       mountPath: mount.mountPath,
       source,
       keyPrefix: mount.keyPrefix,
-      access: mount.access,
+      access: mount.access === "write-only" ? "read-write" : mount.access,
       // Shrink the s3fs stat cache (default 60s plus negative caching) so an
       // object staged by another container (an export, an upload) is visible
       // on the next read instead of a stale or missing entry.
@@ -219,11 +226,15 @@ export class SyncBucketMounts implements SandboxBucketMounts {
 
   mount(mount: BucketMount): Promise<void> {
     assertBucketMount(mount);
+    if (mount.access === "write-only") {
+      return this.serialized(mount.mountPath, () => this.files.mkdir(mount.mountPath, { recursive: true }));
+    }
     return this.serialized(mount.mountPath, () => this.pull(mount));
   }
 
   flush(mount: BucketMount): Promise<void> {
     assertBucketMount(mount);
+    if (mount.access === "write-only") return this.serialized(mount.mountPath, () => this.move(mount));
     if (mount.access !== "read-write") return Promise.resolve();
     return this.serialized(mount.mountPath, () => this.push(mount));
   }
@@ -291,6 +302,23 @@ export class SyncBucketMounts implements SandboxBucketMounts {
       }
     }
     await this.writeState(mount, next);
+  }
+
+  /** Write-only: upload every file under the mount path, then remove it locally. */
+  private async move(mount: BucketMount): Promise<void> {
+    const bucket = this.bucket(mount.binding);
+    const failures: string[] = [];
+    for (const [rel, file] of await this.listLocal(mount.mountPath)) {
+      try {
+        await this.upload(bucket, mount, rel, file.size);
+        await this.files.remove(`${mount.mountPath}/${rel}`, { force: true });
+      } catch (error) {
+        failures.push(`${rel}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (failures.length > 0) {
+      throw new Error(`Could not copy ${failures.length} file(s) from ${mount.mountPath} to R2: ${failures.join("; ").slice(0, 1000)}`);
+    }
   }
 
   private async push(mount: BucketMount): Promise<void> {

@@ -82,12 +82,6 @@ export interface Env
   DB_EGRESS_RELAY_SOCKS_PASSWORD?: string;
   // Auto-expiring R2 staging bucket for warehouse/analysis connection exports.
   WAREHOUSE_EXPORT_BUCKET?: R2Bucket;
-  // DbQueryContainer mounts that bucket over S3 (1.0 cannot mount through the
-  // binding): its name is a var; the R2 API token pair is secret (access key id
-  // = token id, secret = SHA-256 hex of the token value). Unused on self-host.
-  WAREHOUSE_EXPORT_BUCKET_NAME?: string;
-  R2_S3_ACCESS_KEY_ID?: string;
-  R2_S3_SECRET_ACCESS_KEY?: string;
   SESSIONS: KVNamespace;
   OBSERVABILITY_EVENTS?: AnalyticsEngineDataset;
   ERROR_ANALYTICS?: AnalyticsEngineDataset;

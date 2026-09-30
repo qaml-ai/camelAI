@@ -93,11 +93,9 @@ export {
   AnalysisContainer,
   AnalysisEgress,
 } from './analysis-container.js';
-// Signs the R2 requests of native containers' S3 bucket mounts (sandbox-mounts.ts).
-export { S3Gateway } from '@cloudflare/sandbox-v1';
 export { ProjectBuildContainer } from './project-build-container.js';
 export { DbQueryContainer } from './db-query-container.js';
-// DbQueryContainer's warehouse export mount (S3Mount) sends each storage
+// Native containers' R2 bucket mounts (sandbox-mounts.ts: S3Mount) send each storage
 // request to this entrypoint, which signs it; the container never sees the key.
 export { S3Gateway } from '@cloudflare/sandbox-v1';
 

@@ -1,13 +1,7 @@
 import { Files, type S3GatewayBinding, SandboxFileError, SandboxS3MountError } from "@cloudflare/sandbox-v1";
 import { DurableObject } from "cloudflare:workers";
 
-import { isSelfhostRuntime } from "../../../src/lib/selfhost-runtime.js";
 import { DB_QUERY_IDLE_TIMEOUT_MS, DB_QUERY_INSTANCE_TYPE } from "./container-sizing.js";
-import {
-  LocalCopyExportStore,
-  S3MountExportStore,
-  type WarehouseExportStore,
-} from "./db-query-export-store.js";
 import {
   DB_QUERY_RUNNER_DIR,
   DB_RELAY_LOCAL_PORT,
@@ -17,6 +11,7 @@ import {
   type DbRunnerOutput,
 } from "./db-query-contracts.js";
 import { recordObservabilityEvent } from "./observability.js";
+import { createSandboxBucketMounts, type BucketMount, type SandboxBucketMounts } from "./sandbox-mounts.js";
 import type { Env } from "./types.js";
 
 /** Key of the db-query image in wrangler `containers[].images`. */
@@ -81,8 +76,8 @@ echo "$?" >"$dir/exit-code.tmp" && mv "$dir/exit-code.tmp" "$dir/exit-code"`;
 const RUNNER_COMMAND = `printf %s "$DB_RUNNER_SRC" | node --input-type=module`;
 
 export interface DbQueryContainerDeps {
-  files?: Pick<Files, "mkdir" | "stat" | "readFile" | "remove">;
-  exportStore?: WarehouseExportStore;
+  files?: Pick<Files, "mkdir" | "writeFile" | "readFile" | "rename" | "remove" | "stat">;
+  mounts?: SandboxBucketMounts;
 }
 
 /**
@@ -109,14 +104,14 @@ export interface DbQueryContainerDeps {
  */
 export class DbQueryContainer extends DurableObject<Env> implements DbQueryContainerStub {
   private readonly files: DbQueryContainerDeps["files"] | null;
-  private store: WarehouseExportStore | null;
+  private mountsImpl: SandboxBucketMounts | null;
   private setup: Promise<void> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env, deps: DbQueryContainerDeps = {}) {
     super(ctx, env);
     const container = ctx.container;
     this.files = deps.files ?? (container ? new Files(container) : null);
-    this.store = deps.exportStore ?? null;
+    this.mountsImpl = deps.mounts ?? null;
     // The inactivity timeout belongs to the DO instance: a restarted DO (a
     // deploy, an eviction) must set it again or the container stops shortly
     // after the DO goes idle.
@@ -204,21 +199,26 @@ export class DbQueryContainer extends DurableObject<Env> implements DbQueryConta
 
   /**
    * Makes the workspace's warehouse prefix writable at `/<prefix>`, so an
-   * export written at `/<r2Key>` lands at R2 key `<r2Key>`. Safe to call before
-   * every export: an existing mount is reused.
+   * export written at `/<r2Key>` lands at R2 key `<r2Key>`: a write-only mount
+   * of the export bucket (sandbox-mounts.ts). Safe to call before every export:
+   * an existing mount is reused.
    */
   async prepareWarehouseExport(prefix: string): Promise<void> {
-    assertWarehousePrefix(prefix);
-    await this.withContainer("prepareWarehouseExport", () => this.exportStore.prepare(prefix));
+    await this.withContainer("prepareWarehouseExport", () => this.mounts().mount(exportMount(prefix)));
   }
 
   /**
    * Called after the export runner succeeded. On Cloudflare the file is
-   * already in R2 (no-op); on self-host this copies it into the bucket.
+   * already in R2 (s3fs uploads it on close); on self-host this moves it from
+   * the container into the bucket.
    */
   async publishWarehouseExport(prefix: string, exportPath: string): Promise<void> {
-    assertWarehousePrefix(prefix);
-    await this.exportStore.publish(prefix, exportPath);
+    const mount = exportMount(prefix);
+    const key = exportPath.replace(/^\/+/, "");
+    if (!key.startsWith(`${prefix}/`) || key.split("/").includes("..")) {
+      throw new Error(`export path "${exportPath}" is outside the warehouse prefix "${prefix}/"`);
+    }
+    await this.mounts().flush(mount);
   }
 
   /**
@@ -253,17 +253,23 @@ export class DbQueryContainer extends DurableObject<Env> implements DbQueryConta
     return container;
   }
 
-  private get exportStore(): WarehouseExportStore {
-    if (this.store) return this.store;
-    if (isSelfhostRuntime(this.env)) {
-      if (!this.files) throw new Error("The db-query container binding is not configured");
-      this.store = new LocalCopyExportStore(this.files, this.env.WAREHOUSE_EXPORT_BUCKET);
-    } else {
-      const gateway = (this.ctx.exports as unknown as { S3Gateway?: S3GatewayBinding }).S3Gateway;
-      if (!gateway) throw new Error("The Worker must export S3Gateway for the warehouse export mount");
-      this.store = new S3MountExportStore(this.container, gateway, this.env);
-    }
-    return this.store;
+  private mounts(): SandboxBucketMounts {
+    this.mountsImpl ??= createSandboxBucketMounts({
+      container: this.container,
+      files: this.requireFiles(),
+      gateway: () => {
+        const gateway = (this.ctx.exports as unknown as { S3Gateway?: S3GatewayBinding }).S3Gateway;
+        if (!gateway) throw new Error("The Worker must export S3Gateway for the warehouse export mount");
+        return gateway;
+      },
+      env: this.env,
+    });
+    return this.mountsImpl;
+  }
+
+  private requireFiles(): NonNullable<DbQueryContainerDeps["files"]> {
+    if (!this.files) throw new Error("The db-query container binding is not configured");
+    return this.files;
   }
 
   /** `ws-<workspace>` (data-proxy.ts), for telemetry. */
@@ -351,6 +357,12 @@ export class DbQueryContainer extends DurableObject<Env> implements DbQueryConta
       throw error;
     }
   }
+}
+
+/** The workspace's export prefix of WAREHOUSE_EXPORT_BUCKET, at `/<prefix>`. */
+function exportMount(prefix: string): BucketMount {
+  assertWarehousePrefix(prefix);
+  return { binding: "WAREHOUSE_EXPORT_BUCKET", keyPrefix: prefix, mountPath: `/${prefix}`, access: "write-only" };
 }
 
 function assertWarehousePrefix(prefix: string): void {

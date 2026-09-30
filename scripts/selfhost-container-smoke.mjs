@@ -404,7 +404,7 @@ ${needsR2 ? `    (name = "r2:bucket:smoke", worker = (
   }
   console.log(
     `Self-host ${runtimeName} localDocker smoke passed with ${runtime.image}.` +
-      (result.checks ? ` Checks: ${Object.keys(result.checks).join(", ")}.` : ""),
+      (result.checks ? ` Checks: ${Object.keys(result.checks).join(", ")}.` : ` (${String(result.stdout ?? "").trim()})`),
   );
 } finally {
   if (child && child.exitCode === null) {

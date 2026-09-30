@@ -1,11 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DB_QUERY_IDLE_TIMEOUT_MS } from "../src/container-sizing";
-import {
-  LocalCopyExportStore,
-  S3MountExportStore,
-  type WarehouseExportStore,
-} from "../src/db-query-export-store";
+import type { BucketMount, SandboxBucketMounts } from "../src/sandbox-mounts";
 import {
   DB_QUERY_IMAGE,
   DbQueryContainer,
@@ -99,8 +95,12 @@ function fakeContainer(options: { running?: boolean; runningImage?: string; hand
   return { container, execCalls };
 }
 
-function fakeStore() {
-  return { prepare: vi.fn(async () => {}), publish: vi.fn(async () => {}) } satisfies WarehouseExportStore;
+function fakeMounts() {
+  return {
+    kind: "sync" as const,
+    mount: vi.fn(async (_mount: BucketMount) => {}),
+    flush: vi.fn(async (_mount: BucketMount) => {}),
+  } satisfies SandboxBucketMounts;
 }
 
 function createContainer(options: {
@@ -116,13 +116,13 @@ function createContainer(options: {
     blockConcurrencyWhile: vi.fn(async <T>(fn: () => Promise<T>) => fn()),
     waitUntil: vi.fn(),
   };
-  const store = fakeStore();
+  const mounts = fakeMounts();
   const instance = new DbQueryContainer(
     ctx as unknown as DurableObjectState,
     (options.env ?? {}) as Env,
-    { files: {} as never, exportStore: store, ...options.deps },
+    { files: {} as never, mounts, ...options.deps },
   );
-  return { instance, ctx, store };
+  return { instance, ctx, mounts };
 }
 
 afterEach(() => {
@@ -269,16 +269,23 @@ describe("DbQueryContainer runner and relay forwarder", () => {
 });
 
 describe("DbQueryContainer warehouse exports", () => {
-  it("prepares the workspace prefix in a started container and publishes through the store", async () => {
+  const MOUNT = {
+    binding: "WAREHOUSE_EXPORT_BUCKET",
+    keyPrefix: "warehouse/ws-1",
+    mountPath: "/warehouse/ws-1",
+    access: "write-only",
+  };
+
+  it("mounts the workspace prefix write-only in a started container and flushes it on publish", async () => {
     const { container } = fakeContainer();
-    const { instance, store } = createContainer({ container });
+    const { instance, mounts } = createContainer({ container });
 
     await instance.prepareWarehouseExport("warehouse/ws-1");
     await instance.publishWarehouseExport("warehouse/ws-1", "/warehouse/ws-1/x.parquet");
 
     expect(container.start).toHaveBeenCalledTimes(1);
-    expect(store.prepare).toHaveBeenCalledWith("warehouse/ws-1");
-    expect(store.publish).toHaveBeenCalledWith("warehouse/ws-1", "/warehouse/ws-1/x.parquet");
+    expect(mounts.mount).toHaveBeenCalledWith(MOUNT);
+    expect(mounts.flush).toHaveBeenCalledWith(MOUNT);
   });
 
   it.each(["", "/warehouse/ws-1", "warehouse/ws-1/", "warehouse/../ws-2"])("rejects the prefix %j", async (prefix) => {
@@ -286,13 +293,20 @@ describe("DbQueryContainer warehouse exports", () => {
     await expect(instance.prepareWarehouseExport(prefix)).rejects.toThrow(/Invalid warehouse export prefix/);
   });
 
-  it("uses S3Mount through the exported S3Gateway on Cloudflare and the local copy on self-host", async () => {
+  it("refuses to publish outside the workspace prefix", async () => {
+    const { instance, mounts } = createContainer({ container: fakeContainer().container });
+    await expect(instance.publishWarehouseExport("warehouse/ws-1", "/warehouse/ws-2/q.parquet")).rejects.toThrow(/outside/);
+    await expect(instance.publishWarehouseExport("warehouse/ws-1", "/warehouse/ws-1/../ws-2/q.parquet")).rejects.toThrow(/outside/);
+    expect(mounts.flush).not.toHaveBeenCalled();
+  });
+
+  it("uses S3Mount through the exported S3Gateway on Cloudflare and a sync mount on self-host", async () => {
     const { container } = fakeContainer();
     const ctx = { container, id: { name: "ws-1" }, exports: {}, blockConcurrencyWhile: vi.fn() };
     const cloud = new DbQueryContainer(ctx as unknown as DurableObjectState, {} as Env, { files: {} as never });
     await expect(cloud.prepareWarehouseExport("warehouse/ws-1")).rejects.toThrow(/must export S3Gateway/);
 
-    const files = { mkdir: vi.fn(async () => {}), stat: vi.fn(), readFile: vi.fn(), remove: vi.fn() };
+    const files = { mkdir: vi.fn(async () => {}), stat: vi.fn(), readFile: vi.fn(), remove: vi.fn(), writeFile: vi.fn(), rename: vi.fn() };
     const selfhost = new DbQueryContainer(
       ctx as unknown as DurableObjectState,
       { CF_ACCOUNT_ID: "selfhost", WAREHOUSE_EXPORT_BUCKET: {} as R2Bucket } as unknown as Env,
@@ -313,79 +327,5 @@ describe("getDbQueryContainer", () => {
 
   it("fails loudly when the binding is missing", () => {
     expect(() => getDbQueryContainer({}, "ws-abc")).toThrow(/DB_QUERY_SANDBOX container binding/);
-  });
-});
-
-describe("warehouse export stores", () => {
-  const S3_ENV = {
-    CF_ACCOUNT_ID: "acct",
-    WAREHOUSE_EXPORT_BUCKET_NAME: "exports",
-    R2_S3_ACCESS_KEY_ID: "key-id",
-    R2_S3_SECRET_ACCESS_KEY: "secret",
-  };
-
-  it("mounts the workspace prefix of the export bucket read-write over the account's R2 S3 endpoint", async () => {
-    const mounts = { mount: vi.fn(async () => {}) };
-    const store = new S3MountExportStore({} as never, (() => ({})) as never, S3_ENV, mounts);
-    await store.prepare("warehouse/ws-1");
-    expect(mounts.mount).toHaveBeenCalledWith({
-      mountPath: "/warehouse/ws-1",
-      source: {
-        type: "s3",
-        endpoint: "https://acct.r2.cloudflarestorage.com",
-        region: "auto",
-        bucket: "exports",
-        credentials: { type: "static", accessKeyId: "key-id", secretAccessKey: "secret" },
-      },
-      keyPrefix: "warehouse/ws-1",
-      access: "read-write",
-      s3fsOptions: { stat_cache_expire: 1 },
-    });
-    await expect(store.publish()).resolves.toBeUndefined();
-  });
-
-  it("names every missing S3 setting instead of mounting", async () => {
-    const mounts = { mount: vi.fn(async () => {}) };
-    const store = new S3MountExportStore({} as never, (() => ({})) as never, { CF_ACCOUNT_ID: "acct" }, mounts);
-    await expect(store.prepare("warehouse/ws-1")).rejects.toThrow(
-      "set WAREHOUSE_EXPORT_BUCKET_NAME, R2_S3_ACCESS_KEY_ID, R2_S3_SECRET_ACCESS_KEY",
-    );
-    expect(mounts.mount).not.toHaveBeenCalled();
-  });
-
-  it("copies a finished self-host export into the bucket and deletes the local file", async () => {
-    const bytes = encoder.encode("PAR1-data-PAR1");
-    const puts: Array<{ key: string; body: Uint8Array }> = [];
-    const bucket = {
-      put: vi.fn(async (key: string, body: ReadableStream) => {
-        puts.push({ key, body: new Uint8Array(await new Response(body).arrayBuffer()) });
-        return {};
-      }),
-    } as unknown as R2Bucket;
-    const files = {
-      mkdir: vi.fn(async () => {}),
-      stat: vi.fn(async () => ({ size: BigInt(bytes.byteLength) })),
-      readFile: vi.fn(async () => new Response(bytes)),
-      remove: vi.fn(async () => {}),
-    };
-    const store = new LocalCopyExportStore(files as never, bucket);
-
-    await store.publish("warehouse/ws-1", "/warehouse/ws-1/conn/q.parquet");
-
-    expect(puts).toEqual([{ key: "warehouse/ws-1/conn/q.parquet", body: bytes }]);
-    expect(files.remove).toHaveBeenCalledWith("/warehouse/ws-1/conn/q.parquet", { force: true });
-  });
-
-  it("refuses to publish outside the workspace prefix", async () => {
-    const files = { mkdir: vi.fn(), stat: vi.fn(), readFile: vi.fn(), remove: vi.fn() };
-    const store = new LocalCopyExportStore(files as never, {} as R2Bucket);
-    await expect(store.publish("warehouse/ws-1", "/warehouse/ws-2/q.parquet")).rejects.toThrow(/outside/);
-    await expect(store.publish("warehouse/ws-1", "/warehouse/ws-1/../ws-2/q.parquet")).rejects.toThrow(/outside/);
-    expect(files.readFile).not.toHaveBeenCalled();
-  });
-
-  it("requires the bucket binding on self-host", async () => {
-    const store = new LocalCopyExportStore({ mkdir: vi.fn() } as never, undefined);
-    await expect(store.prepare("warehouse/ws-1")).rejects.toThrow(/WAREHOUSE_EXPORT_BUCKET is required/);
   });
 });

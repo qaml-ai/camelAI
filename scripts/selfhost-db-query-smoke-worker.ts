@@ -57,7 +57,7 @@ export default {
       const forwarders = await container.runRunner(script(COUNT_CLOUDFLARED), 10_000);
 
       // A self-host export: the runner writes into the prepared prefix, and
-      // publishing copies the file into the R2 binding.
+      // publishing moves the file into the R2 binding (a write-only sync mount).
       const prefix = "warehouse/ws-selfhost-smoke";
       const exportPath = `/${prefix}/conn/q.parquet`;
       await container.prepareWarehouseExport(prefix);

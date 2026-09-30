@@ -10,8 +10,8 @@
  * CodeModeToolsBinding scoped to that org/workspace/thread/user, the same
  * implementation js_exec's `tools.<name>()` calls use today.
  */
-import { serveTools, type RuntimeIdentity } from "@camelai/agent-runtime/server";
-import { InputRequired, type CallToolResult, type ToolContext, type ToolServer } from "@camelai/agent-runtime";
+import { serveTools, type RuntimeIdentity } from "@camelai/run/server";
+import { InputRequired, type CallToolResult, type ToolContext, type ToolServer } from "@camelai/run";
 import { errorToObservabilityFields, recordObservabilityEvent } from "../observability.js";
 import { CODE_MODE_PI_PASSTHROUGH_TOOL_DEFINITIONS, CODE_MODE_TOOL_DEFINITIONS } from "../code-mode-tools.js";
 import type { CodeModeToolsProps } from "../code-mode-tools.js";

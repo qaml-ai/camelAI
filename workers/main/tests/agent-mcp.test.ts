@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { testRuntime, type TestIdentity } from "@camelai/agent-runtime/testing";
+import { testRuntime, type TestIdentity } from "@camelai/run/testing";
 
 import { AGENT_MCP_TOOL_NAMES, agentMcpHandler, type ToolsFactory } from "../src/routes/agent-mcp";
 import type { Env } from "../src/types";

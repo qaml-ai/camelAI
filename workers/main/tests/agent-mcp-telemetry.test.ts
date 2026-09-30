@@ -4,7 +4,7 @@
  * `agent_mcp_auth_failed` when a request's runtime token is refused.
  */
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { testRuntime, type TestIdentity } from "@camelai/agent-runtime/testing";
+import { testRuntime, type TestIdentity } from "@camelai/run/testing";
 
 import { agentMcpHandler, type ToolsFactory } from "../src/routes/agent-mcp";
 import type { Env } from "../src/types";

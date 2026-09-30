@@ -130,7 +130,7 @@ Agent evals **run locally** (they need Docker + `.dev.vars`; Miniflare spawns th
 containers via the local Docker daemon): `bun run test:eval <id>` (or the `:dashboard` / `:deploy`
 / `:sandbox` shortcuts) wraps `scripts/run-agent-eval.mjs`; `scripts/run-eval-suite.sh` runs a
 list/`all`. Every eval's thread runs on a local agent runtime (Docker Compose from
-`qaml-ai/agent-runtime`'s `deploy/selfhost` with its dev override; `node scripts/runtime-eval-harness.mjs
+`qaml-ai/run`'s `deploy/selfhost` with its dev override; `node scripts/runtime-eval-harness.mjs
 up|run|status|down`, started by `run-agent-eval.mjs` when it is not up): the tests call
 `runRuntimeEval` (`workers/main/tests/evals/runtime-eval.ts`), and the runtime reaches chiridion's
 `/mcp/agent` through the eval relay (`scripts/lib/eval-runtime-relay.mjs`). Needs `~/agent-runtime`

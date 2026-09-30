@@ -18,7 +18,7 @@ import type { Message, PreviewTarget } from "@/types";
 import { localToolName, runtimeInputQuestions, type RuntimeInput } from "@/lib/agent-runtime-shared";
 import { latestRuntimeTodos, piRender, type PiRenderMemo } from "@/lib/pi-render";
 import { getPreviewTabId } from "@/components/preview-panel/preview-utils";
-import { watchAgent, type AgentView, type Watcher } from "@camelai/agent-runtime/watch";
+import { watchAgent, type AgentView, type Watcher } from "@camelai/run/watch";
 import { stripSystemMessageTags } from "@/lib/turn-utils";
 import { trackRuntimeViewMissedReply, trackRuntimeWatchError, trackRuntimeWatchLifecycle } from "@/lib/chat-sse-telemetry";
 import { toast } from "sonner";

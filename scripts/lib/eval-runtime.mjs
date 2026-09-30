@@ -1,5 +1,5 @@
 // A local agent runtime for chiridion's live evals: the runtime's self-host
-// Compose file with its dev override (deploy/selfhost in qaml-ai/agent-runtime),
+// Compose file with its dev override (deploy/selfhost in qaml-ai/run),
 // one tenant, the camelai-thread definition pointing at the eval relay, and the
 // relay itself (scripts/lib/eval-runtime-relay.mjs). State (generated secrets,
 // the definition id) lives in .eval-runtime/, which is git-ignored.
@@ -112,7 +112,7 @@ function composeArgs(config) {
 function runtimeCommit(config) {
   if (!existsSync(config.runtimeDir)) {
     throw new Error(
-      `No agent-runtime checkout at ${config.runtimeDir}. Clone qaml-ai/agent-runtime there or set AGENT_RUNTIME_DIR.`,
+      `No agent-runtime checkout at ${config.runtimeDir}. Clone qaml-ai/run there or set AGENT_RUNTIME_DIR.`,
     );
   }
   return run("git", ["-C", config.runtimeDir, "rev-parse", `${config.runtimeRef}^{commit}`], { capture: true }).trim();

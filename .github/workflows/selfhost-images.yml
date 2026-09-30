@@ -367,7 +367,7 @@ jobs:
             selfhost-release.json > selfhost-release.next.json
           mv selfhost-release.next.json selfhost-release.json
 
-          # The bundled agent runtime, released from qaml-ai/agent-runtime
+          # The bundled agent runtime, released from qaml-ai/run
           # (runtime-v* tags), at the version this checkout pins, and its
           # Postgres, pinned by digest in the same module.
           runtime_image="$(node --input-type=module -e 'const m = await import("./scripts/selfhost-agent-runtime.mjs"); console.log(m.SELFHOST_AGENT_RUNTIME_IMAGE)')"

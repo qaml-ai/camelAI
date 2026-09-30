@@ -35,7 +35,7 @@ vi.mock("@/components/message-bubble", async () => {
 
 type WatcherState = Record<string, unknown> & { messages: unknown[]; indexes: number[] };
 const watchers: Array<{ state: WatcherState; emit(patch: Partial<WatcherState>, event?: Record<string, unknown>): void }> = [];
-vi.mock("@camelai/agent-runtime/watch", () => ({
+vi.mock("@camelai/run/watch", () => ({
   watchAgent: (options: { onChange?: (state: WatcherState) => void; onEvent?: (event: unknown) => void }) => {
     const state: WatcherState = { messages: [], indexes: [], partial: null, progress: new Map(), running: false, pendingInputs: [], lastOutcome: null, hasOlder: false, transport: null, connected: true };
     // As the watcher does: state takes the event in, then onEvent, then onChange.

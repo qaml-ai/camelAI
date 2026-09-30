@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { testRuntime, type TestIdentity } from "@camelai/agent-runtime/testing";
+import { testRuntime, type TestIdentity } from "@camelai/run/testing";
 
 const { forward } = vi.hoisted(() => ({ forward: vi.fn() }));
 vi.mock("../src/agent-runtime/thread-runtime.js", () => ({ forwardRuntimeThreadCodexCall: forward }));

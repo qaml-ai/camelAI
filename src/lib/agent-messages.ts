@@ -12,10 +12,10 @@ export type {
   ToolCallContent,
   ToolResultMessage,
   UserMessage,
-} from "@camelai/agent-runtime";
+} from "@camelai/run";
 
 /** What a tool call answers: content for the model, details for the UI. */
 export interface AgentToolResult<T> {
-  content: Array<import("@camelai/agent-runtime").TextContent | import("@camelai/agent-runtime").ImageContent>;
+  content: Array<import("@camelai/run").TextContent | import("@camelai/run").ImageContent>;
   details: T;
 }

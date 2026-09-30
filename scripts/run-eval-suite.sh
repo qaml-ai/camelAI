@@ -139,7 +139,7 @@ echo "[$(date -Is)] Installing dependencies with: $INSTALL_COMMAND"
 bash -lc "$INSTALL_COMMAND" || fail install $?
 
 # Every eval's thread runs on a local agent runtime (Docker Compose), which needs a
-# qaml-ai/agent-runtime checkout (AGENT_RUNTIME_DIR, default ~/agent-runtime; built at
+# qaml-ai/run checkout (AGENT_RUNTIME_DIR, default ~/agent-runtime; built at
 # AGENT_RUNTIME_REF, default origin/main) or a ready image (AGENT_RUNTIME_IMAGE).
 echo "[$(date -Is)] Starting the local agent runtime"
 node scripts/runtime-eval-harness.mjs up || fail agent-runtime $?

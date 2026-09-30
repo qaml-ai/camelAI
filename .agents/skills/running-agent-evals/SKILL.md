@@ -28,7 +28,7 @@ and `EVAL_REPORT` should be passed explicitly in the shell or CLI.
 ### On the local agent runtime
 
 Every eval's thread runs on a **local agent runtime** (the hosted runtime's self-host Compose files,
-`deploy/selfhost/docker-compose.yml` + `compose.dev.yml` from `qaml-ai/agent-runtime`), as chiridion
+`deploy/selfhost/docker-compose.yml` + `compose.dev.yml` from `qaml-ai/run`), as chiridion
 threads run on the hosted one: the test calls `runRuntimeEval` (`workers/main/tests/evals/runtime-eval.ts`),
 which pins the thread to the runtime, sends the prompt with `startRuntimeTurn`, polls the run's request
 record until it settles, and reads the agent's history back into the result shape the graders read.
@@ -42,7 +42,7 @@ node scripts/runtime-eval-harness.mjs status
 node scripts/runtime-eval-harness.mjs down [--purge]
 ```
 
-- Needs Docker and a `qaml-ai/agent-runtime` checkout at `~/agent-runtime` (`AGENT_RUNTIME_DIR`; its
+- Needs Docker and a `qaml-ai/run` checkout at `~/agent-runtime` (`AGENT_RUNTIME_DIR`; its
   `AGENT_RUNTIME_REF`, default `origin/main`, is built into `chiridion-eval-agent-runtime:<sha>`
   once, and kept until `up --rebuild`), or a ready image in `AGENT_RUNTIME_IMAGE`.
 - Model keys are the same as before: chiridion syncs the runtime's `hosted` key scope from the AI

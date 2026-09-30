@@ -529,7 +529,7 @@ thread's own loop inside the app.
 ### What changes
 
 - **New containers.** `agent-runtime` (image `SELFHOST_AGENT_RUNTIME_IMAGE`,
-  `ghcr.io/qaml-ai/agent-runtime:<version>`, pinned by digest in release
+  `ghcr.io/qaml-ai/run:<version>`, pinned by digest in release
   manifests) and `agent-runtime-postgres` (`postgres:16`, pinned by digest).
   The app starts after the runtime is healthy.
 - **New volumes.** `agent-runtime-data` (agents' transcripts, files and

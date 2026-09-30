@@ -17,7 +17,7 @@ type FakeState = {
 
 const watchers: Array<{ options: any; state: FakeState; emit(patch: Partial<FakeState>): void; closed: boolean; loadOlder: ReturnType<typeof vi.fn> }> = [];
 
-vi.mock("@camelai/agent-runtime/watch", () => ({
+vi.mock("@camelai/run/watch", () => ({
   watchAgent: (options: any) => {
     const state: FakeState = { messages: [], indexes: [], partial: null, progress: new Map(), running: false, pendingInputs: [], lastOutcome: null, hasOlder: false, transport: null, connected: true };
     const watcher = {

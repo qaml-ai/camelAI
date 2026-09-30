@@ -32,7 +32,7 @@ Commands:
                           and generated secrets (.eval-runtime/).
 
 Environment:
-  AGENT_RUNTIME_DIR       qaml-ai/agent-runtime checkout (default ~/agent-runtime)
+  AGENT_RUNTIME_DIR       qaml-ai/run checkout (default ~/agent-runtime)
   AGENT_RUNTIME_REF       its ref to build and take Compose files from (default origin/main)
   AGENT_RUNTIME_IMAGE     use this image instead of building one
   AGENT_RUNTIME_PORT      host port of the runtime (default 18790)

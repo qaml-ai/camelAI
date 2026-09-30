@@ -7,7 +7,7 @@
  * authorizes the caller like the MCP server, and forwards the call
  * (agent-runtime/codex-forwarder.ts, as the thread's acting user).
  */
-import { RuntimeTokenError, verifyRuntimeToken } from "@camelai/agent-runtime/server";
+import { RuntimeTokenError, verifyRuntimeToken } from "@camelai/run/server";
 import type { Env, RouteContext } from "../types.js";
 import { authorizeRuntimeIdentity } from "./agent-mcp.js";
 import { forwardRuntimeThreadCodexCall } from "../agent-runtime/thread-runtime.js";

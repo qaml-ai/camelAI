@@ -839,10 +839,7 @@ routes.post(
 
     for (const sandboxId of sandboxIds) {
       try {
-        const sandbox = getSandbox(c.env.ANALYSIS_SANDBOX, sandboxId, {
-          normalizeId: true,
-        }) as { destroy: () => Promise<void> };
-        await sandbox.destroy();
+        await c.env.ANALYSIS_SANDBOX.getByName(sandboxId).destroy();
         destroyed.push(sandboxId);
       } catch (error) {
         errors.push({

@@ -140,7 +140,7 @@ function errorData(error: unknown): Record<string, unknown> | undefined {
  * The caller is the analysis sandbox's `connections.internal` outbound
  * handler, where the workspace/org scope is attached DO-side via
  * outbound-handler params (unforgeable by container code — see
- * analysis-sandbox.ts).
+ * analysis-container.ts).
  */
 export async function handleAuthenticatedConnectionsRpc(
   req: Request,

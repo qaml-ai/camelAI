@@ -55,9 +55,18 @@ export interface Env
   ASSETS: Fetcher;
   WORKSPACE: DurableObjectNamespace<WorkspaceDO>;
   WORKER_LOGS: DurableObjectNamespace<WorkerLogsDO>;
-  // Unified analysis container (notebooks + shell + DuckDB) — successor to the
-  // warehouse tier; SDK-allowlisted egress, one warm container per workspace.
-  ANALYSIS_SANDBOX?: DurableObjectNamespace<import('./analysis-sandbox.js').AnalysisSandbox>;
+  // Unified analysis container (notebooks + shell + DuckDB) on the native DO
+  // container API; one warm container per workspace (analysis-container.ts).
+  ANALYSIS_SANDBOX?: DurableObjectNamespace<import('./analysis-container.js').AnalysisContainer>;
+  // R2 bucket mounts of native containers (sandbox-mounts.ts). 1.0 cannot
+  // mount through a binding, so on Cloudflare the mounts sign with an R2 API
+  // token: the bucket names are vars, the key pair is secret (access key id =
+  // token id, secret = SHA-256 hex of the token value). Unused on self-host.
+  R2_BUCKET_NAME?: string;
+  WAREHOUSE_EXPORT_BUCKET_NAME?: string;
+  R2_S3_ENDPOINT?: string;
+  R2_S3_ACCESS_KEY_ID?: string;
+  R2_S3_SECRET_ACCESS_KEY?: string;
   // Warm native-toolchain build container for DO+R2-backed projects (per-org).
   PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<import('./project-build-container.js').ProjectBuildContainer>;
   // Trusted query-execution container with static-IP database egress via the

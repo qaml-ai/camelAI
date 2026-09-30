@@ -123,28 +123,6 @@ function loadRuntimeEvalBindings(): Record<string, string> {
   );
 }
 
-// Attach Docker containers to the sandbox DO bindings ONLY for runs that
-// actually boot them (agent evals, the build-sandbox repro, the sandbox eval
-// prototype — all opt-in via env). Regular unit/CI runs leave the DOs
-// container-less. With containers attached, workerd boots real images — and on
-// runners without the images (CI has neither the sandbox images nor the
-// cloudflare/proxy-everything egress interceptor), the container client's
-// background monitor rejects with "Container failed to start" OUTSIDE any
-// test's try/catch, failing the run on unhandled errors even when every test
-// passes.
-const runBootsContainers =
-  process.env.RUN_AGENT_EVALS === '1' ||
-  process.env.RUN_PROJECT_BUILD_SANDBOX_REPRO === '1' ||
-  process.env.RUN_SANDBOX_EVAL_PROTOTYPE === '1';
-
-function sandboxDurableObject(className: string, imageName: string) {
-  return {
-    className,
-    useSQLite: true,
-    ...(runBootsContainers ? { container: { imageName } } : {}),
-  };
-}
-
 export default defineConfig({
   plugins: [
     cloudflareTest({
@@ -158,12 +136,13 @@ export default defineConfig({
         compatibilityDate: '2026-03-24',
         compatibilityFlags: ['nodejs_compat'],
         durableObjects: {
-          // Never gets a container here: ProjectBuildContainer starts a named
-          // image from ctx.container.images, and this pool's miniflare/workerd
-          // (4.20260721) predates named images and container exec. Evals and the
-          // repro that build for real need a pool upgrade first.
+          // Never get a container here: ProjectBuildContainer and
+          // AnalysisContainer start named images from ctx.container.images, and
+          // this pool's miniflare/workerd (4.20260721) predates named images and
+          // container exec. Evals and the repro that build or analyze for real
+          // need a pool upgrade first.
           PROJECT_BUILD_SANDBOX: { className: 'ProjectBuildContainer', useSQLite: true },
-          ANALYSIS_SANDBOX: sandboxDurableObject('AnalysisSandbox', 'camelai-analysis-sandbox:latest'),
+          ANALYSIS_SANDBOX: { className: 'AnalysisContainer', useSQLite: true },
         },
         cachePersist: false,
         d1Persist: false,

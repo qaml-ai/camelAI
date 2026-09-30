@@ -70,9 +70,7 @@ import {
   ANALYSIS_NOTEBOOK_STDERR_MAX_CHARS,
   ANALYSIS_NOTEBOOK_STDOUT_MAX_CHARS,
   ANALYSIS_NOTEBOOK_VALIDATE_TIMEOUT_MS,
-  ANALYSIS_SESSION_RESTARTED_MESSAGE,
   clampOutputTail,
-  isSandboxSessionDeathError,
 } from "./analysis-service";
 import {
   createSandboxExecDeadline,
@@ -4217,16 +4215,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     limits: SandboxExecLimits,
     run: () => Promise<T>,
   ): Promise<T> {
-    try {
-      return await this.sandboxExecDeadline(operation, declaredTimeoutMs, limits).run(run);
-    } catch (error) {
-      // The environment died under the command: the user gets the
-      // plain-English message, never `SessionTerminatedError: ...`.
-      if (isSandboxSessionDeathError(error)) {
-        throw new Error(ANALYSIS_SESSION_RESTARTED_MESSAGE, { cause: error });
-      }
-      throw error;
-    }
+    // A container that stopped under the command already reports it in
+    // plain English (AnalysisContainer), so errors pass through as they are.
+    return this.sandboxExecDeadline(operation, declaredTimeoutMs, limits).run(run);
   }
 
   private sandboxExecDeadline(

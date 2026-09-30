@@ -88,7 +88,13 @@ export { SecureFetchBinding } from './secure-fetch-service.js';
 export { AppScreenshotBinding } from './app-screenshot-binding.js';
 export { AppBrowserBinding } from './app-browser-binding.js';
 export { WorkspaceFilesystemDO } from './workspace-filesystem-do.js';
-export { AnalysisSandbox } from './analysis-sandbox.js';
+export {
+  AnalysisConnectionsGateway,
+  AnalysisContainer,
+  AnalysisEgress,
+} from './analysis-container.js';
+// Signs the R2 requests of native containers' S3 bucket mounts (sandbox-mounts.ts).
+export { S3Gateway } from '@cloudflare/sandbox-v1';
 export { ProjectBuildContainer } from './project-build-container.js';
 export { DbQueryContainer } from './db-query-container.js';
 // DbQueryContainer's warehouse export mount (S3Mount) sends each storage

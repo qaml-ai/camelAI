@@ -44,6 +44,10 @@
     "DB_EGRESS_RELAY_HOSTNAME": "db-relay.camelai.dev",
     "OPENAI_CODEX_PROXY_BASE_URL": "https://codex-egress.camelai.dev/backend-api/codex",
     "R2_BUCKET_NAME": "chiridion-sandbox",
+    // Bucket behind WAREHOUSE_EXPORT_BUCKET. Native containers mount it (and
+    // R2_BUCKET_NAME) over S3 with the R2_S3_ACCESS_KEY_ID /
+    // R2_S3_SECRET_ACCESS_KEY secrets (workers/main/src/sandbox-mounts.ts).
+    "WAREHOUSE_EXPORT_BUCKET_NAME": "chiridion-warehouse-exports",
     "R2_ACCOUNT_ID": "85bbd288051330fb51ee1c86031a299b",
     "R2_PARENT_ACCESS_KEY_ID": "4f8fdc386b4ccb9f4a2bea3c77c8ad95",
     "CF_ACCOUNT_ID": "85bbd288051330fb51ee1c86031a299b",
@@ -91,17 +95,18 @@
       },
     },
     {
-      // Unified analysis container (notebooks + shell + DuckDB) — successor to
-      // the warehouse tier. standard-3 (2 vCPU / 8 GiB / 16 GB) covers typical
-      // DuckDB/notebook work without standard-4's provisioned memory/disk cost.
-      // The account-wide vCPU quota is shared across all environments and
-      // application creation/scale-up is rejected if the requested max_instances
-      // would exceed it; 50 × 2 = 100 vCPU fits with headroom. Ceiling is
-      // demand-driven, not reserved; scale-to-zero when idle.
-      "class_name": "AnalysisSandbox",
-      "image": "./workers/main/analysis-sandbox.Dockerfile",
-      "instance_type": "standard-3",
-      "max_instances": 50,
+      // Unified analysis container (notebooks + shell + DuckDB) on the native
+      // Durable Object container API (Sandbox SDK 1.0),
+      // workers/main/src/analysis-container.ts. The durable_object policy takes
+      // no image/instance_type/max_instances: start() picks the instance
+      // (standard-3) and nothing caps the instance count but the account
+      // limits. The name must be unique per environment.
+      "class_name": "AnalysisContainer",
+      "name": "chiridion-app-analysis",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "analysis": { "dockerfile": "./workers/main/analysis-container.Dockerfile" },
+      },
     },
     {
       // Trusted db-query runner with static-IP egress via the sandbox-host
@@ -129,10 +134,6 @@
   ],
   "r2_buckets": [
     { "binding": "R2_BUCKET", "bucket_name": "chiridion-sandbox" },
-    // Same bucket as R2_BUCKET under a second binding name: the sandbox SDK
-    // refuses to mount one binding at two prefixes, so writable /outputs
-    // needs its own binding to coexist with read-only /uploads.
-    { "binding": "R2_OUTPUTS_BUCKET", "bucket_name": "chiridion-sandbox" },
     { "binding": "WAREHOUSE_EXPORT_BUCKET", "bucket_name": "chiridion-warehouse-exports" },
   ],
   "analytics_engine_datasets": [
@@ -207,7 +208,7 @@
       { "name": "WORKSPACE_CRON", "class_name": "WorkspaceCronDO" },
 	      { "name": "WORKER_LOGS", "class_name": "WorkerLogsDO" },
 	      { "name": "WORKSPACE_FS", "class_name": "WorkspaceFilesystemDO" },
-	      { "name": "ANALYSIS_SANDBOX", "class_name": "AnalysisSandbox" },
+	      { "name": "ANALYSIS_SANDBOX", "class_name": "AnalysisContainer" },
 	      { "name": "PROJECT_BUILD_SANDBOX", "class_name": "ProjectBuildContainer" },
 	      { "name": "DB_QUERY_SANDBOX", "class_name": "DbQueryContainer" },
 	    ],
@@ -261,5 +262,6 @@
 	    { "tag": "v36", "new_sqlite_classes": ["ProjectBuildContainer"] },
 	    { "tag": "v37", "deleted_classes": ["ProjectBuildSandbox"] },
 	    { "tag": "v38", "new_sqlite_classes": ["DbQueryContainer"], "deleted_classes": ["DbQuerySandbox"] },
+	    { "tag": "v39", "new_sqlite_classes": ["AnalysisContainer"], "deleted_classes": ["AnalysisSandbox"] },
 	  ],
 	}

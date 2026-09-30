@@ -11,14 +11,10 @@
 	"dev": { "container_engine": "unix:///tmp/camelai-docker-fuse.sock" },
 	"worker_loaders": [{ "binding": "CODE_MODE_LOADER" }],
 	"browser": { "binding": "BROWSER" },
-	"containers": [
-		{
-			"class_name": "AnalysisSandbox",
-			"image": "./workers/main/analysis-sandbox.Dockerfile",
-			"instance_type": "standard-3",
-			"max_instances": 1
-		}
-	],
+	// No containers: ProjectBuildContainer and AnalysisContainer use the
+	// durable_object scheduling policy, which the wrangler that
+	// vitest-pool-workers bundles (4.113) rejects. Worker tests drive the classes
+	// with fake containers; real runs go through `wrangler dev`.
 	"send_email": [{ "name": "EMAIL" }],
 	"services": [],
 	"vars": {
@@ -55,11 +51,7 @@
 		}
 	],
 	"r2_buckets": [
-		{ "binding": "R2_BUCKET", "bucket_name": "chiridion-sandbox-test" },
-		// Same bucket as R2_BUCKET, under a second binding name. The sandbox SDK
-		// refuses to mount one binding at two prefixes, so the writable /outputs
-		// mount needs its own binding to coexist with read-only /uploads.
-		{ "binding": "R2_OUTPUTS_BUCKET", "bucket_name": "chiridion-sandbox-test" }
+		{ "binding": "R2_BUCKET", "bucket_name": "chiridion-sandbox-test" }
 	],
 	"d1_databases": [
 		{
@@ -82,7 +74,7 @@
 				{ "name": "WORKSPACE_CRON", "class_name": "WorkspaceCronDO" },
 				{ "name": "WORKSPACE_FS", "class_name": "WorkspaceFilesystemDO" },
 				{ "name": "PROJECT_BUILD_SANDBOX", "class_name": "ProjectBuildContainer" },
-				{ "name": "ANALYSIS_SANDBOX", "class_name": "AnalysisSandbox" },
+				{ "name": "ANALYSIS_SANDBOX", "class_name": "AnalysisContainer" },
 				{ "name": "WORKER_LOGS", "class_name": "WorkerLogsDO" }
 			]
 		},
@@ -112,6 +104,7 @@
 			{ "tag": "v16", "deleted_classes": ["EvalSandbox"] },
 			{ "tag": "v17", "deleted_classes": ["OrgSlugDO"] },
 			{ "tag": "v18", "new_sqlite_classes": ["ProjectBuildContainer"] },
-			{ "tag": "v19", "deleted_classes": ["ProjectBuildSandbox"] }
+			{ "tag": "v19", "deleted_classes": ["ProjectBuildSandbox"] },
+			{ "tag": "v20", "new_sqlite_classes": ["AnalysisContainer"], "deleted_classes": ["AnalysisSandbox"] }
 		]
 	}

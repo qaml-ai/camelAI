@@ -1,17 +1,18 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
-  ANALYSIS_CONNECTIONS_HANDLER,
-  ANALYSIS_CONNECTIONS_HOST,
-  AnalysisSandbox,
-} from "../src/analysis-sandbox.js";
-import { AnalysisService } from "../src/analysis-service.js";
+  ANALYSIS_ENVIRONMENT_RESTARTED_MESSAGE,
+  analysisContainerName,
+  type AnalysisAccess,
+  type AnalysisCommandResult,
+  type AnalysisContainerLike,
+  type AnalysisContainerStub,
+  type AnalysisExecOptions,
+} from "../src/analysis-container.js";
 import {
+  AnalysisService,
   ANALYSIS_DEFAULT_EXEC_TIMEOUT_MS,
   ANALYSIS_MAX_PERSIST_BYTES,
-  ANALYSIS_SESSION_RESTARTED_MESSAGE,
-  isSandboxSessionDeathError,
-  sandboxSessionExitCode,
   clampOutputTail,
   diffManifests,
   extractNotebookTraceback,
@@ -25,8 +26,6 @@ import {
   shouldIgnoreAnalysisPath,
   treeManifestCommand,
   validateNotebookCommand,
-  type AnalysisSandboxLike,
-  type AnalysisSandboxStub,
 } from "../src/analysis-service.js";
 import type { WorkspaceFileStoreLike } from "../src/workspace-filesystem-do.js";
 
@@ -160,13 +159,16 @@ function fakeFiles(
   opts?: { failDelete?: boolean },
 ): WorkspaceFileStoreLike & {
   store: Map<string, string>;
+  contentTypes: Map<string, string | undefined>;
   io: { bufferedReads: number; bufferedWrites: number; streamReads: number; streamAdoptions: number };
 } {
   const store = new Map(Object.entries(initial));
+  const contentTypes = new Map<string, string | undefined>();
   const io = { bufferedReads: 0, bufferedWrites: 0, streamReads: 0, streamAdoptions: 0 };
   const norm = (p: string) => p.replace(/^\/+/, "");
   return {
     store,
+    contentTypes,
     io,
     async listFiles() {
       return {
@@ -198,8 +200,9 @@ function fakeFiles(
       store.set(norm(path), Buffer.from(base64, "base64").toString("utf8"));
       return { success: true };
     },
-    async adoptR2File(path: string, stream: ReadableStream<Uint8Array>, expectedSize: number) {
+    async adoptR2File(path: string, stream: ReadableStream<Uint8Array>, expectedSize: number, contentType?: string) {
       io.streamAdoptions += 1;
+      contentTypes.set(norm(path), contentType);
       const bytes = await collectStreamBytes(stream);
       if (bytes.byteLength !== expectedSize) {
         return { success: false, error: "stream size mismatch" };
@@ -233,95 +236,81 @@ function fakeFiles(
     },
   } as unknown as WorkspaceFileStoreLike & {
     store: Map<string, string>;
+    contentTypes: Map<string, string | undefined>;
     io: { bufferedReads: number; bufferedWrites: number; streamReads: number; streamAdoptions: number };
   };
 }
 
 /**
- * Fake AnalysisSandbox: an in-memory filesystem the exec'd commands operate on.
- * It understands just enough — the write/read/mkdir file ops, the wipe glob, the
- * notebook-execute command (mutates the notebook + emits a chart PNG), the
- * validator, and the sha256sum tree manifest — to drive the persist-back path.
+ * Fake AnalysisContainer: an in-memory filesystem the exec'd commands operate
+ * on. It understands just enough — the write/open/mkdir file ops, the wipe
+ * glob, the notebook-execute command (mutates the notebook + emits a chart
+ * PNG), the validator, and the sha256sum tree manifest — to drive the
+ * persist-back path.
  */
 function fakeSandbox(opts?: {
   failManifest?: boolean;
   removeOnRun?: string;
   notebookFailure?: { stderr: string };
   createOnRun?: { command: string; path: string; bytes: Uint8Array };
-}): AnalysisSandboxLike & { execCwds: string[] } {
+}): AnalysisContainerLike & { execCwds: string[]; removed: string[][] } {
   const execCwds: string[] = [];
+  const removed: string[][] = [];
   const fs = new Map<string, Uint8Array>();
   const sha = async (bytes: Uint8Array) => {
     const digest = await crypto.subtle.digest("SHA-256", bytes as unknown as ArrayBuffer);
     return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
   };
   const rel = (workdir: string, abs: string) => abs.slice(workdir.length + 1);
+  const ok = (stdout = ""): AnalysisCommandResult => ({ exitCode: 0, stdout, stderr: "", timedOut: false });
   return {
     execCwds,
-    async mkdir() {
-      return {};
-    },
-    async writeFile(
-      path: string,
-      content: string | ReadableStream<Uint8Array>,
-      options?: { encoding?: string },
-    ) {
+    removed,
+    async mkdir() {},
+    async writeFile(path: string, content: string | ReadableStream<Uint8Array>) {
       const bytes = typeof content === "string"
-        ? options?.encoding === "base64"
-          ? new Uint8Array(Buffer.from(content, "base64"))
-          : new TextEncoder().encode(content)
+        ? new TextEncoder().encode(content)
         : await collectStreamBytes(content);
       fs.set(path, bytes);
-      return {};
     },
-    async readFile(path: string, options?: { encoding?: string }) {
+    async openFile(path: string) {
       const bytes = fs.get(path);
       if (!bytes) throw new Error(`missing ${path}`);
-      if (options?.encoding === "none") {
-        return {
-          content: streamFromBytes(bytes),
-          size: bytes.byteLength,
-          mimeType: "application/octet-stream",
-        };
-      }
-      return { content: Buffer.from(bytes).toString("base64") };
+      return { stream: streamFromBytes(bytes), size: bytes.byteLength };
     },
-    async exec(command: string, options?: { cwd?: string }) {
-      const cwd = options?.cwd ?? "/";
-      execCwds.push(cwd);
-      // Run-workdir cleanup: drop everything under the removed tree.
-      if (command.startsWith("rm -rf ")) {
-        const target = command.slice("rm -rf ".length).replace(/'/g, "");
+    async removePaths(paths: string[]) {
+      removed.push(paths);
+      for (const target of paths) {
         for (const key of fs.keys()) if (key.startsWith(`${target}/`)) fs.delete(key);
-        return { exitCode: 0, stdout: "", stderr: "" };
       }
+    },
+    async exec(command: string, options: { cwd: string }) {
+      const cwd = options.cwd;
+      execCwds.push(cwd);
       // Wipe glob before materialize: drop all files under cwd.
       if (command.startsWith("find . -mindepth 1")) {
         for (const key of fs.keys()) if (key.startsWith(`${cwd}/`)) fs.delete(key);
-        return { exitCode: 0, stdout: "", stderr: "" };
+        return ok();
       }
       // Notebook execution: mark the notebook executed and emit a chart artifact.
       if (command.includes("execute-notebook")) {
         if (opts?.notebookFailure) {
-          return { exitCode: 1, stdout: "", stderr: opts.notebookFailure.stderr };
+          return { exitCode: 1, stdout: "", stderr: opts.notebookFailure.stderr, timedOut: false };
         }
-        const nbAbs = `${cwd}/analysis.ipynb`;
-        fs.set(nbAbs, new TextEncoder().encode('{"cells":[],"executed":true}'));
+        fs.set(`${cwd}/analysis.ipynb`, new TextEncoder().encode('{"cells":[],"executed":true}'));
         fs.set(`${cwd}/chart.png`, new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
         if (opts?.removeOnRun) fs.delete(`${cwd}/${opts.removeOnRun}`);
-        return { exitCode: 0, stdout: "", stderr: "" };
+        return ok();
       }
-      if (command.startsWith("validate-notebook")) {
-        return { exitCode: 0, stdout: "OK", stderr: "" };
-      }
+      if (command.startsWith("validate-notebook")) return ok("OK");
       if (opts?.createOnRun && command === opts.createOnRun.command) {
         fs.set(`${cwd}/${opts.createOnRun.path}`, opts.createOnRun.bytes);
-        return { exitCode: 0, stdout: "", stderr: "" };
+        return ok();
       }
       // Tree manifest: sha256sum over the in-memory fs under cwd (skip ignored).
       if (command.includes("sha256sum")) {
         if (opts?.failManifest) {
-          return { exitCode: 1, stdout: "", stderr: "find: disk exploded" };
+          return { exitCode: 1, stdout: "", stderr: "find: disk exploded", timedOut: false };
         }
         const lines: string[] = [];
         for (const [abs, bytes] of fs) {
@@ -330,9 +319,9 @@ function fakeSandbox(opts?: {
           if (shouldIgnoreAnalysisPath(r)) continue;
           lines.push(`${await sha(bytes)}  ./${r}`);
         }
-        return { exitCode: 0, stdout: lines.join("\n"), stderr: "" };
+        return ok(lines.join("\n"));
       }
-      return { exitCode: 0, stdout: "", stderr: "" };
+      return ok();
     },
   };
 }
@@ -354,7 +343,9 @@ describe("runAnalysisNotebook", () => {
     expect(result.changedFiles).toContain("chart.png");
     expect(result.changedFiles).not.toContain("data.csv");
     expect(files.store.get("chart.png")).toBeDefined();
-    expect(new TextDecoder().decode(new TextEncoder().encode(files.store.get("analysis.ipynb")))).toContain("executed");
+    expect(files.store.get("analysis.ipynb")).toContain("executed");
+    // The persisted files carry a content type from their name.
+    expect(files.contentTypes.get("chart.png")).toBe("image/png");
   });
 
   it("rejects a path that is not a .ipynb", async () => {
@@ -393,9 +384,11 @@ describe("runAnalysisNotebook", () => {
     const nbconvertCwds = sandbox.execCwds.filter((cwd) => cwd.includes("/runs/"));
     const distinctRunDirs = new Set(nbconvertCwds.map((cwd) => cwd.match(/\/runs\/[^/]+/)?.[0]));
     expect(distinctRunDirs).toEqual(new Set(["/runs/run1", "/runs/run2"]));
-    // Both run trees were cleaned up afterwards.
-    const cleanupTargets = sandbox.execCwds.length; // cleanup execs recorded too
-    expect(cleanupTargets).toBeGreaterThan(0);
+    // Both run trees (workdir + scratch) were cleaned up afterwards.
+    expect(sandbox.removed).toEqual(expect.arrayContaining([
+      ["/projects/ca-test-proj/runs/run1", "/scratch/run1"],
+      ["/projects/ca-test-proj/runs/run2", "/scratch/run2"],
+    ]));
   });
 });
 
@@ -508,453 +501,198 @@ describe("persist safety", () => {
   });
 });
 
-describe("runAnalysisCode env scoping", () => {
-  function envRecordingSandbox() {
-    const envs: Array<Record<string, string | undefined> | undefined> = [];
-    const sandbox: AnalysisSandboxLike & { envs: typeof envs } = {
-      envs,
-      async mkdir() {
-        return {};
-      },
-      async writeFile() {
-        return {};
-      },
-      async readFile() {
-        return { content: "" };
-      },
-      async exec(_command: string, options?: { env?: Record<string, string | undefined> }) {
-        envs.push(options?.env);
-        return { exitCode: 0, stdout: "", stderr: "" };
-      },
-    };
-    return sandbox;
-  }
+/** A container whose every command answers `answer`, recording what ran. */
+function recordingSandbox(answer: () => Promise<AnalysisCommandResult>) {
+  const calls: Array<{ command: string; options: AnalysisExecOptions }> = [];
+  const removed: string[][] = [];
+  const written: Array<{ path: string; content: unknown }> = [];
+  const sandbox: AnalysisContainerLike & {
+    calls: typeof calls;
+    removed: typeof removed;
+    written: typeof written;
+  } = {
+    calls,
+    removed,
+    written,
+    async mkdir() {},
+    async writeFile(path, content) {
+      written.push({ path, content });
+    },
+    async openFile() {
+      throw new Error("not in this fake");
+    },
+    async removePaths(paths) {
+      removed.push(paths);
+    },
+    async exec(command, options) {
+      calls.push({ command, options });
+      return answer();
+    },
+  };
+  return sandbox;
+}
 
+const exited = (exitCode: number, stdout = "", stderr = ""): AnalysisCommandResult => ({
+  exitCode,
+  stdout,
+  stderr,
+  timedOut: false,
+});
+
+describe("runAnalysisCode", () => {
   it("injects the connections RPC URL and per-run SCRATCH for agent-scoped runs", async () => {
-    const sandbox = envRecordingSandbox();
+    const sandbox = recordingSandbox(async () => exited(0));
     await runAnalysisCode({ code: "print(1)" }, { sandbox, scratchId: "s1" });
-    expect(sandbox.envs.some((env) => env?.CAMELAI_CONNECTIONS_RPC_URL)).toBe(true);
-    expect(sandbox.envs.some((env) => env?.SCRATCH === "/scratch/s1")).toBe(true);
+    expect(sandbox.calls[0].options.env).toMatchObject({
+      CAMELAI_CONNECTIONS_RPC_URL: "http://connections.internal/",
+      SCRATCH: "/scratch/s1",
+    });
   });
 
   it("omits the connections RPC URL for app-scoped runs", async () => {
-    const sandbox = envRecordingSandbox();
+    const sandbox = recordingSandbox(async () => exited(0));
     await runAnalysisCode({ code: "print(1)" }, { sandbox, scratchId: "s1", connections: false });
-    expect(sandbox.envs.every((env) => !env?.CAMELAI_CONNECTIONS_RPC_URL)).toBe(true);
-  });
-});
-
-describe("run cleanup after a session death", () => {
-  /**
-   * The workdir/scratch tree is per-run and lives IN the container, so once the
-   * shell is dead the `rm -rf` cleans nothing — and once the zombie self-heal
-   * has destroyed the container it is an unconditional 30-120s cold boot,
-   * charged to the caller's exec budget, ahead of the session recovery that
-   * actually needs that time.
-   */
-  function deadShellSandbox() {
-    const commands: string[] = [];
-    const sandbox: AnalysisSandboxLike & { commands: string[] } = {
-      commands,
-      async mkdir() {
-        return {};
-      },
-      async writeFile() {
-        return {};
-      },
-      async readFile() {
-        return { content: "" };
-      },
-      async exec(command: string) {
-        commands.push(command);
-        throw Object.assign(
-          new Error("Session 'sandbox-ws-1' ended because its shell exited (exit code: 128)"),
-          { name: "SessionTerminatedError" },
-        );
-      },
-    };
-    return sandbox;
-  }
-
-  it("skips the workdir rm -rf when runAnalysisExec dies with the shell", async () => {
-    const sandbox = deadShellSandbox();
-
-    await expect(
-      runAnalysisExec(
-        { command: "python main.py" },
-        {
-          sandbox,
-          files: fakeFiles({ "main.py": "print(1)" }),
-          projectId: "ca-test-proj",
-          newRunId: () => "run1",
-          hasProject: true,
-          scratchId: "scratch1",
-        },
-      ),
-    ).rejects.toThrow(/SessionTerminated|shell exited/);
-
-    expect(sandbox.commands.some((command) => command.startsWith("rm -rf"))).toBe(false);
+    expect(sandbox.calls[0].options.env?.CAMELAI_CONNECTIONS_RPC_URL).toBeUndefined();
   });
 
-  it("skips it for runAnalysisCode, whose death is reported as a value", async () => {
-    const sandbox = deadShellSandbox();
+  it("writes the script as text and runs it from its scratch dir", async () => {
+    const sandbox = recordingSandbox(async () => exited(0, "1\n"));
+    const result = await runAnalysisCode({ code: "print(n)", params: { n: 1 } }, { sandbox, scratchId: "s1" });
+    expect(result).toEqual({ ok: true, stdout: "1\n", stderr: "" });
+    expect(sandbox.written).toHaveLength(1);
+    expect(sandbox.written[0].path).toBe("/scratch/s1/main.py");
+    expect(String(sandbox.written[0].content)).toContain("print(n)");
+    expect(sandbox.calls[0]).toMatchObject({
+      command: "python '/scratch/s1/main.py'",
+      options: { cwd: "/scratch/s1", timeoutMs: ANALYSIS_DEFAULT_EXEC_TIMEOUT_MS },
+    });
+    expect(sandbox.removed).toEqual([["/scratch/s1"]]);
+  });
 
+  it("reports a container failure as a value, with its message", async () => {
+    const sandbox = recordingSandbox(async () => {
+      throw new Error(ANALYSIS_ENVIRONMENT_RESTARTED_MESSAGE);
+    });
     const result = await runAnalysisCode({ code: "print(1)" }, { sandbox, scratchId: "s1" });
-
-    expect(result).toMatchObject({ ok: false, sessionDeath: true });
-    expect(sandbox.commands.some((command) => command.startsWith("rm -rf"))).toBe(false);
+    expect(result).toEqual({ ok: false, error: ANALYSIS_ENVIRONMENT_RESTARTED_MESSAGE });
   });
 
-  it("still cleans up after an ordinary non-zero exit", async () => {
-    const commands: string[] = [];
-    const sandbox: AnalysisSandboxLike = {
-      async mkdir() {
-        return {};
-      },
-      async writeFile() {
-        return {};
-      },
-      async readFile() {
-        return { content: "" };
-      },
-      async exec(command: string) {
-        commands.push(command);
-        return { exitCode: 1, stdout: "", stderr: "boom" };
-      },
-    };
-
+  it("cleans up after an ordinary non-zero exit", async () => {
+    const sandbox = recordingSandbox(async () => exited(1, "", "boom"));
     const result = await runAnalysisCode({ code: "print(1)" }, { sandbox, scratchId: "s1" });
-
-    expect(result.ok).toBe(false);
-    expect(commands.some((command) => command.startsWith("rm -rf"))).toBe(true);
-  });
-});
-
-describe("AnalysisService workspace uploads mount", () => {
-  function analysisServiceSandbox() {
-    const mounts: Array<{
-      bucketBinding: string;
-      prefix: string;
-      mountPath?: string;
-      options?: { readOnly?: boolean };
-    }> = [];
-    const connections: Array<unknown> = [];
-    const sandbox: AnalysisSandboxStub & { mounts: typeof mounts; connections: typeof connections } = {
-      mounts,
-      connections,
-      async ensureMounted(
-        bucketBinding: string,
-        prefix: string,
-        mountPath?: string,
-        options?: { readOnly?: boolean },
-      ) {
-        mounts.push({ bucketBinding, prefix, mountPath, options });
-      },
-      async ensureConnectionsRpc(params: unknown) {
-        connections.push(params);
-      },
-      async sealAppEgress() {},
-      async mkdir() {
-        return {};
-      },
-      async writeFile() {
-        return {};
-      },
-      async readFile() {
-        return { content: "" };
-      },
-      async exec() {
-        return { exitCode: 0, stdout: "", stderr: "" };
-      },
-    };
-    return sandbox;
-  }
-
-  function serviceWithUploads(objects: string[]) {
-    const sandbox = analysisServiceSandbox();
-    const listCalls: unknown[] = [];
-    const service = Object.create(AnalysisService.prototype) as AnalysisService & {
-      env: unknown;
-      ctx: unknown;
-    };
-    service.env = {
-      R2_BUCKET: {
-        async list(options: unknown) {
-          listCalls.push(options);
-          return { objects: objects.map((key) => ({ key })) };
-        },
-      },
-      // Same bucket, separate binding — the sandbox SDK will not mount one
-      // binding at two prefixes, so /outputs cannot reuse the uploads binding.
-      R2_OUTPUTS_BUCKET: {},
-    };
-    service.ctx = { props: { orgId: "org-1", workspaceId: "ws-1" } };
-    (service as unknown as { sandboxes: Map<string, AnalysisSandboxStub> }).sandboxes = new Map([["agent", sandbox]]);
-    return { service, sandbox, listCalls };
-  }
-
-  const OUTPUTS_MOUNT = {
-    bucketBinding: "R2_OUTPUTS_BUCKET",
-    prefix: "org-1/ws-1/user-outputs",
-    mountPath: "/outputs",
-    options: { readOnly: false },
-  };
-
-  it("skips the /uploads mount when the workspace upload prefix is empty", async () => {
-    const { service, sandbox, listCalls } = serviceWithUploads([]);
-    await expect(service.runCode({ code: "print('ok')" })).resolves.toMatchObject({ ok: true });
-    expect(listCalls).toEqual([{ prefix: "org-1/ws-1/user-uploads/", limit: 1 }]);
-    // No uploads to read, but outputs is still mounted: it is the run's only
-    // way to hand a generated file back, and it starts empty by definition.
-    expect(sandbox.mounts).toEqual([OUTPUTS_MOUNT]);
-    expect(sandbox.connections).toHaveLength(1);
-  });
-
-  it("mounts /uploads when the workspace upload prefix has objects", async () => {
-    const { service, sandbox } = serviceWithUploads(["org-1/ws-1/user-uploads/data.csv"]);
-    await expect(service.runCode({ code: "print('ok')" })).resolves.toMatchObject({ ok: true });
-    expect(sandbox.mounts).toEqual([
-      {
-        bucketBinding: "R2_BUCKET",
-        prefix: "org-1/ws-1/user-uploads",
-        mountPath: "/uploads",
-        options: undefined,
-      },
-      OUTPUTS_MOUNT,
-    ]);
-  });
-
-  it("mounts /outputs writable so a run can deliver a generated file", async () => {
-    // Regression: with no writable outputs mount a generated .xlsx was trapped
-    // in the sandbox, and agents resorted to base64-through-a-text-tool or
-    // deploying a Worker just to serve one file.
-    const { service, sandbox } = serviceWithUploads([]);
-    await expect(service.runCode({ code: "print('ok')" })).resolves.toMatchObject({ ok: true });
-
-    const outputs = sandbox.mounts.find((mount) => mount.mountPath === "/outputs");
-    expect(outputs).toBeDefined();
-    expect(outputs?.options?.readOnly).toBe(false);
-    expect(outputs?.prefix).toBe("org-1/ws-1/user-outputs");
-  });
-
-  it("skips the outputs mount when its binding is missing, and still runs", async () => {
-    // An environment without R2_OUTPUTS_BUCKET must not try to mount /outputs
-    // from the uploads binding: the SDK rejects a second prefix on the same
-    // binding, so that attempt would fail on every run for every workspace.
-    const { service, sandbox } = serviceWithUploads(["org-1/ws-1/user-uploads/data.csv"]);
-    delete (service.env as Record<string, unknown>).R2_OUTPUTS_BUCKET;
-
-    await expect(service.runCode({ code: "print('ok')" })).resolves.toMatchObject({ ok: true });
-
-    expect(sandbox.mounts.some((mount) => mount.mountPath === "/outputs")).toBe(false);
-    expect(sandbox.mounts.some((mount) => mount.mountPath === "/uploads")).toBe(true);
-  });
-
-  it("still runs when the outputs mount fails", async () => {
-    // Losing the delivery path is bad; taking down notebook and code execution
-    // for every workspace would be far worse.
-    const { service, sandbox } = serviceWithUploads([]);
-    const failing = sandbox as unknown as { ensureMounted: (...args: unknown[]) => Promise<void> };
-    failing.ensureMounted = async (_binding: unknown, _prefix: unknown, mountPath?: unknown) => {
-      if (mountPath === "/outputs") throw new Error("s3fs mount refused");
-    };
-
-    await expect(service.runCode({ code: "print('ok')" })).resolves.toMatchObject({ ok: true });
+    expect(result).toMatchObject({ ok: false, error: "boom" });
+    expect(sandbox.removed).toEqual([["/scratch/s1"]]);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Session death (container OOM / restart under a running command)
+// AnalysisService over a fake container stub
 // ---------------------------------------------------------------------------
 
-/** The exact SDK shape production surfaced to a user, raw. */
-function sessionTerminatedError(exitCode = 128): Error {
-  const error = new Error(
-    `Session "sandbox-ws-1" ended because its shell exited (exit code: ${exitCode}). ` +
-    "Session-local state (env vars, cwd, shell functions) has been lost.",
-  );
-  error.name = "SessionTerminatedError";
-  return error;
+function fakeStub(answer: () => Promise<AnalysisCommandResult>) {
+  const base = recordingSandbox(answer);
+  const prepared: AnalysisAccess[] = [];
+  const stub = Object.assign(base, {
+    prepared,
+    flushes: 0,
+    async prepare(access: AnalysisAccess) {
+      prepared.push(access);
+    },
+    async flushMounts() {
+      stub.flushes += 1;
+    },
+  });
+  return stub as AnalysisContainerStub & typeof stub;
 }
 
-describe("sandbox session-death classification", () => {
-  it("recognizes the whole SDK session/process-death family", () => {
-    expect(isSandboxSessionDeathError(sessionTerminatedError())).toBe(true);
-    for (const name of [
-      "ProcessExitedBeforeReadyError",
-      "ProcessReadyTimeoutError",
-    ]) {
-      const error = new Error("process never became ready");
-      error.name = name;
-      expect(isSandboxSessionDeathError(error)).toBe(true);
-    }
-    // Survives an RPC hop that flattened the class into a plain Error.
-    expect(isSandboxSessionDeathError(
-      new Error("SessionTerminatedError: Session 'sandbox-ws-1' shell exited (exit code: 128)"),
-    )).toBe(true);
+function serviceWith(
+  answer: () => Promise<AnalysisCommandResult>,
+  scope: "agent" | "app" = "agent",
+) {
+  const events: Array<{ blobs: unknown[]; doubles: unknown[] }> = [];
+  const stub = fakeStub(answer);
+  const service = Object.create(AnalysisService.prototype) as AnalysisService & {
+    env: unknown;
+    ctx: unknown;
+  };
+  service.env = {
+    OBSERVABILITY_EVENTS: {
+      writeDataPoint: (point: { blobs: unknown[]; doubles: unknown[] }) => events.push(point),
+    },
+  };
+  service.ctx = { props: { orgId: "org-1", workspaceId: "ws-1" } };
+  (service as unknown as { sandboxes: Map<string, AnalysisContainerStub> }).sandboxes = new Map([[scope, stub]]);
+  return { service, stub, events };
+}
+
+const eventsNamed = (events: Array<{ blobs: unknown[] }>, name: string) =>
+  events.filter((point) => (point.blobs as string[])[0] === name);
+
+describe("AnalysisService container access", () => {
+  it("prepares the agent container with the org/workspace scope before running", async () => {
+    const { service, stub } = serviceWith(async () => exited(0));
+    await expect(service.runCode({ code: "print('ok')" })).resolves.toMatchObject({ ok: true });
+    expect(stub.prepared).toEqual([{ mode: "agent", orgId: "org-1", workspaceId: "ws-1" }]);
+    // Writable mounts that are not live are copied back after agent runs.
+    expect(stub.flushes).toBe(1);
   });
 
-  it("leaves ordinary command failures alone", () => {
-    expect(isSandboxSessionDeathError(new Error("python: command not found"))).toBe(false);
-    expect(isSandboxSessionDeathError(new Error("RPCTransportError: Network connection lost"))).toBe(false);
+  it("runs deployed-app code in the app container, with app access and no connections", async () => {
+    const { service, stub } = serviceWith(async () => exited(0), "app");
+    await expect(service.runCodeForApps({ code: "print('ok')" })).resolves.toMatchObject({ ok: true });
+    expect(stub.prepared).toEqual([{ mode: "app", workspaceId: "ws-1" }]);
+    expect(stub.calls[0].options.env?.CAMELAI_CONNECTIONS_RPC_URL).toBeUndefined();
+    expect(stub.flushes).toBe(0);
   });
 
-  it("extracts the exit code the SDK embeds", () => {
-    expect(sandboxSessionExitCode(sessionTerminatedError(137))).toBe(137);
-    expect(sandboxSessionExitCode(new Error("no code here"))).toBeNull();
+  it("names the containers after the workspace (agent) and app-<workspace> (app)", () => {
+    expect(analysisContainerName({ mode: "agent", orgId: "o", workspaceId: "ws-1" })).toBe("ws-1");
+    expect(analysisContainerName({ mode: "app", workspaceId: "ws-1" })).toBe("app-ws-1");
+  });
+
+  it("still flushes writable mounts when the run throws", async () => {
+    const { service, stub } = serviceWith(async () => {
+      throw new Error(ANALYSIS_ENVIRONMENT_RESTARTED_MESSAGE);
+    });
+    await expect(service.exec({ command: "python main.py" })).rejects.toThrow(ANALYSIS_ENVIRONMENT_RESTARTED_MESSAGE);
+    expect(stub.flushes).toBe(1);
   });
 });
 
 describe("AnalysisService environment failures", () => {
-  function failingService(
-    execImpl: () => Promise<unknown>,
-    prepare: { mkdir?: () => Promise<unknown> } = {},
-  ) {
-    const events: Array<{ blobs: unknown[]; doubles: unknown[] }> = [];
-    const mkdir = vi.fn(prepare.mkdir ?? (async () => ({})));
-    const sandbox = {
-      async ensureMounted() {},
-      async ensureConnectionsRpc() {},
-      async sealAppEgress() {},
-      mkdir,
-      async writeFile() { return {}; },
-      async readFile() { return { content: "" }; },
-      // Cleanup (`rm -rf <workdir>`) runs in a finally and is best-effort; only
-      // the command under test drives the failure path.
-      exec: vi.fn((command: string) =>
-        command.startsWith("rm -rf")
-          ? Promise.resolve({ exitCode: 0, stdout: "", stderr: "" })
-          : execImpl()),
-    } as unknown as AnalysisSandboxStub & {
-      exec: ReturnType<typeof vi.fn>;
-      mkdir: ReturnType<typeof vi.fn>;
-    };
-    const service = Object.create(AnalysisService.prototype) as AnalysisService & {
-      env: unknown;
-      ctx: unknown;
-    };
-    service.env = {
-      OBSERVABILITY_EVENTS: {
-        writeDataPoint: (point: { blobs: unknown[]; doubles: unknown[] }) => events.push(point),
-      },
-    };
-    service.ctx = { props: { orgId: "org-1", workspaceId: "ws-1" } };
-    (service as unknown as { sandboxes: Map<string, AnalysisSandboxStub> }).sandboxes =
-      new Map([["agent", sandbox]]);
-    return { service, sandbox, events };
-  }
+  /** Only the agent's command counts. */
+  const commandRuns = (stub: { calls: Array<{ command: string }> }) => stub.calls.length;
 
-  const eventsNamed = (events: Array<{ blobs: unknown[] }>, name: string) =>
-    events.filter((point) => (point.blobs as string[])[0] === name);
-  const sessionEvents = (events: Array<{ blobs: unknown[] }>) =>
-    eventsNamed(events, "sandbox_session_terminated");
-
-  /** Only the agent's command counts; cleanup `rm -rf` runs unconditionally. */
-  const commandRuns = (sandbox: { exec: ReturnType<typeof vi.fn> }) =>
-    sandbox.exec.mock.calls.filter(([command]) => !String(command).startsWith("rm -rf")).length;
-
-  it("never retries: execs are sessionless, so a death is reported once", async () => {
-    let prepares = 0;
-    const { service, sandbox, events } = failingService(
-      async () => ({ exitCode: 0, stdout: "ok", stderr: "" }),
-      {
-        mkdir: async () => {
-          prepares += 1;
-          throw sessionTerminatedError();
-        },
-      },
-    );
-
-    await expect(service.exec({ command: "psql -f migrate.sql" }))
-      .rejects.toThrow(ANALYSIS_SESSION_RESTARTED_MESSAGE);
-
-    expect(prepares).toBe(1);
-    expect(commandRuns(sandbox)).toBe(0);
-    const recorded = sessionEvents(events);
-    expect(recorded).toHaveLength(1);
-    expect((recorded[0].blobs as string[])[4]).toBe("failed");
-  });
-
-  it("does NOT re-run a command whose environment died UNDER it", async () => {
-    const { service, sandbox, events } = failingService(async () => {
-      throw sessionTerminatedError();
+  it("does NOT re-run a command whose container stopped UNDER it", async () => {
+    const { service, stub } = serviceWith(async () => {
+      throw new Error(ANALYSIS_ENVIRONMENT_RESTARTED_MESSAGE);
     });
 
     // `psql -f migrate.sql` may have applied the migration before the
-    // environment died; re-dispatching it would apply it twice, silently.
-    await expect(service.exec({ command: "psql -f migrate.sql" }))
-      .rejects.toThrow(ANALYSIS_SESSION_RESTARTED_MESSAGE);
-
-    expect(commandRuns(sandbox)).toBe(1);
-    expect(sessionEvents(events)).toHaveLength(1);
-  });
-
-  it("never leaks the raw SDK error name to the caller", async () => {
-    const { service } = failingService(async () => {
-      throw sessionTerminatedError();
-    });
-
-    // runCode reports failures as a VALUE (deployed apps depend on that shape),
-    // so the raw SDK text is replaced in place rather than thrown.
-    const result = await service.runCode({ code: "print('ok')" });
-    expect(result).toMatchObject({ ok: false, error: ANALYSIS_SESSION_RESTARTED_MESSAGE });
-    expect(JSON.stringify(result)).not.toContain("SessionTerminatedError");
-    expect(JSON.stringify(result)).not.toContain("shell exited");
-    // The internal marker never reaches a caller.
-    expect(JSON.stringify(result)).not.toContain("sessionDeath");
-  });
-
-  it("does not treat a script that PRINTS SessionTerminatedError as an environment death", async () => {
-    const { service, sandbox, events } = failingService(async () => ({
-      exitCode: 1,
-      stdout: "",
-      stderr: "Traceback: RuntimeError: SessionTerminatedError is just a string here",
-    }));
-
-    const result = await service.runCode({ code: "print('boom')" }) as Record<string, unknown>;
-    expect(result.ok).toBe(false);
-    // The program's own stderr survives verbatim.
-    expect(String(result.error)).toContain("SessionTerminatedError");
-    expect(commandRuns(sandbox)).toBe(1);
-    expect(sessionEvents(events)).toHaveLength(0);
-  });
-
-  it("keeps the throwing shape for operations that throw", async () => {
-    const { service } = failingService(async () => {
-      throw sessionTerminatedError();
-    });
-
-    // runAnalysisExec propagates sandbox failures, so the tool boundary sees a
-    // rejection — with the user-facing message, not the SDK class name.
-    const failure = await service.exec({ command: "psql -f migrate.sql" })
-      .catch((error) => error as Error);
-    expect(failure.message).toBe(ANALYSIS_SESSION_RESTARTED_MESSAGE);
-    expect((failure.cause as Error).name).toBe("SessionTerminatedError");
+    // container stopped; re-dispatching it would apply it twice, silently.
+    const failure = await service.exec({ command: "psql -f migrate.sql" }).catch((error) => error as Error);
+    expect(failure.message).toBe(ANALYSIS_ENVIRONMENT_RESTARTED_MESSAGE);
+    expect(commandRuns(stub)).toBe(1);
   });
 
   it("does not retry an ordinary command failure", async () => {
-    let attempts = 0;
-    const { service, events } = failingService(async () => {
-      attempts += 1;
-      throw new Error("bash: nope: command not found");
-    });
-
-    await expect(service.exec({ command: "nope" })).rejects.toThrow("command not found");
-    expect(attempts).toBe(1);
-    expect(sessionEvents(events)).toHaveLength(0);
+    const { service, stub } = serviceWith(async () => exited(127, "", "bash: nope: command not found"));
+    const result = await service.exec({ command: "nope" });
+    expect(result).toMatchObject({ ok: false, exitCode: 127, error: "bash: nope: command not found" });
+    expect(commandRuns(stub)).toBe(1);
   });
 
-  describe("sessionless timeout (exit 124)", () => {
-    // Exactly what the container's sessionless execution returns after it
-    // killed the process group at the timeout.
-    const killedAt = (ms: number) => async () => ({
+  describe("timeout (exit 124)", () => {
+    // What the container returns after `timeout` stopped the process group.
+    const killed = async (): Promise<AnalysisCommandResult> => ({
       exitCode: 124,
       stdout: "partial row 1\npartial row 2\n",
-      stderr: `still working...\nCommand timed out after ${ms}ms`,
+      stderr: "still working...\n",
+      timedOut: true,
     });
 
     it("reports the stable timeout message and keeps the partial output", async () => {
-      const { service, events } = failingService(killedAt(5_000));
+      const { service, events } = serviceWith(killed);
 
       const result = await service.exec({ command: "python slow.py", timeoutMs: 5_000 });
 
@@ -972,7 +710,7 @@ describe("AnalysisService environment failures", () => {
     });
 
     it("maps run_code's timeout to its fixed budget", async () => {
-      const { service, events } = failingService(killedAt(ANALYSIS_DEFAULT_EXEC_TIMEOUT_MS));
+      const { service, events } = serviceWith(killed);
 
       const result = await service.runCode({ code: "while True: pass" });
 
@@ -985,11 +723,7 @@ describe("AnalysisService environment failures", () => {
     });
 
     it("leaves a program that exits 124 on its own as an ordinary failure", async () => {
-      const { service, events } = failingService(async () => ({
-        exitCode: 124,
-        stdout: "",
-        stderr: "inner step timed out",
-      }));
+      const { service, events } = serviceWith(async () => exited(124, "", "inner step timed out"));
 
       const result = await service.exec({ command: "timeout 1 sleep 5; exit 124" });
 
@@ -999,26 +733,18 @@ describe("AnalysisService environment failures", () => {
     });
   });
 
-  it("gives every exec a timeout: a sessionless exec without one is unbounded", async () => {
-    const { service, sandbox } = failingService(async () => ({ exitCode: 0, stdout: "", stderr: "" }));
+  it("gives every command a timeout and an absolute cwd", async () => {
+    const { service, stub } = serviceWith(async () => exited(0));
     (service as unknown as { projectFiles: (id: string) => Promise<unknown> }).projectFiles =
       async () => fakeFiles({ "main.py": "print(1)\n" });
 
     await service.exec({ projectId: "ca-test-proj", command: "python main.py" });
 
-    expect(sandbox.exec.mock.calls.length).toBeGreaterThanOrEqual(4);
-    for (const [command, options] of sandbox.exec.mock.calls) {
-      expect({ command, timeout: typeof options?.timeout }).toEqual({ command, timeout: "number" });
+    expect(stub.calls.length).toBeGreaterThanOrEqual(4);
+    for (const { command, options } of stub.calls) {
+      expect({ command, timeout: typeof options.timeoutMs, cwd: options.cwd.startsWith("/") })
+        .toEqual({ command, timeout: "number", cwd: true });
     }
-  });
-
-  it("runs every exec with a UTF-8 locale (the default session used to force one)", async () => {
-    const { service, sandbox } = failingService(async () => ({ exitCode: 0, stdout: "", stderr: "" }));
-
-    await service.exec({ command: "python -c 'print(1)'" });
-
-    const [, options] = sandbox.exec.mock.calls.find(([c]) => String(c).startsWith("python"))!;
-    expect(options.env).toMatchObject({ LANG: "C.UTF-8", LC_ALL: "C.UTF-8" });
   });
 });
 
@@ -1068,57 +794,5 @@ describe("AnalysisService project scoping", () => {
 describe("constants", () => {
   it("caps auto-persist size at 25 MiB", () => {
     expect(ANALYSIS_MAX_PERSIST_BYTES).toBe(25 * 1024 * 1024);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// connections.internal outbound handler — registered on the static registry
-// ---------------------------------------------------------------------------
-
-describe("connectionsRpc outbound handler", () => {
-  const handler = AnalysisSandbox.outboundHandlers?.[ANALYSIS_CONNECTIONS_HANDLER];
-
-  it("is registered on the AnalysisSandbox static registry", () => {
-    expect(typeof handler).toBe("function");
-  });
-
-  it("fails closed (401) when no workspace scope was attached DO-side", async () => {
-    const res = (await handler!(
-      new Request(`http://${ANALYSIS_CONNECTIONS_HOST}/`, { method: "POST", body: "{}" }),
-      {} as never,
-      { containerId: "c1", className: "AnalysisSandbox" } as never,
-    )) as Response;
-    expect(res.status).toBe(401);
-    const body = (await res.json()) as { ok: boolean; error: { message: string } };
-    expect(body.ok).toBe(false);
-    expect(body.error.message).toMatch(/scope/);
-  });
-
-  it("survives the SDK's r2EgressMount registration (registry setter must MERGE)", () => {
-    const before = AnalysisSandbox.outboundHandlers?.[ANALYSIS_CONNECTIONS_HANDLER];
-    expect(typeof before).toBe("function");
-    // Simulate @cloudflare/sandbox's configureR2EgressOutbound, which assigns
-    // `this.constructor.outboundHandlers = { r2EgressMount: ... }` when mounting
-    // R2. The containers setter merges into the registry; if a future SDK
-    // version switches to replace semantics, connectionsRpc would vanish and
-    // the in-sandbox connections RPC would silently break — this pins it.
-    (AnalysisSandbox as unknown as { outboundHandlers: Record<string, unknown> }).outboundHandlers = {
-      r2EgressMount: () => new Response("r2"),
-    };
-    const after = AnalysisSandbox.outboundHandlers;
-    expect(after?.[ANALYSIS_CONNECTIONS_HANDLER]).toBe(before);
-    expect(typeof after?.r2EgressMount).toBe("function");
-  });
-
-  it("serves the protocol descriptor on GET when scope is attached", async () => {
-    const res = (await handler!(
-      new Request(`http://${ANALYSIS_CONNECTIONS_HOST}/`, { method: "GET" }),
-      {} as never,
-      { containerId: "c1", className: "AnalysisSandbox", params: { orgId: "org1", workspaceId: "ws1" } } as never,
-    )) as Response;
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { ok: boolean; actions: string[] };
-    expect(body.ok).toBe(true);
-    expect(body.actions).toContain("invoke");
   });
 });

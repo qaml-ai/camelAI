@@ -61,8 +61,12 @@ export const PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS = 10 * 60_000;
 /** Upper bound on a requested warm window, so a bad caller can't pin a container. */
 export const PROJECT_BUILD_ACTIVE_SESSION_MAX_WINDOW_MS = 30 * 60_000;
 
-/** Interactive notebooks; shorter than the SDK 10m default, still warm enough. */
-export const ANALYSIS_SLEEP_AFTER = "5m";
+/**
+ * How long the analysis container (AnalysisContainer) stays up after its last
+ * request: 5m keeps interactive notebooks warm without the 0.x SDK's 10m
+ * default idle burn. Applied with `setInactivityTimeout()`.
+ */
+export const ANALYSIS_IDLE_TIMEOUT_MS = 5 * 60_000;
 
 /** Single-shot queries/exports; sleep promptly when the workspace goes quiet. */
 export const DB_QUERY_SLEEP_AFTER = "2m";

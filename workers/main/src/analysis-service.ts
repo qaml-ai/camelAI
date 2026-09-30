@@ -1,29 +1,27 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 
 import { assertConnectionsBindingEnabled } from "../../../src/lib/connections-binding";
-import { getWorkspaceR2Prefix } from "../../../src/lib/workspace-r2-paths";
-import { ANALYSIS_CONNECTIONS_HOST, type AnalysisConnectionsParams } from "./analysis-sandbox.js";
+import { getMimeType } from "../../../src/lib/file-content-headers";
+import {
+  ANALYSIS_CONNECTIONS_HOST,
+  analysisContainerName,
+  type AnalysisAccess,
+  type AnalysisCommandResult,
+  type AnalysisContainer,
+  type AnalysisContainerLike,
+  type AnalysisContainerStub,
+} from "./analysis-container.js";
 import { listConnections, type ConnectionsRuntimeEnv } from "./connections-runtime.js";
 import { annotateWarehouseConnections, withWarehouseParams, type WarehouseConnection } from "./warehouse-service.js";
-import { warehouseWorkspacePrefix } from "./warehouse-export.js";
 import { recordObservabilityEvent, type ObservabilityEnv } from "./observability.js";
-import {
-  isSandboxExecTimeoutResult,
-  SANDBOX_EXEC_TIMEOUT_EVENT,
-  sandboxExecTimeoutMessage,
-} from "./sandbox-exec-deadline.js";
-import {
-  isSandboxSessionDeathError,
-  isSandboxSessionDeathResult,
-  sandboxSessionExitCode,
-} from "./sandbox-session-death.js";
+import { SANDBOX_EXEC_TIMEOUT_EVENT, sandboxExecTimeoutMessage } from "./sandbox-exec-deadline.js";
 import { ProjectFilesystemClient, type WorkspaceFileStoreLike } from "./workspace-filesystem-do.js";
 
 /**
  * Unified analysis compute service — the successor to (and absorption of)
  * WarehouseService.
  *
- * Runs on one warm AnalysisSandbox container per workspace (see analysis-sandbox.ts).
+ * Runs on one warm AnalysisContainer per workspace (see analysis-container.ts).
  * Provides the stateless data-analysis surface that used to require a persistent
  * project VM:
  *   - runNotebook: execute + validate a project notebook, persist changed files back
@@ -46,47 +44,8 @@ import { ProjectFilesystemClient, type WorkspaceFileStoreLike } from "./workspac
 export const ANALYSIS_PROJECT_ROOT = "/projects";
 /** Ephemeral scratch root for no-project runs; never persisted. */
 export const ANALYSIS_SCRATCH_ROOT = "/scratch";
-/** R2 binding names the container's s3fs mounts route to. */
-export const ANALYSIS_EXPORT_BUCKET_BINDING = "WAREHOUSE_EXPORT_BUCKET";
-export const ANALYSIS_UPLOADS_BUCKET_BINDING = "R2_BUCKET";
-/**
- * Second binding name for the SAME bucket as R2_BUCKET. The sandbox SDK rejects
- * mounting one binding at two different prefixes ("R2 binding \"R2_BUCKET\" is
- * already mounted at /uploads with a different prefix"), so the writable
- * /outputs mount cannot reuse the uploads binding — with uploads mounted first,
- * every outputs mount failed. Keeping them on separate bindings also keeps
- * /uploads read-only, which a single shared parent mount could not.
- */
-export const ANALYSIS_OUTPUTS_BUCKET_BINDING = "R2_OUTPUTS_BUCKET";
-/**
- * Where workspace uploads mount inside the container. The agent references
- * uploads as `uploads/<name>` (R2-relative), so the in-container path is that
- * same reference with a leading slash — the raw `<org>/<ws>/user-uploads` R2
- * prefix is never shown to the agent and can't be derived inside the container.
- */
-export const ANALYSIS_UPLOADS_MOUNT_PATH = "/uploads";
-/**
- * Where workspace outputs mount inside the container, writable. This is how a
- * run hands a generated file back to the user: anything written to
- * `/outputs/<name>` is the `outputs/<name>` R2 reference the file tools read
- * and the chat links as `/api/workspaces/<id>/outputs/<name>`.
- *
- * Without it a generated binary was effectively trapped. Production agents hit
- * this repeatedly on "export this to Excel": the file existed in the sandbox
- * and every route out was a dead end — `shutil` to a project path (not mounted),
- * base64 through the text-only `write` tool (corrupts), and finally deploying a
- * whole Worker just to serve one spreadsheet.
- */
-export const ANALYSIS_OUTPUTS_MOUNT_PATH = "/outputs";
 /** Files larger than this are NOT auto-persisted back to the project FS. */
 export const ANALYSIS_MAX_PERSIST_BYTES = 25 * 1024 * 1024;
-/**
- * Where the baked `camelai` helper package lives (analysis-sandbox.Dockerfile
- * COPYs it there and sets the same PYTHONPATH as an image ENV). Also set
- * per-run so helper importability never depends on how the container server
- * propagates image ENV to exec'd processes.
- */
-export const ANALYSIS_PYTHONPATH = "/opt/camelai-python";
 /**
  * Container-side timeouts for the analysis legs. Exported because the tool
  * boundary (code-mode-tools.ts) derives its client-side deadline from the SAME
@@ -108,78 +67,10 @@ const DEFAULT_EXEC_TIMEOUT_MS = ANALYSIS_DEFAULT_EXEC_TIMEOUT_MS;
 const DEFAULT_DEP_TIMEOUT_MS = ANALYSIS_DEFAULT_DEP_TIMEOUT_MS;
 /**
  * Bound for the service's own housekeeping commands (materialize wipe, tree
- * manifest, workdir cleanup). Sessionless execs have NO timeout unless one is
- * passed, so every exec here must carry one; these are cheap on any sane tree.
+ * manifest). Every command runs under a timeout; these are cheap on any sane
+ * tree.
  */
 export const ANALYSIS_HOUSEKEEPING_TIMEOUT_MS = 120_000;
-
-/**
- * `getSandbox()` options for every worker-side AnalysisSandbox stub.
- *
- * `enableDefaultSession: false` is load-bearing. By default the SDK writes
- * every exec into ONE persistent bash per sandbox, guarded by a per-session
- * mutex. A timeout there only rejects our promise: the command keeps running in
- * that shell, and every later exec (the next run, the SDK's own mount steps)
- * queues behind it without its own timeout counting the wait. That is what
- * produced sandbox_exec_deadline_exceeded, mount_session_timeout and the
- * zombie restarts that followed. A user `exit` or `set -e` also killed the
- * shared shell (SessionTerminatedError).
- *
- * Sessionless, each exec is a fresh detached `bash -c` that inherits the
- * container server's environment (image ENV: PATH with the baked venv,
- * PYTHONPATH, UV_CACHE_DIR). On timeout the container kills its process group
- * and returns exit 124 with partial output (see isSandboxExecTimeoutResult),
- * and concurrent runs no longer serialize. Nothing here needs shell state:
- * every call passes an explicit cwd, env and timeout.
- */
-export const ANALYSIS_SANDBOX_OPTIONS = {
-  normalizeId: true,
-  transport: "rpc",
-  enableDefaultSession: false,
-} as const;
-
-async function r2PrefixHasObjects(bucket: R2Bucket, prefix: string): Promise<boolean> {
-  const normalizedPrefix = prefix.replace(/\/+$/, "");
-  const listed = await bucket.list({ prefix: `${normalizedPrefix}/`, limit: 1 });
-  return listed.objects.length > 0;
-}
-
-// ---------------------------------------------------------------------------
-// Sandbox interface (minimal, for testability)
-// ---------------------------------------------------------------------------
-
-export interface AnalysisSandboxLike {
-  exec(
-    command: string,
-    options?: { cwd?: string; env?: Record<string, string | undefined>; timeout?: number },
-  ): Promise<{ success?: boolean; stdout?: string; stderr?: string; exitCode?: number }>;
-  mkdir(path: string, options?: { recursive?: boolean }): Promise<unknown>;
-  writeFile(
-    path: string,
-    content: string | ReadableStream<Uint8Array>,
-    options?: { encoding?: "base64" | "utf8" },
-  ): Promise<unknown>;
-  readFile(
-    path: string,
-    options?: { encoding?: "base64" | "utf8" | "none" },
-  ): Promise<{
-    content: string | ReadableStream<Uint8Array>;
-    size?: number;
-    mimeType?: string;
-  }>;
-}
-
-/** The full DO-RPC stub surface the service drives (custom AnalysisSandbox methods). */
-export type AnalysisSandboxStub = AnalysisSandboxLike & {
-  ensureMounted(
-    bucketBinding: string,
-    prefix: string,
-    mountPath?: string,
-    options?: { readOnly?: boolean },
-  ): Promise<void>;
-  ensureConnectionsRpc(params: AnalysisConnectionsParams): Promise<void>;
-  sealAppEgress(): Promise<void>;
-};
 
 // ---------------------------------------------------------------------------
 // Result shapes
@@ -236,13 +127,6 @@ export interface AnalysisRunCodeResult {
   error?: string;
   /** Set when the container killed the program at its timeout. */
   timedOut?: true;
-  /**
-   * Internal marker: the sandbox environment died (not the user program). Set
-   * only where the environment error was caught, never from program output.
-   * Stripped by AnalysisService.runOperation before the result leaves the
-   * service.
-   */
-  sessionDeath?: true;
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +270,7 @@ export function parseValidateNotebookOutput(
 }
 
 /**
- * The default analysis stack, mirrored from analysis-sandbox.Dockerfile (keep
+ * The default analysis stack, mirrored from analysis-container.Dockerfile (keep
  * the two lists in sync). Used to seed a project's pyproject.toml the first
  * time add_python_dependency initializes one, so "default stack + extras"
  * stays true once a project declares its own environment.
@@ -481,7 +365,7 @@ export function treeManifestCommand(): string {
 // ---------------------------------------------------------------------------
 
 interface AnalysisRunDeps {
-  sandbox: AnalysisSandboxLike;
+  sandbox: AnalysisContainerLike;
   files: WorkspaceFileStoreLike;
   projectId: string;
   newRunId: () => string;
@@ -509,53 +393,26 @@ function analysisRunScratchDir(runId: string): string {
   return `${ANALYSIS_SCRATCH_ROOT}/${sanitizeSegment(runId)}`;
 }
 
-/** Best-effort removal of a run's workdir; never masks the run result. */
-async function cleanupWorkdir(sandbox: AnalysisSandboxLike, workdir: string): Promise<void> {
+/**
+ * Best-effort removal of a run's dirs; never masks the run result. A container
+ * that stopped under the run took them with it, and removePaths never starts a
+ * new one just to clean up.
+ */
+async function cleanupRunDirs(sandbox: AnalysisContainerLike, ...paths: string[]): Promise<void> {
   try {
-    await sandbox.exec(`rm -rf ${shellQuote(workdir)}`, { cwd: "/", timeout: ANALYSIS_HOUSEKEEPING_TIMEOUT_MS });
+    await sandbox.removePaths(paths);
   } catch {
-    /* workdir cleanup is best-effort */
+    /* cleanup is best-effort */
   }
 }
 
 /**
- * Per-run bookkeeping for the cleanup `finally`: did this run die with the
- * container's shell?
+ * A failed command's `error`: the stable timeout text when the container
+ * stopped it at `timeoutMs` (the partial stdout/stderr stay on the result),
+ * else its output.
  */
-interface AnalysisRunOutcome {
-  sessionDied: boolean;
-}
-
-/**
- * Remove a run's scratch/work dirs — unless the environment died under it.
- *
- * A container that died (or was destroyed by the zombie self-heal) took the
- * per-run workdir with it, so the `rm -rf` cleans nothing — and against a
- * destroyed container it is an unconditional 30-120s cold boot, paid inside the
- * caller's exec budget.
- */
-async function cleanupRunDirs(
-  sandbox: AnalysisSandboxLike,
-  outcome: AnalysisRunOutcome,
-  ...workdirs: string[]
-): Promise<void> {
-  if (outcome.sessionDied) return;
-  for (const workdir of workdirs) {
-    await cleanupWorkdir(sandbox, workdir);
-  }
-}
-
-/**
- * The container killed the command at `timeoutMs` (sessionless exit 124). The
- * partial stdout/stderr stay on the result; `error` is the stable timeout text.
- */
-function execFailure(
-  res: { stderr: string; stdout: string; exitCode: number },
-  timeoutMs: number,
-): { error: string; timedOut?: true } {
-  if (isSandboxExecTimeoutResult(res)) {
-    return { error: sandboxExecTimeoutMessage(timeoutMs), timedOut: true };
-  }
+function execFailure(res: AnalysisCommandResult, timeoutMs: number): { error: string; timedOut?: true } {
+  if (res.timedOut) return { error: sandboxExecTimeoutMessage(timeoutMs), timedOut: true };
   return { error: execError(res) };
 }
 
@@ -574,7 +431,6 @@ export async function runAnalysisNotebook(
   const runId = deps.newRunId();
   const workdir = analysisRunWorkdir(deps.projectId, runId);
   const scratchDir = analysisRunScratchDir(runId);
-  const outcome: AnalysisRunOutcome = { sessionDied: false };
   try {
     const before = await materializeProject(deps.sandbox, workdir, deps.files);
     if (!before.some((f) => f.path === notebookRel)) {
@@ -582,30 +438,25 @@ export async function runAnalysisNotebook(
     }
     const hasPyproject = before.some((f) => f.path === "pyproject.toml");
     const beforeManifest = await snapshotProjectManifest(deps.sandbox, workdir);
-    await deps.sandbox.mkdir(scratchDir, { recursive: true });
+    await deps.sandbox.mkdir(scratchDir);
 
-    const nb = normalizeExec(
-      await deps.sandbox.exec(notebookExecuteCommand(notebookRel, hasPyproject), {
-        cwd: workdir,
-        timeout: timeoutMs,
-        env: { ...analysisRunEnv({ projectId: deps.projectId }), SCRATCH: scratchDir },
-      }),
-    );
+    const nb = await deps.sandbox.exec(notebookExecuteCommand(notebookRel, hasPyproject), {
+      cwd: workdir,
+      timeoutMs,
+      env: { ...analysisRunEnv({ projectId: deps.projectId }), SCRATCH: scratchDir },
+    });
 
     // Always run the validator (nbconvert can "succeed" while embedding error
     // outputs the report would surface); its stdout is the structured issue list.
-    const val = normalizeExec(
-      await deps.sandbox.exec(validateNotebookCommand(notebookRel), {
-        cwd: workdir,
-        timeout: ANALYSIS_NOTEBOOK_VALIDATE_TIMEOUT_MS,
-      }),
-    );
+    const val = await deps.sandbox.exec(validateNotebookCommand(notebookRel), {
+      cwd: workdir,
+      timeoutMs: ANALYSIS_NOTEBOOK_VALIDATE_TIMEOUT_MS,
+    });
     const validation = parseValidateNotebookOutput(val.stdout, val.exitCode);
 
     const persisted = await persistChangedFiles(deps.sandbox, workdir, deps.files, beforeManifest);
     const executed = nb.exitCode === 0;
     const ok = executed && validation.clean;
-    const timedOut = isSandboxExecTimeoutResult(nb);
     return {
       ok,
       executed,
@@ -617,15 +468,12 @@ export async function runAnalysisNotebook(
       exitCode: nb.exitCode,
       ...persisted,
       durationMs: Date.now() - startedAt,
-      ...(timedOut
+      ...(nb.timedOut
         ? { error: sandboxExecTimeoutMessage(timeoutMs), timedOut: true as const }
         : ok ? {} : { error: notebookErrorMessage(nb, validation) }),
     };
-  } catch (error) {
-    outcome.sessionDied = isSandboxSessionDeathError(error);
-    throw error;
   } finally {
-    await cleanupRunDirs(deps.sandbox, outcome, workdir, scratchDir);
+    await cleanupRunDirs(deps.sandbox, workdir, scratchDir);
   }
 }
 
@@ -640,23 +488,17 @@ export async function runAnalysisExec(
   }
   const timeoutMs = clampTimeout(request.timeoutMs, DEFAULT_EXEC_TIMEOUT_MS, MAX_NOTEBOOK_TIMEOUT_MS);
 
-  const outcome: AnalysisRunOutcome = { sessionDied: false };
   if (!deps.hasProject) {
     const scratch = `${ANALYSIS_SCRATCH_ROOT}/${sanitizeSegment(deps.scratchId)}`;
     try {
-      await deps.sandbox.mkdir(scratch, { recursive: true });
+      await deps.sandbox.mkdir(scratch);
       const cwd = request.cwd ? joinWithin(scratch, request.cwd) : scratch;
-      const res = normalizeExec(
-        await deps.sandbox.exec(request.command, { cwd, timeout: timeoutMs, env: { ...analysisRunEnv(), SCRATCH: scratch, ...request.env } }),
-      );
+      const res = await deps.sandbox.exec(request.command, { cwd, timeoutMs, env: { ...analysisRunEnv(), SCRATCH: scratch, ...request.env } });
       return { ok: res.exitCode === 0, stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode, changedFiles: [], removedFiles: [], skippedOversize: [], durationMs: Date.now() - startedAt, ...(res.exitCode === 0 ? {} : execFailure(res, timeoutMs)) };
-    } catch (error) {
-      outcome.sessionDied = isSandboxSessionDeathError(error);
-      throw error;
     } finally {
       // Scratch is per-call; without cleanup a warm container accumulates
       // abandoned scratch trees until its disk fills.
-      await cleanupRunDirs(deps.sandbox, outcome, scratch);
+      await cleanupRunDirs(deps.sandbox, scratch);
     }
   }
 
@@ -666,11 +508,9 @@ export async function runAnalysisExec(
   try {
     await materializeProject(deps.sandbox, workdir, deps.files);
     const beforeManifest = await snapshotProjectManifest(deps.sandbox, workdir);
-    await deps.sandbox.mkdir(scratchDir, { recursive: true });
+    await deps.sandbox.mkdir(scratchDir);
     const cwd = request.cwd ? joinWithin(workdir, request.cwd) : workdir;
-    const res = normalizeExec(
-      await deps.sandbox.exec(request.command, { cwd, timeout: timeoutMs, env: { ...analysisRunEnv({ projectId: deps.projectId }), SCRATCH: scratchDir, ...request.env } }),
-    );
+    const res = await deps.sandbox.exec(request.command, { cwd, timeoutMs, env: { ...analysisRunEnv({ projectId: deps.projectId }), SCRATCH: scratchDir, ...request.env } });
     const persisted = await persistChangedFiles(deps.sandbox, workdir, deps.files, beforeManifest);
     return {
       ok: res.exitCode === 0,
@@ -681,11 +521,8 @@ export async function runAnalysisExec(
       durationMs: Date.now() - startedAt,
       ...(res.exitCode === 0 ? {} : execFailure(res, timeoutMs)),
     };
-  } catch (error) {
-    outcome.sessionDied = isSandboxSessionDeathError(error);
-    throw error;
   } finally {
-    await cleanupRunDirs(deps.sandbox, outcome, workdir, scratchDir);
+    await cleanupRunDirs(deps.sandbox, workdir, scratchDir);
   }
 }
 
@@ -697,7 +534,6 @@ export async function runAnalysisAddDependency(
   const startedAt = Date.now();
   const packages = normalizeDependencySpecs(request.packages);
   const workdir = analysisRunWorkdir(deps.projectId, deps.newRunId());
-  const outcome: AnalysisRunOutcome = { sessionDied: false };
   try {
     const before = await materializeProject(deps.sandbox, workdir, deps.files);
     const hasPyproject = before.some((f) => f.path === "pyproject.toml");
@@ -713,9 +549,7 @@ export async function runAnalysisAddDependency(
       ? ""
       : `uv init --no-workspace --python 3.13 && uv add ${ANALYSIS_DEFAULT_STACK.map(shellQuote).join(" ")} && `;
     const command = `${initCmd}uv add ${request.dev ? "--dev " : ""}${packages.map(shellQuote).join(" ")}`;
-    const res = normalizeExec(
-      await deps.sandbox.exec(command, { cwd: workdir, timeout: DEFAULT_DEP_TIMEOUT_MS, env: analysisRunEnv({ projectId: deps.projectId }) }),
-    );
+    const res = await deps.sandbox.exec(command, { cwd: workdir, timeoutMs: DEFAULT_DEP_TIMEOUT_MS, env: analysisRunEnv({ projectId: deps.projectId }) });
 
     const pyprojectPersisted = res.exitCode === 0 ? await persistSingleFile(deps.sandbox, workdir, deps.files, "pyproject.toml") : false;
     const lockPersisted = res.exitCode === 0 ? await persistSingleFile(deps.sandbox, workdir, deps.files, "uv.lock") : false;
@@ -730,22 +564,21 @@ export async function runAnalysisAddDependency(
       durationMs: Date.now() - startedAt,
       ...(res.exitCode === 0 ? {} : execFailure(res, DEFAULT_DEP_TIMEOUT_MS)),
     };
-  } catch (error) {
-    outcome.sessionDied = isSandboxSessionDeathError(error);
-    throw error;
   } finally {
-    await cleanupRunDirs(deps.sandbox, outcome, workdir);
+    await cleanupRunDirs(deps.sandbox, workdir);
   }
 }
 
 /**
  * Run a Python string (warehouse-compatible). No project — reads only the mounted
  * exports/uploads. `params` are injected as a Python dict, not interpolated.
+ * Failures, the container's included, come back as a value: deployed apps
+ * depend on that shape.
  */
 export async function runAnalysisCode(
   request: { code: string; params?: Record<string, unknown> },
   deps: {
-    sandbox: AnalysisSandboxLike;
+    sandbox: AnalysisContainerLike;
     scratchId: string;
     connections?: boolean;
   },
@@ -755,36 +588,19 @@ export async function runAnalysisCode(
   }
   const scratch = `${ANALYSIS_SCRATCH_ROOT}/${sanitizeSegment(deps.scratchId)}`;
   const scriptPath = `${scratch}/main.py`;
-  const outcome: AnalysisRunOutcome = { sessionDied: false };
   try {
-    await deps.sandbox.mkdir(scratch, { recursive: true });
-    const code = withWarehouseParams(request.code, request.params);
-    await deps.sandbox.writeFile(scriptPath, base64FromString(code), { encoding: "base64" });
-    const res = normalizeExec(
-      await deps.sandbox.exec(`python ${shellQuote(scriptPath)}`, { cwd: scratch, timeout: DEFAULT_EXEC_TIMEOUT_MS, env: { ...analysisRunEnv({ connections: deps.connections }), SCRATCH: scratch } }),
-    );
+    await deps.sandbox.writeFile(scriptPath, withWarehouseParams(request.code, request.params));
+    const res = await deps.sandbox.exec(`python ${shellQuote(scriptPath)}`, { cwd: scratch, timeoutMs: DEFAULT_EXEC_TIMEOUT_MS, env: { ...analysisRunEnv({ connections: deps.connections }), SCRATCH: scratch } });
     if (res.exitCode !== 0) {
-      // Deliberately NOT flagged as a session death, whatever the text says:
-      // `execError` is the user program's own stderr, and a script that merely
-      // PRINTS "SessionTerminatedError" must not be reported as an environment
-      // restart.
       return { ok: false, stdout: res.stdout, stderr: res.stderr, ...execFailure(res, DEFAULT_EXEC_TIMEOUT_MS) };
     }
     return { ok: true, stdout: res.stdout, stderr: res.stderr };
   } catch (error) {
-    outcome.sessionDied = isSandboxSessionDeathError(error);
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : "analysis code failed",
-      // Structured marker: this shape reports environment failures as a VALUE
-      // (deployed apps depend on that), so the service needs a signal it cannot
-      // confuse with program output.
-      ...(outcome.sessionDied ? { sessionDeath: true as const } : {}),
-    };
+    return { ok: false, error: error instanceof Error ? error.message : "analysis code failed" };
   } finally {
     // Scratch is per-call; without cleanup a warm container accumulates
     // abandoned scratch trees until its disk fills.
-    await cleanupRunDirs(deps.sandbox, outcome, scratch);
+    await cleanupRunDirs(deps.sandbox, scratch);
   }
 }
 
@@ -793,23 +609,20 @@ export async function runAnalysisCode(
 // ---------------------------------------------------------------------------
 
 async function materializeProject(
-  sandbox: AnalysisSandboxLike,
+  sandbox: AnalysisContainerLike,
   workdir: string,
   files: WorkspaceFileStoreLike,
 ): Promise<AnalysisSourceFile[]> {
   const sourceFiles = await collectProjectSourceFiles(files);
-  await sandbox.mkdir(workdir, { recursive: true });
+  await sandbox.mkdir(workdir);
   // Wipe non-derived files (keep .venv / caches for warm reuse) then write the
   // current source tree. A future optimization diffs against a stamp; v1 is a
   // correct full-source rewrite — cheap for notebooks + small data.
   await sandbox.exec(
     `find . -mindepth 1 \\( -name .venv -o -name venv -o -name .uv-cache -o -name __pycache__ -o -name node_modules -o -name .git \\) -prune -o -type f -print0 | xargs -0 -r rm -f`,
-    { cwd: workdir, timeout: ANALYSIS_HOUSEKEEPING_TIMEOUT_MS },
+    { cwd: workdir, timeoutMs: ANALYSIS_HOUSEKEEPING_TIMEOUT_MS },
   );
   for (const file of sourceFiles) {
-    const targetPath = `${workdir}/${file.path}`;
-    const parent = dirname(targetPath);
-    if (parent && parent !== workdir) await sandbox.mkdir(parent, { recursive: true });
     const read = await files.readFileStream(`/${file.path}`);
     if (!read.success || !read.stream) {
       throw new Error(read.error || `Failed to stream /${file.path} from the project store`);
@@ -823,9 +636,10 @@ async function materializeProject(
     }
     try {
       // ReadableStream ownership transfers through RPC: project R2 ->
-      // WorkspaceFilesystemDO -> AnalysisService -> AnalysisSandbox. No file
-      // bytes or base64 copy are retained in a Worker/DO isolate.
-      await sandbox.writeFile(targetPath, read.stream);
+      // WorkspaceFilesystemDO -> AnalysisService -> AnalysisContainer. No file
+      // bytes or base64 copy are retained in a Worker/DO isolate. writeFile
+      // creates the parent directories.
+      await sandbox.writeFile(`${workdir}/${file.path}`, read.stream);
     } catch (error) {
       await read.stream.cancel().catch(() => {});
       throw error;
@@ -835,12 +649,10 @@ async function materializeProject(
 }
 
 async function snapshotProjectManifest(
-  sandbox: AnalysisSandboxLike,
+  sandbox: AnalysisContainerLike,
   workdir: string,
 ): Promise<Map<string, string>> {
-  const manifest = normalizeExec(
-    await sandbox.exec(treeManifestCommand(), { cwd: workdir, timeout: ANALYSIS_HOUSEKEEPING_TIMEOUT_MS }),
-  );
+  const manifest = await sandbox.exec(treeManifestCommand(), { cwd: workdir, timeoutMs: ANALYSIS_HOUSEKEEPING_TIMEOUT_MS });
   if (manifest.exitCode !== 0) {
     throw new Error(
       `analysis persist aborted: tree manifest failed with exit code ${manifest.exitCode}` +
@@ -850,36 +662,13 @@ async function snapshotProjectManifest(
   return parseSha256Manifest(manifest.stdout);
 }
 
-interface StreamedSandboxFile {
-  stream: ReadableStream<Uint8Array>;
-  size: number;
-  mimeType?: string;
-}
-
-async function openSandboxFileStream(
-  sandbox: AnalysisSandboxLike,
-  path: string,
-): Promise<StreamedSandboxFile> {
-  const read = await sandbox.readFile(path, { encoding: "none" });
-  if (typeof read.content === "string") {
-    throw new Error(`Sandbox did not return a binary stream for ${path}`);
-  }
-  if (!Number.isFinite(read.size) || (read.size as number) < 0) {
-    await read.content.cancel().catch(() => {});
-    throw new Error(`Sandbox did not report a valid byte size for ${path}`);
-  }
-  return {
-    stream: read.content,
-    size: Math.floor(read.size as number),
-    mimeType: read.mimeType,
-  };
-}
-
-async function persistOpenedSandboxFile(
+async function persistSandboxFile(
+  sandbox: AnalysisContainerLike,
+  workdir: string,
   files: WorkspaceFileStoreLike,
   rel: string,
-  opened: StreamedSandboxFile,
 ): Promise<"persisted" | "oversize"> {
+  const opened = await sandbox.openFile(`${workdir}/${rel}`);
   if (opened.size > ANALYSIS_MAX_PERSIST_BYTES) {
     await opened.stream.cancel().catch(() => {});
     return "oversize";
@@ -888,12 +677,7 @@ async function persistOpenedSandboxFile(
     await opened.stream.cancel().catch(() => {});
     throw new Error("Project file store does not support streaming R2 adoption");
   }
-  const result = await files.adoptR2File(
-    `/${rel}`,
-    opened.stream,
-    opened.size,
-    opened.mimeType,
-  );
+  const result = await files.adoptR2File(`/${rel}`, opened.stream, opened.size, getMimeType(rel));
   if (!result.success) {
     throw new Error(result.error || `Failed to persist ${rel}`);
   }
@@ -901,7 +685,7 @@ async function persistOpenedSandboxFile(
 }
 
 async function persistChangedFiles(
-  sandbox: AnalysisSandboxLike,
+  sandbox: AnalysisContainerLike,
   workdir: string,
   files: WorkspaceFileStoreLike,
   beforeManifest: Map<string, string>,
@@ -915,9 +699,7 @@ async function persistChangedFiles(
   const changedFiles: string[] = [];
   const skippedOversize: string[] = [];
   for (const rel of changed) {
-    const opened = await openSandboxFileStream(sandbox, `${workdir}/${rel}`);
-    const persisted = await persistOpenedSandboxFile(files, rel, opened);
-    if (persisted === "oversize") {
+    if ((await persistSandboxFile(sandbox, workdir, files, rel)) === "oversize") {
       skippedOversize.push(rel);
       continue;
     }
@@ -936,18 +718,16 @@ async function persistChangedFiles(
 }
 
 async function persistSingleFile(
-  sandbox: AnalysisSandboxLike,
+  sandbox: AnalysisContainerLike,
   workdir: string,
   files: WorkspaceFileStoreLike,
   rel: string,
 ): Promise<boolean> {
-  let opened: StreamedSandboxFile;
   try {
-    opened = await openSandboxFileStream(sandbox, `${workdir}/${rel}`);
+    return (await persistSandboxFile(sandbox, workdir, files, rel)) === "persisted";
   } catch {
     return false;
   }
-  return (await persistOpenedSandboxFile(files, rel, opened)) === "persisted";
 }
 
 async function collectProjectSourceFiles(files: WorkspaceFileStoreLike): Promise<AnalysisSourceFile[]> {
@@ -973,22 +753,20 @@ async function collectProjectSourceFiles(files: WorkspaceFileStoreLike): Promise
 // Small utils
 // ---------------------------------------------------------------------------
 
+/**
+ * Per-run variables. The container adds the stack's own (PATH with the baked
+ * venv, PYTHONPATH for the camelai helpers, UV_CACHE_DIR, the locale and CA
+ * bundle) to every command: ANALYSIS_BASE_ENV in analysis-container.ts.
+ */
 function analysisRunEnv(options: { projectId?: string; connections?: boolean } = {}): Record<string, string> {
   return {
     CI: "1",
     PYTHONUNBUFFERED: "1",
-    // The SDK's default session forced these on its shell; a sessionless exec
-    // only inherits the container server's env, which may not set a locale.
-    LANG: "C.UTF-8",
-    LC_ALL: "C.UTF-8",
-    // The baked camelai helper package (see ANALYSIS_PYTHONPATH).
-    PYTHONPATH: ANALYSIS_PYTHONPATH,
     // Same protocol + variable the project VMs exposed, so the skill's notebook
-    // helper code carries over unchanged. The host is intercepted at the sandbox
-    // egress layer and served by the connectionsRpc outbound handler with the
-    // workspace/org scope the service attached DO-side (see analysis-sandbox.ts).
-    // Omitted for app-scoped runs, whose container never registers the
-    // interception (see runCodeForApps).
+    // helper code carries over unchanged. The host is intercepted in the agent
+    // container and served with the workspace/org scope the container was
+    // started with (see analysis-container.ts). Omitted for app-scoped runs,
+    // whose container has no such intercept (see runCodeForApps).
     ...(options.connections === false ? {} : { CAMELAI_CONNECTIONS_RPC_URL: `http://${ANALYSIS_CONNECTIONS_HOST}/` }),
     // Project runs use per-invocation workdirs (analysisRunWorkdir), so point uv
     // at a container-lifetime venv shared per project — env warmth survives run
@@ -1036,19 +814,6 @@ function execError(res: { stderr: string; stdout: string; exitCode: number }): s
   return res.stderr || res.stdout || `command failed with exit code ${res.exitCode}`;
 }
 
-function normalizeExec(result: { success?: boolean; stdout?: string; stderr?: string; exitCode?: number }): {
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-} {
-  const exitCode = typeof result.exitCode === "number" ? result.exitCode : result.success === false ? 1 : 0;
-  return {
-    stdout: typeof result.stdout === "string" ? result.stdout : "",
-    stderr: typeof result.stderr === "string" ? result.stderr : "",
-    exitCode,
-  };
-}
-
 function normalizeDependencySpecs(value: unknown): string[] {
   const list = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
   const out: string[] = [];
@@ -1081,61 +846,16 @@ function sanitizeSegment(value: string): string {
   return cleaned;
 }
 
-function dirname(path: string): string {
-  const parts = path.split("/").filter(Boolean);
-  parts.pop();
-  return parts.length ? `/${parts.join("/")}` : "/";
-}
-
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
-
-function base64FromString(value: string): string {
-  return base64FromBytes(new TextEncoder().encode(value));
-}
-
-function base64FromBytes(bytes: Uint8Array): string {
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
-  }
-  return btoa(binary);
-}
-
-// ---------------------------------------------------------------------------
-// Session death (container OOM / restart under a running command)
-// ---------------------------------------------------------------------------
-
-// The classifier itself lives in sandbox-session-death.ts so the readiness
-// gate and the sandbox DOs key off the SAME predicate (see that module's
-// header). Re-exported here for the existing importers.
-export {
-  isSandboxSessionDeathError,
-  isSandboxSessionDeathResult,
-  sandboxSessionExitCode,
-} from "./sandbox-session-death.js";
-
-/**
- * User-facing replacement for the raw SDK error. Same tone as the other
- * environment-level messages the agent relays: say what happened, say what to
- * do, never name an SDK class.
- */
-export const ANALYSIS_SESSION_RESTARTED_MESSAGE =
-  "The analysis environment restarted while running this command, so it did not complete. " +
-  "Try again — if it keeps happening, run a smaller step (less data in memory at once).";
 
 // ---------------------------------------------------------------------------
 // WorkerEntrypoint
 // ---------------------------------------------------------------------------
 
 interface AnalysisEnv extends ObservabilityEnv {
-  ANALYSIS_SANDBOX?: unknown;
-  WAREHOUSE_EXPORT_BUCKET?: R2Bucket;
-  R2_BUCKET?: R2Bucket;
-  /** Same bucket as R2_BUCKET; separate binding so /outputs can mount alongside /uploads. */
-  R2_OUTPUTS_BUCKET?: R2Bucket;
+  ANALYSIS_SANDBOX?: DurableObjectNamespace<AnalysisContainer>;
   WORKSPACE_FS?: DurableObjectNamespace<import("./workspace-filesystem-do.js").WorkspaceFilesystemDO>;
 }
 
@@ -1144,31 +864,30 @@ interface AnalysisServiceProps {
   orgId: string;
 }
 
+type AnalysisScope = "agent" | "app";
+
 export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServiceProps> {
-  private readonly sandboxes = new Map<string, AnalysisSandboxStub>();
+  private readonly sandboxes = new Map<AnalysisScope, AnalysisContainerStub>();
 
   /** Test seam (agent-scoped container). */
-  setSandbox(sandbox: AnalysisSandboxStub): void {
+  setSandbox(sandbox: AnalysisContainerStub): void {
     this.sandboxes.set("agent", sandbox);
   }
 
   async runNotebook(request: { projectId: string; path: string; timeoutMs?: number }): Promise<AnalysisNotebookResult> {
     const files = await this.projectFiles(request.projectId);
-    return this.runOperation("run_notebook", async (sandbox) => {
-      await this.prepareWorkspaceAccess(sandbox);
-      return runAnalysisNotebook(
+    return this.runOperation("run_notebook", (sandbox) =>
+      runAnalysisNotebook(
         { path: request.path, timeoutMs: request.timeoutMs },
         { sandbox, files, projectId: request.projectId, newRunId: () => crypto.randomUUID() },
-      );
-    });
+      ));
   }
 
   async exec(request: { projectId?: string; command: string; cwd?: string; env?: Record<string, string>; timeoutMs?: number }): Promise<AnalysisExecResult> {
     const hasProject = Boolean(request.projectId);
     const files = hasProject ? await this.projectFiles(request.projectId as string) : ({} as WorkspaceFileStoreLike);
-    return this.runOperation("exec", async (sandbox) => {
-      await this.prepareWorkspaceAccess(sandbox);
-      return runAnalysisExec(
+    return this.runOperation("exec", (sandbox) =>
+      runAnalysisExec(
         { command: request.command, cwd: request.cwd, env: request.env, timeoutMs: request.timeoutMs },
         {
           sandbox,
@@ -1178,8 +897,7 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
           hasProject,
           scratchId: crypto.randomUUID(),
         },
-      );
-    });
+      ));
   }
 
   async addDependency(request: { projectId: string; packages: string[]; dev?: boolean }): Promise<AnalysisDependencyResult> {
@@ -1192,35 +910,22 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
   }
 
   async runCode(request: { code: string; params?: Record<string, unknown> }): Promise<AnalysisRunCodeResult> {
-    return this.runOperation("run_code", async (sandbox) => {
-      await this.prepareWorkspaceAccess(sandbox);
-      return runAnalysisCode(request, { sandbox, scratchId: crypto.randomUUID() });
-    });
+    return this.runOperation("run_code", (sandbox) =>
+      runAnalysisCode(request, { sandbox, scratchId: crypto.randomUUID() }));
   }
 
   /**
    * App-scoped runCode — the ONLY compute deployed apps get (via
    * AnalysisAppService / the legacy WarehouseService shim). Runs in a SEPARATE
-   * warm container from the agent's (`app-<workspaceId>`): mounts and the
-   * connections interception are container-level state, so sharing the agent's
-   * container would leak the uploads mount and connections.internal access that
-   * agent runs legitimately establish there. The app container only ever gets
-   * the export-prefix mount — the pre-merge warehouse contract — and no
-   * CAMELAI_CONNECTIONS_RPC_URL is injected (the interception is never
-   * registered on this container, so the host is unreachable regardless).
+   * warm container from the agent's (`app-<workspaceId>`): mounts and egress
+   * are container-level state, so sharing the agent's container would give app
+   * code the uploads mount and connections.internal. The app container gets
+   * only the export-prefix mount — the pre-merge warehouse contract — and no
+   * egress at all; no CAMELAI_CONNECTIONS_RPC_URL is injected either.
    */
   async runCodeForApps(request: { code: string; params?: Record<string, unknown> }): Promise<AnalysisRunCodeResult> {
-    return this.runOperation("run_code_for_apps", async (sandbox) => {
-      // Seal egress before every app run: app code has no PyPI use case, so the
-      // class-level allowlist would only be an exfiltration channel for mounted
-      // export data (the override is in-memory DO state, hence per-run; a
-      // restarted container starts from the class-level allowlist again).
-      await sandbox.sealAppEgress();
-      if (this.env.WAREHOUSE_EXPORT_BUCKET) {
-        await sandbox.ensureMounted(ANALYSIS_EXPORT_BUCKET_BINDING, warehouseWorkspacePrefix(this.ctx.props.workspaceId));
-      }
-      return runAnalysisCode(request, { sandbox, scratchId: crypto.randomUUID(), connections: false });
-    }, "app");
+    return this.runOperation("run_code_for_apps", (sandbox) =>
+      runAnalysisCode(request, { sandbox, scratchId: crypto.randomUUID(), connections: false }), "app");
   }
 
   async listConnections(): Promise<WarehouseConnection[]> {
@@ -1232,40 +937,35 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
   }
 
   /**
-   * Run one analysis operation and translate environment failures.
+   * Run one analysis operation on the scope's container, prepared first
+   * (started with its mounts and egress, or re-checked). Never retries: a
+   * container that stopped mid-command may have run it fully or partly, so
+   * re-running would double-apply work whose side effects survived it. The
+   * container reports that case with a user-facing message.
    *
-   * Never retries. Execs are sessionless (ANALYSIS_SANDBOX_OPTIONS), so the old
-   * failure this used to retry — a stale or dead default-session shell — no
-   * longer exists: a user `exit`/`set -e` only ends its own `bash -c`, and a
-   * container that died mid-command may have run it fully or partly, so
-   * re-running would double-apply work whose side effects survived it.
+   * Afterwards, files the run wrote to a writable mount that is not live
+   * (self-host's sync mounts) are copied back, so a delivered `/outputs` file
+   * is readable as soon as the call returns.
    *
-   * The failure SHAPE is preserved: an operation that reports failures as a
-   * `{ ok: false, error }` value (runCode, whose callers include deployed apps
-   * through AnalysisAppService) keeps getting a value, with the raw SDK text
-   * swapped for the user-facing message; one that throws keeps throwing.
-   *
-   * A result the container killed at its timeout (exit 124) is counted as
-   * `sandbox_exec_timeout`, so we can see how often commands hit their budget
-   * now that the kill is real.
+   * A result the container stopped at its timeout (exit 124) is counted as
+   * `sandbox_exec_timeout`, so we can see how often commands hit their budget.
    */
   private async runOperation<T>(
     operation: string,
-    run: (sandbox: AnalysisSandboxStub) => Promise<T>,
-    scope: "agent" | "app" = "agent",
+    run: (sandbox: AnalysisContainerStub) => Promise<T>,
+    scope: AnalysisScope = "agent",
   ): Promise<T> {
+    const sandbox = this.resolveSandbox(scope);
+    await sandbox.prepare(this.access(scope));
     let value: T;
     try {
-      value = await run(await this.resolveSandbox(scope));
-    } catch (error) {
-      if (!isSandboxSessionDeathError(error)) throw error;
-      this.recordSessionTerminated(operation, error);
-      throw new Error(ANALYSIS_SESSION_RESTARTED_MESSAGE, { cause: error });
-    }
-    if (isSandboxSessionDeathResult(value)) {
-      const { sessionDeath: _dropped, ...rest } = value as T & { sessionDeath?: true; error?: unknown };
-      this.recordSessionTerminated(operation, new Error(String(rest.error)));
-      return { ...(rest as T), error: ANALYSIS_SESSION_RESTARTED_MESSAGE };
+      value = await run(sandbox);
+    } finally {
+      if (scope === "agent") {
+        await sandbox.flushMounts().catch((error: unknown) => {
+          console.error("[AnalysisService] copying writable mounts back to R2 failed", error);
+        });
+      }
     }
     if ((value as { timedOut?: unknown } | null)?.timedOut === true) {
       this.recordExecTimeout(operation, value as { durationMs?: number });
@@ -1286,76 +986,12 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
     });
   }
 
-  private recordSessionTerminated(operation: string, error: unknown): void {
-    console.warn("[AnalysisService] analysis environment died under a command", {
-      operation,
-      workspaceId: this.ctx?.props?.workspaceId,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    recordObservabilityEvent(this.env, {
-      event: "sandbox_session_terminated",
-      severity: "error",
-      component: "AnalysisService",
-      operation,
-      status: "failed",
-      count: sandboxSessionExitCode(error) ?? undefined,
-      errorName: error instanceof Error ? error.name : "Error",
-      errorMessage: error instanceof Error ? error.message : String(error),
-      workspaceId: this.ctx?.props?.workspaceId,
-      orgId: this.ctx?.props?.orgId,
-    });
-  }
-
-  /**
-   * Prepare the container's workspace-scoped data access before a run:
-   * read-only R2 mounts (exports + uploads) and the connections.internal
-   * interception with this workspace/org scope attached DO-side. All three are
-   * idempotent-cheap on a warm container.
-   */
-  private async prepareWorkspaceAccess(sandbox: AnalysisSandboxStub): Promise<void> {
-    if (this.env.WAREHOUSE_EXPORT_BUCKET) {
-      await sandbox.ensureMounted(ANALYSIS_EXPORT_BUCKET_BINDING, warehouseWorkspacePrefix(this.ctx.props.workspaceId));
-    }
-    if (this.env.R2_BUCKET && this.ctx.props.orgId) {
-      // Mounted at the stable /uploads alias — the agent's `uploads/<name>`
-      // reference with a leading slash — because the raw org/workspace R2
-      // prefix is neither shown to the agent nor derivable in the container.
-      const uploadsPrefix = `${getWorkspaceR2Prefix(this.ctx.props.orgId, this.ctx.props.workspaceId)}/user-uploads`;
-      if (await r2PrefixHasObjects(this.env.R2_BUCKET, uploadsPrefix)) {
-        await sandbox.ensureMounted(ANALYSIS_UPLOADS_BUCKET_BINDING, uploadsPrefix, ANALYSIS_UPLOADS_MOUNT_PATH);
-      }
-      // Writable, and deliberately NOT gated on the prefix already having
-      // objects the way uploads is: outputs starts empty by definition, and the
-      // whole point is to let a run create the first file in it.
-      //
-      // A failure here is logged rather than thrown. Losing the outputs mount
-      // costs the run its delivery path, but throwing would take down notebook
-      // and code execution entirely — a much larger regression than the one
-      // this mount exists to fix.
-      const outputsPrefix = `${getWorkspaceR2Prefix(this.ctx.props.orgId, this.ctx.props.workspaceId)}/user-outputs`;
-      if (this.env.R2_OUTPUTS_BUCKET) {
-        try {
-          await sandbox.ensureMounted(
-            ANALYSIS_OUTPUTS_BUCKET_BINDING,
-            outputsPrefix,
-            ANALYSIS_OUTPUTS_MOUNT_PATH,
-            { readOnly: false },
-          );
-        } catch (error) {
-          console.error("[AnalysisService] outputs mount failed", error);
-        }
-      } else {
-        console.error(
-          "[AnalysisService] R2_OUTPUTS_BUCKET binding is not configured; generated files cannot be delivered through /outputs",
-        );
-      }
-    }
-    if (this.ctx.props.orgId && this.ctx.props.workspaceId) {
-      await sandbox.ensureConnectionsRpc({
-        orgId: this.ctx.props.orgId,
-        workspaceId: this.ctx.props.workspaceId,
-      });
-    }
+  private access(scope: AnalysisScope): AnalysisAccess {
+    const { orgId, workspaceId } = this.ctx.props;
+    if (!workspaceId) throw new Error("Analysis service requires workspace scope");
+    if (scope === "app") return { mode: "app", workspaceId };
+    if (!orgId) throw new Error("Analysis service requires org scope");
+    return { mode: "agent", orgId, workspaceId };
   }
 
   /**
@@ -1379,24 +1015,16 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
   }
 
   /**
-   * Resolve the workspace's warm container. `scope: "agent"` (default) is the
-   * full-capability container the chat agent's runs use; `scope: "app"` is a
-   * separate container for deployed-app runCode, so app code never shares the
-   * container-level mounts/interception the agent's runs establish.
+   * The workspace's warm container for `scope`: "agent" (default) is the
+   * full-capability container the chat agent's runs use; "app" is a separate
+   * container for deployed-app runCode, so app code never shares the mounts and
+   * egress the agent's runs get.
    */
-  private async resolveSandbox(scope: "agent" | "app" = "agent"): Promise<AnalysisSandboxStub> {
+  private resolveSandbox(scope: AnalysisScope): AnalysisContainerStub {
     const cached = this.sandboxes.get(scope);
     if (cached) return cached;
     if (!this.env.ANALYSIS_SANDBOX) throw new Error("ANALYSIS_SANDBOX container binding is not configured");
-    const { getSandbox } = await import("@cloudflare/sandbox");
-    // One warm container per workspace and scope; per-call isolation is via
-    // working dirs. Sessionless: see ANALYSIS_SANDBOX_OPTIONS.
-    const sandboxId = scope === "app" ? `app-${this.ctx.props.workspaceId}` : this.ctx.props.workspaceId;
-    const sandbox = getSandbox(
-      this.env.ANALYSIS_SANDBOX as Parameters<typeof getSandbox>[0],
-      sandboxId,
-      ANALYSIS_SANDBOX_OPTIONS,
-    ) as unknown as AnalysisSandboxStub;
+    const sandbox = this.env.ANALYSIS_SANDBOX.getByName(analysisContainerName(this.access(scope))) as unknown as AnalysisContainerStub;
     this.sandboxes.set(scope, sandbox);
     return sandbox;
   }

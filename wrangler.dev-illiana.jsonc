@@ -84,11 +84,7 @@
 		}
 	],
 	"r2_buckets": [
-		{ "binding": "R2_BUCKET", "bucket_name": "chiridion-sandbox" },
-		// Same bucket as R2_BUCKET under a second binding name: the sandbox SDK
-		// refuses to mount one binding at two prefixes, so writable /outputs
-		// needs its own binding to coexist with read-only /uploads.
-		{ "binding": "R2_OUTPUTS_BUCKET", "bucket_name": "chiridion-sandbox" }
+		{ "binding": "R2_BUCKET", "bucket_name": "chiridion-sandbox" }
 	],
 	"analytics_engine_datasets": [
 		{ "binding": "ERROR_ANALYTICS", "dataset": "chiridion_errors_dev_illiana" },

@@ -112,7 +112,7 @@ export class DbQuerySandbox extends Sandbox<Env> {
    * Worker-side self-heal for a WEDGED container: db-query-service.ts calls
    * this when a setup operation (container start, relay egress, forwarder
    * prelude, export mount) outlives its client-side deadline. Same bounded
-   * destroy + durable cooldown the build/analysis sandboxes use, so a broken
+   * destroy + durable cooldown the analysis sandbox uses, so a broken
    * image gets one restart per window instead of a restart loop.
    *
    * `requireRunningContainer: false` because the prod incident this exists for

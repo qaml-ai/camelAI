@@ -1,10 +1,9 @@
 // Session-death classification for @cloudflare/sandbox containers.
 //
-// Extracted from analysis-service.ts (its original home) so the readiness gate
-// and the sandbox DOs can key off the SAME predicate the analysis recovery path
-// uses. There must be exactly one definition of "the container's shell died":
-// two would drift, and a drifted classifier is how a zombie container passes a
-// readiness probe (see plans/sse-migration/ZOMBIE-CONTAINER-FIX.md).
+// Extracted from analysis-service.ts (its original home) so the sandbox DOs'
+// self-heal keys off the SAME predicate the analysis recovery path uses. There
+// must be exactly one definition of "the container's shell died": two would
+// drift (see plans/sse-migration/ZOMBIE-CONTAINER-FIX.md).
 //
 // analysis-service.ts re-exports everything here, so existing importers are
 // unaffected.
@@ -19,8 +18,7 @@
  * Audited against the full export list of @cloudflare/sandbox 0.12.0
  * (`dist/index.d.ts`): SessionTerminatedError, ProcessExitedBeforeReadyError and
  * ProcessReadyTimeoutError are the whole family; the remaining SandboxError
- * subclasses are backup/mount/transport concerns handled elsewhere
- * (project-build-readiness.ts owns the transport/cold-boot class).
+ * subclasses are backup/mount/transport concerns handled elsewhere.
  *
  * Matched by NAME as well as by message because the error crosses a DO RPC hop
  * on the way here, where the SDK class identity does not survive.

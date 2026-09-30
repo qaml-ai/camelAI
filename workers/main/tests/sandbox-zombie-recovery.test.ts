@@ -110,7 +110,7 @@ describe("forceSandboxZombieRestart", () => {
     );
     const second = await forceSandboxZombieRestart(
       host,
-      { operation: "readiness_probe", trigger: "probe_session_death" },
+      { operation: "ensureMounted", trigger: "mount_io_error" },
       { nowMs: 1_000 + SANDBOX_ZOMBIE_RESTART_COOLDOWN_MS - 1 },
     );
 
@@ -299,14 +299,14 @@ describe("wedged teardown escalation", () => {
       const abortInstance = vi.fn();
       const healable = { ...sandbox, healState: createSandboxZombieHealState(), abortInstance };
 
-      const first = healZombieSandboxContainer(healable, "ProjectBuildSandbox", {
+      const first = healZombieSandboxContainer(healable, "AnalysisSandbox", {
         operation: "exec",
         trigger: "exec_session_death",
       }, { nowMs: 1_000 });
       await vi.advanceTimersByTimeAsync(SANDBOX_ZOMBIE_DESTROY_TIMEOUT_MS + 1);
       await expect(first).resolves.toMatchObject({ restarted: false, reason: "destroy_failed" });
 
-      const second = await healZombieSandboxContainer(healable, "ProjectBuildSandbox", {
+      const second = await healZombieSandboxContainer(healable, "AnalysisSandbox", {
         operation: "exec",
         trigger: "exec_session_death",
       }, { nowMs: 1_000 + SANDBOX_ZOMBIE_RESTART_COOLDOWN_MS });
@@ -330,14 +330,14 @@ describe("wedged teardown escalation", () => {
       sandbox.destroy = destroy;
       const healable = { ...sandbox, healState: createSandboxZombieHealState() };
 
-      const first = healZombieSandboxContainer(healable, "ProjectBuildSandbox", {
+      const first = healZombieSandboxContainer(healable, "AnalysisSandbox", {
         operation: "exec",
         trigger: "exec_session_death",
       }, { nowMs: 1_000 });
       await vi.advanceTimersByTimeAsync(SANDBOX_ZOMBIE_DESTROY_TIMEOUT_MS + 1);
       await first;
 
-      const second = await healZombieSandboxContainer(healable, "ProjectBuildSandbox", {
+      const second = await healZombieSandboxContainer(healable, "AnalysisSandbox", {
         operation: "exec",
         trigger: "exec_session_death",
       }, { nowMs: 1_000 + SANDBOX_ZOMBIE_RESTART_COOLDOWN_MS });
@@ -357,9 +357,9 @@ describe("healZombieSandboxContainer", () => {
     try {
       const { sandbox, destroy, writeDataPoint } = createSandbox();
 
-      const outcome = await healZombieSandboxContainer(sandbox, "ProjectBuildSandbox", {
-        operation: "readiness_probe",
-        trigger: "probe_session_death",
+      const outcome = await healZombieSandboxContainer(sandbox, "AnalysisSandbox", {
+        operation: "ensureMounted",
+        trigger: "mount_io_error",
         error: SESSION_DEATH(),
       });
 
@@ -371,9 +371,9 @@ describe("healZombieSandboxContainer", () => {
       expect(SANDBOX_ZOMBIE_RESTART_EVENT).toBe("sandbox_zombie_restart");
       expect(LEGACY_SANDBOX_ZOMBIE_RESTART_EVENT).toBe("build_sandbox_zombie_restart");
       const blobs = writeDataPoint.mock.calls[0][0].blobs as string[];
-      expect(blobs).toContain("ProjectBuildSandbox");
-      expect(blobs).toContain("readiness_probe");
-      expect(blobs).toContain("probe_session_death");
+      expect(blobs).toContain("AnalysisSandbox");
+      expect(blobs).toContain("ensureMounted");
+      expect(blobs).toContain("mount_io_error");
     } finally {
       warn.mockRestore();
     }
@@ -473,7 +473,7 @@ describe("healZombieSandboxContainer destroy bound", () => {
       const { sandbox, store, writeDataPoint } = createSandbox();
       sandbox.destroy = vi.fn(() => new Promise<void>(() => {}));
 
-      const pending = healZombieSandboxContainer(sandbox, "ProjectBuildSandbox", {
+      const pending = healZombieSandboxContainer(sandbox, "AnalysisSandbox", {
         operation: "exec",
         trigger: "exec_session_death",
       });
@@ -500,7 +500,7 @@ describe("withZombieSelfHeal", () => {
       const death = SESSION_DEATH();
 
       await expect(
-        withZombieSelfHeal(sandbox, "ProjectBuildSandbox", "exec", async () => {
+        withZombieSelfHeal(sandbox, "AnalysisSandbox", "exec", async () => {
           throw death;
         }),
       ).rejects.toBe(death);
@@ -520,7 +520,7 @@ describe("withZombieSelfHeal", () => {
       "build failed with exit code 1",
     ]) {
       await expect(
-        withZombieSelfHeal(sandbox, "ProjectBuildSandbox", "exec", async () => {
+        withZombieSelfHeal(sandbox, "AnalysisSandbox", "exec", async () => {
           throw new Error(message);
         }),
       ).rejects.toThrow(message);
@@ -602,24 +602,24 @@ describe("withZombieSelfHeal", () => {
     }
   });
 
-  it("does not double-restart when an exec death and a probe death share the cooldown", async () => {
+  it("does not double-restart when an exec death and a mount failure share the cooldown", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      // The build ladder's exec failure heals; the readiness gate that follows
-      // asks for the same heal and is refused, so the container reboots once.
+      // The exec failure heals; the mount recovery that follows asks for the
+      // same heal and is refused, so the container reboots once.
       const { sandbox, destroy } = createSandbox();
 
       await expect(
-        withZombieSelfHeal(sandbox, "ProjectBuildSandbox", "exec", async () => {
+        withZombieSelfHeal(sandbox, "AnalysisSandbox", "exec", async () => {
           throw SESSION_DEATH();
         }),
       ).rejects.toThrow();
-      const probeHeal = await healZombieSandboxContainer(sandbox, "ProjectBuildSandbox", {
-        operation: "readiness_probe",
-        trigger: "probe_session_death",
+      const mountHeal = await healZombieSandboxContainer(sandbox, "AnalysisSandbox", {
+        operation: "ensureMounted",
+        trigger: "mount_io_error",
       });
 
-      expect(probeHeal).toMatchObject({ restarted: false, reason: "rate_limited" });
+      expect(mountHeal).toMatchObject({ restarted: false, reason: "rate_limited" });
       expect(destroy).toHaveBeenCalledTimes(1);
     } finally {
       warn.mockRestore();

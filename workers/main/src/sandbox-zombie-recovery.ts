@@ -4,9 +4,9 @@
 // cheap file/HTTP operations while its shell/executor layer is dead: `exists`
 // succeeds, `exec` answers `SessionTerminatedError: … shell exited (exit code:
 // 128)` forever. Nothing in the SDK recovers from that on its own — the session
-// id is re-created against the same dead container, and every build/analysis
-// command in that org keeps failing until the idle reaper eventually stops the
-// container (up to PROJECT_BUILD_SLEEP_AFTER later).
+// id is re-created against the same dead container, and every analysis command
+// in that workspace keeps failing until the idle reaper eventually stops the
+// container.
 //
 // The only lever that fixes it is destroying the container instance so the next
 // call boots a clean one (`Sandbox.destroy()` → `Container.destroy()`, SIGKILL,
@@ -42,21 +42,6 @@ export const SANDBOX_ZOMBIE_RESTART_COOLDOWN_MS = 5 * 60_000;
 export const SANDBOX_ZOMBIE_RESTART_AT_KEY = "camelai:zombieRestartAtMs";
 
 /**
- * Consecutive session-death readiness probes that mean "zombie", not "blip".
- *
- * Higher than 1 because a single session death can also be an ordinary
- * mid-flight container restart, which the next probe already recovers from; a
- * zombie answers session-death to EVERY probe, so it reaches this in a few
- * seconds of the gate's 1.5s cadence.
- *
- * This threshold only means anything because the readiness probe reaches the
- * container through a heal-EXEMPT entry point (`ProjectBuildSandbox.probeShell`):
- * a probe routed through `exec` would be healed by the wrapper below before the
- * gate ever counted it.
- */
-export const SANDBOX_ZOMBIE_PROBE_THRESHOLD = 3;
-
-/**
  * Consecutive session-death `exec` failures before the ANALYSIS container is
  * destroyed.
  *
@@ -66,16 +51,12 @@ export const SANDBOX_ZOMBIE_PROBE_THRESHOLD = 3;
  * threshold stays at 2 so a single stray failure never costs a 30-120s cold
  * boot plus a full re-mount. Remove with the rest of the heal logic once
  * telemetry shows sessionless execs never trip it.
- *
- * The build path has no such retry (its ladder restarts the whole operation) and
- * keeps the plan's destroy-on-first-exec-death behaviour.
  */
 export const SANDBOX_ZOMBIE_EXEC_DEATH_THRESHOLD = 2;
 
 /** Why a restart was requested. Low-cardinality; goes straight to telemetry. */
 export type SandboxZombieRestartTrigger =
   | "exec_session_death"
-  | "probe_session_death"
   | "mount_io_error"
   | "mount_session_timeout"
   | "setup_deadline";
@@ -104,7 +85,7 @@ export interface SandboxZombieRestartRequest {
 /**
  * The narrow slice of a Sandbox DO this needs. Kept as an interface (rather
  * than the DO itself) so the decision logic is unit-testable without a
- * container, and so ProjectBuildSandbox and AnalysisSandbox share ONE
+ * container, and so AnalysisSandbox and DbQuerySandbox share ONE
  * implementation instead of two copies that drift.
  */
 export interface SandboxZombieRestartHost {
@@ -226,7 +207,8 @@ export async function forceSandboxZombieRestart(
 export const SANDBOX_ZOMBIE_RESTART_EVENT = "sandbox_zombie_restart";
 
 /**
- * The event's old name, from when only the build sandbox healed. Every restart
+ * The event's old name, from when only the (since deleted) 0.12 build sandbox
+ * healed. Every restart
  * is still written under it too, so saved queries and alerts keep working
  * during the switch; drop it once they read the new name.
  */
@@ -319,8 +301,8 @@ async function destroyWithinTimeout(
 }
 
 /**
- * The Sandbox-DO shape the self-heal drives. `ProjectBuildSandbox` and
- * `AnalysisSandbox` both satisfy it structurally (they extend
+ * The Sandbox-DO shape the self-heal drives. `AnalysisSandbox` and
+ * `DbQuerySandbox` both satisfy it structurally (they extend
  * `Sandbox<Env>` → `Container<Env>`), so neither needs its own copy of this
  * wiring.
  */
@@ -552,8 +534,7 @@ export interface ZombieSelfHealOptions {
  *
  * The error is always re-thrown: healing is about the NEXT call (the destroyed
  * container boots clean), never about hiding this one's failure — the analysis
- * service's own recreate+retry and the build ladder still see the original
- * error and keep their existing semantics.
+ * service still sees the original error and keeps its existing semantics.
  *
  * ANY non-session-death outcome (success or another error class) resets the
  * consecutive counter, which is the same rule the readiness gate applies to its

@@ -23,15 +23,17 @@
 //     is NOT abortable, so passing a signal cannot cancel an in-flight command.
 //   - `killProcess`/`killAllProcesses` are sandbox-scoped and operate on the
 //     `startProcess` registry; a command run through `exec` has no process id
-//     and is not reachable from them, and the analysis/build containers are
-//     shared per workspace/org, so a blanket kill would take out unrelated
+//     and is not reachable from them, and the analysis/db-query containers are
+//     shared per workspace, so a blanket kill would take out unrelated
 //     concurrent work.
 // There is therefore NO safe per-exec cancellation surface to fire on a
 // deadline or an abort. The abandoned command stays bounded by the timeout the
 // container already holds — and for a SESSIONLESS exec (the analysis and DB
 // query sandboxes) that timeout really kills its process group. In the default
 // session it only rejected the promise and left the shell busy. Re-check this
-// when the SDK is upgraded.
+// when the SDK is upgraded. Project builds (ProjectBuildContainer, Sandbox SDK
+// 1.0) run each command under GNU `timeout`, which kills its process group too;
+// a build abandoned here still cannot be cancelled from the Worker.
 
 /**
  * Cancellable deadline for one awaited operation; the seam tests replace to

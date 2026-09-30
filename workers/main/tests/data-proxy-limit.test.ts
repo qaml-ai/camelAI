@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { mssqlQuery, postgresQuery } from '../src/data-proxy.js';
-import { fakeDbQuerySandboxNamespace } from './fake-db-query-sandbox.js';
+import { fakeDbQueryContainerNamespace } from './fake-db-query-container.js';
 
 const CONTEXT = { orgId: 'org-1', workspaceId: 'ws-1' };
 
 describe('data-proxy response limits', () => {
   it('hands DATA_PROXY_MAX_RESPONSE_BYTES to the runner as the byte cap', async () => {
-    const fake = fakeDbQuerySandboxNamespace((request) => {
+    const fake = fakeDbQueryContainerNamespace((request) => {
       expect(request.maxResponseBytes).toBe(32);
       // The runner enforces the cap next to the query and reports a 413.
       return { ok: false, error: { message: 'Query response too large (999 bytes > limit 32 bytes)', status: 413 } };
@@ -32,7 +32,7 @@ describe('data-proxy response limits', () => {
   });
 
   it('defaults the byte cap to 8 MiB when the env var is unset', async () => {
-    const fake = fakeDbQuerySandboxNamespace((request) => {
+    const fake = fakeDbQueryContainerNamespace((request) => {
       expect(request.maxResponseBytes).toBe(8 * 1024 * 1024);
       return { ok: true, rows: [], fields: [], rowCount: 0, truncated: false, durationMs: 1 };
     });
@@ -56,11 +56,12 @@ describe('data-proxy response limits', () => {
   });
 });
 
-describe('data-proxy sandbox sessions', () => {
-  it("runs every exec sessionless so a workspace's calls do not queue behind one shell", async () => {
-    const fake = fakeDbQuerySandboxNamespace(() => (
+describe('data-proxy container routing', () => {
+  it("runs a workspace's queries in that workspace's container, starting the relay forwarder first", async () => {
+    const fake = fakeDbQueryContainerNamespace(() => (
       { ok: true, rows: [], fields: [], rowCount: 0, truncated: false, durationMs: 1 }
     ));
+    fake.stub.relayForwarderReady.mockResolvedValueOnce(false);
 
     await postgresQuery(
       {
@@ -69,13 +70,16 @@ describe('data-proxy sandbox sessions', () => {
         DB_EGRESS_RELAY_SOCKS_USERNAME: 'u',
         DB_EGRESS_RELAY_SOCKS_PASSWORD: 'p',
       },
-      CONTEXT,
+      { orgId: 'org-1', workspaceId: 'WS-Mixed' },
       { mode: 'read', host: 'db.example.com', user: 'u', password: 'p', query: 'SELECT 1' },
     );
 
-    // Relay probe + runner, neither on the shared default session.
-    expect(fake.execSessions.length).toBeGreaterThanOrEqual(2);
-    expect(fake.execSessions).not.toContain('default');
-    expect(fake.stub.exec).not.toHaveBeenCalled();
+    expect(fake.names).toEqual(['ws-ws-mixed']);
+    expect(fake.stub.startRelayForwarder).toHaveBeenCalledWith({
+      hostname: 'db-relay.example.com',
+      accessClientId: undefined,
+      accessClientSecret: undefined,
+    });
+    expect(fake.calls).toHaveLength(1);
   });
 });

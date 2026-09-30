@@ -116,7 +116,7 @@ description: Follow ACME runbooks. Use when shipping internal tools.
       'WorkspaceFilesystemDO',
       'ProjectBuildContainer',
       'AnalysisSandbox',
-      'DbQuerySandbox',
+      'DbQueryContainer',
     ],
     'durableObjects',
   );
@@ -141,12 +141,23 @@ description: Follow ACME runbooks. Use when shipping internal tools.
   includesAll(manifest.omittedBindings.sendEmail, ['EMAIL'], 'omitted sendEmail bindings');
   includesAll(
     bindings.containers.map((container) => container.className),
-    ['ProjectBuildContainer', 'AnalysisSandbox', 'DbQuerySandbox'],
+    ['ProjectBuildContainer', 'AnalysisSandbox', 'DbQueryContainer'],
     'container bindings',
   );
   assert(
     !bindings.durableObjects.includes('ProjectBuildSandbox'),
     'the deleted 0.12 ProjectBuildSandbox class must not be bound',
+  );
+  assert(
+    !bindings.durableObjects.includes('DbQuerySandbox'),
+    'the deleted 0.12 DbQuerySandbox class must not be bound',
+  );
+  assert(
+    config.includes(
+      'className = "DbQueryContainer", uniqueKey = "camelai-selfhost-DbQueryContainer", ' +
+      'enableSql = true, container = (images = [(name = "db-query", image = "camelai-selfhost-db-query:1.0.0")])',
+    ),
+    'config should expose the db-query image to DbQueryContainer as ctx.container.images',
   );
   assert(
     !config.includes('PROJECT_BUILD_SANDBOX_RUNTIME'),
@@ -269,7 +280,6 @@ description: Follow ACME runbooks. Use when shipping internal tools.
   }
   for (const [containerClass, image] of [
     ['AnalysisSandbox', 'camelai-selfhost-analysis:0.12.0'],
-    ['DbQuerySandbox', 'camelai-selfhost-db-query:0.12.0'],
   ]) {
     assert(
       config.includes(

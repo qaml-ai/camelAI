@@ -250,6 +250,16 @@ release's images. `selfhost:container:smoke:project` exercises the real class
 against the image; the mount smoke uses the analysis image, which still runs the
 0.12 sandbox server.
 
+SQL queries and warehouse exports run on `DbQueryContainer`, the same class
+Cloudflare runs: the config exposes `SELFHOST_DB_QUERY_IMAGE` to it as the
+named image `db-query` (built from `workers/main/db-query-container.Dockerfile`,
+amd64). On self-host an export is written to a directory inside
+the container and copied into the `WAREHOUSE_EXPORT_BUCKET` binding when the
+export finishes, so it needs no FUSE or S3 credentials.
+`node scripts/selfhost-container-smoke.mjs db-query` exercises the class
+(`bun run selfhost:container:smoke:db-query`; add
+`SELFHOST_SMOKE_PUBLIC_DB=1` to also query a public Postgres).
+
 Intentionally disabled capabilities do not make the service unhealthy. Failed
 runtime checks still return HTTP 503 and `status: "fail"`. In particular,
 `PROJECT_BUILD_SANDBOX`, `ANALYSIS_SANDBOX`, and `DB_QUERY_SANDBOX` are required

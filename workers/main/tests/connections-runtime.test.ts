@@ -14,7 +14,7 @@ import {
   type ConnectionsRuntimeEnv,
 } from '../src/connections-runtime.js';
 import type { WorkspaceIntegrationRecord } from '../src/workspace.js';
-import { fakeDbQuerySandboxNamespace } from './fake-db-query-sandbox.js';
+import { fakeDbQueryContainerNamespace } from './fake-db-query-container.js';
 
 describe('bounded native MCP responses', () => {
   it('rejects declared and streamed oversized bodies before full materialization', async () => {
@@ -2843,7 +2843,7 @@ describe('connections runtime', () => {
   });
 
   it('executes read-only Postgres SQL through the db-query sandbox MCP broker', async () => {
-    const fake = fakeDbQuerySandboxNamespace((request) => {
+    const fake = fakeDbQueryContainerNamespace((request) => {
       expect(request).toMatchObject({
         engine: 'postgres',
         mode: 'read',
@@ -2902,7 +2902,7 @@ describe('connections runtime', () => {
   });
 
   it('does not append a default SQL LIMIT when the query has a parameterized LIMIT', async () => {
-    const fake = fakeDbQuerySandboxNamespace((request) => {
+    const fake = fakeDbQueryContainerNamespace((request) => {
       expect(request).toMatchObject({
         sql: 'select id from users LIMIT $1',
         params: [5],
@@ -2932,7 +2932,7 @@ describe('connections runtime', () => {
   });
 
   it('lists MySQL table metadata through the db-query sandbox MCP broker', async () => {
-    const fake = fakeDbQuerySandboxNamespace((request) => {
+    const fake = fakeDbQueryContainerNamespace((request) => {
       expect(request).toMatchObject({
         engine: 'mysql',
         mode: 'read',
@@ -2975,7 +2975,7 @@ describe('connections runtime', () => {
   });
 
   it('executes read-only Neon SQL through the Postgres db-query sandbox MCP broker', async () => {
-    const fake = fakeDbQuerySandboxNamespace((request) => {
+    const fake = fakeDbQueryContainerNamespace((request) => {
       expect(request).toMatchObject({
         engine: 'postgres',
         mode: 'read',
@@ -3028,7 +3028,7 @@ describe('connections runtime', () => {
   });
 
   it('executes read-only PlanetScale SQL through the MySQL db-query sandbox MCP broker', async () => {
-    const fake = fakeDbQuerySandboxNamespace((request) => {
+    const fake = fakeDbQueryContainerNamespace((request) => {
       expect(request).toMatchObject({
         engine: 'mysql',
         mode: 'read',
@@ -3075,7 +3075,7 @@ describe('connections runtime', () => {
   it('forwards SQL database MCP queries without keyword filtering', async () => {
     // The MCP does no keyword filtering: the statement is forwarded verbatim
     // in read mode — the runner's rolled-back transaction is the safety net.
-    const fake = fakeDbQuerySandboxNamespace((request) => {
+    const fake = fakeDbQueryContainerNamespace((request) => {
       expect(request).toMatchObject({
         mode: 'read',
         sql: 'delete from users',

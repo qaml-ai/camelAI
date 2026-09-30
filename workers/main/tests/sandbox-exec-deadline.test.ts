@@ -24,7 +24,7 @@ import {
   withProjectBuildServiceErrorMapping,
 } from '../src/project-build-readiness';
 import {
-  DbQuerySandboxNotReadyError,
+  DbQueryContainerNotReadyError,
   runDbExport,
   runDbQuery,
   type DbQueryDeps,
@@ -405,105 +405,58 @@ describe('analysis tools under a client-side deadline', () => {
 });
 
 
+const RUNNER_OK = {
+  stdout: JSON.stringify({
+    ok: true,
+    rows: [{ ok: 1 }],
+    fields: [{ name: 'ok' }],
+    rowCount: 1,
+    truncated: false,
+    durationMs: 1,
+  }),
+  stderr: '',
+  exitCode: 0,
+  timedOut: false,
+};
+
+function dbContainer(overrides: Record<string, unknown> = {}) {
+  return {
+    start: vi.fn(async () => {}),
+    startRelayForwarder: vi.fn(async () => {}),
+    relayForwarderReady: vi.fn(async () => true),
+    runRunner: vi.fn(async () => RUNNER_OK),
+    prepareWarehouseExport: vi.fn(async () => {}),
+    publishWarehouseExport: vi.fn(async () => {}),
+    destroy: vi.fn(async () => ({ destroyed: true })),
+    ...overrides,
+  };
+}
+
 describe('db-query under a client-side deadline', () => {
-  it('warms a cold sandbox before starting the short query setup deadline', async () => {
-    let releaseReady!: () => void;
+  it('starts a cold container before starting the short query setup deadline', async () => {
+    let releaseStart!: () => void;
     const order: string[] = [];
-    const deps = {
-      relay: null,
-      sandbox: {
-        ensureReady: vi.fn(() => new Promise<void>((resolve) => {
-          order.push('ready-start');
-          releaseReady = () => {
-            order.push('ready-end');
-            resolve();
-          };
-        })),
-        ensureRelayEgress: vi.fn(async () => {}),
-        ensureWarehouseExportMount: vi.fn(async () => {}),
-        startProcess: vi.fn(async () => ({})),
-        exec: vi.fn(async () => {
-          order.push('exec');
-          return {
-            stdout: JSON.stringify({
-              ok: true,
-              rows: [{ ok: 1 }],
-              fields: [{ name: 'ok' }],
-              rowCount: 1,
-              truncated: false,
-              durationMs: 1,
-            }),
-            stderr: '',
-            exitCode: 0,
-          };
-        }),
-      },
-    } as unknown as DbQueryDeps;
-
-    const running = runDbQuery(deps, {
-      engine: 'postgres',
-      sql: 'select 1 as ok',
+    const container = dbContainer({
+      start: vi.fn(() => new Promise<void>((resolve) => {
+        order.push('start-begin');
+        releaseStart = () => {
+          order.push('start-end');
+          resolve();
+        };
+      })),
+      runRunner: vi.fn(async () => {
+        order.push('runner');
+        return RUNNER_OK;
+      }),
     });
-    await vi.waitFor(() => expect(deps.sandbox.ensureReady).toHaveBeenCalledTimes(1));
-    expect(deps.sandbox.exec).not.toHaveBeenCalled();
-    releaseReady();
-    await expect(running).resolves.toMatchObject({ ok: true, rowCount: 1 });
-    expect(order).toEqual(['ready-start', 'ready-end', 'exec']);
-  });
+    const deps = { relay: null, container } as unknown as DbQueryDeps;
 
-  it('does not charge slow relay egress configuration to the short readiness budget', async () => {
-    vi.useFakeTimers();
-    let releaseRelayEgress!: () => void;
-    const order: string[] = [];
-    const deps = {
-      relay: {
-        hostname: 'db-relay.example.dev',
-        socksUsername: 'u',
-        socksPassword: 'p',
-      },
-      sandbox: {
-        ensureReady: vi.fn(async () => {
-          order.push('ready');
-        }),
-        ensureRelayEgress: vi.fn(() => new Promise<void>((resolve) => {
-          order.push('egress-start');
-          releaseRelayEgress = () => {
-            order.push('egress-end');
-            resolve();
-          };
-        })),
-        ensureWarehouseExportMount: vi.fn(async () => {}),
-        startProcess: vi.fn(async () => ({})),
-        exec: vi.fn(async () => {
-          if (!order.includes('probe')) {
-            order.push('probe');
-            return { stdout: 'up', stderr: '', exitCode: 0 };
-          }
-          order.push('query');
-          return {
-            stdout: JSON.stringify({
-              ok: true,
-              rows: [{ ok: 1 }],
-              fields: [{ name: 'ok' }],
-              rowCount: 1,
-              truncated: false,
-              durationMs: 1,
-            }),
-            stderr: '',
-            exitCode: 0,
-          };
-        }),
-      },
-    } as unknown as DbQueryDeps;
-
-    const running = runDbQuery(deps, { engine: 'postgres', sql: 'select 1 as ok' });
-    await vi.waitFor(() => expect(deps.sandbox.ensureRelayEgress).toHaveBeenCalledTimes(1));
-    // Longer than the 30s readiness + 15s grace that used to abandon this
-    // control-plane call even though the container was still progressing.
-    await vi.advanceTimersByTimeAsync(60_000);
-    releaseRelayEgress();
+    const running = runDbQuery(deps, { engine: 'postgres', sql: 'select 1 as ok' } as DbQueryRequest);
+    await vi.waitFor(() => expect(container.start).toHaveBeenCalledTimes(1));
+    expect(container.runRunner).not.toHaveBeenCalled();
+    releaseStart();
     await expect(running).resolves.toMatchObject({ ok: true, rowCount: 1 });
-    expect(order).toEqual(['ready', 'egress-start', 'egress-end', 'probe', 'query']);
+    expect(order).toEqual(['start-begin', 'start-end', 'runner']);
   });
 
   it('stops waiting on a container that never answers the runner', async () => {
@@ -512,13 +465,7 @@ describe('db-query under a client-side deadline', () => {
     const deps = {
       relay: null,
       onDeadlineExceeded,
-      sandbox: {
-        ensureReady: vi.fn(async () => {}),
-        ensureRelayEgress: vi.fn(async () => {}),
-        ensureWarehouseExportMount: vi.fn(async () => {}),
-        startProcess: vi.fn(async () => ({})),
-        exec: vi.fn(() => new Promise<never>(() => {})),
-      },
+      container: dbContainer({ runRunner: vi.fn(() => new Promise<never>(() => {})) }),
     } as unknown as DbQueryDeps;
 
     const promise = runDbQuery(deps, {
@@ -538,34 +485,19 @@ describe('db-query under a client-side deadline', () => {
   });
 
   it('stops waiting on a relay readiness probe that never answers', async () => {
-    // BOTH deployed environments configure a relay, so every real query runs
-    // the forwarder prelude BEFORE the runner exec. Those awaits used to be
-    // unbounded: the probe's 5s `timeout` is enforced container-side only, and
-    // the poll loop's wall-clock check is reached only AFTER a probe settles.
+    // Deployed environments configure a relay, so every real query runs the
+    // forwarder prelude BEFORE the runner. A probe that never answers must not
+    // hold the caller until its own ceiling.
     vi.useFakeTimers();
     const onDeadlineExceeded = vi.fn();
     const deps = {
-      relay: {
-        hostname: 'db-relay.example.dev',
-        socksUsername: 'u',
-        socksPassword: 'p',
-      },
+      relay: { hostname: 'db-relay.example.dev', socksUsername: 'u', socksPassword: 'p' },
       readinessTimeoutMs: 30_000,
       onDeadlineExceeded,
-      sandbox: {
-        ensureReady: vi.fn(async () => {}),
-        ensureRelayEgress: vi.fn(async () => {}),
-        ensureWarehouseExportMount: vi.fn(async () => {}),
-        startProcess: vi.fn(async () => ({})),
-        // The container took the probe and never answered.
-        exec: vi.fn(() => new Promise<never>(() => {})),
-      },
+      container: dbContainer({ relayForwarderReady: vi.fn(() => new Promise<never>(() => {})) }),
     } as unknown as DbQueryDeps;
 
-    const promise = runDbQuery(deps, {
-      engine: 'postgres',
-      sql: 'select 1',
-    } as unknown as DbQueryRequest);
+    const promise = runDbQuery(deps, { engine: 'postgres', sql: 'select 1' } as unknown as DbQueryRequest);
     const assertion = expect(promise).rejects.toThrow(/db_query_setup did not return within/);
     // 30s readiness + 15s grace — not the caller's 20-minute ceiling.
     await vi.advanceTimersByTimeAsync(45_001);
@@ -580,19 +512,10 @@ describe('db-query under a client-side deadline', () => {
     const deps = {
       relay: { hostname: 'db-relay.example.dev', socksUsername: 'u', socksPassword: 'p' },
       readinessTimeoutMs: 30_000,
-      sandbox: {
-        ensureReady: vi.fn(async () => {}),
-        ensureRelayEgress: vi.fn(async () => {}),
-        ensureWarehouseExportMount: vi.fn(async () => {}),
-        startProcess: vi.fn(async () => ({})),
-        exec: vi.fn(async () => ({ stdout: 'down', stderr: '', exitCode: 0 })),
-      },
+      container: dbContainer({ relayForwarderReady: vi.fn(async () => false) }),
     } as unknown as DbQueryDeps;
 
-    const promise = runDbQuery(deps, {
-      engine: 'postgres',
-      sql: 'select 1',
-    } as unknown as DbQueryRequest);
+    const promise = runDbQuery(deps, { engine: 'postgres', sql: 'select 1' } as unknown as DbQueryRequest);
     const assertion = expect(promise).rejects.toThrow(/forwarder never became ready/);
     await vi.advanceTimersByTimeAsync(31_000);
     await assertion;
@@ -603,66 +526,40 @@ describe('db-query wedged-container recovery', () => {
   const RELAY = { hostname: 'db-relay.example.dev', socksUsername: 'u', socksPassword: 'p' };
 
   function wedgeDeps(overrides: Record<string, unknown>) {
+    const container = dbContainer(overrides);
     return {
       relay: RELAY,
       readinessTimeoutMs: 30_000,
       onDeadlineExceeded: vi.fn(),
-      sandbox: {
-        ensureReady: vi.fn(async () => {}),
-        ensureRelayEgress: vi.fn(async () => {}),
-        ensureWarehouseExportMount: vi.fn(async () => {}),
-        startProcess: vi.fn(async () => ({})),
-        exec: vi.fn(async () => ({ stdout: 'up', stderr: '', exitCode: 0 })),
-        restartWedgedContainer: vi.fn(async () => ({ restarted: true, reason: 'forced' })),
-        ...overrides,
-      },
-    } as unknown as DbQueryDeps & {
-      sandbox: { restartWedgedContainer: ReturnType<typeof vi.fn> };
-    };
+      container,
+    } as unknown as DbQueryDeps & { container: ReturnType<typeof dbContainer> };
   }
 
   it('destroys the container when startup never returns, and still fails this call', async () => {
-    // The prod incident: every query for four days died here at 135s and the
-    // container never self-healed.
+    // The 0.12 prod incident: every query for four days died at the start
+    // budget and the container never recovered on its own.
     vi.useFakeTimers();
-    const deps = wedgeDeps({ ensureReady: vi.fn(() => new Promise<never>(() => {})) });
+    const deps = wedgeDeps({ start: vi.fn(() => new Promise<never>(() => {})) });
 
     const promise = runDbQuery(deps, { engine: 'postgres', sql: 'select 1' } as DbQueryRequest);
-    const assertion = expect(promise).rejects.toThrow(
-      /db_query_container_start did not return within/,
-    );
-    // 120s SDK startup ceiling + 15s grace.
+    const assertion = expect(promise).rejects.toThrow(/db_query_container_start did not return within/);
+    // 120s startup ceiling + 15s grace.
     await vi.advanceTimersByTimeAsync(135_001);
     await assertion;
 
-    expect(deps.sandbox.restartWedgedContainer).toHaveBeenCalledTimes(1);
-    expect(deps.sandbox.restartWedgedContainer.mock.calls[0][0]).toMatchObject({
+    expect(deps.container.destroy).toHaveBeenCalledTimes(1);
+    expect(deps.container.destroy.mock.calls[0][0]).toMatchObject({
       operation: 'db_query_container_start',
       error: expect.stringContaining('SandboxDeadlineExceededError'),
     });
-    // No in-call retry: the heal is for the next call.
-    expect(deps.sandbox.ensureReady).toHaveBeenCalledTimes(1);
-    expect(deps.sandbox.exec).not.toHaveBeenCalled();
-  });
-
-  it('destroys the container when relay egress configuration never returns', async () => {
-    vi.useFakeTimers();
-    const deps = wedgeDeps({ ensureRelayEgress: vi.fn(() => new Promise<never>(() => {})) });
-
-    const promise = runDbQuery(deps, { engine: 'postgres', sql: 'select 1' } as DbQueryRequest);
-    const assertion = expect(promise).rejects.toThrow(/db_query_relay_egress did not return within/);
-    await vi.advanceTimersByTimeAsync(135_001);
-    await assertion;
-
-    expect(deps.sandbox.restartWedgedContainer).toHaveBeenCalledTimes(1);
-    expect(deps.sandbox.restartWedgedContainer.mock.calls[0][0]).toMatchObject({
-      operation: 'db_query_relay_egress',
-    });
+    // No in-call retry: the fresh container is for the next call.
+    expect(deps.container.start).toHaveBeenCalledTimes(1);
+    expect(deps.container.runRunner).not.toHaveBeenCalled();
   });
 
   it('destroys the container when the export setup prelude never answers', async () => {
     vi.useFakeTimers();
-    const deps = wedgeDeps({ exec: vi.fn(() => new Promise<never>(() => {})) });
+    const deps = wedgeDeps({ relayForwarderReady: vi.fn(() => new Promise<never>(() => {})) });
 
     const promise = runDbExport(
       deps,
@@ -674,20 +571,13 @@ describe('db-query wedged-container recovery', () => {
     await vi.advanceTimersByTimeAsync(45_001);
     await assertion;
 
-    expect(deps.sandbox.restartWedgedContainer.mock.calls[0][0]).toMatchObject({
-      operation: 'db_export_setup',
-    });
-    expect(deps.sandbox.ensureWarehouseExportMount).not.toHaveBeenCalled();
+    expect(deps.container.destroy.mock.calls[0][0]).toMatchObject({ operation: 'db_export_setup' });
+    expect(deps.container.prepareWarehouseExport).not.toHaveBeenCalled();
   });
 
   it('never destroys the container for a slow QUERY or a relay that answers "down"', async () => {
     vi.useFakeTimers();
-    const slowQuery = wedgeDeps({
-      exec: vi.fn(async (command: string) => {
-        if (command.includes('/dev/tcp/')) return { stdout: 'up', stderr: '', exitCode: 0 };
-        return new Promise<never>(() => {});
-      }),
-    });
+    const slowQuery = wedgeDeps({ runRunner: vi.fn(() => new Promise<never>(() => {})) });
     const queryPromise = runDbQuery(slowQuery, {
       engine: 'postgres',
       sql: 'select pg_sleep(600)',
@@ -696,28 +586,26 @@ describe('db-query wedged-container recovery', () => {
     const queryAssertion = expect(queryPromise).rejects.toThrow(/db_query did not return within/);
     await vi.advanceTimersByTimeAsync(60_001);
     await queryAssertion;
-    expect(slowQuery.sandbox.restartWedgedContainer).not.toHaveBeenCalled();
+    expect(slowQuery.container.destroy).not.toHaveBeenCalled();
 
-    const relayDown = wedgeDeps({
-      exec: vi.fn(async () => ({ stdout: 'down', stderr: '', exitCode: 0 })),
-    });
+    const relayDown = wedgeDeps({ relayForwarderReady: vi.fn(async () => false) });
     const relayPromise = runDbQuery(relayDown, { engine: 'postgres', sql: 'select 1' } as DbQueryRequest);
     const relayAssertion = expect(relayPromise).rejects.toThrow(/forwarder never became ready/);
     await vi.advanceTimersByTimeAsync(31_000);
     await relayAssertion;
-    expect(relayDown.sandbox.restartWedgedContainer).not.toHaveBeenCalled();
+    expect(relayDown.container.destroy).not.toHaveBeenCalled();
   });
 
   it('tells the agent nothing ran and a retry is safe after a setup deadline', async () => {
     vi.useFakeTimers();
-    const deps = wedgeDeps({ exec: vi.fn(() => new Promise<never>(() => {})) });
+    const deps = wedgeDeps({ relayForwarderReady: vi.fn(() => new Promise<never>(() => {})) });
 
     const promise = runDbQuery(deps, { engine: 'postgres', sql: 'select 1' } as DbQueryRequest)
       .catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(45_001);
     const error = await promise;
 
-    expect(error).toBeInstanceOf(DbQuerySandboxNotReadyError);
+    expect(error).toBeInstanceOf(DbQueryContainerNotReadyError);
     expect((error as Error).message).toMatch(/query was NOT sent to the database/);
     expect((error as Error).message).toMatch(/restarted; retrying the same query is safe/);
     // The generic "may already have run, do NOT repeat" advice is wrong here.
@@ -725,25 +613,25 @@ describe('db-query wedged-container recovery', () => {
     expect((error as Error).cause).toBeInstanceOf(SandboxDeadlineExceededError);
   });
 
-  it('surfaces the original deadline error when the heal request itself fails', async () => {
+  it('surfaces the original deadline error when the destroy request itself fails', async () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const deps = wedgeDeps({
-        ensureReady: vi.fn(() => new Promise<never>(() => {})),
-        restartWedgedContainer: vi.fn(async () => {
+        start: vi.fn(() => new Promise<never>(() => {})),
+        destroy: vi.fn(async () => {
           throw new Error('DO unreachable');
         }),
       });
 
       const promise = runDbQuery(deps, { engine: 'postgres', sql: 'select 1' } as DbQueryRequest);
       const assertion = expect(promise).rejects.toMatchObject({
-        name: 'DbQuerySandboxNotReadyError',
+        name: 'DbQueryContainerNotReadyError',
         cause: expect.any(SandboxDeadlineExceededError),
       });
       await vi.advanceTimersByTimeAsync(135_001);
       await assertion;
-      expect(deps.sandbox.restartWedgedContainer).toHaveBeenCalledTimes(1);
+      expect(deps.container.destroy).toHaveBeenCalledTimes(1);
     } finally {
       warn.mockRestore();
     }

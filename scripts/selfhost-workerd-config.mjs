@@ -169,9 +169,13 @@ const SELFHOST_CONTAINER_IMAGES = {
     env: 'SELFHOST_ANALYSIS_IMAGE',
     image: 'camelai-selfhost-analysis:0.12.0',
   },
-  DbQuerySandbox: {
-    env: 'SELFHOST_DB_QUERY_IMAGE',
-    image: 'camelai-selfhost-db-query:0.12.0',
+  DbQueryContainer: {
+    images: {
+      'db-query': {
+        env: 'SELFHOST_DB_QUERY_IMAGE',
+        image: 'camelai-selfhost-db-query:1.0.0',
+      },
+    },
   },
 };
 
@@ -840,6 +844,7 @@ async function main() {
   for (const key of Object.keys(vars)) {
     if (process.env[key] !== undefined) vars[key] = process.env[key];
   }
+
 
   // Resolve `.selfhost/agent` (or env overrides) into Worker text bindings.
   // loadSelfhostAgentPack already prefers non-empty env values over files.

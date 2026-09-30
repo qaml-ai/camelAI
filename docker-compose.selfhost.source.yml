@@ -27,7 +27,7 @@ services:
   db-query-image:
     build:
       context: workers/main
-      dockerfile: db-query-sandbox.Dockerfile
+      dockerfile: db-query-container.Dockerfile
 
   container-egress-image:
     build:

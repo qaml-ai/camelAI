@@ -2,7 +2,7 @@
 
 // Local smoke for the HTTP-based connection MCP brokers (Redis, ClickHouse,
 // MongoDB, Turso). The SQL-database MCP (postgres/mysql/mssql) is NOT smoked
-// here anymore: it executes in the DbQuerySandbox Cloudflare container (see
+// here anymore: it executes in the DbQueryContainer Cloudflare container (see
 // workers/main/src/db-query-service.ts), which tsx cannot host — its coverage
 // lives in tests/db-query-*.test.ts, workers/main/tests/data-proxy-*.test.ts,
 // workers/main/tests/connections-runtime.test.ts, and the staging smoke route

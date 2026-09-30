@@ -84,17 +84,20 @@ const runtimes = {
     marker: "camelai-analysis-notebook-ok",
     archiveTest: true,
   },
+  // The real DbQueryContainer against the db-query image: drivers, the
+  // background forwarder, the exec timeout, and a self-host export copied into
+  // the R2 binding. SELFHOST_SMOKE_PUBLIC_DB=1 also runs a real query against
+  // a public Postgres through runDbQuery (needs Internet from the container).
   "db-query": {
-    className: "DbQuerySandbox",
+    className: "DbQueryContainer",
+    native: true,
+    imageName: "db-query",
     image:
       process.env.SELFHOST_DB_QUERY_IMAGE ||
       selfhostEnv.SELFHOST_DB_QUERY_IMAGE ||
-      "camelai-selfhost-db-query:0.12.0",
-    command:
-      "cd /opt/db-query-runner && node -e " +
-      `"for (const m of ['pg','pg-cursor','mysql2','tedious','@dsnp/parquetjs','socks']) ` +
-      `require.resolve(m); console.log('camelai-db-query-drivers-ok')"`,
-    marker: "camelai-db-query-drivers-ok",
+      "camelai-selfhost-db-query:1.0.0",
+    marker: "camelai-db-query-ok",
+    bucketBinding: "WAREHOUSE_EXPORT_BUCKET",
   },
 };
 const runtimeName = process.argv[2] || "project";
@@ -136,7 +139,8 @@ let child;
 try {
   await fs.mkdir(statePath);
   await fs.mkdir(r2StatePath);
-  const needsR2 = runtime.mountTest || runtime.archiveTest;
+  const needsR2 = runtime.mountTest || runtime.archiveTest || Boolean(runtime.bucketBinding);
+  const bucketBinding = runtime.bucketBinding ?? "SMOKE_BUCKET";
   const fetchBody = runtime.mountTest
     ? `
       await env.SMOKE_BUCKET.put("smoke/input.txt", "from-r2");
@@ -246,7 +250,10 @@ export default {
 `;
   await fs.writeFile(
     sourcePath,
-    runtime.native ? nativeSource : `
+    runtime.native ? (runtimeName === "db-query"
+      ? `export * from ${JSON.stringify(path.join(repoRoot, "scripts/selfhost-db-query-smoke-worker.ts"))};\n` +
+        `export { default } from ${JSON.stringify(path.join(repoRoot, "scripts/selfhost-db-query-smoke-worker.ts"))};\n`
+      : nativeSource) : `
 import { ContainerProxy, getSandbox, Sandbox } from "@cloudflare/sandbox";
 
 export { ContainerProxy };
@@ -268,15 +275,39 @@ export default {
 `,
   );
 
-  await run("bun", [
-    "build",
-    sourcePath,
-    "--target=browser",
-    "--format=esm",
-    "--external=cloudflare:workers",
-    "--external=node:*",
-    `--outfile=${bundlePath}`,
-  ]);
+  // Bun.build instead of `bun build` for the plugin: db-query-service.ts
+  // imports the runner source as a virtual module (as the Worker build does).
+  const buildScriptPath = path.join(tempDir, "build.mjs");
+  await fs.writeFile(
+    buildScriptPath,
+    `
+import fs from "node:fs/promises";
+const runnerSource = await fs.readFile(${JSON.stringify(path.join(repoRoot, "workers/main/db-query-sandbox-assets/runner/db-query-runner.mjs"))}, "utf8");
+const result = await Bun.build({
+  entrypoints: [${JSON.stringify(sourcePath)}],
+  outdir: ${JSON.stringify(tempDir)},
+  naming: ${JSON.stringify(path.basename(bundlePath))},
+  target: "browser",
+  format: "esm",
+  external: ["cloudflare:workers", "node:*"],
+  plugins: [{
+    name: "db-query-runner-source",
+    setup(builder) {
+      builder.onResolve({ filter: /^virtual:db-query-runner-source$/ }, () => ({ path: "runner", namespace: "smoke-virtual" }));
+      builder.onLoad({ filter: /.*/, namespace: "smoke-virtual" }, () => ({
+        contents: "export default " + JSON.stringify(runnerSource) + ";",
+        loader: "js",
+      }));
+    },
+  }],
+});
+if (!result.success) {
+  for (const log of result.logs) console.error(log);
+  process.exit(1);
+}
+`,
+  );
+  await run("bun", [buildScriptPath]);
 
   await fs.writeFile(
     configPath,
@@ -291,7 +322,9 @@ const smoke :Workerd.Config = (
       bindings = [
         (name = "SANDBOX", durableObjectNamespace = (
           className = ${JSON.stringify(runtime.className)}
-        ))${needsR2 ? ',\n        (name = "SMOKE_BUCKET", r2Bucket = (name = "r2:bucket:smoke"))' : ""}
+        ))${needsR2 ? `,\n        (name = ${JSON.stringify(bucketBinding)}, r2Bucket = (name = "r2:bucket:smoke"))` : ""}${runtime.bucketBinding ? `,
+        (name = "CF_ACCOUNT_ID", text = "selfhost"),
+        (name = "SMOKE_PUBLIC_DB", text = ${JSON.stringify(process.env.SELFHOST_SMOKE_PUBLIC_DB === "1" ? "1" : "0")})` : ""}
       ],
       globalOutbound = "internet",
       durableObjectNamespaces = [(
@@ -390,7 +423,8 @@ ${needsR2 ? `    (name = "r2:bucket:smoke", worker = (
     throw new Error(`Unexpected sandbox response: ${JSON.stringify(result)}`);
   }
   console.log(
-    `Self-host ${runtimeName} localDocker smoke passed with ${runtime.image}.`,
+    `Self-host ${runtimeName} localDocker smoke passed with ${runtime.image}.` +
+      (runtime.bucketBinding ? ` (${result.stdout.trim()})` : ""),
   );
 } finally {
   if (child && child.exitCode === null) {

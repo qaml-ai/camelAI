@@ -188,7 +188,7 @@ includesAll(
     "infra/selfhost/local-artifacts.Dockerfile",
     "project-build-container.Dockerfile",
     "analysis-sandbox.Dockerfile",
-    "db-query-sandbox.Dockerfile",
+    "db-query-container.Dockerfile",
     "workers/main/eval-egress-fix",
   ],
   "source-build Compose override",

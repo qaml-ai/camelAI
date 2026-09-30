@@ -17,7 +17,6 @@ import {
   type MountRecoverTarget,
 } from '../src/analysis-sandbox.js';
 import { ANALYSIS_SANDBOX_OPTIONS } from '../src/analysis-service.js';
-import { DbQuerySandbox } from '../src/db-query-sandbox.js';
 import {
   createSandboxZombieHealState,
   SandboxSessionDeathTracker,
@@ -150,19 +149,6 @@ describe('mount bookkeeping across a container stop', () => {
     expect(sandbox.mountedPaths.size).toBe(0);
     expect(sandbox.mountGates.size).toBe(0);
     // The SDK's own teardown still runs.
-    expect(superOnStop).toHaveBeenCalledTimes(1);
-  });
-
-  it('DbQuerySandbox has the identical reset (same pattern, same hazard)', async () => {
-    const sandbox = Object.create(DbQuerySandbox.prototype) as any;
-    sandbox.mountedPaths = new Set(['/warehouse/ws-1']);
-    sandbox.mountGates = new Map([['/warehouse/ws-1', createSingleFlight()]]);
-    const superOnStop = vi.fn(async () => {});
-    await withStubbedSuperOnStop(DbQuerySandbox, superOnStop, () =>
-      DbQuerySandbox.prototype.onStop.call(sandbox));
-
-    expect(sandbox.mountedPaths.size).toBe(0);
-    expect(sandbox.mountGates.size).toBe(0);
     expect(superOnStop).toHaveBeenCalledTimes(1);
   });
 });
@@ -366,35 +352,6 @@ describe('AnalysisSandbox zombie self-heal', () => {
     } finally {
       warn.mockRestore();
     }
-  });
-
-  it('remounts DbQuerySandbox exports after a generation change or failed health check', async () => {
-    const sandbox = Object.create(DbQuerySandbox.prototype) as any;
-    sandbox.env = { CF_ACCOUNT_ID: 'cloudflare-account' };
-    sandbox.containerGeneration = 1;
-    sandbox.mountedContainerGeneration = 0;
-    sandbox.mountedPaths = new Set(['/warehouse/ws-1']);
-    sandbox.mountGates = new Map([['/warehouse/ws-1', createSingleFlight()]]);
-    sandbox.mountBucket = vi.fn(async () => undefined);
-    sandbox.unmountBucket = vi.fn(async () => undefined);
-    sandbox.exec = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }));
-
-    await DbQuerySandbox.prototype.ensureWarehouseExportMount.call(
-      sandbox,
-      'warehouse/ws-1',
-    );
-    expect(sandbox.mountBucket).toHaveBeenCalledTimes(1);
-
-    sandbox.exec.mockResolvedValue({
-      exitCode: 1,
-      stdout: '',
-      stderr: 'ls: Input/output error',
-    });
-    await DbQuerySandbox.prototype.ensureWarehouseExportMount.call(
-      sandbox,
-      'warehouse/ws-1',
-    );
-    expect(sandbox.mountBucket).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -863,49 +820,6 @@ describe('AnalysisSandbox.ensureMounted self-heal', () => {
     await expect(ensureUploads(sandbox)).rejects.toBeInstanceOf(S3FSMountError);
     expect(destroy).not.toHaveBeenCalled();
     expect(recordedEvents(sandbox)).toEqual([]);
-  });
-
-  it('gives the DbQuerySandbox export mount the same self-heal', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    try {
-      const { sandbox: analysis, destroy } = healableSandbox();
-      const sandbox = Object.create(DbQuerySandbox.prototype) as any;
-      Object.assign(sandbox, {
-        ctx: analysis.ctx,
-        env: analysis.env,
-        destroy,
-        zombieHealState: createSandboxZombieHealState(),
-        containerGeneration: 1,
-        mountedContainerGeneration: 1,
-        mountedPaths: new Set<string>(),
-        mountGates: new Map(),
-        activeMounts: new Map(),
-      });
-      let fuseMounted = true;
-      sandbox.mountBucket = vi.fn(async (_bucket: string, path: string) => {
-        if (fuseMounted) {
-          throw new S3FSMountError(`S3FS mount failed: s3fs: MOUNTPOINT directory ${path} is not empty`);
-        }
-      });
-      sandbox.unmountBucket = vi.fn(async (path: string) => {
-        throw new InvalidMountConfigError(`No active mount found at path: ${path}`);
-      });
-      sandbox.exec = vi.fn(async (command: string) => {
-        if (command === forceUnmountCommand('/warehouse/ws-1')) fuseMounted = false;
-        return { exitCode: 0, stdout: '', stderr: '' };
-      });
-
-      await DbQuerySandbox.prototype.ensureWarehouseExportMount.call(sandbox, 'warehouse/ws-1');
-
-      expect(destroy).not.toHaveBeenCalled();
-      expect(recordedEvents(sandbox)).toEqual([
-        ['sandbox_mount_recovery', 'force_remounted'],
-      ]);
-      const point = sandbox.env.OBSERVABILITY_EVENTS.writeDataPoint.mock.calls[0][0];
-      expect(point.blobs[2]).toBe('DbQuerySandbox');
-    } finally {
-      warn.mockRestore();
-    }
   });
 });
 

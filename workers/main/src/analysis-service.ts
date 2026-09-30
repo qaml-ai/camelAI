@@ -116,8 +116,7 @@ export const ANALYSIS_HOUSEKEEPING_TIMEOUT_MS = 120_000;
 /**
  * `getSandbox()` options for every worker-side AnalysisSandbox stub.
  *
- * `enableDefaultSession: false` is load-bearing (same reasoning as
- * DB_QUERY_SANDBOX_OPTIONS in db-query-service.ts). By default the SDK writes
+ * `enableDefaultSession: false` is load-bearing. By default the SDK writes
  * every exec into ONE persistent bash per sandbox, guarded by a per-session
  * mutex. A timeout there only rejects our promise: the command keeps running in
  * that shell, and every later exec (the next run, the SDK's own mount steps)

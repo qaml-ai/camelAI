@@ -27,6 +27,9 @@
   "routes": [{ "pattern": "camelai.dev", "custom_domain": true }],
   "vpc_services": [],
   "vars": {
+    // Bucket behind WAREHOUSE_EXPORT_BUCKET, which DbQueryContainer mounts over
+    // S3 with the R2_S3_ACCESS_KEY_ID / R2_S3_SECRET_ACCESS_KEY secrets.
+    "WAREHOUSE_EXPORT_BUCKET_NAME": "chiridion-warehouse-exports",
     // Hosted agent runtime: with these plus the AGENT_RUNTIME_API_TOKEN secret,
     // every thread runs on it (threads still on ChatThreadDO move there when
     // next opened or sent to: agent-runtime/thread-migration.ts).
@@ -102,15 +105,18 @@
     },
     {
       // Trusted db-query runner with static-IP egress via the sandbox-host
-      // SOCKS relay (docs/db-egress-relay.md). No user code runs here. This is
-      // THE SQL query/export path (connection MCP, DATA_PROXY user-app binding,
-      // sandbox routes) — one warm container per active workspace, scale-to-zero
-      // when idle, so the cap bounds concurrently-querying workspaces
-      // (25 × standard-1 = 12.5 vCPU, well under the account container budget).
-      "class_name": "DbQuerySandbox",
-      "image": "./workers/main/db-query-sandbox.Dockerfile",
-      "instance_type": "standard-1",
-      "max_instances": 25,
+      // SOCKS relay (docs/db-egress-relay.md), on the native Durable Object
+      // container API (Sandbox SDK 1.0). No user code runs here; one
+      // container per active workspace. The durable_object policy takes no
+      // image/instance_type/max_instances: the instance size (standard-1) is
+      // chosen in start(), see workers/main/src/db-query-container.ts. The
+      // name must be unique per environment.
+      "class_name": "DbQueryContainer",
+      "name": "chiridion-app-db-query",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "db-query": { "dockerfile": "./workers/main/db-query-container.Dockerfile" },
+      },
     },
   ],
   "artifacts": [
@@ -203,7 +209,7 @@
 	      { "name": "WORKSPACE_FS", "class_name": "WorkspaceFilesystemDO" },
 	      { "name": "ANALYSIS_SANDBOX", "class_name": "AnalysisSandbox" },
 	      { "name": "PROJECT_BUILD_SANDBOX", "class_name": "ProjectBuildContainer" },
-	      { "name": "DB_QUERY_SANDBOX", "class_name": "DbQuerySandbox" },
+	      { "name": "DB_QUERY_SANDBOX", "class_name": "DbQueryContainer" },
 	    ],
 	  },
   "workflows": [
@@ -254,5 +260,6 @@
 	    { "tag": "v35", "deleted_classes": ["OrgSlugDO"] },
 	    { "tag": "v36", "new_sqlite_classes": ["ProjectBuildContainer"] },
 	    { "tag": "v37", "deleted_classes": ["ProjectBuildSandbox"] },
+	    { "tag": "v38", "new_sqlite_classes": ["DbQueryContainer"], "deleted_classes": ["DbQuerySandbox"] },
 	  ],
 	}

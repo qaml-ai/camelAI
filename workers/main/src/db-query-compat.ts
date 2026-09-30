@@ -1,5 +1,5 @@
 /**
- * Legacy data-proxy contract ↔ DbQuerySandbox mapping — PURE functions.
+ * Legacy data-proxy contract ↔ DbQueryContainer mapping — PURE functions.
  *
  * The retired Go data-proxy (project-runtime-service cmd/data-proxy) defined
  * the request/response shapes that `DATA_PROXY` user-app bindings, the sandbox

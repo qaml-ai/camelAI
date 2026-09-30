@@ -58,7 +58,7 @@ describe("self-host Docker container runtime", () => {
       "project-build-container.Dockerfile",
     ],
     ["analysis-image", "workers/main", "analysis-sandbox.Dockerfile"],
-    ["db-query-image", "workers/main", "db-query-sandbox.Dockerfile"],
+    ["db-query-image", "workers/main", "db-query-container.Dockerfile"],
   ])("builds %s from the current Cloudflare container Dockerfile only in source mode", (
     serviceName,
     context,

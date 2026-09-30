@@ -66,3 +66,9 @@ export const ANALYSIS_SLEEP_AFTER = "5m";
 
 /** Single-shot queries/exports; sleep promptly when the workspace goes quiet. */
 export const DB_QUERY_SLEEP_AFTER = "2m";
+
+/**
+ * The same 2m idle window as a number, for the native-container db-query
+ * container (DbQueryContainer), which sets it through `setInactivityTimeout()`.
+ */
+export const DB_QUERY_IDLE_TIMEOUT_MS = 2 * 60_000;

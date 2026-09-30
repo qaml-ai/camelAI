@@ -150,12 +150,7 @@ import {
 import { ProjectFilesystemClient, WorkspaceFilesystemClient } from "../../workspace-filesystem-do.js";
 import { recordObservabilityEvent } from "../../observability.js";
 import { getSandbox } from "@cloudflare/sandbox";
-import {
-  DB_QUERY_SANDBOX_OPTIONS,
-  relayConfigFromEnv,
-  runDbQuery,
-  type DbQuerySandboxStub,
-} from "../../db-query-service.js";
+import { dbQueryContainerKey, getDbQueryContainer, relayConfigFromEnv, runDbQuery } from "../../db-query-service.js";
 import { buildLogTail, cleanBuildLog, getProjectBuildSandbox, runProjectBuild } from "../../project-build-service.js";
 import { projectBuildReadinessEventName, runWithProjectBuildReadiness } from "../../project-build-readiness.js";
 import { waitUntil } from "cloudflare:workers";
@@ -896,17 +891,11 @@ routes.post(
       return c.json({ error: "DB_QUERY_SANDBOX container binding is not configured" }, 400);
     }
 
-    // Keep this key identical to data-proxy.ts resolveDbQueryDeps().
-    const sandboxId = `ws-${workspaceId}`;
+    const sandboxId = dbQueryContainerKey(workspaceId);
     const destroyed: string[] = [];
     const errors: Array<{ sandbox_id: string; error: string }> = [];
     try {
-      const sandbox = getSandbox(
-        c.env.DB_QUERY_SANDBOX,
-        sandboxId,
-        DB_QUERY_SANDBOX_OPTIONS,
-      ) as { destroy: () => Promise<void> };
-      await sandbox.destroy();
+      await getDbQueryContainer(c.env, sandboxId).destroy();
       destroyed.push(sandboxId);
     } catch (error) {
       errors.push({
@@ -938,7 +927,7 @@ routes.post(
 // POST /db-query-sandbox/query
 // ---------------------------------------------------------------------------
 
-const DbQuerySandboxQueryBodySchema = z.object({
+const DbQueryContainerQueryBodySchema = z.object({
   engine: z.enum(["postgres", "mysql", "mssql"]),
   mode: z.enum(["read", "modify"]).optional(),
   target: z.object({
@@ -958,7 +947,7 @@ const DbQuerySandboxQueryBodySchema = z.object({
   sandbox_key: z.string().min(1).optional(),
 });
 
-const DbQuerySandboxQueryResponseSchema = z.object({
+const DbQueryContainerQueryResponseSchema = z.object({
   ok: z.boolean(),
   rows: z.array(z.record(z.unknown())).optional(),
   fields: z.array(z.object({ name: z.string() })).optional(),
@@ -970,7 +959,7 @@ const DbQuerySandboxQueryResponseSchema = z.object({
 
 /**
  * Smoke path for the static-IP database egress chain (docs/db-egress-relay.md):
- * DbQuerySandbox container → cloudflared access tcp → sandbox-host tunnel →
+ * DbQueryContainer → cloudflared access tcp → sandbox-host tunnel →
  * gost SOCKS relay → target database, egressing from the VM's static IP.
  * Admin-only with an explicit target; production traffic goes through the
  * legacy-contract surface in data-proxy.ts (connection MCP, DATA_PROXY
@@ -980,9 +969,9 @@ routes.post(
   "/db-query-sandbox/query",
   openApi({
     summary: "Run one SQL query through the static-IP db egress relay (smoke test)",
-    request: { json: DbQuerySandboxQueryBodySchema },
+    request: { json: DbQueryContainerQueryBodySchema },
     responses: {
-      200: DbQuerySandboxQueryResponseSchema,
+      200: DbQueryContainerQueryResponseSchema,
       400: ErrorSchema,
     },
   }),
@@ -995,15 +984,11 @@ routes.post(
     const relay = relayConfigFromEnv(c.env);
     const body = c.req.valid("json");
 
-    const sandbox = getSandbox(
-      c.env.DB_QUERY_SANDBOX,
-      body.sandbox_key ?? "admin-smoke",
-      DB_QUERY_SANDBOX_OPTIONS,
-    ) as unknown as DbQuerySandboxStub;
+    const container = getDbQueryContainer(c.env, body.sandbox_key ?? "admin-smoke");
 
     const started = Date.now();
     const result = await runDbQuery(
-      { sandbox, relay },
+      { container, relay },
       {
         engine: body.engine,
         mode: body.mode,

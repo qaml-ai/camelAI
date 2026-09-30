@@ -90,7 +90,10 @@ export { AppBrowserBinding } from './app-browser-binding.js';
 export { WorkspaceFilesystemDO } from './workspace-filesystem-do.js';
 export { AnalysisSandbox } from './analysis-sandbox.js';
 export { ProjectBuildContainer } from './project-build-container.js';
-export { DbQuerySandbox } from './db-query-sandbox.js';
+export { DbQueryContainer } from './db-query-container.js';
+// DbQueryContainer's warehouse export mount (S3Mount) sends each storage
+// request to this entrypoint, which signs it; the container never sees the key.
+export { S3Gateway } from '@cloudflare/sandbox-v1';
 
 // Compatibility shim for environments whose deployed migration history still
 // references the old AdminIndexDO class. The app uses the D1-backed index now.

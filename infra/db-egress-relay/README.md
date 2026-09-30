@@ -4,7 +4,7 @@ Gives Cloudflare-hosted db-query sandbox containers a **static egress IP** for
 customer database traffic without opening any inbound port on the Azure VM.
 
 ```text
-DbQuerySandbox container (Cloudflare)
+DbQueryContainer (Cloudflare)
   └─ cloudflared access tcp ──WSS/443──▶ Cloudflare edge (Access service-token check)
         └─ existing cloudflared tunnel (VM dials out; NSG stays deny-all-inbound)
               └─ gost SOCKS5 on 127.0.0.1:1080 (this directory)

@@ -2,7 +2,7 @@
   "name": "db-query-runner",
   "private": true,
   "type": "module",
-  "description": "Trusted in-container query runner for DbQuerySandbox: executes worker-authorized SQL (postgres/mysql/mssql) against customer databases through the static-IP SOCKS egress relay, and stages Parquet exports to the mounted warehouse R2 prefix.",
+  "description": "Trusted in-container query runner for DbQueryContainer: executes worker-authorized SQL (postgres/mysql/mssql) against customer databases through the static-IP SOCKS egress relay, and stages Parquet exports to the mounted warehouse R2 prefix.",
   "dependencies": {
     "@dsnp/parquetjs": "1.8.8",
     "mysql2": "3.22.6",

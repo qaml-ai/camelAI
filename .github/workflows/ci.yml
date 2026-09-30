@@ -103,8 +103,8 @@ jobs:
           --load
           --cache-from type=gha,scope=selfhost-db-query
           --cache-to type=gha,mode=max,scope=selfhost-db-query
-          --tag camelai-selfhost-db-query:0.12.0
-          --file workers/main/db-query-sandbox.Dockerfile
+          --tag camelai-selfhost-db-query:1.0.0
+          --file workers/main/db-query-container.Dockerfile
           workers/main
       - name: Smoke project build runtime
         run: node scripts/selfhost-container-smoke.mjs project

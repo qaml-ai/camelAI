@@ -364,7 +364,7 @@ export const SANDBOX_MOUNT_RECOVERY_EVENT = "sandbox_mount_recovery";
 
 export interface MountSelfHealHost {
   target: MountRecoverTarget;
-  /** `AnalysisSandbox` / `DbQuerySandbox`; the event's component. */
+  /** `AnalysisSandbox`; the event's component. */
   component: string;
   /** The sandbox's cooldown-fenced container restart. */
   heal(request: SandboxZombieRestartRequest): Promise<SandboxZombieRestartOutcome>;

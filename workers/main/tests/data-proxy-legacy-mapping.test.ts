@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { mssqlQuery, mysqlQuery, postgresQuery } from '../src/data-proxy.js';
-import { fakeDbQuerySandboxNamespace } from './fake-db-query-sandbox.js';
+import { fakeDbQueryContainerNamespace } from './fake-db-query-container.js';
 
 const CONTEXT = { orgId: 'org-1', workspaceId: 'ws-1' };
 
@@ -66,7 +66,7 @@ const cases = [
 describe('data-proxy legacy request mapping', () => {
   for (const testCase of cases) {
     it(`runs ${testCase.name} query in the db-query sandbox with the legacy request mapping`, async () => {
-      const fake = fakeDbQuerySandboxNamespace((request) => {
+      const fake = fakeDbQueryContainerNamespace((request) => {
         expect(request).toMatchObject(testCase.expectedRequest);
         // Legacy surfaces are uncapped-rows + byte-capped, never row-limited.
         expect(request.rowLimit).toBeNull();
@@ -82,7 +82,7 @@ describe('data-proxy legacy request mapping', () => {
   }
 
   it('modify mode returns rowsAffected only', async () => {
-    const fake = fakeDbQuerySandboxNamespace((request) => {
+    const fake = fakeDbQueryContainerNamespace((request) => {
       expect(request.mode).toBe('modify');
       return { ok: true, rows: [], fields: [], rowCount: 0, truncated: false, durationMs: 2, rowsAffected: [3] };
     });
@@ -99,7 +99,7 @@ describe('data-proxy legacy request mapping', () => {
   });
 
   it('surfaces runner errors with the legacy status', async () => {
-    const fake = fakeDbQuerySandboxNamespace(() => ({
+    const fake = fakeDbQueryContainerNamespace(() => ({
       ok: false,
       error: { message: 'connect ECONNREFUSED', code: 'ECONNREFUSED' },
     }));

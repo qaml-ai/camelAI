@@ -1,11 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
+  DbQueryContainerUnavailableError,
   relayConfigFromEnv,
   runDbExport,
   runDbQuery,
-  DB_RELAY_FORWARDER_PROCESS_ID,
+  type DbQueryContainerStub,
   type DbQueryRequest,
-  type DbQuerySandboxStub,
+  type DbRunnerOutput,
 } from '../workers/main/src/db-query-service.js';
 
 const RELAY = {
@@ -22,61 +23,48 @@ const REQUEST: DbQueryRequest = {
   sql: 'SELECT 1',
 };
 
+const QUERY_OK = JSON.stringify({ ok: true, rows: [{ ok: 1 }], fields: [{ name: 'ok' }], rowCount: 1, truncated: false, durationMs: 3 });
+
 interface FakeOptions {
-  /** forwarderReady probe results in order; the last repeats. "up"/"down". */
-  ready: Array<'up' | 'down'>;
+  /** relayForwarderReady results in order; the last repeats. */
+  ready: boolean[];
   runnerStdout?: string;
   runnerStderr?: string;
   runnerExitCode?: number;
-  startProcessError?: Error;
+  runnerTimedOut?: boolean;
 }
 
-function execResult(stdout: string, stderr = '', exitCode = 0) {
-  return { stdout, stderr, exitCode };
+function runnerOutput(stdout: string, stderr = '', exitCode = 0, timedOut = false): DbRunnerOutput {
+  return { stdout, stderr, exitCode, timedOut };
 }
 
-function fakeSandbox(options: FakeOptions) {
+function fakeContainer(options: FakeOptions) {
   let readyCalls = 0;
-  const ensureReady = vi.fn(async () => {});
-  const ensureRelayEgress = vi.fn(async () => {});
-  const ensureWarehouseExportMount = vi.fn(async () => {});
-  const startProcess = vi.fn(async () => {
-    if (options.startProcessError) throw options.startProcessError;
-    return {};
-  });
-  const execCommands: string[] = [];
-  const execEnvs: Array<Record<string, string | undefined> | undefined> = [];
-  const exec = vi.fn(async (command: string, opts?: { env?: Record<string, string | undefined> }) => {
-    if (command.includes('/dev/tcp/')) {
-      const step = options.ready[Math.min(readyCalls, options.ready.length - 1)];
+  const runnerEnvs: Array<Record<string, string>> = [];
+  const runnerTimeouts: number[] = [];
+  const container = {
+    start: vi.fn(async () => {}),
+    startRelayForwarder: vi.fn(async () => {}),
+    relayForwarderReady: vi.fn(async () => {
+      const ready = options.ready[Math.min(readyCalls, options.ready.length - 1)];
       readyCalls += 1;
-      return execResult(step === 'up' ? 'up' : 'down');
-    }
-    execCommands.push(command);
-    execEnvs.push(opts?.env);
-    return execResult(
-      options.runnerStdout ?? JSON.stringify({ ok: true, rows: [{ ok: 1 }], fields: [{ name: 'ok' }], rowCount: 1, truncated: false, durationMs: 3 }),
-      options.runnerStderr ?? '',
-      options.runnerExitCode ?? 0,
-    );
-  });
-  const sandbox: DbQuerySandboxStub = {
-    ensureReady,
-    ensureRelayEgress,
-    ensureWarehouseExportMount,
-    startProcess,
-    exec,
-  };
-  return {
-    sandbox,
-    ensureReady,
-    ensureRelayEgress,
-    ensureWarehouseExportMount,
-    startProcess,
-    exec,
-    execCommands,
-    execEnvs,
-  };
+      return ready;
+    }),
+    runRunner: vi.fn(async (env: Record<string, string>, timeoutMs: number) => {
+      runnerEnvs.push(env);
+      runnerTimeouts.push(timeoutMs);
+      return runnerOutput(
+        options.runnerStdout ?? QUERY_OK,
+        options.runnerStderr ?? '',
+        options.runnerExitCode ?? 0,
+        options.runnerTimedOut ?? false,
+      );
+    }),
+    prepareWarehouseExport: vi.fn(async () => {}),
+    publishWarehouseExport: vi.fn(async () => {}),
+    destroy: vi.fn(async () => ({ destroyed: true })),
+  } satisfies DbQueryContainerStub;
+  return { container, runnerEnvs, runnerTimeouts };
 }
 
 describe('relayConfigFromEnv', () => {
@@ -125,73 +113,71 @@ describe('relayConfigFromEnv', () => {
   });
 });
 
-describe('runDbQuery — ship + exec', () => {
-  const deps = (sandbox: DbQuerySandboxStub, extra?: Partial<Parameters<typeof runDbQuery>[0]>) => ({
-    sandbox,
+describe('runDbQuery — ship + run', () => {
+  const deps = (container: DbQueryContainerStub, extra?: Partial<Parameters<typeof runDbQuery>[0]>) => ({
+    container,
     relay: RELAY,
-    newRunId: () => 'test-run',
     ...extra,
   });
 
-  it('opens egress and runs the piped runner in one exec when the forwarder is warm', async () => {
-    const fake = fakeSandbox({ ready: ['up'] });
-    const result = await runDbQuery(deps(fake.sandbox), REQUEST);
+  it('runs the runner once with source, request and SOCKS creds when the forwarder is warm', async () => {
+    const fake = fakeContainer({ ready: [true] });
+    const result = await runDbQuery(deps(fake.container), REQUEST);
 
     expect(result).toMatchObject({ ok: true, rows: [{ ok: 1 }], rowCount: 1 });
-    expect(fake.ensureRelayEgress).toHaveBeenCalledWith('db-relay.example.com');
-    expect(fake.startProcess).not.toHaveBeenCalled();
-    // Single stateless exec: runner piped into node over stdin, source + creds in env.
-    expect(fake.execCommands).toHaveLength(1);
-    expect(fake.execCommands[0]).toContain('node --input-type=module');
-    expect(fake.execEnvs[0]?.DB_RUNNER_SRC).toContain('validateQueryRequest');
-    expect(fake.execEnvs[0]).toMatchObject({
+    expect(fake.container.start).toHaveBeenCalledTimes(1);
+    expect(fake.container.startRelayForwarder).not.toHaveBeenCalled();
+    expect(fake.container.runRunner).toHaveBeenCalledTimes(1);
+    expect(fake.runnerEnvs[0]?.DB_RUNNER_SRC).toContain('validateQueryRequest');
+    expect(fake.runnerEnvs[0]).toMatchObject({
       DB_QUERY_REQUEST: JSON.stringify(REQUEST),
+      DB_RELAY_LOCAL_PORT: '11080',
       DB_EGRESS_RELAY_SOCKS_USERNAME: RELAY.socksUsername,
       DB_EGRESS_RELAY_SOCKS_PASSWORD: RELAY.socksPassword,
     });
+    // The default 30s query budget plus the runner's startup overhead.
+    expect(fake.runnerTimeouts[0]).toBe(45_000);
   });
 
   it('direct mode (relay null): dials without a forwarder or SOCKS env', async () => {
-    const fake = fakeSandbox({ ready: ['up'] });
-    const result = await runDbQuery(deps(fake.sandbox, { relay: null }), REQUEST);
+    const fake = fakeContainer({ ready: [true] });
+    const result = await runDbQuery(deps(fake.container, { relay: null }), REQUEST);
 
     expect(result.ok).toBe(true);
-    // No relay plumbing at all.
-    expect(fake.ensureRelayEgress).not.toHaveBeenCalled();
-    expect(fake.startProcess).not.toHaveBeenCalled();
-    expect(fake.exec.mock.calls.every((call) => !String(call[0]).includes('/dev/tcp'))).toBe(true);
-    // Runner still piped + executed, but with no SOCKS creds → direct dial.
-    expect(fake.execEnvs[0]?.DB_RUNNER_SRC).toContain('validateQueryRequest');
-    expect(fake.execEnvs[0]).not.toHaveProperty('DB_EGRESS_RELAY_SOCKS_USERNAME');
-    expect(fake.execEnvs[0]).not.toHaveProperty('DB_RELAY_LOCAL_PORT');
-    expect(fake.execEnvs[0]).toMatchObject({ DB_QUERY_REQUEST: JSON.stringify(REQUEST) });
+    expect(fake.container.relayForwarderReady).not.toHaveBeenCalled();
+    expect(fake.container.startRelayForwarder).not.toHaveBeenCalled();
+    expect(fake.runnerEnvs[0]?.DB_RUNNER_SRC).toContain('validateQueryRequest');
+    expect(fake.runnerEnvs[0]).not.toHaveProperty('DB_EGRESS_RELAY_SOCKS_USERNAME');
+    expect(fake.runnerEnvs[0]).not.toHaveProperty('DB_RELAY_LOCAL_PORT');
+    expect(fake.runnerEnvs[0]).toMatchObject({ DB_QUERY_REQUEST: JSON.stringify(REQUEST) });
   });
 
-  it('starts the cloudflared forwarder when the port is not yet accepting', async () => {
-    const fake = fakeSandbox({ ready: ['down', 'up'] });
-    const result = await runDbQuery(deps(fake.sandbox, { readinessTimeoutMs: 3_000 }), REQUEST);
+  it('starts the forwarder with the relay host and Access token when the port is not yet accepting', async () => {
+    const fake = fakeContainer({ ready: [false, true] });
+    const result = await runDbQuery(deps(fake.container, { readinessTimeoutMs: 3_000 }), REQUEST);
 
     expect(result.ok).toBe(true);
-    expect(fake.startProcess).toHaveBeenCalledTimes(1);
-    const [command, opts] = fake.startProcess.mock.calls[0] as unknown as [string, { processId?: string }];
-    expect(command).toContain('cloudflared access tcp --hostname db-relay.example.com');
-    expect(command).toContain('--service-token-id id');
-    expect(opts.processId).toBe(DB_RELAY_FORWARDER_PROCESS_ID);
+    expect(fake.container.startRelayForwarder).toHaveBeenCalledTimes(1);
+    expect(fake.container.startRelayForwarder).toHaveBeenCalledWith({
+      hostname: 'db-relay.example.com',
+      accessClientId: 'id',
+      accessClientSecret: 'secret',
+    });
   });
 
   it('fails with the forwarder-readiness message when the tunnel never comes up', async () => {
-    const fake = fakeSandbox({ ready: ['down'] });
+    const fake = fakeContainer({ ready: [false] });
     await expect(
-      runDbQuery(deps(fake.sandbox, { readinessTimeoutMs: 600 }), REQUEST),
+      runDbQuery(deps(fake.container, { readinessTimeoutMs: 600 }), REQUEST),
     ).rejects.toThrow(/forwarder never became ready/);
   });
 
   it('surfaces runner error payloads as structured failures', async () => {
-    const fake = fakeSandbox({
-      ready: ['up'],
+    const fake = fakeContainer({
+      ready: [true],
       runnerStdout: JSON.stringify({ ok: false, error: { message: 'Refusing to relay to 10.0.0.1: blocked IPv4 range 10.0.0.0/8', status: 400 } }),
     });
-    const result = await runDbQuery(deps(fake.sandbox), REQUEST);
+    const result = await runDbQuery(deps(fake.container), REQUEST);
     expect(result).toMatchObject({
       ok: false,
       error: { message: expect.stringContaining('blocked IPv4 range'), status: 400 },
@@ -199,127 +185,119 @@ describe('runDbQuery — ship + exec', () => {
   });
 
   it('handles empty runner output without throwing', async () => {
-    const fake = fakeSandbox({ ready: ['up'], runnerStdout: '', runnerStderr: 'node crashed', runnerExitCode: 1 });
-    const result = await runDbQuery(deps(fake.sandbox), REQUEST);
+    const fake = fakeContainer({ ready: [true], runnerStdout: '', runnerStderr: 'node crashed', runnerExitCode: 1 });
+    const result = await runDbQuery(deps(fake.container), REQUEST);
     expect(result).toMatchObject({ ok: false, error: { status: 502 } });
     if (!result.ok) expect(result.error.message).toContain('node crashed');
   });
 
+  it('reports a runner the container timed out as a 504', async () => {
+    const fake = fakeContainer({ ready: [true], runnerStdout: '', runnerExitCode: 124, runnerTimedOut: true });
+    const result = await runDbQuery(deps(fake.container), REQUEST);
+    expect(result).toMatchObject({ ok: false, error: { status: 504, message: 'runner timed out after 45000ms' } });
+  });
+
   it('handles non-JSON runner output without throwing', async () => {
-    const fake = fakeSandbox({ ready: ['up'], runnerStdout: 'Segmentation fault' });
-    const result = await runDbQuery(deps(fake.sandbox), REQUEST);
+    const fake = fakeContainer({ ready: [true], runnerStdout: 'Segmentation fault' });
+    const result = await runDbQuery(deps(fake.container), REQUEST);
     expect(result).toMatchObject({ ok: false, error: { status: 502 } });
   });
 });
 
-describe('runDbExport — mount + exec straight to R2', () => {
-  const deps = (sandbox: DbQuerySandboxStub, extra?: Partial<Parameters<typeof runDbExport>[0]>) => ({
-    sandbox,
+describe('runDbExport — prepare + run straight to R2', () => {
+  const deps = (container: DbQueryContainerStub, extra?: Partial<Parameters<typeof runDbExport>[0]>) => ({
+    container,
     relay: RELAY,
     ...extra,
   });
   const PREFIX = 'warehouse/ws-1';
   const PATH = '/warehouse/ws-1/conn/abc.parquet';
 
-  it('mounts the workspace prefix and execs the runner with op export + DB_EXPORT_PATH', async () => {
-    const fake = fakeSandbox({
-      ready: ['up'],
+  it('prepares the workspace prefix, runs op export with DB_EXPORT_PATH, then publishes', async () => {
+    const fake = fakeContainer({
+      ready: [true],
       runnerStdout: JSON.stringify({ ok: true, rowCount: 42, bytes: 1234, durationMs: 8 }),
     });
-    const result = await runDbExport(deps(fake.sandbox), REQUEST, PREFIX, PATH);
+    const result = await runDbExport(deps(fake.container), REQUEST, PREFIX, PATH);
 
     expect(result).toEqual({ ok: true, rowCount: 42, bytes: 1234, durationMs: 8 });
-    expect(fake.ensureWarehouseExportMount).toHaveBeenCalledWith(PREFIX);
-    expect(fake.ensureRelayEgress).toHaveBeenCalledWith('db-relay.example.com');
-    // Same single stateless exec as queries — no process, no files written by us.
-    expect(fake.startProcess).not.toHaveBeenCalled();
-    expect(fake.execCommands).toHaveLength(1);
-    expect(fake.execCommands[0]).toContain('node --input-type=module');
-    expect(fake.execEnvs[0]?.DB_EXPORT_PATH).toBe(PATH);
-    expect(JSON.parse(fake.execEnvs[0]?.DB_QUERY_REQUEST ?? '{}')).toMatchObject({ op: 'export', engine: 'postgres' });
+    expect(fake.container.prepareWarehouseExport).toHaveBeenCalledWith(PREFIX);
+    expect(fake.container.runRunner).toHaveBeenCalledTimes(1);
+    expect(fake.runnerEnvs[0]?.DB_EXPORT_PATH).toBe(PATH);
+    expect(JSON.parse(fake.runnerEnvs[0]?.DB_QUERY_REQUEST ?? '{}')).toMatchObject({ op: 'export', engine: 'postgres' });
+    expect(fake.container.publishWarehouseExport).toHaveBeenCalledWith(PREFIX, PATH);
   });
 
-  it('direct mode skips relay plumbing but still mounts', async () => {
-    const fake = fakeSandbox({
-      ready: ['up'],
+  it('direct mode skips relay plumbing but still prepares', async () => {
+    const fake = fakeContainer({
+      ready: [true],
       runnerStdout: JSON.stringify({ ok: true, rowCount: 0, bytes: 12, durationMs: 1 }),
     });
-    const result = await runDbExport(deps(fake.sandbox, { relay: null }), REQUEST, PREFIX, PATH);
+    const result = await runDbExport(deps(fake.container, { relay: null }), REQUEST, PREFIX, PATH);
     expect(result.ok).toBe(true);
-    expect(fake.ensureRelayEgress).not.toHaveBeenCalled();
-    expect(fake.ensureWarehouseExportMount).toHaveBeenCalledWith(PREFIX);
-    expect(fake.execEnvs[0]).not.toHaveProperty('DB_EGRESS_RELAY_SOCKS_USERNAME');
+    expect(fake.container.relayForwarderReady).not.toHaveBeenCalled();
+    expect(fake.container.prepareWarehouseExport).toHaveBeenCalledWith(PREFIX);
+    expect(fake.runnerEnvs[0]).not.toHaveProperty('DB_EGRESS_RELAY_SOCKS_USERNAME');
   });
 
-  it('surfaces runner export errors as structured failures', async () => {
-    const fake = fakeSandbox({
-      ready: ['up'],
+  it('surfaces runner export errors as structured failures and publishes nothing', async () => {
+    const fake = fakeContainer({
+      ready: [true],
       runnerStdout: JSON.stringify({ ok: false, error: { message: 'Export timed out after 120000ms', status: 504, code: 'ETIMEOUT' } }),
     });
-    const result = await runDbExport(deps(fake.sandbox), REQUEST, PREFIX, PATH);
+    const result = await runDbExport(deps(fake.container), REQUEST, PREFIX, PATH);
     expect(result).toMatchObject({ ok: false, error: { status: 504, code: 'ETIMEOUT' } });
+    expect(fake.container.publishWarehouseExport).not.toHaveBeenCalled();
   });
 
   it('treats an ok result without rowCount/bytes as malformed', async () => {
-    const fake = fakeSandbox({
-      ready: ['up'],
+    const fake = fakeContainer({
+      ready: [true],
       runnerStdout: JSON.stringify({ ok: true, rows: [], fields: [], rowCount: 0, truncated: false, durationMs: 1 }),
     });
-    const result = await runDbExport(deps(fake.sandbox), REQUEST, PREFIX, PATH);
+    const result = await runDbExport(deps(fake.container), REQUEST, PREFIX, PATH);
     expect(result).toMatchObject({ ok: false, error: { status: 502 } });
+    expect(fake.container.publishWarehouseExport).not.toHaveBeenCalled();
   });
 });
 
-describe('transient sandbox failures', () => {
-  const OK = JSON.stringify({ ok: true, rows: [{ ok: 1 }], fields: [{ name: 'ok' }], rowCount: 1, truncated: false, durationMs: 3 });
-  const isProbe = (command: unknown) => String(command).includes('/dev/tcp/');
-  const runnerCalls = (exec: ReturnType<typeof vi.fn>) => exec.mock.calls.filter(([command]) => !isProbe(command));
-
-  function flakyRunner(error: Error, failures = 1, stdout = OK) {
+describe('transient container failures', () => {
+  function flakyRunner(error: Error, failures = 1, stdout = QUERY_OK) {
     let remaining = failures;
-    return vi.fn(async (command: string) => {
-      if (isProbe(command)) return { stdout: 'up', stderr: '', exitCode: 0 };
+    return vi.fn(async () => {
       if (remaining > 0) {
         remaining -= 1;
         throw error;
       }
-      return { stdout, stderr: '', exitCode: 0 };
+      return runnerOutput(stdout);
     });
   }
 
-  function harness(sandbox: Partial<Record<keyof DbQuerySandboxStub, unknown>>) {
+  function harness(overrides: Partial<Record<keyof DbQueryContainerStub, unknown>>) {
     const onTransientRetry = vi.fn();
     const sleep = vi.fn(async () => {});
+    const { container } = fakeContainer({ ready: [true] });
     const deps = {
       relay: RELAY,
       onTransientRetry,
       sleep,
-      sandbox: {
-        ensureReady: vi.fn(async () => {}),
-        ensureRelayEgress: vi.fn(async () => {}),
-        ensureWarehouseExportMount: vi.fn(async () => {}),
-        startProcess: vi.fn(async () => ({})),
-        exec: flakyRunner(new Error('unused'), 0),
-        ...sandbox,
-      } as DbQuerySandboxStub,
+      container: { ...container, ...overrides } as DbQueryContainerStub,
     };
     return { deps, onTransientRetry, sleep };
   }
 
   it.each([
-    'The container is not running, consider calling start()',
+    'DbQueryContainerUnavailableError: DB query container is not running (runRunner): container crashed',
     'Network connection lost.',
     'Runtime signalled the container to exit due to a new version rollout: 0',
-    'RPC session was shut down by disposing the main stub',
-    'ContainerUnavailableError: no container instance available, try again later',
-    'OperationInterruptedError: runtime_replaced',
+    "Durable Object's code has been updated",
   ])('retries a read once after "%s"', async (message) => {
-    const exec = flakyRunner(new Error(message));
-    const t = harness({ exec });
+    const runRunner = flakyRunner(new Error(message));
+    const t = harness({ runRunner });
     const result = await runDbQuery(t.deps, REQUEST);
 
     expect(result).toMatchObject({ ok: true, rowCount: 1 });
-    expect(runnerCalls(exec)).toHaveLength(2);
+    expect(runRunner).toHaveBeenCalledTimes(2);
     expect(t.sleep).toHaveBeenCalledTimes(1);
     expect(t.onTransientRetry).toHaveBeenCalledWith(
       expect.objectContaining({ operation: 'db_query', dispatched: true }),
@@ -327,37 +305,37 @@ describe('transient sandbox failures', () => {
   });
 
   it('retries a modify when the failure hit before the SQL was dispatched', async () => {
-    const ensureReady = vi.fn()
-      .mockRejectedValueOnce(new Error('The container is not running, consider calling start()'))
+    const start = vi.fn()
+      .mockRejectedValueOnce(new DbQueryContainerUnavailableError('start', new Error('no capacity')))
       .mockResolvedValue(undefined);
-    const t = harness({ ensureReady });
+    const t = harness({ start });
     const result = await runDbQuery(t.deps, { ...REQUEST, mode: 'modify' });
 
     expect(result.ok).toBe(true);
-    expect(ensureReady).toHaveBeenCalledTimes(2);
+    expect(start).toHaveBeenCalledTimes(2);
     expect(t.onTransientRetry).toHaveBeenCalledWith(expect.objectContaining({ dispatched: false }));
   });
 
-  it('never re-runs a modify whose runner exec was already dispatched', async () => {
-    const exec = flakyRunner(new Error('Network connection lost.'));
-    const t = harness({ exec });
+  it('never re-runs a modify whose runner was already dispatched', async () => {
+    const runRunner = flakyRunner(new Error('Network connection lost.'));
+    const t = harness({ runRunner });
 
     await expect(runDbQuery(t.deps, { ...REQUEST, mode: 'modify' })).rejects.toThrow('Network connection lost.');
-    expect(runnerCalls(exec)).toHaveLength(1);
+    expect(runRunner).toHaveBeenCalledTimes(1);
     expect(t.onTransientRetry).not.toHaveBeenCalled();
   });
 
   it('retries at most once', async () => {
-    const exec = flakyRunner(new Error('Network connection lost.'), 2);
-    const t = harness({ exec });
+    const runRunner = flakyRunner(new Error('Network connection lost.'), 2);
+    const t = harness({ runRunner });
 
     await expect(runDbQuery(t.deps, REQUEST)).rejects.toThrow('Network connection lost.');
-    expect(runnerCalls(exec)).toHaveLength(2);
+    expect(runRunner).toHaveBeenCalledTimes(2);
   });
 
   it('does not retry other failures', async () => {
-    const exec = flakyRunner(new Error('relation "nope" does not exist'));
-    const t = harness({ exec });
+    const runRunner = flakyRunner(new Error('relation "nope" does not exist'));
+    const t = harness({ runRunner });
 
     await expect(runDbQuery(t.deps, REQUEST)).rejects.toThrow('does not exist');
     expect(t.onTransientRetry).not.toHaveBeenCalled();
@@ -365,18 +343,18 @@ describe('transient sandbox failures', () => {
 
   it('retries an export only before its runner is dispatched', async () => {
     const exportOk = JSON.stringify({ ok: true, rowCount: 1, bytes: 10, durationMs: 1 });
-    const mount = vi.fn()
-      .mockRejectedValueOnce(new Error('The container is not running, consider calling start()'))
+    const prepare = vi.fn()
+      .mockRejectedValueOnce(new DbQueryContainerUnavailableError('prepareWarehouseExport', new Error('gone')))
       .mockResolvedValue(undefined);
     const beforeDispatch = harness({
-      ensureWarehouseExportMount: mount,
-      exec: flakyRunner(new Error('unused'), 0, exportOk),
+      prepareWarehouseExport: prepare,
+      runRunner: flakyRunner(new Error('unused'), 0, exportOk),
     });
     await expect(runDbExport(beforeDispatch.deps, REQUEST, 'warehouse/ws-1', '/warehouse/ws-1/x.parquet'))
       .resolves.toMatchObject({ ok: true });
-    expect(mount).toHaveBeenCalledTimes(2);
+    expect(prepare).toHaveBeenCalledTimes(2);
 
-    const midExport = harness({ exec: flakyRunner(new Error('Network connection lost.'), 1, exportOk) });
+    const midExport = harness({ runRunner: flakyRunner(new Error('Network connection lost.'), 1, exportOk) });
     await expect(runDbExport(midExport.deps, REQUEST, 'warehouse/ws-1', '/warehouse/ws-1/x.parquet'))
       .rejects.toThrow('Network connection lost.');
     expect(midExport.onTransientRetry).not.toHaveBeenCalled();

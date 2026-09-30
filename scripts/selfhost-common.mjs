@@ -185,7 +185,7 @@ export function scriptEnv(env = {}, extra = {}) {
         SELFHOST_DB_QUERY_IMAGE:
           env.SELFHOST_DB_QUERY_IMAGE ||
           process.env.SELFHOST_DB_QUERY_IMAGE ||
-          "camelai-selfhost-db-query:0.12.0",
+          "camelai-selfhost-db-query:1.0.0",
         SELFHOST_CONTAINER_EGRESS_IMAGE:
           env.SELFHOST_CONTAINER_EGRESS_IMAGE ||
           process.env.SELFHOST_CONTAINER_EGRESS_IMAGE ||

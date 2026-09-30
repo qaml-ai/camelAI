@@ -15,13 +15,6 @@
 // timeouts, transport errors or slow boots — a healthy cold boot must never
 // reach it) and at most once per cooldown window per container.
 //
-// One narrow exception to "never on timeouts": DbQuerySandbox runs no user
-// code, and its SETUP calls (container start, relay egress, forwarder prelude,
-// export mount) are bounded client-side past the SDK's own startup ceiling. A
-// setup call that outlives that deadline is a wedged container/DO, not a slow
-// boot — prod saw one workspace fail every query for four days until a manual
-// destroy (trigger `setup_deadline`).
-//
 // The cooldown timestamp lives in the DO's own key/value storage, which is
 // durable across container restarts and DO evictions — a genuinely broken image
 // (one that comes back dead every time) therefore cannot restart-loop; it gets
@@ -58,8 +51,7 @@ export const SANDBOX_ZOMBIE_EXEC_DEATH_THRESHOLD = 2;
 export type SandboxZombieRestartTrigger =
   | "exec_session_death"
   | "mount_io_error"
-  | "mount_session_timeout"
-  | "setup_deadline";
+  | "mount_session_timeout";
 
 export type SandboxZombieRestartOutcome =
   | {
@@ -85,8 +77,7 @@ export interface SandboxZombieRestartRequest {
 /**
  * The narrow slice of a Sandbox DO this needs. Kept as an interface (rather
  * than the DO itself) so the decision logic is unit-testable without a
- * container, and so AnalysisSandbox and DbQuerySandbox share ONE
- * implementation instead of two copies that drift.
+ * container.
  */
 export interface SandboxZombieRestartHost {
   storage: {
@@ -132,12 +123,6 @@ export function canForceZombieRestart(input: {
 export interface SandboxZombieRestartOptions {
   nowMs?: number;
   cooldownMs?: number;
-  /**
-   * Default true: a stopped container needs no heal. False for a wedged
-   * startup, where the container never reports running but its DO-side state
-   * still has to be torn down before the next start can succeed.
-   */
-  requireRunningContainer?: boolean;
 }
 
 /**
@@ -158,10 +143,7 @@ export async function forceSandboxZombieRestart(
     typeof lastRestartAtMs === "number" && Number.isFinite(lastRestartAtMs)
       ? Math.max(0, nowMs - lastRestartAtMs)
       : null;
-  // A wedged START never reaches `running`, yet destroy() is exactly what
-  // clears it; those callers opt out of the "nothing to heal" shortcut.
-  const containerRunning =
-    options.requireRunningContainer === false || host.isContainerRunning();
+  const containerRunning = host.isContainerRunning();
   if (!containerRunning) {
     // Nothing to heal: the next call starts a fresh container anyway.
     return { restarted: false, reason: "container_not_running", sinceLastRestartMs };
@@ -301,10 +283,8 @@ async function destroyWithinTimeout(
 }
 
 /**
- * The Sandbox-DO shape the self-heal drives. `AnalysisSandbox` and
- * `DbQuerySandbox` both satisfy it structurally (they extend
- * `Sandbox<Env>` → `Container<Env>`), so neither needs its own copy of this
- * wiring.
+ * The Sandbox-DO shape the self-heal drives. `AnalysisSandbox` satisfies it
+ * structurally (it extends `Sandbox<Env>` → `Container<Env>`).
  */
 export interface ZombieHealableSandbox {
   ctx: {
@@ -437,8 +417,7 @@ async function notifyContainerDestroyed(
  *
  * Callers reach this only after a narrow health check proves the container is
  * unrecoverable in place: repeated session death, an R2 mount that still
- * fails traversal after unmount/remount, or a DbQuerySandbox setup call that
- * outlived its client-side deadline (`setup_deadline`, see the module header).
+ * fails traversal after unmount/remount.
  * Slow boots, transport errors, runner timeouts, and ordinary 503s never call
  * this helper.
  */

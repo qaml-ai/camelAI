@@ -1,5 +1,5 @@
 /**
- * Legacy data-proxy surface, served by the DbQuerySandbox container.
+ * Legacy data-proxy surface, served by the DbQueryContainer.
  *
  * This module keeps the request/response contract of the retired Go
  * data-proxy (project-runtime-service cmd/data-proxy) — the shapes that the
@@ -14,17 +14,15 @@
  * file is the thin orchestration (sandbox resolution + dispatch).
  */
 
-import { getSandbox } from '@cloudflare/sandbox';
-
 import {
-  DB_QUERY_SANDBOX_OPTIONS,
+  dbQueryContainerKey,
+  getDbQueryContainer,
   relayConfigFromEnv,
   runDbExport,
   runDbQuery,
   type DbEgressRelayEnv,
   type DbQueryDeps,
   type DbQueryRequest,
-  type DbQuerySandboxStub,
 } from './db-query-service.js';
 import {
   dbErrorToLegacy,
@@ -41,7 +39,7 @@ import { warehouseWorkspacePrefix } from './warehouse-export.js';
 const DEFAULT_DATA_PROXY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
 export interface DataProxyEnv extends DbEgressRelayEnv, ObservabilityEnv {
-  DB_QUERY_SANDBOX?: DurableObjectNamespace<import('./db-query-sandbox.js').DbQuerySandbox>;
+  DB_QUERY_SANDBOX?: DurableObjectNamespace<import('./db-query-container.js').DbQueryContainer>;
   DATA_PROXY_MAX_RESPONSE_BYTES?: string;
 }
 
@@ -84,13 +82,9 @@ function resolveDbQueryDeps(env: DataProxyEnv, context: DataProxyContext): DbQue
   if (!env.DB_QUERY_SANDBOX) {
     throw createDataProxyError('DB_QUERY_SANDBOX container binding is not configured', 500);
   }
-  const sandbox = getSandbox(
-    env.DB_QUERY_SANDBOX,
-    `ws-${context.workspaceId}`,
-    DB_QUERY_SANDBOX_OPTIONS,
-  ) as unknown as DbQuerySandboxStub;
+  const container = getDbQueryContainer(env, dbQueryContainerKey(context.workspaceId));
   return {
-    sandbox,
+    container,
     relay: relayConfigFromEnv(env),
     // A query we stopped waiting for is a container problem, not a SQL one:
     // give it its own event so it is visible next to the other sandbox

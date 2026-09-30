@@ -50,6 +50,11 @@ export interface ProjectBuildSandboxLike {
   }): Promise<{ restarted: boolean; reason: string } | undefined>;
   readFile?(path: string, options?: { encoding?: "base64" | "utf8" }): Promise<{ content: string }>;
   readFileStream?(path: string): Promise<ReadableStream<Uint8Array>>;
+  /**
+   * Whole-file read (ProjectBuildSandboxV1). Preferred over readFileStream,
+   * whose 0.12 SSE framing (parsed by collectFile) Sandbox SDK 1.0 dropped.
+   */
+  readFileBytes?(path: string): Promise<Uint8Array>;
   listFiles?(path: string, options?: { recursive?: boolean; includeHidden?: boolean }): Promise<{ files: Array<{
     name: string;
     type: "file" | "directory";
@@ -81,7 +86,7 @@ export async function collectWorkerBundleFromSandbox(
   workdir: string,
   manifestPath = "build/server/wrangler.json",
 ): Promise<ProjectWorkerBundle> {
-  if (!sandbox.readFileStream || !sandbox.listFiles) {
+  if (!(sandbox.readFileBytes || sandbox.readFileStream) || !sandbox.listFiles) {
     throw new Error("Sandbox does not support streamed build output reads");
   }
   const absoluteManifestPath = joinSandboxPath(workdir, manifestPath);
@@ -405,6 +410,7 @@ async function collectAssetsFromManifest(
 }
 
 async function readSandboxFileBytes(sandbox: ProjectBuildSandboxLike, path: string): Promise<Uint8Array> {
+  if (sandbox.readFileBytes) return sandbox.readFileBytes(path);
   if (!sandbox.readFileStream) throw new Error("Sandbox does not support streamed file reads");
   const { content } = await collectFile(await sandbox.readFileStream(path));
   return typeof content === "string" ? new TextEncoder().encode(content) : content;

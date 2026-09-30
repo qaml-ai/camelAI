@@ -8,7 +8,6 @@ import {
   type WorkspaceAppHostIndex,
 } from "./workspace-app-fetcher";
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { getSandbox } from "@cloudflare/sandbox";
 import type { OrgDO, WorkerScript } from "./auth";
 import { Type, type TSchema } from "typebox";
 import type { WorkspaceDO } from "./workspace";
@@ -51,7 +50,8 @@ import { CodeModeDeterministicAutomations } from "./code-mode-deterministic-auto
 import { CodeModeIntegrations } from "./code-mode-integrations";
 import { PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS } from "./container-sizing";
 import { recordErrorEvent, recordObservabilityEvent } from "./observability";
-import { buildLogTail, cleanBuildLog, DEFAULT_BUILD_TIMEOUT_MS, projectBuildSandboxKey, runProjectAddDependency, runProjectBuild, type ProjectBuildResult } from "./project-build-service";
+import { buildLogTail, cleanBuildLog, DEFAULT_BUILD_TIMEOUT_MS, runProjectAddDependency, runProjectBuild, type ProjectBuildResult } from "./project-build-service";
+import { getProjectBuildSandbox } from "./project-build-sandbox-routing";
 import {
   createProjectBuildReadinessGate,
   ensureBuildSandboxReady,
@@ -2245,13 +2245,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   private projectBuildSandbox(): ProjectBuildSandboxLike {
     const { orgId } = this.ctx.props;
     if (!orgId) throw new Error("Project builds require org scope");
-    if (!this.env.PROJECT_BUILD_SANDBOX) {
-      throw new Error("PROJECT_BUILD_SANDBOX container binding is not configured");
-    }
-    return getSandbox(this.env.PROJECT_BUILD_SANDBOX, projectBuildSandboxKey(orgId), {
-      normalizeId: true,
-      transport: "rpc",
-    }) as unknown as ProjectBuildSandboxLike;
+    return getProjectBuildSandbox(this.env, orgId);
   }
 
   /**

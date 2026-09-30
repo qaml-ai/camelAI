@@ -36,6 +36,12 @@ export const DB_QUERY_INSTANCE_TYPE = "standard-1";
 export const PROJECT_BUILD_SLEEP_AFTER = "2m";
 
 /**
+ * The same 2m idle window as a number, for the native-container build sandbox
+ * (ProjectBuildSandboxV1), which sets it through `setInactivityTimeout()`.
+ */
+export const PROJECT_BUILD_IDLE_TIMEOUT_MS = 2 * 60_000;
+
+/**
  * How long a FINISHED build keeps the container warm for the session that made
  * it.
  *

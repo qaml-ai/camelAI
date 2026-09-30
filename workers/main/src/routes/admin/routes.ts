@@ -156,9 +156,9 @@ import {
   runDbQuery,
   type DbQuerySandboxStub,
 } from "../../db-query-service.js";
-import { buildLogTail, cleanBuildLog, projectBuildSandboxKey, runProjectBuild } from "../../project-build-service.js";
+import { buildLogTail, cleanBuildLog, runProjectBuild } from "../../project-build-service.js";
 import { runWithProjectBuildReadiness } from "../../project-build-readiness.js";
-import type { ProjectBuildSandboxLike } from "../../project-worker-bundle.js";
+import { getProjectBuildSandbox, hasProjectBuildSandbox } from "../../project-build-sandbox-routing.js";
 import { waitUntil } from "cloudflare:workers";
 import { refreshOrgCustomDomainHostnamesForAdmin } from "../../../../../src/lib/admin-custom-domain.server.js";
 import {
@@ -735,14 +735,11 @@ routes.post(
     if (!project) {
       return c.json({ error: `Project not found: ${body.project}` }, 404);
     }
-    if (!c.env.PROJECT_BUILD_SANDBOX) {
+    if (!hasProjectBuildSandbox(c.env)) {
       return c.json({ error: "PROJECT_BUILD_SANDBOX container binding is not configured" }, 400);
     }
 
-    const sandbox = getSandbox(c.env.PROJECT_BUILD_SANDBOX, projectBuildSandboxKey(body.org_id), {
-      normalizeId: true,
-      transport: "rpc",
-    }) as unknown as ProjectBuildSandboxLike;
+    const sandbox = getProjectBuildSandbox(c.env, body.org_id);
 
     // Gated exactly like deploy_project: this route drives the same container,
     // and an ungated admin repro on a sleeping (or zombie) container reports a

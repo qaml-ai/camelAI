@@ -8,18 +8,13 @@ import {
   isProjectBuildPermanentStartupError,
   projectBuildTransientCause,
 } from "../src/project-build-readiness";
-import { PROJECT_BUILD_SESSION_ACTIVITY_KEY } from "../src/project-build-sandbox-lifecycle";
-import {
-  getProjectBuildSandbox,
-  hasProjectBuildSandbox,
-  projectBuildSandboxRuntime,
-} from "../src/project-build-sandbox-routing";
+import { getProjectBuildSandbox, PROJECT_BUILD_SESSION_ACTIVITY_KEY } from "../src/project-build-sandbox-lifecycle";
 import {
   parseFindOutput,
-  PROJECT_BUILD_V1_IMAGE,
-  ProjectBuildSandboxV1,
+  PROJECT_BUILD_IMAGE,
+  ProjectBuildContainer,
   type ProjectBuildFiles,
-} from "../src/project-build-sandbox-v1";
+} from "../src/project-build-container";
 import { isSandboxExecTimeoutResult } from "../src/sandbox-exec-deadline";
 import { collectWorkerBundleFromSandbox, type ProjectBuildSandboxLike } from "../src/project-worker-bundle";
 import type { Env } from "../src/types";
@@ -95,7 +90,7 @@ function fakeContainer(options: {
       return running;
     },
     get images() {
-      return options.images ?? { [PROJECT_BUILD_V1_IMAGE]: IMAGE };
+      return options.images ?? { [PROJECT_BUILD_IMAGE]: IMAGE };
     },
     start: vi.fn((start?: ContainerStartupOptions) => {
       if (running) throw new Error("already running");
@@ -196,7 +191,7 @@ function createSandbox(options: {
 } = {}) {
   const state = fakeState(options.container, options.stored);
   const files = options.files ?? fakeFiles();
-  const sandbox = new ProjectBuildSandboxV1(
+  const sandbox = new ProjectBuildContainer(
     state.ctx as unknown as DurableObjectState,
     {} as Env,
     { files: files as unknown as ProjectBuildFiles },
@@ -209,7 +204,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("ProjectBuildSandboxV1 container lifecycle", () => {
+describe("ProjectBuildContainer container lifecycle", () => {
   it("starts the container lazily on the first command, once", async () => {
     const { container } = fakeContainer();
     const { sandbox } = createSandbox({ container });
@@ -299,7 +294,7 @@ describe("ProjectBuildSandboxV1 container lifecycle", () => {
   });
 });
 
-describe("ProjectBuildSandboxV1 build session window", () => {
+describe("ProjectBuildContainer build session window", () => {
   it("stores the deadline and stretches the running container's inactivity timeout", async () => {
     const { container } = fakeContainer();
     const { sandbox } = createSandbox({ container });
@@ -323,7 +318,7 @@ describe("ProjectBuildSandboxV1 build session window", () => {
   });
 });
 
-describe("ProjectBuildSandboxV1 exec", () => {
+describe("ProjectBuildContainer exec", () => {
   it("runs the command under bash and GNU timeout with an explicit cwd and env", async () => {
     const { container, execCalls } = fakeContainer({
       handler: () => ({ exitCode: 0, stdout: "built\n", stderr: "warn\n" }),
@@ -385,7 +380,7 @@ describe("ProjectBuildSandboxV1 exec", () => {
   });
 });
 
-describe("ProjectBuildSandboxV1 files", () => {
+describe("ProjectBuildContainer files", () => {
   it("writes utf8, base64 and streamed content, creating parent directories", async () => {
     const { container } = fakeContainer();
     const { sandbox, files } = createSandbox({ container });
@@ -493,31 +488,15 @@ describe("ProjectBuildSandboxV1 files", () => {
   });
 });
 
-describe("project build sandbox routing", () => {
-  const v0 = { idFromName: vi.fn(), get: vi.fn() };
-  const v1 = { getByName: vi.fn((name: string) => ({ name, runtime: "v1" })) };
-
-  it("uses v1 only when the switch says v1 and the binding exists", () => {
-    expect(projectBuildSandboxRuntime({ PROJECT_BUILD_SANDBOX_RUNTIME: "v1", PROJECT_BUILD_SANDBOX_V1: v1 } as unknown as Env)).toBe("v1");
-    expect(projectBuildSandboxRuntime({ PROJECT_BUILD_SANDBOX_RUNTIME: " V1 ", PROJECT_BUILD_SANDBOX_V1: v1 } as unknown as Env)).toBe("v1");
-    expect(projectBuildSandboxRuntime({ PROJECT_BUILD_SANDBOX_RUNTIME: "v1" } as unknown as Env)).toBe("v0");
-    expect(projectBuildSandboxRuntime({ PROJECT_BUILD_SANDBOX_RUNTIME: "v0", PROJECT_BUILD_SANDBOX_V1: v1 } as unknown as Env)).toBe("v0");
-    expect(projectBuildSandboxRuntime({ PROJECT_BUILD_SANDBOX_V1: v1 } as unknown as Env)).toBe("v0");
+describe("getProjectBuildSandbox", () => {
+  it("addresses the org's container by its sandbox key", () => {
+    const namespace = { getByName: vi.fn((name: string) => ({ name })) };
+    const stub = getProjectBuildSandbox({ PROJECT_BUILD_SANDBOX: namespace } as unknown as Env, "Org_123");
+    expect(namespace.getByName).toHaveBeenCalledWith("org-org-123");
+    expect(stub).toEqual({ name: "org-org-123" });
   });
 
-  it("addresses the v1 class by the org's sandbox key", () => {
-    const stub = getProjectBuildSandbox(
-      { PROJECT_BUILD_SANDBOX_RUNTIME: "v1", PROJECT_BUILD_SANDBOX_V1: v1, PROJECT_BUILD_SANDBOX: v0 } as unknown as Env,
-      "Org_123",
-    );
-    expect(v1.getByName).toHaveBeenCalledWith("org-org-123");
-    expect(stub).toEqual({ name: "org-org-123", runtime: "v1" });
-  });
-
-  it("reports whether any build sandbox is bound", () => {
-    expect(hasProjectBuildSandbox({} as Env)).toBe(false);
-    expect(hasProjectBuildSandbox({ PROJECT_BUILD_SANDBOX: v0 } as unknown as Env)).toBe(true);
-    expect(hasProjectBuildSandbox({ PROJECT_BUILD_SANDBOX_RUNTIME: "v1", PROJECT_BUILD_SANDBOX_V1: v1 } as unknown as Env)).toBe(true);
+  it("fails clearly when the binding is missing", () => {
     expect(() => getProjectBuildSandbox({} as Env, "org")).toThrow("PROJECT_BUILD_SANDBOX container binding is not configured");
   });
 });

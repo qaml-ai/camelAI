@@ -139,7 +139,7 @@ jobs:
           --cache-from type=gha,scope=selfhost-project-build
           --cache-to type=gha,mode=max,scope=selfhost-project-build
           --tag camelai-selfhost-project-build:1.0.0
-          --file workers/main/project-build-sandbox-v1.Dockerfile
+          --file workers/main/project-build-container.Dockerfile
           workers/main
 
       - name: Build analysis sandbox
@@ -236,7 +236,7 @@ jobs:
             dockerfile: infra/selfhost/local-artifacts.Dockerfile
           - image: project-build
             context: workers/main
-            dockerfile: workers/main/project-build-sandbox-v1.Dockerfile
+            dockerfile: workers/main/project-build-container.Dockerfile
           - image: analysis
             context: workers/main
             dockerfile: workers/main/analysis-sandbox.Dockerfile

@@ -158,7 +158,11 @@ export default defineConfig({
         compatibilityDate: '2026-03-24',
         compatibilityFlags: ['nodejs_compat'],
         durableObjects: {
-          PROJECT_BUILD_SANDBOX: sandboxDurableObject('ProjectBuildSandbox', 'camelai-eval-sandbox:latest'),
+          // Never gets a container here: ProjectBuildContainer starts a named
+          // image from ctx.container.images, and this pool's miniflare/workerd
+          // (4.20260721) predates named images and container exec. Evals and the
+          // repro that build for real need a pool upgrade first.
+          PROJECT_BUILD_SANDBOX: { className: 'ProjectBuildContainer', useSQLite: true },
           ANALYSIS_SANDBOX: sandboxDurableObject('AnalysisSandbox', 'camelai-analysis-sandbox:latest'),
         },
         cachePersist: false,

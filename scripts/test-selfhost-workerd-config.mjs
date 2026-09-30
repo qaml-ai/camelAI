@@ -114,8 +114,7 @@ description: Follow ACME runbooks. Use when shipping internal tools.
       'ChatThreadDO',
       'WorkspaceDO',
       'WorkspaceFilesystemDO',
-      'ProjectBuildSandbox',
-      'ProjectBuildSandboxV1',
+      'ProjectBuildContainer',
       'AnalysisSandbox',
       'DbQuerySandbox',
     ],
@@ -142,29 +141,23 @@ description: Follow ACME runbooks. Use when shipping internal tools.
   includesAll(manifest.omittedBindings.sendEmail, ['EMAIL'], 'omitted sendEmail bindings');
   includesAll(
     bindings.containers.map((container) => container.className),
-    ['ProjectBuildSandboxV1', 'AnalysisSandbox', 'DbQuerySandbox'],
+    ['ProjectBuildContainer', 'AnalysisSandbox', 'DbQuerySandbox'],
     'container bindings',
   );
   assert(
-    !bindings.containers.some((container) => container.className === 'ProjectBuildSandbox'),
-    'the 0.12 ProjectBuildSandbox must not get a container: ProjectBuildSandboxV1 serves builds',
+    !bindings.durableObjects.includes('ProjectBuildSandbox'),
+    'the deleted 0.12 ProjectBuildSandbox class must not be bound',
   );
   assert(
-    config.includes('(name = "PROJECT_BUILD_SANDBOX_RUNTIME", text = "v1")'),
-    'self-host routes project builds to ProjectBuildSandboxV1',
+    !config.includes('PROJECT_BUILD_SANDBOX_RUNTIME'),
+    'the retired project-build runtime switch must not reach self-host vars',
   );
   assert(
     config.includes(
-      'className = "ProjectBuildSandboxV1", uniqueKey = "camelai-selfhost-ProjectBuildSandboxV1", ' +
+      'className = "ProjectBuildContainer", uniqueKey = "camelai-selfhost-ProjectBuildContainer", ' +
       'enableSql = true, container = (images = [(name = "project-build", image = "camelai-selfhost-project-build:1.0.0")])',
     ),
-    'config should expose the project-build image to ProjectBuildSandboxV1 as ctx.container.images',
-  );
-  assert(
-    config.includes(
-      'className = "ProjectBuildSandbox", uniqueKey = "camelai-selfhost-ProjectBuildSandbox", enableSql = true)',
-    ),
-    'the 0.12 ProjectBuildSandbox namespace stays bound without a container',
+    'config should expose the project-build image to ProjectBuildContainer as ctx.container.images',
   );
   assert(
     manifest.containerEngine?.kind === 'localDocker',

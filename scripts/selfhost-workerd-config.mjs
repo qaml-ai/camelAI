@@ -43,9 +43,6 @@ const MINIFLARE_WORKERS_DIR = path.join(
 
 const SELFHOST_DEFAULT_VARS = {
   NODE_ENV: 'production',
-  // Project builds run on ProjectBuildSandboxV1 (native ctx.container, Sandbox
-  // SDK 1.0), the only project-build class self-host attaches a container to.
-  PROJECT_BUILD_SANDBOX_RUNTIME: 'v1',
   AI_VIRTUAL_MODEL: 'dynamic/auto',
   AI_GATEWAY_AUTH_TOKEN: '',
   CF_ACCOUNT_ID: 'selfhost',
@@ -156,17 +153,11 @@ const IMAGES_SERVICE_NAME = 'images:service';
 const DEFAULT_CONTAINER_EGRESS_INTERCEPTOR_IMAGE =
   'camelai-selfhost-container-egress:0.12.0';
 const DEFAULT_DOCKER_SOCKET_URI = 'unix:///var/run/docker.sock';
-// 0.12 container classes whose 1.0 successor serves self-host. Their Durable
-// Object namespaces stay bound (the Worker still exports them) but get no
-// container, so nothing can start the old image.
-const SELFHOST_SUPERSEDED_CONTAINER_CLASSES = {
-  ProjectBuildSandbox: 'ProjectBuildSandboxV1',
-};
 const SELFHOST_CONTAINER_IMAGES = {
   // Native Durable Object container (scheduling_policy "durable_object"): the
   // Worker picks the image at start() from ctx.container.images, so workerd
   // gets named images instead of one imageName.
-  ProjectBuildSandboxV1: {
+  ProjectBuildContainer: {
     images: {
       'project-build': {
         env: 'SELFHOST_PROJECT_BUILD_IMAGE',
@@ -354,7 +345,6 @@ function resolveContainerRuntime(wrangler, env) {
   const containers = [];
   for (const container of wrangler.containers ?? []) {
     const className = container.class_name;
-    if (SELFHOST_SUPERSEDED_CONTAINER_CLASSES[className]) continue;
     const supported = SELFHOST_CONTAINER_IMAGES[className];
     if (!supported) {
       throw new Error(
@@ -849,15 +839,6 @@ async function main() {
   const vars = { ...SELFHOST_DEFAULT_VARS, ...selfhostEnv };
   for (const key of Object.keys(vars)) {
     if (process.env[key] !== undefined) vars[key] = process.env[key];
-  }
-  // Only ProjectBuildSandboxV1 gets a container here (see
-  // SELFHOST_SUPERSEDED_CONTAINER_CLASSES), so any other value would route
-  // builds to a class that cannot start one. Roll back by pinning an earlier
-  // release instead.
-  if (String(vars.PROJECT_BUILD_SANDBOX_RUNTIME).trim().toLowerCase() !== 'v1') {
-    throw new Error(
-      'PROJECT_BUILD_SANDBOX_RUNTIME must be "v1" on self-host: project builds run on ProjectBuildSandboxV1',
-    );
   }
 
   // Resolve `.selfhost/agent` (or env overrides) into Worker text bindings.

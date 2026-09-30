@@ -59,13 +59,7 @@ export interface Env
   // warehouse tier; SDK-allowlisted egress, one warm container per workspace.
   ANALYSIS_SANDBOX?: DurableObjectNamespace<import('./analysis-sandbox.js').AnalysisSandbox>;
   // Warm native-toolchain build container for DO+R2-backed projects (per-org).
-  PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<import('./project-build-sandbox.js').ProjectBuildSandbox>;
-  // Same build container on the native DO container API (Sandbox SDK 1.0),
-  // side by side with the 0.12 class above. PROJECT_BUILD_SANDBOX_RUNTIME="v1"
-  // routes builds to it (project-build-sandbox-routing.ts); anything else
-  // keeps them on PROJECT_BUILD_SANDBOX.
-  PROJECT_BUILD_SANDBOX_V1?: DurableObjectNamespace<import('./project-build-sandbox-v1.js').ProjectBuildSandboxV1>;
-  PROJECT_BUILD_SANDBOX_RUNTIME?: string;
+  PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<import('./project-build-container.js').ProjectBuildContainer>;
   // Trusted query-execution container with static-IP database egress via the
   // sandbox-host SOCKS relay (docs/db-egress-relay.md).
   DB_QUERY_SANDBOX?: DurableObjectNamespace<import('./db-query-sandbox.js').DbQuerySandbox>;

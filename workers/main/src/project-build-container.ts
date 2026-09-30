@@ -16,17 +16,17 @@ import { sandboxExecTimeoutMessage, SANDBOX_EXEC_TIMEOUT_EXIT_CODE } from "./san
 import type { Env } from "./types.js";
 
 /** Key of the build image in wrangler `containers[].images`. */
-export const PROJECT_BUILD_V1_IMAGE = "project-build";
+export const PROJECT_BUILD_IMAGE = "project-build";
 
 /** Directory commands start in when the caller gives no cwd (0.x's session default). */
-const PROJECT_BUILD_V1_DEFAULT_CWD = "/workspace";
+const PROJECT_BUILD_DEFAULT_CWD = "/workspace";
 
 /**
  * Environment for every command. `exec()` sees none of the image's `ENV` lines
  * (only `PATH`), so what the 0.x sandbox server gave its shell is passed here.
  * HOME matters: the image prebakes the bun cache under /root/.bun.
  */
-const PROJECT_BUILD_V1_BASE_ENV: Readonly<Record<string, string>> = {
+const PROJECT_BUILD_BASE_ENV: Readonly<Record<string, string>> = {
   HOME: "/root",
   LANG: "C.UTF-8",
 };
@@ -35,7 +35,7 @@ const PROJECT_BUILD_V1_BASE_ENV: Readonly<Record<string, string>> = {
  * Bound for a command whose caller gave no `timeout`. 0.x ran those unbounded;
  * every current caller passes one, so this is only a backstop.
  */
-export const PROJECT_BUILD_V1_DEFAULT_TIMEOUT_MS = 10 * 60_000;
+export const PROJECT_BUILD_DEFAULT_TIMEOUT_MS = 10 * 60_000;
 
 /** GNU `timeout` sends SIGKILL this long after SIGTERM. */
 const KILL_AFTER_SECONDS = 5;
@@ -69,23 +69,17 @@ export type ProjectBuildFiles = Pick<Files, "readFile" | "writeFile" | "stat" | 
  * Per-org build container on the native Durable Object container API
  * (`scheduling_policy: "durable_object"`, Sandbox SDK 1.0).
  *
- * Side-by-side successor to ProjectBuildSandbox (0.12): same RPC surface as
- * ProjectBuildSandboxLike, reached through getProjectBuildSandbox() when
- * PROJECT_BUILD_SANDBOX_RUNTIME is "v1". The containers hold only a build cache
- * (source is re-materialized from the project store and the manifest tells a
- * cold workdir apart), so moving an org between classes needs no state copy.
- *
- * What 1.0 lets this drop: the zombie self-heal (there is no session layer to
- * die — every exec is its own process), the SDK retry budget (exec waits for a
- * starting container), and onActivityExpired deferral (replaced by the
- * inactivity timeout, sized from the build-session window).
+ * Bound as PROJECT_BUILD_SANDBOX and reached through getProjectBuildSandbox()
+ * (one instance per org). The container holds only a build cache: source is
+ * re-materialized from the project store, and the source manifest tells a cold
+ * workdir apart, so a lost container costs a cold build, never data.
  *
  * The 0.x-shaped contracts here (exit 124 + "Command timed out" trailer, "File
  * not found" / ContainerUnavailableError messages, the probeShell and
  * restartZombieContainer names) exist only so callers don't branch on the
  * runtime. Replace them with typed results when the 0.12 class is deleted.
  */
-export class ProjectBuildSandboxV1 extends DurableObject<Env> {
+export class ProjectBuildContainer extends DurableObject<Env> {
   private readonly files: ProjectBuildFiles | null;
   private setup: Promise<void> | null = null;
 
@@ -196,7 +190,7 @@ export class ProjectBuildSandboxV1 extends DurableObject<Env> {
         "(", "-type", "f", "-o", "-type", "d", ")",
         "-printf", "%y\\t%s\\t%P\\0",
       ];
-      const child = await this.container.exec(argv, { cwd: "/", env: { ...PROJECT_BUILD_V1_BASE_ENV } });
+      const child = await this.container.exec(argv, { cwd: "/", env: { ...PROJECT_BUILD_BASE_ENV } });
       const output = await child.output();
       if (output.exitCode !== 0) {
         const stderr = new TextDecoder().decode(output.stderr).trim();
@@ -237,7 +231,7 @@ export class ProjectBuildSandboxV1 extends DurableObject<Env> {
     recordObservabilityEvent(this.env, {
       event: "build_sandbox_restart",
       severity: "warn",
-      component: "ProjectBuildSandboxV1",
+      component: "ProjectBuildContainer",
       operation: request.operation,
       status: request.trigger,
       errorMessage: request.error?.slice(0, 500) ?? null,
@@ -302,9 +296,9 @@ export class ProjectBuildSandboxV1 extends DurableObject<Env> {
    */
   private async startContainer(): Promise<void> {
     const container = this.container;
-    const image = container.images[PROJECT_BUILD_V1_IMAGE];
+    const image = container.images[PROJECT_BUILD_IMAGE];
     // "no such image" is one of the readiness gate's permanent-startup markers.
-    if (!image) throw new Error(`no such image: ${PROJECT_BUILD_V1_IMAGE} is missing from the container images`);
+    if (!image) throw new Error(`no such image: ${PROJECT_BUILD_IMAGE} is missing from the container images`);
 
     if (container.running) {
       // A deploy never replaces a running container. The first call on a new DO
@@ -316,7 +310,7 @@ export class ProjectBuildSandboxV1 extends DurableObject<Env> {
         recordObservabilityEvent(this.env, {
           event: "build_sandbox_image_replaced",
           severity: "info",
-          component: "ProjectBuildSandboxV1",
+          component: "ProjectBuildContainer",
           operation: "startContainer",
           orgId: this.orgId,
         });
@@ -333,7 +327,7 @@ export class ProjectBuildSandboxV1 extends DurableObject<Env> {
       recordObservabilityEvent(this.env, {
         event: "build_sandbox_start",
         severity: "info",
-        component: "ProjectBuildSandboxV1",
+        component: "ProjectBuildContainer",
         operation: "startContainer",
         orgId: this.orgId,
       });
@@ -367,7 +361,7 @@ export class ProjectBuildSandboxV1 extends DurableObject<Env> {
     ];
     const startedAt = Date.now();
     const child = await this.container.exec(argv, {
-      cwd: options.cwd ?? PROJECT_BUILD_V1_DEFAULT_CWD,
+      cwd: options.cwd ?? PROJECT_BUILD_DEFAULT_CWD,
       env: execEnv(options.env),
     });
     const output = await child.output();
@@ -385,13 +379,13 @@ export class ProjectBuildSandboxV1 extends DurableObject<Env> {
 
 function normalizeTimeoutMs(timeout: number | undefined): number {
   if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) {
-    return PROJECT_BUILD_V1_DEFAULT_TIMEOUT_MS;
+    return PROJECT_BUILD_DEFAULT_TIMEOUT_MS;
   }
   return Math.max(1, Math.ceil(timeout));
 }
 
 function execEnv(env: Record<string, string | undefined> | undefined): Record<string, string> {
-  const merged: Record<string, string> = { ...PROJECT_BUILD_V1_BASE_ENV };
+  const merged: Record<string, string> = { ...PROJECT_BUILD_BASE_ENV };
   for (const [name, value] of Object.entries(env ?? {})) {
     if (typeof value === "string") merged[name] = value;
   }

@@ -2,6 +2,8 @@ import {
   PROJECT_BUILD_ACTIVE_SESSION_MAX_WINDOW_MS,
   PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS,
 } from "./container-sizing.js";
+import type { ProjectBuildContainer } from "./project-build-container.js";
+import type { ProjectBuildSandboxLike } from "./project-worker-bundle.js";
 
 const MAX_PROJECT_BUILD_SANDBOX_KEY_LENGTH = 63;
 
@@ -26,6 +28,17 @@ export function projectBuildSandboxKey(orgId: string): string {
   const prefixLength = MAX_PROJECT_BUILD_SANDBOX_KEY_LENGTH - hash.length - 1;
   const prefix = readable.slice(0, prefixLength).replace(/-+$/g, "");
   return `${prefix}-${hash}`;
+}
+
+/** The org's build container: one ProjectBuildContainer instance per org. */
+export function getProjectBuildSandbox(
+  env: { PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<ProjectBuildContainer> },
+  orgId: string,
+): ProjectBuildSandboxLike {
+  if (!env.PROJECT_BUILD_SANDBOX) {
+    throw new Error("PROJECT_BUILD_SANDBOX container binding is not configured");
+  }
+  return env.PROJECT_BUILD_SANDBOX.getByName(projectBuildSandboxKey(orgId)) as unknown as ProjectBuildSandboxLike;
 }
 
 function stableHexHash(value: string): string {
@@ -54,15 +67,4 @@ export function nextBuildSessionDeadline(
   const deadline = nowMs + bounded;
   const stored = typeof storedUntilMs === "number" && Number.isFinite(storedUntilMs) ? storedUntilMs : 0;
   return deadline > stored ? deadline : null;
-}
-
-/**
- * Whether the idle reaper should be deferred: the owning org used a build tool
- * recently enough that the next deploy would otherwise pay a cold boot.
- */
-export function shouldKeepBuildSandboxAwake(
-  nowMs: number,
-  storedUntilMs: number | undefined,
-): boolean {
-  return typeof storedUntilMs === "number" && Number.isFinite(storedUntilMs) && nowMs < storedUntilMs;
 }

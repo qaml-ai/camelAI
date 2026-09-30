@@ -50,8 +50,7 @@ import { CodeModeDeterministicAutomations } from "./code-mode-deterministic-auto
 import { CodeModeIntegrations } from "./code-mode-integrations";
 import { PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS } from "./container-sizing";
 import { recordErrorEvent, recordObservabilityEvent } from "./observability";
-import { buildLogTail, cleanBuildLog, DEFAULT_BUILD_TIMEOUT_MS, runProjectAddDependency, runProjectBuild, type ProjectBuildResult } from "./project-build-service";
-import { getProjectBuildSandbox } from "./project-build-sandbox-routing";
+import { buildLogTail, cleanBuildLog, DEFAULT_BUILD_TIMEOUT_MS, getProjectBuildSandbox, runProjectAddDependency, runProjectBuild, type ProjectBuildResult } from "./project-build-service";
 import {
   createProjectBuildReadinessGate,
   ensureBuildSandboxReady,

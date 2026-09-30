@@ -1,9 +1,7 @@
-import { getSandbox } from "@cloudflare/sandbox";
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
-import { projectBuildSandboxKey, runProjectAddDependency, runProjectBuild } from "../src/project-build-service";
-import type { ProjectBuildSandboxLike } from "../src/project-worker-bundle";
+import { getProjectBuildSandbox, runProjectAddDependency, runProjectBuild } from "../src/project-build-service";
 import { ProjectFilesystemClient } from "../src/workspace-filesystem-do";
 
 type ReproEnv = typeof env & {
@@ -29,10 +27,7 @@ describe("real project build sandbox repro", () => {
     expect(testEnv.PROJECT_BUILD_SANDBOX).toBeDefined();
     const suffix = Date.now().toString(36);
     const projectId = `large-repro-${suffix}`;
-    const sandbox = getSandbox(testEnv.PROJECT_BUILD_SANDBOX, projectBuildSandboxKey(`large-repro-org-${suffix}`), {
-      normalizeId: true,
-      transport: "rpc",
-    }) as unknown as ProjectBuildSandboxLike;
+    const sandbox = getProjectBuildSandbox(testEnv, `large-repro-org-${suffix}`);
     const files = new ProjectFilesystemClient(testEnv as never, projectId);
     await expect(files.writeFile(
       "/package.json",
@@ -67,10 +62,7 @@ describe("real project build sandbox repro", () => {
   maybeIt("runs add_dependency followed immediately by build repeatedly", async () => {
     expect(testEnv.PROJECT_BUILD_SANDBOX).toBeDefined();
     const projectId = `repro-${Date.now().toString(36)}`;
-    const sandbox = getSandbox(testEnv.PROJECT_BUILD_SANDBOX, projectBuildSandboxKey("repro-org"), {
-      normalizeId: true,
-      transport: "rpc",
-    }) as unknown as ProjectBuildSandboxLike;
+    const sandbox = getProjectBuildSandbox(testEnv, "repro-org");
     const files = new ProjectFilesystemClient(testEnv as never, projectId);
     await expect(files.writeFile(
       "/package.json",

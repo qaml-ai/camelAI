@@ -4,9 +4,9 @@
 the buildable project scaffold templates in `workers/main/src/project-scaffold.ts`
 and the bundled shadcn registry, with the exact same version ranges.
 
-It exists solely so `workers/main/project-build-sandbox.Dockerfile` can run a
+It exists solely so `workers/main/project-build-container.Dockerfile` can run a
 frozen `bun install` against it at image build time, prebaking a warm Bun global
-cache (`~/.bun/install/cache`) into the ProjectBuildSandbox image. Cold
+cache (`~/.bun/install/cache`) into the ProjectBuildContainer image. Cold
 project builds then resolve the scaffold dependency tree from the local cache
 instead of downloading everything from npm on every fresh container.
 

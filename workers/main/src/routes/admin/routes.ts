@@ -156,9 +156,8 @@ import {
   runDbQuery,
   type DbQuerySandboxStub,
 } from "../../db-query-service.js";
-import { buildLogTail, cleanBuildLog, runProjectBuild } from "../../project-build-service.js";
+import { buildLogTail, cleanBuildLog, getProjectBuildSandbox, runProjectBuild } from "../../project-build-service.js";
 import { runWithProjectBuildReadiness } from "../../project-build-readiness.js";
-import { getProjectBuildSandbox, hasProjectBuildSandbox } from "../../project-build-sandbox-routing.js";
 import { waitUntil } from "cloudflare:workers";
 import { refreshOrgCustomDomainHostnamesForAdmin } from "../../../../../src/lib/admin-custom-domain.server.js";
 import {
@@ -735,7 +734,7 @@ routes.post(
     if (!project) {
       return c.json({ error: `Project not found: ${body.project}` }, 404);
     }
-    if (!hasProjectBuildSandbox(c.env)) {
+    if (!c.env.PROJECT_BUILD_SANDBOX) {
       return c.json({ error: "PROJECT_BUILD_SANDBOX container binding is not configured" }, 400);
     }
 

@@ -10,12 +10,10 @@ import {
   PROJECT_BUILD_ACTIVE_SESSION_MAX_WINDOW_MS,
   PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS,
   PROJECT_BUILD_IDLE_TIMEOUT_MS,
-  PROJECT_BUILD_INSTANCE_TYPE,
-  PROJECT_BUILD_SLEEP_AFTER,
 } from "../workers/main/src/container-sizing";
 
 // The image key only; importing the class would pull in cloudflare:workers.
-const PROJECT_BUILD_V1_IMAGE = "project-build";
+const PROJECT_BUILD_IMAGE = "project-build";
 
 /**
  * Strip // and /* *\/ comments plus trailing commas so wrangler JSONC can be
@@ -40,14 +38,13 @@ function instanceTypesByClass(path: string): Record<string, string> {
 }
 
 const EXPECTED = {
-  ProjectBuildSandbox: PROJECT_BUILD_INSTANCE_TYPE,
   AnalysisSandbox: ANALYSIS_INSTANCE_TYPE,
   DbQuerySandbox: DB_QUERY_INSTANCE_TYPE,
 } as const;
 
 describe("container right-sizing", () => {
   it("keeps idle sleep shorter than the SDK 10m default for provisioned billing", () => {
-    expect(PROJECT_BUILD_SLEEP_AFTER).toBe("2m");
+    expect(PROJECT_BUILD_IDLE_TIMEOUT_MS).toBe(2 * 60_000);
     expect(ANALYSIS_SLEEP_AFTER).toBe("5m");
     expect(DB_QUERY_SLEEP_AFTER).toBe("2m");
   });
@@ -61,47 +58,45 @@ describe("container right-sizing", () => {
     expect(PROJECT_BUILD_ACTIVE_SESSION_MAX_WINDOW_MS).toBeLessThanOrEqual(30 * 60_000);
   });
 
-  it("keeps the native build sandbox's idle timeout equal to the 0.12 sleepAfter", () => {
-    expect(PROJECT_BUILD_IDLE_TIMEOUT_MS).toBe(2 * 60_000);
-  });
-
   it.each([
-    ["wrangler.prod.jsonc", "chiridion-app-project-build-v1", "v0"],
-    ["wrangler.staging.jsonc", "chiridion-app-staging-project-build-v1", "v1"],
-    ["wrangler.jsonc", "chiridion-app-local-project-build-v1", "v0"],
-    ["wrangler.dev-miguel.jsonc", "chiridion-app-dev-miguel-project-build-v1", "v0"],
-    ["wrangler.dev-illiana.jsonc", "chiridion-app-dev-illiana-project-build-v1", "v0"],
-  ] as const)("%s declares ProjectBuildSandboxV1 as a durable_object container", (path, name, runtime) => {
+    ["wrangler.prod.jsonc", "chiridion-app-project-build"],
+    ["wrangler.staging.jsonc", "chiridion-app-staging-project-build"],
+    ["wrangler.jsonc", "chiridion-app-local-project-build"],
+    ["wrangler.dev-miguel.jsonc", "chiridion-app-dev-miguel-project-build"],
+    ["wrangler.dev-illiana.jsonc", "chiridion-app-dev-illiana-project-build"],
+  ] as const)("%s declares ProjectBuildContainer as a durable_object container", (path, name) => {
     const config = loadJsonc(resolve(process.cwd(), path)) as unknown as {
       containers: Array<Record<string, unknown>>;
       durable_objects: { bindings: Array<{ name: string; class_name: string }> };
-      migrations: Array<{ tag: string; new_sqlite_classes?: string[] }>;
-      vars: Record<string, string>;
+      migrations: Array<{ tag: string; new_sqlite_classes?: string[]; deleted_classes?: string[] }>;
     };
-    const entry = config.containers.find((container) => container.class_name === "ProjectBuildSandboxV1");
+    const entry = config.containers.find((container) => container.class_name === "ProjectBuildContainer");
     // The durable_object policy rejects image/instance_type/max_instances, and
     // each environment needs its own container application name.
     expect(entry).toEqual({
-      class_name: "ProjectBuildSandboxV1",
+      class_name: "ProjectBuildContainer",
       name,
       scheduling_policy: "durable_object",
-      images: { [PROJECT_BUILD_V1_IMAGE]: { dockerfile: "./workers/main/project-build-sandbox-v1.Dockerfile" } },
+      images: { [PROJECT_BUILD_IMAGE]: { dockerfile: "./workers/main/project-build-container.Dockerfile" } },
     });
+    expect(config.containers.some((container) => container.class_name === "ProjectBuildSandbox")).toBe(false);
     expect(config.durable_objects.bindings).toContainEqual({
-      name: "PROJECT_BUILD_SANDBOX_V1",
-      class_name: "ProjectBuildSandboxV1",
+      name: "PROJECT_BUILD_SANDBOX",
+      class_name: "ProjectBuildContainer",
     });
-    expect(config.migrations.at(-1)?.new_sqlite_classes).toEqual(["ProjectBuildSandboxV1"]);
-    expect(config.vars.PROJECT_BUILD_SANDBOX_RUNTIME).toBe(runtime);
+    expect(config.migrations.slice(-2)).toEqual([
+      expect.objectContaining({ new_sqlite_classes: ["ProjectBuildContainer"] }),
+      expect.objectContaining({ deleted_classes: ["ProjectBuildSandbox"] }),
+    ]);
   });
 
   it.each([
-    ["wrangler.prod.jsonc", ["ProjectBuildSandbox", "AnalysisSandbox", "DbQuerySandbox"]],
-    ["wrangler.staging.jsonc", ["ProjectBuildSandbox", "AnalysisSandbox", "DbQuerySandbox"]],
-    ["wrangler.jsonc", ["ProjectBuildSandbox", "AnalysisSandbox", "DbQuerySandbox"]],
-    ["wrangler.test.jsonc", ["ProjectBuildSandbox", "AnalysisSandbox"]],
-    ["wrangler.dev-miguel.jsonc", ["ProjectBuildSandbox", "DbQuerySandbox"]],
-    ["wrangler.dev-illiana.jsonc", ["ProjectBuildSandbox", "DbQuerySandbox"]],
+    ["wrangler.prod.jsonc", ["AnalysisSandbox", "DbQuerySandbox"]],
+    ["wrangler.staging.jsonc", ["AnalysisSandbox", "DbQuerySandbox"]],
+    ["wrangler.jsonc", ["AnalysisSandbox", "DbQuerySandbox"]],
+    ["wrangler.test.jsonc", ["AnalysisSandbox"]],
+    ["wrangler.dev-miguel.jsonc", ["DbQuerySandbox"]],
+    ["wrangler.dev-illiana.jsonc", ["DbQuerySandbox"]],
   ] as const)("%s instance_type matches container-sizing.ts", (path, classes) => {
     const types = instanceTypesByClass(path);
     for (const className of classes) {

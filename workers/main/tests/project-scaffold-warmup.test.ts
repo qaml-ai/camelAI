@@ -4,7 +4,7 @@ import { defaultProjectScaffoldFiles, type ProjectScaffoldTemplate } from "../sr
 import { SHADCN_NPM_PACKAGE_VERSIONS } from "../src/shadcn-registry.generated";
 import warmupManifest from "../project-build-sandbox-warmup/package.json";
 
-// The project build sandbox image (workers/main/project-build-sandbox.Dockerfile)
+// The project build sandbox image (workers/main/project-build-container.Dockerfile)
 // prebakes a warm bun cache by installing the buildable scaffold templates'
 // dependencies at image build time. This test guards against drift: every
 // dependency (name AND version range) used by a scaffold template must appear in
@@ -41,7 +41,7 @@ describe("project build sandbox warmup manifest", () => {
           warmupDependencies[name],
           `Scaffold template "${template}" depends on "${name}": "${range}", which is missing from `
           + `workers/main/project-build-sandbox-warmup/package.json. Update the warmup manifest so the `
-          + `prebaked bun cache in project-build-sandbox.Dockerfile stays warm for scaffold installs.`,
+          + `prebaked bun cache in project-build-container.Dockerfile stays warm for scaffold installs.`,
         ).toBeDefined();
         expect(
           warmupDependencies[name],
@@ -64,7 +64,7 @@ describe("project build sandbox warmup manifest", () => {
         warmupDependencies[name],
         `shadcn registry can add "${name}": "${range}", which is missing from `
         + `workers/main/project-build-sandbox-warmup/package.json. Update the warmup manifest so the `
-        + `prebaked bun cache in project-build-sandbox.Dockerfile stays warm for component installs.`,
+        + `prebaked bun cache in project-build-container.Dockerfile stays warm for component installs.`,
       ).toBe(range);
     }
   });

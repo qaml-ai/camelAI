@@ -13,12 +13,6 @@
 	"browser": { "binding": "BROWSER" },
 	"containers": [
 		{
-			"class_name": "ProjectBuildSandbox",
-			"image": "./workers/main/project-build-sandbox.Dockerfile",
-			"instance_type": "standard-3",
-			"max_instances": 1
-		},
-		{
 			"class_name": "AnalysisSandbox",
 			"image": "./workers/main/analysis-sandbox.Dockerfile",
 			"instance_type": "standard-3",
@@ -87,7 +81,7 @@
 				{ "name": "WORKSPACE", "class_name": "WorkspaceDO" },
 				{ "name": "WORKSPACE_CRON", "class_name": "WorkspaceCronDO" },
 				{ "name": "WORKSPACE_FS", "class_name": "WorkspaceFilesystemDO" },
-				{ "name": "PROJECT_BUILD_SANDBOX", "class_name": "ProjectBuildSandbox" },
+				{ "name": "PROJECT_BUILD_SANDBOX", "class_name": "ProjectBuildContainer" },
 				{ "name": "ANALYSIS_SANDBOX", "class_name": "AnalysisSandbox" },
 				{ "name": "WORKER_LOGS", "class_name": "WorkerLogsDO" }
 			]
@@ -116,6 +110,8 @@
 			{ "tag": "v14", "new_sqlite_classes": ["SignupDO"] },
 			{ "tag": "v15", "new_sqlite_classes": ["WorkerLogsDO"] },
 			{ "tag": "v16", "deleted_classes": ["EvalSandbox"] },
-			{ "tag": "v17", "deleted_classes": ["OrgSlugDO"] }
+			{ "tag": "v17", "deleted_classes": ["OrgSlugDO"] },
+			{ "tag": "v18", "new_sqlite_classes": ["ProjectBuildContainer"] },
+			{ "tag": "v19", "deleted_classes": ["ProjectBuildSandbox"] }
 		]
 	}

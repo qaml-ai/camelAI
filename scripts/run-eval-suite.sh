@@ -111,11 +111,6 @@ write_status running ',"startedAt":"'"$(date -Is)"'"'
 install_prereqs || true
 echo "[$(date -Is)] ref=$GIT_REF commit=$GIT_COMMIT node=$(node --version 2>/dev/null) bun=$(bun --version 2>/dev/null) docker=$(docker --version 2>/dev/null)"
 
-if [ -f workers/main/eval-sandbox.Dockerfile ]; then
-  echo "[$(date -Is)] Building camelai-eval-sandbox:latest (Docker cache enabled)"
-  docker build -t camelai-eval-sandbox:latest -f workers/main/eval-sandbox.Dockerfile . || fail docker-build $?
-fi
-
 if [ -f workers/main/analysis-sandbox.Dockerfile ]; then
   echo "[$(date -Is)] Building camelai-analysis-sandbox:latest (analysis stack, native arch)"
   # Builds natively for the host arch; on arm64 hosts it first builds the

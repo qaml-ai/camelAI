@@ -1,14 +1,12 @@
-# Project build sandbox on the native Durable Object container API
-# (ProjectBuildSandboxV1, Sandbox SDK 1.0).
+# Project build container (ProjectBuildContainer) on the native Durable Object
+# container API (Sandbox SDK 1.0).
 #
-# Successor to project-build-sandbox.Dockerfile. The 0.12 image was built FROM
-# docker.io/cloudflare/sandbox:0.12.10 (Ubuntu 22.04, bun 1.3.12, node 22,
-# git, curl) and its entrypoint ran the sandbox HTTP server. 1.0 has no server:
-# the Durable Object runs every command with ctx.container.exec(), so this is a
-# plain image whose main process just stays alive.
+# There is no sandbox server: the Durable Object runs every command with
+# ctx.container.exec(), so this is a plain image (bun 1.3.12, node 22, git,
+# curl) whose main process just stays alive.
 #
 # exec() does not see ENV lines here (only PATH), and it starts in / whatever
-# WORKDIR says: project-build-sandbox-v1.ts passes HOME, LANG and cwd itself.
+# WORKDIR says: project-build-container.ts passes HOME, LANG and cwd itself.
 #
 # Cloudflare runs containers as linux/amd64; sandbox-shim (used by Files) is
 # amd64-only.
@@ -30,9 +28,8 @@ RUN ln -s /usr/local/bin/bun /usr/local/bin/bunx
 # the installed @cloudflare/sandbox-v1 version.
 COPY --from=sandbox-tools /usr/local/bin/sandbox-shim /usr/local/bin/sandbox-shim
 
-# Prebake a warm bun cache for the scaffold templates, exactly as the 0.12 image
-# does (see project-build-sandbox.Dockerfile): install into a throwaway dir,
-# keep /root/.bun/install/cache. Commands run as root with HOME=/root, which the
+# Prebake a warm bun cache for the scaffold templates: install into a throwaway
+# dir, keep /root/.bun/install/cache. Commands run as root with HOME=/root, which the
 # Durable Object passes explicitly. Wrangler's build context is this
 # Dockerfile's directory (workers/main).
 COPY project-build-sandbox-warmup/ /tmp/camelai-warmup/

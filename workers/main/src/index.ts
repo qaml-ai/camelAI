@@ -89,8 +89,7 @@ export { AppScreenshotBinding } from './app-screenshot-binding.js';
 export { AppBrowserBinding } from './app-browser-binding.js';
 export { WorkspaceFilesystemDO } from './workspace-filesystem-do.js';
 export { AnalysisSandbox } from './analysis-sandbox.js';
-export { ProjectBuildSandbox } from './project-build-sandbox.js';
-export { ProjectBuildSandboxV1 } from './project-build-sandbox-v1.js';
+export { ProjectBuildContainer } from './project-build-container.js';
 export { DbQuerySandbox } from './db-query-sandbox.js';
 
 // Compatibility shim for environments whose deployed migration history still

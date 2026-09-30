@@ -9,7 +9,7 @@ import {
 } from "./cron-schedule";
 import type { WorkspaceDO } from "./workspace";
 import type { WorkspaceFilesystemDO } from "./workspace-filesystem-do";
-import type { ProjectBuildSandbox } from "./project-build-sandbox";
+import type { ProjectBuildContainer } from "./project-build-container";
 import {
   getDefaultLlmModel,
   getStoredBedrockAwsRegion,
@@ -338,7 +338,7 @@ export interface WorkspaceCronEnv {
   WORKSPACE_FS: DurableObjectNamespace<WorkspaceFilesystemDO>;
   R2_BUCKET: R2Bucket;
   CHAT_THREAD: DurableObjectNamespace<ChatThreadDO>;
-  PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<ProjectBuildSandbox>;
+  PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<ProjectBuildContainer>;
   CODE_MODE_LOADER?: WorkerLoader;
   DETERMINISTIC_AUTOMATION_WORKFLOWS?: Workflow;
   CF_ACCOUNT_ID?: string;

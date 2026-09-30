@@ -57,10 +57,10 @@ const runtimes = {
     marker: "camelai-local-r2-sync-ok",
     mountTest: true,
   },
-  // The real ProjectBuildSandboxV1 (native ctx.container) against the
+  // The real ProjectBuildContainer (native ctx.container) against the
   // project-build image, through the calls a build makes.
   project: {
-    className: "ProjectBuildSandboxV1",
+    className: "ProjectBuildContainer",
     native: true,
     imageName: "project-build",
     image:
@@ -208,9 +208,9 @@ try {
       return Response.json(result);
     `;
   const nativeSource = `
-import { ProjectBuildSandboxV1 } from ${JSON.stringify(path.join(repoRoot, "workers/main/src/project-build-sandbox-v1.ts"))};
+import { ProjectBuildContainer } from ${JSON.stringify(path.join(repoRoot, "workers/main/src/project-build-container.ts"))};
 
-export { ProjectBuildSandboxV1 };
+export { ProjectBuildContainer };
 
 export default {
   async fetch(_request, env) {

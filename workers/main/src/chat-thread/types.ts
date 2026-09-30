@@ -94,7 +94,7 @@ export interface ChatEnv extends WorkspaceFilesystemEnv {
   WORKSPACE_CRON?: DurableObjectNamespace<WorkspaceCronDO>;
   DETERMINISTIC_AUTOMATION_WORKFLOWS?: Workflow;
   WORKER_LOGS?: DurableObjectNamespace<WorkerLogsDO>;
-  PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<import("../project-build-sandbox.js").ProjectBuildSandbox>;
+  PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<import("../project-build-container.js").ProjectBuildContainer>;
   APP_KV: KVNamespace;
   // Hosted agent runtime: with the tenant's operator token, id and definition
   // set, threads run there, as agents of AGENT_RUNTIME_DEFINITION.

@@ -20,10 +20,6 @@
 	],
 	"vpc_services": [],
 	"vars": {
-		// Which class serves project builds: "v1" = ProjectBuildSandboxV1
-		// (native ctx.container), anything else = the 0.12 ProjectBuildSandbox.
-		// Rollback is setting this back to "v0" (project-build-sandbox-routing.ts).
-		"PROJECT_BUILD_SANDBOX_RUNTIME": "v0",
 		"AI_VIRTUAL_MODEL": "dynamic/auto",
 			"R2_BUCKET_NAME": "chiridion-sandbox",
 			"R2_ACCOUNT_ID": "85bbd288051330fb51ee1c86031a299b",
@@ -50,24 +46,17 @@
 	"worker_loaders": [{ "binding": "CODE_MODE_LOADER" }],
 	"containers": [
 		{
-			"class_name": "ProjectBuildSandbox",
-			"image": "./workers/main/project-build-sandbox.Dockerfile",
-			"instance_type": "standard-3",
-			"max_instances": 2
-		},
-		{
-			// ProjectBuildSandbox on the native Durable Object container API
-			// (Sandbox SDK 1.0), side by side with the 0.12 class above.
-			// PROJECT_BUILD_SANDBOX_RUNTIME="v1" routes builds here. The
-			// durable_object policy takes no image/instance_type/max_instances:
-			// the instance size (standard-3) is chosen in start(), see
-			// workers/main/src/project-build-sandbox-v1.ts. The name must be
-			// unique per environment.
-			"class_name": "ProjectBuildSandboxV1",
-			"name": "chiridion-app-dev-illiana-project-build-v1",
+			// Per-org Vite/bun builds with a prewarmed bun cache, on the native
+			// Durable Object container API (Sandbox SDK 1.0). The durable_object
+			// policy takes no image/instance_type/max_instances: the instance size
+			// (standard-3) is chosen in start(), see
+			// workers/main/src/project-build-container.ts. The name must be unique
+			// per environment.
+			"class_name": "ProjectBuildContainer",
+			"name": "chiridion-app-dev-illiana-project-build",
 			"scheduling_policy": "durable_object",
 			"images": {
-				"project-build": { "dockerfile": "./workers/main/project-build-sandbox-v1.Dockerfile" },
+				"project-build": { "dockerfile": "./workers/main/project-build-container.Dockerfile" },
 			},
 		},
 		{
@@ -153,8 +142,7 @@
 			{ "name": "WORKSPACE_CRON", "class_name": "WorkspaceCronDO" },
 				{ "name": "WORKER_LOGS", "class_name": "WorkerLogsDO" },
 				{ "name": "WORKSPACE_FS", "class_name": "WorkspaceFilesystemDO" },
-				{ "name": "PROJECT_BUILD_SANDBOX", "class_name": "ProjectBuildSandbox" },
-				{ "name": "PROJECT_BUILD_SANDBOX_V1", "class_name": "ProjectBuildSandboxV1" },
+				{ "name": "PROJECT_BUILD_SANDBOX", "class_name": "ProjectBuildContainer" },
 				{ "name": "DB_QUERY_SANDBOX", "class_name": "DbQuerySandbox" },
 			]
 		},
@@ -197,6 +185,7 @@
 			{ "tag": "v30", "new_sqlite_classes": ["SignupDO"] },
 			{ "tag": "v31", "deleted_classes": ["ChiridionMcp"] },
 			{ "tag": "v32", "deleted_classes": ["OrgSlugDO"] },
-			{ "tag": "v33", "new_sqlite_classes": ["ProjectBuildSandboxV1"] },
+			{ "tag": "v33", "new_sqlite_classes": ["ProjectBuildContainer"] },
+			{ "tag": "v34", "deleted_classes": ["ProjectBuildSandbox"] },
 	]
 }

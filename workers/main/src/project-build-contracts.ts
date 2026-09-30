@@ -56,12 +56,15 @@ export interface ProjectBuildTimings {
  * ladder absorb it.
  *
  * Thrown inside the Durable Object and recognized in the Worker. A DO RPC hop
- * keeps an error's `name` and message but not its class, so callers use
- * `is()` rather than `instanceof`.
+ * delivers a plain `Error` (name "Error", no own properties) whose message is
+ * prefixed with the original name — checked under `wrangler dev` — so callers
+ * use `is()` rather than `instanceof`.
  */
 export class ProjectBuildContainerUnavailableError extends Error {
   static is(error: unknown): boolean {
-    return error instanceof Error && error.name === "ProjectBuildContainerUnavailableError";
+    if (!(error instanceof Error)) return false;
+    return error.name === "ProjectBuildContainerUnavailableError" ||
+      error.message.startsWith("ProjectBuildContainerUnavailableError: ");
   }
 
   constructor(operation: string, cause: unknown) {

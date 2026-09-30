@@ -399,8 +399,10 @@ describe("cold-start budget sizing", () => {
 describe("project build error classification", () => {
   it("names a stopped container as transient, across the DO RPC hop", () => {
     const thrown = new ProjectBuildContainerUnavailableError("exec", new Error("container exited"));
-    // What the Worker sees after the hop: a plain Error that kept its name.
-    const received = Object.assign(new Error(thrown.message), { name: thrown.name });
+    // What the Worker sees after the hop: a plain Error whose message carries
+    // the original name.
+    const received = new Error(`${thrown.name}: ${thrown.message}`);
+    expect(received.name).toBe("Error");
     expect(projectBuildTransientCause(thrown)).toBe("container_unavailable");
     expect(projectBuildTransientCause(received)).toBe("container_unavailable");
     expect(isProjectBuildServiceUnavailableError(received)).toBe(true);

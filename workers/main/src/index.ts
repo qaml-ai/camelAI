@@ -102,6 +102,10 @@ export { S3Gateway } from '@cloudflare/sandbox';
 // references the old AdminIndexDO class. The app uses the D1-backed index now.
 export class AdminIndexDO extends DurableObject<Env> {}
 
+// Compatibility shim for deployed migration histories that contain the retired
+// Cloudflare Sandbox SDK experiment. Projects are DO+R2 backed now.
+export class CloudflareSandbox extends DurableObject<Env> {}
+
 // Compatibility shim for deployed migration histories that introduced the
 // old Think-based migration planning Durable Object. The legacy workspace
 // migration feature has since been removed; this no-op class remains only so

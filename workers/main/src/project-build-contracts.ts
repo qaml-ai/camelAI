@@ -48,3 +48,25 @@ export interface ProjectBuildTimings {
   persistMs: number;
   totalMs: number;
 }
+
+/**
+ * ProjectBuildContainer could not run an operation because its container is
+ * not running: it failed to start, or it stopped under the call. Transient: the
+ * next call starts a fresh container, so the readiness gate and the retry
+ * ladder absorb it.
+ *
+ * Thrown inside the Durable Object and recognized in the Worker. A DO RPC hop
+ * keeps an error's `name` and message but not its class, so callers use
+ * `is()` rather than `instanceof`.
+ */
+export class ProjectBuildContainerUnavailableError extends Error {
+  static is(error: unknown): boolean {
+    return error instanceof Error && error.name === "ProjectBuildContainerUnavailableError";
+  }
+
+  constructor(operation: string, cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`Project build container is not running (${operation}): ${detail}`, { cause });
+    this.name = "ProjectBuildContainerUnavailableError";
+  }
+}

@@ -4,6 +4,7 @@ import {
   PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS,
   PROJECT_BUILD_IDLE_TIMEOUT_MS,
 } from "../src/container-sizing";
+import { ProjectBuildContainerUnavailableError } from "../src/project-build-contracts";
 import {
   isProjectBuildPermanentStartupError,
   projectBuildTransientCause,
@@ -15,7 +16,6 @@ import {
   ProjectBuildContainer,
   type ProjectBuildFiles,
 } from "../src/project-build-container";
-import { isSandboxExecTimeoutResult } from "../src/sandbox-exec-deadline";
 import { collectWorkerBundleFromSandbox, type ProjectBuildSandboxLike } from "../src/project-worker-bundle";
 import type { Env } from "../src/types";
 
@@ -168,10 +168,6 @@ function fakeFiles(initial: Record<string, string | Uint8Array> = {}) {
           : new Uint8Array(content as ArrayBuffer);
       files.set(path, bytes);
     }),
-    stat: vi.fn(async (path: string) => {
-      if (!files.has(path) && !dirs.has(path)) throw fileError("ENOENT", "stat", path);
-      return { type: files.has(path) ? "file" : "directory" } as Awaited<ReturnType<ProjectBuildFiles["stat"]>>;
-    }),
     mkdir: vi.fn(async (path: string, options?: { recursive?: boolean }) => {
       const parts = path.split("/").filter(Boolean);
       for (let i = 1; i <= parts.length; i += 1) {
@@ -260,13 +256,13 @@ describe("ProjectBuildContainer container lifecycle", () => {
     expect(container.start).not.toHaveBeenCalled();
   });
 
-  it("reports a container that is not running as a transient ContainerUnavailableError", async () => {
+  it("reports a container that is not running as a transient ProjectBuildContainerUnavailableError", async () => {
     const { container } = fakeContainer({ startError: new Error("container exited before it was ready") });
     const { sandbox } = createSandbox({ container });
 
     const error = await sandbox.exec("true").catch((cause: unknown) => cause);
 
-    expect(String(error)).toContain("ContainerUnavailableError");
+    expect(ProjectBuildContainerUnavailableError.is(error)).toBe(true);
     expect(String(error)).toContain("container exited before it was ready");
     expect(projectBuildTransientCause(error)).toBe("container_unavailable");
     // The next call tries a fresh start instead of reusing the failed setup.
@@ -280,17 +276,6 @@ describe("ProjectBuildContainer container lifecycle", () => {
     const error = await sandbox.exec("true").catch((cause: unknown) => cause);
     expect(isProjectBuildPermanentStartupError(error)).toBe(true);
     expect(container.start).not.toHaveBeenCalled();
-  });
-
-  it("restartZombieContainer destroys a running container", async () => {
-    const { container } = fakeContainer();
-    const { sandbox } = createSandbox({ container });
-    await sandbox.exec("true");
-    await expect(sandbox.restartZombieContainer({ operation: "readiness_probe", trigger: "probe_session_death" }))
-      .resolves.toEqual({ restarted: true, reason: "destroyed" });
-    expect(container.running).toBe(false);
-    await expect(sandbox.restartZombieContainer({ operation: "readiness_probe", trigger: "probe_session_death" }))
-      .resolves.toEqual({ restarted: false, reason: "not_running" });
   });
 });
 
@@ -331,7 +316,7 @@ describe("ProjectBuildContainer exec", () => {
       env: { CI: "1", SKIPPED: undefined },
     });
 
-    expect(result).toEqual({ success: true, exitCode: 0, stdout: "built\n", stderr: "warn\n" });
+    expect(result).toEqual({ success: true, exitCode: 0, stdout: "built\n", stderr: "warn\n", timedOut: false });
     expect(execCalls[0].argv).toEqual([
       "timeout", "--kill-after=5", "120s", "bash", "-c", "bun install && bun run build",
     ]);
@@ -355,28 +340,18 @@ describe("ProjectBuildContainer exec", () => {
     await expect(sandbox.exec("false")).resolves.toMatchObject({ success: false, exitCode: 1, stderr: "boom" });
   });
 
-  it("reports its own timeout like 0.x's sessionless exec", async () => {
+  it("reports its own timeout as timedOut, keeping the partial output", async () => {
     const { container } = fakeContainer({ handler: () => ({ exitCode: 124, stderr: "partial", delayMs: 20 }) });
     const { sandbox } = createSandbox({ container });
     const result = await sandbox.exec("sleep 60", { timeout: 10 });
-    expect(result.exitCode).toBe(124);
-    expect(result.stderr).toBe("partial\nCommand timed out after 10ms");
-    expect(isSandboxExecTimeoutResult(result)).toBe(true);
+    expect(result).toMatchObject({ success: false, exitCode: 124, stderr: "partial", timedOut: true });
   });
 
   it("does not mistake a command's own quick exit 124 for a timeout", async () => {
     const { container } = fakeContainer({ handler: () => ({ exitCode: 124, stderr: "inner timeout" }) });
     const { sandbox } = createSandbox({ container });
     const result = await sandbox.exec("timeout 1 sleep 5", { timeout: 60_000 });
-    expect(result).toMatchObject({ exitCode: 124, stderr: "inner timeout" });
-    expect(isSandboxExecTimeoutResult(result)).toBe(false);
-  });
-
-  it("probeShell runs the probe as a plain command", async () => {
-    const { container, execCalls } = fakeContainer();
-    const { sandbox } = createSandbox({ container });
-    await expect(sandbox.probeShell("true", { cwd: "/", timeout: 15_000 })).resolves.toMatchObject({ exitCode: 0 });
-    expect(execCalls[0].argv).toEqual(["timeout", "--kill-after=5", "15s", "bash", "-c", "true"]);
+    expect(result).toMatchObject({ exitCode: 124, stderr: "inner timeout", timedOut: false });
   });
 });
 
@@ -403,16 +378,14 @@ describe("ProjectBuildContainer files", () => {
     });
     await expect(sandbox.readFile("/workspace/p1/bun.lock")).resolves.toEqual({ content: "lock" });
     await expect(sandbox.readFile("/workspace/p1/bun.lock", { encoding: "base64" })).resolves.toEqual({ content: btoa("lock") });
-    expect(Array.from(await sandbox.readFileBytes("/workspace/p1/x.bin"))).toEqual([0, 255]);
+    expect(Array.from(await sandbox.readFileBytes("/workspace/p1/x.bin") ?? [])).toEqual([0, 255]);
   });
 
-  it("reports a missing file the way callers treat as a cache miss", async () => {
+  it("reads a missing file as null", async () => {
     const { container } = fakeContainer();
     const { sandbox } = createSandbox({ container });
-    const error = await sandbox.readFile("/workspace/p1/bun.lock").catch((cause: unknown) => cause);
-    expect(String(error).toLowerCase()).toContain("not found");
-    await expect(sandbox.exists("/workspace/p1/bun.lock")).resolves.toEqual({ exists: false });
-    await expect(sandbox.exists("/workspace")).resolves.toEqual({ exists: true });
+    await expect(sandbox.readFile("/workspace/p1/bun.lock")).resolves.toBeNull();
+    await expect(sandbox.readFileBytes("/workspace/p1/bun.lock")).resolves.toBeNull();
   });
 
   it("mkdir passes recursive through", async () => {

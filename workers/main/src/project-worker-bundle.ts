@@ -1,68 +1,18 @@
-import { collectFile } from "@cloudflare/sandbox";
 import type { DirectDeployAsset, DirectWorkerMetadata, DirectWorkerModule } from "./direct-dispatch-deploy.js";
 import type { WorkerBinding } from "./cf-api-proxy.js";
 import { mapWithConcurrency } from "../../../src/lib/map-with-concurrency";
+import type { ProjectBuildContainer } from "./project-build-container.js";
 
 const BUNDLE_READ_CONCURRENCY = 4;
 
-export interface ProjectBuildSandboxLike {
-  // Matches @cloudflare/sandbox ExecOptions: the execution bound is `timeout`
-  // (ms). Do not add a `timeoutMs` alias — the SDK silently ignores it.
-  exec(command: string, options?: { cwd?: string; env?: Record<string, string | undefined>; timeout?: number }): Promise<{
-    success?: boolean;
-    stdout?: string;
-    stderr?: string;
-    exitCode?: number;
-  }>;
-  mkdir(path: string, options?: { recursive?: boolean }): Promise<unknown>;
-  writeFile(
-    path: string,
-    content: string | ReadableStream<Uint8Array>,
-    options?: { encoding?: "base64" | "utf8" },
-  ): Promise<unknown>;
-  exists?(path: string): Promise<{ exists: boolean }>;
-  /**
-   * Readiness-probe entry point that runs a command through the session layer
-   * WITHOUT the DO-side zombie self-heal, so the gate's consecutive-probe
-   * threshold — not the DO's destroy-on-first-death exec wrapper — decides when
-   * a zombie is restarted. Optional: shapes without it fall back to `exec`.
-   */
-  probeShell?(command: string, options?: { cwd?: string; timeout?: number }): Promise<{
-    stdout?: string;
-    stderr?: string;
-    exitCode?: number;
-  }>;
-  /**
-   * ProjectBuildSandbox-only: defer the idle reaper while the org's build
-   * session is active. Optional so plain Sandbox stubs and test fakes still
-   * satisfy this interface.
-   */
-  noteBuildSessionActivity?(windowMs?: number): Promise<void>;
-  /**
-   * Zombie self-heal (sandbox-zombie-recovery.ts): destroy a container whose
-   * shell layer is dead so the next call boots clean. Rate-limited DO-side.
-   * Optional for the same reason as above.
-   */
-  restartZombieContainer?(request: {
-    operation: string;
-    trigger: "exec_session_death" | "probe_session_death";
-    error?: string;
-  }): Promise<{ restarted: boolean; reason: string } | undefined>;
-  readFile?(path: string, options?: { encoding?: "base64" | "utf8" }): Promise<{ content: string }>;
-  readFileStream?(path: string): Promise<ReadableStream<Uint8Array>>;
-  /**
-   * Whole-file read (ProjectBuildSandboxV1). Preferred over readFileStream,
-   * whose 0.12 SSE framing (parsed by collectFile) Sandbox SDK 1.0 dropped.
-   */
-  readFileBytes?(path: string): Promise<Uint8Array>;
-  listFiles?(path: string, options?: { recursive?: boolean; includeHidden?: boolean }): Promise<{ files: Array<{
-    name: string;
-    type: "file" | "directory";
-    relativePath?: string;
-    absolutePath?: string;
-    size?: number;
-  }> }>;
-}
+/**
+ * What build code calls on the org's build container (ProjectBuildContainer,
+ * reached as a DO stub through getProjectBuildSandbox). Tests pass fakes.
+ */
+export type ProjectBuildSandboxLike = Pick<
+  ProjectBuildContainer,
+  "exec" | "mkdir" | "writeFile" | "readFile" | "readFileBytes" | "listFiles" | "noteBuildSessionActivity"
+>;
 
 export interface ProjectWorkerBundle {
   metadata: DirectWorkerMetadata;
@@ -86,9 +36,6 @@ export async function collectWorkerBundleFromSandbox(
   workdir: string,
   manifestPath = "build/server/wrangler.json",
 ): Promise<ProjectWorkerBundle> {
-  if (!(sandbox.readFileBytes || sandbox.readFileStream) || !sandbox.listFiles) {
-    throw new Error("Sandbox does not support streamed build output reads");
-  }
   const absoluteManifestPath = joinSandboxPath(workdir, manifestPath);
   const manifestBytes = await readSandboxFileBytes(sandbox, absoluteManifestPath);
   const manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as DirectWorkerMetadata & {
@@ -393,7 +340,6 @@ async function collectAssetsFromManifest(
       ? manifest.assets.directory
       : "";
   if (!rawDirectory) return [];
-  if (!sandbox.listFiles) throw new Error("Sandbox does not support file listing");
   const assetsRoot = joinSandboxPath(serverRoot, rawDirectory);
   const listed = await sandbox.listFiles(assetsRoot, { recursive: true, includeHidden: true });
   const assets = listed.files.filter((file) => file.type === "file").map((file) => {
@@ -410,10 +356,9 @@ async function collectAssetsFromManifest(
 }
 
 async function readSandboxFileBytes(sandbox: ProjectBuildSandboxLike, path: string): Promise<Uint8Array> {
-  if (sandbox.readFileBytes) return sandbox.readFileBytes(path);
-  if (!sandbox.readFileStream) throw new Error("Sandbox does not support streamed file reads");
-  const { content } = await collectFile(await sandbox.readFileStream(path));
-  return typeof content === "string" ? new TextEncoder().encode(content) : content;
+  const bytes = await sandbox.readFileBytes(path);
+  if (bytes === null) throw new Error(`Build output is missing: ${path}`);
+  return bytes;
 }
 
 /** Wrangler module rule types → Cloudflare upload content types. */

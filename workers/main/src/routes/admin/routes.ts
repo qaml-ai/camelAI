@@ -157,7 +157,7 @@ import {
   type DbQuerySandboxStub,
 } from "../../db-query-service.js";
 import { buildLogTail, cleanBuildLog, getProjectBuildSandbox, runProjectBuild } from "../../project-build-service.js";
-import { runWithProjectBuildReadiness } from "../../project-build-readiness.js";
+import { projectBuildReadinessEventName, runWithProjectBuildReadiness } from "../../project-build-readiness.js";
 import { waitUntil } from "cloudflare:workers";
 import { refreshOrgCustomDomainHostnamesForAdmin } from "../../../../../src/lib/admin-custom-domain.server.js";
 import {
@@ -741,7 +741,7 @@ routes.post(
     const sandbox = getProjectBuildSandbox(c.env, body.org_id);
 
     // Gated exactly like deploy_project: this route drives the same container,
-    // and an ungated admin repro on a sleeping (or zombie) container reports a
+    // and an ungated admin repro on a stopped container reports a
     // failure the user-facing path would have absorbed.
     let result: Awaited<ReturnType<typeof runProjectBuild>>;
     try {
@@ -756,13 +756,7 @@ routes.post(
         {
           operation: "project_build_verify",
           onEvent: (event) => recordObservabilityEvent(c.env, {
-            event: event.type === "cold_start"
-              ? "build_sandbox_cold_start"
-              : event.type === "zombie_detected"
-                ? "build_sandbox_zombie_detected"
-                : event.type === "startup_failed"
-                  ? "build_sandbox_startup_failed"
-                  : "build_sandbox_ready_timeout",
+            event: projectBuildReadinessEventName(event),
             severity: event.type === "cold_start" ? "info" : "error",
             component: "admin",
             operation: "project-build-verify",
@@ -775,8 +769,8 @@ routes.post(
         },
       );
     } catch (error) {
-      // The gate's terminal messages (never ready, permanently broken image,
-      // unusable storage mount) are the useful answer for an operator running a
+      // The gate's terminal messages (never ready, permanently broken image)
+      // are the useful answer for an operator running a
       // repro — an opaque 500 is not.
       const message = error instanceof Error ? error.message : String(error);
       recordObservabilityEvent(c.env, {

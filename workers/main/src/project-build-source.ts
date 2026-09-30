@@ -378,24 +378,9 @@ async function readSourceManifestFromSandbox(
   sandbox: ProjectBuildSandboxLike,
   workdir: string,
 ): Promise<SourceManifest | null> {
-  if (!sandbox.readFile) return null;
-  const manifestPath = sourceManifestPath(workdir);
-  // A missing manifest is the normal first-build cache-miss path. Avoid using a
-  // rejected readFile RPC as an existence probe: the eval runtime can surface a
-  // handled Sandbox RPC rejection as a Vitest unhandled error after the caller
-  // has already recovered from it.
-  if (sandbox.exists) {
-    const existence = await sandbox.exists(manifestPath);
-    if (!existence.exists) return null;
-  }
-  let read: { content: string };
-  try {
-    read = await sandbox.readFile(manifestPath, { encoding: "utf8" });
-  } catch (error) {
-    const message = String(error).toLowerCase();
-    if (message.includes("missing") || message.includes("not found") || message.includes("enoent")) return null;
-    throw error;
-  }
+  // A missing manifest is the normal first-build cache-miss path.
+  const read = await sandbox.readFile(sourceManifestPath(workdir), { encoding: "utf8" });
+  if (read === null) return null;
   try {
     return validateSourceManifest(JSON.parse(read.content));
   } catch {

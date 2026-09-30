@@ -53,9 +53,7 @@ function fakeSandbox(): ProjectBuildSandboxLike & {
     mkdir: vi.fn(async () => undefined),
     writeFile: vi.fn(async () => undefined),
     exists: vi.fn(async () => ({ exists: false })),
-    readFile: vi.fn(async () => {
-      throw new Error("not found");
-    }),
+    readFile: vi.fn(async () => null),
   };
 }
 
@@ -93,11 +91,8 @@ describe("runProjectBuild", () => {
       }),
     });
     expect(sandbox.mkdir).toHaveBeenCalledWith("/workspace/demo-project", { recursive: true });
-    expect(sandbox.exists).toHaveBeenCalledWith("/workspace/demo-project.source-manifest.json");
-    expect(sandbox.readFile).not.toHaveBeenCalledWith(
-      "/workspace/demo-project.source-manifest.json",
-      { encoding: "base64" },
-    );
+    // A cold workdir has no source manifest: a cache miss, not an error.
+    expect(sandbox.readFile).toHaveBeenCalledWith("/workspace/demo-project.source-manifest.json", { encoding: "utf8" });
     expect(sandbox.exec).toHaveBeenCalledWith(expect.stringContaining("tar -xf '/workspace/demo-project.source.0.tar'"), { cwd: "/workspace", timeout: 120_000 });
     expect(sandbox.exec).toHaveBeenCalledWith("bun install && bun run build", {
       cwd: "/workspace/demo-project",
@@ -131,6 +126,19 @@ describe("runProjectBuild", () => {
       error: "missing build",
     });
     expect(files.writeFile).toHaveBeenCalledWith("/.camelai/tmp/build.log", "missing build");
+  });
+
+  it("says when the container stopped the build at its timeout", async () => {
+    const files = fakeFileStore({ "/package.json": JSON.stringify({ scripts: { build: "vite build" } }) });
+    const sandbox = fakeSandbox();
+    sandbox.exec.mockResolvedValueOnce({ success: true, exitCode: 0, stdout: "", stderr: "", timedOut: false });
+    sandbox.exec.mockResolvedValueOnce({ success: false, exitCode: 124, stdout: "", stderr: "vite: building", timedOut: true });
+
+    await expect(runProjectBuild({ projectId: "demo", files, sandbox, timeoutMs: 15_000 })).resolves.toMatchObject({
+      success: false,
+      exitCode: 124,
+      error: "vite: building\nCommand timed out after 15000ms",
+    });
   });
 
   it("fails fast when package.json has no build script", async () => {
@@ -215,7 +223,7 @@ describe("runProjectBuild", () => {
       ...fakeSandbox(),
       readFile: vi.fn(async (path: string) => {
         if (path.endsWith("/bun.lock")) throw new Error("sandbox exploded");
-        throw new Error("not found");
+        return null;
       }),
     };
     sandbox.exec = vi.fn(async (command: string) => command.includes("bun run build")
@@ -280,7 +288,7 @@ describe("runProjectAddDependency", () => {
       readFile: vi.fn(async (path: string) => {
         if (path.endsWith("/package.json")) return { content: Buffer.from(updatedPackageJson).toString("base64") };
         if (path.endsWith("/bun.lock")) return { content: Buffer.from("# lockfile\n").toString("base64") };
-        throw new Error(`missing ${path}`);
+        return null;
       }),
     };
 

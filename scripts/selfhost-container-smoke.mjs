@@ -214,36 +214,33 @@ export { ProjectBuildContainer };
 
 export default {
   async fetch(_request, env) {
+    // The container is removed with the others by cleanupSmokeContainers().
     const sandbox = env.SANDBOX.getByName("org-selfhost-smoke");
-    try {
-      const workdir = "/workspace/smoke";
-      await sandbox.mkdir(workdir + "/src", { recursive: true });
-      await sandbox.writeFile(workdir + "/src/index.ts", 'console.log("' + ${JSON.stringify("camelai-project-build-ok")} + '")');
-      await sandbox.writeFile(workdir + "/archive.bin", new Blob(["streamed"]).stream());
-      const build = await sandbox.exec(
-        "bun build src/index.ts --outfile out/index.js >/dev/null && node out/index.js",
-        { cwd: workdir, timeout: 120000, env: { CI: "1" } },
-      );
-      if (build.exitCode !== 0) return Response.json({ ...build, success: false });
-      const listed = await sandbox.listFiles(workdir + "/out", { recursive: true, includeHidden: true });
-      const bundle = await sandbox.readFileBytes(workdir + "/out/index.js");
-      const streamed = await sandbox.readFile(workdir + "/archive.bin");
-      const missing = await sandbox.exists(workdir + "/missing");
-      const timedOut = await sandbox.exec("sleep 30", { timeout: 1000 });
-      const checks = [
-        listed.files.some((file) => file.relativePath === "index.js"),
-        bundle.byteLength > 0,
-        streamed.content === "streamed",
-        missing.exists === false,
-        timedOut.exitCode === 124,
-      ];
-      if (checks.includes(false)) {
-        return Response.json({ success: false, stdout: build.stdout, checks });
-      }
-      return Response.json({ success: true, stdout: build.stdout });
-    } finally {
-      await sandbox.restartZombieContainer({ operation: "smoke", trigger: "cleanup" });
+    const workdir = "/workspace/smoke";
+    await sandbox.mkdir(workdir + "/src", { recursive: true });
+    await sandbox.writeFile(workdir + "/src/index.ts", 'console.log("' + ${JSON.stringify("camelai-project-build-ok")} + '")');
+    await sandbox.writeFile(workdir + "/archive.bin", new Blob(["streamed"]).stream());
+    const build = await sandbox.exec(
+      "bun build src/index.ts --outfile out/index.js >/dev/null && node out/index.js",
+      { cwd: workdir, timeout: 120000, env: { CI: "1" } },
+    );
+    if (build.exitCode !== 0) return Response.json({ ...build, success: false });
+    const listed = await sandbox.listFiles(workdir + "/out", { recursive: true, includeHidden: true });
+    const bundle = await sandbox.readFileBytes(workdir + "/out/index.js");
+    const streamed = await sandbox.readFile(workdir + "/archive.bin");
+    const missing = await sandbox.readFileBytes(workdir + "/missing");
+    const timedOut = await sandbox.exec("sleep 30", { timeout: 1000 });
+    const checks = [
+      listed.files.some((file) => file.relativePath === "index.js"),
+      bundle.byteLength > 0,
+      streamed.content === "streamed",
+      missing === null,
+      timedOut.timedOut === true,
+    ];
+    if (checks.includes(false)) {
+      return Response.json({ success: false, stdout: build.stdout, checks });
     }
+    return Response.json({ success: true, stdout: build.stdout });
   },
 };
 `;

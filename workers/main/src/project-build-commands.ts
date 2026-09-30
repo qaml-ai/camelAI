@@ -78,7 +78,6 @@ export async function runProjectBuild(input: {
   const commandStartedAt = Date.now();
   const result = normalizeSandboxExecResult(await input.sandbox.exec("bun install && bun run build", {
     cwd: workdir,
-    // @cloudflare/sandbox ExecOptions bounds execution via `timeout` (ms), not `timeoutMs`.
     timeout: timeoutMs,
     env: {
       CI: "1",
@@ -86,7 +85,7 @@ export async function runProjectBuild(input: {
       CAMELAI_PROJECT_ID: projectId,
       CAMELAI_BUILD_TIMEOUT_MS: String(timeoutMs),
     },
-  }));
+  }), timeoutMs);
   const commandMs = Date.now() - commandStartedAt;
   if (result.exitCode !== 0) {
     logProjectCommandFailure("build", {
@@ -199,7 +198,7 @@ export async function runProjectAddDependency(input: {
       WRANGLER_SEND_METRICS: "false",
       CAMELAI_PROJECT_ID: projectId,
     },
-  }));
+  }), DEFAULT_BUILD_TIMEOUT_MS);
   const commandMs = Date.now() - commandStartedAt;
   if (result.exitCode !== 0) {
     logProjectCommandFailure("dependency_install", {

@@ -54,6 +54,7 @@ import { buildLogTail, cleanBuildLog, DEFAULT_BUILD_TIMEOUT_MS, getProjectBuildS
 import {
   createProjectBuildReadinessGate,
   ensureBuildSandboxReady,
+  projectBuildReadinessEventName,
   withProjectBuildServiceErrorMapping,
   type ProjectBuildReadinessEvent,
   type ProjectBuildReadinessGate,
@@ -2302,7 +2303,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     operation: "add_dependency" | "deploy_project",
   ): Promise<void> {
     try {
-      await sandbox.noteBuildSessionActivity?.();
+      await sandbox.noteBuildSessionActivity();
     } catch (error) {
       console.warn("[project-build] failed to extend build session window", {
         operation,
@@ -2318,24 +2319,13 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const props = this.ctx?.props;
     // A permanently broken container is a configuration problem, not a slow
     // boot — it gets its own event so cold-start dashboards stay boot-shaped.
-    // Same for a zombie: the wait is real, but the cause is a dead shell layer,
-    // and the DO's own sandbox_zombie_restart records what was done.
-    const eventName = event.type === "cold_start"
-      ? "build_sandbox_cold_start"
-      : event.type === "zombie_detected"
-        ? "build_sandbox_zombie_detected"
-        : event.type === "startup_failed"
-          ? "build_sandbox_startup_failed"
-          : "build_sandbox_ready_timeout";
     const status = event.type === "cold_start"
       ? "ready"
-      : event.type === "zombie_detected"
-        ? (event.restarted ? "restarted" : "restart_suppressed")
-        : event.type === "startup_failed"
-          ? "startup_failed"
-          : "timeout";
+      : event.type === "startup_failed"
+        ? "startup_failed"
+        : "timeout";
     recordObservabilityEvent(this.env, {
-      event: eventName,
+      event: projectBuildReadinessEventName(event),
       severity: event.type === "cold_start" ? "info" : "error",
       component: "CodeModeToolsBinding",
       operation,

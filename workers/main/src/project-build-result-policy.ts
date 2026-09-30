@@ -1,6 +1,7 @@
 import { base64ToBytes } from "./base64-codec.js";
 import type { ProjectBuildTimings } from "./project-build-contracts.js";
 import type { ProjectBuildSandboxLike } from "./project-worker-bundle.js";
+import { sandboxExecTimeoutMessage } from "./sandbox-exec-deadline.js";
 import type { WorkspaceFileStoreLike } from "./workspace-filesystem-do.js";
 
 const BUILD_LOG_EXCERPT_MAX_CHARS = 10_000;
@@ -92,17 +93,10 @@ export async function persistSandboxTextFile(
   path: string,
   options: { required: boolean },
 ): Promise<boolean> {
-  if (!sandbox.readFile) {
-    if (options.required) throw new Error("Sandbox does not support dependency output reads");
+  const read = await sandbox.readFile(`${workdir}/${path}`, { encoding: "base64" });
+  if (read === null) {
+    if (options.required) throw new Error(`Build output is missing: ${path}`);
     return false;
-  }
-  let read: { content: string };
-  try {
-    read = await sandbox.readFile(`${workdir}/${path}`, { encoding: "base64" });
-  } catch (error) {
-    const message = String(error).toLowerCase();
-    if (!options.required && (message.includes("missing") || message.includes("not found"))) return false;
-    throw error;
   }
   const content = new TextDecoder().decode(base64ToBytes(read.content));
   const result = await files.writeFile(`/${path}`, content);
@@ -133,16 +127,26 @@ export function normalizeProjectBuildId(value: string): string {
   return normalized;
 }
 
+/**
+ * A build command's result as build logs and tool results report it. A command
+ * the container stopped at `timeoutMs` gets that said on its last stderr line,
+ * after the partial output.
+ */
 export function normalizeSandboxExecResult(result: {
   success?: boolean;
   stdout?: string;
   stderr?: string;
   exitCode?: number;
-}): { stdout: string; stderr: string; exitCode: number } {
+  timedOut?: boolean;
+}, timeoutMs: number): { stdout: string; stderr: string; exitCode: number } {
   const exitCode = typeof result.exitCode === "number" ? result.exitCode : result.success === false ? 1 : 0;
+  let stderr = typeof result.stderr === "string" ? result.stderr : "";
+  if (result.timedOut) {
+    stderr = `${stderr}${stderr && !stderr.endsWith("\n") ? "\n" : ""}${sandboxExecTimeoutMessage(timeoutMs)}`;
+  }
   return {
     stdout: typeof result.stdout === "string" ? result.stdout : "",
-    stderr: typeof result.stderr === "string" ? result.stderr : "",
+    stderr,
     exitCode,
   };
 }

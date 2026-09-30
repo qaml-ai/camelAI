@@ -8,42 +8,42 @@ import {
   PROJECT_BUILD_INSTANCE_TYPE,
 } from "./container-sizing.js";
 import { recordObservabilityEvent } from "./observability.js";
+import { ProjectBuildContainerUnavailableError } from "./project-build-contracts.js";
 import {
   nextBuildSessionDeadline,
   PROJECT_BUILD_SESSION_ACTIVITY_KEY,
 } from "./project-build-sandbox-lifecycle.js";
-import { sandboxExecTimeoutMessage, SANDBOX_EXEC_TIMEOUT_EXIT_CODE } from "./sandbox-exec-deadline.js";
 import type { Env } from "./types.js";
 
 /** Key of the build image in wrangler `containers[].images`. */
 export const PROJECT_BUILD_IMAGE = "project-build";
 
-/** Directory commands start in when the caller gives no cwd (0.x's session default). */
+/** Directory commands start in when the caller gives no cwd. */
 const PROJECT_BUILD_DEFAULT_CWD = "/workspace";
 
 /**
  * Environment for every command. `exec()` sees none of the image's `ENV` lines
- * (only `PATH`), so what the 0.x sandbox server gave its shell is passed here.
- * HOME matters: the image prebakes the bun cache under /root/.bun.
+ * (only `PATH`), so the shell basics are passed here. HOME matters: the image
+ * prebakes the bun cache under /root/.bun.
  */
 const PROJECT_BUILD_BASE_ENV: Readonly<Record<string, string>> = {
   HOME: "/root",
   LANG: "C.UTF-8",
 };
 
-/**
- * Bound for a command whose caller gave no `timeout`. 0.x ran those unbounded;
- * every current caller passes one, so this is only a backstop.
- */
+/** Bound for a command whose caller gave no `timeout`; every caller passes one. */
 export const PROJECT_BUILD_DEFAULT_TIMEOUT_MS = 10 * 60_000;
 
 /** GNU `timeout` sends SIGKILL this long after SIGTERM. */
 const KILL_AFTER_SECONDS = 5;
 
+/** Exit code GNU `timeout` reports when it stopped the command. */
+const TIMEOUT_EXIT_CODE = 124;
+
 export interface ProjectBuildExecOptions {
   cwd?: string;
   env?: Record<string, string | undefined>;
-  /** Milliseconds, like @cloudflare/sandbox 0.12's ExecOptions.timeout. */
+  /** Milliseconds. */
   timeout?: number;
 }
 
@@ -52,6 +52,8 @@ export interface ProjectBuildExecResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+  /** The command was stopped at its `timeout`; stdout/stderr are partial. */
+  timedOut: boolean;
 }
 
 export interface ProjectBuildListedFile {
@@ -63,7 +65,7 @@ export interface ProjectBuildListedFile {
 }
 
 /** The part of `Files` this class uses; tests pass a fake. */
-export type ProjectBuildFiles = Pick<Files, "readFile" | "writeFile" | "stat" | "mkdir">;
+export type ProjectBuildFiles = Pick<Files, "readFile" | "writeFile" | "mkdir">;
 
 /**
  * Per-org build container on the native Durable Object container API
@@ -74,10 +76,9 @@ export type ProjectBuildFiles = Pick<Files, "readFile" | "writeFile" | "stat" | 
  * re-materialized from the project store, and the source manifest tells a cold
  * workdir apart, so a lost container costs a cold build, never data.
  *
- * The 0.x-shaped contracts here (exit 124 + "Command timed out" trailer, "File
- * not found" / ContainerUnavailableError messages, the probeShell and
- * restartZombieContainer names) exist only so callers don't branch on the
- * runtime. Replace them with typed results when the 0.12 class is deleted.
+ * Contracts: a missing file reads as `null`, a command stopped at its timeout
+ * comes back with `timedOut: true`, and a call that finds no running container
+ * throws ProjectBuildContainerUnavailableError.
  */
 export class ProjectBuildContainer extends DurableObject<Env> {
   private readonly files: ProjectBuildFiles | null;
@@ -101,21 +102,13 @@ export class ProjectBuildContainer extends DurableObject<Env> {
     return this.withContainer("exec", () => this.runShell(command, options));
   }
 
-  /**
-   * The readiness gate's probe. On 0.x it skipped the DO-side zombie heal; 1.0
-   * has no zombie state, so it is just a (bounded) command.
-   */
-  async probeShell(command: string, options: ProjectBuildExecOptions = {}): Promise<ProjectBuildExecResult> {
-    return this.exec(command, options);
-  }
-
   async mkdir(path: string, options: { recursive?: boolean } = {}): Promise<void> {
     await this.withContainer("mkdir", () => this.requireFiles().mkdir(path, { recursive: options.recursive === true }));
   }
 
   /**
-   * Writes a file, creating its parent directories as 0.x did. A string is
-   * utf8 unless `encoding: "base64"`; a stream is written as it arrives.
+   * Writes a file, creating its parent directories. A string is utf8 unless
+   * `encoding: "base64"`; a stream is written as it arrives.
    */
   async writeFile(
     path: string,
@@ -133,42 +126,27 @@ export class ProjectBuildContainer extends DurableObject<Env> {
     });
   }
 
-  async exists(path: string): Promise<{ exists: boolean }> {
-    return this.withContainer("exists", async () => {
-      try {
-        await this.requireFiles().stat(path);
-        return { exists: true };
-      } catch (error) {
-        if (SandboxFileError.is(error) && (error.code === "ENOENT" || error.code === "ENOTDIR")) {
-          return { exists: false };
-        }
-        throw error;
-      }
-    });
-  }
-
-  async readFile(path: string, options: { encoding?: "base64" | "utf8" } = {}): Promise<{ content: string }> {
+  /** Text (or base64) file contents; `null` when the file does not exist. */
+  async readFile(path: string, options: { encoding?: "base64" | "utf8" } = {}): Promise<{ content: string } | null> {
     const bytes = await this.readFileBytes(path);
+    if (bytes === null) return null;
     return {
       content: options.encoding === "base64" ? bytesToBase64(bytes) : new TextDecoder().decode(bytes),
     };
   }
 
   /**
-   * Whole-file read. Replaces 0.x `readFileStream()` + `collectFile()`, whose
-   * SSE framing 1.0 dropped; build outputs are bounded by Workers' own
-   * per-asset/per-module limits, well under one RPC message.
+   * Whole-file read; `null` when the file does not exist. Build outputs are
+   * bounded by Workers' own per-asset/per-module limits, well under one RPC
+   * message.
    */
-  async readFileBytes(path: string): Promise<Uint8Array> {
+  async readFileBytes(path: string): Promise<Uint8Array | null> {
     return this.withContainer("readFile", async () => {
       try {
         const response = await this.requireFiles().readFile(path);
         return new Uint8Array(await response.arrayBuffer());
       } catch (error) {
-        if (SandboxFileError.is(error) && error.code === "ENOENT") {
-          // Callers treat "not found" in the message as a normal miss.
-          throw new Error(`File not found: ${path}`, { cause: error });
-        }
+        if (SandboxFileError.is(error) && (error.code === "ENOENT" || error.code === "ENOTDIR")) return null;
         throw error;
       }
     });
@@ -202,9 +180,9 @@ export class ProjectBuildContainer extends DurableObject<Env> {
   }
 
   /**
-   * Keep the container warm for the org's build session. Same storage key and
-   * window policy as 0.x; the window is applied as the inactivity timeout
-   * instead of deferring an activity alarm. Never starts a container.
+   * Keep the container warm for the org's build session: the window is stored
+   * and applied as the container's inactivity timeout. Called when a build
+   * finishes; never starts a container.
    */
   async noteBuildSessionActivity(windowMs: number = PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS): Promise<void> {
     const stored = await this.ctx.storage.get<number>(PROJECT_BUILD_SESSION_ACTIVITY_KEY);
@@ -212,32 +190,6 @@ export class ProjectBuildContainer extends DurableObject<Env> {
     if (deadline !== null) await this.ctx.storage.put(PROJECT_BUILD_SESSION_ACTIVITY_KEY, deadline);
     const container = this.ctx.container;
     if (container?.running) await container.setInactivityTimeout(await this.inactivityTimeoutMs());
-  }
-
-  /**
-   * Kept for the readiness gate's contract. 1.0 has no zombie (dead-shell)
-   * state, so this is a plain restart: destroy, and the next call starts a
-   * fresh container.
-   */
-  async restartZombieContainer(request: {
-    operation: string;
-    trigger: string;
-    error?: string;
-  }): Promise<{ restarted: boolean; reason: string }> {
-    const container = this.ctx.container;
-    this.setup = null;
-    if (!container?.running) return { restarted: false, reason: "not_running" };
-    await container.destroy();
-    recordObservabilityEvent(this.env, {
-      event: "build_sandbox_restart",
-      severity: "warn",
-      component: "ProjectBuildContainer",
-      operation: request.operation,
-      status: request.trigger,
-      errorMessage: request.error?.slice(0, 500) ?? null,
-      orgId: this.orgId,
-    });
-    return { restarted: true, reason: "destroyed" };
   }
 
   // -------------------------------------------------------------------------
@@ -261,9 +213,8 @@ export class ProjectBuildContainer extends DurableObject<Env> {
 
   /**
    * Run `operation` against a started container. A failure that leaves the
-   * container stopped (it failed to start, or died under the call) is reported
-   * as ContainerUnavailableError, the transient class the readiness gate and
-   * the retry ladder already absorb; the next call starts a new container.
+   * container stopped (it failed to start, or died under the call) becomes
+   * ProjectBuildContainerUnavailableError; the next call starts a new container.
    */
   private async withContainer<T>(operation: string, run: () => Promise<T>): Promise<T> {
     try {
@@ -272,10 +223,7 @@ export class ProjectBuildContainer extends DurableObject<Env> {
     } catch (error) {
       if (this.ctx.container?.running || SandboxFileError.is(error)) throw error;
       this.setup = null;
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`ContainerUnavailableError: project build container is not running (${operation}): ${message}`, {
-        cause: error,
-      });
+      throw new ProjectBuildContainerUnavailableError(operation, error);
     }
   }
 
@@ -321,7 +269,7 @@ export class ProjectBuildContainer extends DurableObject<Env> {
       container.start({
         image,
         instance: PROJECT_BUILD_INSTANCE_TYPE,
-        // Builds need the npm registry; 0.x allowed Internet by default.
+        // Builds need the npm registry.
         enableInternet: true,
       });
       recordObservabilityEvent(this.env, {
@@ -350,8 +298,7 @@ export class ProjectBuildContainer extends DurableObject<Env> {
 
   /**
    * `bash -c command` under GNU `timeout`, which signals the whole process
-   * group (SIGTERM, then SIGKILL after 5s). On a timeout the result matches
-   * 0.x's sessionless exec: exit 124 and the "Command timed out" trailer.
+   * group (SIGTERM, then SIGKILL after 5s).
    */
   private async runShell(command: string, options: ProjectBuildExecOptions): Promise<ProjectBuildExecResult> {
     const timeoutMs = normalizeTimeoutMs(options.timeout);
@@ -366,14 +313,16 @@ export class ProjectBuildContainer extends DurableObject<Env> {
     });
     const output = await child.output();
     const decoder = new TextDecoder();
-    const stdout = decoder.decode(output.stdout);
-    let stderr = decoder.decode(output.stderr);
     // Exit 124 alone could be the command's own `timeout`; the elapsed time is
     // what says it was ours.
-    const timedOut = output.exitCode === SANDBOX_EXEC_TIMEOUT_EXIT_CODE && Date.now() - startedAt >= timeoutMs;
-    if (!timedOut) return { success: output.exitCode === 0, exitCode: output.exitCode, stdout, stderr };
-    stderr = `${stderr}${stderr && !stderr.endsWith("\n") ? "\n" : ""}${sandboxExecTimeoutMessage(timeoutMs)}`;
-    return { success: false, exitCode: SANDBOX_EXEC_TIMEOUT_EXIT_CODE, stdout, stderr };
+    const timedOut = output.exitCode === TIMEOUT_EXIT_CODE && Date.now() - startedAt >= timeoutMs;
+    return {
+      success: output.exitCode === 0,
+      exitCode: output.exitCode,
+      stdout: decoder.decode(output.stdout),
+      stderr: decoder.decode(output.stderr),
+      timedOut,
+    };
   }
 }
 

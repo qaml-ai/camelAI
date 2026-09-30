@@ -10,30 +10,13 @@ function fakeBundleSandbox(files: Map<string, string>): ProjectBuildSandboxLike 
     writeFile: vi.fn(async () => undefined),
     readFile: vi.fn(async (path: string) => {
       const content = files.get(path);
-      if (content == null) throw new Error(`missing ${path}`);
-      return { content: Buffer.from(content).toString("base64") };
+      return content == null ? null : { content: Buffer.from(content).toString("base64") };
     }),
-    readFileStream: vi.fn(async (path: string) => {
+    readFileBytes: vi.fn(async (path: string) => {
       const content = files.get(path);
-      if (content == null) throw new Error(`missing ${path}`);
-      const bytes = new TextEncoder().encode(content);
-      const midpoint = Math.ceil(bytes.byteLength / 2);
-      const events = [
-        { type: "metadata", mimeType: "application/octet-stream", size: bytes.byteLength, isBinary: true, encoding: "base64" },
-        { type: "chunk", data: Buffer.from(bytes.slice(0, midpoint)).toString("base64") },
-        { type: "chunk", data: Buffer.from(bytes.slice(midpoint)).toString("base64") },
-        { type: "complete" },
-      ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
-      const encoded = new TextEncoder().encode(events);
-      const wireMidpoint = Math.ceil(encoded.byteLength / 2);
-      return new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(encoded.slice(0, wireMidpoint));
-          controller.enqueue(encoded.slice(wireMidpoint));
-          controller.close();
-        },
-      });
+      return content == null ? null : new TextEncoder().encode(content);
     }),
+    noteBuildSessionActivity: vi.fn(async () => undefined),
     listFiles: vi.fn(async (root: string) => ({
       files: Array.from(files.keys()).filter((absolutePath) => absolutePath.startsWith(`${root}/`)).map((absolutePath) => ({
         name: absolutePath.split("/").pop() || "",
@@ -50,8 +33,8 @@ function readFilePaths(sandbox: ProjectBuildSandboxLike): string[] {
   return (sandbox.readFile as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((call) => call[0] as string);
 }
 
-function readFileStreamPaths(sandbox: ProjectBuildSandboxLike): string[] {
-  return (sandbox.readFileStream as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((call) => call[0] as string);
+function readFileBytesPaths(sandbox: ProjectBuildSandboxLike): string[] {
+  return (sandbox.readFileBytes as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((call) => call[0] as string);
 }
 
 describe("collectWorkerBundleFromSandbox", () => {
@@ -87,16 +70,16 @@ describe("collectWorkerBundleFromSandbox", () => {
 
     // Collection must NOT read asset bytes up front — only the manifest and the
     // uploadable modules are read. Client assets stay lazy until deploy asks.
-    const streamReadsAfterCollect = readFileStreamPaths(sandbox);
-    expect(streamReadsAfterCollect).toContain("/workspace/demo/build/server/index.js");
-    expect(streamReadsAfterCollect).not.toContain("/workspace/demo/build/client/index.html");
-    expect(streamReadsAfterCollect).not.toContain("/workspace/demo/build/client/assets/app.css");
+    const byteReadsAfterCollect = readFileBytesPaths(sandbox);
+    expect(byteReadsAfterCollect).toContain("/workspace/demo/build/server/index.js");
+    expect(byteReadsAfterCollect).not.toContain("/workspace/demo/build/client/index.html");
+    expect(byteReadsAfterCollect).not.toContain("/workspace/demo/build/client/assets/app.css");
     expect(readFilePaths(sandbox)).toEqual([]);
 
     // The lazy handle reads the real bytes on demand.
     const cssAsset = bundle.assets.find((asset) => asset.path === "assets/app.css")!;
     expect(new TextDecoder().decode(await cssAsset.read())).toBe("body{}");
-    expect(readFileStreamPaths(sandbox)).toContain("/workspace/demo/build/client/assets/app.css");
+    expect(readFileBytesPaths(sandbox)).toContain("/workspace/demo/build/client/assets/app.css");
     expect(readFilePaths(sandbox)).not.toContain("/workspace/demo/build/client/assets/app.css");
   });
 
@@ -387,7 +370,7 @@ it("honors declared module rules including Text and Data types", async () => {
   ]);
   expect((bundle.modules.find((module) => module.name === "assets/hero.png")!.content as Uint8Array).byteLength)
     .toBe(2 * 1024 * 1024);
-  expect(readFileStreamPaths(sandbox)).toContain("/workspace/demo/build/server/assets/hero.png");
+  expect(readFileBytesPaths(sandbox)).toContain("/workspace/demo/build/server/assets/hero.png");
   expect(readFilePaths(sandbox)).not.toContain("/workspace/demo/build/server/assets/hero.png");
 });
 

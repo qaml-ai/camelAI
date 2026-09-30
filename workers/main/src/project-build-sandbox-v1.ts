@@ -40,12 +40,6 @@ export const PROJECT_BUILD_V1_DEFAULT_TIMEOUT_MS = 10 * 60_000;
 /** GNU `timeout` sends SIGKILL this long after SIGTERM. */
 const KILL_AFTER_SECONDS = 5;
 
-/**
- * If `timeout` itself does not end the command (it should), the DO kills the
- * process group this long after the command's deadline.
- */
-const BACKSTOP_GRACE_MS = (KILL_AFTER_SECONDS + 10) * 1000;
-
 export interface ProjectBuildExecOptions {
   cwd?: string;
   env?: Record<string, string | undefined>;
@@ -371,53 +365,16 @@ export class ProjectBuildSandboxV1 extends DurableObject<Env> {
       cwd: options.cwd ?? PROJECT_BUILD_V1_DEFAULT_CWD,
       env: execEnv(options.env),
     });
-    const backstop = this.scheduleProcessGroupKill(child, timeoutMs + BACKSTOP_GRACE_MS);
-    let output: ExecOutput;
-    try {
-      output = await child.output();
-    } finally {
-      backstop.cancel();
-    }
+    const output = await child.output();
     const decoder = new TextDecoder();
     const stdout = decoder.decode(output.stdout);
     let stderr = decoder.decode(output.stderr);
     // Exit 124 alone could be the command's own `timeout`; the elapsed time is
     // what says it was ours.
-    const timedOut = backstop.fired ||
-      (output.exitCode === SANDBOX_EXEC_TIMEOUT_EXIT_CODE && Date.now() - startedAt >= timeoutMs);
+    const timedOut = output.exitCode === SANDBOX_EXEC_TIMEOUT_EXIT_CODE && Date.now() - startedAt >= timeoutMs;
     if (!timedOut) return { success: output.exitCode === 0, exitCode: output.exitCode, stdout, stderr };
     stderr = `${stderr}${stderr && !stderr.endsWith("\n") ? "\n" : ""}${sandboxExecTimeoutMessage(timeoutMs)}`;
     return { success: false, exitCode: SANDBOX_EXEC_TIMEOUT_EXIT_CODE, stdout, stderr };
-  }
-
-  /**
-   * Backstop for a `timeout` that did not end its command: kill the process
-   * group it leads (GNU timeout calls setpgid(0, 0), so the group id is its
-   * pid). Killing the group rather than the process is what also stops
-   * children of `bash -c`, which would otherwise keep output() waiting.
-   */
-  private scheduleProcessGroupKill(child: ExecProcess, afterMs: number): { cancel: () => void; readonly fired: boolean } {
-    let fired = false;
-    let exited = false;
-    void child.exitCode.then(() => {
-      exited = true;
-    }, () => {
-      exited = true;
-    });
-    const handle = setTimeout(() => {
-      if (exited) return;
-      fired = true;
-      console.warn("[project-build] command outlived its timeout; killing its process group", { pid: child.pid });
-      void this.container.exec(["kill", "-KILL", "--", `-${child.pid}`], { cwd: "/" })
-        .then((kill) => kill.exitCode)
-        .catch(() => {});
-    }, afterMs);
-    return {
-      cancel: () => clearTimeout(handle),
-      get fired() {
-        return fired;
-      },
-    };
   }
 }
 

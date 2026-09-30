@@ -44,23 +44,19 @@ interface FakeRun {
   exitCode?: number;
   stdout?: string;
   stderr?: string;
-  /** Resolve only once `release()` is called (or the process group is killed). */
-  hang?: boolean;
   /** Pretend the command took this long (drives the elapsed-time check). */
   delayMs?: number;
 }
 
 type ExecHandler = (argv: string[], options: ContainerExecOptions | undefined) => FakeRun;
 
-function fakeProcess(run: FakeRun, pid: number, hung: Map<number, () => void>): ExecProcess {
+function fakeProcess(run: FakeRun, pid: number): ExecProcess {
   let resolveExit!: (code: number) => void;
   const exitCode = new Promise<number>((resolve) => {
     resolveExit = resolve;
   });
   const finish = (code: number) => resolveExit(code);
-  if (run.hang) {
-    hung.set(pid, () => finish(137));
-  } else if (run.delayMs) {
+  if (run.delayMs) {
     setTimeout(() => finish(run.exitCode ?? 0), run.delayMs);
   } else {
     finish(run.exitCode ?? 0);
@@ -92,7 +88,6 @@ function fakeContainer(options: {
   let running = options.running ?? false;
   let runningImage = options.runningImage ?? IMAGE;
   let nextPid = 100;
-  const hung = new Map<number, () => void>();
   const execCalls: Array<{ argv: string[]; options: ContainerExecOptions | undefined }> = [];
   const handler: ExecHandler = options.handler ?? (() => ({ exitCode: 0 }));
   const container = {
@@ -119,15 +114,10 @@ function fakeContainer(options: {
         throw options.startError;
       }
       if (!running) throw new Error("container is not running");
-      if (argv[0] === "kill" && argv[2] === "--") {
-        const pid = Number(argv[3].slice(1));
-        hung.get(pid)?.();
-        return fakeProcess({ exitCode: 0 }, nextPid++, hung);
-      }
-      return fakeProcess(handler(argv, execOptions), nextPid++, hung);
+      return fakeProcess(handler(argv, execOptions), nextPid++);
     }),
   };
-  return { container, execCalls, hung };
+  return { container, execCalls };
 }
 
 function fakeState(container: unknown, stored: Record<string, unknown> = {}) {
@@ -385,21 +375,6 @@ describe("ProjectBuildSandboxV1 exec", () => {
     const result = await sandbox.exec("timeout 1 sleep 5", { timeout: 60_000 });
     expect(result).toMatchObject({ exitCode: 124, stderr: "inner timeout" });
     expect(isSandboxExecTimeoutResult(result)).toBe(false);
-  });
-
-  it("kills the process group when the command outlives its timeout", async () => {
-    vi.useFakeTimers();
-    const { container, execCalls } = fakeContainer({ handler: () => ({ hang: true }) });
-    const { sandbox } = createSandbox({ container });
-
-    const pending = sandbox.exec("sleep infinity", { timeout: 1_000 });
-    await vi.advanceTimersByTimeAsync(1_000 + 15_000 + 1);
-    const result = await pending;
-
-    const kill = execCalls.find((call) => call.argv[0] === "kill");
-    expect(kill?.argv).toEqual(["kill", "-KILL", "--", "-100"]);
-    expect(result.exitCode).toBe(124);
-    expect(isSandboxExecTimeoutResult(result)).toBe(true);
   });
 
   it("probeShell runs the probe as a plain command", async () => {

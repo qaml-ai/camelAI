@@ -100,7 +100,7 @@
 		"build:renderer": "node scripts/build-notebook-renderer.mjs"
 	},
 	"dependencies": {
-		"@camelai/agent-runtime": "0.10.0",
+		"@camelai/agent-runtime": "0.10.1",
 		"@cloudflare/dynamic-workflows": "^0.1.1",
 		"@cloudflare/puppeteer": "^1.0.6",
 		"@cloudflare/sandbox": "^0.12.10",

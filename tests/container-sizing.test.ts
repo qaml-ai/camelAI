@@ -9,9 +9,13 @@ import {
   DB_QUERY_SLEEP_AFTER,
   PROJECT_BUILD_ACTIVE_SESSION_MAX_WINDOW_MS,
   PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS,
+  PROJECT_BUILD_IDLE_TIMEOUT_MS,
   PROJECT_BUILD_INSTANCE_TYPE,
   PROJECT_BUILD_SLEEP_AFTER,
 } from "../workers/main/src/container-sizing";
+
+// The image key only; importing the class would pull in cloudflare:workers.
+const PROJECT_BUILD_V1_IMAGE = "project-build";
 
 /**
  * Strip // and /* *\/ comments plus trailing commas so wrangler JSONC can be
@@ -55,6 +59,40 @@ describe("container right-sizing", () => {
     expect(PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS)
       .toBeLessThanOrEqual(PROJECT_BUILD_ACTIVE_SESSION_MAX_WINDOW_MS);
     expect(PROJECT_BUILD_ACTIVE_SESSION_MAX_WINDOW_MS).toBeLessThanOrEqual(30 * 60_000);
+  });
+
+  it("keeps the native build sandbox's idle timeout equal to the 0.12 sleepAfter", () => {
+    expect(PROJECT_BUILD_IDLE_TIMEOUT_MS).toBe(2 * 60_000);
+  });
+
+  it.each([
+    ["wrangler.prod.jsonc", "chiridion-app-project-build-v1", "v0"],
+    ["wrangler.staging.jsonc", "chiridion-app-staging-project-build-v1", "v1"],
+    ["wrangler.jsonc", "chiridion-app-local-project-build-v1", "v0"],
+    ["wrangler.dev-miguel.jsonc", "chiridion-app-dev-miguel-project-build-v1", "v0"],
+    ["wrangler.dev-illiana.jsonc", "chiridion-app-dev-illiana-project-build-v1", "v0"],
+  ] as const)("%s declares ProjectBuildSandboxV1 as a durable_object container", (path, name, runtime) => {
+    const config = loadJsonc(resolve(process.cwd(), path)) as unknown as {
+      containers: Array<Record<string, unknown>>;
+      durable_objects: { bindings: Array<{ name: string; class_name: string }> };
+      migrations: Array<{ tag: string; new_sqlite_classes?: string[] }>;
+      vars: Record<string, string>;
+    };
+    const entry = config.containers.find((container) => container.class_name === "ProjectBuildSandboxV1");
+    // The durable_object policy rejects image/instance_type/max_instances, and
+    // each environment needs its own container application name.
+    expect(entry).toEqual({
+      class_name: "ProjectBuildSandboxV1",
+      name,
+      scheduling_policy: "durable_object",
+      images: { [PROJECT_BUILD_V1_IMAGE]: { dockerfile: "./workers/main/project-build-sandbox-v1.Dockerfile" } },
+    });
+    expect(config.durable_objects.bindings).toContainEqual({
+      name: "PROJECT_BUILD_SANDBOX_V1",
+      class_name: "ProjectBuildSandboxV1",
+    });
+    expect(config.migrations.at(-1)?.new_sqlite_classes).toEqual(["ProjectBuildSandboxV1"]);
+    expect(config.vars.PROJECT_BUILD_SANDBOX_RUNTIME).toBe(runtime);
   });
 
   it.each([

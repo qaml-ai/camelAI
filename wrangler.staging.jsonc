@@ -27,6 +27,10 @@
   "routes": [{ "pattern": "staging.camelai.dev", "custom_domain": true }],
   "vpc_services": [],
   "vars": {
+    // Which class serves project builds: "v1" = ProjectBuildSandboxV1
+    // (native ctx.container), anything else = the 0.12 ProjectBuildSandbox.
+    // Rollback is setting this back to "v0" (project-build-sandbox-routing.ts).
+    "PROJECT_BUILD_SANDBOX_RUNTIME": "v1",
     "AI_VIRTUAL_MODEL": "dynamic/auto",
     // Cloudflare Access fronts staging.camelai.dev ("camelAI staging internal"),
     // so admin MCP callers are identified by its signed assertion rather than
@@ -83,6 +87,21 @@
       "image": "./workers/main/project-build-sandbox.Dockerfile",
       "instance_type": "standard-3",
       "max_instances": 3,
+    },
+    {
+      // ProjectBuildSandbox on the native Durable Object container API
+      // (Sandbox SDK 1.0), side by side with the 0.12 class above.
+      // PROJECT_BUILD_SANDBOX_RUNTIME="v1" routes builds here. The
+      // durable_object policy takes no image/instance_type/max_instances:
+      // the instance size (standard-3) is chosen in start(), see
+      // workers/main/src/project-build-sandbox-v1.ts. The name must be
+      // unique per environment.
+      "class_name": "ProjectBuildSandboxV1",
+      "name": "chiridion-app-staging-project-build-v1",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "project-build": { "dockerfile": "./workers/main/project-build-sandbox-v1.Dockerfile" },
+      },
     },
     {
       // Unified analysis container — successor to the warehouse tier. Match prod's
@@ -192,6 +211,7 @@
 	      { "name": "WORKSPACE_FS", "class_name": "WorkspaceFilesystemDO" },
 	      { "name": "ANALYSIS_SANDBOX", "class_name": "AnalysisSandbox" },
 	      { "name": "PROJECT_BUILD_SANDBOX", "class_name": "ProjectBuildSandbox" },
+	      { "name": "PROJECT_BUILD_SANDBOX_V1", "class_name": "ProjectBuildSandboxV1" },
 	      { "name": "DB_QUERY_SANDBOX", "class_name": "DbQuerySandbox" },
 	    ],
 	  },
@@ -219,5 +239,6 @@
 	    { "tag": "v37", "new_sqlite_classes": ["SignupDO"] },
 	    { "tag": "v38", "deleted_classes": ["ChiridionMcp"] },
 	    { "tag": "v39", "deleted_classes": ["OrgSlugDO"] },
+	    { "tag": "v40", "new_sqlite_classes": ["ProjectBuildSandboxV1"] },
 	  ],
 	}

@@ -106,7 +106,7 @@
 		"@cloudflare/sandbox": "^0.12.10",
 		"@cloudflare/sandbox-v1": "npm:@cloudflare/sandbox@1.0.0",
 		"@cloudflare/shell": "0.3.7",
-		"@cloudflare/vite-plugin": "1.46.0",
+		"@cloudflare/vite-plugin": "1.62.3",
 		"@conform-to/react": "^1.15.1",
 		"@conform-to/zod": "^1.15.1",
 		"@earendil-works/pi-ai": "0.80.6",

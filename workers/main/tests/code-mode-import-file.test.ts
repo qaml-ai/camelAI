@@ -67,6 +67,23 @@ describe("import_file", () => {
     expect(writes).toHaveLength(0);
   });
 
+  it("reads the hosted runtime's links at either of its names through AGENT_RUNTIME_URL", async () => {
+    const hosted = "https://agents.camelai.dev";
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      return url.origin === hosted && url.pathname.startsWith("/v1/links/") ? new Response("csv", { headers: { "Content-Type": "text/csv" } }) : new Response("unexpected", { status: 500 });
+    });
+    const { instance, writes } = binding();
+    Object.assign(instance, { env: { AGENT_RUNTIME_URL: hosted } });
+    for (const origin of ["https://run.camelai.com", hosted]) {
+      await methods.importFile.call(instance, { source: `${origin}/v1/links/tok.mac/data.csv`, destination: { location: "r2", path: "outputs/data.csv" } });
+    }
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([`${hosted}/v1/links/tok.mac/data.csv`, `${hosted}/v1/links/tok.mac/data.csv`]);
+    expect(writes).toHaveLength(2);
+    await expect(methods.importFile.call(instance, { source: "https://run.camelai.dev/v1/links/tok/x", destination: { location: "r2", path: "outputs/x" } }))
+      .rejects.toThrow(/scratch file/);
+  });
+
   it("refuses files larger than it copies", async () => {
     serveLink("x", { "Content-Type": "text/plain", "Content-Length": String(65 * 1024 * 1024) });
     const { instance, writes } = binding();

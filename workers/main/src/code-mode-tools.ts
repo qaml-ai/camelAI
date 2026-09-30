@@ -274,6 +274,8 @@ export function assertNotBase64IntoBinaryFile(path: string, content: string): vo
 const CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES = 10 * 1024 * 1024;
 /** The largest scratch file import_file copies into the workspace (a volume file is at most 256 MiB). */
 const IMPORT_FILE_MAX_BYTES = 64 * 1024 * 1024;
+/** The hosted agent runtime's origins: it serves both, and its signed links name its public one. */
+const HOSTED_RUNTIME_ORIGINS = ["https://run.camelai.com", "https://agents.camelai.dev"];
 
 const JS_EXEC_EXCLUDED_TOOL_NAMES = new Set([
   // This tool waits for human input and can outlive js_exec's short sandbox
@@ -3227,24 +3229,27 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   /**
    * import_file: copy a runtime thread's scratch file into the workspace. The
    * runtime turns the model's `{"$file": "/workspace/..."}` into a signed link
-   * to that file (its /v1/links route), the only source this reads.
+   * to that file (its /v1/links route), the only source this reads. The hosted
+   * runtime answers at two names and links at its public one, which may not be
+   * AGENT_RUNTIME_URL: a link at either is read through AGENT_RUNTIME_URL.
    */
   private async importFile(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const runtimeOrigin = new URL((this.env as { AGENT_RUNTIME_URL?: string }).AGENT_RUNTIME_URL || "https://agents.camelai.dev").origin;
+    const origins = HOSTED_RUNTIME_ORIGINS.includes(runtimeOrigin) ? HOSTED_RUNTIME_ORIGINS : [runtimeOrigin];
     let source: URL | null = null;
     try {
       source = typeof args.source === "string" ? new URL(args.source) : null;
     } catch {
       source = null;
     }
-    if (!source || source.origin !== runtimeOrigin || !source.pathname.startsWith("/v1/links/")) {
+    if (!source || !origins.includes(source.origin) || !source.pathname.startsWith("/v1/links/")) {
       throw new Error('source must be a scratch file, passed as { "$file": "/workspace/<path>" }');
     }
     const destination = this.normalizeMoveEndpoint(args.destination, "destination");
     if (destination.location === "r2") {
       this.resolveCodeModeR2Path(destination as unknown as Record<string, unknown>, { requireWritable: true });
     }
-    const response = await fetch(source.toString());
+    const response = await fetch(`${runtimeOrigin}${source.pathname}${source.search}`);
     if (!response.ok) {
       await response.body?.cancel();
       throw new Error(`Could not read the scratch file (HTTP ${response.status}); its link may have expired, so pass { "$file": … } again`);

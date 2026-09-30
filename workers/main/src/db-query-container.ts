@@ -1,4 +1,4 @@
-import { Files, type S3GatewayBinding, SandboxFileError, SandboxS3MountError } from "@cloudflare/sandbox-v1";
+import { Files, type S3GatewayBinding, SandboxFileError, SandboxS3MountError } from "@cloudflare/sandbox";
 import { DurableObject } from "cloudflare:workers";
 
 import { DB_QUERY_IDLE_TIMEOUT_MS, DB_QUERY_INSTANCE_TYPE } from "./container-sizing.js";

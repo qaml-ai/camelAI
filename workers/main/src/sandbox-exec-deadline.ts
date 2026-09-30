@@ -12,28 +12,15 @@
 // container-side timeout, it only refuses to wait forever for one that failed
 // to fire. Inside the grace window the container's own error still wins.
 //
-// ## What the SDK does and does not give us
+// ## Cancellation
 //
-// `@cloudflare/sandbox` 0.12.x (`dist/sandbox-*.js`):
-//   - `exec(command, { timeout })` forwards `timeoutMs` to the container and
-//     the container enforces it ("unlimited by default"), so container-side
-//     enforcement is real — this deadline is strictly the outer bound.
-//   - `ExecOptions.signal` is checked ONCE before dispatch (and between SSE
-//     events on the streaming path). The non-streaming `execWithSession` await
-//     is NOT abortable, so passing a signal cannot cancel an in-flight command.
-//   - `killProcess`/`killAllProcesses` are sandbox-scoped and operate on the
-//     `startProcess` registry; a command run through `exec` has no process id
-//     and is not reachable from them, and the analysis/db-query containers are
-//     shared per workspace, so a blanket kill would take out unrelated
-//     concurrent work.
-// There is therefore NO safe per-exec cancellation surface to fire on a
-// deadline or an abort. The abandoned command stays bounded by the timeout the
-// container already holds — and for a SESSIONLESS exec (the analysis and DB
-// query sandboxes) that timeout really kills its process group. In the default
-// session it only rejected the promise and left the shell busy. Re-check this
-// when the SDK is upgraded. Project builds (ProjectBuildContainer, Sandbox SDK
-// 1.0) run each command under GNU `timeout`, which kills its process group too;
-// a build abandoned here still cannot be cancelled from the Worker.
+// The native containers (Sandbox SDK 1.0: ProjectBuildContainer,
+// AnalysisContainer, DbQueryContainer) run each command as its own process
+// under GNU `timeout`, which kills the command's process group at its budget.
+// Nothing here cancels it from the Worker: `exec()`'s abort signal only
+// SIGKILLs the direct child, and signalling a process that already exited
+// raises an internal error in the Durable Object. A command abandoned by this
+// deadline therefore stays bounded by the container-side `timeout`.
 
 /**
  * Cancellable deadline for one awaited operation; the seam tests replace to
@@ -58,38 +45,11 @@ export function createSandboxDeadlineTimer(ms: number): SandboxDeadlineTimer {
   };
 }
 
-/**
- * Exit code a SESSIONLESS exec (`getSandbox(..., { enableDefaultSession: false })`)
- * reports when the container killed the command at its `timeout`. The
- * container's execution-service spawns each sessionless command as a detached
- * `bash -c`, and on timeout signals the whole process group (SIGTERM, 5s grace,
- * SIGKILL), then resolves with this code, the partial output, and a
- * "Command timed out after <ms>ms" line appended to stderr. Same code GNU
- * `timeout` uses.
- */
+/** Exit code GNU `timeout` reports when it stopped a command at its budget. */
 export const SANDBOX_EXEC_TIMEOUT_EXIT_CODE = 124;
 
 /** Low-cardinality counter for container-side kills at the exec timeout. */
 export const SANDBOX_EXEC_TIMEOUT_EVENT = "sandbox_exec_timeout";
-
-const SANDBOX_EXEC_TIMEOUT_STDERR = /(^|\n)Command timed out after \d+ms\s*$/;
-
-/**
- * True when a sessionless exec result is the container's own timeout kill, not
- * a program that happened to exit 124. Keyed on the stderr trailer the
- * container appends, so a user's `timeout 5 foo` (exit 124, no trailer) still
- * reads as an ordinary command failure.
- */
-export function isSandboxExecTimeoutResult(result: {
-  exitCode?: number;
-  stderr?: string;
-}): boolean {
-  return (
-    result.exitCode === SANDBOX_EXEC_TIMEOUT_EXIT_CODE &&
-    typeof result.stderr === "string" &&
-    SANDBOX_EXEC_TIMEOUT_STDERR.test(result.stderr)
-  );
-}
 
 /**
  * The error text a timed-out exec reports. Kept identical to what the tool

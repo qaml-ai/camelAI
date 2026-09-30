@@ -46,7 +46,7 @@ RUN set -eux; \
     cloudflared --version
 
 # Files and S3Mount run this helper. Keep its tag equal to the installed
-# @cloudflare/sandbox-v1 version.
+# @cloudflare/sandbox version.
 COPY --from=sandbox-tools /usr/local/bin/sandbox-shim /usr/local/bin/sandbox-shim
 
 # --- baked query drivers ------------------------------------------------------

@@ -1,4 +1,4 @@
-import { S3Mount, SandboxFileError, type Files, type S3GatewayBinding } from "@cloudflare/sandbox-v1";
+import { S3Mount, SandboxFileError, type Files, type S3GatewayBinding } from "@cloudflare/sandbox";
 
 import { isSelfhostRuntime, type SelfhostRuntimeEnv } from "../../../src/lib/selfhost-runtime.js";
 

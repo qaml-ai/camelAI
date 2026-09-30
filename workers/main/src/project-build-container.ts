@@ -1,4 +1,4 @@
-import { Files, SandboxFileError } from "@cloudflare/sandbox-v1";
+import { Files, SandboxFileError } from "@cloudflare/sandbox";
 import { DurableObject } from "cloudflare:workers";
 
 import {

@@ -1,4 +1,4 @@
-import { Files, SandboxFileError, type S3GatewayBinding } from "@cloudflare/sandbox-v1";
+import { Files, SandboxFileError, type S3GatewayBinding } from "@cloudflare/sandbox";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 
 import { getWorkspaceR2Prefix } from "../../../src/lib/workspace-r2-paths.js";

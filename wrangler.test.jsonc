@@ -105,6 +105,7 @@
 			{ "tag": "v17", "deleted_classes": ["OrgSlugDO"] },
 			{ "tag": "v18", "new_sqlite_classes": ["ProjectBuildContainer"] },
 			{ "tag": "v19", "deleted_classes": ["ProjectBuildSandbox"] },
-			{ "tag": "v20", "new_sqlite_classes": ["AnalysisContainer"], "deleted_classes": ["AnalysisSandbox"] }
+			{ "tag": "v20", "new_sqlite_classes": ["AnalysisContainer"], "deleted_classes": ["AnalysisSandbox"] },
+			{ "tag": "v21", "deleted_classes": ["Sandbox"] }
 		]
 	}

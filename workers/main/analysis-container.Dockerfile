@@ -39,7 +39,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Files (readFile/writeFile/stat/mkdir/rename) and S3Mount run this helper. Keep
-# its tag equal to the installed @cloudflare/sandbox-v1 version.
+# its tag equal to the installed @cloudflare/sandbox version.
 COPY --from=sandbox-tools /usr/local/bin/sandbox-shim /usr/local/bin/sandbox-shim
 
 # usql universal SQL client (static-ish binary built against glibc 2.35).

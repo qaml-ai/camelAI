@@ -202,7 +202,7 @@ async function callSqlDatabaseTool(
  * handle. The db-query sandbox streams the full result set as Parquet straight
  * into the workspace's mounted warehouse prefix (see data-proxy.ts
  * sqlExportToWarehouse) — the rows never pass through the Worker. The analysis
- * container then reads `r2_key` via `mountBucket`. After the runner reports
+ * container then reads `r2_key` through its warehouse mount. After the runner reports
  * success we HEAD the key so a silent persistence failure becomes a loud error
  * instead of a phantom the tool reports `ok` for.
  */

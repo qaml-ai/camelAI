@@ -149,7 +149,6 @@ import {
 } from "../../ban-list.js";
 import { ProjectFilesystemClient, WorkspaceFilesystemClient } from "../../workspace-filesystem-do.js";
 import { recordObservabilityEvent } from "../../observability.js";
-import { getSandbox } from "@cloudflare/sandbox";
 import { dbQueryContainerKey, getDbQueryContainer, relayConfigFromEnv, runDbQuery } from "../../db-query-service.js";
 import { buildLogTail, cleanBuildLog, getProjectBuildSandbox, runProjectBuild } from "../../project-build-service.js";
 import { projectBuildReadinessEventName, runWithProjectBuildReadiness } from "../../project-build-readiness.js";

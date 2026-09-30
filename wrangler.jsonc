@@ -275,5 +275,6 @@
 		{ "tag": "v38", "deleted_classes": ["ProjectBuildSandbox"] },
 		{ "tag": "v39", "new_sqlite_classes": ["DbQueryContainer"], "deleted_classes": ["DbQuerySandbox"] },
 		{ "tag": "v40", "new_sqlite_classes": ["AnalysisContainer"], "deleted_classes": ["AnalysisSandbox"] },
+		{ "tag": "v41", "deleted_classes": ["CloudflareSandbox"] },
 		]
 }

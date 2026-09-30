@@ -165,8 +165,8 @@ async function callClickHouseTool(
         );
       }
       // ClickHouse emits Parquet natively (`FORMAT Parquet`); stream it straight
-      // into the auto-expiring warehouse bucket without buffering. The sealed
-      // DuckDB container then reads `r2_key` via mountBucket.
+      // into the auto-expiring warehouse bucket without buffering. The
+      // analysis container then reads `r2_key` through its warehouse mount.
       const query = requireString(args.query, 'query');
       // Namespace by unique integration id, not display name (names can collide across types).
       const r2Key = warehouseExportKey(context.workspaceId, record.id, query, 'parquet');

@@ -1385,6 +1385,50 @@ describe('connections runtime', () => {
     expect(serializedPoints).not.toContain('private-chat-content');
   });
 
+  it.each([
+    [{ code: '42703' }, 'Connection invocation failed (code 42703)'],
+    [{ code: 'MYSQL_ERROR', number: 1054 }, 'Connection invocation failed (code MYSQL_ERROR:1054)'],
+    [{ code: 'ECONNRESET' }, 'Connection invocation failed (code ECONNRESET)'],
+    [{ code: 'column "secret_col" does not exist' }, 'Connection invocation failed'],
+    [{}, 'Connection invocation failed'],
+  ])('records only a bare error code for a failed SQL invocation (%j)', async (fields, expected) => {
+    const observabilityWrite = vi.fn();
+    const errorWrite = vi.fn();
+    const records = [
+      integration({
+        id: 'pg_main',
+        integration_type: 'postgres',
+        name: 'warehouse',
+        category: 'databases',
+        config: JSON.stringify({ host: 'db.example.com', database: 'appdb' }),
+        credentials_encrypted: await encryptedCredentials({ username: 'app', password: 'pg-secret' }),
+      }),
+    ];
+    const env = envWith(records);
+    env.OBSERVABILITY_EVENTS = { writeDataPoint: observabilityWrite } as never;
+    env.ERROR_ANALYTICS = { writeDataPoint: errorWrite } as never;
+    env.DB_QUERY_SANDBOX = fakeDbQueryContainerNamespace(() => ({
+      ok: false,
+      error: { message: 'column "secret_col" does not exist in SELECT secret_col FROM private_table', ...fields },
+    })).namespace as never;
+
+    await expect(invokeConnectionMethod(env, context, {
+      connection: 'warehouse',
+      method: 'query',
+      input: { query: 'SELECT secret_col FROM private_table' },
+    })).rejects.toMatchObject({ status: 500 });
+
+    const point = observabilityWrite.mock.calls[0]![0] as { blobs: string[]; doubles: number[] };
+    expect(point.blobs[0]).toBe('connection_invocation');
+    expect(point.blobs[15]).toBe('ConnectionUpstreamError');
+    expect(point.blobs[16]).toBe(expected);
+    expect(point.doubles[2]).toBe(500);
+    const serialized = JSON.stringify({ observability: observabilityWrite.mock.calls, errors: errorWrite.mock.calls });
+    expect(serialized).not.toContain('secret_col');
+    expect(serialized).not.toContain('private_table');
+    expect(serialized).not.toContain('pg-secret');
+  });
+
   it('performs a live Slack auth probe and records ready health', async () => {
     const fetchMock = vi.fn(async (url: string | URL | Request) => {
       expect(String(url)).toBe('https://slack.com/api/auth.test');

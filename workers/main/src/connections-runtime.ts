@@ -1531,6 +1531,21 @@ function connectionInvocationStatusCode(error: unknown): number | null {
   return null;
 }
 
+/**
+ * The error's machine code, when it is one: a Postgres SQLSTATE (`42703`,
+ * undefined column), a driver/system code (`ECONNRESET`, `ETIMEOUT`), or the
+ * MySQL/MSSQL constant plus the driver's error number (`MYSQL_ERROR:1054`).
+ * Without it a SQL error, a schema change on the customer's side and a broken
+ * runner all record the same "ConnectionUpstreamError" (500). Anything that is
+ * not shaped like a bare code is dropped, so no message or query text leaks.
+ */
+function connectionInvocationErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== 'object') return null;
+  const { code, number } = error as { code?: unknown; number?: unknown };
+  if (typeof code !== 'string' || !/^[A-Z0-9_]{2,32}$/.test(code)) return null;
+  return typeof number === 'number' && Number.isInteger(number) ? `${code}:${number}` : code;
+}
+
 function connectionInvocationDiagnosticError(error: unknown, statusCode: number | null): Error {
   const sourceName = error instanceof Error ? error.name : '';
   let name = 'ConnectionRuntimeError';
@@ -1547,8 +1562,10 @@ function connectionInvocationDiagnosticError(error: unknown, statusCode: number 
   }
 
   // Provider errors can echo query text or request payloads. Emit only a stable,
-  // aggregate-friendly class; the original error still propagates to the caller.
-  const diagnostic = new Error('Connection invocation failed');
+  // aggregate-friendly class plus the error's code when it is a bare code
+  // (never message text); the original error still propagates to the caller.
+  const code = connectionInvocationErrorCode(error);
+  const diagnostic = new Error(code ? `Connection invocation failed (code ${code})` : 'Connection invocation failed');
   diagnostic.name = name;
   diagnostic.stack = '';
   return diagnostic;

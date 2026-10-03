@@ -73,7 +73,9 @@ export interface RuntimeRequestRecord {
   id: string;
   state: "running" | "completed";
   error?: string;
-  stopped?: "input_required" | "spend_limit";
+  stopped?: "input_required" | "spend_limit" | "turn_limit";
+  /** How an ended request ended (`state` says only that it ended); absent while running and on older runtimes. */
+  status?: "completed" | "input_required" | "failed";
   steeredInto?: string;
   outcome?: {
     error?: string;
@@ -81,6 +83,8 @@ export interface RuntimeRequestRecord {
     result?: {
       reply?: string;
       error?: string | null;
+      /** A stable name for `error`: model_key_missing, model_key_invalid, output_missing, spend_limit, turn_limit. */
+      code?: string;
       stopped?: string;
       inputs?: Array<{ id: string; kind?: string; message?: string }>;
       toolErrors?: Array<Record<string, unknown>>;
@@ -127,20 +131,33 @@ export async function waitForRuntimeRequest(options: {
 
 export type RuntimeRunOutcome =
   | { status: "completed"; reply?: string }
-  | { status: "error"; error: string; reply?: string }
+  | { status: "error"; error: string; code?: string; reply?: string }
   | { status: "input_required"; inputIds: string[]; reply?: string };
 
-/** What a settled request says happened: the runtime's error, the model's, an early stop, or the reply. */
+const LIMIT_STOPS: Record<string, string> = {
+  spend_limit: "The run reached its spend limit",
+  turn_limit: "The run reached its turn limit",
+};
+
+/**
+ * What a settled request says happened: the runtime's error, the model's (a
+ * missing or refused key among them), an early stop, or the reply. The
+ * record's `status` is the runtime's own verdict; `failed` is an error even
+ * without an error message.
+ */
 export function runtimeRunOutcome(record: RuntimeRequestRecord): RuntimeRunOutcome {
   const result = record.outcome?.result;
   const reply = typeof result?.reply === "string" ? result.reply : undefined;
   const stopped = record.stopped ?? result?.stopped;
-  if (stopped === "input_required") {
+  if (record.status === "input_required" || stopped === "input_required") {
     return { status: "input_required", inputIds: (result?.inputs ?? []).map((input) => input.id).filter(Boolean), reply };
   }
-  const error = record.error ?? record.outcome?.error ?? result?.error ?? undefined;
-  if (error) return { status: "error", error: record.outcome?.uncertain ? `${error} (outcome uncertain)` : error, reply };
-  if (stopped === "spend_limit") return { status: "error", error: "The run reached its spend limit", reply };
+  const code = result?.code ?? (stopped && stopped in LIMIT_STOPS ? stopped : undefined);
+  const error = record.error ?? record.outcome?.error ?? result?.error ?? (stopped ? LIMIT_STOPS[stopped] : undefined)
+    ?? (record.status === "failed" ? "The run failed" : undefined);
+  if (error) {
+    return { status: "error", error: record.outcome?.uncertain ? `${error} (outcome uncertain)` : error, ...(code ? { code } : {}), reply };
+  }
   return { status: "completed", reply };
 }
 

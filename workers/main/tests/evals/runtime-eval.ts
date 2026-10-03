@@ -349,7 +349,8 @@ export async function runRuntimeEval(env: unknown, body: RuntimeEvalRequest): Pr
     const completedAtMs = Date.now();
     const status = outcome.status === "completed" ? "completed" : "error";
     const reply = outcome.reply ?? latestAssistantReply(runMessages);
-    const error = outcome.status === "error" ? outcome.error : undefined;
+    // The runtime's code (model_key_missing, turn_limit, ...) leads, so a report says why without reading the message.
+    const error = outcome.status === "error" ? (outcome.code ? `${outcome.code}: ${outcome.error}` : outcome.error) : undefined;
     return {
       status,
       ...(error ? { error } : {}),

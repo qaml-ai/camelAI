@@ -151,6 +151,31 @@ describe("runtime eval outcome", () => {
     }))).toEqual({ status: "input_required", inputIds: ["in_1"], reply: undefined });
   });
 
+  it("reads the runtime's status, a refused or missing key and a turn limit", () => {
+    expect(runtimeRunOutcome(record({
+      status: "failed",
+      error: "No openai API key is configured for this agent's model",
+      outcome: { result: { error: "No openai API key is configured for this agent's model", code: "model_key_missing" } },
+    }))).toEqual({ status: "error", error: "No openai API key is configured for this agent's model", code: "model_key_missing", reply: undefined });
+    expect(runtimeRunOutcome(record({ status: "failed", outcome: { result: { code: "model_key_invalid" } } })))
+      .toEqual({ status: "error", error: "The run failed", code: "model_key_invalid", reply: undefined });
+    expect(runtimeRunOutcome(record({
+      status: "failed",
+      stopped: "turn_limit",
+      outcome: { result: { stopped: "turn_limit", reply: "partial" } },
+    }))).toEqual({ status: "error", error: "The run reached its turn limit", code: "turn_limit", reply: "partial" });
+    expect(runtimeRunOutcome(record({
+      status: "failed",
+      error: "Run limit reached",
+      stopped: "turn_limit",
+      outcome: { result: { stopped: "turn_limit", error: "Run limit reached", code: "turn_limit" } },
+    }))).toMatchObject({ status: "error", error: "Run limit reached", code: "turn_limit" });
+    expect(runtimeRunOutcome(record({ status: "input_required", outcome: { result: { inputs: [{ id: "in_2" }] } } })))
+      .toEqual({ status: "input_required", inputIds: ["in_2"], reply: undefined });
+    expect(runtimeRunOutcome(record({ status: "completed", outcome: { result: { reply: "ok" } } })))
+      .toEqual({ status: "completed", reply: "ok" });
+  });
+
   it("keeps the in-DO eval's timeout arithmetic", () => {
     expect(runtimeEvalTimeoutMs(undefined)).toBe(120_000);
     expect(runtimeEvalTimeoutMs(10)).toBe(1_000);

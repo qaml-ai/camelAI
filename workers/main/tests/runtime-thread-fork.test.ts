@@ -1,6 +1,6 @@
 /**
- * Forking a runtime thread: a new thread whose agent starts with the source
- * agent's history up to the fork point (agent-runtime/thread-fork.ts).
+ * Forking a runtime thread: a new thread whose agent is the runtime's fork of
+ * the source thread's, through the fork point (agent-runtime/thread-fork.ts).
  *
  * Run with: bun run test:workers
  */
@@ -13,19 +13,14 @@ vi.mock("../src/agent-runtime/runtime-api.js", async (importOriginal) => ({
 }));
 
 import { forkRuntimeThread } from "../src/agent-runtime/thread-fork";
+import { RuntimeApiError } from "../src/agent-runtime/runtime-api";
 import type { ChatEnv } from "../src/chat-thread/types";
 import { hostedModelHeaders } from "../src/agent-runtime/key-scopes";
 import { RUNTIME_PROMPT_VERSION } from "../src/agent-runtime/runtime-prompt";
 
-const history = [
-  { role: "user", content: "build it", timestamp: 1 },
-  { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "camel__read", arguments: {} }], timestamp: 2 },
-  { role: "toolResult", toolCallId: "c1", toolName: "camel__read", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 3 },
-  { role: "assistant", content: [{ type: "text", text: "Built." }], timestamp: 4 },
-  { role: "user", content: "now test it", timestamp: 5 },
-];
 const SOURCE = { threadId: "src", agentId: "agt_src", model: "anthropic/claude-sonnet-5-5", keyScope: "org_org1", configured: null, createdAt: 1, updatedAt: 1 };
 const target = { orgId: "org1", workspaceId: "ws1", threadId: "fork1", userId: "u1", userName: "Ada", userEmail: null };
+const forkCall = () => runtimeApiMock.mock.calls.find((call) => call[1] === "POST")!;
 
 function fakeEnv() {
   const org = {
@@ -45,25 +40,23 @@ function fakeEnv() {
 beforeEach(() => {
   vi.clearAllMocks();
   runtimeApiMock.mockImplementation(async (_env: unknown, method: string, path: string) => {
-    if (method === "GET" && path === "/v1/agents/agt_src/history") return { messages: history };
-    if (method === "POST" && path === "/v1/agents") return { id: "agt_fork" };
+    if (method === "POST" && path === "/v1/agents/agt_src/fork") return { id: "agt_fork", forkedFrom: { agentId: "agt_src", atMessage: 3 } };
     return {};
   });
 });
 
 describe("forkRuntimeThread", () => {
-  it("starts the fork's agent with the history through the fork point, and its preview", async () => {
+  it("forks the source's agent through the fork point in one call, for the new thread, with its preview", async () => {
     const { env, org } = fakeEnv();
     const result = await forkRuntimeThread(env, { source: SOURCE, target, forkEntryId: "rt:3" });
     expect(result).toMatchObject({ status: "forked", row: { threadId: "fork1", agentId: "agt_fork" } });
-    const [, , , body, headers] = runtimeApiMock.mock.calls.find((call) => call[1] === "POST")!;
-    expect(body.initialMessages).toEqual(history.slice(0, 4));
-    expect(body).toMatchObject({ name: "fork1", subject: "u1", context: { org: "org1", workspace: "ws1", thread: "fork1" } });
-    expect(headers["Idempotency-Key"]).toMatch(/^fork_fork1_[0-9a-f]{16}$/);
+    expect(runtimeApiMock).toHaveBeenCalledTimes(1);
+    const [, , path, body] = forkCall();
+    expect(path).toBe("/v1/agents/agt_src/fork");
+    expect(body).toMatchObject({ key: "fork_fork1", name: "fork1", atMessage: 3, ttlSeconds: null, subject: "u1", context: { org: "org1", workspace: "ws1", thread: "fork1" } });
+    expect(body.systemPromptAppend).toContain("Thread ID: fork1");
+    expect(body.modelHeaders).toBeNull();
     expect(org.setThreadUiState).toHaveBeenCalledWith("fork1", { tabs: [{ kind: "app", scriptName: "shop", isPublic: true }], activeTabId: "app:shop" });
-    // Made on its source's model and key scope (the runtime refuses an agent without keys), recorded on its row.
-    expect(body).toMatchObject({ model: "anthropic/claude-sonnet-5-5", keyScope: "org_org1", thinkingLevel: "medium" });
-    expect(body).not.toHaveProperty("modelHeaders");
     expect(org.claimThreadRuntimeAgent).toHaveBeenCalledWith("fork1", "agt_fork", {
       model: "anthropic/claude-sonnet-5-5",
       keyScope: "org_org1",
@@ -73,20 +66,20 @@ describe("forkRuntimeThread", () => {
 
   it("gives a fork of a hosted thread the hosted model headers for its own thread", async () => {
     await forkRuntimeThread(fakeEnv().env, { source: { ...SOURCE, keyScope: "hosted", configured: { thinkingLevel: "high" } }, target, forkEntryId: "rt:3" });
-    const [, , , body] = runtimeApiMock.mock.calls.find((call) => call[1] === "POST")!;
-    expect(body).toMatchObject({ keyScope: "hosted", modelHeaders: hostedModelHeaders(target), thinkingLevel: "high" });
+    expect(forkCall()[3]).toMatchObject({ modelHeaders: hostedModelHeaders(target) });
   });
 
-  it("keeps a forked turn's tool results after its last message", async () => {
-    await forkRuntimeThread(fakeEnv().env, { source: SOURCE, target, forkEntryId: "rt:1" });
-    const [, , , body] = runtimeApiMock.mock.calls.find((call) => call[1] === "POST")!;
-    expect(body.initialMessages).toEqual(history.slice(0, 3));
-  });
-
-  it("answers not found for a fork point the history lacks, making nothing", async () => {
+  it("answers not found for a fork point the history lacks", async () => {
+    runtimeApiMock.mockRejectedValueOnce(new RuntimeApiError("atMessage is a history index from 0 to 4, or a request id", 400, "FORK_POINT_INVALID"));
     expect(await forkRuntimeThread(fakeEnv().env, { source: SOURCE, target, forkEntryId: "rt:9" })).toMatchObject({ status: "not_found" });
+    vi.clearAllMocks();
     expect(await forkRuntimeThread(fakeEnv().env, { source: SOURCE, target, forkEntryId: "client-1" })).toMatchObject({ status: "not_found" });
-    expect(runtimeApiMock.mock.calls.some((call) => call[1] === "POST")).toBe(false);
+    expect(runtimeApiMock).not.toHaveBeenCalled();
+  });
+
+  it("says when the fork point's turn is still running", async () => {
+    runtimeApiMock.mockRejectedValueOnce(new RuntimeApiError("Message 3 is in a turn that has not ended yet", 409, "FORK_POINT_RUNNING"));
+    expect(await forkRuntimeThread(fakeEnv().env, { source: SOURCE, target, forkEntryId: "rt:3" })).toMatchObject({ status: "failed", error: expect.stringMatching(/still running/) });
   });
 
   it("deletes the fork's agent when the fork cannot be recorded", async () => {
@@ -96,10 +89,14 @@ describe("forkRuntimeThread", () => {
     expect(runtimeApiMock).toHaveBeenCalledWith(env, "DELETE", "/v1/agents/agt_fork");
   });
 
-  it("never gives a thread that already has an agent a second one", async () => {
+  it("never gives a thread that already has an agent a second one, and keeps the one a retry recorded", async () => {
     const { env, org } = fakeEnv();
     org.claimThreadRuntimeAgent.mockResolvedValueOnce({ row: { ...SOURCE, threadId: "fork1", agentId: "agt_other" }, claimed: false } as never);
     expect(await forkRuntimeThread(env, { source: SOURCE, target, forkEntryId: "rt:3" })).toMatchObject({ status: "failed" });
     expect(runtimeApiMock).toHaveBeenCalledWith(env, "DELETE", "/v1/agents/agt_fork");
+    vi.clearAllMocks();
+    org.claimThreadRuntimeAgent.mockResolvedValueOnce({ row: { ...SOURCE, threadId: "fork1", agentId: "agt_fork" }, claimed: false } as never);
+    expect(await forkRuntimeThread(env, { source: SOURCE, target, forkEntryId: "rt:3" })).toMatchObject({ status: "forked", row: { agentId: "agt_fork" } });
+    expect(runtimeApiMock.mock.calls.some((call) => call[1] === "DELETE")).toBe(false);
   });
 });

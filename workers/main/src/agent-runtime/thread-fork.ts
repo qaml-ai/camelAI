@@ -1,14 +1,14 @@
 /**
- * Forking a runtime thread: the new thread's agent starts with the source
- * agent's history through the fork point, and the source's preview tabs.
- * The fork point is a history index (`rt:<index>`, pi-render's forkEntryId);
- * a turn's tool results after it come along, so no call is left unanswered.
+ * Forking a runtime thread: the runtime forks the source thread's agent
+ * (POST /v1/agents/{id}/fork) into the new thread's, with its history through
+ * the fork point and a copy of its workspace; the source's preview tabs come
+ * along here. The fork point is a history index (`rt:<index>`, pi-render's
+ * forkEntryId); the runtime keeps a turn's tool results after it, so no call
+ * is left unanswered, and refuses a point in a turn still running.
  */
-import type { AgentMessage } from "../../../../src/lib/agent-messages";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import type { ThreadRuntimeRecord } from "../identity/org-do.js";
-import { ARCHIVE_FILE_NAME, ARCHIVE_REQUEST_ID, convertTranscript, withImportNote } from "./thread-migration.js";
-import { RuntimeApiError, runtimeApi, runtimeUrl } from "./runtime-api.js";
+import { RuntimeApiError, runtimeApi } from "./runtime-api.js";
 import { runtimeSystemPromptAppend, type RuntimeAgentModel } from "./run-gates.js";
 import { HOSTED_KEY_SCOPE, hostedModelHeaders } from "./key-scopes.js";
 import { RUNTIME_PROMPT_VERSION } from "./runtime-prompt.js";
@@ -17,6 +17,8 @@ export type RuntimeForkResult =
   | { status: "forked"; row: ThreadRuntimeRecord }
   | { status: "not_found"; error: string }
   | { status: "failed"; error: string };
+
+const NOT_FOUND = "Fork target not found in the thread's history";
 
 function forkIndex(forkEntryId: string): number | null {
   const match = /^rt:(\d+)$/.exec(forkEntryId.trim());
@@ -29,14 +31,7 @@ export async function forkRuntimeThread(
 ): Promise<RuntimeForkResult> {
   const { source, target } = input;
   const index = forkIndex(input.forkEntryId);
-  const whole = await runtimeApi(env, "GET", `/v1/agents/${encodeURIComponent(source.agentId)}/history`) as { messages?: unknown } | null;
-  const history = Array.isArray(whole?.messages) ? whole.messages as AgentMessage[] : [];
-  if (index === null || index >= history.length) return { status: "not_found", error: "Fork target not found in the thread's history" };
-  let end = index + 1;
-  while (end < history.length && (history[end] as { role?: string }).role === "toolResult") end++;
-  const forked: AgentMessage[] = history.slice(0, end);
-  const converted = convertTranscript(forked);
-  if (converted.tooLarge) return { status: "failed", error: "The thread's history is too large to fork" };
+  if (index === null) return { status: "not_found", error: NOT_FOUND };
 
   const org = env.ORG.get(env.ORG.idFromName(target.orgId)) as unknown as {
     getThread(threadId: string): Promise<{ created_by?: string | null } | null>;
@@ -48,8 +43,8 @@ export async function forkRuntimeThread(
       configuration?: { model: string | null; keyScope: string | null; configured: Record<string, unknown> | null },
     ): Promise<{ row: ThreadRuntimeRecord; claimed: boolean } | null>;
   };
-  // The fork runs its source's model, on its key scope (synced by the source's
-  // runs): the runtime refuses an agent made without one it has keys for.
+  // The fork runs its source's model on its key scope, as the runtime copies
+  // them, recorded on its row; a hosted fork's model headers name its own thread.
   const agentModel: RuntimeAgentModel | null = source.model
     ? {
       model: source.model,
@@ -61,10 +56,7 @@ export async function forkRuntimeThread(
   let agentId: string | null = null;
   try {
     const thread = await org.getThread(target.threadId);
-    // A shortened fork says where its original is; a whole one needs no note.
-    const initialMessages = converted.lossy ? withImportNote(converted.messages, true) : converted.messages;
-    agentId = await createForkAgent(env, target, thread?.created_by?.trim() || target.userId || null, initialMessages, agentModel);
-    if (converted.lossy) await archiveHistory(env, agentId, forked);
+    agentId = await forkAgent(env, source.agentId, target, thread?.created_by?.trim() || target.userId || null, index, agentModel);
     const preview = (await org.getThreadUiState(source.threadId))?.preview;
     if (preview?.tabs?.length) {
       await org.setThreadUiState(target.threadId, { tabs: preview.tabs, activeTabId: preview.activeTabId ?? null });
@@ -77,64 +69,46 @@ export async function forkRuntimeThread(
       }
       : undefined);
     if (!claim) throw new Error("Thread not found");
-    if (!claim.claimed) throw new Error("The fork already has an agent");
+    // A retry finds the same agent recorded already: that is this fork.
+    if (!claim.claimed && claim.row.agentId !== agentId) throw new Error("The fork already has an agent");
     return { status: "forked", row: claim.row };
   } catch (error) {
     if (agentId) await deleteAgent(env, agentId);
+    if (error instanceof RuntimeApiError && error.code === "FORK_POINT_INVALID") return { status: "not_found", error: NOT_FOUND };
+    if (error instanceof RuntimeApiError && error.code === "FORK_POINT_RUNNING") {
+      return { status: "failed", error: "That message's turn is still running; fork it once the turn ends" };
+    }
     return { status: "failed", error: error instanceof Error ? error.message : String(error) };
   }
 }
 
 /**
- * The fork's agent, with its history and its source's model (the thread's
- * first send configures the rest). The same history makes the same agent
- * (a retried fork gets it back), never a second one.
+ * The fork's agent, in one runtime call: the source agent's configuration,
+ * history through `atMessage` and workspace, named for the new thread, acting
+ * for its creator in its own context, with its own instructions and model
+ * headers. Its key is the new thread's, so a retried fork gets the same agent
+ * back, never a second one.
  */
-async function createForkAgent(
+async function forkAgent(
   env: ChatEnv,
+  sourceAgentId: string,
   context: ChatContextState,
   subject: string | null,
-  initialMessages: AgentMessage[],
+  atMessage: number,
   agentModel: RuntimeAgentModel | null,
 ): Promise<string> {
-  const history = JSON.stringify(initialMessages);
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(history));
-  const key = `fork_${context.threadId}_${[...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 16)}`;
-  const created = await runtimeApi(env, "POST", "/v1/agents", {
-    definition: env.AGENT_RUNTIME_DEFINITION,
+  const forked = await runtimeApi(env, "POST", `/v1/agents/${encodeURIComponent(sourceAgentId)}/fork`, {
+    key: `fork_${context.threadId}`,
     name: context.threadId,
-    type: "camelai-thread",
+    atMessage,
     ttlSeconds: null,
-    ...(agentModel
-      ? {
-        model: agentModel.model,
-        ...(agentModel.keyScope ? { keyScope: agentModel.keyScope } : {}),
-        ...(agentModel.modelHeaders ? { modelHeaders: agentModel.modelHeaders } : {}),
-        thinkingLevel: agentModel.thinkingLevel,
-      }
-      : {}),
-    systemPromptAppend: runtimeSystemPromptAppend(env, context),
-    fileTools: false,
     ...(subject ? { subject } : {}),
     context: { org: context.orgId, workspace: context.workspaceId, thread: context.threadId },
-    ...(initialMessages.length ? { initialMessages } : {}),
-  }, { "Idempotency-Key": key }) as { id?: unknown };
-  if (typeof created?.id !== "string") throw new Error("Agent runtime returned no agent id");
-  return created.id;
-}
-
-/** The forked history as it was, into the fork agent's workspace, when the fork had to shorten it. */
-async function archiveHistory(env: ChatEnv, agentId: string, messages: AgentMessage[]): Promise<void> {
-  const response = await fetch(
-    `${runtimeUrl(env)}/v1/agents/${encodeURIComponent(agentId)}/uploads/${ARCHIVE_REQUEST_ID}/${ARCHIVE_FILE_NAME}`,
-    {
-      method: "PUT",
-      headers: { Authorization: `Bearer ${env.AGENT_RUNTIME_API_TOKEN ?? ""}`, "Content-Type": "application/x-ndjson" },
-      body: messages.map((message) => JSON.stringify(message)).join("\n"),
-    },
-  );
-  await response.body?.cancel();
-  if (!response.ok) throw new Error(`Could not save the forked history: HTTP ${response.status}`);
+    systemPromptAppend: runtimeSystemPromptAppend(env, context),
+    ...(agentModel ? { modelHeaders: agentModel.modelHeaders } : {}),
+  }) as { id?: unknown };
+  if (typeof forked?.id !== "string") throw new Error("Agent runtime returned no agent id");
+  return forked.id;
 }
 
 async function deleteAgent(env: ChatEnv, agentId: string): Promise<void> {

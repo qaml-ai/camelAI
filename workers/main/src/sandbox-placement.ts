@@ -139,8 +139,10 @@ export function followSandboxGeneration<T extends object>(open: (generation: num
       return async (...args: unknown[]) => {
         for (let redirects = 0; ; redirects += 1) {
           try {
-            const method = (current as Record<string, (...a: unknown[]) => Promise<unknown>>)[property];
-            return await method.apply(current, args);
+            // Called as a method, never through `.apply`/`.call`: on a DO RPC
+            // stub those are themselves RPC names ("does not implement the
+            // method apply").
+            return await (current as Record<string, (...a: unknown[]) => Promise<unknown>>)[property](...args);
           } catch (error) {
             const next = SandboxRelocatedError.generationOf(error);
             if (next === null || next <= generation || redirects >= MAX_REDIRECTS) throw error;

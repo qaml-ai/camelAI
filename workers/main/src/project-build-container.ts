@@ -21,6 +21,13 @@ import {
   nextBuildSessionDeadline,
   PROJECT_BUILD_SESSION_ACTIVITY_KEY,
 } from "./project-build-sandbox-lifecycle.js";
+import {
+  parseSandboxGenerationName,
+  SandboxPlacement,
+  type RotationRequest,
+  type RotationResult,
+  type SandboxPlacementRegistry,
+} from "./sandbox-placement.js";
 import type { Env } from "./types.js";
 
 /** Key of the build image in wrangler `containers[].images`. */
@@ -80,16 +87,19 @@ export type ProjectBuildFiles = Pick<Files, "readFile" | "writeFile" | "mkdir">;
  * (`scheduling_policy: "durable_object"`, Sandbox SDK 1.0).
  *
  * Bound as PROJECT_BUILD_SANDBOX and reached through getProjectBuildSandbox()
- * (one instance per org). The container holds only a build cache: source is
- * re-materialized from the project store, and the source manifest tells a cold
- * workdir apart, so a lost container costs a cold build, never data.
+ * (one instance per org, `org-<org>`, or `org-<org>-g<N>` after its placement
+ * rotated; sandbox-placement.ts). The container holds only a build cache:
+ * source is re-materialized from the project store, and the source manifest
+ * tells a cold workdir apart, so a lost container (or a rotated placement)
+ * costs a cold build, never data.
  *
  * Contracts: a missing file reads as `null`, a command stopped at its timeout
  * comes back with `timedOut: true`, and a call that finds no running container
  * throws ProjectBuildContainerUnavailableError.
  */
-export class ProjectBuildContainer extends DurableObject<Env> {
+export class ProjectBuildContainer extends DurableObject<Env> implements SandboxPlacementRegistry {
   private readonly files: ProjectBuildFiles | null;
+  private readonly placement: SandboxPlacement;
   private setup: Promise<void> | null = null;
   /** A start (with its retry) is in flight: callers join it, even while it destroys between attempts. */
   private starting = false;
@@ -98,6 +108,17 @@ export class ProjectBuildContainer extends DurableObject<Env> {
     super(ctx, env);
     const container = ctx.container;
     this.files = deps.files ?? (container ? createContainerFiles(container, env) : null);
+    this.placement = new SandboxPlacement({
+      storage: ctx.storage,
+      name: ctx.id.name,
+      component: "ProjectBuildContainer",
+      env,
+      registry: (base) => {
+        if (!env.PROJECT_BUILD_SANDBOX) throw new Error("PROJECT_BUILD_SANDBOX container binding is not configured");
+        return env.PROJECT_BUILD_SANDBOX.getByName(base) as unknown as SandboxPlacementRegistry;
+      },
+      scope: () => ({ orgId: this.orgId }),
+    });
     // The inactivity timeout belongs to the DO instance: a restarted DO (a
     // deploy, an eviction) must set it again or the container stops shortly
     // after the DO goes idle.
@@ -195,11 +216,17 @@ export class ProjectBuildContainer extends DurableObject<Env> {
    * finishes; never starts a container.
    */
   async noteBuildSessionActivity(windowMs: number = PROJECT_BUILD_ACTIVE_SESSION_WINDOW_MS): Promise<void> {
+    await this.placement.assertCurrent();
     const stored = await this.ctx.storage.get<number>(PROJECT_BUILD_SESSION_ACTIVITY_KEY);
     const deadline = nextBuildSessionDeadline(Date.now(), stored, windowMs);
     if (deadline !== null) await this.ctx.storage.put(PROJECT_BUILD_SESSION_ACTIVITY_KEY, deadline);
     const container = this.ctx.container;
     if (container?.running) await container.setInactivityTimeout(await this.inactivityTimeoutMs());
+  }
+
+  /** Generation 0 only: moves this org's sandbox to a new DO (sandbox-placement.ts). */
+  async rotateSandboxPlacement(request: RotationRequest): Promise<RotationResult> {
+    return this.placement.rotate(request);
   }
 
   // -------------------------------------------------------------------------
@@ -215,10 +242,11 @@ export class ProjectBuildContainer extends DurableObject<Env> {
     return this.files;
   }
 
-  /** `org-<org>` (projectBuildSandboxKey), for telemetry. */
+  /** `org-<org>[-g<N>]` (projectBuildSandboxKey), for telemetry. */
   private get orgId(): string | null {
     const name = this.ctx.id.name;
-    return name?.startsWith("org-") ? name.slice("org-".length) : null;
+    const base = name ? parseSandboxGenerationName(name).base : null;
+    return base?.startsWith("org-") ? base.slice("org-".length) : null;
   }
 
   /**
@@ -227,6 +255,8 @@ export class ProjectBuildContainer extends DurableObject<Env> {
    * ProjectBuildContainerUnavailableError; the next call starts a new container.
    */
   private async withContainer<T>(operation: string, run: () => Promise<T>): Promise<T> {
+    // A retired generation does nothing: the caller re-sends to the current one.
+    await this.placement.assertCurrent();
     try {
       await this.ensureRunning();
       return await run();
@@ -301,7 +331,8 @@ export class ProjectBuildContainer extends DurableObject<Env> {
     // probe (the first command blocks until the container runs). A stuck or
     // failed attempt is destroyed and retried once; see container-start.ts.
     const freshImage = (await this.ctx.storage.get<string>(LAST_STARTED_IMAGE_KEY)) !== image;
-    await startWithRetry({
+    // Two whole failed starts in a row move the sandbox to a new DO.
+    await this.placement.trackStart(() => startWithRetry({
       policy: PROJECT_BUILD_START_POLICY,
       label: "build environment",
       freshImage,
@@ -336,6 +367,8 @@ export class ProjectBuildContainer extends DurableObject<Env> {
       },
       onEvent: (event) =>
         recordContainerStartEvent(this.env, event, { component: "ProjectBuildContainer", orgId: this.orgId }),
+    }), async () => {
+      if (container.running) await container.destroy();
     });
     await this.ctx.storage.put(LAST_STARTED_IMAGE_KEY, image);
   }

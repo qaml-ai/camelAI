@@ -150,6 +150,7 @@ import {
 import { ProjectFilesystemClient, WorkspaceFilesystemClient } from "../../workspace-filesystem-do.js";
 import { recordObservabilityEvent } from "../../observability.js";
 import { dbQueryContainerKey, getDbQueryContainer, relayConfigFromEnv, runDbQuery } from "../../db-query-service.js";
+import { getAnalysisSandboxByName } from "../../analysis-container.js";
 import { buildLogTail, cleanBuildLog, getProjectBuildSandbox, runProjectBuild } from "../../project-build-service.js";
 import { projectBuildReadinessEventName, runWithProjectBuildReadiness } from "../../project-build-readiness.js";
 import { waitUntil } from "cloudflare:workers";
@@ -838,7 +839,7 @@ routes.post(
 
     for (const sandboxId of sandboxIds) {
       try {
-        await c.env.ANALYSIS_SANDBOX.getByName(sandboxId).destroy();
+        await getAnalysisSandboxByName(c.env, sandboxId).destroy();
         destroyed.push(sandboxId);
       } catch (error) {
         errors.push({

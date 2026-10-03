@@ -19,6 +19,15 @@ import {
   type BucketMount,
   type SandboxBucketMounts,
 } from "./sandbox-mounts.js";
+import {
+  followSandboxGeneration,
+  parseSandboxGenerationName,
+  sandboxGenerationName,
+  SandboxPlacement,
+  type RotationRequest,
+  type RotationResult,
+  type SandboxPlacementRegistry,
+} from "./sandbox-placement.js";
 import type { Env } from "./types.js";
 import { warehouseWorkspacePrefix } from "./warehouse-export.js";
 
@@ -117,9 +126,33 @@ export type AnalysisAccess =
   | { readonly mode: "agent"; readonly orgId: string; readonly workspaceId: string }
   | { readonly mode: "app"; readonly workspaceId: string };
 
-/** The Durable Object name that serves `access`; the class refuses any other pairing. */
+/**
+ * The Durable Object name that serves `access` (at placement generation 0;
+ * generation N appends `-g<N>`, sandbox-placement.ts); the class refuses any
+ * other pairing.
+ */
 export function analysisContainerName(access: AnalysisAccess): string {
   return access.mode === "app" ? `app-${access.workspaceId}` : access.workspaceId;
+}
+
+/** The container that serves `access`, at its current placement generation. */
+export function getAnalysisSandbox(
+  env: { ANALYSIS_SANDBOX?: DurableObjectNamespace<AnalysisContainer> },
+  access: AnalysisAccess,
+): AnalysisContainerStub {
+  return getAnalysisSandboxByName(env, analysisContainerName(access));
+}
+
+/** The container named `base` (an analysisContainerName()), at its current placement generation. */
+export function getAnalysisSandboxByName(
+  env: { ANALYSIS_SANDBOX?: DurableObjectNamespace<AnalysisContainer> },
+  base: string,
+): AnalysisContainerStub {
+  const namespace = env.ANALYSIS_SANDBOX;
+  if (!namespace) throw new Error("ANALYSIS_SANDBOX container binding is not configured");
+  return followSandboxGeneration(
+    (generation) => namespace.getByName(sandboxGenerationName(base, generation)) as unknown as AnalysisContainerStub,
+  );
 }
 
 export interface AnalysisExecOptions {
@@ -210,8 +243,9 @@ export interface AnalysisContainerDeps {
  * (sandbox-mounts.ts): exports (`/warehouse/<ws>`, read-only), uploads
  * (`/uploads`, read-only) and outputs (`/outputs`, read-write).
  */
-export class AnalysisContainer extends DurableObject<Env> {
+export class AnalysisContainer extends DurableObject<Env> implements SandboxPlacementRegistry {
   private readonly files: AnalysisContainerDeps["files"] | null;
+  private readonly placement: SandboxPlacement;
   private mountsImpl: SandboxBucketMounts | null;
   private setup: Promise<void> | null = null;
   /** A start (with its retry) is in flight: callers join it. */
@@ -224,6 +258,17 @@ export class AnalysisContainer extends DurableObject<Env> {
     const container = ctx.container;
     this.files = deps.files ?? (container ? createContainerFiles(container, env) : null);
     this.mountsImpl = deps.mounts ?? null;
+    this.placement = new SandboxPlacement({
+      storage: ctx.storage,
+      name: ctx.id.name,
+      component: "AnalysisContainer",
+      env,
+      registry: (base) => {
+        if (!env.ANALYSIS_SANDBOX) throw new Error("ANALYSIS_SANDBOX container binding is not configured");
+        return env.ANALYSIS_SANDBOX.getByName(base) as unknown as SandboxPlacementRegistry;
+      },
+      scope: () => ({ workspaceId: this.workspaceId }),
+    });
     // The inactivity timeout belongs to the DO instance: a restarted DO (a
     // deploy, an eviction) must set it again or the container stops shortly
     // after the DO goes idle.
@@ -240,6 +285,8 @@ export class AnalysisContainer extends DurableObject<Env> {
    */
   async prepare(access: AnalysisAccess): Promise<void> {
     this.assertAccess(access);
+    // A retired generation does nothing: the caller re-sends to the current one.
+    await this.placement.assertCurrent();
     const started = await this.ensureStarted(access);
     if (started) return;
     try {
@@ -288,6 +335,7 @@ export class AnalysisContainer extends DurableObject<Env> {
   }
 
   async removePaths(paths: string[]): Promise<void> {
+    await this.placement.assertCurrent();
     if (paths.length === 0 || !this.ctx.container?.running) return;
     for (const path of paths) {
       if (!/^\/(projects|scratch)\/[^/]/.test(path) || path.includes("\0") || path.split("/").includes("..")) {
@@ -298,6 +346,7 @@ export class AnalysisContainer extends DurableObject<Env> {
   }
 
   async flushMounts(): Promise<void> {
+    await this.placement.assertCurrent();
     const container = this.ctx.container;
     if (!container?.running) return;
     const setup = this.current ?? await this.readStoredSetup();
@@ -312,12 +361,25 @@ export class AnalysisContainer extends DurableObject<Env> {
 
   /** Stops the container; the next call starts a fresh one (admin reset, a failed setup). */
   async destroy(): Promise<void> {
+    try {
+      await this.placement.assertCurrent();
+    } catch (relocated) {
+      // A retired generation: let go of anything left here, then send the
+      // caller on to the current one.
+      if (this.ctx.container?.running) await this.ctx.container.destroy().catch(() => {});
+      throw relocated;
+    }
     this.setup = null;
     this.starting = false;
     this.current = null;
     await this.ctx.storage.delete(SETUP_KEY);
     const container = this.ctx.container;
     if (container?.running) await container.destroy();
+  }
+
+  /** Generation 0 only: moves this sandbox to a new DO (sandbox-placement.ts). */
+  async rotateSandboxPlacement(request: RotationRequest): Promise<RotationResult> {
+    return this.placement.rotate(request);
   }
 
   // -------------------------------------------------------------------------
@@ -353,7 +415,7 @@ export class AnalysisContainer extends DurableObject<Env> {
     if (!access.workspaceId || (access.mode === "agent" && !access.orgId)) {
       throw new Error("Analysis access requires a workspace (and, for the agent, an org)");
     }
-    if (name !== undefined && name !== analysisContainerName(access)) {
+    if (name !== undefined && parseSandboxGenerationName(name).base !== analysisContainerName(access)) {
       throw new Error(`Analysis container ${name} cannot serve ${access.mode} access for workspace ${access.workspaceId}`);
     }
   }
@@ -364,6 +426,7 @@ export class AnalysisContainer extends DurableObject<Env> {
    * message; the next prepare() starts a new container.
    */
   private async withContainer<T>(operation: string, run: () => Promise<T>): Promise<T> {
+    await this.placement.assertCurrent();
     // Only prepare() starts a container: one that stopped since took the run's
     // materialized files with it, so the run cannot simply carry on.
     if (!this.ctx.container?.running) {
@@ -466,7 +529,8 @@ export class AnalysisContainer extends DurableObject<Env> {
     const freshImage = (await this.ctx.storage.get<string>(LAST_STARTED_IMAGE_KEY)) !== image;
     const startedAt = Date.now();
     try {
-      await startWithRetry({
+      // Two whole failed starts in a row move the sandbox to a new DO.
+      await this.placement.trackStart(() => startWithRetry({
         policy: ANALYSIS_START_POLICY,
         label: ANALYSIS_ENVIRONMENT_LABEL,
         freshImage,
@@ -498,6 +562,10 @@ export class AnalysisContainer extends DurableObject<Env> {
             component: "AnalysisContainer",
             workspaceId: access.workspaceId,
           }),
+      }), async () => {
+        this.current = null;
+        await this.ctx.storage.delete(SETUP_KEY);
+        if (container.running) await container.destroy();
       });
     } catch (error) {
       recordObservabilityEvent(this.env, {
@@ -660,9 +728,10 @@ export class AnalysisContainer extends DurableObject<Env> {
     return (await this.ctx.storage.get<StoredSetup>(SETUP_KEY)) ?? null;
   }
 
-  /** The workspace this container serves (`<ws>` or `app-<ws>`), for telemetry. */
+  /** The workspace this container serves (`<ws>` or `app-<ws>`, plus `-g<N>`), for telemetry. */
   private get workspaceId(): string | null {
-    return this.ctx.id.name?.replace(/^app-/, "") ?? null;
+    const name = this.ctx.id.name;
+    return name ? parseSandboxGenerationName(name).base.replace(/^app-/, "") : null;
   }
 }
 

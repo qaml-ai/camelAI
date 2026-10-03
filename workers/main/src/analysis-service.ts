@@ -4,7 +4,7 @@ import { assertConnectionsBindingEnabled } from "../../../src/lib/connections-bi
 import { getMimeType } from "../../../src/lib/file-content-headers";
 import {
   ANALYSIS_CONNECTIONS_HOST,
-  analysisContainerName,
+  getAnalysisSandbox,
   type AnalysisAccess,
   type AnalysisCommandResult,
   type AnalysisContainer,
@@ -1023,8 +1023,7 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
   private resolveSandbox(scope: AnalysisScope): AnalysisContainerStub {
     const cached = this.sandboxes.get(scope);
     if (cached) return cached;
-    if (!this.env.ANALYSIS_SANDBOX) throw new Error("ANALYSIS_SANDBOX container binding is not configured");
-    const sandbox = this.env.ANALYSIS_SANDBOX.getByName(analysisContainerName(this.access(scope))) as unknown as AnalysisContainerStub;
+    const sandbox = getAnalysisSandbox(this.env, this.access(scope));
     this.sandboxes.set(scope, sandbox);
     return sandbox;
   }

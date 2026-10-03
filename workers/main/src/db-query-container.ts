@@ -20,6 +20,13 @@ import {
 } from "./db-query-contracts.js";
 import { recordObservabilityEvent } from "./observability.js";
 import { createSandboxBucketMounts, type BucketMount, type SandboxBucketMounts } from "./sandbox-mounts.js";
+import {
+  parseSandboxGenerationName,
+  SandboxPlacement,
+  type RotationRequest,
+  type RotationResult,
+  type SandboxPlacementRegistry,
+} from "./sandbox-placement.js";
 import type { Env } from "./types.js";
 
 /** Key of the db-query image in wrangler `containers[].images`. */
@@ -95,7 +102,8 @@ export interface DbQueryContainerDeps {
  * Per-workspace database query container on the native Durable Object
  * container API (`scheduling_policy: "durable_object"`, Sandbox SDK 1.0),
  * bound as DB_QUERY_SANDBOX and reached through getDbQueryContainer()
- * (db-query-contracts.ts), one instance per workspace (`ws-<workspace>`).
+ * (db-query-contracts.ts), one instance per workspace (`ws-<workspace>`, or
+ * `ws-<workspace>-g<N>` after its placement rotated; sandbox-placement.ts).
  *
  * It runs NO user code and holds no state worth keeping: db-query-service.ts
  * ships the runner per call, exports land in R2, and the relay forwarder
@@ -113,8 +121,9 @@ export interface DbQueryContainerDeps {
  * forwarder's WebSocket through the Worker. The export mount (S3Mount) has
  * its own host-scoped intercept and needs no CA in the container.
  */
-export class DbQueryContainer extends DurableObject<Env> implements DbQueryContainerStub {
+export class DbQueryContainer extends DurableObject<Env> implements DbQueryContainerStub, SandboxPlacementRegistry {
   private readonly files: DbQueryContainerDeps["files"] | null;
+  private readonly placement: SandboxPlacement;
   private mountsImpl: SandboxBucketMounts | null;
   private setup: Promise<void> | null = null;
   /** A start (with its retry) is in flight: callers join it, even while it destroys between attempts. */
@@ -125,6 +134,17 @@ export class DbQueryContainer extends DurableObject<Env> implements DbQueryConta
     const container = ctx.container;
     this.files = deps.files ?? (container ? createContainerFiles(container, env) : null);
     this.mountsImpl = deps.mounts ?? null;
+    this.placement = new SandboxPlacement({
+      storage: ctx.storage,
+      name: ctx.id.name,
+      component: "DbQueryContainer",
+      env,
+      registry: (base) => {
+        if (!env.DB_QUERY_SANDBOX) throw new Error("DB_QUERY_SANDBOX container binding is not configured");
+        return env.DB_QUERY_SANDBOX.getByName(base) as unknown as SandboxPlacementRegistry;
+      },
+      scope: () => ({ workspaceId: this.workspaceId }),
+    });
     // The inactivity timeout belongs to the DO instance: a restarted DO (a
     // deploy, an eviction) must set it again or the container stops shortly
     // after the DO goes idle.
@@ -240,6 +260,14 @@ export class DbQueryContainer extends DurableObject<Env> implements DbQueryConta
    * queries within seconds.
    */
   async destroy(reason?: { operation: string; error?: string }): Promise<{ destroyed: boolean }> {
+    try {
+      await this.placement.assertCurrent();
+    } catch (relocated) {
+      // A retired generation: let go of anything left here, then send the
+      // caller on to the current one.
+      if (this.ctx.container?.running) await this.ctx.container.destroy().catch(() => {});
+      throw relocated;
+    }
     this.setup = null;
     this.starting = false;
     const container = this.ctx.container;
@@ -257,6 +285,11 @@ export class DbQueryContainer extends DurableObject<Env> implements DbQueryConta
       });
     }
     return { destroyed };
+  }
+
+  /** Generation 0 only: moves this sandbox to a new DO (sandbox-placement.ts). */
+  async rotateSandboxPlacement(request: RotationRequest): Promise<RotationResult> {
+    return this.placement.rotate(request);
   }
 
   // -------------------------------------------------------------------------
@@ -286,10 +319,11 @@ export class DbQueryContainer extends DurableObject<Env> implements DbQueryConta
     return this.files;
   }
 
-  /** `ws-<workspace>` (data-proxy.ts), for telemetry. */
+  /** `ws-<workspace>[-g<N>]` (data-proxy.ts), for telemetry. */
   private get workspaceId(): string | null {
     const name = this.ctx.id.name;
-    return name?.startsWith("ws-") ? name.slice("ws-".length) : null;
+    const base = name ? parseSandboxGenerationName(name).base : null;
+    return base?.startsWith("ws-") ? base.slice("ws-".length) : null;
   }
 
   /**
@@ -299,6 +333,8 @@ export class DbQueryContainer extends DurableObject<Env> implements DbQueryConta
    * the next call starts a new container.
    */
   private async withContainer<T>(operation: string, run: () => Promise<T>): Promise<T> {
+    // A retired generation does nothing: the caller re-sends to the current one.
+    await this.placement.assertCurrent();
     try {
       await this.ensureRunning();
       return await run();
@@ -383,7 +419,8 @@ export class DbQueryContainer extends DurableObject<Env> implements DbQueryConta
     }
 
     const freshImage = (await this.ctx.storage.get<string>(LAST_STARTED_IMAGE_KEY)) !== image;
-    await startWithRetry({
+    // Two whole failed starts in a row move the sandbox to a new DO.
+    await this.placement.trackStart(() => startWithRetry({
       policy: DB_QUERY_START_POLICY,
       label: DB_QUERY_ENVIRONMENT_LABEL,
       freshImage,
@@ -418,6 +455,8 @@ export class DbQueryContainer extends DurableObject<Env> implements DbQueryConta
       },
       onEvent: (event) =>
         recordContainerStartEvent(this.env, event, { component: "DbQueryContainer", workspaceId: this.workspaceId }),
+    }), async () => {
+      if (container.running) await container.destroy();
     });
     await this.ctx.storage.put(LAST_STARTED_IMAGE_KEY, image);
   }

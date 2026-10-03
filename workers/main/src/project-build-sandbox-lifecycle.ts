@@ -4,6 +4,7 @@ import {
 } from "./container-sizing.js";
 import type { ProjectBuildContainer } from "./project-build-container.js";
 import type { ProjectBuildSandboxLike } from "./project-worker-bundle.js";
+import { followSandboxGeneration, sandboxGenerationName } from "./sandbox-placement.js";
 
 const MAX_PROJECT_BUILD_SANDBOX_KEY_LENGTH = 63;
 
@@ -30,15 +31,24 @@ export function projectBuildSandboxKey(orgId: string): string {
   return `${prefix}-${hash}`;
 }
 
-/** The org's build container: one ProjectBuildContainer instance per org. */
+/**
+ * The org's build container: one ProjectBuildContainer instance per org, at
+ * its current placement generation (sandbox-placement.ts). A rotated name is
+ * the key plus `-g<N>`, which may pass 63 characters: that bound was the 0.x
+ * Sandbox SDK's sandbox id, not a Durable Object name limit.
+ */
 export function getProjectBuildSandbox(
   env: { PROJECT_BUILD_SANDBOX?: DurableObjectNamespace<ProjectBuildContainer> },
   orgId: string,
 ): ProjectBuildSandboxLike {
-  if (!env.PROJECT_BUILD_SANDBOX) {
+  const namespace = env.PROJECT_BUILD_SANDBOX;
+  if (!namespace) {
     throw new Error("PROJECT_BUILD_SANDBOX container binding is not configured");
   }
-  return env.PROJECT_BUILD_SANDBOX.getByName(projectBuildSandboxKey(orgId)) as unknown as ProjectBuildSandboxLike;
+  const base = projectBuildSandboxKey(orgId);
+  return followSandboxGeneration(
+    (generation) => namespace.getByName(sandboxGenerationName(base, generation)) as unknown as ProjectBuildSandboxLike,
+  );
 }
 
 function stableHexHash(value: string): string {

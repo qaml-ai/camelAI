@@ -430,11 +430,13 @@ describe("DbQueryContainer warehouse exports", () => {
 });
 
 describe("getDbQueryContainer", () => {
-  it("opens a workspace's instance by its lowercased key, as 0.12 normalized it", () => {
-    const namespace = { getByName: vi.fn(() => ({ id: "stub" })) };
+  it("opens a workspace's instance by its lowercased key, as 0.12 normalized it", async () => {
+    const start = vi.fn(async () => {});
+    const namespace = { getByName: vi.fn(() => ({ start })) };
     expect(dbQueryContainerKey("ABC")).toBe("ws-abc");
-    expect(getDbQueryContainer({ DB_QUERY_SANDBOX: namespace as never }, "ws-ABC")).toEqual({ id: "stub" });
+    await getDbQueryContainer({ DB_QUERY_SANDBOX: namespace as never }, "ws-ABC").start();
     expect(namespace.getByName).toHaveBeenCalledWith("ws-abc");
+    expect(start).toHaveBeenCalledTimes(1);
   });
 
   it("fails loudly when the binding is missing", () => {

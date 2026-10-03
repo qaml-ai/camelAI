@@ -102,6 +102,8 @@ export class ContainerStartFailedError extends Error {
 
   readonly attempts: number;
   readonly waitedMs: number;
+  /** No retry fixes it (the image or the application is missing). */
+  readonly permanent: boolean;
 
   constructor(input: { label: string; attempts: number; waitedMs: number; permanent: boolean; cause: unknown }) {
     const detail = input.cause instanceof Error ? input.cause.message : String(input.cause);
@@ -117,6 +119,7 @@ export class ContainerStartFailedError extends Error {
     this.name = "ContainerStartFailedError";
     this.attempts = input.attempts;
     this.waitedMs = input.waitedMs;
+    this.permanent = input.permanent;
   }
 }
 

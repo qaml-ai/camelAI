@@ -1,4 +1,5 @@
 import type { DbQueryContainer } from "./db-query-container.js";
+import { followSandboxGeneration, sandboxGenerationName } from "./sandbox-placement.js";
 
 /**
  * What the Worker and DbQueryContainer agree on: the container surface
@@ -85,14 +86,19 @@ export function dbQueryContainerKey(workspaceId: string): string {
 
 /**
  * The db-query container for `key` (dbQueryContainerKey(), or the admin smoke
- * key). The one place callers obtain it.
+ * key). The one place callers obtain it. Each call goes to the key's current
+ * placement generation (sandbox-placement.ts).
  */
 export function getDbQueryContainer(
   env: { DB_QUERY_SANDBOX?: DurableObjectNamespace<DbQueryContainer> },
   key: string,
 ): DbQueryContainerStub {
-  if (!env.DB_QUERY_SANDBOX) {
+  const namespace = env.DB_QUERY_SANDBOX;
+  if (!namespace) {
     throw Object.assign(new Error("DB_QUERY_SANDBOX container binding is not configured"), { status: 500 });
   }
-  return env.DB_QUERY_SANDBOX.getByName(key.toLowerCase()) as unknown as DbQueryContainerStub;
+  const base = key.toLowerCase();
+  return followSandboxGeneration(
+    (generation) => namespace.getByName(sandboxGenerationName(base, generation)) as unknown as DbQueryContainerStub,
+  );
 }

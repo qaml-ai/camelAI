@@ -489,11 +489,13 @@ describe("ProjectBuildContainer files", () => {
 });
 
 describe("getProjectBuildSandbox", () => {
-  it("addresses the org's container by its sandbox key", () => {
-    const namespace = { getByName: vi.fn((name: string) => ({ name })) };
+  it("addresses the org's container by its sandbox key", async () => {
+    const namespace = {
+      getByName: vi.fn((name: string) => ({ exec: async () => ({ name }) })),
+    };
     const stub = getProjectBuildSandbox({ PROJECT_BUILD_SANDBOX: namespace } as unknown as Env, "Org_123");
     expect(namespace.getByName).toHaveBeenCalledWith("org-org-123");
-    expect(stub).toEqual({ name: "org-org-123" });
+    expect(await stub.exec("true")).toEqual({ name: "org-org-123" });
   });
 
   it("fails clearly when the binding is missing", () => {

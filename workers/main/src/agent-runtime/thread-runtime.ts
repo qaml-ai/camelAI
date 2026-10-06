@@ -461,7 +461,7 @@ async function sendRuntimeTurn(
   // run's own events can end the mark but a quick run never finds it after.
   const marked = markThreadRunning(env, context, startedAt);
   let agentId: string;
-  let request: { id?: unknown; state?: unknown };
+  let request: { id?: unknown; state?: unknown; steeredInto?: unknown };
   try {
     // Configuring is idempotent (the agent's Idempotency-Key, PUT/PATCH), so
     // a Durable Object reset under it (a deploy) is ridden out, once.
@@ -488,7 +488,7 @@ async function sendRuntimeTurn(
       whileRunning: "steer",
       // On the message and on the run's webhook events (routes/agent-runtime-events.ts).
       metadata: runtimeMessageMetadata(context, input.source ?? "web"),
-    })) as { id?: unknown; state?: unknown };
+    })) as { id?: unknown; state?: unknown; steeredInto?: unknown };
   } catch (error) {
     if (await marked) await unmarkThreadRunning(env, context, startedAt);
     if (error instanceof RuntimeApiError && error.status === 429) {
@@ -497,8 +497,9 @@ async function sendRuntimeTurn(
     throw error;
   }
   // A retry of a request that already finished starts no run, whose events
-  // would end the mark.
-  if (request?.state === "completed" && await marked) await unmarkThreadRunning(env, context, startedAt);
+  // would end the mark. A steer the running turn already read completes at
+  // once while that turn goes on: its events end the mark.
+  if (request?.state === "completed" && !request.steeredInto && await marked) await unmarkThreadRunning(env, context, startedAt);
   // Running/idle in the sidebar and end-of-turn work come from the runtime's
   // run events (routes/agent-runtime-events.ts), for every run however started;
   // runs no message of ours started (a resume after an input) find the thread here.
@@ -621,7 +622,11 @@ export async function answerRuntimeInput(
   }
 }
 
-/** Stop the agent's running turn (its tool calls are cancelled; the stream shows the end). */
+/**
+ * Stop the agent's running turn (its tool calls are cancelled; the stream shows
+ * the end), and the messages queued behind it: the runtime cancels them too,
+ * each ending as run.failed with code "cancelled" (routes/agent-runtime-events.ts).
+ */
 export async function abortRuntimeThread(env: ChatEnv, agentId: string): Promise<void> {
   await runtimeApi(env, "POST", `/v1/agents/${encodeURIComponent(agentId)}/abort`);
 }

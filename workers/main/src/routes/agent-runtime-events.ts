@@ -8,7 +8,9 @@
  * - run.started: the thread shows as running in the sidebar.
  * - run.completed / run.failed: it goes idle, its completion (and a failure's
  *   error) is recorded on the thread, and its summary generated, as
- *   ChatThreadDO does at a turn's end.
+ *   ChatThreadDO does at a turn's end. A stop is no error: the stopped turn
+ *   (code "aborted") goes idle with no error, and the messages queued behind it
+ *   that the stop cancelled (code "cancelled") change nothing.
  * - input.requested: on a channel or scheduled thread, where nobody is at a
  *   computer to answer, the input is cancelled at once (ChatThreadDO answers
  *   such a thread's questions the same way). A web thread's page reads its
@@ -50,6 +52,7 @@ export interface RuntimeEventEnvelope {
     steeredInto?: string;
     replyIndex?: number;
     error?: string;
+    code?: string;
     [key: string]: unknown;
   };
 }
@@ -164,7 +167,11 @@ export async function handleRuntimeEvent(
     return true;
   }
   const completedAt = Math.round((Number.isFinite(event.created) ? event.created : Date.now() / 1000) * 1000);
-  if (event.type === "run.failed") {
+  // A person stopped the agent: the stopped turn ends "aborted", the runs
+  // queued behind it "cancelled".
+  const code = event.type === "run.failed" ? text(data.code) : "";
+  const stopped = code === "aborted" || code === "cancelled";
+  if (event.type === "run.failed" && !stopped) {
     await org.recordThreadError(ref.thread, {
       message: text(data.error) || "The agent run failed",
       source: "agent_runtime",
@@ -182,6 +189,9 @@ export async function handleRuntimeEvent(
       completedAt,
     });
   }
+  // A cancelled run never began: the stopped turn's own event settles the
+  // thread, and one arriving late must not end a run started since.
+  if (code === "cancelled") return true;
   const summarySource = event.type === "run.completed" ? await replyText(env, agentId, data.replyIndex) : null;
   // Clears the running row, then records the completion; its summary (a model
   // call) finishes after the runtime has its acknowledgement.

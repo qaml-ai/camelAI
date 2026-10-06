@@ -446,6 +446,13 @@ describe("the usual send", () => {
     expect(await send(setup, "again", "cm_f1")).toMatchObject({ status: "accepted" });
     expect((await runningRows(setup)).some((status) => status.threadId === setup.threadId)).toBe(false);
 
+    // A steer the running turn read at once completes while that turn goes on:
+    // the turn's own events end the mark.
+    fakeRuntime({ "POST /v1/agents/agt_1/prompt": (call) => Response.json({ id: call.body.requestId, method: "prompt", state: "completed", steeredInto: "cm_turn", steer: "accepted", fingerprint: "f" }, { status: 202 }) });
+    expect(await send(setup, "steered", "cm_f4")).toMatchObject({ status: "accepted" });
+    expect((await runningRows(setup)).some((status) => status.threadId === setup.threadId)).toBe(true);
+    await workspace.recordThreadStreaming(setup.threadId, false);
+
     // Busy while another turn runs: that turn stays running, from its own start.
     const otherStart = Date.now() - 10_000;
     await workspace.recordThreadStreaming(setup.threadId, true, { startedAt: otherStart });

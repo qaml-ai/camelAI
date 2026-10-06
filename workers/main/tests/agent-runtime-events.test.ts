@@ -217,6 +217,49 @@ describe("POST /agent-runtime/events", () => {
     expect(thread?.chat_error_count).toBe(1);
   });
 
+  it("records a stop as no error: the stopped turn goes idle, the runs it cancelled change nothing", async () => {
+    const { runEnv, agentId, metadata, threadId, orgStub, streaming } = await setup();
+    const created = Math.floor(Date.now() / 1000);
+    await deliver(runEnv, {
+      id: eventId(), type: "run.failed", created,
+      data: { agentId, requestId: "r6", method: "prompt", metadata, error: "The run was aborted", code: "aborted", usage: null },
+    });
+    expect(streaming).toHaveBeenCalledWith(threadId, false, expect.objectContaining({ clearOnlyIfRunning: true }));
+    let thread = await orgStub.getThread(threadId);
+    expect(thread?.chat_error_count ?? 0).toBe(0);
+    expect(thread?.last_chat_error_message ?? null).toBeNull();
+    expect(thread?.last_assistant_completed_at).toBeGreaterThanOrEqual(created * 1000);
+    const completedAt = thread?.last_assistant_completed_at;
+
+    // A message queued (or steered and not yet read) behind it, cancelled by the stop.
+    streaming.mockClear();
+    await deliver(runEnv, {
+      id: eventId(), type: "run.failed", created: created + 1,
+      data: { agentId, requestId: "r7", method: "prompt", metadata, error: "Cancelled by a stop", code: "cancelled", usage: null },
+    });
+    expect(streaming).not.toHaveBeenCalled();
+    thread = await orgStub.getThread(threadId);
+    expect(thread?.chat_error_count ?? 0).toBe(0);
+    expect(thread?.last_assistant_completed_at).toBe(completedAt);
+  });
+
+  it("finishes a scheduled prompt's run that a stop cancelled", async () => {
+    const { runEnv, agentId, metadata, streaming } = await setup({ source: "scheduled" });
+    const finishScheduledRun = vi.fn(async () => true);
+    const cronEnv = {
+      ...runEnv,
+      WORKSPACE_CRON: { idFromName: (name: string) => name, get: () => ({ finishScheduledRun }) },
+    } as unknown as Env;
+    await deliver(cronEnv, {
+      id: eventId(), type: "run.failed", created: 1_790_000_000,
+      data: { agentId, requestId: "run-8", method: "prompt", metadata: { ...metadata, source: "scheduled prompt" }, error: "Cancelled by a stop", code: "cancelled", usage: null },
+    });
+    expect(finishScheduledRun).toHaveBeenCalledWith({
+      workspaceId: metadata.workspace, runId: "run-8", error: "Cancelled by a stop", completedAt: 1_790_000_000_000,
+    });
+    expect(streaming).not.toHaveBeenCalled();
+  });
+
   it("only clears running for a turn that waits on input, and ignores a steered message's end", async () => {
     const { runEnv, agentId, metadata, threadId, orgStub, streaming } = await setup();
     await deliver(runEnv, {

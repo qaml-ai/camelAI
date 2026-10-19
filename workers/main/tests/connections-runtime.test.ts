@@ -2379,7 +2379,7 @@ describe('connections runtime', () => {
       method: 'searchConversations',
       input: { query: 'refund' },
     })).rejects.toMatchObject({
-      message: 'Native MCP request failed with HTTP 401',
+      message: 'Native MCP request failed with HTTP 401: invalid token',
       status: 401,
       code: 'AUTH_REAUTH_REQUIRED',
       data: {
@@ -2387,6 +2387,90 @@ describe('connections runtime', () => {
         reauthUrl: '/connections?connection=intercom_support&reauth=1',
       },
     });
+  });
+
+  it('surfaces GitHub MCP 400 bodies and marks a malformed token as setup incomplete', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response('bad request: Authorization header is badly formatted\n', { status: 400 })
+    ));
+    const authUpdates: Array<{ status: string; code: string | null }> = [];
+    const records = [
+      integration({
+        id: 'github_mcp',
+        integration_type: 'remote_mcp',
+        name: 'GitHub',
+        category: 'saas',
+        config: JSON.stringify({
+          server_url: 'https://api.githubcopilot.com/mcp/',
+          auth_type: 'bearer',
+        }),
+        credentials_encrypted: await encryptedCredentials({ token: 'not-a-github-token' }),
+      }),
+    ];
+
+    await expect(verifyConnection(
+      envWith(records, (_id, status, code) => authUpdates.push({ status, code })),
+      context,
+      'github_mcp',
+    )).resolves.toMatchObject({
+      ok: false,
+      message: 'Native MCP request failed with HTTP 400: bad request: Authorization header is badly formatted',
+    });
+    expect(authUpdates).toContainEqual({ status: 'setup_incomplete', code: 'AUTH_SETUP_INCOMPLETE' });
+  });
+
+  it('drops HTML error pages from native MCP failure messages', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response('<!DOCTYPE html><html><body>Bad gateway</body></html>', { status: 502 })
+    ));
+    const records = [
+      integration({
+        id: 'remote_html',
+        integration_type: 'remote_mcp',
+        name: 'html',
+        category: 'saas',
+        config: JSON.stringify({ server_url: 'https://mcp.example.com/mcp', auth_type: 'none' }),
+      }),
+    ];
+
+    await expect(listConnectionTools(envWith(records), context, 'remote_html')).rejects.toMatchObject({
+      message: 'Native MCP request failed with HTTP 502',
+      status: 502,
+    });
+  });
+
+  it('strips a pasted Bearer/token scheme from MCP tokens', async () => {
+    const seen: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      seen.push(new Headers(init?.headers).get('authorization') ?? '');
+      const body = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        jsonrpc: '2.0',
+        id: body.id,
+        result: body.method === 'tools/list' ? { tools: [] } : { capabilities: { tools: {} } },
+      }));
+    }));
+    const records = [
+      integration({
+        id: 'github_pat',
+        integration_type: 'github',
+        name: 'gh',
+        category: 'saas',
+        credentials_encrypted: await encryptedCredentials({ api_key: ' Bearer ghp_example ' }),
+      }),
+      integration({
+        id: 'github_remote',
+        integration_type: 'remote_mcp',
+        name: 'gh remote',
+        category: 'saas',
+        config: JSON.stringify({ server_url: 'https://api.githubcopilot.com/mcp/', auth_type: 'bearer' }),
+        credentials_encrypted: await encryptedCredentials({ token: 'token ghp_remote' }),
+      }),
+    ];
+
+    await listConnectionTools(envWith(records), context, 'github_pat');
+    await listConnectionTools(envWith(records), context, 'github_remote');
+    expect(new Set(seen)).toEqual(new Set(['Bearer ghp_example', 'Bearer ghp_remote']));
   });
 
   it('supports both direct Typeform MCP metadata and brokered tools through connected credentials', async () => {

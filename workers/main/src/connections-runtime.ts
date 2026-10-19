@@ -655,7 +655,10 @@ function providerSetupStatus(httpStatus: number, message: string): WorkspaceInte
     normalized.includes('account_sid is required') ||
     normalized.includes('client_id is required') ||
     normalized.includes('client_secret is required') ||
-    normalized.includes('private_key is required')
+    normalized.includes('private_key is required') ||
+    // GitHub's MCP server rejects tokens that aren't GitHub token formats
+    // (e.g. a pasted "Bearer ghp_..." or a non-GitHub secret) with this 400.
+    normalized.includes('authorization header is badly formatted')
   ) {
     return 'setup_incomplete';
   }
@@ -2406,9 +2409,10 @@ function mcpAuthHeaders(
     const authType = typeof config.auth_type === 'string' ? config.auth_type : 'none';
     if (authType === 'none') return { ok: true, headers: {} };
 
-    const token = authType === 'oauth'
-      ? (typeof credentials.access_token === 'string' ? credentials.access_token.trim() : '')
-      : (typeof credentials.token === 'string' ? credentials.token.trim() : '');
+    const rawToken = authType === 'oauth' ? credentials.access_token : credentials.token;
+    const token = typeof rawToken === 'string'
+      ? (authType === 'custom_header' ? rawToken.trim() : stripAuthScheme(rawToken))
+      : '';
     if (!token) {
       return {
         ok: false,
@@ -2527,7 +2531,7 @@ async function nativeMcpHttp(
   }
   const payload = parseNativePayload(text);
   if (!response.ok) {
-    const message = extractMcpError(payload) || `Native MCP request failed with HTTP ${response.status}`;
+    const message = extractMcpError(payload) || nativeHttpFailureMessage(response.status, payload);
     throw Object.assign(new Error(message), { status: response.status });
   }
   const error = extractMcpError(payload);
@@ -2568,6 +2572,29 @@ function parseNativePayload(text: string): JsonValue | Record<string, unknown> {
   }
 }
 
+const NATIVE_MCP_ERROR_BODY_MAX_CHARS = 200;
+
+// Non-JSON error bodies (e.g. GitHub's "bad request: Authorization header is
+// badly formatted") are the only hint at what went wrong, so keep a short,
+// single-line excerpt instead of dropping it. HTML error pages are skipped.
+function nativeHttpFailureMessage(status: number, payload: unknown): string {
+  const base = `Native MCP request failed with HTTP ${status}`;
+  const raw = (payload as { raw?: unknown })?.raw;
+  if (typeof raw !== 'string') return base;
+  const text = raw.replace(/\s+/g, ' ').trim();
+  if (!text || /^<(?:!doctype|html|\?xml)/i.test(text)) return base;
+  const excerpt = text.length > NATIVE_MCP_ERROR_BODY_MAX_CHARS
+    ? `${text.slice(0, NATIVE_MCP_ERROR_BODY_MAX_CHARS)}...`
+    : text;
+  return `${base}: ${excerpt}`;
+}
+
+// Users often paste a token together with its scheme ("Bearer ghp_..." or
+// "token ghp_..."); we add "Bearer " ourselves, so drop a pasted scheme.
+function stripAuthScheme(value: string): string {
+  return value.trim().replace(/^(?:bearer|token)\s+/i, '').trim();
+}
+
 function extractMcpError(payload: unknown): string {
   const error = (payload as { error?: unknown })?.error;
   if (!error) return '';
@@ -2579,8 +2606,8 @@ function extractMcpError(payload: unknown): string {
 function credentialToken(credentials: Record<string, unknown>): string {
   for (const key of ['access_token', 'api_key', 'token', 'bot_token', 'user_access_token']) {
     const value = credentials[key];
-    if (typeof value === 'string' && value.trim()) {
-      return value.trim();
+    if (typeof value === 'string' && stripAuthScheme(value)) {
+      return stripAuthScheme(value);
     }
   }
   return '';

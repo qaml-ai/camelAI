@@ -5,7 +5,7 @@
     "": {
       "name": "chiridion-app",
       "dependencies": {
-        "@camelai/run": "0.21.0",
+        "@camelai/run": "0.22.1",
         "@cloudflare/dynamic-workflows": "^0.1.1",
         "@cloudflare/puppeteer": "^1.0.6",
         "@cloudflare/sandbox": "1.0.0",
@@ -197,7 +197,7 @@
 
     "@babel/types": ["@babel/types@7.29.7", "", { "dependencies": { "@babel/helper-string-parser": "^7.29.7", "@babel/helper-validator-identifier": "^7.29.7" } }, "sha512-4zBIxpPzowiZpusoFkyGVwakdRJUyuH5PxQ/PrqghfdFWWasvnCdPfQXHrenDai+gyLARulZjZowCOj6fjT4pA=="],
 
-    "@camelai/run": ["@camelai/run@0.21.0", "", { "dependencies": { "typebox": "1.1.38" }, "peerDependencies": { "@modelcontextprotocol/sdk": "^1.30.1" }, "optionalPeers": ["@modelcontextprotocol/sdk"] }, "sha512-UA+2IUOw8ArqHcoYdZW83usZxBi5Uo+g/wLm7Zayk6WkcNeXFddJ+BOz3f7aXmcrVPLMrrGmBTK557icjfCWdA=="],
+    "@camelai/run": ["@camelai/run@0.22.1", "", { "dependencies": { "typebox": "1.1.38" }, "peerDependencies": { "@modelcontextprotocol/sdk": "^1.30.1" }, "optionalPeers": ["@modelcontextprotocol/sdk"] }, "sha512-eKw7TE6hNhNo2Uc3c26/XIv1rkmNzocYRJLNQljwx1oQK+lsRm9tkSAsrnhL1aU/lPB2BXJ36KjI6KKoUlOoew=="],
 
     "@cfworker/json-schema": ["@cfworker/json-schema@4.1.1", "", {}, "sha512-gAmrUZSGtKc3AiBL71iNWxDsyUC5uMaKKGdvzYsBoTW/xi42JQHl7eKV2OYzCUqvc+D2RCcf7EXY2iCyFIk6og=="],
 

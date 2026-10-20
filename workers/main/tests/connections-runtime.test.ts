@@ -2448,6 +2448,20 @@ describe('connections runtime', () => {
     expect(updates.join(' ')).not.toContain(token);
   });
 
+  it('keeps the HTTP status and excerpt when an error body exceeds the tool response limit', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      `Service unavailable ${'x'.repeat(5 * 1024 * 1024)}`,
+      { status: 503, headers: { 'content-length': String(5 * 1024 * 1024) } },
+    )));
+    const records = [integration({
+      id: 'large_error', integration_type: 'remote_mcp', name: 'large', category: 'saas',
+      config: JSON.stringify({ server_url: 'https://mcp.example.com/mcp', auth_type: 'none' }),
+    })];
+    await expect(listConnectionTools(envWith(records), context, 'large_error')).rejects.toMatchObject({
+      status: 503, message: expect.stringMatching(/^Native MCP request failed with HTTP 503: Service unavailable .*\.\.\.$/),
+    });
+  });
+
   it('drops HTML error pages from native MCP failure messages', async () => {
     vi.stubGlobal('fetch', vi.fn(async () =>
       new Response('<!DOCTYPE html><html><body>Bad gateway</body></html>', { status: 502 })

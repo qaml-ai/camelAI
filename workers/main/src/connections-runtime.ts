@@ -2518,7 +2518,12 @@ async function nativeMcpHttp(
         params,
       }),
     });
-    text = await readBoundedMcpResponseText(response);
+    // Error pages need only a diagnostic excerpt; keep the original HTTP status
+    // even when the server sends an oversized body. Successful tool results
+    // still use the strict response-size guard.
+    text = response.ok
+      ? await readBoundedMcpResponseText(response)
+      : (await boundedResponseText(response, 16_384)).text;
   } catch (error) {
     if (controller.signal.aborted) {
       throw Object.assign(

@@ -1,6 +1,6 @@
 /** Pasted Authorization schemes are supplied by the connection adapter itself. */
 export function stripAuthScheme(value: string): string {
-  return value.trim().replace(/^(?:(?:bearer|token)\s+)+/i, '').trim();
+  return value.trim().replace(/^(?:(?:bearer|token)(?:\s+|$))+/i, '').trim();
 }
 
 /** Normalize only token-based MCP credentials; custom header values are opaque. */

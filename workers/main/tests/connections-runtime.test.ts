@@ -2414,9 +2414,38 @@ describe('connections runtime', () => {
       'github_mcp',
     )).resolves.toMatchObject({
       ok: false,
-      message: 'Native MCP request failed with HTTP 400: bad request: Authorization header is badly formatted',
+      message: 'Native MCP request failed with HTTP 400: bad request: Authorization header is badly formatted Replace the saved token with a valid GitHub personal access token, then verify the connection again.',
     });
     expect(authUpdates).toContainEqual({ status: 'setup_incomplete', code: 'AUTH_SETUP_INCOMPLETE' });
+  });
+
+  it.each(['plain', 'json', 'rpc'])('redacts and bounds %s MCP errors for verification and agent calls', async (format) => {
+    const token = 'test-credential-do-not-expose';
+    const detail = `Authorization header is badly formatted: ${token} ${'x'.repeat(400)}`;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      format === 'plain' ? detail : JSON.stringify(format === 'json'
+        ? { message: detail, api_key: token }
+        : { error: { message: detail } }),
+      { status: 400 },
+    )));
+    const updates: string[] = [];
+    const records = [integration({
+      id: 'remote_error', integration_type: 'remote_mcp', name: 'GitHub', category: 'saas',
+      config: JSON.stringify({ server_url: 'https://api.githubcopilot.com/mcp/', auth_type: 'bearer' }),
+      credentials_encrypted: await encryptedCredentials({ token }),
+    })];
+    const env = envWith(records, (_id, _status, _code, message) => updates.push(String(message)));
+    const verification = await verifyConnection(env, context, 'remote_error');
+    expect(verification).toMatchObject({ ok: false });
+    expect(verification.message).toContain('HTTP 400');
+    expect(verification.message).toContain('[REDACTED]');
+    expect(verification.message).toContain('valid GitHub personal access token');
+    expect(verification.message).not.toContain(token);
+    expect(verification.message.length).toBeLessThan(360);
+    await expect(invokeConnectionMethod(env, context, {
+      connection: 'remote_error', method: 'tools/list', input: {},
+    })).rejects.toMatchObject({ message: verification.message, status: 400, code: 'AUTH_SETUP_INCOMPLETE' });
+    expect(updates.join(' ')).not.toContain(token);
   });
 
   it('drops HTML error pages from native MCP failure messages', async () => {

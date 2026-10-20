@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { encryptCredentials } from "@/lib/integration-crypto";
+import { decryptCredentials, encryptCredentials } from "@/lib/integration-crypto";
 
 const requireAuthContextMock = vi.fn();
 const requireWorkspaceAccessMock = vi.fn();
@@ -1454,6 +1454,31 @@ describe("connections action admin guard", () => {
       error: "Discord bot token (legacy) can no longer be created",
     });
     expect(createIntegrationMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['github', 'remote_mcp'])('saves normalized %s tokens on create and update', async (integrationType) => {
+    isOrgAdminMock.mockResolvedValue(true);
+    const config = integrationType === 'remote_mcp'
+      ? { server_url: 'https://api.githubcopilot.com/mcp/', auth_type: 'bearer' }
+      : {};
+    const field = integrationType === 'github' ? 'api_key' : 'token';
+    const response = await action({
+      request: postForm({ intent: 'createIntegration', integration_type: integrationType, name: 'GitHub',
+        config: JSON.stringify(config), credentials: JSON.stringify({ [field]: '  bEaReR   ghp_example  ' }) }),
+      context: {}, params: {},
+    } as never);
+    expect(response).toMatchObject({ success: true });
+    const secretKey = getEnvMock().INTEGRATION_SECRET_KEY;
+    await expect(decryptCredentials(createIntegrationMock.mock.calls[0][6], secretKey))
+      .resolves.toEqual({ [field]: 'ghp_example' });
+    getIntegrationMock.mockResolvedValue(makeRecord({ integration_type: integrationType, config: JSON.stringify(config) }));
+    await expect(action({
+      request: postForm({ intent: 'updateIntegration', integrationId: 'int_1',
+        credentials: JSON.stringify({ [field]: '  ToKeN   ghp_updated  ' }) }),
+      context: {}, params: {},
+    } as never)).resolves.toEqual({ success: true });
+    await expect(decryptCredentials(updateIntegrationMock.mock.calls.at(-1)![1].credentialsEncrypted, secretKey))
+      .resolves.toEqual({ [field]: 'ghp_updated' });
   });
 
   it("normalizes remote MCP OAuth URLs and returns the follow-up OAuth URL", async () => {

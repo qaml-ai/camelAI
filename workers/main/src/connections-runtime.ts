@@ -1,3 +1,4 @@
+import { stripAuthScheme } from '../../../src/lib/integration-token';
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { getIntegrationDefinition } from '../../../src/lib/integration-registry';
 import {
@@ -2531,12 +2532,12 @@ async function nativeMcpHttp(
   }
   const payload = parseNativePayload(text);
   if (!response.ok) {
-    const message = extractMcpError(payload) || nativeHttpFailureMessage(response.status, payload);
+    const message = nativeHttpFailureMessage(response.status, payload, authHeaders);
     throw Object.assign(new Error(message), { status: response.status });
   }
   const error = extractMcpError(payload);
   if (error) {
-    throw Object.assign(new Error(error), { status: 502 });
+    throw Object.assign(new Error(safeMcpErrorExcerpt(error, authHeaders)), { status: 502 });
   }
   return {
     result: (payload as { result?: unknown }).result ?? payload,
@@ -2574,29 +2575,39 @@ function parseNativePayload(text: string): JsonValue | Record<string, unknown> {
 
 const NATIVE_MCP_ERROR_BODY_MAX_CHARS = 200;
 
-// Non-JSON error bodies (e.g. GitHub's "bad request: Authorization header is
-// badly formatted") are the only hint at what went wrong, so keep a short,
-// single-line excerpt instead of dropping it. HTML error pages are skipped.
-function nativeHttpFailureMessage(status: number, payload: unknown): string {
-  const base = `Native MCP request failed with HTTP ${status}`;
-  const raw = (payload as { raw?: unknown })?.raw;
-  if (typeof raw !== 'string') return base;
-  const text = raw.replace(/\s+/g, ' ').trim();
-  if (!text || /^<(?:!doctype|html|\?xml)/i.test(text)) return base;
-  const excerpt = text.length > NATIVE_MCP_ERROR_BODY_MAX_CHARS
+/** Redact before truncating, including credentials echoed without their auth scheme. */
+function safeMcpErrorExcerpt(text: string, authHeaders: Record<string, string>): string {
+  const secrets = Object.values(authHeaders).flatMap((value) => [value, stripAuthScheme(value)])
+    .filter(Boolean).sort((a, b) => b.length - a.length);
+  for (const secret of secrets) {
+    for (const variant of [secret, encodeURIComponent(secret), JSON.stringify(secret).slice(1, -1)]) {
+      text = text.split(variant).join('[REDACTED]');
+    }
+  }
+  text = text
+    .replace(/\b(?:Bearer|token)\s+[^\s"'<>;,]+/gi, '[REDACTED]')
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)/g, '[REDACTED]')
+    .replace(/("(?:access_token|refresh_token|api_key|client_secret|password|token)"\s*:\s*)"(?:[^"\\]|\\.)*"/gi, '$1"[REDACTED]"')
+    .replace(/\s+/g, ' ').trim();
+  return text.length > NATIVE_MCP_ERROR_BODY_MAX_CHARS
     ? `${text.slice(0, NATIVE_MCP_ERROR_BODY_MAX_CHARS)}...`
     : text;
-  return `${base}: ${excerpt}`;
 }
 
-// Users often paste a token together with its scheme ("Bearer ghp_..." or
-// "token ghp_..."); we add "Bearer " ourselves, so drop a pasted scheme.
-function stripAuthScheme(value: string): string {
-  return value.trim().replace(/^(?:bearer|token)\s+/i, '').trim();
+function nativeHttpFailureMessage(status: number, payload: unknown, authHeaders: Record<string, string>): string {
+  const base = `Native MCP request failed with HTTP ${status}`;
+  const raw = (payload as { raw?: unknown } | null)?.raw;
+  const body = extractMcpError(payload) || (typeof raw === 'string' ? raw : JSON.stringify(payload));
+  if (!body || body === '{}' || /^\s*<(?:!doctype|html|\?xml)/i.test(body)) return base;
+  const excerpt = safeMcpErrorExcerpt(body, authHeaders);
+  const nextStep = status === 400 && body.toLowerCase().includes('authorization header is badly formatted')
+    ? ' Replace the saved token with a valid GitHub personal access token, then verify the connection again.'
+    : '';
+  return `${base}: ${excerpt}${nextStep}`;
 }
 
 function extractMcpError(payload: unknown): string {
-  const error = (payload as { error?: unknown })?.error;
+  const error = (payload as { error?: unknown } | null)?.error;
   if (!error) return '';
   if (typeof error === 'string') return error;
   const message = (error as { message?: unknown })?.message;

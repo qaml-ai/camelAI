@@ -1,3 +1,4 @@
+import { normalizeIntegrationTokens } from '@/lib/integration-token';
 import { Suspense } from 'react';
 import { Await, useLoaderData } from 'react-router';
 import type { Route } from './+types/_app.connections';
@@ -661,7 +662,7 @@ export async function action({ request, context }: Route.ActionArgs) {
 
     try {
       const config = configStr ? JSON.parse(configStr) : {};
-      const credentials = credentialsStr ? JSON.parse(credentialsStr) : {};
+      const credentials = normalizeIntegrationTokens(integrationType, config, credentialsStr ? JSON.parse(credentialsStr) : {});
       const validationErrors = validateRequiredIntegrationFields(definition, config, credentials);
       if (validationErrors.length > 0) {
         return { error: validationErrors.join(', ') };
@@ -843,9 +844,8 @@ export async function action({ request, context }: Route.ActionArgs) {
       }
       const selectedTemplate = definition.auth.find((auth) => auth.kind === authType);
       if (definition.surface === 'mcp') {
-        const remoteCredentials = authType === 'bearer' || authType === 'header'
-          ? { token: credentials.api_key }
-          : {};
+        const remoteCredentials = normalizeIntegrationTokens('remote_mcp', { auth_type: authType },
+          authType === 'bearer' || authType === 'header' ? { token: credentials.api_key } : {});
         const remoteConfig = {
           server_url: normalizeRemoteMcpUrl(resolvedDefinition.baseUrl),
           auth_type: authType === 'oauth2' ? 'oauth' : authType === 'header' ? 'custom_header' : authType,
@@ -961,7 +961,11 @@ export async function action({ request, context }: Route.ActionArgs) {
         parsedConfig = JSON.parse(configStr) as Record<string, unknown>;
       }
       if (credentialsStr) {
-        parsedCredentials = JSON.parse(credentialsStr) as Record<string, unknown>;
+        parsedCredentials = normalizeIntegrationTokens(
+          existing.integration_type,
+          parsedConfig ?? JSON.parse(existing.config),
+          JSON.parse(credentialsStr) as Record<string, unknown>,
+        );
       }
 
       if (existing.integration_type === 'remote_mcp' && (parsedConfig || parsedCredentials)) {

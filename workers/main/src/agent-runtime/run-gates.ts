@@ -155,6 +155,7 @@ export async function resolveThreadRuntimeRoute(
       resolveRequestConfig: (resolved, ctx, requestedModelId) => resolvePiRequestConfig(
         {
           env,
+          hostedRuntime: true,
           modelMapping,
           getChatMetadata: () => context,
           resolveByokCredentials: (byokContext, options) =>
@@ -188,6 +189,7 @@ export async function resolveThreadRuntimeRoute(
   const route = runtimeModelRoute(config, {
     orgId: context.orgId,
     freeTier: isCreditFreeHostedModel(threadModel),
+    selfhost: isSelfhostRuntime(env),
     operatorEndpointOrigin: selfhostOperatorEndpointOrigin(env),
   });
   return { threadModel, config, route, fallback, llmProviderRecord };
@@ -249,7 +251,7 @@ export async function prepareThreadRuntimeRun(
     if (!userId) return;
     // Limits are checked against the model the runtime will call (the free
     // tier's runtime model is not the in-DO loop's dynamic route).
-    const gated = route.kind === "scope" && route.model === FREE_TIER_RUNTIME_MODEL
+    const gated = route.model === FREE_TIER_RUNTIME_MODEL
       ? { provider: "openrouter", model: "openai/gpt-6-luna" }
       : { provider: config.usageProvider || config.model.provider, model: config.model.id };
     try {
@@ -308,9 +310,8 @@ export function runtimeAgentModel(context: ChatContextState, route: RuntimeModel
 
 /**
  * The runtime's copy of the key scope the thread's route runs under, brought
- * up to date (the hosted scope, or the org's BYOK one); a run or agent create
- * under a scope the runtime lacks is refused. Throws RuntimeRunRefused when
- * hosted models are not configured.
+ * up to date for BYOK and self-host providers, including the self-host gateway.
+ * Hosted platform routes need no scope.
  */
 export async function syncRouteKeyScope(
   env: ChatEnv,

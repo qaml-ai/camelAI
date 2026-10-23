@@ -356,6 +356,8 @@ reports. (An earlier design forwarded every model call through the thread's
 DO; it held the DO open for every streamed call and added a hop, which is
 cross-Atlantic for EU-placed DOs. Only Codex is still forwarded.)
 
+**Hosted OpenRouter update (2026-10-23):** hosted agents now use camelRun platform keys with no key scope or gateway headers. See [the migration and dependency audit](runtime-platform-openrouter.md). The scope/run descriptions below describe the earlier gateway design.
+
 **Key scopes** (`agent-runtime/key-scopes.ts`, runtime `PUT
 /v1/key-scopes/:scope/providers/:provider {apiKey?, baseUrl?, headers?, region?}`;
 a `baseUrl` replaces the provider's API root):

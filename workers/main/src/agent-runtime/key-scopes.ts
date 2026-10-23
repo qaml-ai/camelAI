@@ -1,13 +1,8 @@
 /**
- * The provider keys runtime agents call providers with, kept in the runtime's
- * key scopes: `hosted` (camelAI's AI Gateway, shared by every hosted thread)
- * and `org_<orgId>` (an org's BYOK key, and the org's own endpoints as the
- * scope's model providers: a custom endpoint, Bedrock's OpenAI models). Synced
- * lazily: before a runtime run, and when an org's AI provider settings change.
- * What was last synced is remembered in APP_KV by fingerprint, and in this
- * isolate once seen, so an unchanged scope costs nothing after its isolate's
- * first send.
+ * Org BYOK and self-host operator/gateway credentials, synced to runtime key scopes.
+ * Hosted agents use camelRun platform keys without a scope.
  */
+import { buildCloudflareGatewayUrl } from "../../../../src/lib/cloudflare-ai-gateway";
 import type { Model } from "@earendil-works/pi-ai";
 import { decryptCredentials } from "../../../../src/lib/integration-crypto";
 import {
@@ -17,7 +12,6 @@ import {
   parseStoredLlmProviderConfig,
   type LlmProviderStoredConfig,
 } from "../../../../src/lib/llm-provider-config";
-import { buildCloudflareGatewayUrl } from "../../../../src/lib/cloudflare-ai-gateway";
 import {
   getSelfhostAiProviderCredentials,
   getSelfhostAiProviderRecord,
@@ -39,6 +33,7 @@ import {
   type RuntimeApiEnv,
 } from "./runtime-api";
 
+/** Self-host gateway scope; also identifies legacy hosted agents and usage. */
 export const HOSTED_KEY_SCOPE = "hosted";
 
 export function orgKeyScope(orgId: string): string {
@@ -84,10 +79,9 @@ const OPENROUTER_ATTRIBUTION = {
 };
 
 /**
- * camelAI's hosted providers: OpenRouter through the AI Gateway, which holds
+ * Self-host's gateway provider: OpenRouter through AI Gateway, which holds
  * the provider keys and takes its own token as `cf-aig-authorization` (the
- * entry has no key). Null when the gateway is not configured (hosted threads
- * then have no runtime route).
+ * entry has no key). Null when the gateway is not configured.
  */
 export function hostedScopeProviders(env: KeyScopeEnv): Providers | null {
   const accountId = env.CF_ACCOUNT_ID?.trim();
@@ -454,7 +448,7 @@ export async function syncOrgKeyScope(
   await syncKeyScope(env, orgKeyScope(orgId), await orgScopeProviders(env, current), fetcher);
 }
 
-/** Sync the shared hosted scope; false when the gateway is not configured. */
+/** Sync self-host's shared gateway scope; false when the gateway is not configured. */
 export async function ensureHostedKeyScope(env: KeyScopeEnv, fetcher?: typeof globalThis.fetch): Promise<boolean> {
   const providers = hostedScopeProviders(env);
   if (!providers) return false;

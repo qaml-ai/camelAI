@@ -3,7 +3,7 @@
  * chiridion's runtime agents, delivered to /agent-runtime/events. Each becomes
  * a usage_log row of the org in the agent's `context`, as the acting user
  * (actor, else subject), idempotent by the event id. Billing follows the key
- * scope: `hosted` is camelAI's (credit-chargeable unless the org is enterprise
+ * scope: no scope (or legacy `hosted`) is camelAI's (credit-chargeable unless the org is enterprise
  * or it is the free tier's model), an org scope or the Codex forwarder is the
  * org's own (BYOK), its model providers (custom endpoint, Bedrock's OpenAI
  * models) included: their declared price is only the estimate the in-DO loop
@@ -51,7 +51,9 @@ function usageKindOf(kind: string | undefined): "llm" | "audio" | "image" | "unk
 
 /** The usage_log row an event becomes (the provider and model as chiridion names them). */
 export function usageRowFor(eventId: string, data: RuntimeUsageRecorded, org: { billing_status?: unknown } | null) {
-  const hosted = data.keyScope === HOSTED_KEY_SCOPE;
+  // Unscoped Codex uses the org subscription. Legacy hosted deliveries can arrive late.
+  const hosted = data.keyScope === HOSTED_KEY_SCOPE ||
+    (data.keyScope == null && data.provider !== RUNTIME_MODEL_ENDPOINT);
   let provider = text(data.provider);
   let model = text(data.model);
   // The Codex forwarder is a tenant endpoint: `chiridion/openai-codex/<model>`.

@@ -5,7 +5,7 @@ import { LLM_MODEL_OPTIONS } from "../../../src/lib/llm-provider-config";
 import { PiModelMapping } from "../src/pi-model-resolution";
 import { runtimeModelRoute } from "../src/agent-runtime/model-routes";
 import type { PiResolvedModelConfig } from "../src/chat-thread/pi-model-config";
-import { customEndpointRunsOnRuntime, hostedModelHeaders, hostedScopeProviders, orgScopeProviders, selfhostOperatorEndpointOrigin, syncKeyScope, syncOrgKeyScope, type KeyScopeEnv } from "../src/agent-runtime/key-scopes";
+import { customEndpointRunsOnRuntime, orgScopeProviders, selfhostOperatorEndpointOrigin, syncKeyScope, syncOrgKeyScope, type KeyScopeEnv } from "../src/agent-runtime/key-scopes";
 
 const SECRET = "test-integration-secret-key-for-key-scope-tests";
 
@@ -55,22 +55,6 @@ const record = async (provider: string, creds: Record<string, string>, config: R
 const LUNA = { contextWindow: 272_000, maxOutputTokens: 128_000, input: ["text", "image"], reasoning: true, pricing: { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 } };
 
 describe("key scope providers", () => {
-  it("builds the hosted scope from the AI Gateway config, or none without it", () => {
-    const { kv } = memoryKv();
-    expect(hostedScopeProviders(env(kv))).toBeNull();
-    expect(hostedScopeProviders(env(kv, { CF_ACCOUNT_ID: "acct", CF_GATEWAY_NAME: "gw", AI_GATEWAY_AUTH_TOKEN: "gw-token" }))).toEqual({
-      openrouter: {
-        baseUrl: "https://gateway.ai.cloudflare.com/v1/acct/gw/openrouter",
-        headers: expect.objectContaining({ "cf-aig-authorization": "Bearer gw-token", "HTTP-Referer": "https://camelai.dev" }),
-      },
-    });
-  });
-
-  it("gives hosted agents the thread's gateway metadata", () => {
-    const headers = hostedModelHeaders({ orgId: "o1", workspaceId: "w1", threadId: "t1" });
-    expect(JSON.parse(headers["cf-aig-metadata"])).toEqual({ uid: "o1:w1:t1", chiridion: { orgId: "o1", workspaceId: "w1", threadId: "t1" } });
-  });
-
   it("builds an org scope from its BYOK settings", async () => {
     const { kv } = memoryKv();
     expect(await orgScopeProviders(env(kv), await record("anthropic", { api_key: "sk-ant" }))).toEqual({ providers: { anthropic: { apiKey: "sk-ant" } } });

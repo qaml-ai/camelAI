@@ -19,6 +19,7 @@ import { parseUploadRefs } from "../../../../src/lib/chat-attachment-refs";
 import { buildWorkspaceScopedR2Key } from "../../../../src/lib/workspace-r2-paths";
 import { applyMentionContext } from "../mention-context";
 import { WorkspaceFilesystemClient } from "../workspace-filesystem-do";
+import { configureRuntimeAgent, RuntimeConfigurationFailedError } from "./configure-agent";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
 import { RuntimeApiError, runtimeApi, runtimeUrl } from "./runtime-api";
@@ -338,6 +339,7 @@ async function ensureConfiguredAgent(
   }
   const id = row.agentId;
   const modelChanged = row.model !== run.model;
+  // Also migrates legacy hosted agents in place: null clears their scope and gateway headers.
   const scopeChanged = (row.keyScope ?? null) !== run.keyScope;
   const { spendLimitUsd: agentLimit, spendLimitSetAt: _setAt, ...configured } = row.configured ?? {};
   // A limit an earlier release set on the agent itself (each run carries its own now).
@@ -346,13 +348,26 @@ async function ensureConfiguredAgent(
   const promptChanged = row.configured?.promptVersion !== RUNTIME_PROMPT_VERSION;
   if (!modelChanged && !scopeChanged && !limitLeft && !promptChanged) return id;
   if (await timed(timings, "activity", () => retriedRequest(env, id, requestId))) return id;
-  await timed(timings, "patch", () => runtimeApi(env, "PATCH", `/v1/agents/${encodeURIComponent(id)}/configuration`, {
-    requestId: `run_${crypto.randomUUID()}`,
-    ...(limitLeft ? { spendLimit: null } : {}),
-    ...(modelChanged ? { model: run.model, thinkingLevel: run.thinkingLevel } : {}),
-    ...(scopeChanged ? { keyScope: run.keyScope, modelHeaders: run.modelHeaders } : {}),
-    ...(promptChanged ? { systemPromptAppend: runtimeSystemPromptAppend(env, context) } : {}),
-  }));
+  const migratingToPlatform = scopeChanged && run.keyScope === null;
+  try {
+    const completed = await timed(timings, "patch", () => configureRuntimeAgent(env, id, {
+      requestId: `run_${crypto.randomUUID()}`,
+      ...(limitLeft ? { spendLimit: null } : {}),
+      ...(modelChanged ? { model: run.model, thinkingLevel: run.thinkingLevel } : {}),
+      ...(scopeChanged ? { keyScope: run.keyScope, modelHeaders: run.modelHeaders } : {}),
+      ...(promptChanged ? { systemPromptAppend: runtimeSystemPromptAppend(env, context) } : {}),
+    }, migratingToPlatform ? 3 : 0));
+    // A pending configure is accepted, but is not evidence the scope changed.
+    // Keep the legacy row so the next send retries the migration as a no-op.
+    if (migratingToPlatform && !completed) return id;
+  } catch (error) {
+    const rejected = error instanceof RuntimeConfigurationFailedError
+      || (error instanceof RuntimeApiError && error.status >= 400 && error.status < 500);
+    if (row.keyScope !== HOSTED_KEY_SCOPE || run.keyScope !== null
+      || ((modelChanged || promptChanged) && rejected)) throw error;
+    console.warn("[runtime-thread] platform migration not applied; retaining legacy configuration for retry", error);
+    return id;
+  }
   await org.setThreadRuntimeAgent(context.threadId, {
     agentId: id,
     model: run.model,

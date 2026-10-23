@@ -10,6 +10,8 @@ import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import type { ThreadRuntimeRecord } from "../identity/org-do.js";
 import { RuntimeApiError, runtimeApi } from "./runtime-api.js";
 import { runtimeSystemPromptAppend, type RuntimeAgentModel } from "./run-gates.js";
+import { isSelfhostRuntime } from "../../../../src/lib/selfhost-ai-provider";
+import { configureRuntimeAgent } from "./configure-agent";
 import { HOSTED_KEY_SCOPE, hostedModelHeaders } from "./key-scopes.js";
 import { RUNTIME_PROMPT_VERSION } from "./runtime-prompt.js";
 
@@ -44,7 +46,8 @@ export async function forkRuntimeThread(
     ): Promise<{ row: ThreadRuntimeRecord; claimed: boolean } | null>;
   };
   // The fork runs its source's model on its key scope, as the runtime copies
-  // them, recorded on its row; a hosted fork's model headers name its own thread.
+  // them, recorded on its row; a legacy hosted fork moves to platform keys.
+  const migrate = source.keyScope === HOSTED_KEY_SCOPE && !isSelfhostRuntime(env);
   const agentModel: RuntimeAgentModel | null = source.model
     ? {
       model: source.model,
@@ -57,6 +60,23 @@ export async function forkRuntimeThread(
   try {
     const thread = await org.getThread(target.threadId);
     agentId = await forkAgent(env, source.agentId, target, thread?.created_by?.trim() || target.userId || null, index, agentModel);
+    // camelRun's fork API inherits the source scope and cannot override it.
+    // Clear a legacy hosted scope before recording the fork as platform-backed.
+    if (migrate) {
+      try {
+        const completed = await configureRuntimeAgent(env, agentId, {
+          requestId: `fork_platform_${target.threadId}`,
+          keyScope: null,
+          modelHeaders: null,
+        }, 25);
+        if (completed && agentModel) {
+          agentModel.keyScope = null;
+          agentModel.modelHeaders = null;
+        }
+      } catch (error) {
+        console.warn("[runtime-thread] fork platform migration not applied; retaining legacy configuration for retry", error);
+      }
+    }
     const preview = (await org.getThreadUiState(source.threadId))?.preview;
     if (preview?.tabs?.length) {
       await org.setThreadUiState(target.threadId, { tabs: preview.tabs, activeTabId: preview.activeTabId ?? null });

@@ -1,9 +1,10 @@
 /**
  * How a thread's resolved model (chiridion's resolver: picker, BYOK, hosted
- * gateway, credit fallback) runs on the hosted agent runtime:
+ * credit fallback) runs on the hosted agent runtime:
  *
+ * - `platform`: hosted OpenRouter on camelRun's platform key, without a scope;
  * - `scope`: the runtime calls the provider itself, with a normal Pi model id
- *   and the keys of a key scope (`hosted`, or the org's `org_<id>`), and
+ *   and the keys of a key scope (the org's `org_<id>`), and
  *   reports usage back as `usage.recorded` webhook events (agent-runtime/usage.ts);
  * - `codex`: the org's ChatGPT subscription, which only chiridion can
  *   authenticate: `chiridion/openai-codex/<model>` through chiridion's
@@ -22,8 +23,8 @@ import type { PiResolvedModelConfig } from "../chat-thread/pi-model-config";
 import { codexRoute } from "./codex-forwarder";
 import {
   BEDROCK_OPENAI_BASE_URL,
-  CUSTOM_MODEL_PROVIDER,
   HOSTED_KEY_SCOPE,
+  CUSTOM_MODEL_PROVIDER,
   bedrockOpenAiModelProvider,
   customEndpointRunsOnRuntime,
   orgKeyScope,
@@ -32,6 +33,7 @@ import {
 
 export type RuntimeModelRoute =
   | { kind: "scope"; model: string; keyScope: string }
+  | { kind: "platform"; model: string }
   | { kind: "codex"; model: string };
 
 /** The tenant model endpoint in the runtime that is chiridion's Codex forwarder. */
@@ -39,7 +41,7 @@ export const RUNTIME_MODEL_ENDPOINT = "chiridion";
 
 /**
  * The free tier on the runtime: GPT-6 Luna on OpenRouter (Responses) with the
- * hosted keys. The in-DO loop keeps the gateway's dynamic route, which only
+ * platform keys. The in-DO loop keeps the gateway's dynamic route, which only
  * takes chat completions.
  */
 export const FREE_TIER_RUNTIME_MODEL = "openrouter/openai/gpt-6-luna";
@@ -94,6 +96,7 @@ export function runtimeModelRoute(
   context: {
     orgId: string;
     freeTier?: boolean;
+    selfhost?: boolean;
     /**
      * The origin of a self-host operator's own custom endpoint
      * (key-scopes.ts, selfhostOperatorEndpointOrigin), the one endpoint the
@@ -103,13 +106,20 @@ export function runtimeModelRoute(
   },
 ): RuntimeModelRoute | null {
   const { model } = config;
-  if (model.provider === "cloudflare-ai-gateway") {
+  if (context.selfhost && model.provider === "cloudflare-ai-gateway") {
     if (context.freeTier && config.usageProvider === "compat") {
       return { kind: "scope", model: FREE_TIER_RUNTIME_MODEL, keyScope: HOSTED_KEY_SCOPE };
     }
-    // The hosted scope holds OpenRouter through the gateway.
     if (config.usageProvider !== "openrouter") return null;
     return { kind: "scope", model: `openrouter/${model.id}`, keyScope: HOSTED_KEY_SCOPE };
+  }
+  if (!context.selfhost && config.billingSource === "hosted") {
+    if (context.freeTier && config.usageProvider === "compat") {
+      return { kind: "platform", model: FREE_TIER_RUNTIME_MODEL };
+    }
+    // camelRun resolves OpenRouter with its platform key; no gateway override.
+    if (config.usageProvider !== "openrouter") return null;
+    return { kind: "platform", model: `openrouter/${model.id}` };
   }
   if (config.billingSource !== "byok" || !config.apiKey) return null;
   const scope = orgKeyScope(context.orgId);

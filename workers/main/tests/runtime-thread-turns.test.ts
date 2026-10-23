@@ -196,7 +196,7 @@ describe("hosted platform OpenRouter", () => {
     expect(await setup.orgStub.getThreadRuntime(setup.threadId)).toMatchObject({ agentId: "agt_legacy", keyScope: null });
   });
 
-  it.each(["failed", "running", "http_error"])("retains and retries the legacy scope when configuration is %s", async (state) => {
+  it.each(["failed", "queued", "running", "http_error"])("retains and retries the legacy scope when configuration is %s", async (state) => {
     const setup = await hostedThread();
     await setup.orgStub.setThreadRuntimeAgent(setup.threadId, {
       agentId: "agt_legacy", model: "openrouter/anthropic/claude-sonnet-5.5:nitro", keyScope: "hosted",
@@ -216,12 +216,31 @@ describe("hosted platform OpenRouter", () => {
     });
     expect(await send(setup, "Continue", "cm_failed_migration")).toMatchObject({ status: "accepted" });
     expect((await setup.orgStub.getThreadRuntime(setup.threadId))!.keyScope).toBe("hosted");
-    expect(warn).toHaveBeenCalled();
-    expect(calls.some(call => call.path.endsWith("/requests/config_receipt?wait=25"))).toBe(true);
+    if (state === "failed" || state === "http_error") expect(warn).toHaveBeenCalled();
+    expect(calls.some(call => call.path.endsWith("/requests/config_receipt?wait=3"))).toBe(true);
     expect(await send(setup, "Retry", "cm_retry_migration")).toMatchObject({ status: "accepted" });
     expect((await setup.orgStub.getThreadRuntime(setup.threadId))!.keyScope).toBeNull();
     expect(calls.filter(call => call.method === "PATCH")).toHaveLength(2);
     expect(calls.filter(call => call.path.endsWith("/prompt"))).toHaveLength(2);
+  });
+
+  it.each(["model", "prompt"])("surfaces explicit rejection when migration also changes the %s", async (change) => {
+    for (const failure of ["failed", "http_400"]) {
+      const setup = await hostedThread();
+      await setup.orgStub.setThreadRuntimeAgent(setup.threadId, {
+        agentId: "agt_legacy", model: change === "model" ? "old-model" : "openrouter/anthropic/claude-sonnet-5.5:nitro", keyScope: "hosted",
+        configured: { promptVersion: change === "prompt" ? "old-version" : RUNTIME_PROMPT_VERSION, thinkingLevel: "medium" },
+      });
+      const calls = fakeRuntime({
+        "PATCH /v1/agents/agt_legacy/configuration": () => failure === "http_400"
+          ? Response.json({ error: "Invalid configuration" }, { status: 400 })
+          : Response.json({ requestId: "config_failed" }, { status: 202 }),
+        "GET /v1/agents/agt_legacy/requests/config_failed": () => Response.json({ state: "completed", status: "failed" }),
+      });
+      await expect(send(setup, "Continue", "cm_rejected")).rejects.toThrow(failure === "failed" ? "Runtime configuration failed" : "Invalid configuration");
+      expect((await setup.orgStub.getThreadRuntime(setup.threadId))!.keyScope).toBe("hosted");
+      expect(calls.some(call => call.path.endsWith("/prompt"))).toBe(false);
+    }
   });
 
 });
@@ -342,6 +361,45 @@ describe("startRuntimeTurn", () => {
     expect(configure.body).not.toHaveProperty("keyScope");
     const order = calls.map((call) => call.path);
     expect(order.indexOf("/v1/agents/agt_1/configuration")).toBeLessThan(order.indexOf("/v1/agents/agt_1/prompt"));
+  });
+
+  it.each(["queued", "running"])("sends a mid-turn model-change steer while configure is %s without waiting", async (state) => {
+    const setup = await runtimeThread();
+    fakeRuntime();
+    await send(setup, "first", "cm_first");
+    await setup.orgStub.updateThreadModel(setup.threadId, "opus");
+    const calls = fakeRuntime({
+      "PATCH /v1/agents/agt_1/configuration": () => Response.json({ requestId: "config_pending" }, { status: 202 }),
+      "GET /v1/agents/agt_1/requests/config_pending": (call) => {
+        // A long-poll here would stall behind the currently running turn.
+        expect(call.path).toBe("/v1/agents/agt_1/requests/config_pending?wait=0");
+        return Response.json({ state });
+      },
+      "POST /v1/agents/agt_1/prompt": (call) => {
+        expect(call.body.whileRunning).toBe("steer");
+        return Response.json({ id: call.body.requestId, state: "completed", steeredInto: "cm_first" }, { status: 202 });
+      },
+    });
+    expect(await send(setup, "change direction", "cm_steer")).toMatchObject({ status: "accepted" });
+    expect(calls.some(call => call.path.endsWith("/prompt"))).toBe(true);
+    expect((await setup.orgStub.getThreadRuntime(setup.threadId))!.model).toMatch(/opus/);
+  });
+
+  it.each(["failed", "http_400"])("surfaces an explicit %s model-change rejection", async (failure) => {
+    const setup = await runtimeThread();
+    fakeRuntime();
+    await send(setup, "first", "cm_first");
+    const previous = (await setup.orgStub.getThreadRuntime(setup.threadId))!;
+    await setup.orgStub.updateThreadModel(setup.threadId, "opus");
+    const calls = fakeRuntime({
+      "PATCH /v1/agents/agt_1/configuration": () => failure === "http_400"
+        ? Response.json({ error: "Invalid model" }, { status: 400 })
+        : Response.json({ requestId: "config_failed" }, { status: 202 }),
+      "GET /v1/agents/agt_1/requests/config_failed": () => Response.json({ state: "completed", status: "failed" }),
+    });
+    await expect(send(setup, "change model", "cm_rejected")).rejects.toThrow(failure === "failed" ? "Runtime configuration failed" : "Invalid model");
+    expect(calls.some(call => call.path.endsWith("/prompt"))).toBe(false);
+    expect((await setup.orgStub.getThreadRuntime(setup.threadId))!.model).toBe(previous.model);
   });
 
   it("rides out a connection lost under the agent's configuration once, and nothing else", async () => {

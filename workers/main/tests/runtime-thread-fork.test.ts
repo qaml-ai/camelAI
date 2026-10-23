@@ -89,7 +89,7 @@ describe("forkRuntimeThread", () => {
     expect(runtimeApiMock).toHaveBeenCalledWith(env, "GET", "/v1/agents/agt_fork/requests/configure_receipt?wait=25");
     expect(org.claimThreadRuntimeAgent).toHaveBeenCalledWith("fork1", "agt_fork", expect.objectContaining({ keyScope: "hosted" }));
     expect(runtimeApiMock.mock.calls.some(call => call[1] === "DELETE")).toBe(false);
-    expect(warn).toHaveBeenCalled();
+    if (state !== "running") expect(warn).toHaveBeenCalled();
     warn.mockRestore();
   });
 

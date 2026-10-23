@@ -64,12 +64,12 @@ export async function forkRuntimeThread(
     // Clear a legacy hosted scope before recording the fork as platform-backed.
     if (migrate) {
       try {
-        await configureRuntimeAgent(env, agentId, {
+        const completed = await configureRuntimeAgent(env, agentId, {
           requestId: `fork_platform_${target.threadId}`,
           keyScope: null,
           modelHeaders: null,
-        });
-        if (agentModel) {
+        }, 25);
+        if (completed && agentModel) {
           agentModel.keyScope = null;
           agentModel.modelHeaders = null;
         }

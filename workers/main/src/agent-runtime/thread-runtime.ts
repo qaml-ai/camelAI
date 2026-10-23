@@ -19,7 +19,7 @@ import { parseUploadRefs } from "../../../../src/lib/chat-attachment-refs";
 import { buildWorkspaceScopedR2Key } from "../../../../src/lib/workspace-r2-paths";
 import { applyMentionContext } from "../mention-context";
 import { WorkspaceFilesystemClient } from "../workspace-filesystem-do";
-import { configureRuntimeAgent } from "./configure-agent";
+import { configureRuntimeAgent, RuntimeConfigurationFailedError } from "./configure-agent";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
 import { RuntimeApiError, runtimeApi, runtimeUrl } from "./runtime-api";
@@ -348,16 +348,23 @@ async function ensureConfiguredAgent(
   const promptChanged = row.configured?.promptVersion !== RUNTIME_PROMPT_VERSION;
   if (!modelChanged && !scopeChanged && !limitLeft && !promptChanged) return id;
   if (await timed(timings, "activity", () => retriedRequest(env, id, requestId))) return id;
+  const migratingToPlatform = scopeChanged && run.keyScope === null;
   try {
-    await timed(timings, "patch", () => configureRuntimeAgent(env, id, {
+    const completed = await timed(timings, "patch", () => configureRuntimeAgent(env, id, {
       requestId: `run_${crypto.randomUUID()}`,
       ...(limitLeft ? { spendLimit: null } : {}),
       ...(modelChanged ? { model: run.model, thinkingLevel: run.thinkingLevel } : {}),
       ...(scopeChanged ? { keyScope: run.keyScope, modelHeaders: run.modelHeaders } : {}),
       ...(promptChanged ? { systemPromptAppend: runtimeSystemPromptAppend(env, context) } : {}),
-    }));
+    }, migratingToPlatform ? 3 : 0));
+    // A pending configure is accepted, but is not evidence the scope changed.
+    // Keep the legacy row so the next send retries the migration as a no-op.
+    if (migratingToPlatform && !completed) return id;
   } catch (error) {
-    if (row.keyScope !== HOSTED_KEY_SCOPE || run.keyScope !== null) throw error;
+    const rejected = error instanceof RuntimeConfigurationFailedError
+      || (error instanceof RuntimeApiError && error.status >= 400 && error.status < 500);
+    if (row.keyScope !== HOSTED_KEY_SCOPE || run.keyScope !== null
+      || ((modelChanged || promptChanged) && rejected)) throw error;
     console.warn("[runtime-thread] platform migration not applied; retaining legacy configuration for retry", error);
     return id;
   }

@@ -93,6 +93,13 @@ describe("usageRowFor", () => {
     });
   });
 
+  it.each([null, undefined, "hosted"])("charges hosted OpenRouter usage with scope %s", (keyScope) => {
+    expect(usageRowFor("evt", { ...data, keyScope }, { billing_status: "active" }))
+      .toMatchObject({ billing_source: "hosted", credit_chargeable: true });
+    expect(usageRowFor("evt", { ...data, keyScope, model: "openai/gpt-6-luna" }, null).credit_chargeable).toBe(false);
+    expect(usageRowFor("evt", { ...data, keyScope }, { billing_status: "enterprise" }).credit_chargeable).toBe(false);
+  });
+
   it("does not charge credits for the free tier, enterprise orgs, BYOK or Codex", () => {
     const row = (overrides: Partial<RuntimeUsageRecorded>, org: { billing_status?: unknown } | null = null) =>
       usageRowFor("evt", { ...data, ...overrides }, org);

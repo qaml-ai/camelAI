@@ -22,6 +22,7 @@ import {
   threadScratchVolume,
   startRuntimeTurn,
 } from "../src/agent-runtime/thread-runtime";
+import { resolveThreadRuntimeRoute } from "../src/agent-runtime/run-gates";
 import { createOrg, createUser, type TestEnv } from "./test-helpers";
 
 const testEnv = env as unknown as TestEnv;
@@ -112,6 +113,60 @@ async function send(setup: Awaited<ReturnType<typeof runtimeThread>>, text: stri
   await Promise.allSettled(pending);
   return result;
 }
+
+describe("hosted platform OpenRouter", () => {
+  async function hostedThread() {
+    const setup = await runtimeThread();
+    await setup.orgStub.deleteLlmProviderConfig();
+    await setup.orgStub.updateBillingState({ billing_status: "enterprise" });
+    await setup.orgStub.updateThreadModel(setup.threadId, "sonnet", setup.sender.userId);
+    return setup;
+  }
+
+  it("creates a hosted agent with no gateway configuration, scope or headers", async () => {
+    const setup = await hostedThread();
+    const noGateway = { ...runtimeEnv, CF_ACCOUNT_ID: "", CF_GATEWAY_NAME: "", AI_GATEWAY_AUTH_TOKEN: "", CF_GATEWAY_TOKEN: "" } as ChatEnv;
+    const calls = fakeRuntime();
+    const resolved = await resolveThreadRuntimeRoute(noGateway, setup.context);
+    expect(resolved.route).toEqual({ kind: "platform", model: "openrouter/anthropic/claude-sonnet-5.5:nitro" });
+    expect(resolved.config.model.baseUrl).toBe("https://openrouter.ai/api/v1");
+    expect(resolved.config.headers).toBeUndefined();
+    expect(JSON.stringify(resolved.config.model.headers)).not.toMatch(/cf-aig/);
+    expect(await prewarmThreadAgent(noGateway, setup.context, setup.sender.userId)).toBe("agt_1");
+    const create = calls.find(call => call.path === "/v1/agents")!;
+    expect(create.body).not.toHaveProperty("keyScope");
+    expect(create.body).not.toHaveProperty("modelHeaders");
+    expect(create.body).not.toHaveProperty("baseUrl");
+    expect(JSON.stringify(create.body)).not.toMatch(/cf-aig|gateway\.ai/);
+    expect(calls.some(call => call.path.includes("key-scopes"))).toBe(false);
+  });
+
+  it("keeps a self-host operator's provider on its org scope", async () => {
+    const setup = await runtimeThread();
+    const local = { ...runtimeEnv, CF_ACCOUNT_ID: "selfhost", CF_DISPATCH_NAMESPACE: "selfhost",
+      SELFHOST_AI_PROVIDER: "openrouter", SELFHOST_AI_API_KEY: "operator-key" } as ChatEnv;
+    const resolved = await resolveThreadRuntimeRoute(local, setup.context);
+    expect(resolved.route).toMatchObject({ kind: "scope", keyScope: `org_${setup.context.orgId}` });
+    expect(resolved.config).toMatchObject({ billingSource: "byok", apiKey: "operator-key" });
+    expect(resolved.config.model.baseUrl).toBe("https://openrouter.ai/api");
+  });
+
+  it("patches a legacy hosted agent in place before the next prompt", async () => {
+    const setup = await hostedThread();
+    const model = "openrouter/anthropic/claude-sonnet-5.5:nitro";
+    await setup.orgStub.setThreadRuntimeAgent(setup.threadId, {
+      agentId: "agt_legacy", model, keyScope: "hosted",
+      configured: { promptVersion: RUNTIME_PROMPT_VERSION, thinkingLevel: "medium" },
+    });
+    const calls = fakeRuntime();
+    expect(await send(setup, "Continue", "cm_migrate_platform")).toMatchObject({ status: "accepted", agentId: "agt_legacy" });
+    const patch = calls.find(call => call.path === "/v1/agents/agt_legacy/configuration")!;
+    expect(patch.body).toMatchObject({ keyScope: null, modelHeaders: null });
+    expect(calls.some(call => call.path === "/v1/agents")).toBe(false);
+    expect(calls.indexOf(patch)).toBeLessThan(calls.findIndex(call => call.path.endsWith("/prompt")));
+    expect(await setup.orgStub.getThreadRuntime(setup.threadId)).toMatchObject({ agentId: "agt_legacy", keyScope: null });
+  });
+});
 
 describe("prewarmThreadAgent", () => {
   it("makes a new thread's agent ahead of its first send, which then only prompts it", async () => {

@@ -37,7 +37,7 @@ import { createPiSystemPrompt } from "../pi-system-prompt";
 import { resolveAgentSkillCatalog } from "../selfhost-agent-pack";
 import { RUNTIME_PROMPT_PREAMBLE, type RuntimeRunConfig } from "./runtime-prompt";
 import { FREE_TIER_RUNTIME_MODEL, runtimeModelRoute, type RuntimeModelRoute } from "./model-routes";
-import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, selfhostOperatorEndpointOrigin, syncOrgKeyScope } from "./key-scopes";
+import { selfhostOperatorEndpointOrigin, syncOrgKeyScope } from "./key-scopes";
 
 type OrgInfoLike = {
   billing_status?: string | null;
@@ -155,6 +155,7 @@ export async function resolveThreadRuntimeRoute(
       resolveRequestConfig: (resolved, ctx, requestedModelId) => resolvePiRequestConfig(
         {
           env,
+          hostedRuntime: true,
           modelMapping,
           getChatMetadata: () => context,
           resolveByokCredentials: (byokContext, options) =>
@@ -297,20 +298,18 @@ export interface RuntimeAgentModel {
   thinkingLevel: "medium" | "high";
 }
 
-export function runtimeAgentModel(context: ChatContextState, route: RuntimeModelRoute, threadModel: LlmModel): RuntimeAgentModel {
+export function runtimeAgentModel(_context: ChatContextState, route: RuntimeModelRoute, threadModel: LlmModel): RuntimeAgentModel {
   return {
     model: route.model,
     keyScope: route.kind === "scope" ? route.keyScope : null,
-    modelHeaders: route.kind === "scope" && route.keyScope === HOSTED_KEY_SCOPE ? hostedModelHeaders(context) : null,
+    modelHeaders: null,
     thinkingLevel: primaryPiThinkingLevel(threadModel),
   };
 }
 
 /**
  * The runtime's copy of the key scope the thread's route runs under, brought
- * up to date (the hosted scope, or the org's BYOK one); a run or agent create
- * under a scope the runtime lacks is refused. Throws RuntimeRunRefused when
- * hosted models are not configured.
+ * up to date for BYOK and self-host providers. Hosted platform routes need no scope.
  */
 export async function syncRouteKeyScope(
   env: ChatEnv,
@@ -318,11 +317,7 @@ export async function syncRouteKeyScope(
   { route, llmProviderRecord }: Pick<ThreadRuntimeRoute, "route" | "llmProviderRecord">,
 ): Promise<void> {
   if (route?.kind !== "scope") return;
-  if (route.keyScope === HOSTED_KEY_SCOPE) {
-    if (!await ensureHostedKeyScope(env)) throw new RuntimeRunRefused("Hosted models are not configured for the agent runtime.", "not_configured");
-  } else {
-    await syncOrgKeyScope(env, context.orgId, llmProviderRecord);
-  }
+  await syncOrgKeyScope(env, context.orgId, llmProviderRecord);
 }
 
 /**

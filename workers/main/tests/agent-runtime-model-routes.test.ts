@@ -23,11 +23,11 @@ const GATEWAY = "https://gateway.ai.cloudflare.com/v1/acct/gw";
 const org = { orgId: "org1" };
 
 describe("runtimeModelRoute", () => {
-  it("runs hosted models with the hosted key scope and their OpenRouter id", () => {
+  it("runs hosted models with platform keys and their OpenRouter id", () => {
     expect(runtimeModelRoute(config({
       billingSource: "hosted", usageProvider: "openrouter",
       model: { provider: "cloudflare-ai-gateway", id: "anthropic/claude-sonnet-5.5:nitro", baseUrl: `${GATEWAY}/openrouter` },
-    }), org)).toEqual({ kind: "scope", model: "openrouter/anthropic/claude-sonnet-5.5:nitro", keyScope: "hosted" });
+    }), org)).toEqual({ kind: "platform", model: "openrouter/anthropic/claude-sonnet-5.5:nitro" });
   });
 
   it.each([
@@ -49,12 +49,12 @@ describe("runtimeModelRoute", () => {
     expect(runtimeModelRoute(config({
       billingSource: "hosted", usageProvider: "openrouter",
       model: { provider: "cloudflare-ai-gateway", id: hostedModelId, baseUrl: `${GATEWAY}/openrouter` },
-    }), org)).toEqual({ kind: "scope", model: runtimeModel, keyScope: "hosted" });
+    }), org)).toEqual({ kind: "platform", model: runtimeModel });
   });
 
   it("runs the free tier as GPT-6 Luna, and no other dynamic route", () => {
     const free = config({ billingSource: "hosted", usageProvider: "compat", model: { provider: "cloudflare-ai-gateway", id: "dynamic/luna-muse-fallback", baseUrl: `${GATEWAY}/compat` } });
-    expect(runtimeModelRoute(free, { ...org, freeTier: true })).toEqual({ kind: "scope", model: "openrouter/openai/gpt-6-luna", keyScope: "hosted" });
+    expect(runtimeModelRoute(free, { ...org, freeTier: true })).toEqual({ kind: "platform", model: "openrouter/openai/gpt-6-luna" });
     expect(runtimeModelRoute(free, org)).toBeNull();
   });
 

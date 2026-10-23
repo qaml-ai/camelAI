@@ -338,6 +338,7 @@ async function ensureConfiguredAgent(
   }
   const id = row.agentId;
   const modelChanged = row.model !== run.model;
+  // Also migrates legacy hosted agents in place: null clears their scope and gateway headers.
   const scopeChanged = (row.keyScope ?? null) !== run.keyScope;
   const { spendLimitUsd: agentLimit, spendLimitSetAt: _setAt, ...configured } = row.configured ?? {};
   // A limit an earlier release set on the agent itself (each run carries its own now).

@@ -134,6 +134,8 @@ export class HostedModelSubscriptionUnavailableError extends HostedModelFallback
 }
 
 export interface ResolvePiRequestConfigDeps {
+  /** Hosted runtime selects its platform key; the in-DO path still uses the gateway. */
+  hostedRuntime?: boolean;
   env: ChatEnv;
   modelMapping: PiModelMapping;
   /** Platform-sponsored capability agents must use the hosted route, never user credentials. */
@@ -462,6 +464,18 @@ export async function resolvePiRequestConfig(
     requestedModelId,
   );
   const creditChargeable = hostedAccess.creditChargeable;
+  if (deps.hostedRuntime && !isSelfhostRuntime(deps.env)) {
+    return {
+      apiKey: "",
+      billingSource: "hosted",
+      creditChargeable,
+      requestProvider: "openrouter",
+      requestModelId: resolved.hostedModelId,
+      usageProvider: resolved.hostedGatewayProvider,
+      baseUrl: "https://openrouter.ai/api/v1",
+    };
+  }
+
   // E2E replay routes hosted calls to a local stub that ignores account/
   // gateway/auth, so stand in dummy values to clear this gateway-config check
   // (the real origin is swapped in resolveCloudflareGatewayOrigin). Lets the

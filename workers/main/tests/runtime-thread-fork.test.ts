@@ -15,7 +15,6 @@ vi.mock("../src/agent-runtime/runtime-api.js", async (importOriginal) => ({
 import { forkRuntimeThread } from "../src/agent-runtime/thread-fork";
 import { RuntimeApiError } from "../src/agent-runtime/runtime-api";
 import type { ChatEnv } from "../src/chat-thread/types";
-import { hostedModelHeaders } from "../src/agent-runtime/key-scopes";
 import { RUNTIME_PROMPT_VERSION } from "../src/agent-runtime/runtime-prompt";
 
 const SOURCE = { threadId: "src", agentId: "agt_src", model: "anthropic/claude-sonnet-5-5", keyScope: "org_org1", configured: null, createdAt: 1, updatedAt: 1 };
@@ -64,9 +63,14 @@ describe("forkRuntimeThread", () => {
     });
   });
 
-  it("gives a fork of a hosted thread the hosted model headers for its own thread", async () => {
-    await forkRuntimeThread(fakeEnv().env, { source: { ...SOURCE, keyScope: "hosted", configured: { thinkingLevel: "high" } }, target, forkEntryId: "rt:3" });
-    expect(forkCall()[3]).toMatchObject({ modelHeaders: hostedModelHeaders(target) });
+  it("clears the inherited legacy hosted scope and headers on a fork", async () => {
+    const { env, org } = fakeEnv();
+    await forkRuntimeThread(env, { source: { ...SOURCE, keyScope: "hosted", configured: { thinkingLevel: "high" } }, target, forkEntryId: "rt:3" });
+    expect(forkCall()[3]).toMatchObject({ modelHeaders: null });
+    expect(runtimeApiMock).toHaveBeenCalledWith(env, "PATCH", "/v1/agents/agt_fork/configuration", {
+      requestId: "fork_platform_fork1", keyScope: null, modelHeaders: null,
+    });
+    expect(org.claimThreadRuntimeAgent).toHaveBeenCalledWith("fork1", "agt_fork", expect.objectContaining({ keyScope: null }));
   });
 
   it("answers not found for a fork point the history lacks", async () => {

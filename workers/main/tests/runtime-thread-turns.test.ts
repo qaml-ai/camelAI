@@ -65,6 +65,7 @@ function fakeRuntime(responses: Record<string, (call: Call) => Response | Promis
       const [requestId, name] = url.pathname.split("/uploads/")[1].split("/").map(decodeURIComponent);
       return Response.json({ path: `/workspace/uploads/${requestId}/${name}`, version: 1, size: raw?.length ?? 0, updatedAt: 1, contentType: headers.get("content-type") ?? "" }, { status: 201 });
     }
+    if (call.method === "GET" && url.searchParams.has("wait")) return Response.json({ state: "completed", status: "completed", outcome: { result: {} } });
     // An idle agent that has never seen the request.
     if (call.method === "GET" && url.pathname.endsWith("/state")) return Response.json({ cursor: 1, requests: [] });
     if (call.method === "GET" && url.pathname.includes("/requests/")) return Response.json({ error: "Unknown request" }, { status: 404 });
@@ -141,6 +142,34 @@ describe("hosted platform OpenRouter", () => {
     expect(calls.some(call => call.path.includes("key-scopes"))).toBe(false);
   });
 
+  it("admits the free tier with a per-user LLM limit using priced Luna", async () => {
+    const setup = await hostedThread();
+    await setup.orgStub.updateThreadModel(setup.threadId, "camel-code", setup.sender.userId);
+    await setup.orgStub.setUserLlmUsageLimits(setup.sender.userId, [{ window_hours: 24, limit_usd: 5 }]);
+    const calls = fakeRuntime({ "POST /v1/agents": () => Response.json({ id: "agt_free_limit" }, { status: 201 }) });
+    expect(await send(setup, "Hello", "cm_free_limit")).toMatchObject({ status: "accepted" });
+    expect(calls.find(call => call.path === "/v1/agents")!.body.model).toBe("openrouter/openai/gpt-6-luna");
+    expect(calls.find(call => call.path.endsWith("/prompt"))!.body.spendLimit).toEqual({ usd: 5 });
+  });
+
+  it("keeps gateway-only self-host installs on the hosted gateway scope", async () => {
+    const setup = await hostedThread();
+    const local = { ...runtimeEnv, CF_DISPATCH_NAMESPACE: "selfhost", CF_ACCOUNT_ID: "acct",
+      CF_GATEWAY_NAME: "gw", AI_GATEWAY_AUTH_TOKEN: "gateway-token",
+      SELFHOST_AI_PROVIDER: "", SELFHOST_AI_API_KEY: "" } as ChatEnv;
+    const calls = fakeRuntime({ "POST /v1/agents": () => Response.json({ id: "agt_selfhost_gateway" }, { status: 201 }) });
+    expect((await resolveThreadRuntimeRoute(local, setup.context)).route).toEqual({
+      kind: "scope", keyScope: "hosted", model: "openrouter/anthropic/claude-sonnet-5.5:nitro",
+    });
+    expect(await prewarmThreadAgent(local, setup.context, setup.sender.userId)).toBe("agt_selfhost_gateway");
+    const provider = calls.find(call => call.path === "/v1/key-scopes/hosted/providers/openrouter")!;
+    expect(provider.body.baseUrl).toBe("https://gateway.ai.cloudflare.com/v1/acct/gw/openrouter");
+    expect(provider.body.headers["cf-aig-authorization"]).toBe("Bearer gateway-token");
+    expect(calls.find(call => call.path === "/v1/agents")!.body).toMatchObject({
+      keyScope: "hosted", modelHeaders: { "cf-aig-metadata": expect.any(String) },
+    });
+  });
+
   it("keeps a self-host operator's provider on its org scope", async () => {
     const setup = await runtimeThread();
     const local = { ...runtimeEnv, CF_ACCOUNT_ID: "selfhost", CF_DISPATCH_NAMESPACE: "selfhost",
@@ -166,6 +195,35 @@ describe("hosted platform OpenRouter", () => {
     expect(calls.indexOf(patch)).toBeLessThan(calls.findIndex(call => call.path.endsWith("/prompt")));
     expect(await setup.orgStub.getThreadRuntime(setup.threadId)).toMatchObject({ agentId: "agt_legacy", keyScope: null });
   });
+
+  it.each(["failed", "running", "http_error"])("retains and retries the legacy scope when configuration is %s", async (state) => {
+    const setup = await hostedThread();
+    await setup.orgStub.setThreadRuntimeAgent(setup.threadId, {
+      agentId: "agt_legacy", model: "openrouter/anthropic/claude-sonnet-5.5:nitro", keyScope: "hosted",
+      configured: { promptVersion: RUNTIME_PROMPT_VERSION, thinkingLevel: "medium" },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let waits = 0;
+    const calls = fakeRuntime({
+      "GET /v1/agents/agt_legacy/requests/config_receipt": async () => {
+        expect((await setup.orgStub.getThreadRuntime(setup.threadId))!.keyScope).toBe("hosted");
+        waits++;
+        if (waits > 1) return Response.json({ state: "completed", status: "completed" });
+        return state === "http_error" ? Response.json({ error: "unavailable" }, { status: 500 })
+          : Response.json(state === "failed" ? { state: "completed", status: "failed", outcome: { error: "No provider key" } } : { state });
+      },
+      "PATCH /v1/agents/agt_legacy/configuration": () => Response.json({ requestId: "config_receipt" }, { status: 202 }),
+    });
+    expect(await send(setup, "Continue", "cm_failed_migration")).toMatchObject({ status: "accepted" });
+    expect((await setup.orgStub.getThreadRuntime(setup.threadId))!.keyScope).toBe("hosted");
+    expect(warn).toHaveBeenCalled();
+    expect(calls.some(call => call.path.endsWith("/requests/config_receipt?wait=25"))).toBe(true);
+    expect(await send(setup, "Retry", "cm_retry_migration")).toMatchObject({ status: "accepted" });
+    expect((await setup.orgStub.getThreadRuntime(setup.threadId))!.keyScope).toBeNull();
+    expect(calls.filter(call => call.method === "PATCH")).toHaveLength(2);
+    expect(calls.filter(call => call.path.endsWith("/prompt"))).toHaveLength(2);
+  });
+
 });
 
 describe("prewarmThreadAgent", () => {

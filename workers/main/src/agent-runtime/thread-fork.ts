@@ -10,7 +10,9 @@ import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import type { ThreadRuntimeRecord } from "../identity/org-do.js";
 import { RuntimeApiError, runtimeApi } from "./runtime-api.js";
 import { runtimeSystemPromptAppend, type RuntimeAgentModel } from "./run-gates.js";
-import { HOSTED_KEY_SCOPE } from "./key-scopes.js";
+import { isSelfhostRuntime } from "../../../../src/lib/selfhost-ai-provider";
+import { configureRuntimeAgent } from "./configure-agent";
+import { HOSTED_KEY_SCOPE, hostedModelHeaders } from "./key-scopes.js";
 import { RUNTIME_PROMPT_VERSION } from "./runtime-prompt.js";
 
 export type RuntimeForkResult =
@@ -45,11 +47,12 @@ export async function forkRuntimeThread(
   };
   // The fork runs its source's model on its key scope, as the runtime copies
   // them, recorded on its row; a legacy hosted fork moves to platform keys.
+  const migrate = source.keyScope === HOSTED_KEY_SCOPE && !isSelfhostRuntime(env);
   const agentModel: RuntimeAgentModel | null = source.model
     ? {
       model: source.model,
-      keyScope: source.keyScope === HOSTED_KEY_SCOPE ? null : source.keyScope ?? null,
-      modelHeaders: null,
+      keyScope: source.keyScope ?? null,
+      modelHeaders: source.keyScope === HOSTED_KEY_SCOPE ? hostedModelHeaders(target) : null,
       thinkingLevel: source.configured?.thinkingLevel === "high" ? "high" : "medium",
     }
     : null;
@@ -59,12 +62,20 @@ export async function forkRuntimeThread(
     agentId = await forkAgent(env, source.agentId, target, thread?.created_by?.trim() || target.userId || null, index, agentModel);
     // camelRun's fork API inherits the source scope and cannot override it.
     // Clear a legacy hosted scope before recording the fork as platform-backed.
-    if (source.keyScope === HOSTED_KEY_SCOPE) {
-      await runtimeApi(env, "PATCH", `/v1/agents/${encodeURIComponent(agentId)}/configuration`, {
-        requestId: `fork_platform_${target.threadId}`,
-        keyScope: null,
-        modelHeaders: null,
-      });
+    if (migrate) {
+      try {
+        await configureRuntimeAgent(env, agentId, {
+          requestId: `fork_platform_${target.threadId}`,
+          keyScope: null,
+          modelHeaders: null,
+        });
+        if (agentModel) {
+          agentModel.keyScope = null;
+          agentModel.modelHeaders = null;
+        }
+      } catch (error) {
+        console.warn("[runtime-thread] fork platform migration not applied; retaining legacy configuration for retry", error);
+      }
     }
     const preview = (await org.getThreadUiState(source.threadId))?.preview;
     if (preview?.tabs?.length) {

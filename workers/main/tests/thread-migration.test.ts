@@ -529,7 +529,7 @@ describe("a person retrying a move", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     directEnabledMock.mockReturnValue(true);
-    routeMock.mockResolvedValue({ route: { kind: "scope", model: "openrouter/x", keyScope: "hosted" }, threadModel: "x", llmProviderRecord: null });
+    routeMock.mockResolvedValue({ route: { kind: "platform", model: "openrouter/x" }, threadModel: "x", llmProviderRecord: null });
   });
 
   it("ends a transient backoff and moves the thread at once", async () => {
@@ -567,7 +567,7 @@ describe("moveThreadForSend", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     directEnabledMock.mockReturnValue(true);
-    routeMock.mockResolvedValue({ route: { kind: "scope", model: "openrouter/x", keyScope: "hosted" }, threadModel: "x", llmProviderRecord: null });
+    routeMock.mockResolvedValue({ route: { kind: "platform", model: "openrouter/x" }, threadModel: "x", llmProviderRecord: null });
   });
 
   it("says a thread that can never move is read-only, so its sender re-homes it", async () => {

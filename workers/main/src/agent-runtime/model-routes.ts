@@ -23,6 +23,7 @@ import type { PiResolvedModelConfig } from "../chat-thread/pi-model-config";
 import { codexRoute } from "./codex-forwarder";
 import {
   BEDROCK_OPENAI_BASE_URL,
+  HOSTED_KEY_SCOPE,
   CUSTOM_MODEL_PROVIDER,
   bedrockOpenAiModelProvider,
   customEndpointRunsOnRuntime,
@@ -95,6 +96,7 @@ export function runtimeModelRoute(
   context: {
     orgId: string;
     freeTier?: boolean;
+    selfhost?: boolean;
     /**
      * The origin of a self-host operator's own custom endpoint
      * (key-scopes.ts, selfhostOperatorEndpointOrigin), the one endpoint the
@@ -104,7 +106,14 @@ export function runtimeModelRoute(
   },
 ): RuntimeModelRoute | null {
   const { model } = config;
-  if (config.billingSource === "hosted") {
+  if (context.selfhost && model.provider === "cloudflare-ai-gateway") {
+    if (context.freeTier && config.usageProvider === "compat") {
+      return { kind: "scope", model: FREE_TIER_RUNTIME_MODEL, keyScope: HOSTED_KEY_SCOPE };
+    }
+    if (config.usageProvider !== "openrouter") return null;
+    return { kind: "scope", model: `openrouter/${model.id}`, keyScope: HOSTED_KEY_SCOPE };
+  }
+  if (!context.selfhost && config.billingSource === "hosted") {
     if (context.freeTier && config.usageProvider === "compat") {
       return { kind: "platform", model: FREE_TIER_RUNTIME_MODEL };
     }

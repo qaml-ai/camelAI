@@ -58,6 +58,18 @@ describe("runtimeModelRoute", () => {
     expect(runtimeModelRoute(free, org)).toBeNull();
   });
 
+  it("keeps self-host paid and free models on the gateway scope", () => {
+    const selfhost = { ...org, selfhost: true };
+    expect(runtimeModelRoute(config({
+      billingSource: "hosted", usageProvider: "openrouter",
+      model: { provider: "cloudflare-ai-gateway", id: "anthropic/claude-sonnet-5.5:nitro", baseUrl: `${GATEWAY}/openrouter` },
+    }), selfhost)).toEqual({ kind: "scope", model: "openrouter/anthropic/claude-sonnet-5.5:nitro", keyScope: "hosted" });
+    expect(runtimeModelRoute(config({
+      billingSource: "hosted", usageProvider: "compat",
+      model: { provider: "cloudflare-ai-gateway", id: "dynamic/luna-muse-fallback", baseUrl: `${GATEWAY}/compat` },
+    }), { ...selfhost, freeTier: true })).toEqual({ kind: "scope", model: "openrouter/openai/gpt-6-luna", keyScope: "hosted" });
+  });
+
   it("runs BYOK models with the org's key scope", () => {
     const scope = "org_org1";
     expect(runtimeModelRoute(config({ usageProvider: "anthropic", model: { provider: "anthropic", id: "claude-opus-5-5", baseUrl: "https://api.anthropic.com" } }), org))

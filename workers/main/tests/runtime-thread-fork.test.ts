@@ -40,6 +40,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   runtimeApiMock.mockImplementation(async (_env: unknown, method: string, path: string) => {
     if (method === "POST" && path === "/v1/agents/agt_src/fork") return { id: "agt_fork", forkedFrom: { agentId: "agt_src", atMessage: 3 } };
+    if (method === "PATCH") return { requestId: "configure_receipt" };
+    if (method === "GET") return { state: "completed", status: "completed" };
     return {};
   });
 });
@@ -66,11 +68,37 @@ describe("forkRuntimeThread", () => {
   it("clears the inherited legacy hosted scope and headers on a fork", async () => {
     const { env, org } = fakeEnv();
     await forkRuntimeThread(env, { source: { ...SOURCE, keyScope: "hosted", configured: { thinkingLevel: "high" } }, target, forkEntryId: "rt:3" });
-    expect(forkCall()[3]).toMatchObject({ modelHeaders: null });
+    expect(forkCall()[3]).toMatchObject({ modelHeaders: { "cf-aig-metadata": expect.any(String) } });
     expect(runtimeApiMock).toHaveBeenCalledWith(env, "PATCH", "/v1/agents/agt_fork/configuration", {
       requestId: "fork_platform_fork1", keyScope: null, modelHeaders: null,
     });
+    expect(runtimeApiMock).toHaveBeenCalledWith(env, "GET", "/v1/agents/agt_fork/requests/configure_receipt?wait=25");
     expect(org.claimThreadRuntimeAgent).toHaveBeenCalledWith("fork1", "agt_fork", expect.objectContaining({ keyScope: null }));
+  });
+
+  it.each(["failed", "running", "http_error"])("keeps a fork legacy when migration is %s", async (state) => {
+    const { env, org } = fakeEnv();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    runtimeApiMock.mockImplementation(async (_env: unknown, method: string) => {
+      if (method === "POST") return { id: "agt_fork" };
+      if (method === "PATCH") return { requestId: "configure_receipt" };
+      if (state === "http_error") throw new Error("unavailable");
+      return state === "failed" ? { state: "completed", status: "failed", outcome: { error: "No key" } } : { state };
+    });
+    expect(await forkRuntimeThread(env, { source: { ...SOURCE, keyScope: "hosted" }, target, forkEntryId: "rt:3" })).toMatchObject({ status: "forked" });
+    expect(runtimeApiMock).toHaveBeenCalledWith(env, "GET", "/v1/agents/agt_fork/requests/configure_receipt?wait=25");
+    expect(org.claimThreadRuntimeAgent).toHaveBeenCalledWith("fork1", "agt_fork", expect.objectContaining({ keyScope: "hosted" }));
+    expect(runtimeApiMock.mock.calls.some(call => call[1] === "DELETE")).toBe(false);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("keeps self-host forks on the gateway without migrating", async () => {
+    const { env, org } = fakeEnv();
+    env.CF_DISPATCH_NAMESPACE = "selfhost";
+    await forkRuntimeThread(env, { source: { ...SOURCE, keyScope: "hosted" }, target, forkEntryId: "rt:3" });
+    expect(runtimeApiMock).toHaveBeenCalledTimes(1);
+    expect(org.claimThreadRuntimeAgent).toHaveBeenCalledWith("fork1", "agt_fork", expect.objectContaining({ keyScope: "hosted" }));
   });
 
   it("answers not found for a fork point the history lacks", async () => {

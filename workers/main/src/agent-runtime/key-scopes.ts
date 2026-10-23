@@ -1,7 +1,8 @@
 /**
- * Org BYOK and self-host operator credentials, synced to runtime key scopes.
+ * Org BYOK and self-host operator/gateway credentials, synced to runtime key scopes.
  * Hosted agents use camelRun platform keys without a scope.
  */
+import { buildCloudflareGatewayUrl } from "../../../../src/lib/cloudflare-ai-gateway";
 import type { Model } from "@earendil-works/pi-ai";
 import { decryptCredentials } from "../../../../src/lib/integration-crypto";
 import {
@@ -32,7 +33,7 @@ import {
   type RuntimeApiEnv,
 } from "./runtime-api";
 
-/** Legacy scope, retained only to recognize pre-migration agents and usage. */
+/** Self-host gateway scope; also identifies legacy hosted agents and usage. */
 export const HOSTED_KEY_SCOPE = "hosted";
 
 export function orgKeyScope(orgId: string): string {
@@ -43,6 +44,12 @@ export interface KeyScopeEnv extends RuntimeApiEnv, SelfhostAiProviderEnv {
   APP_KV: KVNamespace;
   ORG: DurableObjectNamespace;
   INTEGRATION_SECRET_KEY: string;
+  CF_ACCOUNT_ID?: string;
+  CF_GATEWAY_NAME?: string;
+  CF_GATEWAY_BASE_URL?: string;
+  AI_GATEWAY_AUTH_TOKEN?: string;
+  CF_GATEWAY_TOKEN?: string;
+  TEST_LLM_REPLAY_URL?: string;
 }
 
 type Providers = Record<string, KeyScopeProvider>;
@@ -70,6 +77,43 @@ const OPENROUTER_ATTRIBUTION = {
   "X-OpenRouter-Title": "camelAI",
   "X-OpenRouter-Categories": "cloud-agent,programming-app",
 };
+
+/**
+ * Self-host's gateway provider: OpenRouter through AI Gateway, which holds
+ * the provider keys and takes its own token as `cf-aig-authorization` (the
+ * entry has no key). Null when the gateway is not configured.
+ */
+export function hostedScopeProviders(env: KeyScopeEnv): Providers | null {
+  const accountId = env.CF_ACCOUNT_ID?.trim();
+  const gatewayName = env.CF_GATEWAY_NAME?.trim();
+  const token = env.AI_GATEWAY_AUTH_TOKEN?.trim() || env.CF_GATEWAY_TOKEN?.trim();
+  if (!accountId || !gatewayName || !token) return null;
+  const gateway = buildCloudflareGatewayUrl(
+    env,
+    `/v1/${encodeURIComponent(accountId)}/${encodeURIComponent(gatewayName)}`,
+  );
+  return {
+    openrouter: {
+      baseUrl: `${gateway}/openrouter`,
+      headers: { "cf-aig-authorization": `Bearer ${token}`, ...OPENROUTER_ATTRIBUTION },
+    },
+  };
+}
+
+/**
+ * The per-agent headers a hosted-scope agent sends on every model call: the
+ * thread's AI Gateway metadata, as the in-DO loop sends it (pi-model-config).
+ * BYOK and Codex agents send none, so internal ids stay off customers' providers.
+ */
+export function hostedModelHeaders(thread: { orgId: string; workspaceId: string; threadId: string }): Record<string, string> {
+  const { orgId, workspaceId, threadId } = thread;
+  return {
+    "cf-aig-metadata": JSON.stringify({
+      uid: [orgId, workspaceId, threadId].filter(Boolean).join(":"),
+      chiridion: { orgId, workspaceId, threadId },
+    }),
+  };
+}
 
 /**
  * An org's key scope, from its AI provider settings: its BYOK key for
@@ -402,4 +446,12 @@ export async function syncOrgKeyScope(
     : await (env.ORG.get(env.ORG.idFromName(orgId)) as unknown as { getLlmProviderConfig(): Promise<ProviderRecord> })
         .getLlmProviderConfig();
   await syncKeyScope(env, orgKeyScope(orgId), await orgScopeProviders(env, current), fetcher);
+}
+
+/** Sync self-host's shared gateway scope; false when the gateway is not configured. */
+export async function ensureHostedKeyScope(env: KeyScopeEnv, fetcher?: typeof globalThis.fetch): Promise<boolean> {
+  const providers = hostedScopeProviders(env);
+  if (!providers) return false;
+  await syncKeyScope(env, HOSTED_KEY_SCOPE, { providers }, fetcher);
+  return true;
 }

@@ -37,7 +37,7 @@ import { createPiSystemPrompt } from "../pi-system-prompt";
 import { resolveAgentSkillCatalog } from "../selfhost-agent-pack";
 import { RUNTIME_PROMPT_PREAMBLE, type RuntimeRunConfig } from "./runtime-prompt";
 import { FREE_TIER_RUNTIME_MODEL, runtimeModelRoute, type RuntimeModelRoute } from "./model-routes";
-import { selfhostOperatorEndpointOrigin, syncOrgKeyScope } from "./key-scopes";
+import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, selfhostOperatorEndpointOrigin, syncOrgKeyScope } from "./key-scopes";
 
 type OrgInfoLike = {
   billing_status?: string | null;
@@ -189,6 +189,7 @@ export async function resolveThreadRuntimeRoute(
   const route = runtimeModelRoute(config, {
     orgId: context.orgId,
     freeTier: isCreditFreeHostedModel(threadModel),
+    selfhost: isSelfhostRuntime(env),
     operatorEndpointOrigin: selfhostOperatorEndpointOrigin(env),
   });
   return { threadModel, config, route, fallback, llmProviderRecord };
@@ -250,7 +251,7 @@ export async function prepareThreadRuntimeRun(
     if (!userId) return;
     // Limits are checked against the model the runtime will call (the free
     // tier's runtime model is not the in-DO loop's dynamic route).
-    const gated = route.kind === "scope" && route.model === FREE_TIER_RUNTIME_MODEL
+    const gated = route.model === FREE_TIER_RUNTIME_MODEL
       ? { provider: "openrouter", model: "openai/gpt-6-luna" }
       : { provider: config.usageProvider || config.model.provider, model: config.model.id };
     try {
@@ -298,18 +299,19 @@ export interface RuntimeAgentModel {
   thinkingLevel: "medium" | "high";
 }
 
-export function runtimeAgentModel(_context: ChatContextState, route: RuntimeModelRoute, threadModel: LlmModel): RuntimeAgentModel {
+export function runtimeAgentModel(context: ChatContextState, route: RuntimeModelRoute, threadModel: LlmModel): RuntimeAgentModel {
   return {
     model: route.model,
     keyScope: route.kind === "scope" ? route.keyScope : null,
-    modelHeaders: null,
+    modelHeaders: route.kind === "scope" && route.keyScope === HOSTED_KEY_SCOPE ? hostedModelHeaders(context) : null,
     thinkingLevel: primaryPiThinkingLevel(threadModel),
   };
 }
 
 /**
  * The runtime's copy of the key scope the thread's route runs under, brought
- * up to date for BYOK and self-host providers. Hosted platform routes need no scope.
+ * up to date for BYOK and self-host providers, including the self-host gateway.
+ * Hosted platform routes need no scope.
  */
 export async function syncRouteKeyScope(
   env: ChatEnv,
@@ -317,7 +319,11 @@ export async function syncRouteKeyScope(
   { route, llmProviderRecord }: Pick<ThreadRuntimeRoute, "route" | "llmProviderRecord">,
 ): Promise<void> {
   if (route?.kind !== "scope") return;
-  await syncOrgKeyScope(env, context.orgId, llmProviderRecord);
+  if (route.keyScope === HOSTED_KEY_SCOPE) {
+    if (!await ensureHostedKeyScope(env)) throw new RuntimeRunRefused("Hosted models are not configured for the agent runtime.", "not_configured");
+  } else {
+    await syncOrgKeyScope(env, context.orgId, llmProviderRecord);
+  }
 }
 
 /**

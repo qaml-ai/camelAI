@@ -87,11 +87,19 @@ async function fetchWithTimeout(
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    return await fetch(input, {
+    // Cloudflare Workers does not implement redirect: 'error' (fetch throws
+    // before reaching the network). Manual mode plus rejecting 3xx keeps the
+    // same never-follow-redirects policy.
+    const response = await fetch(input, {
       ...init,
-      redirect: 'error',
+      redirect: 'manual',
       signal: controller.signal,
     });
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel();
+      throw new Error('OAuth provider redirects are not allowed');
+    }
+    return response;
   } catch (error) {
     if (
       error instanceof Error &&

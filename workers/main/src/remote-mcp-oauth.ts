@@ -84,10 +84,12 @@ function assertSafeEndpoint(raw: unknown, label: string): string {
 
 // Never forward OAuth POST bodies (codes, verifiers, or refresh tokens) to
 // redirect targets. Apply the same policy to discovery to prevent redirect SSRF.
+// Cloudflare Workers does not implement redirect: "error"; manual mode never
+// follows a redirect, and callers treat the unfollowed 3xx as a failed response.
 function oauthFetch(fetchFn: FetchLike, url: string, init: RequestInit = {}): Promise<Response> {
   return fetchFn(assertSafeEndpoint(url, "OAuth endpoint"), {
     ...init,
-    redirect: "error",
+    redirect: "manual",
     signal: AbortSignal.timeout(15_000),
   });
 }

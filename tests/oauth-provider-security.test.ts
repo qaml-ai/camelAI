@@ -13,7 +13,7 @@ describe('OAuth identity proof', () => {
   });
   it('does not trust the public GitHub profile email', async () => {
     const mock = vi.fn(async (url: string, init: RequestInit) => {
-      expect(init.redirect).toBe('error');
+      expect(init.redirect).toBe('manual');
       return Response.json(url.endsWith('/emails')
         ? [{ email: 'unverified@example.com', primary: true, verified: false }, { email: 'verified@example.com', verified: true }]
         : { id: 1, email: 'unverified@example.com', login: 'user' });
@@ -27,11 +27,15 @@ describe('OAuth identity proof', () => {
     expect(url.searchParams.get('code_challenge')).toBe('challenge');
     expect(url.searchParams.get('code_challenge_method')).toBe('S256');
     vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
-      expect(init.redirect).toBe('error');
+      expect(init.redirect).toBe('manual');
       expect(new URLSearchParams(init.body).get('code_verifier')).toBe('verifier');
       return Response.json({ access_token: 'token' });
     }));
     await exchangeCodeForTokens(provider, 'code', 'client', 'secret', 'https://app.example/callback', 1000, 'verifier');
+  });
+  it('rejects provider redirects instead of following them', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 302, headers: { location: 'https://attacker.example' } })));
+    await expect(exchangeCodeForTokens('google', 'code', 'client', 'secret', 'https://app.example/callback')).rejects.toThrow('redirects are not allowed');
   });
   it('does not expose provider error bodies', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('secret echoed by provider', { status: 400 })));

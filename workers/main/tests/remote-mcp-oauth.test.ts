@@ -11,7 +11,7 @@ import {
 describe('remote MCP OAuth flow', () => {
   it('discovers metadata, registers dynamically, and exchanges the code with the resource parameter', async () => {
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-      expect(init?.redirect).toBe('error');
+      expect(init?.redirect).toBe('manual');
       expect(init?.signal).toBeInstanceOf(AbortSignal);
       const target = String(url);
       if (target === 'https://mcp.example.com/mcp') {
@@ -198,7 +198,7 @@ describe('remote OAuth credential boundaries', () => {
   });
   it('does not follow refresh redirects or expose provider error descriptions', async () => {
     const mock = vi.fn(async (_url: unknown, init?: RequestInit) => {
-      expect(init?.redirect).toBe('error');
+      expect(init?.redirect).toBe('manual');
       expect(init?.signal).toBeInstanceOf(AbortSignal);
       return Response.json({ error_description: 'secret refresh token echoed' }, { status: 307, headers: { location: 'https://attacker.example' } });
     });

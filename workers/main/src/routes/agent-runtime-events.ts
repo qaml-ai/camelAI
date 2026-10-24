@@ -102,16 +102,26 @@ const UNATTENDED_THREAD_SOURCES = new Set(["channel", "scheduled"]);
  * already settled is left as it is.
  */
 async function cancelUnattendedInput(env: Env, agentId: string, inputId: string): Promise<void> {
-  const base = `/v1/agents/${encodeURIComponent(agentId)}/inputs/${encodeURIComponent(inputId)}`;
-  const input = await runtimeApi(env, "GET", base) as { state?: unknown; responders?: { audience?: unknown } } | null;
-  if (input?.state !== "pending") return;
-  const audience = Array.isArray(input.responders?.audience) ? input.responders.audience : [];
-  const actor = typeof audience[0] === "string" ? audience[0] : null;
+  const base = `/v1/agents/${encodeURIComponent(agentId)}/inputs`;
   try {
-    await runtimeApi(env, "POST", base, { action: "cancel", ...(actor ? { actor } : {}) });
+    const inputs = await runtimeApi(env, "GET", `${base}?state=pending`) as Array<{
+      id: string;
+      state?: unknown;
+      responders?: { audience?: unknown };
+    }>;
+    const input = Array.isArray(inputs) ? inputs.find((entry) => entry?.id === inputId) : undefined;
+    if (input?.state !== "pending") return;
+    const audience = Array.isArray(input.responders?.audience) ? input.responders.audience : [];
+    const actor = typeof audience[0] === "string" ? audience[0] : null;
+    try {
+      await runtimeApi(env, "POST", `${base}/${encodeURIComponent(inputId)}`, { action: "cancel", ...(actor ? { actor } : {}) });
+    } catch (error) {
+      // Someone (or the input's expiry) settled it first.
+      if (!(error instanceof RuntimeApiError && error.status === 409)) throw error;
+    }
   } catch (error) {
-    // Someone (or the input's expiry) settled it first.
-    if (!(error instanceof RuntimeApiError && error.status === 409)) throw error;
+    if (!(error instanceof RuntimeApiError && error.status === 404)) throw error;
+    console.warn("[agent-runtime-events] nothing to cancel: runtime agent or input not found", { agentId, inputId });
   }
 }
 

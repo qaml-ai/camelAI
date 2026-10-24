@@ -80,17 +80,21 @@ const eventId = () => `evt_${crypto.randomUUID().replaceAll("-", "").slice(0, 24
 afterEach(() => vi.restoreAllMocks());
 
 /** The runtime's input routes, as the webhook handler calls them with the tenant token. */
-function fakeInputs(input: Record<string, unknown>) {
+function fakeInputs(inputs: Array<Record<string, unknown>>, failure?: { method: "GET" | "POST"; status: number }) {
+  const reads: string[] = [];
   const answers: Array<{ path: string; body: Record<string, unknown> }> = [];
   const original = globalThis.fetch;
   vi.spyOn(globalThis, "fetch").mockImplementation(async (request: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(request instanceof Request ? request.url : String(request));
     if (url.origin !== RUNTIME) return original(request, init);
-    if ((init?.method ?? "GET") === "GET") return Response.json(input);
-    answers.push({ path: url.pathname, body: JSON.parse(String(init?.body ?? "{}")) });
-    return Response.json({ input: { ...input, state: "cancelled" } });
+    const method = init?.method ?? "GET";
+    if (method === "GET") reads.push(`${url.pathname}${url.search}`);
+    if (method === "POST") answers.push({ path: url.pathname, body: JSON.parse(String(init?.body ?? "{}")) });
+    if (method === failure?.method) return Response.json({ error: "Unknown agent route" }, { status: failure.status });
+    if (method === "GET") return Response.json(inputs);
+    return Response.json({ state: "cancelled" });
   });
-  return answers;
+  return { answers, reads };
 }
 
 describe("input.requested on POST /agent-runtime/events", () => {
@@ -104,8 +108,12 @@ describe("input.requested on POST /agent-runtime/events", () => {
     async (source) => {
       const { runEnv, agentId, metadata } = await setup({ source });
       await testEnv.APP_KV.put(runtimeAgentThreadKey(agentId), JSON.stringify({ org: metadata.org, workspace: metadata.workspace, thread: metadata.thread }));
-      const answers = fakeInputs({ id: "in_1", state: "pending", responders: { audience: ["owner-1"] } });
+      const { answers, reads } = fakeInputs([
+        { id: "in_newer", state: "pending", responders: { audience: ["other-owner"] } },
+        { id: "in_1", state: "pending", responders: { audience: ["owner-1"] } },
+      ]);
       expect((await deliver(runEnv, inputEvent(agentId))).status).toBe(204);
+      expect(reads).toEqual([`/v1/agents/${agentId}/inputs?state=pending`]);
       expect(answers).toEqual([{
         path: `/v1/agents/${agentId}/inputs/in_1`,
         body: expect.objectContaining({ action: "cancel", actor: "owner-1" }),
@@ -116,17 +124,44 @@ describe("input.requested on POST /agent-runtime/events", () => {
   it("leaves a web thread's input to the person watching it", async () => {
     const { runEnv, agentId, metadata } = await setup();
     await testEnv.APP_KV.put(runtimeAgentThreadKey(agentId), JSON.stringify({ org: metadata.org, workspace: metadata.workspace, thread: metadata.thread }));
-    const answers = fakeInputs({ id: "in_1", state: "pending", responders: {} });
+    const { answers, reads } = fakeInputs([{ id: "in_1", state: "pending", responders: {} }]);
+    expect((await deliver(runEnv, inputEvent(agentId))).status).toBe(204);
+    expect(answers).toEqual([]);
+    expect(reads).toEqual([]);
+  });
+
+  it("does not answer an input absent from the pending list", async () => {
+    const { runEnv, agentId, metadata } = await setup({ source: "channel" });
+    await testEnv.APP_KV.put(runtimeAgentThreadKey(agentId), JSON.stringify({ org: metadata.org, workspace: metadata.workspace, thread: metadata.thread }));
+    const { answers } = fakeInputs([{ id: "in_other", state: "pending", responders: {} }]);
     expect((await deliver(runEnv, inputEvent(agentId))).status).toBe(204);
     expect(answers).toEqual([]);
   });
 
-  it("does not answer an input that already settled", async () => {
+  it.each(["GET", "POST"] as const)("acknowledges a runtime 404 during %s without retrying the event", async (method) => {
     const { runEnv, agentId, metadata } = await setup({ source: "channel" });
-    await testEnv.APP_KV.put(runtimeAgentThreadKey(agentId), JSON.stringify({ org: metadata.org, workspace: metadata.workspace, thread: metadata.thread }));
-    const answers = fakeInputs({ id: "in_1", state: "answered", responders: {} });
-    expect((await deliver(runEnv, inputEvent(agentId))).status).toBe(204);
-    expect(answers).toEqual([]);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { answers, reads } = fakeInputs([{ id: "in_1", state: "pending", responders: { audience: ["owner-1"] } }], { method, status: 404 });
+    const requested = inputEvent(agentId);
+    const event = { ...requested, data: { ...requested.data, metadata } };
+    expect((await deliver(runEnv, event)).status).toBe(204);
+    expect((await deliver(runEnv, event)).status).toBe(204);
+    expect(reads).toEqual([`/v1/agents/${agentId}/inputs?state=pending`]);
+    expect(answers).toHaveLength(method === "POST" ? 1 : 0);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("nothing to cancel"), { agentId, inputId: "in_1" });
+  });
+
+  it.each([409, 500])("handles a cancel returning %s", async (status) => {
+    const { runEnv, agentId, metadata } = await setup({ source: "channel" });
+    const { answers } = fakeInputs([{ id: "in_1", state: "pending", responders: {} }], { method: "POST", status });
+    const requested = inputEvent(agentId);
+    const event = { ...requested, data: { ...requested.data, metadata } };
+    if (status === 409) {
+      expect((await deliver(runEnv, event)).status).toBe(204);
+    } else {
+      await expect(deliver(runEnv, event)).rejects.toMatchObject({ name: "RuntimeApiError", status });
+    }
+    expect(answers).toEqual([{ path: `/v1/agents/${agentId}/inputs/in_1`, body: { action: "cancel" } }]);
   });
 });
 

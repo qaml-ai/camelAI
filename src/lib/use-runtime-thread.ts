@@ -113,7 +113,7 @@ function seedView(seed: RuntimeThreadSeed | null | undefined): View {
     lastOutcome: null,
     hasOlder: Boolean(seed?.page?.next),
     // What the loader read is what the page shows until the watcher has read history itself.
-    loaded: Boolean(seed),
+    loaded: Boolean(seed?.page),
   };
 }
 

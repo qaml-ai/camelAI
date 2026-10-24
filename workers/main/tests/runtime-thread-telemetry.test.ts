@@ -10,6 +10,7 @@ import {
   recordRuntimeSendFailure,
   recordRuntimeSendTiming,
   recordRuntimeTokenMintFailure,
+  recordRuntimeSeedHistoryFailure,
   SEND_TIMING_STEPS,
 } from "../src/agent-runtime/runtime-thread-telemetry";
 import { RuntimeApiError } from "../src/agent-runtime/runtime-api";
@@ -101,5 +102,18 @@ describe("recordRuntimeTokenMintFailure", () => {
     recordRuntimeTokenMintFailure(env, context, "page_seed", { error: new RuntimeApiError("Unauthorized", 401) });
     expect(point(events)).toMatchObject({ operation: "page_seed", status: "runtime_4xx", statusCode: 401 });
     expect(errors.writeDataPoint).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe("seed timeout telemetry", () => {
+  it("distinguishes history and token timeouts without transcript data", () => {
+    const { env, events } = datasets();
+    const error = new DOMException("Timed out", "TimeoutError");
+    recordRuntimeSeedHistoryFailure(env, context, error);
+    expect(point(events)).toMatchObject({ event: "runtime_seed_history_failed", operation: "page_seed", status: "timeout", thread: "thread1" });
+    events.writeDataPoint.mockClear();
+    recordRuntimeTokenMintFailure(env, context, "page_seed", { error });
+    expect(point(events)).toMatchObject({ event: "runtime_token_mint_failed", operation: "page_seed", status: "timeout", thread: "thread1" });
   });
 });

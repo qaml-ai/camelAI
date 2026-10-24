@@ -117,6 +117,19 @@ describe("useRuntimeThread", () => {
     expect(result.current.chat.streamingMessageId).toBe("rt:2");
   });
 
+  it("recovers a null seed page through the watcher using the successful seed token", async () => {
+    const { result } = mount({ ...seed, page: null });
+    await waitFor(() => expect(watchers).toHaveLength(1));
+    expect(watchers[0].options).toMatchObject({ token: seed.token, agentId: seed.agentId, url: seed.url });
+    expect(fetchCalls).toHaveLength(0); // no second token request
+    act(() => watchers[0].emit({
+      loaded: true,
+      messages: seed.page!.entries.map((entry) => entry.message),
+      indexes: [0, 1],
+    }));
+    await waitFor(() => expect(result.current.chat.messages.map((message) => message.id)).toEqual(["rt:0", "rt:1"]));
+  });
+
   it("keeps the loader's page on screen until the watcher has read history (AgentView.loaded)", async () => {
     const { result } = mount();
     await waitFor(() => expect(watchers).toHaveLength(1));

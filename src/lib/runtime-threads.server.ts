@@ -18,7 +18,7 @@ import {
   type RuntimeThreadSender,
 } from "../../workers/main/src/agent-runtime/thread-runtime";
 import type { RuntimeThreadSeed } from "@/lib/use-runtime-thread";
-import { recordRuntimeMigration, recordRuntimeTokenMintFailure } from "../../workers/main/src/agent-runtime/runtime-thread-telemetry";
+import { recordRuntimeMigration, recordRuntimeTokenMintFailure, recordRuntimeSeedHistoryFailure } from "../../workers/main/src/agent-runtime/runtime-thread-telemetry";
 import { classifyMove, migrateThreadToRuntime, type UnmovableReason } from "../../workers/main/src/agent-runtime/thread-migration";
 import type { ChatThreadReadOnlyHistory } from "../../workers/main/src/chat-thread-do";
 import { normalizePreviewTabs } from "../../workers/main/src/chat-thread/preview-state";
@@ -100,6 +100,9 @@ export function requestWorkspaceId(request: Request, body?: unknown): string | n
   return typeof fromBody === "string" && fromBody.trim() ? fromBody.trim() : null;
 }
 
+const SEED_REQUEST_TIMEOUT_MS = 8_000;
+const SEED_HISTORY_BUDGET_MS = 12_000;
+
 /**
  * What a runtime thread's page loads server-side for first paint, with no
  * DO: its saved preview tabs, and (once it has an agent) a browser token and
@@ -117,16 +120,15 @@ export async function loadRuntimeThreadSeed(
     org.getThreadUiState(input.threadId).catch(() => null),
     agentId
       ? Promise.all([
-          mintRuntimeBrowserToken(env, { ...input.row, agentId }, input.userId, runtimeReadProxyBase(input.threadId, input.workspaceId)),
-          runtimeHistoryPage(env, agentId, { limit: 50 }),
-        ]).then(
-          ([token, page]) => ({ token, page, error: null as string | null }),
-          (error: unknown) => {
-            console.error("[runtime-thread] failed to load the thread", error);
-            recordRuntimeTokenMintFailure(env, input, "page_seed", { error });
-            return { token: null, page: null, error: "Can't reach the agent service. Try again in a moment." };
-          },
-        )
+          mintRuntimeBrowserToken(env, { ...input.row, agentId }, input.userId, runtimeReadProxyBase(input.threadId, input.workspaceId), AbortSignal.timeout(SEED_REQUEST_TIMEOUT_MS)).then(
+            (token) => ({ token, error: null }),
+            (error: unknown) => {
+              recordRuntimeTokenMintFailure(env, input, "page_seed", { error });
+              return { token: null, error: "Can't reach the agent service. Try again in a moment." };
+            },
+          ),
+          loadSeedHistory(env, agentId, input),
+        ]).then(([tokenResult, page]) => ({ ...tokenResult, page }))
       : Promise.resolve({ token: null, page: null, error: null }),
     runtimeStartError(org, input.threadId),
   ]);
@@ -149,6 +151,26 @@ export async function loadRuntimeThreadSeed(
     },
     error: reads.error,
   };
+}
+
+/** One timeout retry, using only what remains of the seed's 12-second budget. */
+async function loadSeedHistory(
+  env: ChatEnv,
+  agentId: string,
+  context: { orgId: string; workspaceId: string; threadId: string; userId: string },
+): Promise<Awaited<ReturnType<typeof runtimeHistoryPage>> | null> {
+  const deadline = Date.now() + SEED_HISTORY_BUDGET_MS;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const signal = AbortSignal.timeout(Math.min(SEED_REQUEST_TIMEOUT_MS, deadline - Date.now()));
+    try {
+      // ~256 KB first paint; older pages load from the browser. Runtimes before maxBytes ignore it.
+      return await runtimeHistoryPage(env, agentId, { limit: 50, maxBytes: 262_144, signal });
+    } catch (error) {
+      recordRuntimeSeedHistoryFailure(env, context, signal.aborted ? signal.reason : error);
+      if (!signal.aborted || attempt > 0 || deadline - Date.now() < 1_000) return null;
+    }
+  }
+  return null;
 }
 
 /** Why a runtime thread's first message was refused, as an earlier release recorded it on the thread, or null. */

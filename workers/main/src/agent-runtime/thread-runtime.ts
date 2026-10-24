@@ -567,6 +567,7 @@ export async function mintRuntimeBrowserToken(
    * AGENT_BROWSER_URL empty) that browsers cannot reach.
    */
   readProxy?: string,
+  signal?: AbortSignal,
 ): Promise<BrowserToken> {
   const minted = await runtimeApi(env, "POST", `/v1/agents/${encodeURIComponent(row.agentId)}/browser-tokens`, {
     ttlSeconds: BROWSER_TOKEN_TTL_SECONDS,
@@ -574,7 +575,7 @@ export async function mintRuntimeBrowserToken(
     events: [...BROWSER_TOKEN_EVENTS],
     ...(row.keyScope === null || row.keyScope === HOSTED_KEY_SCOPE ? { redact: ["usage.cost"] } : {}),
     subject: userId,
-  }) as { token: string; expiresAt: number; url?: string };
+  }, {}, undefined, signal) as { token: string; expiresAt: number; url?: string };
   return {
     token: minted.token,
     expiresAt: minted.expiresAt,
@@ -583,15 +584,20 @@ export async function mintRuntimeBrowserToken(
   };
 }
 
-/** One page of the agent's history, newest first page without `before` (the runtime's turn-aligned paging). */
+/**
+ * One page of the agent's history, newest first page without `before`.
+ * `maxBytes` opts into the runtime's byte cap; older runtimes ignore this
+ * unknown query parameter. Omit it to preserve the existing page shape.
+ */
 export async function runtimeHistoryPage(
   env: ChatEnv,
   agentId: string,
-  page: { limit?: number; before?: number | null } = {},
+  page: { limit?: number; before?: number | null; maxBytes?: number; signal?: AbortSignal } = {},
 ): Promise<{ entries: Array<{ index: number; message: unknown }>; next: number | null; total?: number }> {
   const params = new URLSearchParams({ limit: String(page.limit ?? 50) });
   if (typeof page.before === "number") params.set("before", String(page.before));
-  return await runtimeApi(env, "GET", `/v1/agents/${encodeURIComponent(agentId)}/history?${params}`) as {
+  if (page.maxBytes !== undefined) params.set("maxBytes", String(page.maxBytes));
+  return await runtimeApi(env, "GET", `/v1/agents/${encodeURIComponent(agentId)}/history?${params}`, undefined, {}, undefined, page.signal) as {
     entries: Array<{ index: number; message: unknown }>;
     next: number | null;
     total?: number;

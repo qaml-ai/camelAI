@@ -1,5 +1,7 @@
 "use client"
 
+import { useSettledFetcherResult } from "@/hooks/use-settled-fetcher-result";
+
 import { useCallback, useEffect, useState } from "react"
 import { Cable, CircleHelp, Clock, LayoutGrid, MessagesSquare, Plus, Sparkles } from "lucide-react"
 import { Link, useFetcher, useLocation, useNavigate, useRevalidator, useRouteLoaderData } from "react-router"
@@ -212,22 +214,16 @@ export function AppSidebar({
     closeBillingDialogs()
   }, [closeBillingDialogs, orgId])
 
-  useEffect(() => {
-    if (providerFetcher.state !== "idle" || !providerFetcher.data) return
-    if (providerFetcher.data.error) {
-      setProviderError(providerFetcher.data.error)
+  useSettledFetcherResult(providerFetcher.state, providerFetcher.data, (result) => {
+    if (result.error) {
+      setProviderError(result.error)
       return
     }
-    if (providerFetcher.data.success) {
+    if (result.success) {
       closeBillingDialogs()
       revalidator.revalidate()
     }
-  }, [
-    closeBillingDialogs,
-    providerFetcher.data,
-    providerFetcher.state,
-    revalidator,
-  ])
+  })
 
   const saveByokProvider = useCallback(() => {
     if (!orgId) {

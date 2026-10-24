@@ -61,9 +61,11 @@ export async function runtimeApi(
   body?: unknown,
   headers: Record<string, string> = {},
   fetcher: typeof globalThis.fetch = globalThis.fetch.bind(globalThis),
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const call = () => fetcher(`${runtimeUrl(env)}${path}`, {
     method,
+    signal,
     headers: {
       Authorization: `Bearer ${env.AGENT_RUNTIME_API_TOKEN ?? ""}`,
       ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
@@ -76,7 +78,18 @@ export async function runtimeApi(
     if (response.status !== 503) break;
     await response.body?.cancel();
     const retryAfter = Number(response.headers.get("Retry-After")) * 1000;
-    await new Promise((resolve) => setTimeout(resolve, Math.min(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : pause, 1_000)));
+    await new Promise<void>((resolve, reject) => {
+      signal?.throwIfAborted();
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(signal?.reason);
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, Math.min(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : pause, 1_000));
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
     response = await call();
   }
   const text = await response.text();

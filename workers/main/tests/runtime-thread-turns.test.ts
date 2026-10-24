@@ -19,6 +19,7 @@ import {
   pinNewThreadToRuntime,
   prewarmThreadAgent,
   runtimeAgentThreadKey,
+  runtimeHistoryPage,
   threadScratchVolume,
   startRuntimeTurn,
 } from "../src/agent-runtime/thread-runtime";
@@ -643,5 +644,27 @@ describe("sends while the runtime rolls its tasks", () => {
     await send(setup, "two", "cm_b");
     expect(puts.mock.calls.filter(([key]) => key === runtimeAgentThreadKey(agentId))).toHaveLength(1);
     expect(await testEnv.APP_KV.get(runtimeAgentThreadKey(agentId), "json")).toMatchObject({ thread: setup.threadId });
+  });
+});
+
+
+describe("runtime seed request options", () => {
+  it("forwards history paging, optional maxBytes and the abort signal", async () => {
+    const signal = AbortSignal.timeout(8_000);
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async () => Response.json({ entries: [], next: null }));
+    await runtimeHistoryPage(runtimeEnv, "agent/id", { limit: 50, before: 123, maxBytes: 1_000_000, signal });
+    expect(fetcher).toHaveBeenCalledWith(
+      `${RUNTIME}/v1/agents/agent%2Fid/history?limit=50&before=123&maxBytes=1000000`,
+      expect.objectContaining({ signal }),
+    );
+    await runtimeHistoryPage(runtimeEnv, "agent");
+    expect(String(fetcher.mock.calls[1][0])).not.toContain("maxBytes");
+  });
+
+  it("forwards the seed token request abort signal", async () => {
+    const signal = AbortSignal.timeout(8_000);
+    const fetcher = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ token: "t", expiresAt: 1 }));
+    await mintRuntimeBrowserToken(runtimeEnv, { agentId: "agent", keyScope: null } as never, "u", undefined, signal);
+    expect(fetcher).toHaveBeenCalledWith(expect.stringContaining("/browser-tokens"), expect.objectContaining({ signal }));
   });
 });

@@ -1,5 +1,7 @@
 "use client";
 
+import { useSettledFetcherResult } from "@/hooks/use-settled-fetcher-result";
+
 import {
   useState,
   useEffect,
@@ -987,24 +989,18 @@ export default function Chat({
     isSidebarBillingDialogOpen,
   );
 
-  useEffect(() => {
-    if (providerFetcher.state !== "idle" || !providerFetcher.data) return;
-    if (providerFetcher.data.error) {
-      setProviderError(providerFetcher.data.error);
+  useSettledFetcherResult(providerFetcher.state, providerFetcher.data, (result) => {
+    if (result.error) {
+      setProviderError(result.error);
       return;
     }
-    if (providerFetcher.data.success) {
+    if (result.success) {
       if (billingDialogRef.current.kind === "byok") {
         transitionBillingDialog({ kind: "none" });
       }
       revalidator.revalidate();
     }
-  }, [
-    providerFetcher.data,
-    providerFetcher.state,
-    revalidator,
-    transitionBillingDialog,
-  ]);
+  });
 
   const saveByokProvider = useCallback(() => {
     if (!currentOrg?.id) {

@@ -17,14 +17,14 @@ export interface RuntimeThreadTelemetryContext {
   userId?: string | null;
 }
 
-export type RuntimeFailureClass = { status: "runtime_4xx" | "runtime_5xx" | "exception"; statusCode: number | null };
+export type RuntimeFailureClass = { status: "runtime_4xx" | "runtime_5xx" | "exception" | "timeout"; statusCode: number | null };
 
 /** A thrown error: the runtime refused (4xx), the runtime failed (5xx), or anything else. */
 export function classifyRuntimeFailure(error: unknown): RuntimeFailureClass {
   if (error instanceof RuntimeApiError) {
     return { status: error.status >= 500 ? "runtime_5xx" : "runtime_4xx", statusCode: error.status };
   }
-  return { status: "exception", statusCode: null };
+  return { status: error instanceof Error && error.name === "TimeoutError" ? "timeout" : "exception", statusCode: null };
 }
 
 function ids(context: RuntimeThreadTelemetryContext) {
@@ -189,5 +189,23 @@ export function recordRuntimeMigration(
     extraCounts: stats
       ? [stats.imported, stats.droppedRoles, stats.shortenedResults, stats.omittedImages, stats.tail ? 1 : 0, "archived" in result && result.archived ? 1 : 0, stats.normalized]
       : [],
+  });
+}
+
+/** A failed seed history attempt; the browser can still read with its token. */
+export function recordRuntimeSeedHistoryFailure(
+  env: ObservabilityEnv | undefined,
+  context: RuntimeThreadTelemetryContext,
+  error: unknown,
+): void {
+  const failure = classifyRuntimeFailure(error);
+  recordErrorEvent(env, {
+    event: "runtime_seed_history_failed",
+    component: "runtime_thread",
+    operation: "page_seed",
+    ...ids(context),
+    status: failure.status,
+    statusCode: failure.statusCode,
+    error,
   });
 }

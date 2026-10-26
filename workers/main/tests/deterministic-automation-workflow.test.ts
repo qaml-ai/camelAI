@@ -54,10 +54,14 @@ describe("DeterministicAutomationWorkflow", () => {
       orgId: "org1",
       workspaceId: "workspace1",
       userId: "user1",
+      invocationId: "run-1",
     });
 
     const props = {
-      props: { orgId: "org1", workspaceId: "workspace1", userId: "user1" },
+      props: {
+        orgId: "org1", workspaceId: "workspace1", userId: "user1",
+        externalSessionId: "run-1", parentToolUseId: "automation:run-1",
+      },
     };
     expect(bindings).toEqual({
       TOOLS: tools,

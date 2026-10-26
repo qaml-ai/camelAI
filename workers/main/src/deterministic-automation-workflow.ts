@@ -432,6 +432,7 @@ export function createDeterministicAutomationRuntimeBindings(input: {
     orgId: input.orgId,
     workspaceId: input.workspaceId,
     userId: input.userId,
+    externalSessionId: input.invocationId,
     parentToolUseId: input.invocationId
       ? `automation:${input.invocationId}`
       : undefined,

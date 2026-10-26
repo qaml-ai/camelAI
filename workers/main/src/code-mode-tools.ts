@@ -103,6 +103,8 @@ export interface CodeModeToolsProps {
   orgId: string;
   workspaceId: string;
   threadId?: string;
+  /** Stable run/session scope for tmp/ paths when no chat thread is present. */
+  externalSessionId?: string;
   userId?: string;
   parentToolUseId?: string;
   /**
@@ -2437,11 +2439,12 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private safeThreadR2SessionId(): string {
-    const { threadId } = this.ctx.props;
-    if (!threadId) {
-      throw new Error("R2 temp paths require chat thread scope");
+    const { threadId, externalSessionId } = this.ctx.props;
+    const sessionId = threadId || externalSessionId;
+    if (!sessionId?.trim()) {
+      throw new Error("R2 temp paths require threadId or externalSessionId");
     }
-    return threadId.replace(/[^a-zA-Z0-9_-]/g, "_");
+    return sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
   }
 
   private r2MountBaseKey(mount: CodeModeR2Mount): string {
@@ -3391,6 +3394,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     sendToolCallRecords(this.env, [{
       ingested_at_ms: Date.now(),
       ts_ms: startedAtMs,
+      // The lake schema requires a string; threadless calls use an empty id.
       thread_id: props?.threadId ?? "",
       org_id: props?.orgId ?? "",
       workspace_id: props?.workspaceId ?? "",
@@ -3603,6 +3607,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
   }
 
   private async setPreview(args: Record<string, unknown>): Promise<unknown> {
+    // Workflows and external callers have no chat UI to receive a preview.
+    // Skip before reading the target: completed work must not fail on UI state.
+    if (!this.ctx.props.threadId) return { skipped: "no_thread" };
+
     const scriptNameArg = typeof args.script_name === "string" ? args.script_name.trim() : "";
     const appNameArg = typeof args.app_name === "string" ? args.app_name.trim() : "";
     if (scriptNameArg && appNameArg && scriptNameArg !== appNameArg) {
@@ -4301,7 +4309,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       path,
       content_type: "application/x-ipynb+json",
     });
-    const message = `Executed and previewed ${path}`;
+    const message = this.ctx.props.threadId
+      ? `Executed and previewed ${path}`
+      : `Executed ${path}`;
     console.log(message);
     return {
       ...result,
@@ -4891,7 +4901,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       const appUrl = await this.appUrlForScriptName(scriptName);
       const warnings = [...(deploy.warnings ?? []), ...this.localDeployReachabilityWarnings()];
       const preview = await this.setPreview({ app_name: scriptName });
-      const message = `Deployed and previewed at ${appUrl}`;
+      const message = this.ctx.props.threadId
+        ? `Deployed and previewed at ${appUrl}`
+        : `Deployed at ${appUrl}`;
       console.log(message);
       return {
         success: true,
@@ -5014,7 +5026,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const appUrl = await this.appUrlForScriptName(scriptName);
     const allWarnings = [...warnings, ...(deploy.warnings ?? []), ...this.localDeployReachabilityWarnings()];
     const preview = await this.setPreview({ app_name: scriptName });
-    const message = `Deployed and previewed at ${appUrl}`;
+    const message = this.ctx.props.threadId
+      ? `Deployed and previewed at ${appUrl}`
+      : `Deployed at ${appUrl}`;
     console.log(message);
     return {
       success: true,

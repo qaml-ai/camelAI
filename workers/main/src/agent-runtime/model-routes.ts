@@ -19,6 +19,7 @@
  * `bedrock-openai-<region>/<model id>`.
  */
 import type { PiResolvedModelConfig } from "../chat-thread/pi-model-config";
+import { CAMEL_CODE_LLM_MODEL } from "../../../../src/lib/llm-provider-config";
 import { codexRoute } from "./codex-forwarder";
 import {
   BEDROCK_OPENAI_BASE_URL,
@@ -38,11 +39,14 @@ export type RuntimeModelRoute =
 export const RUNTIME_MODEL_ENDPOINT = "chiridion";
 
 /**
- * The free tier on the runtime: GPT-6 Luna on OpenRouter (Responses) with the
- * hosted keys. The in-DO loop keeps the gateway's dynamic route, which only
- * takes chat completions.
+ * GPT-6 Luna, camelCode's runtime model until 2026-10-26 (now
+ * CAMEL_CODE_RUNTIME_MODEL): a credit-free compat route that falls through
+ * here, and usage.ts still treats its usage as free for runs in flight at the switch.
  */
 export const FREE_TIER_RUNTIME_MODEL = "openrouter/openai/gpt-6-luna";
+
+/** camelCode's hosted runtime model, independent of its legacy gateway route. */
+export const CAMEL_CODE_RUNTIME_MODEL = "openrouter/deepseek/deepseek-v4.1-flash-1017:nitro";
 
 /**
  * Bedrock's Converse ids for the bare ids chiridion's resolver names (bedrock-mantle's), where they
@@ -94,6 +98,8 @@ export function runtimeModelRoute(
   context: {
     orgId: string;
     freeTier?: boolean;
+    /** Persisted picker id, after any hosted-credit fallback. */
+    threadModel?: string;
     /**
      * The origin of a self-host operator's own custom endpoint
      * (key-scopes.ts, selfhostOperatorEndpointOrigin), the one endpoint the
@@ -104,6 +110,9 @@ export function runtimeModelRoute(
 ): RuntimeModelRoute | null {
   const { model } = config;
   if (model.provider === "cloudflare-ai-gateway") {
+    if (context.threadModel === CAMEL_CODE_LLM_MODEL) {
+      return { kind: "scope", model: CAMEL_CODE_RUNTIME_MODEL, keyScope: HOSTED_KEY_SCOPE };
+    }
     if (context.freeTier && config.usageProvider === "compat") {
       return { kind: "scope", model: FREE_TIER_RUNTIME_MODEL, keyScope: HOSTED_KEY_SCOPE };
     }

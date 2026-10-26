@@ -72,6 +72,15 @@ describe("verifyStandardWebhook", () => {
 });
 
 describe("usageRowFor", () => {
+  it.each(["", ":nitro"])("meters camelCode %s without charging credits for free or paid orgs", (suffix) => {
+    for (const billing_status of ["inactive", "active"]) {
+      expect(usageRowFor("evt", { ...data, model: `deepseek/deepseek-v4.1-flash-1017${suffix}` }, { billing_status }))
+        .toMatchObject({ billing_source: "hosted", credit_chargeable: false });
+    }
+    expect(usageRowFor("evt", { ...data, model: "deepseek/deepseek-v4.1-flash" }, { billing_status: "active" }))
+      .toMatchObject({ credit_chargeable: true });
+  });
+
   it("bills hosted usage as camelAI's, as the acting user, keyed by the event id", () => {
     expect(usageRowFor("evt_use1", data, { billing_status: "active" })).toMatchObject({
       workspace_id: "ws1",

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { runtimeModelRoute } from "../src/agent-runtime/model-routes";
 import { PiModelMapping } from "../src/pi-model-resolution";
 import type { PiResolvedModelConfig } from "../src/chat-thread/pi-model-config";
+import { resolveThreadRuntimeRoute } from "../src/agent-runtime/run-gates";
 
 const b64url = (value: unknown) => btoa(JSON.stringify(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const CODEX_TOKEN = `${b64url({})}.${b64url({ "https://api.openai.com/auth": { chatgpt_account_id: "acct" } })}.sig`;
@@ -23,6 +24,27 @@ const GATEWAY = "https://gateway.ai.cloudflare.com/v1/acct/gw";
 const org = { orgId: "org1" };
 
 describe("runtimeModelRoute", () => {
+  it.each([true, false])("runs camelCode on DeepSeek Flash nitro (free tier: %s)", async (freeTier) => {
+    const orgStub = {
+      getThread: async () => ({ model: "deepseek-v4-auto", workspace_id: "ws1" }),
+      getInfo: async () => ({ billing_status: freeTier ? "inactive" : "active", billing_plan: "payg" }),
+      getLlmProviderConfig: async () => null,
+    };
+    const env = {
+      CF_ACCOUNT_ID: "acct", CF_GATEWAY_NAME: "gw", AI_GATEWAY_AUTH_TOKEN: "token",
+      ORG: { idFromName: (id: string) => id, get: () => orgStub },
+    } as unknown as Parameters<typeof resolveThreadRuntimeRoute>[0];
+    const context = { orgId: "org1", workspaceId: "ws1", threadId: "t1" } as Parameters<typeof resolveThreadRuntimeRoute>[1];
+    const { config: resolved, route, threadModel } = await resolveThreadRuntimeRoute(env, context);
+    // The legacy resolver config remains separate from the runtime route.
+    expect(resolved.model.id).toBe("dynamic/luna-muse-fallback");
+    expect(resolved.usageProvider).toBe("compat");
+    expect(threadModel).toBe("deepseek-v4-auto");
+    expect(resolved.creditChargeable).toBe(false);
+    expect(route)
+      .toEqual({ kind: "scope", model: "openrouter/deepseek/deepseek-v4.1-flash-1017:nitro", keyScope: "hosted" });
+  });
+
   it("runs hosted models with the hosted key scope and their OpenRouter id", () => {
     expect(runtimeModelRoute(config({
       billingSource: "hosted", usageProvider: "openrouter",

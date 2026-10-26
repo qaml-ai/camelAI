@@ -10,7 +10,7 @@
  * records too.
  */
 import type { Env } from "../types.js";
-import { FREE_TIER_RUNTIME_MODEL, RUNTIME_MODEL_ENDPOINT } from "./model-routes.js";
+import { CAMEL_CODE_RUNTIME_MODEL, FREE_TIER_RUNTIME_MODEL, RUNTIME_MODEL_ENDPOINT } from "./model-routes.js";
 import { HOSTED_KEY_SCOPE } from "./key-scopes.js";
 import { recordWorkspaceThreadStreaming } from "../thread-status.js";
 
@@ -62,7 +62,9 @@ export function usageRowFor(eventId: string, data: RuntimeUsageRecorded, org: { 
   // chiridion's usage and pricing name Bedrock `bedrock`, its OpenAI models'
   // scope model providers (`bedrock-openai-<region>`) included.
   if (provider === "amazon-bedrock" || provider.startsWith("bedrock-openai-")) provider = "bedrock";
-  const freeTier = `${provider}/${model}` === FREE_TIER_RUNTIME_MODEL;
+  const runtimeModel = `${provider}/${model}`.replace(/:nitro$/, "");
+  const freeTier = runtimeModel === FREE_TIER_RUNTIME_MODEL ||
+    runtimeModel === CAMEL_CODE_RUNTIME_MODEL.replace(/:nitro$/, "");
   const context = data.context ?? {};
   return {
     workspace_id: text(context.workspace),

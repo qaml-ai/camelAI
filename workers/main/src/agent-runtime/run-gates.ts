@@ -36,7 +36,7 @@ import { assertUserLlmUsageAccess, UserLlmUsageLimitError } from "../user-llm-us
 import { createPiSystemPrompt } from "../pi-system-prompt";
 import { resolveAgentSkillCatalog } from "../selfhost-agent-pack";
 import { RUNTIME_PROMPT_PREAMBLE, type RuntimeRunConfig } from "./runtime-prompt";
-import { FREE_TIER_RUNTIME_MODEL, runtimeModelRoute, type RuntimeModelRoute } from "./model-routes";
+import { runtimeModelRoute, type RuntimeModelRoute } from "./model-routes";
 import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, selfhostOperatorEndpointOrigin, syncOrgKeyScope } from "./key-scopes";
 
 type OrgInfoLike = {
@@ -187,6 +187,7 @@ export async function resolveThreadRuntimeRoute(
   if (ranOn) threadModel = ranOn as LlmModel;
   const route = runtimeModelRoute(config, {
     orgId: context.orgId,
+    threadModel,
     freeTier: isCreditFreeHostedModel(threadModel),
     operatorEndpointOrigin: selfhostOperatorEndpointOrigin(env),
   });
@@ -249,8 +250,9 @@ export async function prepareThreadRuntimeRun(
     if (!userId) return;
     // Limits are checked against the model the runtime will call (the free
     // tier's runtime model is not the in-DO loop's dynamic route).
-    const gated = route.kind === "scope" && route.model === FREE_TIER_RUNTIME_MODEL
-      ? { provider: "openrouter", model: "openai/gpt-6-luna" }
+    const slash = route.model.indexOf("/");
+    const gated = route.kind === "scope" && route.keyScope === HOSTED_KEY_SCOPE
+      ? { provider: route.model.slice(0, slash), model: route.model.slice(slash + 1) }
       : { provider: config.usageProvider || config.model.provider, model: config.model.id };
     try {
       await assertUserLlmUsageAccess(org, {

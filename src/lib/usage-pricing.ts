@@ -437,6 +437,16 @@ const modelPricingTable: Record<string, ModelPricing> = {
     cacheCreationPerToken: 0.0000000416666666666667,
     cacheReadPerToken: 0.000000075,
   },
+  "deepseek/deepseek-v4.1-flash-1017": {
+    inputPerToken: 0.00000015,
+    outputPerToken: 0.0000006,
+    cacheReadPerToken: 0.000000003,
+  },
+  "deepseek-v4.1-flash-1017": {
+    inputPerToken: 0.00000015,
+    outputPerToken: 0.0000006,
+    cacheReadPerToken: 0.000000003,
+  },
   "deepseek/deepseek-v4.1-flash": {
     inputPerToken: 0.0000003,
     outputPerToken: 0.0000012,

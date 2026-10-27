@@ -56,7 +56,7 @@ describe("runtimeModelRoute", () => {
     ["sonnet", "openrouter/anthropic/claude-sonnet-5.5:nitro"],
     ["opus-5.5", "openrouter/anthropic/claude-opus-5.5"],
     ["fable-5.1", "openrouter/anthropic/claude-fable-5.1:nitro"],
-    ["haiku", "openrouter/anthropic/claude-sonnet-5.5:nitro"],
+    ["haiku", "openrouter/anthropic/claude-haiku-5.5:nitro"],
     ["haiku-5.5", "openrouter/anthropic/claude-haiku-5.5:nitro"],
     ["gpt-6.1-sol", "openrouter/openai/gpt-6.1-sol:nitro"],
     ["gpt-6-luna", "openrouter/openai/gpt-6-luna"],

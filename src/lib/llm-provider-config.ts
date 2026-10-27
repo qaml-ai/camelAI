@@ -43,8 +43,8 @@ const STORED_LLM_MODEL_REPLACEMENTS: Readonly<Record<string, LlmModel>> = {
   "gpt-5.5": "gpt-6.1-sol",
   "gpt-5.4": "gpt-6.1-sol",
   "gpt-5.4-mini": "gpt-6-luna",
-  // Sonnet runs on every key that could run Haiku, including Claude-only ones.
-  haiku: "sonnet",
+  // Haiku 5.5 is a picker model on every key that could run the old Haiku.
+  haiku: "haiku-5.5",
 };
 
 // Raw Claude API ids (claude-sonnet-4-20250514, claude-3-7-sonnet-20250219,

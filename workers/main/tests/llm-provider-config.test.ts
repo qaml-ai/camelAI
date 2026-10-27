@@ -149,15 +149,15 @@ describe("llm provider config helpers", () => {
       "grok-4.5": "grok-4.7",
       "glm-5.2": "glm-5.3",
       "glm-latest": "glm-5.3",
-      haiku: "sonnet",
+      haiku: "haiku-5.5",
     };
     for (const [stored, replacement] of Object.entries(replacements)) {
       expect(isLlmModel(stored), stored).toBe(false);
       expect(resolveStoredLlmModel(stored), stored).toBe(replacement);
     }
     expect(normalizeLlmModel("glm-5.2", "openrouter")).toBe("glm-5.3");
-    expect(normalizeLlmModel("haiku", "anthropic")).toBe("sonnet");
-    expect(normalizeLlmModel("haiku", "bedrock")).toBe("sonnet");
+    expect(normalizeLlmModel("haiku", "anthropic")).toBe("haiku-5.5");
+    expect(normalizeLlmModel("haiku", "bedrock")).toBe("haiku-5.5");
     expect(normalizeLlmModel("opus-5", "anthropic")).toBe("opus-5.5");
     expect(normalizeLlmModel("fable-5", "bedrock")).toBe("fable-5.1");
     expect(normalizeLlmModel("gpt-5.6-terra", "openai")).toBe("gpt-6.1-sol");

@@ -15,7 +15,7 @@ import type { PiHeaderValue, PiResolvedModelReference } from "./chat-thread-do";
 
 // Retired product and provider ids, run as their closest current model.
 const RETIRED_PI_MODEL_IDS: Readonly<Record<string, string>> = {
-  haiku: "sonnet",
+  haiku: "haiku-5.5",
   opus: "opus-5.5",
   "opus-4.7": "opus-5.5",
   "opus-4.8": "opus-5.5",

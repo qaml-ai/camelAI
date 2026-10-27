@@ -47,6 +47,27 @@ const STORED_LLM_MODEL_REPLACEMENTS: Readonly<Record<string, LlmModel>> = {
   haiku: "sonnet",
 };
 
+// Raw Claude API ids (claude-sonnet-4-20250514, claude-3-7-sonnet-20250219,
+// claude-opus-4-20250514, claude-3-5-haiku-20241022, Bedrock's
+// anthropic.claude-* and us.anthropic.claude-*, ...) that older threads and
+// agents still carry. Each family runs as its current picker model, so these
+// threads stay on Claude instead of taking the OpenAI default. OpenRouter-style
+// "anthropic/claude-*" ids are left alone: Pi routes those through OpenRouter.
+const LEGACY_CLAUDE_MODEL_ID = /^(?:[a-z]+\.)?(?:anthropic\.)?claude-[a-z0-9.:@-]+$/;
+const LEGACY_CLAUDE_FAMILY_MODELS: ReadonlyArray<readonly [string, LlmModel]> = [
+  ["opus", "opus-5.5"],
+  ["fable", "fable-5.1"],
+  ["haiku", "haiku-5.5"],
+  ["sonnet", "sonnet"],
+];
+
+/** The current picker model a raw Claude API id runs as, or null if it is not one. */
+export function replaceLegacyClaudeModelId(value: string): LlmModel | null {
+  const normalized = value.trim().toLowerCase();
+  if (!LEGACY_CLAUDE_MODEL_ID.test(normalized)) return null;
+  return LEGACY_CLAUDE_FAMILY_MODELS.find(([family]) => normalized.includes(family))?.[1] ?? null;
+}
+
 // Bedrock has no GPT-6 Sol or Luna, so its retired OpenAI models land on Terra.
 const STORED_BEDROCK_OPENAI_MODELS = new Set([
   "gpt-5.6-sol",
@@ -497,7 +518,9 @@ export function replaceRetiredLlmModel(
   ) {
     return "gpt-5.6-terra-bedrock";
   }
-  return STORED_LLM_MODEL_REPLACEMENTS[value] ?? value;
+  return STORED_LLM_MODEL_REPLACEMENTS[value] ??
+    replaceLegacyClaudeModelId(value) ??
+    value;
 }
 
 export function resolveStoredLlmModel(

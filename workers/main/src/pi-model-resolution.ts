@@ -9,6 +9,7 @@ import {
   DEFAULT_OPENAI_MODEL,
   getBedrockOpenAiModelRegions,
   normalizeLlmModel,
+  replaceLegacyClaudeModelId,
 } from "../../../src/lib/llm-provider-config";
 import type { PiHeaderValue, PiResolvedModelReference } from "./chat-thread-do";
 
@@ -136,7 +137,9 @@ export class PiModelMapping {
 
   normalizePiModelId(modelId: string): string {
     const normalized = modelId.trim();
-    return RETIRED_PI_MODEL_IDS[normalized.toLowerCase()] ?? normalized;
+    return RETIRED_PI_MODEL_IDS[normalized.toLowerCase()] ??
+      replaceLegacyClaudeModelId(normalized) ??
+      normalized;
   }
 
   openRouterAttributionHeaders(): Record<string, string> {
@@ -190,50 +193,17 @@ export class PiModelMapping {
     };
   }
 
+  /** The OpenRouter id of a Claude model resolvePiModelReference runs. */
   openRouterClaudeModel(model: string): string {
     switch (model.trim().toLowerCase()) {
-      case "sonnet":
       case "claude-sonnet-5-5":
-      case "claude-sonnet-5":
         return "anthropic/claude-sonnet-5.5";
-      case "haiku-5.5":
       case "claude-haiku-5-5":
         return "anthropic/claude-haiku-5.5";
-      case "fable-5.1":
-      case "fable-5":
       case "claude-fable-5-1":
-      case "claude-fable-5":
         return "anthropic/claude-fable-5.1";
-      case "opus":
-      case "opus-4.7":
-      case "opus-4.8":
-      case "opus-5":
-      case "opus-5.5":
       case "claude-opus-5-5":
-      case "claude-opus-5":
-      case "claude-opus-4-8":
-      case "claude-opus-4.8":
-      case "claude-opus-4-7":
-      case "claude-opus-4.7":
-      case "claude-opus-4-6":
-      case "claude-opus-4.6":
         return "anthropic/claude-opus-5.5";
-      case "claude-sonnet-4-6":
-        return "anthropic/claude-sonnet-4.6";
-      // Claude Sonnet 4, Opus 4, 3.7 Sonnet and the 3.5s are no longer in
-      // Pi's catalog (pi-ai 1.4.0): they run as their closest current model.
-      case "claude-sonnet-4-5-20250929":
-      case "claude-sonnet-4-20250514":
-      case "claude-3-7-sonnet-20250219":
-      case "claude-3-5-sonnet-20241022":
-      case "claude-3-5-sonnet-20240620":
-        return "anthropic/claude-sonnet-4.5";
-      case "claude-haiku-4-5-20251001":
-      case "claude-3-5-haiku-20241022":
-        return "anthropic/claude-haiku-4.5";
-      case "claude-opus-4-5-20251101":
-      case "claude-opus-4-20250514":
-        return "anthropic/claude-opus-4.5";
       default:
         return model;
     }

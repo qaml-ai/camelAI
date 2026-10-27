@@ -220,23 +220,20 @@ export class PiModelMapping {
         return "anthropic/claude-opus-5.5";
       case "claude-sonnet-4-6":
         return "anthropic/claude-sonnet-4.6";
+      // Claude Sonnet 4, Opus 4, 3.7 Sonnet and the 3.5s are no longer in
+      // Pi's catalog (pi-ai 1.4.0): they run as their closest current model.
       case "claude-sonnet-4-5-20250929":
-        return "anthropic/claude-sonnet-4.5";
-      case "claude-haiku-4-5-20251001":
-        return "anthropic/claude-haiku-4.5";
-      case "claude-opus-4-5-20251101":
-        return "anthropic/claude-opus-4.5";
       case "claude-sonnet-4-20250514":
-        return "anthropic/claude-sonnet-4";
-      case "claude-opus-4-20250514":
-        return "anthropic/claude-opus-4";
       case "claude-3-7-sonnet-20250219":
-        return "anthropic/claude-3.7-sonnet";
       case "claude-3-5-sonnet-20241022":
       case "claude-3-5-sonnet-20240620":
-        return "anthropic/claude-3.5-sonnet";
+        return "anthropic/claude-sonnet-4.5";
+      case "claude-haiku-4-5-20251001":
       case "claude-3-5-haiku-20241022":
-        return "anthropic/claude-3.5-haiku";
+        return "anthropic/claude-haiku-4.5";
+      case "claude-opus-4-5-20251101":
+      case "claude-opus-4-20250514":
+        return "anthropic/claude-opus-4.5";
       default:
         return model;
     }

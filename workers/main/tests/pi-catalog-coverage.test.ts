@@ -23,3 +23,27 @@ describe("Pi's catalog", () => {
     expect(lookup("openrouter", openRouterId), `openrouter/${openRouterId}`).toBeTruthy();
   });
 });
+
+// Claude ids that older threads and BYOK configs may still carry, and the
+// current OpenRouter model each runs as. pi-ai 1.4.0 (camelRun's catalog) has
+// no Claude Sonnet 4, Opus 4, 3.7 Sonnet or 3.5s, so none maps to them.
+const LEGACY_CLAUDE_OPENROUTER_MODELS: Readonly<Record<string, string>> = {
+  "claude-sonnet-4-6": "anthropic/claude-sonnet-4.6",
+  "claude-sonnet-4-5-20250929": "anthropic/claude-sonnet-4.5",
+  "claude-sonnet-4-20250514": "anthropic/claude-sonnet-4.5",
+  "claude-3-7-sonnet-20250219": "anthropic/claude-sonnet-4.5",
+  "claude-3-5-sonnet-20241022": "anthropic/claude-sonnet-4.5",
+  "claude-3-5-sonnet-20240620": "anthropic/claude-sonnet-4.5",
+  "claude-haiku-4-5-20251001": "anthropic/claude-haiku-4.5",
+  "claude-3-5-haiku-20241022": "anthropic/claude-haiku-4.5",
+  "claude-opus-4-5-20251101": "anthropic/claude-opus-4.5",
+  "claude-opus-4-20250514": "anthropic/claude-opus-4.5",
+};
+
+describe("legacy Claude ids", () => {
+  it.each(Object.entries(LEGACY_CLAUDE_OPENROUTER_MODELS))("run %s as %s, a model Pi's catalog has", (id, expected) => {
+    const openRouterId = mapping.openRouterClaudeModel(id);
+    expect(openRouterId).toBe(expected);
+    expect(lookup("openrouter", openRouterId), `openrouter/${openRouterId}`).toBeTruthy();
+  });
+});

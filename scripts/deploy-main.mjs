@@ -10,9 +10,11 @@
  * 5. Applies the APP_DB D1 migrations (--remote; SKIP_D1_MIGRATIONS=1 skips)
  * 6. Runs wrangler deploy
  *
- * Workers Builds runs this for both environments (deploy command
- * `bun run deploy:main:staging` on main, `deploy:main:prod` on the
- * production branch the Deploy to Production workflow pushes).
+ * GitHub Actions runs this for both environments (.github/workflows/
+ * deploy-worker.yml: `deploy:main:staging` on push to main,
+ * `deploy:main:prod` from the Deploy to Production workflow). Workers Builds
+ * cannot, as it has no Docker for the Containers images.
+ * See infra/deploy/README.md.
  *
  * Usage: node scripts/deploy-main.mjs [staging|prod]
  */

@@ -1,0 +1,20 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/deploy-worker.yml
+    with:
+      environment: staging
+      ref: ${{ github.sha }}
+      # Until the staging environment has CLOUDFLARE_API_TOKEN, pushes to main
+      # skip with a warning (Workers Builds still deploys); a manual run fails.
+      skip_without_token: ${{ github.event_name == 'push' }}
+    secrets: inherit

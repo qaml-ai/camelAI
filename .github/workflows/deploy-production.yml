@@ -8,18 +8,35 @@ on:
         required: true
 
 jobs:
-  deploy:
+  promote:
+    name: Push main to production
     runs-on: ubuntu-latest
     permissions:
       contents: write
     if: github.event.inputs.confirm == 'deploy'
+    outputs:
+      sha: ${{ steps.push.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Push main to production
+        id: push
         run: |
           git fetch origin main
           production_sha="$(git rev-parse origin/main)"
           git push origin "${production_sha}:refs/heads/production" --force
+          echo "sha=${production_sha}" >> "$GITHUB_OUTPUT"
+
+  # The production branch records what is live; the deploy itself runs here
+  # (Docker is available for the Containers images), on the same commit.
+  deploy:
+    needs: promote
+    permissions:
+      contents: read
+    uses: ./.github/workflows/deploy-worker.yml
+    with:
+      environment: production
+      ref: ${{ needs.promote.outputs.sha }}
+    secrets: inherit

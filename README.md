@@ -216,6 +216,11 @@ bun run deploy:dispatcher:staging
 bun run deploy:dispatcher:prod
 ```
 
+The main application deploys from GitHub Actions: pushes to `main` deploy
+staging and the manual Deploy to Production workflow deploys prod (see
+[infra/deploy/README.md](infra/deploy/README.md)).
+The commands above remain the local fallback.
+
 Other Workers have dedicated `deploy:*` scripts in [package.json](package.json).
 Environment-specific bindings live in the corresponding `wrangler*.jsonc`
 files.

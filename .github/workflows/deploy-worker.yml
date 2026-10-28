@@ -1,0 +1,165 @@
+name: Deploy worker
+
+# Reusable deploy of the main worker (chiridion-app / chiridion-app-staging):
+# build, D1 migrations, `wrangler deploy` (which builds the Containers images
+# with the runner's Docker and pushes them to Cloudflare's registry), then a
+# smoke check. Called by deploy-staging.yml (push to main) and
+# deploy-production.yml (manual). See infra/deploy/README.md.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment, staging or production
+        required: true
+        type: string
+      ref:
+        description: Commit SHA to deploy
+        required: true
+        type: string
+      skip_without_token:
+        description: Skip (warning, green) instead of failing when CLOUDFLARE_API_TOKEN is missing
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: deploy (${{ inputs.environment }})
+    # amd64 runner: Cloudflare runs containers as linux/amd64, so the images
+    # build natively here (no emulation).
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.environment == 'production' && 'https://camelai.dev' || 'https://staging.camelai.dev' }}
+    # One deploy per environment at a time; a newer pending run replaces an
+    # older pending one, a running deploy is never cancelled midway.
+    concurrency:
+      group: deploy-worker-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      # Not secret: the same account id is in wrangler.*.jsonc vars.
+      CLOUDFLARE_ACCOUNT_ID: 85bbd288051330fb51ee1c86031a299b
+      DEPLOY_TARGET: ${{ inputs.environment == 'production' && 'prod' || 'staging' }}
+      APP_URL: ${{ inputs.environment == 'production' && 'https://camelai.dev' || 'https://staging.camelai.dev' }}
+    steps:
+      - name: Check deploy credentials
+        id: preflight
+        env:
+          HAS_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+          SKIP_WITHOUT_TOKEN: ${{ inputs.skip_without_token }}
+          TARGET_ENV: ${{ inputs.environment }}
+        run: |
+          if [[ "$TARGET_ENV" != staging && "$TARGET_ENV" != production ]]; then
+            echo "::error::Unknown environment '$TARGET_ENV' (expected staging or production)."
+            exit 1
+          fi
+          if [[ "$HAS_TOKEN" == true ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          message="CLOUDFLARE_API_TOKEN is not set for the '$TARGET_ENV' GitHub environment; nothing was deployed. Add it under Settings > Environments > $TARGET_ENV (see infra/deploy/README.md)."
+          if [[ "$SKIP_WITHOUT_TOKEN" == true ]]; then
+            echo "::warning::$message"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::$message"
+          exit 1
+
+      - if: steps.preflight.outputs.ready == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - if: steps.preflight.outputs.ready == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - if: steps.preflight.outputs.ready == 'true'
+        uses: oven-sh/setup-bun@v2
+
+      - if: steps.preflight.outputs.ready == 'true'
+        run: bun install --frozen-lockfile
+
+      - name: Check Docker
+        if: steps.preflight.outputs.ready == 'true'
+        # wrangler deploy runs `docker build --load --platform linux/amd64` for
+        # each container image, then pushes to registry.cloudflare.com.
+        run: |
+          docker version
+          docker buildx version
+          df -h /
+
+      - name: Deploy (build, D1 migrations, wrangler deploy)
+        id: deploy
+        if: steps.preflight.outputs.ready == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          build_id="$(git rev-parse HEAD)"
+          echo "build_id=$build_id" >> "$GITHUB_OUTPUT"
+          # Served by /api/version; the smoke step waits for it.
+          export CAMELAI_BUILD_ID="$build_id"
+          bun run "deploy:main:$DEPLOY_TARGET"
+
+      - name: Smoke
+        if: steps.preflight.outputs.ready == 'true'
+        env:
+          BUILD_ID: ${{ steps.deploy.outputs.build_id }}
+          # Optional Cloudflare Access service token: staging is behind Access,
+          # so without it the staging smoke can only see the Access redirect.
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          access_headers=()
+          if [[ -n "$CF_ACCESS_CLIENT_ID" && -n "$CF_ACCESS_CLIENT_SECRET" ]]; then
+            access_headers=(-H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET")
+          fi
+
+          expect_status() {
+            local url="$1" want="$2" got
+            got="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "${access_headers[@]}" "$url" || true)"
+            echo "$url -> $got"
+            if [[ "$got" != "$want" ]]; then
+              echo "::error::Smoke failed: $url returned $got, expected $want"
+              return 1
+            fi
+          }
+
+          wait_for_build() {
+            local live=""
+            for _ in $(seq 1 30); do
+              live="$(curl -sS --max-time 15 "${access_headers[@]}" "$APP_URL/api/version" | jq -r '.buildId // empty' 2>/dev/null || true)"
+              if [[ "$live" == "$BUILD_ID" ]]; then
+                echo "$APP_URL is serving build $BUILD_ID"
+                return 0
+              fi
+              sleep 10
+            done
+            echo "::error::$APP_URL/api/version still reports '$live', expected $BUILD_ID"
+            return 1
+          }
+
+          if [[ "$DEPLOY_TARGET" == prod ]]; then
+            wait_for_build
+            expect_status https://camelai.dev/login 200
+            expect_status https://camelai.com 200
+            expect_status https://camelai.com/login 200
+          elif [[ ${#access_headers[@]} -gt 0 ]]; then
+            wait_for_build
+            expect_status "$APP_URL/login" 200
+          else
+            echo "::warning::No CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET for staging; only checking the Access redirect, not the deployed build."
+            location="$(curl -sS -o /dev/null -w '%{redirect_url}' --max-time 20 "$APP_URL/login" || true)"
+            echo "$APP_URL/login -> $location"
+            if [[ "$location" != https://qaml.cloudflareaccess.com/* ]]; then
+              echo "::error::Smoke failed: expected a Cloudflare Access redirect from $APP_URL/login"
+              exit 1
+            fi
+          fi

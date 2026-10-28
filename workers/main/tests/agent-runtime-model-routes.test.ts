@@ -24,7 +24,7 @@ const GATEWAY = "https://gateway.ai.cloudflare.com/v1/acct/gw";
 const org = { orgId: "org1" };
 
 describe("runtimeModelRoute", () => {
-  it.each([true, false])("runs camelCode on DeepSeek Flash nitro (free tier: %s)", async (freeTier) => {
+  it.each([true, false])("runs camelCode on DeepSeek Flash on the platform's Azure deployment (free tier: %s)", async (freeTier) => {
     const orgStub = {
       getThread: async () => ({ model: "deepseek-v4-auto", workspace_id: "ws1" }),
       getInfo: async () => ({ billing_status: freeTier ? "inactive" : "active", billing_plan: "payg" }),
@@ -42,7 +42,7 @@ describe("runtimeModelRoute", () => {
     expect(threadModel).toBe("deepseek-v4-auto");
     expect(resolved.creditChargeable).toBe(false);
     expect(route)
-      .toEqual({ kind: "scope", model: "openrouter/deepseek/deepseek-v4.1-flash-1017:nitro", keyScope: "hosted" });
+      .toEqual({ kind: "scope", model: "azure/deepseek-v4.1-flash", keyScope: "hosted" });
   });
 
   it("runs hosted models with the hosted key scope and their OpenRouter id", () => {

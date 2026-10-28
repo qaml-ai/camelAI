@@ -12,6 +12,8 @@ import { stringifyStoredLlmProviderConfig } from "../../../src/lib/llm-provider-
 import { buildWorkspaceScopedR2Key } from "../../../src/lib/workspace-r2-paths";
 import type { ChatEnv } from "../src/chat-thread/types";
 import { RUNTIME_PROMPT_VERSION } from "../src/agent-runtime/runtime-prompt";
+import { CAMEL_CODE_LLM_MODEL } from "../../../src/lib/llm-provider-config";
+import { CAMEL_CODE_RUNTIME_MODEL, PREVIOUS_CAMEL_CODE_RUNTIME_MODEL } from "../src/agent-runtime/model-routes";
 import {
   abortRuntimeThread,
   answerRuntimeInput,
@@ -230,6 +232,54 @@ describe("startRuntimeTurn", () => {
     expect(configure.body).not.toHaveProperty("keyScope");
     const order = calls.map((call) => call.path);
     expect(order.indexOf("/v1/agents/agt_1/configuration")).toBeLessThan(order.indexOf("/v1/agents/agt_1/prompt"));
+  });
+
+  it("caps camelCode's context on its agent, and takes the cap off when the thread leaves camelCode", async () => {
+    const hostedEnv = { ...runtimeEnv, CF_ACCOUNT_ID: "acct", CF_GATEWAY_NAME: "gw", AI_GATEWAY_AUTH_TOKEN: "gw-token" } as ChatEnv;
+    const sendWith = async (setup: Awaited<ReturnType<typeof runtimeThread>>, text: string, clientMessageId: string) => {
+      const row = (await setup.orgStub.getThreadRuntime(setup.threadId))!;
+      return await startRuntimeTurn(hostedEnv, { context: setup.context, row, sender: setup.sender, text, clientMessageId, waitUntil: () => {} });
+    };
+
+    // A new camelCode thread's agent is made with the cap.
+    const fresh = await runtimeThread();
+    await fresh.orgStub.updateThreadModel(fresh.threadId, CAMEL_CODE_LLM_MODEL);
+    let calls = fakeRuntime();
+    expect(await sendWith(fresh, "first", "cm_cc1")).toMatchObject({ status: "accepted" });
+    const create = calls.find((call) => call.method === "POST" && call.path === "/v1/agents")!;
+    expect(create.body).toMatchObject({ model: CAMEL_CODE_RUNTIME_MODEL, keyScope: "hosted", runLimits: { contextTokens: 262_144 } });
+
+    // An existing camelCode thread (its agent on the previous model) gets the cap with the new model.
+    const existing = await runtimeThread();
+    await existing.orgStub.updateThreadModel(existing.threadId, CAMEL_CODE_LLM_MODEL);
+    await existing.orgStub.setThreadRuntimeAgent(existing.threadId, {
+      agentId: "agt_1", model: PREVIOUS_CAMEL_CODE_RUNTIME_MODEL, keyScope: "hosted", configured: { promptVersion: RUNTIME_PROMPT_VERSION },
+    });
+    calls = fakeRuntime();
+    expect(await sendWith(existing, "again", "cm_cc2")).toMatchObject({ status: "accepted" });
+    let configure = calls.find((call) => call.path === "/v1/agents/agt_1/configuration")!;
+    expect(configure.body).toMatchObject({ model: CAMEL_CODE_RUNTIME_MODEL, runLimits: { contextTokens: 262_144 } });
+
+    // Switched to another model, the cap goes.
+    await existing.orgStub.updateThreadModel(existing.threadId, "opus");
+    calls = fakeRuntime();
+    expect(await sendWith(existing, "on opus", "cm_cc3")).toMatchObject({ status: "accepted" });
+    configure = calls.find((call) => call.path === "/v1/agents/agt_1/configuration")!;
+    expect(configure.body.model).not.toBe(CAMEL_CODE_RUNTIME_MODEL);
+    expect(configure.body).toHaveProperty("runLimits", null);
+  });
+
+  it("leaves run limits alone when neither model is camelCode", async () => {
+    const setup = await runtimeThread();
+    fakeRuntime();
+    await send(setup, "first", "cm_nl1");
+    await setup.orgStub.updateThreadModel(setup.threadId, "opus");
+    const calls = fakeRuntime();
+    await send(setup, "second", "cm_nl2");
+    const configure = calls.find((call) => call.path === "/v1/agents/agt_1/configuration")!;
+    expect(configure.body).not.toHaveProperty("runLimits");
+    const create = calls.find((call) => call.method === "POST" && call.path === "/v1/agents");
+    expect(create).toBeUndefined();
   });
 
   it("rides out a connection lost under the agent's configuration once, and nothing else", async () => {

@@ -20,6 +20,7 @@ import { buildWorkspaceScopedR2Key } from "../../../../src/lib/workspace-r2-path
 import { applyMentionContext } from "../mention-context";
 import { WorkspaceFilesystemClient } from "../workspace-filesystem-do";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
+import { runtimeRunLimits } from "./model-routes";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
 import { RuntimeApiError, runtimeApi, runtimeUrl } from "./runtime-api";
 import { codexError, codexRoute, codexUpstreamCall, forwardedResponseHeaders } from "./codex-forwarder";
@@ -230,6 +231,7 @@ async function createThreadAgent(
 ): Promise<string> {
   const thread = await orgStub(env, context.orgId).getThread(context.threadId);
   const subject = thread?.created_by?.trim() || context.userId || "";
+  const runLimits = runtimeRunLimits(run.model);
   const created = await runtimeApi(env, "POST", "/v1/agents", {
     definition: env.AGENT_RUNTIME_DEFINITION,
     name: context.threadId,
@@ -239,6 +241,7 @@ async function createThreadAgent(
     ...(run.keyScope ? { keyScope: run.keyScope } : {}),
     ...(run.modelHeaders ? { modelHeaders: run.modelHeaders } : {}),
     thinkingLevel: run.thinkingLevel,
+    ...(runLimits ? { runLimits } : {}),
     systemPromptAppend: runtimeSystemPromptAppend(env, context),
     fileTools: false,
     ...(subject ? { subject } : {}),
@@ -338,6 +341,9 @@ async function ensureConfiguredAgent(
   }
   const id = row.agentId;
   const modelChanged = row.model !== run.model;
+  // A model with run limits of chiridion's own (camelCode's context cap) sets
+  // them; leaving it removes them, so they never outlive the model.
+  const limitsChanged = modelChanged && (runtimeRunLimits(run.model) !== null || runtimeRunLimits(row.model) !== null);
   const scopeChanged = (row.keyScope ?? null) !== run.keyScope;
   const { spendLimitUsd: agentLimit, spendLimitSetAt: _setAt, ...configured } = row.configured ?? {};
   // A limit an earlier release set on the agent itself (each run carries its own now).
@@ -350,6 +356,7 @@ async function ensureConfiguredAgent(
     requestId: `run_${crypto.randomUUID()}`,
     ...(limitLeft ? { spendLimit: null } : {}),
     ...(modelChanged ? { model: run.model, thinkingLevel: run.thinkingLevel } : {}),
+    ...(limitsChanged ? { runLimits: runtimeRunLimits(run.model) } : {}),
     ...(scopeChanged ? { keyScope: run.keyScope, modelHeaders: run.modelHeaders } : {}),
     ...(promptChanged ? { systemPromptAppend: runtimeSystemPromptAppend(env, context) } : {}),
   }));

@@ -81,6 +81,13 @@ describe("usageRowFor", () => {
       .toMatchObject({ credit_chargeable: true });
   });
 
+  it("meters camelCode on the platform's Azure deployment without charging credits", () => {
+    for (const billing_status of ["inactive", "active"]) {
+      expect(usageRowFor("evt", { ...data, provider: "azure", model: "deepseek-v4.1-flash" }, { billing_status }))
+        .toMatchObject({ provider: "azure", model: "deepseek-v4.1-flash", billing_source: "hosted", credit_chargeable: false });
+    }
+  });
+
   it("bills hosted usage as camelAI's, as the acting user, keyed by the event id", () => {
     expect(usageRowFor("evt_use1", data, { billing_status: "active" })).toMatchObject({
       workspace_id: "ws1",

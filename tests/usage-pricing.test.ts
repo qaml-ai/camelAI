@@ -52,6 +52,16 @@ describe("calculateUsageCostUsd", () => {
       cacheReadInputTokens: 1_000_000, cacheCreationInputTokens: 0 })).toBeCloseTo(0.753);
   });
 
+  it.each(["azure/deepseek-v4.1-flash", "deepseek-v4.1-flash"])("prices camelCode on Azure as %s", (model) => {
+    expect(lookupPricingOrNull(model)).toEqual({
+      inputPerToken: 0.0000003,
+      outputPerToken: 0.0000012,
+      cacheReadPerToken: 0.000000006,
+    });
+    expect(calculateUsageCostUsd({ model, inputTokens: 1_000_000, outputTokens: 1_000_000,
+      cacheReadInputTokens: 1_000_000, cacheCreationInputTokens: 0 })).toBeCloseTo(1.506);
+  });
+
   it("keeps strict lookup separate from the legacy Sonnet fallback", () => {
     expect(lookupPricingOrNull("camel/anthropic/claude-sonnet-5:nitro")).toEqual(
       lookupPricing("claude-sonnet-5"),

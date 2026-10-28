@@ -452,6 +452,12 @@ const modelPricingTable: Record<string, ModelPricing> = {
     outputPerToken: 0.0000012,
     cacheReadPerToken: 0.000000006,
   },
+  // camelCode on camelRun's platform Azure deployment (its pi-catalog price).
+  "azure/deepseek-v4.1-flash": {
+    inputPerToken: 0.0000003,
+    outputPerToken: 0.0000012,
+    cacheReadPerToken: 0.000000006,
+  },
   "deepseek-v4.1-flash": {
     inputPerToken: 0.0000003,
     outputPerToken: 0.0000012,

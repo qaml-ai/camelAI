@@ -45,8 +45,32 @@ export const RUNTIME_MODEL_ENDPOINT = "chiridion";
  */
 export const FREE_TIER_RUNTIME_MODEL = "openrouter/openai/gpt-6-luna";
 
-/** camelCode's hosted runtime model, independent of its legacy gateway route. */
-export const CAMEL_CODE_RUNTIME_MODEL = "openrouter/deepseek/deepseek-v4.1-flash-1017:nitro";
+/**
+ * camelCode's hosted runtime model, independent of its legacy gateway route:
+ * DeepSeek V4.1 Flash on camelRun's platform Azure deployment (paid from Azure
+ * credits). The hosted key scope holds no `azure` entry, so the runtime calls
+ * it on the platform's key, which chiridion's admin tenant uses (it is unbilled
+ * and does not set `platformKeys: false`).
+ */
+export const CAMEL_CODE_RUNTIME_MODEL = "azure/deepseek-v4.1-flash";
+
+/**
+ * camelCode's runtime model until 2026-10-28 (now CAMEL_CODE_RUNTIME_MODEL):
+ * usage.ts still treats its usage as free for runs in flight at the switch.
+ */
+export const PREVIOUS_CAMEL_CODE_RUNTIME_MODEL = "openrouter/deepseek/deepseek-v4.1-flash-1017:nitro";
+
+/**
+ * The most context one camelCode request carries: the runtime compacts before
+ * a request would pass it, well below the model's 1M window, since each
+ * request reads (and pays for) its whole context.
+ */
+export const CAMEL_CODE_CONTEXT_TOKENS = 262_144;
+
+/** The runtime run limits an agent on `model` gets of chiridion's own: only camelCode has any. */
+export function runtimeRunLimits(model: string | null | undefined): { contextTokens: number } | null {
+  return model === CAMEL_CODE_RUNTIME_MODEL ? { contextTokens: CAMEL_CODE_CONTEXT_TOKENS } : null;
+}
 
 /**
  * Bedrock's Converse ids for the bare ids chiridion's resolver names (bedrock-mantle's), where they

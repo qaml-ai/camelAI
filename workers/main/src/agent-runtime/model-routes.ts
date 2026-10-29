@@ -55,8 +55,11 @@ export const FREE_TIER_RUNTIME_MODEL = "openrouter/openai/gpt-6-luna";
 export const CAMEL_CODE_RUNTIME_MODEL = "azure/deepseek-v4.1-flash";
 
 /**
- * camelCode's runtime model until 2026-10-28 (now CAMEL_CODE_RUNTIME_MODEL):
- * usage.ts still treats its usage as free for runs in flight at the switch.
+ * camelCode's runtime model until 2026-10-28 (now CAMEL_CODE_RUNTIME_MODEL),
+ * and still the runtime's content-filter fallback for it: a request Azure's
+ * content filter blocks is made again on this model, on the hosted scope's
+ * OpenRouter key (camelRun's AGENT_CONTENT_FILTER_FALLBACKS default). usage.ts
+ * treats its usage as free, as camelCode's.
  */
 export const PREVIOUS_CAMEL_CODE_RUNTIME_MODEL = "openrouter/deepseek/deepseek-v4.1-flash-1017:nitro";
 

@@ -88,6 +88,13 @@ describe("usageRowFor", () => {
     }
   });
 
+  it("charges a blocked response its fallback replaced to nobody, and the fallback's answer as any other", () => {
+    // A credit-chargeable hosted model, so only `superseded` decides.
+    const blocked = { ...data, superseded: "content_filter" };
+    expect(usageRowFor("evt_blocked", blocked, { billing_status: "active" })).toMatchObject({ billing_source: "hosted", credit_chargeable: false, input_tokens: data.input });
+    expect(usageRowFor("evt_answer", data, { billing_status: "active" }).credit_chargeable).toBe(true);
+  });
+
   it("bills hosted usage as camelAI's, as the acting user, keyed by the event id", () => {
     expect(usageRowFor("evt_use1", data, { billing_status: "active" })).toMatchObject({
       workspace_id: "ws1",

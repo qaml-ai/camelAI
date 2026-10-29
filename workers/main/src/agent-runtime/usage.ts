@@ -40,6 +40,11 @@ export interface RuntimeUsageRecorded {
   cacheWrite?: number;
   reasoning?: number;
   cost?: { usd?: number; source?: "provider" | "catalog" };
+  /**
+   * A response that is not the answer: `content_filter`, its provider's content filter blocked it and the runtime made
+   * the request again on the fallback model, whose own event follows. Kept for the books; never charged.
+   */
+  superseded?: string;
   at?: number;
 }
 
@@ -81,7 +86,8 @@ export function usageRowFor(eventId: string, data: RuntimeUsageRecorded, org: { 
     model: model || "unknown",
     provider: provider || "unknown",
     billing_source: hosted ? "hosted" : "byok",
-    credit_chargeable: hosted && !freeTier && org?.billing_status !== "enterprise",
+    // A superseded response (blocked, and answered by the fallback's) is the platform's cost: the user pays for the answer once.
+    credit_chargeable: hosted && !freeTier && !data.superseded && org?.billing_status !== "enterprise",
     // Audio attached to a runtime message is transcribed for its agent, and its generate_image tool makes
     // images for it: audio and image usage, on the agent's surface (auxiliary when made alone, with no agent).
     // A kind chiridion does not know yet is still recorded, at the runtime's cost, as `unknown`: never

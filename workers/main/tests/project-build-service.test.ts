@@ -7,6 +7,8 @@ import {
   runProjectAddDependency,
   runProjectBuild,
 } from "../src/project-build-service";
+import { PROJECT_BUILD_COMMAND } from "../src/project-build-commands";
+import { logProjectCommandFailure } from "../src/project-build-result-policy";
 import type { ProjectBuildSandboxLike } from "../src/project-worker-bundle";
 import type { WorkspaceFileStoreLike, WorkspaceListEntry } from "../src/workspace-filesystem-do";
 
@@ -94,7 +96,7 @@ describe("runProjectBuild", () => {
     // A cold workdir has no source manifest: a cache miss, not an error.
     expect(sandbox.readFile).toHaveBeenCalledWith("/workspace/demo-project.source-manifest.json", { encoding: "utf8" });
     expect(sandbox.exec).toHaveBeenCalledWith(expect.stringContaining("tar -xf '/workspace/demo-project.source.0.tar'"), { cwd: "/workspace", timeout: 120_000 });
-    expect(sandbox.exec).toHaveBeenCalledWith("bun install && bun run build", {
+    expect(sandbox.exec).toHaveBeenCalledWith(PROJECT_BUILD_COMMAND, {
       cwd: "/workspace/demo-project",
       timeout: 15_000,
       env: {
@@ -487,5 +489,28 @@ describe("build failure output ordering", () => {
     const tail = buildLogTail(result.error!)!;
     expect(tail).toContain("error TS2339");
     expect(tail).toContain("[truncated");
+  });
+});
+
+describe("project build file descriptor handling", () => {
+  it("reports and raises the limit before installing, and keeps the build's exit code last", () => {
+    expect(PROJECT_BUILD_COMMAND).toContain("[camelai-build] nofile before");
+    expect(PROJECT_BUILD_COMMAND).toContain("ulimit -Hn 65536");
+    expect(PROJECT_BUILD_COMMAND.indexOf("ulimit -Hn 65536")).toBeLessThan(PROJECT_BUILD_COMMAND.indexOf("bun install"));
+    expect(PROJECT_BUILD_COMMAND.endsWith("bun install && bun run build")).toBe(true);
+  });
+
+  it("keeps the cause in the failure log when a long module list fills the output tail", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const cause = "[vite:load-fallback] Could not load icons/layers-2.mjs: EMFILE: too many open files";
+    logProjectCommandFailure("build", { projectId: "p", workdir: "/workspace/p", fileCount: 1, durationMs: 1 }, {
+      stdout: "[camelai-build] nofile before: soft=1024 hard=1024\nSESSION_SECRET: \"hidden\"",
+      stderr: `\u001b[31m${cause}\u001b[39m\n${cause}\n${"x".repeat(5000)}`,
+      exitCode: 1,
+    });
+    const details = warn.mock.calls[0][1] as { diagnostics: string[]; stderr: string };
+    expect(details.stderr).not.toContain("EMFILE");
+    expect(details.diagnostics).toEqual(["[camelai-build] nofile before: soft=1024 hard=1024", cause]);
+    warn.mockRestore();
   });
 });

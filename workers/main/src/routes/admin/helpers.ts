@@ -100,7 +100,10 @@ export async function loadAdminThreadMessagesResponse(
     env as unknown as ChatEnv,
     threadContext.org_id,
     trimmedThreadId,
-  ).catch(() => []);
+  ).catch((error) => {
+    console.error("[admin] thread messages read failed", { threadId: trimmedThreadId, error: String(error) });
+    return [];
+  });
 
   return Response.json(
     { success: true, messages },

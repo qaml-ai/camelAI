@@ -31,6 +31,22 @@ import type { WorkspaceFileStoreLike } from "./workspace-filesystem-do.js";
  */
 export const DEFAULT_BUILD_TIMEOUT_MS = 120_000;
 
+/**
+ * Rollup reads up to 1000 modules at once, so a project importing a large barrel
+ * such as lucide-react fails with EMFILE under a limit near 1024. Node raises its
+ * soft limit to the hard limit by itself, so only raising the hard limit helps.
+ * The limits go in the build log because the container's values are otherwise
+ * invisible. A failed raise is reported and the build still runs.
+ */
+export const PROJECT_BUILD_COMMAND = [
+  `echo "[camelai-build] nofile before: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"`,
+  `hard=$(ulimit -Hn)`,
+  `if [ "$hard" != unlimited ] && [ "$hard" -lt 65536 ]; then ulimit -Hn 65536 2>/dev/null || echo "[camelai-build] could not raise hard nofile limit"; fi`,
+  `ulimit -Sn "$(ulimit -Hn)" 2>/dev/null`,
+  `echo "[camelai-build] nofile after: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"`,
+  `bun install && bun run build`,
+].join("\n");
+
 export async function runProjectBuild(input: {
   projectId: string;
   files: WorkspaceFileStoreLike;
@@ -76,7 +92,7 @@ export async function runProjectBuild(input: {
   }
   const materializeTiming = await materializeProjectSourceFiles(input.sandbox, workdir, sourceCollection);
   const commandStartedAt = Date.now();
-  const result = normalizeSandboxExecResult(await input.sandbox.exec("bun install && bun run build", {
+  const result = normalizeSandboxExecResult(await input.sandbox.exec(PROJECT_BUILD_COMMAND, {
     cwd: workdir,
     timeout: timeoutMs,
     env: {

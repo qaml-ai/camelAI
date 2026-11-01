@@ -6,6 +6,9 @@ import type { WorkspaceFileStoreLike } from "./workspace-filesystem-do.js";
 
 const BUILD_LOG_EXCERPT_MAX_CHARS = 10_000;
 const MAX_COMMAND_OUTPUT_LOG_CHARS = 4000;
+const MAX_DIAGNOSTIC_LINES = 10;
+const MAX_DIAGNOSTIC_LINE_CHARS = 300;
+const BUILD_DIAGNOSTIC_PATTERN = /\[camelai-build\]|EMFILE|ENFILE|ENOMEM|failed to resolve import/;
 export const PROJECT_BUILD_LOG_PATH = "/.camelai/tmp/build.log";
 
 function commandOutputForLog(value: string): string | undefined {
@@ -14,6 +17,21 @@ function commandOutputForLog(value: string): string | undefined {
   if (trimmed.length <= MAX_COMMAND_OUTPUT_LOG_CHARS) return trimmed;
   const omitted = trimmed.length - MAX_COMMAND_OUTPUT_LOG_CHARS;
   return `[truncated ${omitted} chars]\n${trimmed.slice(-MAX_COMMAND_OUTPUT_LOG_CHARS)}`;
+}
+
+/**
+ * Lines worth keeping when the output tail is too long to hold them: a failing
+ * Rollup error ends in a long module list that pushes the cause out of the tail.
+ */
+function commandDiagnosticsForLog(result: { stdout: string; stderr: string }): string[] | undefined {
+  const lines = `${result.stdout}\n${result.stderr}`
+    .split("\n")
+    // oxlint-disable-next-line no-control-regex -- Strip ANSI colors so repeats dedupe.
+    .map((line) => line.replace(/\u001b\[[0-9;]*m/g, "").trim())
+    .filter((line) => BUILD_DIAGNOSTIC_PATTERN.test(line))
+    .map((line) => line.slice(0, MAX_DIAGNOSTIC_LINE_CHARS));
+  const unique = [...new Set(lines)].slice(0, MAX_DIAGNOSTIC_LINES);
+  return unique.length > 0 ? unique : undefined;
 }
 
 export function logProjectCommandFailure(
@@ -39,6 +57,7 @@ export function logProjectCommandFailure(
     dependency: details.dependency,
     dev: details.dev,
     exitCode: result.exitCode,
+    diagnostics: commandDiagnosticsForLog(result),
     stdout: commandOutputForLog(result.stdout),
     stderr: commandOutputForLog(result.stderr),
   });

@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { readOrgExportManifest, readOrgExportPage, readExportRecord, ORG_EXPORT_SETS, type OrgExportSet } from "../org-export.js";
 import { syncOrgKeyScope, type KeyScopeEnv } from "../agent-runtime/key-scopes";
 import { RuntimeApiError, runtimeApi } from "../agent-runtime/runtime-api";
 import type { DOEnv } from "./env";
@@ -3042,6 +3043,19 @@ export class OrgDO extends DurableObject<DOEnv> {
     if (info.archived_at === undefined) info.archived_at = null;
     if (info.archived_by === undefined) info.archived_by = null;
     return info;
+  }
+
+  /** Export reads: allowlisted columns straight from storage, skipping the getters' hydration, usage initialization and the admin index. */
+  readOrgExportManifest() { return readOrgExportManifest(this.ctx.storage.sql); }
+  readOrgExportPage(set: OrgExportSet, cursor?: string | null, limit?: number) {
+    return readOrgExportPage(this.ctx.storage.sql, set, cursor, limit);
+  }
+  readOrgExportOwnership(kind: "workspace" | "thread" | "app", id: string) {
+    const set = kind === "workspace" ? "workspaces" : kind === "thread" ? "threads" : "apps";
+    const [table, fields] = ORG_EXPORT_SETS[set];
+    const row = readExportRecord(this.ctx.storage.sql, table, kind === "app" ? "script_name" : "id", id, fields);
+    if (row && kind === "thread") row.runtime = readExportRecord(this.ctx.storage.sql, "thread_runtime", "thread_id", id, "agent_id model created_at updated_at");
+    return row;
   }
 
   async getInfo(): Promise<Organization | null> {

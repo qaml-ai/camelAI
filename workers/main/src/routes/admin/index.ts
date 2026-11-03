@@ -40,6 +40,17 @@
  *   GET   /api/admin/r2/:key+             — R2 object metadata
  *   POST  /api/admin/apps/:name/cost-controls — Re-apply user-app cost controls (backfill)
  *
+ * Organization export (org-export-routes.ts), under /api/admin/org-export/:orgId:
+ *   GET /manifest; GET /records/:set; GET /threads; GET /threads/:threadId/history
+ *   GET /threads/:threadId/agents/:agentId/volumes
+ *   GET /threads/:threadId/agents/:agentId/volumes/:volumeId/files[/content]
+ *   GET /workspaces/:workspaceId/projects; GET /workspaces/:workspaceId/automations/:kind
+ *   GET /workspaces/:workspaceId/fs[/content]
+ *   GET /workspaces/:workspaceId/projects/:projectId/fs[/content]
+ *   POST /workspaces/:workspaceId/projects/:projectId/git-token
+ *   GET /r2-prefixes; GET /r2; GET /r2/object
+ *   GET /workspaces/:workspaceId/apps/:scriptName/kv
+ *
  * Detail + management (management-routes.ts):
  *   GET/PATCH/DELETE /api/admin/users/:id  — Detail / edit / hard delete
  *   POST  /api/admin/users/:id/force-orphan, /reset-onboarding
@@ -65,6 +76,7 @@ import { routes } from './routes.js';
 import { managementRoutes } from './management-routes.js';
 import { d1MirrorRoutes } from './d1-mirror-routes.js';
 import { selfhostSweepRoutes } from './selfhost-sweep-routes.js';
+import { orgExportRoutes } from './org-export-routes.js';
 import { runtimeMigrationRoutes } from './runtime-migration-routes.js';
 
 // ---------------------------------------------------------------------------
@@ -81,6 +93,7 @@ app.route('/', managementRoutes);
 app.route('/', d1MirrorRoutes);
 app.route('/', selfhostSweepRoutes);
 app.route('/', runtimeMigrationRoutes);
+app.route('/', orgExportRoutes);
 
 // Auto-generate and serve OpenAPI spec from route middleware declarations
 createOpenApiDocument(app, {

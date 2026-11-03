@@ -16,6 +16,7 @@
  * thread not yet moved.
  */
 import { DurableObject } from "cloudflare:workers";
+import { exportTableExists, exportLimit, EXPORT_BYTES } from "./org-export.js";
 import type { AgentMessage } from "../../../src/lib/agent-messages";
 import type { PreviewTarget } from "../../../src/types";
 import { PiCoreMessageStore } from "./chat-thread/pi-core-store";
@@ -201,6 +202,23 @@ export class ChatThreadDO extends DurableObject<ChatEnv> {
   }
 
   // ---- Reads. ----
+
+  /** Raw stored Pi rows, newest page first and ascending within the page. No repair or hydration. */
+  readOrgExportHistory(before?: number, limit = 50) {
+    const sql = this.ctx.storage.sql;
+    if (!exportTableExists(sql, "pi_core_messages")) return { entries: [], next: null };
+    const ids = sql.exec<{ idx: number }>("SELECT idx FROM pi_core_messages WHERE idx < ? ORDER BY idx DESC LIMIT ?", before ?? Number.MAX_SAFE_INTEGER, exportLimit(limit) + 1).toArray();
+    const entries: Array<{ index: number; message: unknown }> = [];
+    let bytes = 0;
+    for (const { idx } of ids.slice(0, exportLimit(limit))) {
+      const row = sql.exec<{ payload: string }>("SELECT payload FROM pi_core_messages WHERE idx = ?", idx).toArray()[0];
+      const size = new TextEncoder().encode(row.payload).byteLength;
+      if (entries.length && bytes + size > EXPORT_BYTES) break;
+      entries.push({ index: idx, message: JSON.parse(row.payload) }); bytes += size;
+    }
+    entries.reverse();
+    return { entries, next: entries.length && ids.some(row => row.idx < entries[0].index) ? entries[0].index : null };
+  }
 
   /**
    * The whole stored transcript, parsed (the export surface: admin views and

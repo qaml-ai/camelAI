@@ -49,6 +49,7 @@
 		"check:unused:source": "oxlint src workers/main/src workers/discord-bridge/src workers/dispatcher/src workers/user-logs-tail/src workers/e2e-reports/src workers/eval-reports/src workers/eval-reports/app scripts sandbox/create-worker/renderer sandbox/create-worker/templates/starter workers/main/db-query-sandbox-assets/runner -A all -D no-unused-vars",
 		"typecheck": "react-router typegen && tsc --incremental --tsBuildInfoFile node_modules/.cache/chiridion-typecheck.tsbuildinfo && tsc -p workers/app-usage-guard/tsconfig.json --noEmit && bun run typecheck:discord-bridge",
 		"typecheck:discord-bridge": "tsc -p workers/discord-bridge/tsconfig.json --noEmit",
+		"org-export": "bun scripts/org-export.ts",
 		"backfill:user-app-cost-controls": "bun scripts/backfill-user-app-cost-controls.ts",
 		"deploy:main:prod": "node scripts/deploy-main.mjs prod",
 		"deploy:main:staging": "node scripts/deploy-main.mjs staging",

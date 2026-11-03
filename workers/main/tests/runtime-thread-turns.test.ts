@@ -555,6 +555,10 @@ describe("the runtime prompt's two filesystems", () => {
     const append: string = calls.find((call) => call.path === "/v1/agents")!.body.systemPromptAppend;
     expect(append).toContain("/workspace is this conversation's scratch space");
     expect(append).toContain("fs in js_exec");
+    // Right on both runtimes: codemode has no fs, its code reads /workspace with tools.read.
+    expect(append).toContain("Your code tool is `codemode` (`js_exec` on older runtimes)");
+    expect(append).toContain("tools.read and tools.write in codemode");
+    expect(append).toContain("tools.read with offset and length in codemode, fs.readFile in js_exec");
     expect(append).toContain("only when the user asks");
     expect(append).toContain("camel__import_file");
     expect(append).toContain("/workspace/tool-results/");

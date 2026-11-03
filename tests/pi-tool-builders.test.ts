@@ -169,6 +169,10 @@ describe('buildToolUseFromPiItem name canonicalization + input', () => {
       name: 'JavaScript',
       input: { description: 'evaluate a quick expression', code: 'return 1;', rawToolName: 'js_exec' },
     });
+    expect(buildToolUseFromPiItem(dynamicTool('codemode', { code: 'return 1;' }))).toMatchObject({
+      name: 'JavaScript',
+      input: { code: 'return 1;', rawToolName: 'codemode' },
+    });
     expect(buildToolUseFromPiItem(dynamicTool('ls', { path: '/workspace/src' }))).toMatchObject({
       name: 'LS',
       input: { path: '/workspace/src' },

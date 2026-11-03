@@ -98,6 +98,8 @@ describe("project eval runtime evidence extraction", () => {
     expect(readSkillWithTool([item({ tool: "read_skill", arguments: { skill: "developing-software", file: "VANILLA-APPS.md" } })], "developing-software")).toBe(false);
     expect(readSkillWithTool([item({ tool: "js_exec", arguments: { code: 'return await tools.camel__read_skill({skill:"developing-software"});' } })], "developing-software")).toBe(true);
     expect(readSkillWithTool([item({ tool: "js_exec", arguments: { code: 'await tools.camel__read_skill({skill:"developing-software", file:"CRUD.md"});' } })], "developing-software")).toBe(false);
+    // camelRun's codemode replaces js_exec; both are the code tool.
+    expect(readSkillWithTool([item({ tool: "codemode", arguments: { code: 'return await tools.camel__read_skill({skill:"developing-software"});' } })], "developing-software")).toBe(true);
     expect(readSkillWithTool([item({ tool: "read_skill", status: "failed", isError: true, arguments: { skill: "developing-software" } })], "developing-software")).toBe(false);
   });
 

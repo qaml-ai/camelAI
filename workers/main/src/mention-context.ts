@@ -18,6 +18,7 @@ import {
   type MentionableConnection,
   type MentionableProject,
 } from '../../../src/lib/mentions';
+import { RUNTIME_TOOL_PREFIX } from '../../../src/lib/agent-runtime-shared';
 import type { WorkspaceIntegrationRecord } from './workspace';
 import type { WorkspaceProject } from './workspace-filesystem-do';
 
@@ -54,10 +55,10 @@ function buildConnectionsSection(
     '## Available connections',
     '',
     'The user has the following connections (integrations) configured. They may',
-    'reference them by `@<slug>` in messages. Use the `js_exec` tool and the',
-    '`connections` facade or `env.CONNECTIONS` binding to inspect and call',
-    'connection methods. Connection credentials are intentionally hidden behind',
-    'the binding.',
+    'reference them by `@<slug>` in messages. Inspect and call their methods',
+    `with the \`${RUNTIME_TOOL_PREFIX}connections_find\`, \`${RUNTIME_TOOL_PREFIX}connections_query\` and`,
+    `\`${RUNTIME_TOOL_PREFIX}connections_invoke\` tools. Connection credentials are intentionally`,
+    'hidden behind them.',
     '',
     ...entries,
     '</camelai system message>',

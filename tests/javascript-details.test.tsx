@@ -26,6 +26,33 @@ describe('JavaScriptDetails', () => {
     expect(screen.getByText('checking database connection')).toBeInTheDocument();
   });
 
+  it("reads codemode's options line and its Script completed header", () => {
+    const tool: ToolUseBlock = {
+      type: 'tool_use',
+      id: 'tool_codemode',
+      name: 'JavaScript',
+      input: {
+        code: '// @options: {"timeout_ms": 30000, "max_output_tokens": 2000}\nreturn [{ id: 1, name: "a" }];',
+      },
+    };
+    const result: ToolResultBlock = {
+      type: 'tool_result',
+      tool_use_id: 'tool_codemode',
+      content: [
+        { type: 'text', text: 'Script completed\nWall time 0.4 seconds\nOutput:\n' },
+        { type: 'text', text: '[{"id":1,"name":"a"}]' },
+      ],
+    };
+
+    render(<JavaScriptDetails tool={tool} result={result} />);
+
+    expect(screen.getByText('30000ms')).toBeInTheDocument();
+    expect(screen.getByText('2000 tokens')).toBeInTheDocument();
+    expect(screen.getByText('0.4 seconds')).toBeInTheDocument();
+    // The output after the header is still read as a table.
+    expect(screen.getByRole('columnheader', { name: 'name' })).toBeInTheDocument();
+  });
+
   it('renders captured code-mode function calls as nested tool rows', () => {
     const tool: ToolUseBlock = {
       type: 'tool_use',

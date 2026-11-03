@@ -117,9 +117,10 @@ function runtimeToolName(item: RuntimeItem): string | undefined {
   return asString(item.tool)?.toLowerCase();
 }
 
+/** The model's code tool: `codemode`, or `js_exec` on runtimes before camelRun's code mode. */
 function isJsExecItem(item: RuntimeItem): boolean {
   const tool = runtimeToolName(item);
-  return tool === "js_exec" || tool?.endsWith("__js_exec") === true;
+  return tool === "codemode" || tool === "js_exec" || tool?.endsWith("__js_exec") === true;
 }
 
 function isExecutableCodePosition(code: string, targetIndex: number): boolean {

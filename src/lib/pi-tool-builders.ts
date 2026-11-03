@@ -265,6 +265,7 @@ export function canonicalizeDynamicToolName(tool: unknown): string {
     case 'web_fetch':
       return 'WebFetch';
     case 'js_exec':
+    case 'codemode':
       return 'JavaScript';
     case 'list_apps':
       return 'ListApps';

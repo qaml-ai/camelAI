@@ -210,7 +210,7 @@ describe("channels", () => {
       .toBeLessThan(512);
   });
 
-  it("builds hidden channel reply instructions for js_exec provider tools", () => {
+  it("builds hidden channel reply instructions for code-tool provider tools", () => {
     expect(getChannelReplyToolName("email")).toBe("send_email");
     expect(getChannelReplyToolName("slack")).toBe("send_slack_message");
     expect(getChannelReplyToolName("telegram")).toBe("send_telegram_message");
@@ -221,13 +221,14 @@ describe("channels", () => {
     });
 
     expect(message).toContain("<camelai system message>");
-    expect(message).toContain("call the js_exec tool");
+    expect(message).toContain("call your code tool");
+    expect(message).not.toContain("js_exec");
     expect(message).toContain("await tools.send_email");
     expect(message).toContain("user@example.com");
     expect(message).toContain("will not be sent to the external channel automatically");
   });
 
-  it("tells Telegram replies to use js_exec without a chat id", () => {
+  it("tells Telegram replies to use the code tool without a chat id", () => {
     const message = buildChannelReplySystemMessage("telegram", {
       userEmail: null,
     });
@@ -243,7 +244,7 @@ describe("channels", () => {
     expect(message).not.toContain("tools.send_telegram_message");
   });
 
-  it("tells Discord replies to use the scoped js_exec provider tool", () => {
+  it("tells Discord replies to use the scoped code-tool provider tool", () => {
     const message = buildChannelReplySystemMessage("discord", {
       userEmail: null,
     });

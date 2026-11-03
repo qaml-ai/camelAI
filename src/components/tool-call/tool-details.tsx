@@ -46,6 +46,7 @@ function normalizeToolDetailsName(name?: string): string | undefined {
     case 'glob':
       return 'Glob';
     case 'js_exec':
+    case 'codemode':
       return 'JavaScript';
     case 'web_search':
       return 'WebSearch';

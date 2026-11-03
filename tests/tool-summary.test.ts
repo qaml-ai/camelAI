@@ -248,6 +248,17 @@ describe('getToolSummaryParts agent progress', () => {
 });
 
 describe('getToolSummaryParts JavaScript', () => {
+  it('labels a codemode call as JavaScript', () => {
+    const tool: ToolUseBlock = {
+      type: 'tool_use',
+      id: 'tool_codemode',
+      name: 'codemode',
+      input: { code: 'return 1;' },
+    };
+
+    expect(getToolSummaryParts(tool, undefined, false, 'complete').action).toBe('Ran JavaScript');
+  });
+
   it('renders friendly code-mode copy for each status', () => {
     const tool: ToolUseBlock = {
       type: 'tool_use',

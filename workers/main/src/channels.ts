@@ -219,7 +219,7 @@ export function buildChannelReplySystemMessage(
 ): string {
   const safeKind = safeChannelKeyPart(kind) || "unknown";
   const localToolName = getChannelReplyToolName(kind);
-  // The agent runtime names chiridion's tools camel__<tool>, in js_exec too.
+  // The agent runtime names chiridion's tools camel__<tool>, in code too.
   const toolName = localToolName && options.runtime ? `${RUNTIME_TOOL_PREFIX}${localToolName}` : localToolName;
   const emailHint =
     safeKind === "email" && request.userEmail?.trim()
@@ -230,8 +230,8 @@ export function buildChannelReplySystemMessage(
       ? " You do not need to provide the channel/chat id because the tool is already scoped to the originating conversation."
       : "";
   const replyInstruction = toolName
-    ? `To reply externally, call the js_exec tool and from inside that JavaScript call await tools.${toolName}(...).${emailHint}${routingHint}`
-    : "No outbound tool is configured for this channel yet; do not claim you replied externally unless you call a provider-specific send tool from js_exec.";
+    ? `To reply externally, call your code tool and from inside that JavaScript call await tools.${toolName}(...).${emailHint}${routingHint}`
+    : "No outbound tool is configured for this channel yet; do not claim you replied externally unless you call a provider-specific send tool from your code tool.";
 
   return [
     "<camelai system message>",

@@ -21,11 +21,11 @@ export function automationOutcomeInstruction(toolName: string, howToCall = ""): 
   ].join("\n");
 }
 
-/** As a runtime agent has the tool (camel__<tool>, in js_exec too). */
+/** As a runtime agent has the tool (camel__<tool>, in code too). */
 const RUNTIME_OUTCOME_TOOL = `${RUNTIME_TOOL_PREFIX}report_automation_outcome`;
 export const RUNTIME_AUTOMATION_OUTCOME_INSTRUCTION = automationOutcomeInstruction(
   RUNTIME_OUTCOME_TOOL,
-  ` From js_exec: await tools.${RUNTIME_OUTCOME_TOOL}({ status, summary }).`,
+  ` From your code tool: await tools.${RUNTIME_OUTCOME_TOOL}({ status, summary }).`,
 );
 
 export interface ScheduledTurnRequest {

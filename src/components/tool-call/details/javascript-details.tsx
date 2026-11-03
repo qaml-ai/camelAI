@@ -259,14 +259,36 @@ function RuntimeArtifactToolCalls({ artifacts }: { artifacts?: RuntimeCallArtifa
   );
 }
 
+/** codemode's options: an optional first line `// @options: {"timeout_ms": ..., "max_output_tokens": ...}`. */
+function parseCodeOptions(code: string): { timeoutMs?: number; maxOutputTokens?: number } {
+  const match = /^\s*\/\/\s*@options:\s*(\{.*\})\s*$/.exec(code.split('\n', 1)[0] ?? '');
+  if (!match) return {};
+  try {
+    const options = JSON.parse(match[1]) as Record<string, unknown>;
+    return {
+      ...(typeof options.timeout_ms === 'number' ? { timeoutMs: options.timeout_ms } : {}),
+      ...(typeof options.max_output_tokens === 'number' ? { maxOutputTokens: options.max_output_tokens } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
+/** codemode's result leads with `Script completed|failed`, the wall time and `Output:`; js_exec's is the output alone. */
+function splitScriptResult(text: string): { wallTime?: string; output: string } {
+  const match = /^Script (?:completed|failed)\nWall time ([\d.]+ seconds)\nOutput:\n*/.exec(text);
+  return match ? { wallTime: match[1], output: text.slice(match[0].length) } : { output: text };
+}
+
 export function JavaScriptDetails({ tool, result }: JavaScriptDetailsProps) {
   const input = tool?.input ?? {};
   const description = typeof input.description === 'string' ? input.description : '';
   const code = typeof input.code === 'string' ? input.code : '';
-  const timeoutMs = typeof input.timeoutMs === 'number' ? input.timeoutMs : undefined;
+  const options = parseCodeOptions(code);
+  const timeoutMs = typeof input.timeoutMs === 'number' ? input.timeoutMs : options.timeoutMs;
   const maxOutputCharacters =
     typeof input.maxOutputCharacters === 'number' ? input.maxOutputCharacters : undefined;
-  const output = getResultText(result);
+  const { wallTime, output } = splitScriptResult(getResultText(result));
   const tablePreview = parseTablePreview(output);
   const artifacts = result?.artifacts;
 
@@ -278,6 +300,10 @@ export function JavaScriptDetails({ tool, result }: JavaScriptDetailsProps) {
       {maxOutputCharacters !== undefined ? (
         <DetailRow label="Output limit:" value={`${maxOutputCharacters} chars`} />
       ) : null}
+      {options.maxOutputTokens !== undefined ? (
+        <DetailRow label="Output limit:" value={`${options.maxOutputTokens} tokens`} />
+      ) : null}
+      {wallTime ? <DetailRow label="Wall time:" value={wallTime} /> : null}
       <OutputBlock value={code} label="Code" copyValue={code} />
       <RuntimeArtifactToolCalls artifacts={artifacts} />
       {tablePreview ? <ResultTablePreview preview={tablePreview} /> : null}

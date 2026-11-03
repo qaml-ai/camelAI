@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { readExportSqlPage } from "./org-export.js";
 import { wrapWorkflowBinding } from "@cloudflare/dynamic-workflows";
 import type { OrgDO, OrgThread } from "./auth";
 import type { ChatThreadDO } from "./chat-thread-do";
@@ -1376,6 +1377,14 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
     // Floor at now+1s so a just-due or slightly-past next_run_at cannot arm a
     // tight 0-delay loop if the handler returns without advancing schedules.
     await this.ctx.storage.setAlarm(Math.max(now + 1000, nextRunAt));
+  }
+
+  /** Read existing schedules without binding an uninitialized scheduler to a workspace. */
+  readOrgExportAutomations(kind: "prompts" | "automations" | "versions", cursor?: string | null, limit?: number) {
+    const table = kind === "prompts" ? "scheduled_prompts" : kind === "automations" ? "deterministic_automations" : "deterministic_automation_versions";
+    const fields = kind === "versions" ? "automation_id workspace_id source_version source created_by created_at"
+      : "id name description prompt source source_version cron_expression thread_id scheduled_by_thread_id enabled created_by created_at updated_at next_run_at last_run_at last_run_status run_count";
+    return readExportSqlPage(this.ctx.storage.sql, table, fields, kind, cursor, limit);
   }
 
   async listScheduledPrompts(

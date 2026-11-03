@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { exportJson, pickExport, readExportRecord } from "../org-export.js";
 import type { DOEnv } from "./env";
 import { hashPassword, verifyPassword } from "../password";
 import {
@@ -745,6 +746,12 @@ export class UserDO extends DurableObject<DOEnv> {
   }
 
   // Profile methods
+  /** Profile fields for backups; never fill defaults or persist profile repairs. */
+  readOrgExportProfile() {
+    const row = readExportRecord(this.ctx.storage.sql, "profile", "key", "data", "value");
+    return row ? pickExport(exportJson(row.value), "id email name") : null;
+  }
+
   async getProfile(): Promise<User | null> {
     const rows = this.sql
       .exec("SELECT value FROM profile WHERE key = ?", "data")

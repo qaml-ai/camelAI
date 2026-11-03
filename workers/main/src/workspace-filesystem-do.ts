@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { exportCursor, readExportCursor, exportLimit, exportTableExists, pickExport, safeExportKey } from "./org-export.js";
 import { Workspace, type FileInfo } from "@cloudflare/shell";
 import { normalizeGlobalProjectId } from "./project-vm-protocol.js";
 import { isNotebookPath, normalizeNotebookJson } from "./notebook-normalize";
@@ -936,6 +937,63 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
       blobsDeleted += 1;
     }
     return { snapshotsDeleted, blobsDeleted };
+  }
+
+  /** Flat registry reads: getProject/listProjects can otherwise provision or nest repositories. */
+  async readOrgExportProjects(cursor?: string | null, limit = 50) {
+    const after = readExportCursor("projects", cursor) ?? "";
+    const projects = (await this.readProjects()).filter(project => project.id > after).sort((a, b) => a.id < b.id ? -1 : 1);
+    const items = projects.slice(0, exportLimit(limit)).map(project => pickExport(project, "id name description backend kind clonedFromProjectId createdAt updatedAt artifactDefaultBranch artifactStatus"));
+    return { items, cursor: projects.length > items.length ? exportCursor("projects", String(items.at(-1)!.id)) : null };
+  }
+  async readOrgExportProject(projectId: string) {
+    const project = (await this.readProjects()).find(project => project.id === projectId);
+    return project ? pickExport(project, "id name description backend kind clonedFromProjectId createdAt updatedAt artifactDefaultBranch artifactStatus") : null;
+  }
+
+  /** Artifacts.get + read token only. Missing repository metadata never provisions a repo. */
+  async mintProjectArtifactReadToken(projectId: string) {
+    const project = (await this.readProjects()).find(project => project.id === projectId);
+    if (!project?.artifactRepoName || !project.artifactRemote || !this.env.ARTIFACTS) return null;
+    try {
+      const repo = await this.env.ARTIFACTS.get(project.artifactRepoName);
+      const token = await repo.createToken("read", 300);
+      return { token: token.plaintext, expiresAt: token.expiresAt, remote: project.artifactRemote, scope: "read" as const, ttlSeconds: 300 };
+    } catch (error) {
+      if (error && typeof error === "object" && "status" in error && error.status === 404) return null;
+      throw error;
+    }
+  }
+
+  /** Read the shell store directly: Workspace.ensureInit writes a root on first read. */
+  readOrgExportFiles(path = "/", cursor?: string | null, limit = 50) {
+    if (path !== "/" && (!path.startsWith("/") || !safeExportKey(path.slice(1)))) throw new Error("Invalid file path");
+    const scope = `files:${path}`;
+    const after = readExportCursor(scope, cursor) ?? "";
+    const sql = this.ctx.storage.sql;
+    if (!exportTableExists(sql, WORKSPACE_STORE_TABLE)) return { items: [], cursor: null };
+    const prefix = path === "/" ? "/" : `${path}/`;
+    const rows = sql.exec(`SELECT path, type, size, mime_type, target, created_at, modified_at FROM ${WORKSPACE_STORE_TABLE}
+      WHERE path > ? AND path != '/' AND (path = ? OR substr(path, 1, ?) = ?) ORDER BY path LIMIT ?`, after, path, prefix.length, prefix, exportLimit(limit) + 1).toArray();
+    const items = rows.slice(0, exportLimit(limit));
+    return { items, cursor: rows.length > items.length ? exportCursor(scope, String(items.at(-1)!.path)) : null };
+  }
+  async readOrgExportFile(path: string, scope: "workspace" | "project") {
+    if (!path.startsWith("/") || !safeExportKey(path.slice(1))) return null;
+    const sql = this.ctx.storage.sql;
+    if (!exportTableExists(sql, WORKSPACE_STORE_TABLE)) return null;
+    const row = sql.exec<{ type: string; storage_backend: string; r2_key: string | null; content: string | null; content_encoding: string; mime_type: string }>(
+      `SELECT type, storage_backend, r2_key, content, content_encoding, mime_type FROM ${WORKSPACE_STORE_TABLE} WHERE path = ?`, path).toArray()[0];
+    if (!row || row.type !== "file") return null;
+    if (row.storage_backend === "r2") {
+      const prefix = `${fileStoreR2Prefix(scope, this.ctx.id.toString())}/${WORKSPACE_STORE_NAMESPACE}/`;
+      if (!row.r2_key || !safeExportKey(row.r2_key) || !row.r2_key.startsWith(prefix)) throw new Error("File backing key outside export scope");
+      const object = await this.env.R2_BUCKET.get(row.r2_key);
+      if (!object) throw new Error("File backing object missing");
+      return { stream: object.body, mimeType: row.mime_type };
+    }
+    const bytes = row.content_encoding === "base64" ? Uint8Array.from(atob(row.content ?? ""), c => c.charCodeAt(0)) : new TextEncoder().encode(row.content ?? "");
+    return { stream: new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(bytes); controller.close(); } }), mimeType: row.mime_type };
   }
 
   async listProjects(): Promise<WorkspaceProject[]> {

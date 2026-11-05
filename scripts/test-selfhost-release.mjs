@@ -530,6 +530,23 @@ assert(
   packageJson.dependencies?.sharp,
   "sharp must be a production dependency for the self-host Images binding",
 );
+// The self-host workerd config embeds Miniflare's internal workers
+// (node_modules/miniflare/dist/src/workers). The app image installs production
+// dependencies only, so without a pinned production dependency it would get
+// whichever Miniflare another package hoists: in selfhost-v0.2.0's first
+// candidate that was a 5.x alpha whose Workflows worker imports a module the
+// config does not provide, and the app failed to start. Pin the version the
+// self-host tests run (the lockfile's top-level Miniflare).
+const pinnedMiniflare = packageJson.dependencies?.miniflare ?? "";
+assert(
+  /^\d+\.\d+\.\d+$/.test(pinnedMiniflare),
+  "miniflare must be an exactly pinned production dependency for the self-host workerd config",
+);
+const lockedMiniflare = /^\s+"miniflare": \["miniflare@([^"]+)"/m.exec(await read("bun.lock"))?.[1];
+assert(
+  lockedMiniflare === pinnedMiniflare,
+  `bun.lock must resolve top-level miniflare to the pinned ${pinnedMiniflare} (found ${lockedMiniflare})`,
+);
 
 includesAll(
   imageWorkflow,

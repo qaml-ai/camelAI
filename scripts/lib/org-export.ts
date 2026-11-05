@@ -26,13 +26,28 @@ export function parseExportArgs(args: string[]) {
   return { env: values['--env'] as 'prod' | 'staging', orgId: values['--org'], out: path.resolve(values['--out']), concurrency };
 }
 export const digest = (text: string) => createHash('sha256').update(text).digest('hex');
-/** Keep ordinary lowercase names. Encode all other names, including case variants, without collisions on case-insensitive disks. */
-export function safeSegment(value: string): string {
-  if (/^[a-z0-9][a-z0-9._-]{0,79}$/.test(value) && !value.endsWith('.') && !/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/i.test(value)) return value;
-  return `${value.toLowerCase().replace(/[^a-z0-9_-]/g, '_').slice(0, 40) || 'name'}~${digest(value)}`;
+/** Add a short hash before the extension, preserving whole UTF-8 characters within the disk limit. */
+function hashedSegment(value: string, original: string): string {
+  const match = /\.[A-Za-z0-9]{1,16}$/.exec(value);
+  const extension = match && match.index > 0 ? match[0] : '';
+  const stem = (extension ? value.slice(0, -extension.length) : value) || 'name';
+  const suffix = `~${digest(original).slice(0, 12)}${extension}`;
+  const budget = 255 - Buffer.byteLength(suffix);
+  let truncated = '', bytes = 0;
+  for (const character of stem) {
+    bytes += Buffer.byteLength(character);
+    if (bytes > budget) break;
+    truncated += character;
+  }
+  return `${truncated}${suffix}`;
 }
-export function safeRelativePath(value: string): string {
-  return value.split('/').map(safeSegment).join('/');
+/** Preserve customer names unless a segment cannot be safely represented on every supported disk. */
+export function portableSegment(value: string): string {
+  // oxlint-disable-next-line no-control-regex -- Disk names must exclude controls and Windows-invalid characters.
+  let sanitized = value.replace(/[/\\<>:"|?*\x00-\x1f\x7f]/g, '_').replace(/[. ]+$/, ending => '_'.repeat(ending.length));
+  if (/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/i.test(value)) sanitized = `_${sanitized}`;
+  if (value && sanitized === value && Buffer.byteLength(value) <= 255) return value;
+  return hashedSegment(sanitized, value);
 }
 export function redactError(error: unknown, secrets: Iterable<string> = []): string {
   let text = error instanceof Error ? error.message : String(error);
@@ -63,15 +78,19 @@ export async function boundedMap<T>(items: T[], concurrency: number, fn: (item: 
 }
 
 export interface ExportState {
-  version: 1; orgId: string; baseUrl: string; started: string;
+  version: 2; orgId: string; baseUrl: string; started: string;
   finished: Record<string, { outputs: string[]; count: number }>;
-  warnings: Record<string, string>; mappings: Record<string, string>; excluded: string[];
+  warnings: Record<string, string>; mappings: Record<string, string>; claims: Record<string, string>; excluded: string[];
 }
 // Customer-facing: written into the backup's README.md and manifest.json.
 export const EXCLUSIONS = [
   'Passwords, API keys, connection credentials, sign-in sessions, invitation links and SSO secrets. Connection settings are included, with any secret-looking field replaced by [REDACTED].',
   'Data your deployed apps keep in their own Durable Object storage, which can only be read from inside each app.',
   'Data in the databases and services your connections point to. It stays with those providers.',
+  "camelAI's saved project versions and revert points. Each project's current files are included, and its git history where it has one.",
+  'Warehouse data saved from database queries (Parquet files).',
+  'Content types and custom metadata of stored objects. Their contents are included.',
+  "Your organization's model provider settings, per-member usage limits and pricing overrides.",
   'Anything deleted or expired before the export ran.',
   'Platform data shared across customers, such as agent runtime snapshots and billing records.',
   'Logs: app logs, audit logs, per-request usage records and automation run history. Your organization\'s usage totals and your automation definitions are included.',
@@ -91,13 +110,34 @@ export class ExportWriter {
     }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      state = { version: 1, orgId, baseUrl, started: new Date().toISOString(), finished: {}, warnings: {}, mappings: {}, excluded: [...EXCLUSIONS] };
+      state = { version: 2, orgId, baseUrl, started: new Date().toISOString(), finished: {}, warnings: {}, mappings: {}, claims: {}, excluded: [...EXCLUSIONS] };
     }
-    if (state.version !== 1 || state.orgId !== orgId || state.baseUrl !== baseUrl) throw new Error('Existing export belongs to a different organization, environment or format');
+    if (state.version !== 2 || state.orgId !== orgId || state.baseUrl !== baseUrl) throw new Error('Existing export belongs to a different organization, environment or format');
     return new ExportWriter(root, state, new Set(secrets));
   }
-  name(value: string) { const result = safeSegment(value); if (result !== value) Object.defineProperty(this.state.mappings, value, { value: result, enumerable: true, writable: true, configurable: true }); return result; }
-  relative(value: string) { const result = safeRelativePath(value); if (result !== value) Object.defineProperty(this.state.mappings, value, { value: result, enumerable: true, writable: true, configurable: true }); return result; }
+  name(value: string) { return portableSegment(value); }
+  tree(base: string, originalPath: string) {
+    const segments = originalPath.split('/').filter(Boolean);
+    if (!segments.length) throw new Error('Customer file path has no segments');
+    let parent = base, prefix = base;
+    for (let i = 0; i < segments.length; i++) {
+      prefix += `/${segments[i]}`;
+      const owner = `${i === segments.length - 1 ? 'file' : 'dir'}:${prefix}`;
+      let candidate = portableSegment(segments[i]);
+      const claimKey = (name: string) => `${parent}\u0000${name.normalize('NFC').toLowerCase()}`;
+      let key = claimKey(candidate);
+      if (Object.hasOwn(this.state.claims, key) && this.state.claims[key] !== owner) {
+        candidate = hashedSegment(candidate, owner);
+        key = claimKey(candidate);
+        if (Object.hasOwn(this.state.claims, key) && this.state.claims[key] !== owner) throw new Error('Export path collision after disambiguation');
+      }
+      this.state.claims[key] = owner;
+      parent += `/${candidate}`;
+    }
+    const original = `${base}/${originalPath.replace(/^\/+/, '')}`;
+    if (parent !== original) Object.defineProperty(this.state.mappings, original, { value: parent, enumerable: true, writable: true, configurable: true });
+    return parent;
+  }
   async target(relative: string) {
     const parts = relative.split('/');
     // oxlint-disable-next-line no-control-regex -- Output paths must reject NUL.
@@ -226,11 +266,19 @@ export async function writeChecksums(writer: ExportWriter) {
   }
   await writer.write('SHA256SUMS', entries.join(''));
 }
-export async function command(executable: string, args: string[], env: Record<string, string | undefined> = process.env) {
-  await new Promise<void>((resolve, reject) => {
+export async function command(executable: string, args: string[], env: Record<string, string | undefined> = process.env, options: { captureStdout?: boolean } = {}) {
+  return new Promise<string>((resolve, reject) => {
     // Child output may contain credentials or remote data; errors report status only.
-    const child = spawn(executable, args, { env: env as NodeJS.ProcessEnv, stdio: ['ignore', 'ignore', 'ignore'] });
+    const child = spawn(executable, args, { env: env as NodeJS.ProcessEnv, stdio: ['ignore', options.captureStdout ? 'pipe' : 'ignore', 'ignore'] });
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    child.stdout?.on('data', (chunk: Buffer) => {
+      if (bytes >= 64 * 1024) return;
+      const captured = chunk.subarray(0, 64 * 1024 - bytes);
+      chunks.push(captured);
+      bytes += captured.length;
+    });
     child.on('error', () => reject(new Error(`${executable} could not start`)));
-    child.on('exit', code => code === 0 ? resolve() : reject(new Error(`${executable} exited with status ${code}`)));
+    child.on('close', code => code === 0 ? resolve(Buffer.concat(chunks).toString('utf8')) : reject(new Error(`${executable} exited with status ${code}`)));
   });
 }

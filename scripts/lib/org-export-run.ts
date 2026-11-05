@@ -4,7 +4,7 @@ import { mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promi
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
-import { boundedMap, command, ExportClient, ExportHttpError, ExportWriter, fileSha256, retry, safeSegment, writeChecksums, type Row } from './org-export';
+import { boundedMap, command, ExportClient, ExportHttpError, ExportWriter, fileSha256, portableSegment, retry, writeChecksums, type Row } from './org-export';
 
 const enc = encodeURIComponent;
 export async function exportHistory(client: ExportClient, writer: ExportWriter, threadId: string, relative: string) {
@@ -59,6 +59,12 @@ export async function exportGit(client: ExportClient, writer: ExportWriter, endp
           GIT_CONFIG_KEY_1: 'credential.helper', GIT_CONFIG_VALUE_1: '', GIT_CONFIG_KEY_2: 'http.followRedirects', GIT_CONFIG_VALUE_2: 'false',
           GIT_CONFIG_KEY_3: 'core.hooksPath', GIT_CONFIG_VALUE_3: '/dev/null' });
         await runCommand('git', ['clone', '--mirror', '--', remote.href, mirror], env);
+        const refs = await runCommand('git', ['-C', mirror, 'for-each-ref', '--count=1', '--format=%(refname)'], env, { captureStdout: true });
+        if (!refs.trim()) {
+          const reason = `${relative}: the project has no git history; its files are exported separately.`;
+          if (!writer.state.excluded.includes(reason)) writer.state.excluded.push(reason);
+          return 0;
+        }
         const bundle = path.join(tempDir, 'project.bundle');
         await runCommand('git', ['-C', mirror, 'bundle', 'create', bundle, '--all'], env);
         await runCommand('git', ['-C', mirror, 'bundle', 'verify', bundle], env);
@@ -79,17 +85,18 @@ export async function walkExport(client: ExportClient, writer: ExportWriter, con
   }
   const sets: Record<string, Row[]> = {};
   for (const set of manifest.record_sets as string[]) {
-    sets[set] = await writer.cachedJson<Row[]>(`org/${writer.name(set)}.json`, () => client.all(`/records/${enc(set)}`), rows => rows.length) ?? [];
+    sets[set] = await writer.cachedJson<Row[]>(`org/${writer.name(`${set}.json`)}`, () => client.all(`/records/${enc(set)}`), rows => rows.length) ?? [];
   }
   const threads = await writer.cachedJson<Row[]>('org/threads.json', () => client.all('/threads'), rows => rows.length) ?? [];
 
   async function files(endpoint: string, destination: string, metadata: string, query: Record<string, string> = {}) {
     // Keep directory and symlink metadata without creating filesystem symlinks in the backup.
     const rows = await writer.cachedJson<Row[]>(metadata, () => client.all(endpoint, query), rows => rows.length) ?? [];
-    await boundedMap(rows, concurrency, async row => {
-      const kind = row.type ?? 'file';
-      if (kind !== 'file') return;
-      const relative = `${destination}/${writer.relative(String(row.path).replace(/^\//, ''))}`;
+    // Claim names in listing order and persist them before concurrent downloads can finish.
+    const downloads = rows.filter(row => (row.type ?? 'file') === 'file')
+      .map(row => ({ row, relative: writer.tree(destination, String(row.path)) }));
+    await writer.save();
+    await boundedMap(downloads, concurrency, async ({ row, relative }) => {
       await client.download(writer, relative, `${endpoint}/content`, { ...query, path: String(row.path) });
     });
   }
@@ -100,7 +107,9 @@ export async function walkExport(client: ExportClient, writer: ExportWriter, con
       // A project request also returns workspace prefixes; those are walked once per workspace.
       for (const prefix of scope.prefixes.filter(prefix => !projectId || prefix.startsWith('project-fs/'))) {
         for await (const page of client.pages('/r2', { ...query, bucket: scope.bucket, prefix })) {
-          await boundedMap(page, concurrency, row => client.download(writer, `r2/R2_BUCKET/${writer.relative(row.key)}`, '/r2/object', { ...query, bucket: scope.bucket, key: row.key }));
+          const downloads = page.map(row => ({ row, relative: writer.tree('r2/R2_BUCKET', row.key) }));
+          await writer.save();
+          await boundedMap(downloads, concurrency, ({ row, relative }) => client.download(writer, relative, '/r2/object', { ...query, bucket: scope.bucket, key: row.key }));
         }
       }
       // Do not mark a walk finished while any discovered object is incomplete.
@@ -113,7 +122,7 @@ export async function walkExport(client: ExportClient, writer: ExportWriter, con
   const automationIndex: Row[] = [];
   for (const ws of sets.workspaces ?? []) {
     const workspaceId = String(ws.id), endpoint = `/workspaces/${enc(workspaceId)}`;
-    const directory = `workspaces/${writer.name(String(ws.slug ?? ws.name))}-${writer.name(workspaceId)}`;
+    const directory = `workspaces/${writer.name(`${ws.slug ?? ws.name}-${workspaceId}`)}`;
     const automationFiles: Row = { workspace_id: workspaceId };
     for (const kind of ['prompts', 'automations', 'versions']) {
       const file = `${directory}/automations-${kind}.json`;
@@ -125,8 +134,9 @@ export async function walkExport(client: ExportClient, writer: ExportWriter, con
     const projects = await writer.cachedJson<Row[]>(`${directory}/projects.json`, () => client.all(`${endpoint}/projects`), rows => rows.length) ?? [];
     for (const project of projects) {
       const projectId = String(project.id), projectEndpoint = `${endpoint}/projects/${enc(projectId)}`;
-      const projectDirectory = `${directory}/projects/${writer.name(String(project.name))}-${writer.name(projectId)}`;
+      const projectDirectory = `${directory}/projects/${writer.name(`${project.name}-${projectId}`)}`;
       await files(`${projectEndpoint}/fs`, `${projectDirectory}/files`, `${projectDirectory}/filesystem.json`);
+      // Named after its folder, so the bundle sits beside the project it belongs to.
       await exportGit(client, writer, `${projectEndpoint}/git-token`, `${projectDirectory}.bundle`);
       await r2(workspaceId, projectId);
     }
@@ -158,9 +168,12 @@ export async function walkExport(client: ExportClient, writer: ExportWriter, con
         const volumes = await writer.cachedJson<Row[]>(`${relative}/volumes.json`, () => client.all(volumesEndpoint), rows => rows.length) ?? [];
         for (const volume of volumes) {
           // Walk a single thread's files serially, keeping total concurrency at the configured thread limit.
-          const rows = await writer.cachedJson<Row[]>(`${relative}/volume-${writer.name(volume.volumeId)}-${writer.name(volume.path)}.json`, () => client.all(`${volumesEndpoint}/${enc(volume.volumeId)}/files`, { path: volume.subpath ?? '/' }), rows => rows.length) ?? [];
-          for (const row of rows) if ((row.type ?? 'file') === 'file') {
-            await client.download(writer, `${relative}/files/${writer.name(volume.volumeId)}/${writer.relative(String(row.path).replace(/^\//, ''))}`, `${volumesEndpoint}/${enc(volume.volumeId)}/files/content`, { path: row.path });
+          const rows = await writer.cachedJson<Row[]>(`${relative}/${writer.name(`volume-${volume.volumeId}-${volume.path}.json`)}`, () => client.all(`${volumesEndpoint}/${enc(volume.volumeId)}/files`, { path: volume.subpath ?? '/' }), rows => rows.length) ?? [];
+          const downloads = rows.filter(row => (row.type ?? 'file') === 'file')
+            .map(row => ({ row, output: writer.tree(`${relative}/files/${writer.name(volume.volumeId)}`, String(row.path)) }));
+          await writer.save();
+          for (const { row, output } of downloads) {
+            await client.download(writer, output, `${volumesEndpoint}/${enc(volume.volumeId)}/files/content`, { path: row.path });
           }
         }
       }
@@ -172,7 +185,7 @@ export async function walkExport(client: ExportClient, writer: ExportWriter, con
 }
 
 export async function findExportDirectory(out: string, orgId: string, baseUrl: string, date = new Date()) {
-  const prefix = `camelai-export-${safeSegment(orgId)}-`;
+  const prefix = `camelai-export-${portableSegment(orgId)}-`;
   let entries: string[] = [];
   try { entries = await readdir(out); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   // Resume the most recent matching archive even after midnight. A fresh --out starts a new backup.
@@ -211,12 +224,12 @@ A one-time backup of your camelAI organization in open formats: JSON, JSONL, git
 - \`org/\`: organization settings, members, workspaces (including archived ones), connections (without credentials), deployed apps and their deploy history, and an index of automations.
 - \`workspaces/<workspace>/threads/\`: each chat thread's details (\`<thread>.json\`) and its messages, oldest first, one per line (\`<thread>.jsonl\`). Files the agent kept for a thread are in \`<thread>/files/\`.
 - \`workspaces/<workspace>/files/\`: the workspace's files.
-- \`workspaces/<workspace>/projects/<project>/files/\`: each project's current files. \`<project>.bundle\` holds its full git history; restore it with \`git clone <project>.bundle <folder>\`.
+- \`workspaces/<workspace>/projects/<project>/files/\`: each project's current files. \`<project>.bundle\` holds its git history, where it has one; restore it with \`git clone <project>.bundle <folder>\`.
 - \`workspaces/<workspace>/automations-*.json\`: scheduled prompts, automations and their past versions.
 - \`workspaces/<workspace>/apps/<app>/kv.jsonl\`: key-value data your deployed apps stored, one entry per line, values base64-encoded.
 - \`r2/R2_BUCKET/\`: uploads, outputs, deployed app code, app previews and app data, under their original storage paths.
 - \`manifest.json\`: what was exported, how many of each, and what was left out.
-- \`path-mapping.json\`: the original names of any files renamed to be safe on disk.
+- \`path-mapping.json\`: files keep their original names, except the few listed here. They were renamed to be safe on every disk because they used characters some disks don't allow, differed from another name only in letter case or Unicode form, or named both a file and a folder.
 - \`SHA256SUMS\`: a checksum for every file. Check them from this folder with \`sha256sum -c SHA256SUMS\`.
 
 ## Good to know

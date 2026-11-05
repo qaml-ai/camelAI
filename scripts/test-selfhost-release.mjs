@@ -43,6 +43,8 @@ const [
   commonScript,
   bundledDockerfile,
   imageWorkflow,
+  ciWorkflow,
+  runtimeSmokeScript,
   upScript,
   upgradeScript,
   latestReleaseScript,
@@ -68,6 +70,8 @@ const [
   read("scripts/selfhost-common.mjs"),
   read("infra/selfhost/app-bundled.Dockerfile"),
   read(".github/workflows/selfhost-images.yml"),
+  read(".github/workflows/ci.yml"),
+  read("scripts/selfhost-agent-runtime-smoke.mjs"),
   read("scripts/selfhost-up.mjs"),
   read("scripts/selfhost-upgrade.mjs"),
   read("scripts/selfhost-latest-release.mjs"),
@@ -148,6 +152,52 @@ includesAll(
   imageWorkflow,
   ['.images["agent-runtime"]', '.images["agent-runtime-postgres"]', "selfhost-agent-runtime.mjs"],
   "self-host release manifest pins the agent runtime",
+);
+const ciContractJob = ciWorkflow.slice(
+  ciWorkflow.indexOf("\n  selfhost:\n"),
+  ciWorkflow.indexOf("\n  selfhost-runtime:\n"),
+);
+const imageContractJob = imageWorkflow.slice(
+  imageWorkflow.indexOf("\n  validate-contract:\n"),
+  imageWorkflow.indexOf("\n  validate-bundled-images:\n"),
+);
+const runtimeSmokeSteps = [
+  ["CI self-host", ciContractJob],
+  ["self-host image release", imageContractJob],
+].map(([name, job]) => {
+  assert(job.length > 0, `${name} workflow must include a contract job`);
+  const marker = "      - name: Smoke bundled agent runtime\n";
+  const start = job.indexOf(marker);
+  assert(start >= 0, `${name} contract job must smoke the bundled agent runtime`);
+  const end = job.indexOf("\n      - ", start + marker.length);
+  const step = job.slice(start, end === -1 ? undefined : end);
+  includesAll(
+    step,
+    [
+      "compose up --detach --wait",
+      "agent-runtime-postgres agent-runtime",
+      "node scripts/selfhost-agent-runtime-smoke.mjs --pinned",
+      "trap cleanup EXIT",
+      "compose logs --tail=200 agent-runtime-postgres agent-runtime",
+      "compose down --volumes",
+    ],
+    `${name} bundled agent runtime smoke`,
+  );
+  assert(
+    job.indexOf("config --quiet") >= 0 && job.indexOf("config --quiet") < start,
+    `${name} bundled agent runtime smoke must follow Compose validation`,
+  );
+  assert(
+    start < job.indexOf("Validate bundled Pomerium overlay"),
+    `${name} bundled agent runtime smoke must precede the Pomerium env changes`,
+  );
+  return step;
+});
+assert(runtimeSmokeSteps[0] === runtimeSmokeSteps[1], "both contract jobs must run identical bundled agent runtime smoke steps");
+includesAll(
+  runtimeSmokeScript,
+  ["provisionSelfhostAgentRuntime", "inspectSelfhostAgentRuntime", "SELFHOST_AGENT_RUNTIME_IMAGE", "--pinned"],
+  "bundled agent runtime smoke script",
 );
 includesAll(
   latestReleaseScript,

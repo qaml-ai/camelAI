@@ -29,6 +29,7 @@ references from one manifest.
 | --- | --- |
 | Web application and reverse-proxy SSO | Supported |
 | Bedrock, Anthropic, OpenAI, OpenRouter, or custom key-backed chat | Supported |
+| `env.AI.run()` in deployed apps | Supported with `SELFHOST_AI_PROVIDER=bedrock` (text generation) or a Cloudflare AI Gateway; not yet with other providers |
 | Custom agent skills + prompt append via `.selfhost/agent/` | Supported (additive; see `SELF_HOSTING.md`) |
 | Durable Objects, KV, R2, D1, queues, and workflows | Supported by local `workerd` services |
 | Workspace/project source and local git history | Supported |
@@ -345,6 +346,12 @@ SELFHOST_AI_AWS_REGION=us-east-1
 EC2 instance-profile/IMDS SigV4 model authentication is not implemented by this
 release. The instance role is for SSM and bootstrap secret reads only. Bedrock
 model access and regional availability still apply.
+
+Deployed apps' `env.AI.run()` calls use the same key and region. The tiers
+`cheap`, `fast` and `auto` run Claude Sonnet 5.5 and `smart` runs Claude Opus
+5.5. Claude model ids run that Claude model, and Claude Sonnet 5.5 answers
+every other text model. Image, audio and embedding models fail with an error
+that names the model. See "AI calls from deployed apps" in `SELF_HOSTING.md`.
 
 The standalone default is the supported Bedrock model configured by the model
 catalog.

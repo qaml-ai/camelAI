@@ -312,6 +312,44 @@ When disabled:
 Redeploy apps after flipping the flag so stored self-host worker records drop
 the binding. Runtime fail-closed still protects apps that were not redeployed.
 
+## AI calls from deployed apps
+
+Deployed apps that declare the `AI` binding call models with
+`env.AI.run(model, input)`. On an install with `SELFHOST_AI_PROVIDER=bedrock`,
+these calls go to Bedrock with the install's own key and region
+(`SELFHOST_AI_API_KEY`, `SELFHOST_AI_AWS_REGION`), the same provider chats use.
+Apps built on hosted camelAI work unchanged and never see the key: the binding
+runs in the dispatcher, outside app code.
+
+- **Models.**
+  - The tiers `cheap`, `fast` and `auto` run Claude Sonnet 5.5. `smart` runs
+    Claude Opus 5.5.
+  - Claude model ids in their usual spellings (`anthropic/claude-opus-5.5`,
+    `claude-sonnet-5-5`, `anthropic.claude-haiku-5-5`) run that Claude model on
+    Bedrock.
+  - Claude Sonnet 5.5, the `auto` tier's model, answers every other text
+    model: Workers AI `@cf/...` ids, and GPT, Gemini, DeepSeek, Kimi and other
+    OpenRouter ids. The response's `model` field names the model that
+    answered.
+  - Models that make images, audio or other non-text output fail with an
+    error that names the model.
+- **Inputs and results.** Apps can send chat `messages` (including tools and
+  `stream: true`), or a plain text `prompt`, which is sent as one user
+  message. Any other input, such as text to embed or audio, fails with an
+  error that names the model. A result is an OpenAI chat completion
+  (`choices[0].message.content`) that also has the text in `response`, as
+  Workers AI returns it. A stream is OpenAI `chat.completion.chunk`
+  server-sent events, as on hosted camelAI.
+- **Usage.** Calls are recorded in the organization's usage with provider
+  `bedrock`, like chats, and never use camelAI credits.
+- **Not included yet.** Image generation (`env.CAMELAI.generateImage`) and
+  audio transcription (`env.CAMELAI.transcribeAudio`) don't run on Bedrock.
+  Apps can't reach Bedrock's GPT models yet.
+
+On an install with another `SELFHOST_AI_PROVIDER`, `env.AI.run()` doesn't work
+yet. An install that uses a Cloudflare AI Gateway instead of `SELFHOST_AI_*`
+serves it through the gateway.
+
 ## TLS front door
 
 Caddy is the ingress service for every supported Compose installation.

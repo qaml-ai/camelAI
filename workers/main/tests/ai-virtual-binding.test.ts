@@ -12,7 +12,11 @@ import {
   normalizeLegacyModel,
   resolveGatewaySettings,
   resolveRouting,
+  resolveSelfhostBedrockModel,
   runViaGatewayHTTP,
+  toSelfhostBedrockInput,
+  type AIVirtualBindingEnv,
+  type VirtualAiRunScope,
 } from "../src/ai-virtual-binding.js";
 import {
   BedrockPiCompletionError,
@@ -21,6 +25,423 @@ import {
   piMessageToChatCompletion,
 } from "../src/bedrock-pi-adapter.js";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+
+function bedrockMessagesSseBody(): string {
+  // A whole Anthropic Messages stream: Pi fails streams without a stop reason.
+  const events = [
+    ["message_start", { type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", model: "anthropic.claude-sonnet-5-5", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 3, output_tokens: 0 } } }],
+    ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
+    ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } }],
+    ["content_block_stop", { type: "content_block_stop", index: 0 }],
+    ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 1 } }],
+    ["message_stop", { type: "message_stop" }],
+  ] as const;
+  return events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join("");
+}
+
+function virtualAiTestScope(envOverrides: Partial<AIVirtualBindingEnv> = {}) {
+  const orgStub = {
+    getLlmProviderConfig: vi.fn<() => Promise<{
+      provider: string;
+      config: string;
+      credentials_encrypted: string;
+    } | null>>(async () => null),
+    getInfo: vi.fn(async () => ({
+      billing_status: "active",
+      billing_plan: "payg",
+      billing_credit_purchase_total_cents: 1_000,
+      billing_credit_grant_total_cents: 0,
+    })),
+    getCreditChargeableSpendUsd: vi.fn(async () => 0),
+    checkUserLlmUsageAccess: vi.fn(async () => ({
+      allowed: true,
+      reason: "no_limits" as const,
+      evaluated_at_ms: Date.now(),
+      blocking_limit: null,
+      limits: [],
+    })),
+    recordUsage: vi.fn(async () => undefined),
+  };
+  const backgroundTasks: Promise<unknown>[] = [];
+  const scope: VirtualAiRunScope = {
+    env: {
+      CF_ACCOUNT_ID: "acct",
+      CF_GATEWAY_NAME: "gateway",
+      CF_GATEWAY_TOKEN: "hosted-token",
+      INTEGRATION_SECRET_KEY: "secret",
+      ORG: {
+        idFromName: vi.fn((id: string) => id),
+        get: vi.fn(() => orgStub),
+      } as never,
+      ...envOverrides,
+    },
+    props: { orgId: "org1", workspaceId: "ws1", userId: "user1" },
+    waitUntil: vi.fn((task: Promise<unknown>) => { backgroundTasks.push(task); }),
+  };
+  return { scope, orgStub, backgroundTasks };
+}
+
+describe("resolveSelfhostBedrockModel", () => {
+  it.each([
+    ["cheap", "anthropic.claude-sonnet-5-5"],
+    ["fast", "anthropic.claude-sonnet-5-5"],
+    ["auto", "anthropic.claude-sonnet-5-5"],
+    ["smart", "anthropic.claude-opus-5-5"],
+    ["anthropic/claude-opus-5.5", "anthropic.claude-opus-5-5"],
+    ["claude-sonnet-5-5", "anthropic.claude-sonnet-5-5"],
+    ["anthropic.claude-haiku-5-5", "anthropic.claude-haiku-5-5"],
+    ["global.anthropic.claude-opus-5-5", "anthropic.claude-opus-5-5"],
+    ["us.anthropic.claude-sonnet-5-5", "anthropic.claude-sonnet-5-5"],
+    ["anthropic/claude-fable-5.1", "anthropic.claude-fable-5-1"],
+    ["anthropic/claude-3.5-sonnet", "anthropic.claude-sonnet-5-5"],
+    ["anthropic/claude-haiku-4.5", "anthropic.claude-haiku-4-5"],
+    ["anthropic.claude-haiku-4-5", "anthropic.claude-haiku-4-5"],
+    ["claude-haiku-4-5-20251001", "anthropic.claude-haiku-4-5"],
+    ["claude-unknown", "anthropic.claude-sonnet-5-5"],
+  ])("maps %s to %s", (model, expected) => {
+    expect(resolveSelfhostBedrockModel(model)).toBe(expected);
+  });
+
+  it.each([
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "@cf/openai/gpt-oss-120b",
+    "openai/gpt-5.6-luna",
+    "deepseek-v4-pro",
+    "deepseek-v4-auto",
+    "google/gemini-3.8-flash",
+    "moonshotai/kimi-k3",
+    "",
+  ])("maps %s to the default auto model", (model) => {
+    expect(resolveSelfhostBedrockModel(model)).toBe("anthropic.claude-sonnet-5-5");
+  });
+
+  it.each([
+    "@cf/black-forest-labs/flux-1-schnell",
+    "@cf/myshell-ai/melotts",
+    "@cf/deepgram/aura-1",
+    "@cf/stabilityai/stable-diffusion-xl-base-1.0",
+    "@cf/runwayml/model",
+    "@cf/bytedance/model",
+    "@cf/lykon/model",
+    "@cf/leonardo/model",
+    "google/gemini-3.8-flash-image",
+    "openai/gpt-image-1",
+    "openai/dall-e-3",
+    "other/stable-diffusion",
+    "@CF/BLACK-FOREST-LABS/FLUX-1-SCHNELL",
+  ])("rejects non-text model %s with an actionable error", (model) => {
+    expect(() => resolveSelfhostBedrockModel(model)).toThrow(new Error(
+      `Model "${model}" isn't available through env.AI on this install. Its AI provider is AWS Bedrock, which serves text generation here (chat messages or a text prompt), and this model makes images, audio or other non-text output.`,
+    ));
+  });
+});
+
+describe("toSelfhostBedrockInput", () => {
+  it("keeps messages and tool options unchanged", () => {
+    const input = {
+      messages: [{ role: "user", content: "hello" }],
+      tools: [{ type: "function", function: { name: "lookup" } }],
+      tool_choice: "auto",
+      prompt: "ignored because messages win",
+    };
+    expect(toSelfhostBedrockInput("auto", input)).toBe(input);
+  });
+
+  it("converts a prompt while preserving generation options", () => {
+    expect(toSelfhostBedrockInput("auto", {
+      prompt: "Say ok",
+      messages: [],
+      stream: true,
+      max_tokens: 10,
+      temperature: 0.5,
+    })).toEqual({
+      messages: [{ role: "user", content: "Say ok" }],
+      stream: true,
+      max_tokens: 10,
+      temperature: 0.5,
+    });
+  });
+
+  it.each([
+    null, undefined, "Say ok", 42, [], new Date(), {},
+    { messages: [] }, { messages: "hello" }, { prompt: "" },
+    { text: ["a"] }, { prompt: "x", image: [1, 2] },
+    { messages: [{ role: "user", content: "x" }], audio: undefined },
+    { prompt: "x", mask: [] },
+  ].map((input) => ({ input })))("rejects unsupported input $input", ({ input }) => {
+    expect(() => toSelfhostBedrockInput("requested-model", input)).toThrow(new Error(
+      'env.AI.run("requested-model") needs chat "messages" or a text "prompt" on this install. Its AI provider is AWS Bedrock, which serves text generation here; image, audio, embedding and other non-text inputs aren\'t supported.',
+    ));
+  });
+});
+
+describe("self-host install Bedrock virtual AI", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  function selfhostScope(overrides: Partial<AIVirtualBindingEnv> = {}) {
+    return virtualAiTestScope({
+      CF_ACCOUNT_ID: "selfhost",
+      CF_DISPATCH_NAMESPACE: "selfhost",
+      CF_GATEWAY_NAME: undefined,
+      CF_GATEWAY_TOKEN: undefined,
+      SELFHOST_AI_PROVIDER: "bedrock",
+      SELFHOST_AI_API_KEY: "install-bedrock-key",
+      SELFHOST_AI_AWS_REGION: "us-west-2",
+      ...overrides,
+    });
+  }
+
+  function mockBedrockFetch() {
+    return vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(bedrockMessagesSseBody(), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    );
+  }
+
+  it.each([
+    ["auto", "anthropic.claude-sonnet-5-5"],
+    ["opus", "anthropic.claude-opus-5-5"],
+  ])("routes %s through the install without reading stored org credentials", async (model, expected) => {
+    const { scope, orgStub } = selfhostScope();
+    orgStub.getLlmProviderConfig.mockResolvedValue({
+      provider: "bedrock",
+      config: JSON.stringify({ aws_region: "eu-west-1" }),
+      credentials_encrypted: await encryptCredentials({ bearer_token: "org-key" }, "secret"),
+    });
+    expect(await resolveRouting(scope, model)).toEqual({
+      provider: "bedrock",
+      gatewayProvider: "compat",
+      model: expected,
+      byokKey: "install-bedrock-key",
+      awsRegion: "us-west-2",
+      installProvider: true,
+    });
+    expect(orgStub.getLlmProviderConfig).not.toHaveBeenCalled();
+  });
+
+  it("defaults the install's region to us-east-1", async () => {
+    const { scope } = selfhostScope({ SELFHOST_AI_AWS_REGION: undefined });
+    expect(await resolveRouting(scope, "auto")).toMatchObject({ awsRegion: "us-east-1" });
+  });
+
+  it("serves messages with the install key and records BYOK usage without credits or a gateway", async () => {
+    const fetchMock = mockBedrockFetch();
+    const { scope, orgStub, backgroundTasks } = selfhostScope();
+    const result = await executeVirtualAiRun(scope, "auto", {
+      messages: [{ role: "user", content: "Say ok" }],
+    });
+    expect(result).toMatchObject({
+      model: "anthropic.claude-sonnet-5-5",
+      choices: [{ message: { content: "ok" } }],
+      response: "ok",
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const upstream = new URL(url);
+    expect(`${upstream.origin}${upstream.pathname}`).toBe(
+      "https://bedrock-mantle.us-west-2.api.aws/anthropic/v1/messages",
+    );
+    expect(new Headers(init.headers).get("x-api-key")).toBe("install-bedrock-key");
+    expect(JSON.parse(String(init.body)).model).toBe("anthropic.claude-sonnet-5-5");
+    expect(scope.waitUntil).toHaveBeenCalledOnce();
+    await Promise.all(backgroundTasks);
+    expect(orgStub.recordUsage).toHaveBeenCalledOnce();
+    expect(orgStub.recordUsage).toHaveBeenCalledWith(expect.objectContaining({
+      provider: "bedrock",
+      billing_source: "byok",
+      credit_chargeable: false,
+      usage_surface: "virtual_ai",
+      user_id: "user1",
+      input_tokens: 3,
+      output_tokens: 1,
+    }));
+    expect(orgStub.checkUserLlmUsageAccess).toHaveBeenCalledOnce();
+    expect(orgStub.getLlmProviderConfig).not.toHaveBeenCalled();
+    expect(orgStub.getInfo).not.toHaveBeenCalled();
+    expect(orgStub.getCreditChargeableSpendUsd).not.toHaveBeenCalled();
+  });
+
+  it("converts a Workers AI prompt to a Bedrock user message", async () => {
+    const fetchMock = mockBedrockFetch();
+    const { scope, backgroundTasks } = selfhostScope();
+    const result = await executeVirtualAiRun(scope, "@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
+      prompt: "Say ok",
+    });
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      model: "anthropic.claude-sonnet-5-5",
+      messages: [{ role: "user", content: [{ type: "text", text: "Say ok" }] }],
+    });
+    expect(result).toMatchObject({ response: "ok" });
+    await Promise.all(backgroundTasks);
+  });
+
+  it("streams OpenAI deltas without response fields and records usage after consumption", async () => {
+    mockBedrockFetch();
+    const { scope, orgStub, backgroundTasks } = selfhostScope();
+    const result = await executeVirtualAiRun(scope, "auto", {
+      messages: [{ role: "user", content: "Say ok" }],
+      stream: true,
+    });
+    expect(result).toBeInstanceOf(ReadableStream);
+    const body = await new Response(result as ReadableStream<Uint8Array>).text();
+    expect(body.endsWith("data: [DONE]\n\n")).toBe(true);
+    const chunks = body.split("\n\n")
+      .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+      .map((line) => JSON.parse(line.slice(6)));
+    expect(chunks.length).toBeGreaterThan(0);
+    for (const chunk of chunks) {
+      expect(chunk.object).toBe("chat.completion.chunk");
+      expect(chunk).not.toHaveProperty("response");
+    }
+    expect(chunks.map((chunk) => chunk.choices[0]?.delta?.content ?? "").join("")).toBe("ok");
+    expect(scope.waitUntil).toHaveBeenCalledOnce();
+    await Promise.all(backgroundTasks);
+    expect(orgStub.recordUsage).toHaveBeenCalledOnce();
+    expect(orgStub.recordUsage).toHaveBeenCalledWith(expect.objectContaining({
+      provider: "bedrock", billing_source: "byok", credit_chargeable: false,
+      usage_surface: "virtual_ai", input_tokens: 3, output_tokens: 1,
+    }));
+  });
+
+  it.each([null, ""])("leaves completions with %j content unchanged", async (content) => {
+    const { scope } = selfhostScope();
+    const result = { choices: [{ message: { content, tool_calls: [] } }] };
+    scope.runBedrock = vi.fn(async () => result);
+    expect(await executeVirtualAiRun(scope, "auto", { prompt: "hello" })).toBe(result);
+    expect(result).not.toHaveProperty("response");
+  });
+
+  it.each([
+    ["@cf/baai/bge-base-en-v1.5", { text: ["a"] }],
+    ["@cf/meta/llama-3.3-70b-instruct-fp8-fast", { prompt: "x", image: [1, 2] }],
+  ])("rejects unsupported input for %s before fetching", async (model, input) => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const { scope, orgStub } = selfhostScope();
+    await expect(executeVirtualAiRun(scope, model, input)).rejects.toThrow(new Error(
+      `env.AI.run("${model}") needs chat "messages" or a text "prompt" on this install. Its AI provider is AWS Bedrock, which serves text generation here; image, audio, embedding and other non-text inputs aren't supported.`,
+    ));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(orgStub.checkUserLlmUsageAccess).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-text models before fetching", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const { scope } = selfhostScope();
+    await expect(executeVirtualAiRun(scope, "google/gemini-3.8-flash-image", { prompt: "x" })).rejects.toThrow(new Error(
+      'Model "google/gemini-3.8-flash-image" isn\'t available through env.AI on this install. Its AI provider is AWS Bedrock, which serves text generation here (chat messages or a text prompt), and this model makes images, audio or other non-text output.',
+    ));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["auto_image", "dynamic/auto_image"])("explains unavailable %s without a gateway", async (model) => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const { scope } = selfhostScope();
+    await expect(executeVirtualAiRun(scope, model, { prompt: "x" })).rejects.toThrow(new Error(
+      "Image generation isn't available on this install yet. Its AI provider is AWS Bedrock, which serves text generation through env.AI.",
+    ));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps auto_image on the gateway when configured", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ response: "image" }));
+    const { scope, orgStub } = selfhostScope({ CF_GATEWAY_NAME: "gateway", CF_GATEWAY_TOKEN: "hosted-token" });
+    expect(await executeVirtualAiRun(scope, "auto_image", { prompt: "x" })).toEqual({ response: "image" });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://gateway.ai.cloudflare.com/v1/selfhost/gateway/compat/chat/completions");
+    expect(JSON.parse(String(init.body)).model).toBe("dynamic/auto_image");
+    expect(new Headers(init.headers).get("authorization")).toBe("Bearer hosted-token");
+    expect(orgStub.getInfo).toHaveBeenCalledOnce();
+  });
+
+  it("surfaces the install configuration error before fetching or reading org keys", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const { scope, orgStub } = selfhostScope({ SELFHOST_AI_API_KEY: "" });
+    await expect(executeVirtualAiRun(scope, "auto", { prompt: "x" })).rejects.toThrow(new Error(
+      "SELFHOST_AI_API_KEY is required for the configured self-host AI provider.",
+    ));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(orgStub.getLlmProviderConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe("hosted virtual AI is unchanged by self-host Bedrock support", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each([
+    "auto", "smart", "cheap", "deepseek-v4-auto", "deepseek-v4-pro",
+    "anthropic/claude-opus-5.5", "@cf/meta/llama-3.3-70b-instruct-fp8-fast", "openai/gpt-5.6-luna",
+  ])("keeps hosted routing identical for %s even with SELFHOST_AI vars", async (model) => {
+    const { scope, orgStub } = virtualAiTestScope();
+    const expected = await resolveRouting(scope, model);
+    const actual = await resolveRouting({
+      ...scope,
+      env: { ...scope.env, SELFHOST_AI_PROVIDER: "bedrock", SELFHOST_AI_API_KEY: "install-key" },
+    }, model);
+    expect(actual).toEqual(expected);
+    expect(actual).not.toHaveProperty("installProvider");
+    expect(expected).not.toHaveProperty("installProvider");
+    expect(orgStub.getLlmProviderConfig).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["cheap", "anthropic.claude-sonnet-5-5"],
+    ["fast", "anthropic.claude-sonnet-5-5"],
+    ["auto", "anthropic.claude-sonnet-5-5"],
+    ["smart", "anthropic.claude-opus-5-5"],
+  ])("keeps hosted Bedrock BYOK %s on the org's key and region", async (model, expected) => {
+    const { scope, orgStub } = virtualAiTestScope({ SELFHOST_AI_PROVIDER: "bedrock", SELFHOST_AI_API_KEY: "ignored-install-key" });
+    orgStub.getLlmProviderConfig.mockResolvedValue({
+      provider: "bedrock",
+      config: JSON.stringify({ aws_region: "eu-west-1" }),
+      credentials_encrypted: await encryptCredentials({ bearer_token: "org-bedrock-key" }, "secret"),
+    });
+    expect(await resolveRouting(scope, model)).toEqual({
+      provider: "bedrock", gatewayProvider: "compat", model: expected,
+      byokKey: "org-bedrock-key", awsRegion: "eu-west-1",
+    });
+    expect(orgStub.getLlmProviderConfig).toHaveBeenCalledOnce();
+  });
+
+  it("still sends hosted auto to AI Gateway with the hosted token and credit check", async () => {
+    const completion = {
+      choices: [{ message: { content: "ok" } }],
+      usage: { prompt_tokens: 3, completion_tokens: 1 },
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json(completion));
+    const { scope, orgStub, backgroundTasks } = virtualAiTestScope();
+    expect(await executeVirtualAiRun(scope, "auto", {
+      messages: [{ role: "user", content: "Say ok" }],
+    })).toEqual(completion);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://gateway.ai.cloudflare.com/v1/acct/gateway/openrouter/chat/completions");
+    expect(new Headers(init.headers).get("authorization")).toBe("Bearer hosted-token");
+    expect(orgStub.getInfo).toHaveBeenCalledOnce();
+    expect(orgStub.getCreditChargeableSpendUsd).toHaveBeenCalledOnce();
+    await Promise.all(backgroundTasks);
+    expect(orgStub.recordUsage).toHaveBeenCalledWith(expect.objectContaining({
+      provider: "openrouter", billing_source: "hosted", credit_chargeable: true,
+    }));
+  });
+
+  it.each([
+    { SELFHOST_AI_PROVIDER: "openai", SELFHOST_AI_API_KEY: "openai-key" },
+    { SELFHOST_AI_PROVIDER: "openai", SELFHOST_AI_API_KEY: "" },
+    { SELFHOST_AI_API_KEY: "partial-config-key" },
+    {},
+  ])("keeps self-host non-Bedrock or unset providers on today's path: %j", async (providerEnv) => {
+    const { scope, orgStub } = virtualAiTestScope({
+      CF_ACCOUNT_ID: "selfhost", CF_DISPATCH_NAMESPACE: "selfhost", ...providerEnv,
+    });
+    expect(await resolveRouting(scope, "auto")).toEqual({
+      provider: "openrouter", gatewayProvider: "openrouter", model: "openai/gpt-6-luna",
+      byokKey: undefined, awsRegion: undefined,
+    });
+    expect(orgStub.getLlmProviderConfig).toHaveBeenCalledOnce();
+  });
+});
 
 describe("buildBedrockPiModel", () => {
   it("uses the suffix-free Opus 5.5 Mantle model with adaptive-thinking metadata", () => {
@@ -761,16 +1182,7 @@ describe("executeVirtualAiRun", () => {
 
   it("does not require AI Gateway settings before Bedrock BYOK routing", async () => {
     const encrypted = await encryptCredentials({ bearer_token: "bedrock-token" }, "secret");
-    // A whole Anthropic Messages stream: Pi 1.1 fails a stream that ends without a stop reason.
-    const events = [
-      ["message_start", { type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", model: "anthropic.claude-sonnet-5-5", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 3, output_tokens: 0 } } }],
-      ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
-      ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } }],
-      ["content_block_stop", { type: "content_block_stop", index: 0 }],
-      ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 1 } }],
-      ["message_stop", { type: "message_stop" }],
-    ] as const;
-    const body = events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join("");
+    const body = bedrockMessagesSseBody();
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
       new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
     );

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -440,16 +441,26 @@ assert(
 );
 assert(
   bundledDockerfile.includes(
-    "COPY package.json bun.lock ./\nCOPY patches ./patches\nRUN bun install --frozen-lockfile",
+    "COPY package.json bun.lock ./\nRUN bun install --frozen-lockfile",
   ),
-  "bundled app build must copy patched dependencies before installing",
+  "bundled app build must install from the lockfile before copying the source",
 );
 assert(
   bundledDockerfile.includes(
-    "COPY package.json bun.lock ./\nCOPY patches ./patches\nRUN bun install --frozen-lockfile --production",
+    "COPY package.json bun.lock ./\nRUN bun install --frozen-lockfile --production",
   ),
-  "bundled app runtime must copy patched dependencies before installing",
+  "bundled app runtime must install production dependencies from the lockfile",
 );
+// Every path the image COPYs from the build context must exist in the checkout:
+// a deleted directory (patches/, removed with the in-app agent loop) otherwise
+// only fails at release time, in the image build.
+for (const [, args] of bundledDockerfile.matchAll(/^COPY\s+(.+)$/gm)) {
+  const tokens = args.trim().split(/\s+/);
+  if (tokens.some((token) => token.startsWith("--from="))) continue;
+  for (const source of tokens.filter((token) => !token.startsWith("--")).slice(0, -1)) {
+    assert(existsSync(path.join(repoRoot, source)), `bundled app Dockerfile copies ${source}, which does not exist`);
+  }
+}
 const bundledCommand =
   bundledDockerfile.match(/^CMD\s+(.+)$/m)?.[1] ?? "";
 assert(

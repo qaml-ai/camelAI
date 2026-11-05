@@ -50,6 +50,16 @@ export const volumeNames = [
  * start of a release that bundles it. A backup taken then skips them.
  */
 export const optionalVolumeNames = new Set(["agent-runtime-postgres", "agent-runtime-data"]);
+/**
+ * Every volume a backup can hold (volumeNamesForEnv under any auth and TLS
+ * mode), which selfhost:restore accepts.
+ */
+export const restorableVolumeNames = new Set([
+  ...volumeNames,
+  "pomerium-data",
+  "caddy-data",
+  "caddy-config",
+]);
 
 export function volumeNamesForEnv(env = {}) {
   const names =

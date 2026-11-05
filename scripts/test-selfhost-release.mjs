@@ -9,6 +9,7 @@ import {
   composeArgs,
   pomeriumComposeFile,
   pomeriumLoopbackComposeFile,
+  restorableVolumeNames,
   sourceComposeFile,
   volumeNamesForEnv,
 } from "./selfhost-common.mjs";
@@ -720,9 +721,22 @@ includesAll(
 );
 includesAll(
   restoreScript,
-  ["Missing declared backup archive", "new Set(selectedVolumeNames)"],
+  ["Missing declared backup archive", "new Set(selectedVolumeNames)", "restorableVolumeNames.has(name)"],
   "fail-closed self-host restore",
 );
+// selfhost:restore must accept every volume selfhost:backup can write, under
+// every auth and TLS mode. It once refused caddy-data and caddy-config, so no
+// backup of an install fronted by Caddy (every TLS mode) could be restored.
+for (const SELFHOST_AUTH_MODE of ["bundled-pomerium", "external-pomerium", "cloudflare-access", "local"]) {
+  for (const SELFHOST_TLS_MODE of ["automatic", "external", "provided", "none"]) {
+    for (const name of volumeNamesForEnv({ SELFHOST_AUTH_MODE, SELFHOST_TLS_MODE })) {
+      assert(
+        restorableVolumeNames.has(name),
+        `selfhost:restore must accept the ${name} volume a ${SELFHOST_AUTH_MODE}/${SELFHOST_TLS_MODE} backup holds`,
+      );
+    }
+  }
+}
 includesAll(
   doctorScript,
   [

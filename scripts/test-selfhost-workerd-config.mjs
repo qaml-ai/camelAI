@@ -218,6 +218,25 @@ description: Follow ACME runbooks. Use when shipping internal tools.
   }
   assert(config.includes('infra/selfhost/ai-binding.worker.js'), 'config should embed the self-host AI binding module');
   assert(config.includes('name = "dispatcher"'), 'config should contain dispatcher service');
+  const dispatcherStart = config.indexOf('(name = "dispatcher", worker = (');
+  // Services are joined with a newline; nested bindings stay on the service's line.
+  const dispatcherEnd = config.indexOf(',\n    (name = ', dispatcherStart);
+  assert(dispatcherStart >= 0 && dispatcherEnd > dispatcherStart, 'config should delimit the dispatcher worker service');
+  const dispatcherConfig = config.slice(dispatcherStart, dispatcherEnd);
+  for (const [name, value] of [
+    ['SELFHOST_AI_PROVIDER', 'bedrock'],
+    ['SELFHOST_AI_API_KEY', 'test-bedrock-key'],
+    ['SELFHOST_AI_AWS_REGION', 'us-east-1'],
+  ]) {
+    assert(
+      dispatcherConfig.includes(`(name = "${name}", text = "${value}")`),
+      `deployed apps' env.AI runs in the dispatcher and needs the install's AI provider settings: ${name}`,
+    );
+  }
+  assert(
+    dispatcherConfig.includes('(name = "INTEGRATION_SECRET_KEY", text = "'),
+    "deployed apps' env.AI runs in the dispatcher and needs the install's AI provider settings: INTEGRATION_SECRET_KEY",
+  );
   assert(
     !config.includes('(name = "SKIP_AUTH", text = "true")'),
     'production self-host dispatcher must not bypass app authentication',

@@ -10,6 +10,12 @@ import {
   resolveCloudflareGatewayOrigin,
 } from "../../../src/lib/cloudflare-ai-gateway";
 import {
+  getSelfhostAiProviderCredentials,
+  getSelfhostAiProviderStatus,
+  type SelfhostAiProviderEnv,
+} from "../../../src/lib/selfhost-ai-provider";
+import { isSelfhostRuntime } from "../../../src/lib/selfhost-runtime";
+import {
   BedrockPiCompletionError,
   chatCompletionToPiCall,
   runBedrockViaPi,
@@ -18,11 +24,10 @@ import { getHostedVllmPriority } from "./hosted-vllm-priority";
 import { assertUserLlmUsageAccess } from "./user-llm-usage-policy";
 import { recordObservabilityEvent } from "./observability";
 
-export interface AIVirtualBindingEnv {
+export interface AIVirtualBindingEnv extends SelfhostAiProviderEnv {
   ORG: DurableObjectNamespace<OrgDO>;
   AI?: Ai;
   R2_BUCKET?: R2Bucket;
-  CF_ACCOUNT_ID?: string;
   CF_GATEWAY_NAME?: string;
   CF_GATEWAY_BASE_URL?: string;
   CF_GATEWAY_TOKEN?: string;
@@ -80,6 +85,67 @@ const TIER_MODELS: Readonly<Record<ProviderKind, Readonly<Record<TierName, strin
 
 // Mantle host region for Bedrock BYOK env.AI.run tier calls.
 const DEFAULT_BEDROCK_REGION = "us-east-1";
+
+// Models with no Bedrock route are answered by the auto tier's model; the response's `model` field names it.
+const SELFHOST_BEDROCK_DEFAULT_MODEL = TIER_MODELS.bedrock.auto;
+
+// These take a prompt or messages but do not return text, so must not be quietly
+// answered by a chat model. Other non-text models are caught by the input check.
+const SELFHOST_BEDROCK_NON_TEXT_MODELS = /^(?:@cf\/(?:black-forest-labs|stabilityai|runwayml|bytedance|lykon|leonardo|myshell-ai|deepgram)\/)|stable-diffusion|dall-e|image/;
+
+export function resolveSelfhostBedrockModel(model: string): string {
+  if (TIERS.has(model as TierName)) return TIER_MODELS.bedrock[model as TierName];
+  const lower = model.toLowerCase();
+  if (SELFHOST_BEDROCK_NON_TEXT_MODELS.test(lower)) {
+    throw new Error(
+      `Model "${model}" isn't available through env.AI on this install. Its AI provider is AWS Bedrock, which serves text generation here (chat messages or a text prompt), and this model makes images, audio or other non-text output.`,
+    );
+  }
+  if (lower.includes("claude")) {
+    if (lower.includes("fable")) return "anthropic.claude-fable-5-1";
+    if (lower.includes("opus")) return "anthropic.claude-opus-5-5";
+    if (lower.includes("haiku")) {
+      return /haiku-4[-.]5/.test(lower)
+        ? "anthropic.claude-haiku-4-5"
+        : "anthropic.claude-haiku-5-5";
+    }
+    return "anthropic.claude-sonnet-5-5";
+  }
+  return SELFHOST_BEDROCK_DEFAULT_MODEL;
+}
+
+export function toSelfhostBedrockInput(
+  model: string,
+  input: unknown,
+): Record<string, unknown> {
+  const unsupported = () => new Error(
+    `env.AI.run("${model}") needs chat "messages" or a text "prompt" on this install. Its AI provider is AWS Bedrock, which serves text generation here; image, audio, embedding and other non-text inputs aren't supported.`,
+  );
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw unsupported();
+  const prototype = Object.getPrototypeOf(input);
+  if (prototype !== Object.prototype && prototype !== null) throw unsupported();
+  const obj = input as Record<string, unknown>;
+  if ("image" in obj || "audio" in obj || "mask" in obj) throw unsupported();
+  if (Array.isArray(obj.messages) && obj.messages.length > 0) return obj;
+  if (typeof obj.prompt === "string" && obj.prompt.length > 0) {
+    const { prompt, ...rest } = obj;
+    return { ...rest, messages: [{ role: "user", content: prompt }] };
+  }
+  throw unsupported();
+}
+
+function selfhostBedrockProvider(
+  env: AIVirtualBindingEnv,
+): { apiKey: string; awsRegion: string } | null {
+  if (!isSelfhostRuntime(env)) return null;
+  const status = getSelfhostAiProviderStatus(env);
+  if (status.provider !== "bedrock") return null;
+  if (!status.valid) {
+    throw new Error(status.message ?? "Self-host AI provider is not configured correctly.");
+  }
+  const creds = getSelfhostAiProviderCredentials(env)!;
+  return { apiKey: creds.apiKey, awsRegion: creds.awsRegion ?? DEFAULT_BEDROCK_REGION };
+}
 
 /**
  * Back-compat shim for already-deployed user workers that still call the old
@@ -186,6 +252,8 @@ interface ResolvedRouting {
   byokKey?: string;
   /** Bedrock-only: region for the Converse URL. */
   awsRegion?: string;
+  /** Served by the self-host install's own provider (SELFHOST_AI_*). */
+  installProvider?: true;
 }
 
 /**
@@ -196,11 +264,26 @@ interface ResolvedRouting {
  * orgs without BYOK get the OpenRouter mapping routed through our hosted credits.
  * Anything else is treated as a real OpenRouter model id and passes through to
  * the OpenRouter route (still using the org's OpenRouter BYOK if present).
+ *
+ * A self-hosted install whose own provider is Bedrock (SELFHOST_AI_PROVIDER)
+ * serves every org with that key instead, as its chats do: see
+ * resolveSelfhostBedrockModel for the model mapping.
  */
 export async function resolveRouting(
   scope: VirtualAiRunScope,
   rawModel: string,
 ): Promise<ResolvedRouting> {
+  const installProvider = selfhostBedrockProvider(scope.env);
+  if (installProvider) {
+    return {
+      provider: "bedrock",
+      gatewayProvider: "compat",
+      model: resolveSelfhostBedrockModel(normalizeLegacyModel(rawModel)),
+      byokKey: installProvider.apiKey,
+      awsRegion: installProvider.awsRegion,
+      installProvider: true,
+    };
+  }
   const byok = await readOrgByok(scope.env, scope.props);
   const trimmed = normalizeLegacyModel(rawModel);
 
@@ -329,11 +412,19 @@ export async function executeVirtualAiRun(
   // on our hosted credits (no BYOK, charges credits). `dynamic/auto_image`
   // (old public string) is normalized to `auto_image` by normalizeLegacyModel.
   if (requestedModel === "auto_image") {
+    if (!resolveGatewaySettings(scope.env) && selfhostBedrockProvider(scope.env)) {
+      throw new Error(
+        "Image generation isn't available on this install yet. Its AI provider is AWS Bedrock, which serves text generation through env.AI.",
+      );
+    }
     const settings = requireGatewaySettings(scope.env);
     return runLegacyAutoImage(scope, settings, sanitizedInput);
   }
 
   const routing = await resolveRouting(scope, requestedModel);
+  const providerInput = routing.installProvider
+    ? toSelfhostBedrockInput(requestedModel, sanitizedInput)
+    : sanitizedInput;
   const usesByok = routing.byokKey !== undefined;
   const access: { creditChargeable: boolean; vllmPriority?: string } = usesByok
     ? { creditChargeable: false }
@@ -395,19 +486,16 @@ export async function executeVirtualAiRun(
   try {
     result = routing.provider === "bedrock"
       ? await (scope.runBedrock ?? runBedrockViaPi)({
-          call: chatCompletionToPiCall(sanitizedInput),
+          call: chatCompletionToPiCall(providerInput),
           modelId: routing.model,
-          // Bedrock BYOK is the only path here — if we got bedrock routing
-          // without a key, that's a bug in resolveRouting (would mean an org
-          // with Bedrock-typed BYOK record but no decryptable bearer token,
-          // which `readOrgByok` now throws on).
+          // Both org BYOK and the install provider require a valid key in resolveRouting.
           bearerToken: routing.byokKey!,
           region: routing.awsRegion,
         })
       : await runViaGatewayHTTP(
           settings!,
           scope.props,
-          sanitizedInput,
+          providerInput,
           routing.model,
           routing.gatewayProvider,
           routing.byokKey,
@@ -432,6 +520,13 @@ export async function executeVirtualAiRun(
         }),
     );
     return clientStream;
+  }
+  if (routing.installProvider && result && typeof result === "object") {
+    const completion = result as { choices?: { message?: { content?: unknown } }[] };
+    const content = completion.choices?.[0]?.message?.content;
+    if (typeof content === "string" && content.length > 0) {
+      result = { ...result, response: content };
+    }
   }
   const usage = extractJsonUsage(result, fallbackModel);
   if (usage) {

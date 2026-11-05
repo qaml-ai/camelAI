@@ -841,10 +841,13 @@ The helper verifies the manifest against the selected checkout, backs up durable
 volumes, and snapshots the previous checkout and `.env.selfhost`. Failures
 before the new runtime starts restore that runtime configuration automatically.
 Once startup begins, D1 migrations may have run, so failures leave the new
-checkout and image configuration in place. Restore the matching pre-upgrade
-volume backup before using the printed explicit rollback command. Before
-declaring success the helper waits for Compose health, runs the doctor, and
-executes the project, analysis, and database-query deep smokes.
+checkout and image configuration in place. Either go forward or go back. To go
+forward, fix the cause (the log names the failed step) and run `bun run
+selfhost:refresh` to finish the upgrade on the new release. To go back, restore
+the matching pre-upgrade volume backup before using the printed explicit
+rollback command. Before declaring success the helper waits for Compose health,
+runs the doctor, and executes the project, analysis, and database-query deep
+smokes.
 Normal upgrades re-exec the target checkout's upgrader before applying images,
 so the target release owns its manifest and migration rules.
 

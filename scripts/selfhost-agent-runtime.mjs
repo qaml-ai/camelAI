@@ -25,7 +25,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 /** The runtime release this checkout runs; release manifests pin it by digest. */
-export const SELFHOST_AGENT_RUNTIME_VERSION = "0.9.0";
+export const SELFHOST_AGENT_RUNTIME_VERSION = "0.12.0";
 export const SELFHOST_AGENT_RUNTIME_IMAGE = `ghcr.io/qaml-ai/run:${SELFHOST_AGENT_RUNTIME_VERSION}`;
 export const SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE =
   "postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54";

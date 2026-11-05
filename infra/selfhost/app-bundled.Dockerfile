@@ -7,7 +7,6 @@ RUN npm install --global "bun@${BUN_VERSION}"
 WORKDIR /workspace
 
 COPY package.json bun.lock ./
-COPY patches ./patches
 RUN bun install --frozen-lockfile
 
 COPY . .
@@ -67,7 +66,6 @@ WORKDIR /workspace
 # and Miniflare/workerd support modules. Install only production dependencies,
 # copy the source tree, then overlay the immutable build artifacts.
 COPY package.json bun.lock ./
-COPY patches ./patches
 RUN bun install --frozen-lockfile --production
 COPY . .
 COPY --from=build /workspace/build /workspace/build

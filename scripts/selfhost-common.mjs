@@ -60,15 +60,15 @@ export function volumeNamesForEnv(env = {}) {
   return usesCaddy(env) ? [...names, "caddy-data", "caddy-config"] : names;
 }
 
-export async function readSelfhostEnv(required = false) {
-  if (!existsSync(envFile)) {
+export async function readSelfhostEnv(required = false, filePath = envFile) {
+  if (!existsSync(filePath)) {
     if (required) {
-      throw new Error(`Missing ${path.relative(repoRoot, envFile)}. Run \`bun run selfhost:init\` first.`);
+      throw new Error(`Missing ${path.relative(repoRoot, filePath)}. Run \`bun run selfhost:init\` first.`);
     }
     return {};
   }
 
-  const text = await fs.readFile(envFile, "utf8");
+  const text = await fs.readFile(filePath, "utf8");
   const entries = {};
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim();

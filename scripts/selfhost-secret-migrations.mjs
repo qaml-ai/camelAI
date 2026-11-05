@@ -25,6 +25,28 @@ function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function definitionsOf(lines, key) {
+  const pattern = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=(.*)$`);
+  return lines.flatMap((line, index) => {
+    const match = line.match(pattern);
+    return match ? [{ index, value: decodeEnvValue(match[1]) }] : [];
+  });
+}
+
+function replaceEnvDefinition(lines, definitions, line) {
+  if (definitions.length > 0) {
+    const definitionIndexes = new Set(definitions.map((definition) => definition.index));
+    const firstIndex = definitions[0].index;
+    return lines.flatMap((existingLine, index) => {
+      if (index === firstIndex) return [line];
+      return definitionIndexes.has(index) ? [] : [existingLine];
+    });
+  }
+  while (lines.length > 0 && lines.at(-1).trim() === "") lines.pop();
+  lines.push(line, "");
+  return lines;
+}
+
 /**
  * Give an existing .env.selfhost every value in `defaults` ([key, generate]
  * pairs) it lacks (absent, or empty in its last definition), in one atomic
@@ -35,36 +57,19 @@ function escapeRegExp(text) {
  */
 export async function ensureSelfhostEnvValues(envPath, defaults, { beforeCreate } = {}) {
   let lines = (await fs.readFile(envPath, "utf8")).split(/\r?\n/);
-  const definitionsOf = (key) => {
-    const pattern = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=(.*)$`);
-    return lines.flatMap((line, index) => {
-      const match = line.match(pattern);
-      return match ? [{ index, value: decodeEnvValue(match[1]) }] : [];
-    });
-  };
   if (beforeCreate) {
-    const missing = defaults.map(([key]) => key).filter((key) => !definitionsOf(key).at(-1)?.value);
+    const missing = defaults.map(([key]) => key).filter((key) => !definitionsOf(lines, key).at(-1)?.value);
     if (missing.length > 0) {
-      const value = (key) => definitionsOf(key).at(-1)?.value ?? "";
+      const value = (key) => definitionsOf(lines, key).at(-1)?.value ?? "";
       await beforeCreate(missing, value);
     }
   }
   const created = [];
   for (const [key, generate] of defaults) {
-    const definitions = definitionsOf(key);
+    const definitions = definitionsOf(lines, key);
     if (definitions.at(-1)?.value) continue;
     const line = `${key}=${generate()}`;
-    if (definitions.length > 0) {
-      const definitionIndexes = new Set(definitions.map((definition) => definition.index));
-      const firstIndex = definitions[0].index;
-      lines = lines.flatMap((existingLine, index) => {
-        if (index === firstIndex) return [line];
-        return definitionIndexes.has(index) ? [] : [existingLine];
-      });
-    } else {
-      while (lines.length > 0 && lines.at(-1).trim() === "") lines.pop();
-      lines.push(line, "");
-    }
+    lines = replaceEnvDefinition(lines, definitions, line);
     created.push(key);
   }
   if (created.length === 0) {
@@ -78,6 +83,51 @@ export async function ensureSelfhostEnvValues(envPath, defaults, { beforeCreate 
 }
 
 const ADMIN_API_KEY_DEFAULT = ["ADMIN_API_KEY", () => randomBytes(32).toString("base64url")];
+export const SELFHOST_SECRET_DEFAULTS = Object.freeze([ADMIN_API_KEY_DEFAULT, ...AGENT_RUNTIME_ENV_DEFAULTS]);
+
+/** The bundled agent runtime's settings: AGENT_RUNTIME_* and SELFHOST_AGENT_RUNTIME_*. */
+const AGENT_RUNTIME_SETTING = /^(?:SELFHOST_)?AGENT_RUNTIME_[A-Z0-9_]+$/;
+
+/**
+ * Put a release snapshot's .env.selfhost back at `envPath`, except that a
+ * value the snapshot lacks (absent, or empty in its last definition) keeps the
+ * current definition, verbatim, when it is one of SELFHOST_SECRET_DEFAULTS or
+ * one of the agent runtime's settings. A value the snapshot sets wins. The
+ * snapshot may come from an older release's upgrader, which never knew these
+ * keys, while what they guard and configure (the runtime and its volumes)
+ * outlives the rollback: the next upgrade refuses to generate new secrets over
+ * those volumes, and would start the runtime without the operator's settings
+ * (an outbound allow-origin for a private model endpoint, a port). Returns the
+ * keys kept; the file ends up 0600.
+ */
+export async function restoreSelfhostEnvSnapshot(snapshotPath, envPath) {
+  const snapshotText = await fs.readFile(snapshotPath, "utf8");
+  const currentText = await fs.readFile(envPath, "utf8").catch((error) => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  let lines = snapshotText.split(/\r?\n/);
+  const currentLines = currentText.split(/\r?\n/);
+  const kept = [];
+  const currentKeys = currentLines.flatMap((line) => line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/)?.[1] ?? []);
+  const candidates = new Set([
+    ...SELFHOST_SECRET_DEFAULTS.map(([key]) => key),
+    ...currentKeys.filter((key) => AGENT_RUNTIME_SETTING.test(key)),
+  ]);
+  for (const key of candidates) {
+    const definitions = definitionsOf(lines, key);
+    if (definitions.at(-1)?.value) continue;
+    const currentDefinition = definitionsOf(currentLines, key).at(-1);
+    if (!currentDefinition?.value) continue;
+    const line = currentLines[currentDefinition.index].trim();
+    lines = replaceEnvDefinition(lines, definitions, line);
+    kept.push(key);
+  }
+  let text = kept.length > 0 ? lines.join("\n") : snapshotText;
+  if (kept.length > 0 && !text.endsWith("\n")) text += "\n";
+  await atomicWritePrivateFile(envPath, text);
+  return { kept };
+}
 
 export async function ensureSelfhostAdminApiKey(envPath) {
   const { created } = await ensureSelfhostEnvValues(envPath, [ADMIN_API_KEY_DEFAULT]);
@@ -92,7 +142,7 @@ export async function ensureSelfhostAdminApiKey(envPath) {
  * selfhost:migrate-secrets), so the values are generated once and kept.
  */
 export async function ensureSelfhostSecrets(envPath, { existingVolumes = existingDockerVolumes } = {}) {
-  return await ensureSelfhostEnvValues(envPath, [ADMIN_API_KEY_DEFAULT, ...AGENT_RUNTIME_ENV_DEFAULTS], {
+  return await ensureSelfhostEnvValues(envPath, SELFHOST_SECRET_DEFAULTS, {
     // Never a new database password, secrets key or session secret over the
     // runtime's existing data: it would lock the install out of it.
     beforeCreate: async (keys, value) => {

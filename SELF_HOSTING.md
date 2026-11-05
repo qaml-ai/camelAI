@@ -9,9 +9,9 @@ for project builds, notebook analysis, and database queries.
 Production installations should use the release Compose file with immutable
 image references. At minimum, `.env.selfhost` must set `SELFHOST_APP_IMAGE` to
 the camelAI application image published for the selected release. The
-local-artifacts, project-build, analysis, database-query, and container-egress
-image variables must refer to the matching release as well. Prefer
-digest-pinned values:
+local-artifacts, project-build, analysis, database-query, container-egress and
+agent-runtime image variables must refer to the matching release as well.
+Prefer digest-pinned values:
 
 ```dotenv
 SELFHOST_APP_IMAGE=ghcr.io/your-org/camelai-selfhost-app@sha256:...
@@ -22,10 +22,15 @@ SELFHOST_DB_QUERY_IMAGE=ghcr.io/your-org/camelai-selfhost-db-query@sha256:...
 SELFHOST_CONTAINER_EGRESS_IMAGE=ghcr.io/your-org/camelai-selfhost-container-egress@sha256:...
 SELFHOST_CADDY_IMAGE=ghcr.io/your-org/camelai-selfhost-caddy@sha256:...
 SELFHOST_POMERIUM_IMAGE=pomerium/pomerium@sha256:...
+SELFHOST_AGENT_RUNTIME_IMAGE=ghcr.io/qaml-ai/run@sha256:...
+SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE=postgres:16@sha256:...
 ```
 
-Pin all eight dependency references from the same release manifest. Seven are
-camelAI images; Pomerium is the tested upstream image. The container-egress
+Pin all ten dependency references from the same release manifest
+(`selfhost-release.json`). Seven are camelAI images, and Pomerium is the tested
+upstream image. From `selfhost-v0.2.0`, the last two are the bundled agent
+runtime (`ghcr.io/qaml-ai/run` at the version the release pins) and its
+Postgres (see "Upgrading to the runtime"). The container-egress
 wrapper is required for the known Docker 29 bridge-interception bug and is
 covered by the attached-container functional smoke.
 
@@ -554,10 +559,13 @@ Rules:
 
 ## Upgrading to the runtime
 
-Chat threads run on the camelAI agent runtime, which self-host installs now
-run themselves: the runtime keeps each thread's agent (its model loop,
-history and sandbox) and calls camelAI's tools over MCP, instead of the
-thread's own loop inside the app.
+From `selfhost-v0.2.0`, chat threads run on the camelAI agent runtime, which
+the install runs itself. The runtime keeps each thread's agent (its model
+loop, history and sandbox) and calls camelAI's tools over MCP. In
+`selfhost-v0.1.18` and earlier, each thread ran its own loop inside the app.
+From v0.1.18, upgrade with plain `bun run selfhost:upgrade` ("Operational
+validation" below). Its upgrader already hands over to the target release's
+upgrader, which adds the runtime's secrets and starts the runtime.
 
 ### What changes
 
@@ -595,7 +603,8 @@ thread's own loop inside the app.
   secrets key and database password guard the runtime's volumes, so
   `selfhost:migrate-secrets` and `selfhost:init` (with `--force` too) refuse to
   generate them while `agent-runtime-postgres` or `agent-runtime-data` exist:
-  restore them from a backup of `.env.selfhost` instead.
+  restore them from a backup of `.env.selfhost` instead (a rollback keeps one
+  beside its snapshot: `.selfhost/releases/<timestamp>/env.selfhost.replaced-*`).
 - **Provisioned at every start.** Before workerd starts, the app waits for the
   runtime, upserts the `camelai-thread` definition (stable id; a changed spec
   is a new revision) and registers its events webhook once, keeping the
@@ -641,12 +650,43 @@ does anything.
 
 ### Rollback
 
-`selfhost:upgrade --rollback <snapshot>` restores the previous release's
-images; the runtime's volumes are left as they are, and a later upgrade picks
-them up again. Threads already on the runtime keep working (their agents live
-in the runtime), so leave the runtime containers, their volumes and the
-`AGENT_RUNTIME_*` secrets in place. A release without the runtime cannot open
-threads that were created on it.
+`bun run selfhost:upgrade -- --rollback .selfhost/releases/<timestamp>` (the
+upgrade prints the exact command) returns to the release in that snapshot:
+
+1. It backs up the volumes, unless you pass `--skip-backup`.
+2. It saves the current `.env.selfhost` beside the snapshot as
+   `env.selfhost.replaced-<time>`.
+3. It restores the snapshot's `.env.selfhost` and checkout, with one
+   exception. When the snapshot lacks a value for something the rollback
+   leaves in place, the current value is kept: `ADMIN_API_KEY`, and the
+   runtime's secrets and settings (`AGENT_RUNTIME_*` and
+   `SELFHOST_AGENT_RUNTIME_*`, such as an outbound allow-origin you added).
+   An upgrade from `selfhost-v0.1.18` or earlier always has such values,
+   because the older release's upgrader took the snapshot before the runtime's
+   secrets existed. Without them, the next upgrade would refuse to start over
+   the runtime's volumes.
+4. It starts the restored release in the background with that release's own
+   `selfhost:refresh` (`docker compose up -d --wait`), then runs that release's
+   doctor and deep smokes.
+
+A rollback does not reverse migrations: the app's D1 migrations and the
+runtime's Postgres migrations only run forward. When a schema has to go back,
+restore the matching pre-upgrade volume backup first.
+
+- **To a release without the runtime** (`selfhost-v0.1.18` or earlier):
+  Compose removes the `agent-runtime` and `agent-runtime-postgres` containers,
+  because that release does not define them. Their volumes and secrets stay,
+  and the next upgrade picks them up again. The pre-upgrade backup has no
+  runtime volumes, so restoring it leaves them as they are. The older release
+  cannot open threads created on the runtime. It does not know which threads
+  moved there either. Expect it to show a moved thread as it was before the
+  move, and anything sent to that thread from the older release does not
+  reach the runtime. Keep such a rollback short.
+- **Between two releases that both bundle the runtime:** the runtime's
+  containers stay, on the snapshot's runtime image. An older runtime image
+  cannot read data a newer one has migrated, so when the pinned runtime
+  version differs, also restore the pre-upgrade backup, which includes the
+  runtime's volumes.
 
 ## Moving existing threads
 
@@ -732,7 +772,7 @@ bun run selfhost:upgrade
 ```
 
 The upgrader resolves GitHub's latest release once, then pins the checkout and
-all eight dependency images to the immutable revision and digests in that
+all ten dependency images to the immutable revision and digests in that
 release's `selfhost-release.json`. `--latest` is also accepted explicitly.
 
 To select a particular version instead, download the durable

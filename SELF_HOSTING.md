@@ -657,13 +657,14 @@ upgrade prints the exact command) returns to the release in that snapshot:
 2. It saves the current `.env.selfhost` beside the snapshot as
    `env.selfhost.replaced-<time>`.
 3. It restores the snapshot's `.env.selfhost` and checkout, with one
-   exception. When the snapshot lacks a value that guards data the rollback
+   exception. When the snapshot lacks a value for something the rollback
    leaves in place, the current value is kept: `ADMIN_API_KEY`, and the
-   runtime's `AGENT_RUNTIME_*` secrets and image settings. An upgrade from
-   `selfhost-v0.1.18` or earlier always has such values, because the older
-   release's upgrader took the snapshot before the runtime's secrets existed.
-   Without them, the next upgrade would refuse to start over the runtime's
-   volumes.
+   runtime's secrets and settings (`AGENT_RUNTIME_*` and
+   `SELFHOST_AGENT_RUNTIME_*`, such as an outbound allow-origin you added).
+   An upgrade from `selfhost-v0.1.18` or earlier always has such values,
+   because the older release's upgrader took the snapshot before the runtime's
+   secrets existed. Without them, the next upgrade would refuse to start over
+   the runtime's volumes.
 4. It starts the restored release in the background with that release's own
    `selfhost:refresh` (`docker compose up -d --wait`), then runs that release's
    doctor and deep smokes.

@@ -31,6 +31,7 @@ const currentEnv = [
   `SELFHOST_APP_IMAGE=example.invalid/app@sha256:${"c".repeat(64)}`,
   ...Object.entries(runtimeValues).map(([key, value]) => `${key}=${value}`),
   "SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS=http://10.1.2.3:8000",
+  "SELFHOST_RUNTIME_SWEEP=0",
   "",
 ].join("\n");
 const metadata = {
@@ -92,8 +93,11 @@ describe("self-host release restore", () => {
       ADMIN_API_KEY: "snapshot-admin",
       SELFHOST_APP_IMAGE: `example.invalid/app@sha256:${"b".repeat(64)}`,
       ...runtimeValues,
+      // An operator's runtime setting outlives the rollback with the runtime.
+      SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS: "http://10.1.2.3:8000",
     });
-    expect(restoredText).not.toContain("SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS");
+    // Other values only the newer release had are not carried.
+    expect(restoredText).not.toContain("SELFHOST_RUNTIME_SWEEP");
     expect((await fs.stat(envPath)).mode & 0o777).toBe(0o600);
     expect(envSnapshots[0]).toBe(restoredText);
     expect(await fs.readFile(path.join(snapshotDir, "env.selfhost"), "utf8")).toBe(snapshotEnv);
@@ -103,7 +107,10 @@ describe("self-host release restore", () => {
     expect((await fs.stat(replacedPath)).mode & 0o777).toBe(0o600);
     expect(log).toHaveBeenCalledWith(`Saved the replaced .env.selfhost to ${path.relative(repoRoot, replacedPath)}.`);
     expect(log).toHaveBeenCalledWith(
-      `Kept from the current .env.selfhost (the snapshot lacks them): ${AGENT_RUNTIME_ENV_DEFAULTS.map(([key]) => key).join(", ")}.`,
+      `Kept from the current .env.selfhost (the snapshot lacks them): ${[
+        ...AGENT_RUNTIME_ENV_DEFAULTS.map(([key]) => key),
+        "SELFHOST_AGENT_RUNTIME_OUTBOUND_ALLOW_ORIGINS",
+      ].join(", ")}.`,
     );
   });
 
@@ -181,6 +188,20 @@ describe("self-host release restore", () => {
       "",
     ].join("\n"));
     expect(text.match(/^\s*AGENT_RUNTIME_SECRETS_KEY\s*=/gm)).toHaveLength(1);
+  });
+
+  it("keeps the runtime's settings the snapshot lacks, and lets the snapshot's own win", async () => {
+    const { snapshotDir, envPath } = await restoreFixture(
+      "SELFHOST_AGENT_RUNTIME_PORT=8790\n",
+      "SELFHOST_AGENT_RUNTIME_PORT=9000\nAGENT_RUNTIME_CHIRIDION_URL=http://127.0.0.1:3002\nSELFHOST_RUNTIME_SWEEP=0\n",
+    );
+
+    await expect(restoreSelfhostEnvSnapshot(path.join(snapshotDir, "env.selfhost"), envPath)).resolves.toEqual({
+      kept: ["AGENT_RUNTIME_CHIRIDION_URL"],
+    });
+    expect(await fs.readFile(envPath, "utf8")).toBe(
+      "SELFHOST_AGENT_RUNTIME_PORT=8790\nAGENT_RUNTIME_CHIRIDION_URL=http://127.0.0.1:3002\n",
+    );
   });
 
   it("does not keep an earlier current value when its last definition is empty", async () => {

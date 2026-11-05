@@ -85,14 +85,20 @@ export async function ensureSelfhostEnvValues(envPath, defaults, { beforeCreate 
 const ADMIN_API_KEY_DEFAULT = ["ADMIN_API_KEY", () => randomBytes(32).toString("base64url")];
 export const SELFHOST_SECRET_DEFAULTS = Object.freeze([ADMIN_API_KEY_DEFAULT, ...AGENT_RUNTIME_ENV_DEFAULTS]);
 
+/** The bundled agent runtime's settings: AGENT_RUNTIME_* and SELFHOST_AGENT_RUNTIME_*. */
+const AGENT_RUNTIME_SETTING = /^(?:SELFHOST_)?AGENT_RUNTIME_[A-Z0-9_]+$/;
+
 /**
- * Put a release snapshot's .env.selfhost back at `envPath`, except that every
- * SELFHOST_SECRET_DEFAULTS value the snapshot lacks (absent, or empty in its
- * last definition) keeps the current definition, verbatim. A value the
- * snapshot sets wins. The snapshot may come from an older release's upgrader,
- * which never knew these keys, while the data they guard (the agent runtime's
- * volumes) outlives the rollback, and the next upgrade refuses to generate new
- * ones over it. Returns the keys kept; the file ends up 0600.
+ * Put a release snapshot's .env.selfhost back at `envPath`, except that a
+ * value the snapshot lacks (absent, or empty in its last definition) keeps the
+ * current definition, verbatim, when it is one of SELFHOST_SECRET_DEFAULTS or
+ * one of the agent runtime's settings. A value the snapshot sets wins. The
+ * snapshot may come from an older release's upgrader, which never knew these
+ * keys, while what they guard and configure (the runtime and its volumes)
+ * outlives the rollback: the next upgrade refuses to generate new secrets over
+ * those volumes, and would start the runtime without the operator's settings
+ * (an outbound allow-origin for a private model endpoint, a port). Returns the
+ * keys kept; the file ends up 0600.
  */
 export async function restoreSelfhostEnvSnapshot(snapshotPath, envPath) {
   const snapshotText = await fs.readFile(snapshotPath, "utf8");
@@ -103,7 +109,12 @@ export async function restoreSelfhostEnvSnapshot(snapshotPath, envPath) {
   let lines = snapshotText.split(/\r?\n/);
   const currentLines = currentText.split(/\r?\n/);
   const kept = [];
-  for (const [key] of SELFHOST_SECRET_DEFAULTS) {
+  const currentKeys = currentLines.flatMap((line) => line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/)?.[1] ?? []);
+  const candidates = new Set([
+    ...SELFHOST_SECRET_DEFAULTS.map(([key]) => key),
+    ...currentKeys.filter((key) => AGENT_RUNTIME_SETTING.test(key)),
+  ]);
+  for (const key of candidates) {
     const definitions = definitionsOf(lines, key);
     if (definitions.at(-1)?.value) continue;
     const currentDefinition = definitionsOf(currentLines, key).at(-1);

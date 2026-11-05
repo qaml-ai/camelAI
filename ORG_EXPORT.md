@@ -27,7 +27,11 @@ bun run org-export -- --env prod --org <orgId> --out <private-directory> --concu
 ```
 
 The output directory is `camelai-export-<orgId>-<YYYYMMDD>` under `--out`, using a
-UTC date. Unsafe names are encoded; `path-mapping.json` records each change.
+UTC date. Original file names, including uppercase letters, spaces, leading dots
+and Unicode, are kept. Unsafe or overlong names get a short hash before their
+extension. Names that collide by case, Unicode normalization or file/folder use
+are disambiguated in listing order. `path-mapping.json` records only renamed
+customer file paths; persisted claims keep their names stable on resume.
 The script creates `.tar.gz` and `.tar.gz.sha256` files beside that directory.
 A `.org-export-state.json` checkpoint records completed items. Re-run the same
 command to skip completed items and retry failed ones, even across midnight.
@@ -54,16 +58,16 @@ until its warnings are resolved or its incompleteness is explicitly accepted.
   messages, oldest first. `threads/<id>/files/<volumeId>/` holds agent volume files.
   `volumes.json` records the mounts/subpaths. Migration copies such as
   `uploads/camel-migration/original-transcript.jsonl` remain in those files.
-- `r2/R2_BUCKET/`: scoped R2 objects. `R2_BUCKET` is the logical binding; both
-  hosted configs currently bind it to `chiridion-sandbox`. This includes workspace
-  uploads/outputs, spilled filesystem bytes, deploy artifacts, previews and app R2
+- `r2/R2_BUCKET/`: scoped R2 objects. `R2_BUCKET` is the logical binding. This
+  includes workspace uploads/outputs, spilled filesystem bytes, deploy artifacts, previews and app R2
   data. Some files deliberately appear both here and in the friendly file tree.
 - `filesystem.json` preserves directories, timestamps and symlink targets. Symlinks
   are represented as metadata, never created as executable filesystem links.
 - `manifest.json`: format version, identity, start/finish times, completion status,
   counts, exclusions and warnings. Counts use record-set filenames plus `messages`,
   `files`, `r2_objects`, `git_bundles` and `kv_entries` where applicable.
-- `SHA256SUMS`: hashes of every other file, including the checkpoint and manifest.
+- `SHA256SUMS`: hashes of every other archived file, including the manifest. The
+  local resume checkpoint is excluded from both the checksums and the archive.
 
 Check that the organization ID/name is correct, `complete` is true and `warnings`
 is empty. Compare record counts with the JSON arrays, message counts with JSONL
@@ -140,8 +144,10 @@ Artifacts returns its actual remote and a 300-second token with scope `read`.
 Git authenticates using `Authorization: Bearer <token>` through Git's environment
 configuration (`GIT_CONFIG_COUNT`, URL-scoped `http.<origin>/.extraHeader`), not a
 credential in the URL, command line or `.git/config`. The script mirror-clones,
-creates `git bundle create --all`, verifies it and removes the mirror. A project
-without a repository is listed as excluded, with its working tree still exported.
+checks for refs, creates `git bundle create --all` when refs exist, verifies it and
+removes the mirror. A project without a repository or with an empty repository is
+listed as excluded, with its current files still exported. Empty repositories do
+not produce bundles, retries or warnings.
 Git tokens are never persisted. Normal DO schema initialization and migration
 alarm recovery are deferred until ordinary access; export reads do not trigger
 them, even on a cold or uninitialized object.
@@ -160,7 +166,11 @@ transcript messages already removed by compaction cannot be recovered. Runtime
 volume snapshots and tenant-wide runtime settings/billing are excluded because
 that tenant is shared. Operational/audit logs, per-request usage, automation run
 logs and transient events are outside this archive; spend totals and automation
-source versions are included. This backup is not a cross-store point-in-time
+source versions are included. Saved project versions and revert points are
+excluded; current project files and existing git history are included. Warehouse
+query exports (Parquet files), stored objects' content types and custom metadata,
+and organization model provider settings, per-member usage limits and pricing
+overrides are also excluded. This backup is not a cross-store point-in-time
 snapshot and is not a self-host restoration package.
 
 ## Deliver to the customer's S3 bucket

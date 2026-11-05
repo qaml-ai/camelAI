@@ -45,6 +45,7 @@ const [
   imageWorkflow,
   upScript,
   upgradeScript,
+  releaseRestoreScript,
   latestReleaseScript,
   upgradeBootstrapScript,
   backupScript,
@@ -70,6 +71,7 @@ const [
   read(".github/workflows/selfhost-images.yml"),
   read("scripts/selfhost-up.mjs"),
   read("scripts/selfhost-upgrade.mjs"),
+  read("scripts/selfhost-release-restore.mjs"),
   read("scripts/selfhost-latest-release.mjs"),
   read("scripts/selfhost-upgrade-bootstrap.mjs"),
   read("scripts/selfhost-backup.mjs"),
@@ -527,6 +529,8 @@ includesAll(
   ],
   "self-host release upgrade helper",
 );
+assert(releaseRestoreScript.includes("--refresh"), "release restore must delegate detached startup and validation to refresh");
+assert(!releaseRestoreScript.includes("selfhost:up"), "release restore must not attach to foreground startup logs");
 
 const secretMigrationDir = await fs.mkdtemp(path.join(os.tmpdir(), "camelai-secret-migration-"));
 const legacyEnvPath = path.join(secretMigrationDir, ".env.selfhost");

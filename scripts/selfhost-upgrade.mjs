@@ -19,6 +19,7 @@ import {
   SELFHOST_IMAGE_ENV_BY_MANIFEST_KEY,
 } from "./selfhost-latest-release.mjs";
 import { writePomeriumConfig } from "./selfhost-pomerium-config.mjs";
+import { restoreReleaseState } from "./selfhost-release-restore.mjs";
 import { ensureSelfhostSecrets } from "./selfhost-secret-migrations.mjs";
 
 const args = parseArgs(process.argv.slice(2));
@@ -54,10 +55,11 @@ if (Boolean(releaseRef) !== Boolean(manifestArg)) {
   usage("--release and --manifest must be provided together");
 }
 
-// Target releases may introduce operator secrets that older installations do
-// not have. Migrate before snapshots, environment reads, doctor, or Compose so
-// rollback captures the exact effective value and repeated upgrades never
-// rotate it.
+// Migrate the secrets this release needs before snapshots, environment reads,
+// doctor, or Compose, so repeated upgrades never rotate them. An upgrade from an
+// older release snapshots .env.selfhost in the older upgrader, before this
+// re-exec adds them: restoreReleaseState keeps them when it restores such a
+// snapshot (restoreSelfhostEnvSnapshot).
 await ensureSelfhostSecrets(envFile);
 
 if (resumeUpgradeArg) {
@@ -306,38 +308,6 @@ async function readUpgradeHandoff(handoffPath) {
     manifestPath: path.join(snapshotDir, metadata.manifestFile),
     snapshotDir,
   };
-}
-
-async function restoreReleaseState(snapshotDir) {
-  const metadataPath = path.join(snapshotDir, "runtime.json");
-  const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
-  if (
-    metadata.schema !== 1 ||
-    typeof metadata.repositoryCommit !== "string" ||
-    !/^[0-9a-f]{40}$/i.test(metadata.repositoryCommit) ||
-    metadata.environmentFile !== "env.selfhost"
-  ) {
-    throw new Error(`Invalid release snapshot metadata: ${metadataPath}`);
-  }
-  const snapshotEnv = path.join(snapshotDir, metadata.environmentFile);
-  await fs.copyFile(snapshotEnv, envFile);
-  await fs.chmod(envFile, 0o600);
-  await run("git", ["checkout", "--detach", metadata.repositoryCommit]);
-  await run("bun", ["install", "--frozen-lockfile"]);
-
-  const restoredEnv = await readSelfhostEnv(true);
-  // The restored checkout owns its Compose topology and config schema. This
-  // matters when rolling back across a release that adds or removes overlays.
-  await run("bun", ["run", "selfhost:configure"], {
-    env: scriptEnv(restoredEnv),
-  });
-  await run("bun", ["run", "selfhost:up"], {
-    env: scriptEnv(restoredEnv),
-  });
-  await run(process.execPath, ["scripts/selfhost-doctor.mjs"], {
-    env: scriptEnv(restoredEnv),
-  });
-  await runDeepSmokes(scriptEnv(restoredEnv));
 }
 
 async function runDeepSmokes(env) {

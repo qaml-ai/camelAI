@@ -5,7 +5,7 @@ stack runs the application with local `workerd`, persists state and project git
 repositories in Docker volumes, and starts attached Docker containers for
 project builds, notebook analysis, SQL queries, and container egress.
 
-Production installations consume seven version-matched release images:
+Production installations consume seven version-matched camelAI release images:
 
 ```text
 ghcr.io/qaml-ai/camelai-selfhost-app:<release>
@@ -19,8 +19,9 @@ ghcr.io/qaml-ai/camelai-selfhost-caddy:<release>
 
 Tags named `selfhost-v*` publish all seven camelAI images and a release manifest
 through `.github/workflows/selfhost-images.yml`. The manifest also pins the
-tested upstream Pomerium image. Use all eight dependency references from one
-manifest.
+tested upstream Pomerium image and, from `selfhost-v0.2.0`, the bundled agent
+runtime (`ghcr.io/qaml-ai/run`) and its Postgres. Use all ten dependency
+references from one manifest.
 
 ## Capability status
 
@@ -78,8 +79,10 @@ bun install --frozen-lockfile
 bun run selfhost:init
 ```
 
-Set release mode, the seven version-matched image references, hostnames, and an AI
-provider in `.env.selfhost`:
+Set release mode, the version-matched image references, hostnames, and an AI
+provider in `.env.selfhost`. `selfhost:init` already wrote the agent runtime's
+two image references at this checkout's pins. For digest pins, take them from
+the release's `selfhost-release.json` instead:
 
 ```dotenv
 SELFHOST_DEPLOYMENT_MODE=release
@@ -90,6 +93,8 @@ SELFHOST_ANALYSIS_IMAGE=ghcr.io/qaml-ai/camelai-selfhost-analysis:selfhost-vX.Y.
 SELFHOST_DB_QUERY_IMAGE=ghcr.io/qaml-ai/camelai-selfhost-db-query:selfhost-vX.Y.Z
 SELFHOST_CONTAINER_EGRESS_IMAGE=ghcr.io/qaml-ai/camelai-selfhost-container-egress:selfhost-vX.Y.Z
 SELFHOST_CADDY_IMAGE=ghcr.io/qaml-ai/camelai-selfhost-caddy:selfhost-vX.Y.Z
+SELFHOST_AGENT_RUNTIME_IMAGE=ghcr.io/qaml-ai/run@sha256:...
+SELFHOST_AGENT_RUNTIME_POSTGRES_IMAGE=postgres:16@sha256:...
 
 SELFHOST_PUBLIC_BASE_URL=https://camel.example.com
 SELFHOST_MAIN_HOSTNAME=camel.example.com
@@ -490,7 +495,7 @@ bun run selfhost:upgrade
 ```
 
 This resolves the latest GitHub release once and then pins the checkout and all
-eight image references to that release's immutable revision and digests. Use
+ten image references to that release's immutable revision and digests. Use
 `bun run selfhost:upgrade -- --latest` when an explicit spelling is preferable.
 
 To select a specific release, download `selfhost-release.json` from the matching
@@ -522,10 +527,10 @@ phase to the target release's upgrader. Subsequent upgrades do this handoff
 automatically.
 
 The helper requires a clean tracked worktree. It verifies that the selected Git
-ref matches the manifest revision and that all seven camelAI images plus Pomerium
-are digest-pinned, backs up the durable volumes, and saves the previous checkout
+ref matches the manifest revision and that every image the manifest lists
+is digest-pinned, backs up the durable volumes, and saves the previous checkout
 plus `.env.selfhost` under `.selfhost/releases/`. It then checks out the
-release, updates all eight dependency references, pulls them, waits for Compose
+release, updates all ten dependency references, pulls them, waits for Compose
 health, and runs the doctor plus all three attached-runtime smokes. A failure
 before the new runtime starts automatically restores the saved checkout and
 image configuration. After startup begins, migrations may have run, so the

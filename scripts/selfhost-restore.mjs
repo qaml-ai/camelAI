@@ -7,8 +7,8 @@ import {
   readSelfhostEnv,
   run,
   scriptEnv,
+  restorableVolumeNames,
   volumeName,
-  volumeNames,
 } from "./selfhost-common.mjs";
 
 const backupDir = path.resolve(process.cwd(), process.argv[2] || "");
@@ -25,7 +25,6 @@ if (!existsSync(manifestPath)) {
 }
 
 const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
-const allowedVolumeNames = new Set([...volumeNames, "pomerium-data"]);
 const selectedVolumeNames = Array.isArray(manifest.volumes)
   ? manifest.volumes.map((entry) => entry?.name)
   : [];
@@ -33,7 +32,7 @@ if (
   selectedVolumeNames.length === 0 ||
   new Set(selectedVolumeNames).size !== selectedVolumeNames.length ||
   selectedVolumeNames.some(
-    (name) => typeof name !== "string" || !allowedVolumeNames.has(name),
+    (name) => typeof name !== "string" || !restorableVolumeNames.has(name),
   )
 ) {
   console.error(`Invalid volume list in backup manifest: ${manifestPath}`);

@@ -9,6 +9,7 @@ import {
   composeArgs,
   pomeriumComposeFile,
   pomeriumLoopbackComposeFile,
+  restorableVolumeNames,
   sourceComposeFile,
   volumeNamesForEnv,
 } from "./selfhost-common.mjs";
@@ -530,6 +531,23 @@ assert(
   packageJson.dependencies?.sharp,
   "sharp must be a production dependency for the self-host Images binding",
 );
+// The self-host workerd config embeds Miniflare's internal workers
+// (node_modules/miniflare/dist/src/workers). The app image installs production
+// dependencies only, so without a pinned production dependency it would get
+// whichever Miniflare another package hoists: in selfhost-v0.2.0's first
+// candidate that was a 5.x alpha whose Workflows worker imports a module the
+// config does not provide, and the app failed to start. Pin the version the
+// self-host tests run (the lockfile's top-level Miniflare).
+const pinnedMiniflare = packageJson.dependencies?.miniflare ?? "";
+assert(
+  /^\d+\.\d+\.\d+$/.test(pinnedMiniflare),
+  "miniflare must be an exactly pinned production dependency for the self-host workerd config",
+);
+const lockedMiniflare = /^\s+"miniflare": \["miniflare@([^"]+)"/m.exec(await read("bun.lock"))?.[1];
+assert(
+  lockedMiniflare === pinnedMiniflare,
+  `bun.lock must resolve top-level miniflare to the pinned ${pinnedMiniflare} (found ${lockedMiniflare})`,
+);
 
 includesAll(
   imageWorkflow,
@@ -703,9 +721,22 @@ includesAll(
 );
 includesAll(
   restoreScript,
-  ["Missing declared backup archive", "new Set(selectedVolumeNames)"],
+  ["Missing declared backup archive", "new Set(selectedVolumeNames)", "restorableVolumeNames.has(name)"],
   "fail-closed self-host restore",
 );
+// selfhost:restore must accept every volume selfhost:backup can write, under
+// every auth and TLS mode. It once refused caddy-data and caddy-config, so no
+// backup of an install fronted by Caddy (every TLS mode) could be restored.
+for (const SELFHOST_AUTH_MODE of ["bundled-pomerium", "external-pomerium", "cloudflare-access", "local"]) {
+  for (const SELFHOST_TLS_MODE of ["automatic", "external", "provided", "none"]) {
+    for (const name of volumeNamesForEnv({ SELFHOST_AUTH_MODE, SELFHOST_TLS_MODE })) {
+      assert(
+        restorableVolumeNames.has(name),
+        `selfhost:restore must accept the ${name} volume a ${SELFHOST_AUTH_MODE}/${SELFHOST_TLS_MODE} backup holds`,
+      );
+    }
+  }
+}
 includesAll(
   doctorScript,
   [

@@ -13,9 +13,8 @@
  */
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { AgentMessage } from "@/lib/agent-messages";
-import type { AssistantMessage } from "@/lib/agent-messages";
 import type { Message, PreviewTarget } from "@/types";
-import { localToolName, runtimeInputQuestions, type RuntimeInput } from "@/lib/agent-runtime-shared";
+import { localToolName, runtimeInputQuestions, runtimeLimitError, type RuntimeInput } from "@/lib/agent-runtime-shared";
 import { latestRuntimeTodos, piRender, type PiRenderMemo } from "@/lib/pi-render";
 import { getPreviewTabId } from "@/components/preview-panel/preview-utils";
 import { watchAgent, type AgentView, type Watcher } from "@camelai/run/watch";
@@ -93,13 +92,7 @@ const MISSED_REPLY_GRACE_MS = 3_000;
 /** A hidden page's watcher pauses (the SDK closes its stream): not a stall, and nothing is missed. */
 const pageHidden = () => typeof document !== "undefined" && document.visibilityState === "hidden";
 
-// The watcher's messages are Pi's (the SDK declares its own structural copy
-// of them); the view keeps Pi's types for pi-render.
-type View = Pick<AgentView, "indexes" | "running" | "pendingInputs" | "lastOutcome" | "hasOlder" | "loaded"> & {
-  messages: AgentMessage[];
-  partial: AssistantMessage | null;
-  progress: Map<string, unknown>;
-};
+type View = Pick<AgentView, "messages" | "partial" | "progress" | "indexes" | "running" | "pendingInputs" | "lastOutcome" | "hasOlder" | "loaded">;
 
 function seedView(seed: RuntimeThreadSeed | null | undefined): View {
   const entries = [...(seed?.page?.entries ?? [])].sort((a, b) => a.index - b.index);
@@ -121,9 +114,9 @@ const maxIndex = (indexes: number[]) => (indexes.length > 0 ? indexes[indexes.le
 
 function snapshot(state: AgentView): View {
   return {
-    messages: [...state.messages] as AgentMessage[],
+    messages: [...state.messages],
     indexes: [...state.indexes],
-    partial: state.partial as AssistantMessage | null,
+    partial: state.partial,
     progress: new Map(state.progress),
     running: state.running,
     pendingInputs: [...state.pendingInputs],
@@ -567,8 +560,9 @@ export function useRuntimeThread(options: {
         break;
       }
     }
-    if (!lastError && view.lastOutcome?.error) {
-      lastError = { id: `rt-outcome:${view.lastOutcome.id}`, error: view.lastOutcome.error, billingSource: null, provider: null, status: null, errorType: null };
+    const outcomeError = view.lastOutcome?.error || runtimeLimitError(view.lastOutcome?.stopped);
+    if (!lastError && view.lastOutcome && outcomeError) {
+      lastError = { id: `rt-outcome:${view.lastOutcome.id}`, error: outcomeError, billingSource: null, provider: null, status: null, errorType: null };
     }
     // The refusal of the thread's first message, while nothing reached the agent after it.
     if (!lastError && seed?.startError) {

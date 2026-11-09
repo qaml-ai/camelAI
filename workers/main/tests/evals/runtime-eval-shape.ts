@@ -6,7 +6,7 @@
  * a runtime run as they read an in-DO one.
  */
 import type { AgentMessage } from "../../../../src/lib/agent-messages";
-import { localToolName } from "../../../../src/lib/agent-runtime-shared";
+import { localToolName, runtimeLimitError } from "../../../../src/lib/agent-runtime-shared";
 
 function piRuntimeUsageSummary(message: AgentMessage): Record<string, unknown> | null {
   if (message.role !== "assistant") return null;
@@ -75,7 +75,8 @@ export interface RuntimeRequestRecord {
   error?: string;
   stopped?: "input_required" | "spend_limit" | "turn_limit";
   /** How an ended request ended (`state` says only that it ended); absent while running and on older runtimes. */
-  status?: "completed" | "input_required" | "failed";
+  status?: "completed" | "input_required" | "failed" | "paused";
+  stoppedReason?: string;
   steeredInto?: string;
   outcome?: {
     error?: string;
@@ -134,11 +135,6 @@ export type RuntimeRunOutcome =
   | { status: "error"; error: string; code?: string; reply?: string }
   | { status: "input_required"; inputIds: string[]; reply?: string };
 
-const LIMIT_STOPS: Record<string, string> = {
-  spend_limit: "The run reached its spend limit",
-  turn_limit: "The run reached its turn limit",
-};
-
 /**
  * What a settled request says happened: the runtime's error, the model's (a
  * missing or refused key among them), an early stop, or the reply. The
@@ -148,12 +144,12 @@ const LIMIT_STOPS: Record<string, string> = {
 export function runtimeRunOutcome(record: RuntimeRequestRecord): RuntimeRunOutcome {
   const result = record.outcome?.result;
   const reply = typeof result?.reply === "string" ? result.reply : undefined;
-  const stopped = record.stopped ?? result?.stopped;
+  const stopped = record.stopped ?? result?.stopped ?? record.stoppedReason;
   if (record.status === "input_required" || stopped === "input_required") {
     return { status: "input_required", inputIds: (result?.inputs ?? []).map((input) => input.id).filter(Boolean), reply };
   }
-  const code = result?.code ?? (stopped && stopped in LIMIT_STOPS ? stopped : undefined);
-  const error = record.error ?? record.outcome?.error ?? result?.error ?? (stopped ? LIMIT_STOPS[stopped] : undefined)
+  const code = result?.code ?? (stopped && runtimeLimitError(stopped) ? stopped : undefined);
+  const error = record.error ?? record.outcome?.error ?? result?.error ?? runtimeLimitError(stopped)
     ?? (record.status === "failed" ? "The run failed" : undefined);
   if (error) {
     return { status: "error", error: record.outcome?.uncertain ? `${error} (outcome uncertain)` : error, ...(code ? { code } : {}), reply };

@@ -97,6 +97,16 @@ function mount(initialSeed: RuntimeThreadSeed | null = seed) {
 }
 
 describe("useRuntimeThread", () => {
+  it("shows a paused spend stop even when the watcher has no error text", async () => {
+    const { callbacks, result } = mount();
+    await waitFor(() => expect(watchers).toHaveLength(1));
+    act(() => watchers[0].emit({ running: false, lastOutcome: { id: "budget-run", stopped: "spend_limit" } }));
+    await waitFor(() => expect(callbacks.current.onStateUpdate).toHaveBeenLastCalledWith(expect.objectContaining({
+      lastError: expect.objectContaining({ id: "rt-outcome:budget-run", error: "The run reached its spend limit" }),
+    })));
+    expect(result.current.chat.isStreaming).toBe(false);
+  });
+
   it("paints the loader's page, then watches the agent with the loader's token", async () => {
     const { result, callbacks } = mount();
     expect(result.current.chat.messages.map((message) => message.id)).toEqual(["rt:0", "rt:1"]);

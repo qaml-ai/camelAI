@@ -11,6 +11,20 @@ permissions:
   contents: read
 
 jobs:
+  build:
+    name: typecheck and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run build
+
   selfhost:
     name: self-host Docker and workerd
     runs-on: ubuntu-latest

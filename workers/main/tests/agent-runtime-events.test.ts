@@ -252,6 +252,23 @@ describe("POST /agent-runtime/events", () => {
     expect(thread?.chat_error_count).toBe(1);
   });
 
+  it("records paused spend stops as errors and finishes scheduled runs", async () => {
+    const { runEnv, agentId, metadata, threadId, orgStub, streaming } = await setup({ source: "scheduled" });
+    const finishScheduledRun = vi.fn(async () => true);
+    const cronEnv = {
+      ...runEnv,
+      WORKSPACE_CRON: { idFromName: (name: string) => name, get: () => ({ finishScheduledRun }) },
+    } as unknown as Env;
+    await deliver(cronEnv, {
+      id: eventId(), type: "run.completed", created: 1_790_000_000,
+      data: { agentId, requestId: "budget-run", metadata: { ...metadata, source: "scheduled prompt" },
+        status: "paused", stoppedReason: "budget_reached", stopped: "spend_limit", code: "spend_limit", limit: 1 },
+    });
+    expect((await orgStub.getThread(threadId))?.last_chat_error_message).toBe("The run reached its spend limit");
+    expect(streaming).toHaveBeenCalledWith(threadId, false, expect.objectContaining({ clearOnlyIfRunning: true }));
+    expect(finishScheduledRun).toHaveBeenCalledWith(expect.objectContaining({ runId: "budget-run", error: "The run reached its spend limit" }));
+  });
+
   it("records a stop as no error: the stopped turn goes idle, the runs it cancelled change nothing", async () => {
     const { runEnv, agentId, metadata, threadId, orgStub, streaming } = await setup();
     const created = Math.floor(Date.now() / 1000);

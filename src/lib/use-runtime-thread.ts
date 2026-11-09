@@ -14,7 +14,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { AgentMessage } from "@/lib/agent-messages";
 import type { Message, PreviewTarget } from "@/types";
-import { localToolName, runtimeInputQuestions, runtimeLimitError, type RuntimeInput } from "@/lib/agent-runtime-shared";
+import { localToolName, runtimeInputQuestions, runtimeSpendLimitError, type RuntimeInput } from "@/lib/agent-runtime-shared";
 import { latestRuntimeTodos, piRender, type PiRenderMemo } from "@/lib/pi-render";
 import { getPreviewTabId } from "@/components/preview-panel/preview-utils";
 import { watchAgent, type AgentView, type Watcher } from "@camelai/run/watch";
@@ -560,7 +560,7 @@ export function useRuntimeThread(options: {
         break;
       }
     }
-    const outcomeError = view.lastOutcome?.error || runtimeLimitError(view.lastOutcome?.stopped);
+    const outcomeError = view.lastOutcome?.error || runtimeSpendLimitError(view.lastOutcome?.stopped);
     if (!lastError && view.lastOutcome && outcomeError) {
       lastError = { id: `rt-outcome:${view.lastOutcome.id}`, error: outcomeError, billingSource: null, provider: null, status: null, errorType: null };
     }

@@ -6,7 +6,7 @@
  * a runtime run as they read an in-DO one.
  */
 import type { AgentMessage } from "../../../../src/lib/agent-messages";
-import { localToolName, runtimeLimitError } from "../../../../src/lib/agent-runtime-shared";
+import { localToolName, runtimeSpendLimitError } from "../../../../src/lib/agent-runtime-shared";
 
 function piRuntimeUsageSummary(message: AgentMessage): Record<string, unknown> | null {
   if (message.role !== "assistant") return null;
@@ -148,8 +148,10 @@ export function runtimeRunOutcome(record: RuntimeRequestRecord): RuntimeRunOutco
   if (record.status === "input_required" || stopped === "input_required") {
     return { status: "input_required", inputIds: (result?.inputs ?? []).map((input) => input.id).filter(Boolean), reply };
   }
-  const code = result?.code ?? (stopped && runtimeLimitError(stopped) ? stopped : undefined);
-  const error = record.error ?? record.outcome?.error ?? result?.error ?? runtimeLimitError(stopped)
+  // Evals have always treated turn limits as incomplete work; chat completions do not.
+  const limitError = stopped === "turn_limit" ? "The run reached its turn limit" : runtimeSpendLimitError(stopped);
+  const code = result?.code ?? (stopped && limitError ? stopped : undefined);
+  const error = record.error ?? record.outcome?.error ?? result?.error ?? limitError
     ?? (record.status === "failed" ? "The run failed" : undefined);
   if (error) {
     return { status: "error", error: record.outcome?.uncertain ? `${error} (outcome uncertain)` : error, ...(code ? { code } : {}), reply };

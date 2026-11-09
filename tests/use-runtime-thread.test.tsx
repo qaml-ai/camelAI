@@ -97,6 +97,30 @@ function mount(initialSeed: RuntimeThreadSeed | null = seed) {
 }
 
 describe("useRuntimeThread", () => {
+  it.each(["turn_limit", "agent_loop_limit"])("does not show a %s completion as an error", async (stopped) => {
+    const { callbacks, result } = mount();
+    await waitFor(() => expect(watchers).toHaveLength(1));
+    act(() => watchers[0].emit({
+      running: false,
+      lastOutcome: { id: "limited-run", stopped },
+      messages: [...seed.page!.entries.map((entry) => entry.message), { role: "assistant", content: [{ type: "text", text: "Stopped at the limit" }], stopReason: "stop", timestamp: 3 }],
+      indexes: [0, 1, 2],
+    }));
+    await waitFor(() => expect(JSON.stringify(result.current.chat.messages)).toContain("Stopped at the limit"));
+    await waitFor(() => expect(callbacks.current.onStateUpdate).toHaveBeenLastCalledWith(expect.objectContaining({ lastError: null })));
+    expect(result.current.chat.isStreaming).toBe(false);
+  });
+
+  it("shows a paused spend stop even when the watcher has no error text", async () => {
+    const { callbacks, result } = mount();
+    await waitFor(() => expect(watchers).toHaveLength(1));
+    act(() => watchers[0].emit({ running: false, lastOutcome: { id: "budget-run", stopped: "spend_limit" } }));
+    await waitFor(() => expect(callbacks.current.onStateUpdate).toHaveBeenLastCalledWith(expect.objectContaining({
+      lastError: expect.objectContaining({ id: "rt-outcome:budget-run", error: "The run reached its spend limit" }),
+    })));
+    expect(result.current.chat.isStreaming).toBe(false);
+  });
+
   it("paints the loader's page, then watches the agent with the loader's token", async () => {
     const { result, callbacks } = mount();
     expect(result.current.chat.messages.map((message) => message.id)).toEqual(["rt:0", "rt:1"]);

@@ -24,6 +24,7 @@
  * A run's thread comes from the metadata chiridion put on the message that
  * started it (runtimeMessageMetadata), else from the agent's remembered thread.
  */
+import { runtimeSpendLimitError } from "../../../../src/lib/agent-runtime-shared";
 import type { Env, RouteContext } from "../types.js";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import type { ThreadRuntimeRecord } from "../identity/org-do.js";
@@ -181,9 +182,11 @@ export async function handleRuntimeEvent(
   // queued behind it "cancelled".
   const code = event.type === "run.failed" ? text(data.code) : "";
   const stopped = code === "aborted" || code === "cancelled";
-  if (event.type === "run.failed" && !stopped) {
+  const runError = event.type === "run.failed" ? text(data.error) || "The agent run failed"
+    : runtimeSpendLimitError(text(data.stopped) || text(data.stoppedReason));
+  if (runError && !stopped) {
     await org.recordThreadError(ref.thread, {
-      message: text(data.error) || "The agent run failed",
+      message: runError,
       source: "agent_runtime",
       errorKind: "run_failed",
     });
@@ -195,7 +198,7 @@ export async function handleRuntimeEvent(
     await cron.finishScheduledRun({
       workspaceId: ref.workspace,
       runId: text(data.requestId),
-      error: event.type === "run.failed" ? text(data.error) || "The agent run failed" : null,
+      error: runError ?? null,
       completedAt,
     });
   }

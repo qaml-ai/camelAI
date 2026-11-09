@@ -218,3 +218,14 @@ export function runtimeInputQuestions(input: RuntimeInput): RuntimeInputCard | n
   }
   return null;
 }
+
+/** Spend stops remain actionable even when the runtime reports a paused run without an error. */
+export function runtimeSpendLimitError(stopped: string | undefined): string | undefined {
+  switch (stopped) {
+    case "spend_limit":
+    case "budget_reached":
+      return "The run reached its spend limit";
+    default:
+      return undefined;
+  }
+}

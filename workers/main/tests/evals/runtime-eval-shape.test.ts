@@ -137,6 +137,17 @@ describe("runtime eval history", () => {
 describe("runtime eval outcome", () => {
   const record = (overrides: Partial<RuntimeRequestRecord>): RuntimeRequestRecord => ({ id: "r1", state: "completed", ...overrides });
 
+  it("treats paused budget runs as incomplete evals", () => {
+    for (const stoppedReason of [undefined, "budget_reached"]) {
+      expect(runtimeRunOutcome({
+        id: "budget-run", state: "completed", status: "paused", stoppedReason,
+        stopped: "spend_limit", outcome: { result: { stopped: "spend_limit", code: "spend_limit", reply: "partial" } },
+      })).toEqual({ status: "error", error: "The run reached its spend limit", code: "spend_limit", reply: "partial" });
+    }
+    expect(runtimeRunOutcome({ id: "budget-run", state: "completed", status: "paused", stoppedReason: "budget_reached" }))
+      .toMatchObject({ status: "error", error: "The run reached its spend limit" });
+  });
+
   it("reads a reply, an error, a spend stop and a wait on input", () => {
     expect(runtimeRunOutcome(record({ outcome: { result: { reply: "done" } } }))).toEqual({ status: "completed", reply: "done" });
     expect(runtimeRunOutcome(record({ error: "model refused", outcome: { result: { error: "model refused" } } })))

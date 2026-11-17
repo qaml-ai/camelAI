@@ -58,6 +58,15 @@ export function redactError(error: unknown, secrets: Iterable<string> = []): str
     .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[REDACTED]@')
     .replace(/((?:token|api[_-]?key|password|secret)\s*[=:]\s*)[^\s&,;"']+/gi, '$1[REDACTED]');
 }
+/** Cloudflare Access credentials for an environment behind Access (staging): a service token, or a user token from `cloudflared access token`. */
+export function accessHeaders(env: Record<string, string | undefined>): Record<string, string> {
+  const id = env.CF_ACCESS_CLIENT_ID?.trim(), secret = env.CF_ACCESS_CLIENT_SECRET?.trim(), token = env.CF_ACCESS_TOKEN?.trim();
+  if (id || secret) {
+    if (!id || !secret) throw new Error('Set both CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, or neither');
+    return { 'CF-Access-Client-Id': id, 'CF-Access-Client-Secret': secret };
+  }
+  return token ? { 'cf-access-token': token } : {};
+}
 export class ExportHttpError extends Error {
   constructor(readonly status: number, readonly retryAfterMs = 0) { super(`Export API HTTP ${status}`); }
 }
@@ -188,14 +197,14 @@ export class ExportWriter {
 }
 
 export class ExportClient {
-  constructor(readonly baseUrl: string, readonly orgId: string, private readonly key: string, readonly fetcher: typeof fetch = fetch, readonly sleep?: (ms: number) => Promise<void>) {}
+  constructor(readonly baseUrl: string, readonly orgId: string, private readonly key: string, readonly fetcher: typeof fetch = fetch, readonly sleep?: (ms: number) => Promise<void>, private readonly access: Record<string, string> = {}) {}
   async response(endpoint: string, query: Record<string, string | number | undefined> = {}, method = 'GET') {
     const url = new URL(`${this.baseUrl}/api/admin/org-export/${encodeURIComponent(this.orgId)}${endpoint}`);
     for (const [key, value] of Object.entries(query)) if (value !== undefined) url.searchParams.set(key, String(value));
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 120_000);
     let response: Response;
-    try { response = await this.fetcher(url, { method, headers: { Authorization: `Bearer ${this.key}` }, redirect: 'error', signal: controller.signal }); }
+    try { response = await this.fetcher(url, { method, headers: { ...this.access, Authorization: `Bearer ${this.key}` }, redirect: 'error', signal: controller.signal }); }
     finally { clearTimeout(timer); } // Bound response setup, not the transfer time of a large streamed object.
     if (!response.ok) {
       await response.body?.cancel();
@@ -208,12 +217,13 @@ export class ExportClient {
   async json<T>(endpoint: string, query: Record<string, string | number | undefined> = {}, method = 'GET'): Promise<T> {
     return retry(async () => await (await this.response(endpoint, query, method)).json() as T, { sleep: this.sleep });
   }
-  async *pages(endpoint: string, query: Record<string, string | number | undefined> = {}): AsyncGenerator<Row[]> {
+  async *pages(endpoint: string, query: Record<string, string | number | undefined> = {}, onPage?: (page: Row) => void): AsyncGenerator<Row[]> {
     let cursor: string | undefined;
     const seen = new Set<string>();
     do {
       const page = await this.json<{ items: Row[]; cursor: string | null }>(endpoint, { ...query, cursor });
       if (!Array.isArray(page.items)) throw new Error('Invalid export page');
+      onPage?.(page);
       yield page.items;
       cursor = page.cursor ?? undefined;
       if (cursor && seen.has(cursor)) throw new Error('Export cursor did not advance');

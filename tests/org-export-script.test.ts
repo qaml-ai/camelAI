@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { ExportClient, ExportHttpError, ExportWriter, boundedMap, command, digest, listLocalFiles, parseExportArgs, portableSegment, redactError, retry, writeChecksums } from '../scripts/lib/org-export';
+import { ExportClient, ExportHttpError, ExportWriter, accessHeaders, boundedMap, command, digest, listLocalFiles, parseExportArgs, portableSegment, redactError, retry, writeChecksums } from '../scripts/lib/org-export';
 import { exportGit, exportHistory, findExportDirectory, finishExport, walkExport } from '../scripts/lib/org-export-run';
 
 const roots: string[] = [];
@@ -150,6 +150,15 @@ describe('resumption, retries and warnings', () => {
     const text = redactError(`${key} ${encodeURIComponent(key)} ${Buffer.from(key).toString('base64')} Bearer unknown https://user:pass@example.com token=unknown`, [key]);
     for (const secret of [key, encodeURIComponent(key), Buffer.from(key).toString('base64'), 'unknown', 'user:pass']) expect(text).not.toContain(secret);
   });
+  it('sends Cloudflare Access credentials from the environment alongside the admin key', async () => {
+    expect(accessHeaders({})).toEqual({});
+    expect(accessHeaders({ CF_ACCESS_TOKEN: ' user-jwt ' })).toEqual({ 'cf-access-token': 'user-jwt' });
+    expect(accessHeaders({ CF_ACCESS_TOKEN: 'user-jwt', CF_ACCESS_CLIENT_ID: 'id', CF_ACCESS_CLIENT_SECRET: 'secret' })).toEqual({ 'CF-Access-Client-Id': 'id', 'CF-Access-Client-Secret': 'secret' });
+    expect(() => accessHeaders({ CF_ACCESS_CLIENT_ID: 'id' })).toThrow('CF_ACCESS_CLIENT_SECRET');
+    const fetcher = vi.fn(async (_url: URL, _init?: RequestInit) => Response.json({ ok: true }));
+    await new ExportClient('https://api.invalid', 'org', 'admin-secret', fetcher as unknown as typeof fetch, undefined, { 'cf-access-token': 'user-jwt' }).json('/manifest');
+    expect(fetcher.mock.calls[0][1]?.headers).toEqual({ 'cf-access-token': 'user-jwt', Authorization: 'Bearer admin-secret' });
+  });
   it('resumes the latest matching directory across dates and rejects a different environment', async () => {
     const w = await writer(); await w.save();
     expect(await findExportDirectory(path.dirname(w.root), 'org', 'https://api.invalid', new Date('2026-02-02'))).toBe(w.root);
@@ -197,6 +206,23 @@ describe('walking and packaging', () => {
     fail = false; fetcher.mockClear(); await walkExport(client, w, 2);
     expect(w.state.warnings).toEqual({}); expect(fetcher.mock.calls).toHaveLength(2);
     expect(String(fetcher.mock.calls[0][0])).toContain('path=%2Fbad');
+  });
+  it('exports the listed R2 objects and warns about stored keys the API skipped', async () => {
+    const w = await writer();
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input)), route = url.pathname.replace('/api/admin/org-export/org', '');
+      const page = (items: unknown[]) => Response.json({ items, cursor: null });
+      if (route === '/manifest') return Response.json({ org: { id: 'org', name: 'Test' }, record_sets: ['workspaces'] });
+      if (route === '/records/workspaces') return page([{ id: 'ws', name: 'work' }]);
+      if (route === '/threads' || route.includes('/automations/') || route.endsWith('/projects') || route.endsWith('/fs')) return page([]);
+      if (route === '/r2-prefixes') return Response.json({ bucket: 'R2_BUCKET', prefixes: ['org/ws/'] });
+      if (route === '/r2') return Response.json({ items: [{ key: 'org/ws/user-uploads/a.png' }], skipped: 2, cursor: null });
+      if (route === '/r2/object') return new Response('png');
+      throw new Error(`Unexpected fake request: ${route}`);
+    });
+    await walkExport(new ExportClient('https://api.invalid', 'org', 'admin-secret', fetcher, async () => {}), w, 2);
+    expect(await readFile(path.join(w.root, 'r2/R2_BUCKET/org/ws/user-uploads/a.png'), 'utf8')).toBe('png');
+    expect(w.state.warnings['r2-walk:ws:']).toContain('2 stored objects');
   });
   it('assigns listing names before downloads and keeps them identical across concurrent runs', async () => {
     const snapshots: Array<{ files: string[]; mappings: Record<string, string> }> = [];

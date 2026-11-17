@@ -15,6 +15,10 @@ this job: hosted organizations share a runtime tenant.
 - Obtain the target environment's `ADMIN_API_KEY` through the team's secret store.
   Supply it as an environment variable. Do not put it in shell command arguments,
   logs, shared terminals or files inside the export directory.
+- Staging is behind Cloudflare Access, so a staging run also needs Access credentials in
+  the environment: `CF_ACCESS_TOKEN` (after `cloudflared access login https://staging.camelai.dev`,
+  from `cloudflared access token -app=https://staging.camelai.dev`) or a service token in
+  `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET`. Production needs neither.
 - Confirm the exact organization ID and environment. The script reads
   `WORKER_BASE_URL` from `wrangler.prod.jsonc` or `wrangler.staging.jsonc`.
 - Ask the customer to pause changes while exporting. Reads are not a transactional
@@ -115,7 +119,7 @@ rewrite the registry.
 | `GET /workspaces/:workspaceId/projects/:projectId/fs[/content]` | Project working-tree rows or bytes, after checking the workspace registry |
 | `POST /workspaces/:workspaceId/projects/:projectId/git-token` | A read token for an existing Artifacts repo; no repo is created |
 | `GET /r2-prefixes?workspaceId&projectId` | Allowed prefixes derived on the server; `projectId` is optional |
-| `GET /r2?workspaceId&projectId&bucket=R2_BUCKET&prefix&cursor&limit` | A bounded object listing under an allowed prefix |
+| `GET /r2?workspaceId&projectId&bucket=R2_BUCKET&prefix&cursor&limit` | A bounded object listing under an allowed prefix. Empty folder markers (`<folder>/`, written by filesystem mounts) are omitted; keys the export can't name safely are counted in `skipped`, and the script reports them as a warning |
 | `GET /r2/object?workspaceId&projectId&bucket=R2_BUCKET&key` | One streamed object |
 | `GET /workspaces/:workspaceId/apps/:scriptName/kv?cursor` | One virtual KV value per page, including its namespace/key |
 

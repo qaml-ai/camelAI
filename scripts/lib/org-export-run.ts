@@ -104,9 +104,10 @@ export async function walkExport(client: ExportClient, writer: ExportWriter, con
     const query = { workspaceId, ...(projectId ? { projectId } : {}) };
     await writer.item(`r2-walk:${workspaceId}:${projectId ?? ''}`, [], async () => {
       const scope = await client.json<{ bucket: string; prefixes: string[] }>('/r2-prefixes', query);
+      let skipped = 0;
       // A project request also returns workspace prefixes; those are walked once per workspace.
       for (const prefix of scope.prefixes.filter(prefix => !projectId || prefix.startsWith('project-fs/'))) {
-        for await (const page of client.pages('/r2', { ...query, bucket: scope.bucket, prefix })) {
+        for await (const page of client.pages('/r2', { ...query, bucket: scope.bucket, prefix }, page => { skipped += Number(page.skipped ?? 0); })) {
           const downloads = page.map(row => ({ row, relative: writer.tree('r2/R2_BUCKET', row.key) }));
           await writer.save();
           await boundedMap(downloads, concurrency, ({ row, relative }) => client.download(writer, relative, '/r2/object', { ...query, bucket: scope.bucket, key: row.key }));
@@ -114,6 +115,7 @@ export async function walkExport(client: ExportClient, writer: ExportWriter, con
       }
       // Do not mark a walk finished while any discovered object is incomplete.
       if (Object.keys(writer.state.warnings).some(key => key.startsWith('r2/'))) throw new Error('Some R2 objects are incomplete');
+      if (skipped) throw new Error(`${skipped} stored objects have names the export API refuses (such as "..", "//", a backslash or a control character); everything else was exported`);
     }, () => 0);
     // Re-list R2 on resume so deleted local files and earlier failed objects are retried.
     delete writer.state.finished[`r2-walk:${workspaceId}:${projectId ?? ''}`];

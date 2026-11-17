@@ -213,8 +213,16 @@ orgExportRoutes.get(`${base}/r2`, openApi({ summary: 'List one page of scoped R2
   if (!allowedExportR2Key(q.prefix, prefixes, true)) throw notFound();
   const after = cursor(`r2:${q.prefix}`, q.cursor);
   const page = await c.env.R2_BUCKET.list({ prefix: q.prefix, limit: q.limit, ...(after ? { cursor: after } : {}) });
-  if (page.objects.some(object => !allowedExportR2Key(object.key, prefixes))) throw notFound('Unsafe stored R2 key');
-  return c.json({ items: page.objects.map(object => ({ key: object.key, size: object.size, etag: object.etag, uploaded: object.uploaded })), cursor: page.truncated ? exportCursor(`r2:${q.prefix}`, page.cursor) : null });
+  const items: ExportRow[] = [];
+  let skipped = 0;
+  for (const object of page.objects) {
+    // Filesystem mounts store a folder as an empty object named `<folder>/`. It holds no data, so it is not listed.
+    if (object.size === 0 && object.key.endsWith('/') && allowedExportR2Key(object.key, prefixes, true)) continue;
+    // Any other key the export can't name safely is counted, not listed, so one odd name doesn't hide its whole folder.
+    if (!allowedExportR2Key(object.key, prefixes)) { skipped++; continue; }
+    items.push({ key: object.key, size: object.size, etag: object.etag, uploaded: object.uploaded });
+  }
+  return c.json({ items, skipped, cursor: page.truncated ? exportCursor(`r2:${q.prefix}`, page.cursor) : null });
 });
 orgExportRoutes.get(`${base}/r2/object`, openApi({ summary: 'Stream one scoped R2 object', request: { query: r2Query.extend({ key: z.string() }) }, responses: binaryResponseSchema }), async c => {
   const q = c.req.valid('query');

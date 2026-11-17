@@ -129,6 +129,16 @@ describe('R2 guards', () => {
     expect((await f.request('/r2/object?workspaceId=ws-a&projectId=project-b&key=project-fs/do-project-b/default/a')).status).toBe(404);
     expect(f.r2.get).not.toHaveBeenCalled(); expect(f.r2.list).not.toHaveBeenCalled();
   });
+  it('omits empty folder markers and counts unsafe stored keys instead of refusing the page', async () => {
+    const f = fixture();
+    const object = (key: string, size = 1) => ({ key, size, etag: 'e', uploaded: new Date(0) });
+    f.r2.list.mockResolvedValueOnce({ objects: [object('org-a/ws-a/user-uploads/', 0), object('org-a/ws-a/user-uploads/a.png'), object('org-a/ws-a/user-uploads//b'), object('org-a/ws-a/user-uploads/c/', 3)], truncated: false } as never);
+    const response = await f.request('/r2?workspaceId=ws-a&prefix=org-a/ws-a/');
+    expect(response.status).toBe(200);
+    const body = await response.json() as { items: { key: string }[]; skipped: number };
+    expect(body.items.map(item => item.key)).toEqual(['org-a/ws-a/user-uploads/a.png']);
+    expect(body.skipped).toBe(2);
+  });
 });
 const enc = encodeURIComponent;
 

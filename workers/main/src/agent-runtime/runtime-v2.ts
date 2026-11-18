@@ -49,7 +49,13 @@ export async function v2Fetch(
   if (!token) throw new RuntimeApiError("Chiridion's v2 tenant key is missing", 503, "v2_not_configured");
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${token}`);
-  return fetch(v2RuntimeUrl(env) + path, { ...init, headers, redirect: "error" });
+  // Workers supports manual redirects. Stop here so the tenant key stays on the runtime origin.
+  const response = await fetch(v2RuntimeUrl(env) + path, { ...init, headers, redirect: "manual" });
+  if (response.status >= 300 && response.status < 400) {
+    await response.body?.cancel();
+    throw new RuntimeApiError("camelRun v2 returned an unexpected redirect", 502, "v2_runtime_redirect");
+  }
+  return response;
 }
 
 export async function v2Json<T>(

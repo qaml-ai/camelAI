@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { v2Fetch } from "../src/agent-runtime/runtime-v2";
 import { readV2Thread } from "../src/agent-runtime/v2-thread-read";
 import type { ChatEnv } from "../src/chat-thread/types";
 
@@ -7,6 +8,14 @@ const agentId = "agt_thread";
 const request = (read: string) => new Request(`https://app.test/threads/123/${read}`);
 
 afterEach(() => vi.restoreAllMocks());
+
+it("uses Workers-compatible manual redirects and never repeats the request at the redirect target", async () => {
+  const fetcher = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.redirect("https://other.test/", 307));
+  await expect(v2Fetch(env, "/agents/test")).rejects.toMatchObject({ status: 502, code: "v2_runtime_redirect" });
+  expect(fetcher).toHaveBeenCalledExactlyOnceWith("https://run.camelai.com/v2/agents/test", expect.objectContaining({
+    redirect: "manual",
+  }));
+});
 
 it("projects v2 messages and hides the upstream agent's configuration", async () => {
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {

@@ -34,6 +34,12 @@ export function runtimeUrl(env: RuntimeApiEnv): string {
   return (env.AGENT_RUNTIME_URL || "https://agents.camelai.dev").replace(/\/+$/, "");
 }
 
+export function v2RuntimeUrl(env: { WORKER_BASE_URL?: string }): string {
+  return env.WORKER_BASE_URL === "https://staging.camelai.dev"
+    ? "https://camelrun-v2-chiridion-staging.miguel-85b.workers.dev/v2"
+    : "https://run.camelai.com/v2";
+}
+
 /**
  * The runtime's agent id for a provisioning key (its `agentId(tenant, key)`),
  * to find an agent it already made. A key whose agent was deleted makes its

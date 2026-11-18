@@ -5,10 +5,9 @@ import { buildWorkspaceScopedR2Key } from "../../../../src/lib/workspace-r2-path
 import { RUNTIME_TOOL_SERVER } from "../../../../src/lib/agent-runtime-shared";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types";
 import { isUnsafeUploadPath } from "../file-safety";
-import { RuntimeApiError } from "./runtime-api";
+import { RuntimeApiError, v2RuntimeUrl } from "./runtime-api";
 import { runtimeSystemPromptAppend } from "./run-gates";
 
-export const V2_RUNTIME_URL = "https://run.camelai.com/v2";
 export const V2_BROWSER_SESSION = "chiridion-v2-session";
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 
@@ -50,7 +49,7 @@ export async function v2Fetch(
   if (!token) throw new RuntimeApiError("Chiridion's v2 tenant key is missing", 503, "v2_not_configured");
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${token}`);
-  return fetch(V2_RUNTIME_URL + path, { ...init, headers, redirect: "error" });
+  return fetch(v2RuntimeUrl(env) + path, { ...init, headers, redirect: "error" });
 }
 
 export async function v2Json<T>(

@@ -18,9 +18,9 @@ import type { CodeModeToolsProps } from "../code-mode-tools.js";
 import type { Env, RouteContext } from "../types.js";
 import { getOrgStub } from "../helpers/stubs.js";
 import { recordWorkspaceThreadStreaming } from "../thread-status.js";
+import { v2RuntimeUrl } from "../agent-runtime/runtime-api.js";
 
 const DEFAULT_RUNTIME = "https://agents.camelai.dev";
-const V2_RUNTIME = "https://run.camelai.com/v2";
 
 /**
  * CodeModeToolsBinding tools the runtime does NOT get (none now: the old
@@ -295,7 +295,7 @@ export function agentMcpHandler(env: Env, tools: ToolsFactory, options: AgentMcp
   const audience = v2 ? undefined : env.AGENT_RUNTIME_MCP_AUDIENCE;
   const serve = serveTools(observedToolServer(env, agentToolServer(env, tools, options.version)), {
     tenant,
-    runtime: v2 ? V2_RUNTIME : env.AGENT_RUNTIME_URL || DEFAULT_RUNTIME,
+    runtime: v2 ? v2RuntimeUrl(env) : env.AGENT_RUNTIME_URL || DEFAULT_RUNTIME,
     ...(audience ? { audience } : {}),
     ...(options.fetch ? { fetch: options.fetch } : {}),
     metadata: false,

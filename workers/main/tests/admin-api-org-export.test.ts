@@ -100,6 +100,17 @@ describe('org export scope', () => {
     const response = await f.request('/threads/thread-a/history'); expect(response.status).toBe(502);
     expect(await response.text()).not.toContain('runtime-secret');
   });
+  it('fails a redirected runtime export without forwarding the tenant key', async () => {
+    const f = fixture(), fetcher = vi.fn(async () => Response.redirect('https://redirect.invalid', 307));
+    vi.stubGlobal('fetch', fetcher);
+    const response = await f.request('/threads/thread-a/history');
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({ error: 'Runtime export read failed' });
+    expect(fetcher).toHaveBeenCalledExactlyOnceWith(
+      'https://runtime.invalid/v1/agents/agent-a/history?limit=50&maxBytes=2000000',
+      { headers: { Authorization: 'Bearer runtime-secret' }, redirect: 'manual' },
+    );
+  });
   it('reads app virtual KV with the dispatch script prefix and includes binary values', async () => {
     const f = fixture(); expect(await (await f.request('/workspaces/ws-a/apps/app-a/kv')).json()).toMatchObject({ items: [{ key: 'default/key', value_base64: btoa('value') }] });
     expect(f.kv.list).toHaveBeenCalledWith({ prefix: 'selfhost:user-kv/ws-a/app-a--a/', limit: 1 });

@@ -75,12 +75,18 @@ export async function v2Json<T>(
   return await response.json() as T;
 }
 
-export async function createV2ThreadAgent(env: ChatEnv, context: ChatContextState, subject: string, model: string) {
+export async function createV2ThreadAgent(
+  env: ChatEnv,
+  context: ChatContextState,
+  subject: string,
+  model: string,
+  key = `chiridion-thread-${context.threadId}`,
+) {
   if (!env.WORKER_BASE_URL || !env.AGENT_RUNTIME_V2_TENANT || !env.AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET) {
     throw new RuntimeApiError("Chiridion's v2 tenant and callback URLs are required", 503, "v2_not_configured");
   }
   const url = new URL("/mcp/agent/v2", env.WORKER_BASE_URL).toString();
-  const agent = await v2Json<{ id: string }>(env, v2AgentPath(`chiridion-thread-${context.threadId}`), {
+  const agent = await v2Json<{ id: string }>(env, v2AgentPath(key), {
     method: "PUT",
     body: {
       model,

@@ -165,6 +165,17 @@ export class ChatThreadDO extends DurableObject<ChatEnv> {
     return await this.migration.migrate(request);
   }
 
+  async exportLegacyThreadForV2() {
+    if (this.env.WORKER_BASE_URL !== "https://staging.camelai.dev") throw new Error("Staging migration only");
+    if (this.relayRuntimeAgent()) return { status: "relay" as const };
+    const { messages, archived } = await this.migration.exportHistory();
+    const sql = this.ctx.storage.sql;
+    const renderOnly = messages.length === 0 && exportTableExists(sql, RENDER_TABLE) &&
+      sql.exec(`SELECT 1 FROM ${RENDER_TABLE} LIMIT 1`).toArray().length > 0;
+    if (archived || renderOnly) return { status: "archived_history" as const };
+    return { status: "exported" as const, messages, preview: this.previewTabs() };
+  }
+
   /** Where this thread's move stands (moving, moved, backing off), before anyone asks for one. */
   runtimeMigrationStatus(): RuntimeMigrationStatus {
     return this.migration.status();

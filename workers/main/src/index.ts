@@ -63,6 +63,7 @@ export {
 export { ChatThreadDO } from './chat-thread-do.js';
 export { CodeModeToolsBinding } from './code-mode-tools.js';
 export { UserDO, OrgDO } from './auth.js';
+export { StagingV2Migration } from './agent-runtime/staging-v2-migration.js';
 export { EmailHandleDO } from './email-handle-registry.js';
 export { SignupDO } from './signup-do.js';
 export {

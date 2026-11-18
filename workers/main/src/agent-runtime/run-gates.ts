@@ -135,7 +135,7 @@ function orgStub(env: ChatEnv, orgId: string): OrgStub {
 export async function resolveThreadRuntimeRoute(
   env: ChatEnv,
   context: ChatContextState,
-  options: { persistFallback?: boolean } = {},
+  options: { persistFallback?: boolean; allowFallback?: boolean } = {},
 ): Promise<ThreadRuntimeRoute> {
   const org = orgStub(env, context.orgId);
   const [thread, llmProviderRecord, orgInfo] = await Promise.all([
@@ -167,6 +167,9 @@ export async function resolveThreadRuntimeRoute(
       ),
       onBillingResolved: () => {},
       onHostedModelFallback: async (requestedModel, fallbackModel, reason) => {
+        if (options.allowFallback === false) {
+          throw new RuntimeRunRefused("The stored model is unavailable at its current credit level", "hosted_access");
+        }
         ranOn = fallbackModel;
         if (options.persistFallback === false) return;
         const updated = await org.updateThreadModel(

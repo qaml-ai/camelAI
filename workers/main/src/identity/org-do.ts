@@ -8825,6 +8825,28 @@ export class OrgDO extends DurableObject<DOEnv> {
     return row ? { row, claimed: row.agentId === agentId } : null;
   }
 
+  /** Publish a verified copy only while the thread still belongs to the legacy exporter. */
+  claimLegacyThreadForV2(
+    threadId: string,
+    expectedModel: string | null,
+    update: ThreadRuntimeAgentUpdate,
+    preview: Record<string, unknown>,
+  ): boolean {
+    if (this.env.WORKER_BASE_URL !== "https://staging.camelai.dev") throw new Error("Staging migration only");
+    return this.ctx.storage.transactionSync(() => {
+      const thread = this.getThread(threadId);
+      if (!thread || (thread.model ?? null) !== expectedModel || this.getThreadRuntime(threadId)) return false;
+      const now = Date.now();
+      this.sql.exec(
+        `INSERT INTO thread_runtime (thread_id, agent_id, model, key_scope, configured_json, runtime_version, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'v2', ?, ?)`,
+        threadId, update.agentId, update.model, update.keyScope, JSON.stringify(update.configured ?? null), now, now,
+      );
+      if (!this.getThreadUiState(threadId)) this.setThreadUiState(threadId, preview);
+      return true;
+    });
+  }
+
   /** A direct runtime thread's preview tabs, or null when none were saved. */
   getThreadUiState(threadId: string): ThreadUiStateRecord | null {
     const row = this.sql

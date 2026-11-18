@@ -380,7 +380,7 @@ export async function directRuntimeRow(
  * for a channel thread (created by "slack", "telegram", …) the member who
  * connected the channel; else (a "system" scheduled thread) the org's owner.
  */
-async function migrationSubject(env: ChatEnv, thread: OrgThread, context: ChatContextState): Promise<string | null> {
+export async function migrationSubject(env: ChatEnv, thread: OrgThread, context: ChatContextState): Promise<string | null> {
   const org = orgStub(env, context.orgId);
   const creator = thread.created_by?.trim();
   if (creator && await org.getMember(creator)) return creator;

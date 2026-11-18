@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      worker_only:
+        description: Reuse the deployed container images
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -14,6 +19,7 @@ jobs:
     with:
       environment: staging
       ref: ${{ github.sha }}
+      worker_only: ${{ github.event_name == 'workflow_dispatch' && inputs.worker_only }}
       # Until the staging environment has CLOUDFLARE_API_TOKEN, pushes to main
       # skip with a warning (Workers Builds still deploys); a manual run fails.
       skip_without_token: ${{ github.event_name == 'push' }}

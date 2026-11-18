@@ -37,6 +37,7 @@ if (!env || !validEnvs.includes(env)) {
 const sourceConfig = path.join(rootDir, `wrangler.${env}.jsonc`);
 const targetConfig = path.join(rootDir, 'build/server', `wrangler.${env}.json`);
 const redirectConfig = path.join(rootDir, '.wrangler/deploy/config.json');
+const workerOnly = env === 'staging' && process.env.CAMELAI_WORKER_ONLY === '1';
 
 if (process.env.SKIP_BUILD === '1') {
   console.log('Skipping build because SKIP_BUILD=1');
@@ -102,7 +103,7 @@ if (process.env.SKIP_D1_MIGRATIONS === '1') {
 // Run wrangler deploy
 console.log(`\nDeploying to ${env}...`);
 try {
-  execSync('npx wrangler deploy', {
+  execSync(workerOnly ? 'npx wrangler deploy --containers-rollout=none' : 'npx wrangler deploy', {
     cwd: rootDir,
     stdio: 'inherit'
   });

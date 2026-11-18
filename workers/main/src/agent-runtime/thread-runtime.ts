@@ -20,7 +20,7 @@ import { buildWorkspaceScopedR2Key } from "../../../../src/lib/workspace-r2-path
 import { applyMentionContext } from "../mention-context";
 import { WorkspaceFilesystemClient } from "../workspace-filesystem-do";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
-import { runtimeRunLimits } from "./model-routes";
+import { runtimeRunLimits, v2HostedModelMatches } from "./model-routes";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
 import { RuntimeApiError, runtimeApi, runtimeUrl } from "./runtime-api";
 import { attachV2Uploads, createV2ThreadAgent, V2_BROWSER_SESSION, v2AgentPath, v2Json, type V2Run } from "./runtime-v2";
@@ -100,7 +100,7 @@ export async function pinNewThreadToRuntime(
   const org = orgStub(env, context.orgId);
   const stagingWorkspaces = env.AGENT_RUNTIME_V2_WORKSPACE === "*" && env.WORKER_BASE_URL === "https://staging.camelai.dev";
   const canary = options.web && (stagingWorkspaces || context.workspaceId === env.AGENT_RUNTIME_V2_WORKSPACE) &&
-    route.kind === "scope" && route.keyScope === HOSTED_KEY_SCOPE && route.model === env.AGENT_RUNTIME_V2_MODEL;
+    v2HostedModelMatches(route, env.AGENT_RUNTIME_V2_MODELS);
   const firstMessage = options.pendingFirstMessage ?? null;
   const pinned = canary
     ? await org.pinThreadRuntime(context.threadId, firstMessage, "v2")

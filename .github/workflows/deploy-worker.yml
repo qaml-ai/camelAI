@@ -22,6 +22,10 @@ on:
         required: false
         type: boolean
         default: false
+      worker_only:
+        description: Reuse the deployed container images on staging
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -88,7 +92,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Check Docker
-        if: steps.preflight.outputs.ready == 'true'
+        if: steps.preflight.outputs.ready == 'true' && !inputs.worker_only
         # wrangler deploy runs `docker build --load --platform linux/amd64` for
         # each container image, then pushes to registry.cloudflare.com.
         run: |
@@ -101,6 +105,7 @@ jobs:
         if: steps.preflight.outputs.ready == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CAMELAI_WORKER_ONLY: ${{ inputs.worker_only && '1' || '0' }}
         run: |
           build_id="$(git rev-parse HEAD)"
           echo "build_id=$build_id" >> "$GITHUB_OUTPUT"

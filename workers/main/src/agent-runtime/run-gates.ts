@@ -36,7 +36,7 @@ import { assertUserLlmUsageAccess, UserLlmUsageLimitError } from "../user-llm-us
 import { createPiSystemPrompt } from "../pi-system-prompt";
 import { resolveAgentSkillCatalog } from "../selfhost-agent-pack";
 import { RUNTIME_PROMPT_PREAMBLE, type RuntimeRunConfig } from "./runtime-prompt";
-import { runtimeModelRoute, type RuntimeModelRoute } from "./model-routes";
+import { runtimeModelRoute, v2HostedModelMatches, type RuntimeModelRoute } from "./model-routes";
 import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, selfhostOperatorEndpointOrigin, syncOrgKeyScope } from "./key-scopes";
 
 type OrgInfoLike = {
@@ -246,10 +246,8 @@ export async function prepareThreadRuntimeRun(
   }
   const { route, config, threadModel, fallback } = resolved;
   if (!route) throw new RuntimeRunRefused("This thread's model cannot run on the agent runtime; switch models to continue.", "no_route");
-  if (runtimeVersion === "v2" && (
-    route.kind !== "scope" || route.keyScope !== HOSTED_KEY_SCOPE || route.model !== env.AGENT_RUNTIME_V2_MODEL
-  )) {
-    throw new RuntimeRunRefused("This v2 thread requires the configured hosted model.", "no_route");
+  if (runtimeVersion === "v2" && !v2HostedModelMatches(route, env.AGENT_RUNTIME_V2_MODELS)) {
+    throw new RuntimeRunRefused("Choose a hosted model enabled for v2 to continue this thread.", "no_route");
   }
   const org = orgStub(env, context.orgId);
   const access = async () => {

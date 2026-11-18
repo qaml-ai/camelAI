@@ -35,6 +35,11 @@ export type RuntimeModelRoute =
   | { kind: "scope"; model: string; keyScope: string }
   | { kind: "codex"; model: string };
 
+export function v2HostedModelMatches(route: RuntimeModelRoute, models: string | undefined): boolean {
+  return route.kind === "scope" && route.keyScope === HOSTED_KEY_SCOPE &&
+    (models?.split(",").some((model) => model.trim() === route.model) ?? false);
+}
+
 /** The tenant model endpoint in the runtime that is chiridion's Codex forwarder. */
 export const RUNTIME_MODEL_ENDPOINT = "chiridion";
 

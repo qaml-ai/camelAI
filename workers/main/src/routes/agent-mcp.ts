@@ -103,7 +103,9 @@ export async function authorizeRuntimeIdentity(
   const access = await getOrgStub(env, orgId).validateChatWebSocketAccess(userId, workspaceId, threadId);
   if (!access.ok) return { error: `Forbidden (${access.reason})` };
   if (access.orgId !== orgId) return { error: "Forbidden (org_mismatch)" };
-  if (version === "v2" && (!identity.agent || access.runtime?.agentId !== identity.agent)) {
+  if (version === "v2" && (
+    access.runtime?.runtimeVersion !== "v2" || !identity.agent || access.runtime.agentId !== identity.agent
+  )) {
     return { error: "Forbidden (agent_mismatch)" };
   }
   return {

@@ -99,7 +99,7 @@ describe("agent MCP", () => {
     const identity: TestIdentity = { ...ALICE, tenant: "chiridion-v2", agent: "agt_v2", actor: "user2" };
     const validate = vi.fn(async (user: string, workspaceId: string, threadId: string) => ({
       ...allowed(user, workspaceId, threadId),
-      runtime: { agentId: "agt_v2" },
+      runtime: { agentId: "agt_v2", runtimeVersion: "v2" },
     }));
     const env = {
       AGENT_RUNTIME_URL: rt.url,

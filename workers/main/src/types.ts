@@ -123,6 +123,7 @@ export interface Env
   // endpoints sit behind a proxy. AGENT_RUNTIME_URL (its JWKS) is on ChatEnv.
   AGENT_RUNTIME_TENANT?: string;
   AGENT_RUNTIME_V2_TENANT?: string;
+  AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET?: string;
   AGENT_RUNTIME_MCP_AUDIENCE?: string;
   AGENT_RUNTIME_LLM_AUDIENCE?: string;
   // Standard Webhooks secret (whsec_…) of the runtime's webhook endpoint for

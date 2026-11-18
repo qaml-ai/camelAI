@@ -607,6 +607,7 @@ export interface CreateThreadOptions {
 /** A direct runtime thread (plans/runtime-threads-direct.md): its agent, once created, and the configuration last applied. */
 export interface ThreadRuntimeRecord {
   threadId: string;
+  runtimeVersion?: "v2";
   agentId: string | null;
   /** The runtime model id last configured on the agent. */
   model: string | null;
@@ -641,6 +642,7 @@ export interface ThreadUiStateRecord {
 
 type ThreadRuntimeRow = {
   thread_id: string;
+  runtime_version: "v1" | "v2";
   agent_id: string | null;
   model: string | null;
   key_scope: string | null;
@@ -663,6 +665,7 @@ function parseJsonObject(text: string | null): Record<string, unknown> | null {
 function threadRuntimeRecord(row: ThreadRuntimeRow): ThreadRuntimeRecord {
   return {
     threadId: row.thread_id,
+    ...(row.runtime_version === "v2" ? { runtimeVersion: "v2" } : {}),
     agentId: row.agent_id,
     model: row.model,
     keyScope: row.key_scope,
@@ -2547,6 +2550,12 @@ export class OrgDO extends DurableObject<DOEnv> {
       !threadRuntimeColumns.some((column) => column.name === "pending_first_message")
     ) {
       this.sql.exec("ALTER TABLE thread_runtime ADD COLUMN pending_first_message TEXT");
+    }
+    if (
+      threadRuntimeColumns.length > 0 &&
+      !threadRuntimeColumns.some((column) => column.name === "runtime_version")
+    ) {
+      this.sql.exec("ALTER TABLE thread_runtime ADD COLUMN runtime_version TEXT NOT NULL DEFAULT 'v1'");
     }
 
     const CURRENT_SCHEMA_VERSION = 53;
@@ -8664,7 +8673,7 @@ export class OrgDO extends DurableObject<DOEnv> {
   getThreadRuntime(threadId: string): ThreadRuntimeRecord | null {
     const row = this.sql
       .exec<ThreadRuntimeRow>(
-        "SELECT thread_id, agent_id, model, key_scope, configured_json, pending_first_message, created_at, updated_at FROM thread_runtime WHERE thread_id = ?",
+        "SELECT thread_id, runtime_version, agent_id, model, key_scope, configured_json, pending_first_message, created_at, updated_at FROM thread_runtime WHERE thread_id = ?",
         threadId,
       )
       .toArray()[0];
@@ -8707,13 +8716,14 @@ export class OrgDO extends DurableObject<DOEnv> {
    * (a row already there keeps its message); false when the thread does not
    * exist.
    */
-  pinThreadRuntime(threadId: string, pendingFirstMessage?: string | null): boolean {
+  pinThreadRuntime(threadId: string, pendingFirstMessage?: string | null, runtimeVersion: "v1" | "v2" = "v1"): boolean {
     if (!this.getThread(threadId)) return false;
     const now = Date.now();
     this.sql.exec(
-      "INSERT OR IGNORE INTO thread_runtime (thread_id, pending_first_message, created_at, updated_at) VALUES (?, ?, ?, ?)",
+      "INSERT OR IGNORE INTO thread_runtime (thread_id, pending_first_message, runtime_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
       threadId,
       pendingFirstMessage?.trim() ? pendingFirstMessage : null,
+      runtimeVersion,
       now,
       now,
     );

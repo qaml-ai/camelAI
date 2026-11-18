@@ -45,3 +45,24 @@ export async function verifyStandardWebhook(
     return diff === 0;
   });
 }
+
+/** camelRun v2 signs the raw delivery as HMAC-SHA256(timestamp + "." + body). */
+export async function verifyV2Webhook(
+  secret: string,
+  headers: Headers,
+  body: string,
+  nowSeconds = Math.floor(Date.now() / 1000),
+): Promise<boolean> {
+  const header = headers.get("x-camelrun-signature");
+  const match = header?.match(/^t=(\d{1,16}),v1=([a-f0-9]{64})$/);
+  if (!match || !match[1] || !match[2]) return false;
+  const [, timestamp, hex] = match;
+  if (Math.abs(nowSeconds - Number(timestamp)) > TOLERANCE_SECONDS) return false;
+  const signature = new Uint8Array(32);
+  for (let index = 0; index < signature.length; index++) {
+    signature[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+  }
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  return crypto.subtle.verify("HMAC", key, signature, encoder.encode(`${timestamp}.${body}`));
+}

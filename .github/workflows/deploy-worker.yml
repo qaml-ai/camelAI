@@ -23,7 +23,7 @@ on:
         type: boolean
         default: false
       worker_only:
-        description: Reuse the deployed container images on staging
+        description: Reuse the deployed container images
         type: boolean
         default: false
 

@@ -5,7 +5,7 @@ import type { Env } from "../types";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
 import { v2HostedModelMatches } from "./model-routes";
 import { resolveThreadRuntimeRoute, runtimeAgentModel, RuntimeRunRefused } from "./run-gates";
-import { RuntimeApiError } from "./runtime-api";
+import { RuntimeApiError, v2WorkspaceEnabled } from "./runtime-api";
 import { attachV2Uploads, createV2ThreadAgent, v2AgentPath, v2Json } from "./runtime-v2";
 import { MAX_IMPORT_BYTES, migrationSubject } from "./thread-migration";
 import { RUNTIME_PROMPT_VERSION } from "./runtime-prompt";
@@ -13,11 +13,11 @@ import { RUNTIME_PROMPT_VERSION } from "./runtime-prompt";
 /** The first migration source is immutable. Its old conversation ID and workspace remain the same. */
 export class StagingV2Migration extends WorkerEntrypoint<Env> {
   async moveLegacyThread(orgId: string, threadId: string, dryRun = true) {
-    if (this.env.WORKER_BASE_URL !== "https://staging.camelai.dev") throw new Error("Staging migration only");
     const env = this.env as unknown as ChatEnv;
     const org = env.ORG.get(env.ORG.idFromName(orgId));
     const [thread, existing] = await Promise.all([org.getThread(threadId), org.getThreadRuntime(threadId)]);
     if (!thread) return { status: "missing" };
+    if (!v2WorkspaceEnabled(env, thread.workspace_id)) return { status: "workspace_disabled" };
     if (existing) return { status: existing.runtimeVersion ?? "v1" };
     if (thread.source === "channel" || thread.channel_kind) return { status: "channel" };
     const context: ChatContextState = {

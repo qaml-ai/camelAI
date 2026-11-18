@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { readOrgExportManifest, readOrgExportPage, readExportRecord, ORG_EXPORT_SETS, type OrgExportSet } from "../org-export.js";
 import { syncOrgKeyScope, type KeyScopeEnv } from "../agent-runtime/key-scopes";
-import { RuntimeApiError, runtimeApi } from "../agent-runtime/runtime-api";
+import { RuntimeApiError, runtimeApi, v2WorkspaceEnabled } from "../agent-runtime/runtime-api";
 import type { DOEnv } from "./env";
 import {
   WorkspaceDO,
@@ -8832,10 +8832,11 @@ export class OrgDO extends DurableObject<DOEnv> {
     update: ThreadRuntimeAgentUpdate,
     preview: Record<string, unknown>,
   ): boolean {
-    if (this.env.WORKER_BASE_URL !== "https://staging.camelai.dev") throw new Error("Staging migration only");
     return this.ctx.storage.transactionSync(() => {
       const thread = this.getThread(threadId);
-      if (!thread || (thread.model ?? null) !== expectedModel || this.getThreadRuntime(threadId)) return false;
+      if (!thread || !v2WorkspaceEnabled(this.env, thread.workspace_id) ||
+        thread.source === "channel" || thread.channel_kind ||
+        (thread.model ?? null) !== expectedModel || this.getThreadRuntime(threadId)) return false;
       const now = Date.now();
       this.sql.exec(
         `INSERT INTO thread_runtime (thread_id, agent_id, model, key_scope, configured_json, runtime_version, created_at, updated_at)

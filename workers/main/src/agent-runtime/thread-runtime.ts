@@ -22,7 +22,7 @@ import { WorkspaceFilesystemClient } from "../workspace-filesystem-do";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
 import { runtimeRunLimits, v2HostedModelMatches } from "./model-routes";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
-import { RuntimeApiError, runtimeApi, runtimeUrl } from "./runtime-api";
+import { RuntimeApiError, runtimeApi, runtimeUrl, v2WorkspaceEnabled } from "./runtime-api";
 import { attachV2Uploads, createV2ThreadAgent, V2_BROWSER_SESSION, v2AgentPath, v2Json, type V2Run } from "./runtime-v2";
 import { codexError, codexRoute, codexUpstreamCall, forwardedResponseHeaders } from "./codex-forwarder";
 import { HostedModelFallbackRequiredError } from "../chat-thread/pi-model-config";
@@ -98,8 +98,7 @@ export async function pinNewThreadToRuntime(
   }
   if (!route) return null;
   const org = orgStub(env, context.orgId);
-  const stagingWorkspaces = env.AGENT_RUNTIME_V2_WORKSPACE === "*" && env.WORKER_BASE_URL === "https://staging.camelai.dev";
-  const canary = options.web && (stagingWorkspaces || context.workspaceId === env.AGENT_RUNTIME_V2_WORKSPACE) &&
+  const canary = options.web && v2WorkspaceEnabled(env, context.workspaceId) &&
     v2HostedModelMatches(route, env.AGENT_RUNTIME_V2_MODELS);
   const firstMessage = options.pendingFirstMessage ?? null;
   const pinned = canary

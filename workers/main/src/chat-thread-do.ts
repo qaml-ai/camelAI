@@ -30,6 +30,7 @@ import {
 } from "./chat-thread/render-archive-export";
 import { piMessagesToParsedMessages } from "./pi-message-export";
 import type { DoMigrationRequest, DoMigrationResult } from "./agent-runtime/thread-migration";
+import { v2WorkspaceEnabled } from "./agent-runtime/runtime-api";
 import type { RelayRuntimeAgent } from "./agent-runtime/channel-turns";
 import type {
   AgentEvalParsedMessage,
@@ -166,7 +167,9 @@ export class ChatThreadDO extends DurableObject<ChatEnv> {
   }
 
   async exportLegacyThreadForV2() {
-    if (this.env.WORKER_BASE_URL !== "https://staging.camelai.dev") throw new Error("Staging migration only");
+    if (!v2WorkspaceEnabled(this.env, this.chatContext()?.workspaceId)) {
+      return { status: "workspace_disabled" as const };
+    }
     if (this.relayRuntimeAgent()) return { status: "relay" as const };
     const { messages, archived } = await this.migration.exportHistory();
     const sql = this.ctx.storage.sql;

@@ -249,7 +249,7 @@ export async function prepareThreadRuntimeRun(
   if (runtimeVersion === "v2" && (
     route.kind !== "scope" || route.keyScope !== HOSTED_KEY_SCOPE || route.model !== env.AGENT_RUNTIME_V2_MODEL
   )) {
-    throw new RuntimeRunRefused("This v2 test workspace only supports its configured hosted model.", "unsupported_v2_model");
+    throw new RuntimeRunRefused("This v2 thread requires the configured hosted model.", "no_route");
   }
   const org = orgStub(env, context.orgId);
   const access = async () => {

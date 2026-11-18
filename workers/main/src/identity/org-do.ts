@@ -7745,6 +7745,9 @@ export class OrgDO extends DurableObject<DOEnv> {
     if (!info) {
       return;
     }
+    if (this.sql.exec("SELECT 1 FROM thread_runtime WHERE runtime_version = 'v2' LIMIT 1").toArray().length > 0) {
+      throw new Error("This organization contains v2 canary threads. Their usage must be settled before deletion.");
+    }
 
     // Clean up slug→org KV mapping
     try {
@@ -8634,7 +8637,11 @@ export class OrgDO extends DurableObject<DOEnv> {
   deleteThread(id: string, actorId?: string): boolean {
     const existing = this.getThread(id);
     if (!existing) return false;
-    const agentId = this.getThreadRuntime(id)?.agentId;
+    const runtime = this.getThreadRuntime(id);
+    if (runtime?.runtimeVersion === "v2") {
+      throw new Error("V2 canary threads are retained while usage delivery is enabled.");
+    }
+    const agentId = runtime?.agentId;
     this.sql.exec("DELETE FROM threads WHERE id = ?", id);
     this.markMirrorDirty("thread", id);
     this.sql.exec("DELETE FROM thread_runtime WHERE thread_id = ?", id);

@@ -9,6 +9,7 @@ import {
 } from "./workspace-app-fetcher";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { OrgDO, WorkerScript } from "./auth";
+import type { ThreadRuntimeRecord } from "./identity/org-do";
 import { Type, type TSchema } from "typebox";
 import type { WorkspaceDO } from "./workspace";
 import type { ScheduledRunOutcomeStatus, WorkspaceCronDO } from "./workspace-cron";
@@ -3255,7 +3256,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       const { scratchVolumePath } = await import("../../../src/lib/agent-runtime-shared");
       const path = scratchVolumePath(input.$file);
       if (threadId && path) {
-        const [thread, row] = await Promise.all([this.orgStub.getThread(threadId), this.orgStub.getThreadRuntime(threadId)]);
+        const org = this.orgStub;
+        const runtime = org as unknown as { getThreadRuntime(id: string): Promise<ThreadRuntimeRecord | null> };
+        const [thread, row] = await Promise.all([org.getThread(threadId), runtime.getThreadRuntime(threadId)]);
         if (thread?.workspace_id === workspaceId && row?.runtimeVersion === "v2" && row.agentId) {
           const { fetchV2Scratch } = await import("./agent-runtime/runtime-v2");
           return fetchV2Scratch(this.env, row.agentId, path);

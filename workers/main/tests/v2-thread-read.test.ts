@@ -47,7 +47,9 @@ it("delivers a tool snapshot and a text delta while the run is still active", as
     expect(await read()).toContain("event: ready");
     expect(await read()).toContain("id: 1");
     expect(await read()).toContain('id: 2\ndata: {"type":"snapshot"}');
-    expect(await read()).toContain('"delta":"Working"');
+    const text = await read();
+    expect(text).toContain('"type":"message_start"');
+    expect(text).toContain('"delta":"Working"');
   } finally {
     await reader.cancel();
   }

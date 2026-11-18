@@ -67,7 +67,11 @@ function browserInput(agentId: string, run: V2Run, input: V2Input): AgentInput {
     id: input.id, agent: agentId, requestId: run.idempotencyKey ?? run.id, toolCallId: input.toolCallId,
     kind, message, state: "pending",
     detail: {
-      ...(kind === "question" ? { questions: [{ question: message, options: prompt.options ?? [] }] } : {}),
+      ...(kind === "question" ? { questions: [{
+        question: message,
+        options: (prompt.options ?? []).map((label) => ({ label, description: "" })),
+        allowOther: true,
+      }] } : {}),
       ...(kind === "form" ? { requestedSchema: prompt.elicitation?.requestedSchema } : {}),
       ...(kind === "url" ? { url: prompt.elicitation?.url } : {}),
     } as AgentInput["detail"],

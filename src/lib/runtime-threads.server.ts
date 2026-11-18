@@ -23,6 +23,7 @@ import { classifyMove, migrateThreadToRuntime, type UnmovableReason } from "../.
 import type { ChatThreadReadOnlyHistory } from "../../workers/main/src/chat-thread-do";
 import { normalizePreviewTabs } from "../../workers/main/src/chat-thread/preview-state";
 import { requireSameOriginJson, runtimeReadProxyBase, startErrorStillCurrent } from "@/lib/agent-runtime-shared";
+import { v2HistoryPage } from "../../workers/main/src/agent-runtime/v2-thread-read";
 
 export interface RuntimeThreadAccess {
   env: ChatEnv;
@@ -127,7 +128,7 @@ export async function loadRuntimeThreadSeed(
               return { token: null, error: "Can't reach the agent service. Try again in a moment." };
             },
           ),
-          loadSeedHistory(env, agentId, input),
+          loadSeedHistory(env, agentId, input, input.row.runtimeVersion),
         ]).then(([tokenResult, page]) => ({ ...tokenResult, page }))
       : Promise.resolve({ token: null, page: null, error: null }),
     runtimeStartError(org, input.threadId),
@@ -158,13 +159,16 @@ async function loadSeedHistory(
   env: ChatEnv,
   agentId: string,
   context: { orgId: string; workspaceId: string; threadId: string; userId: string },
+  version?: "v2",
 ): Promise<Awaited<ReturnType<typeof runtimeHistoryPage>> | null> {
   const deadline = Date.now() + SEED_HISTORY_BUDGET_MS;
   for (let attempt = 0; attempt < 2; attempt++) {
     const signal = AbortSignal.timeout(Math.min(SEED_REQUEST_TIMEOUT_MS, deadline - Date.now()));
     try {
       // ~256 KB first paint; older pages load from the browser. Runtimes before maxBytes ignore it.
-      return await runtimeHistoryPage(env, agentId, { limit: 50, maxBytes: 262_144, signal });
+      return version === "v2"
+        ? await v2HistoryPage(env, agentId, { limit: 50, signal })
+        : await runtimeHistoryPage(env, agentId, { limit: 50, maxBytes: 262_144, signal });
     } catch (error) {
       recordRuntimeSeedHistoryFailure(env, context, signal.aborted ? signal.reason : error);
       if (!signal.aborted || attempt > 0 || deadline - Date.now() < 1_000) return null;
@@ -277,7 +281,7 @@ export async function pinNewWebThread(
   context: ChatContextState,
   options: { pendingFirstMessage?: string | null } = {},
 ): Promise<ThreadRuntimeRecord | null> {
-  return await pinNewThreadToRuntime(getEnv(loadContext) as unknown as ChatEnv, context, options);
+  return await pinNewThreadToRuntime(getEnv(loadContext) as unknown as ChatEnv, context, { ...options, web: true });
 }
 
 /**

@@ -4,6 +4,7 @@ import { runtimeModelRoute } from "../src/agent-runtime/model-routes";
 import { PiModelMapping } from "../src/pi-model-resolution";
 import type { PiResolvedModelConfig } from "../src/chat-thread/pi-model-config";
 import { resolveThreadRuntimeRoute } from "../src/agent-runtime/run-gates";
+import { v2WorkspaceEnabled } from "../src/agent-runtime/runtime-api";
 
 const b64url = (value: unknown) => btoa(JSON.stringify(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const CODEX_TOKEN = `${b64url({})}.${b64url({ "https://api.openai.com/auth": { chatgpt_account_id: "acct" } })}.sig`;
@@ -22,6 +23,23 @@ function config(overrides: { model: Record<string, unknown>; billingSource?: "ho
 
 const GATEWAY = "https://gateway.ai.cloudflare.com/v1/acct/gw";
 const org = { orgId: "org1" };
+
+describe("v2WorkspaceEnabled", () => {
+  it("requires a selected workspace in production", () => {
+    const production = { WORKER_BASE_URL: "https://camelai.dev", AGENT_RUNTIME_V2_WORKSPACE: "ws1" };
+    expect(v2WorkspaceEnabled(production, "ws1")).toBe(true);
+    expect(v2WorkspaceEnabled(production, "ws2")).toBe(false);
+    expect(v2WorkspaceEnabled(production, undefined)).toBe(false);
+    expect(v2WorkspaceEnabled({ ...production, AGENT_RUNTIME_V2_WORKSPACE: "*" }, "ws1")).toBe(false);
+    expect(v2WorkspaceEnabled({}, undefined)).toBe(false);
+  });
+
+  it("accepts the staging wildcard for legacy exports with no saved workspace", () => {
+    const staging = { WORKER_BASE_URL: "https://staging.camelai.dev", AGENT_RUNTIME_V2_WORKSPACE: "*" };
+    expect(v2WorkspaceEnabled(staging, "ws1")).toBe(true);
+    expect(v2WorkspaceEnabled(staging, undefined)).toBe(true);
+  });
+});
 
 describe("runtimeModelRoute", () => {
   it.each([true, false])("runs camelCode on DeepSeek Flash on the platform's Azure deployment (free tier: %s)", async (freeTier) => {

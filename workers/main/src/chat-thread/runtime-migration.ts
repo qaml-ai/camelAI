@@ -304,7 +304,7 @@ export class ChatThreadRuntimeMigration {
     if (this.deps.hasRelayAgent()) return { status: "relay" };
 
     if (request.dryRun) {
-      const history = await this.history();
+      const history = await this.exportHistory();
       const converted = convertTranscript(history.messages);
       if (converted.tooLarge) return { status: "skipped", reason: "too_large" };
       const archived = history.archived || converted.lossy;
@@ -347,7 +347,7 @@ export class ChatThreadRuntimeMigration {
         this.renew(leaseId, { orphanAgentId: undefined, orphanKey: undefined, orphanKeyAt: undefined });
       }
 
-      const history = await this.history();
+      const history = await this.exportHistory();
       const converted = convertTranscript(history.messages);
       history.messages = [];
       if (converted.tooLarge) {
@@ -427,7 +427,7 @@ export class ChatThreadRuntimeMigration {
    * belongs to) only the part the export does not repeat. `archived`: the
    * import is not the whole history as stored.
    */
-  private async history(): Promise<{ messages: AgentMessage[]; archived: boolean }> {
+  async exportHistory(): Promise<{ messages: AgentMessage[]; archived: boolean }> {
     const history = await this.deps.loadHistory(RUNTIME_MIGRATION_EXPORT_MAX_CHARS);
     const exported = history.messages as Array<{ role?: string; content?: unknown; timestamp?: unknown }>;
     const isSummary = (message: { role?: string; content?: unknown }) =>

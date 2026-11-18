@@ -20,6 +20,8 @@ export interface DOEnv {
   APP_KV: KVNamespace;
   EMAIL_HANDLE?: DurableObjectNamespace<EmailHandleDO>;
   WORKSPACE_CRON?: DurableObjectNamespace<WorkspaceCronDO>;
+  WORKER_BASE_URL?: string;
+  AGENT_RUNTIME_V2_WORKSPACE?: string;
   INTEGRATION_SECRET_KEY?: string;
   NOTION_CLIENT_ID?: string;
   NOTION_CLIENT_SECRET?: string;

@@ -32,6 +32,7 @@ export async function action({ request, context, params }: ActionFunctionArgs) {
     inputId,
     { action: body.action as "accept" | "decline" | "cancel", ...(body.content !== undefined ? { content: body.content } : {}) },
     sender,
+    row.runtimeVersion,
   );
   return Response.json(answered.body, { status: answered.status });
 }

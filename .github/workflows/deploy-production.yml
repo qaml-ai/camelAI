@@ -6,6 +6,10 @@ on:
       confirm:
         description: 'Type "deploy" to confirm'
         required: true
+      worker_only:
+        description: Reuse the deployed container images
+        type: boolean
+        default: false
 
 jobs:
   promote:
@@ -39,4 +43,5 @@ jobs:
     with:
       environment: production
       ref: ${{ needs.promote.outputs.sha }}
+      worker_only: ${{ inputs.worker_only }}
     secrets: inherit

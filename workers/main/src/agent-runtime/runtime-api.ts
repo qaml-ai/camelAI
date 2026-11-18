@@ -34,6 +34,21 @@ export function runtimeUrl(env: RuntimeApiEnv): string {
   return (env.AGENT_RUNTIME_URL || "https://agents.camelai.dev").replace(/\/+$/, "");
 }
 
+export function v2RuntimeUrl(env: { WORKER_BASE_URL?: string }): string {
+  return env.WORKER_BASE_URL === "https://staging.camelai.dev"
+    ? "https://camelrun-v2-chiridion-staging.miguel-85b.workers.dev/v2"
+    : "https://run.camelai.com/v2";
+}
+
+export function v2WorkspaceEnabled(
+  env: { WORKER_BASE_URL?: string; AGENT_RUNTIME_V2_WORKSPACE?: string },
+  workspaceId: string | undefined,
+): boolean {
+  const selected = env.AGENT_RUNTIME_V2_WORKSPACE;
+  if (selected === "*") return env.WORKER_BASE_URL === "https://staging.camelai.dev";
+  return Boolean(selected && selected === workspaceId);
+}
+
 /**
  * The runtime's agent id for a provisioning key (its `agentId(tenant, key)`),
  * to find an agent it already made. A key whose agent was deleted makes its

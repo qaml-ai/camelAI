@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { readOrgExportManifest, readOrgExportPage, readExportRecord, ORG_EXPORT_SETS, type OrgExportSet } from "../org-export.js";
 import { syncOrgKeyScope, type KeyScopeEnv } from "../agent-runtime/key-scopes";
-import { RuntimeApiError, runtimeApi } from "../agent-runtime/runtime-api";
+import { RuntimeApiError, runtimeApi, v2WorkspaceEnabled } from "../agent-runtime/runtime-api";
 import type { DOEnv } from "./env";
 import {
   WorkspaceDO,
@@ -607,6 +607,7 @@ export interface CreateThreadOptions {
 /** A direct runtime thread (plans/runtime-threads-direct.md): its agent, once created, and the configuration last applied. */
 export interface ThreadRuntimeRecord {
   threadId: string;
+  runtimeVersion?: "v2";
   agentId: string | null;
   /** The runtime model id last configured on the agent. */
   model: string | null;
@@ -641,6 +642,7 @@ export interface ThreadUiStateRecord {
 
 type ThreadRuntimeRow = {
   thread_id: string;
+  runtime_version: "v1" | "v2";
   agent_id: string | null;
   model: string | null;
   key_scope: string | null;
@@ -663,6 +665,7 @@ function parseJsonObject(text: string | null): Record<string, unknown> | null {
 function threadRuntimeRecord(row: ThreadRuntimeRow): ThreadRuntimeRecord {
   return {
     threadId: row.thread_id,
+    ...(row.runtime_version === "v2" ? { runtimeVersion: "v2" } : {}),
     agentId: row.agent_id,
     model: row.model,
     keyScope: row.key_scope,
@@ -2547,6 +2550,12 @@ export class OrgDO extends DurableObject<DOEnv> {
       !threadRuntimeColumns.some((column) => column.name === "pending_first_message")
     ) {
       this.sql.exec("ALTER TABLE thread_runtime ADD COLUMN pending_first_message TEXT");
+    }
+    if (
+      threadRuntimeColumns.length > 0 &&
+      !threadRuntimeColumns.some((column) => column.name === "runtime_version")
+    ) {
+      this.sql.exec("ALTER TABLE thread_runtime ADD COLUMN runtime_version TEXT NOT NULL DEFAULT 'v1'");
     }
 
     const CURRENT_SCHEMA_VERSION = 53;
@@ -6121,6 +6130,14 @@ export class OrgDO extends DurableObject<DOEnv> {
     );
   }
 
+  hasBrowserSession(workspaceId: string, sessionId: string): boolean {
+    return this.sql.exec(
+      "SELECT 1 FROM workspace_browser_sessions WHERE session_id = ? AND workspace_id = ?",
+      sessionId,
+      workspaceId,
+    ).toArray().length > 0;
+  }
+
   /** Drop a browser session from the registry (best-effort, on session close). */
   async removeBrowserSession(sessionId: string): Promise<void> {
     if (!sessionId) return;
@@ -7736,6 +7753,9 @@ export class OrgDO extends DurableObject<DOEnv> {
     if (!info) {
       return;
     }
+    if (this.sql.exec("SELECT 1 FROM thread_runtime WHERE runtime_version = 'v2' LIMIT 1").toArray().length > 0) {
+      throw new Error("This organization contains v2 canary threads. Their usage must be settled before deletion.");
+    }
 
     // Clean up slug→org KV mapping
     try {
@@ -8625,7 +8645,11 @@ export class OrgDO extends DurableObject<DOEnv> {
   deleteThread(id: string, actorId?: string): boolean {
     const existing = this.getThread(id);
     if (!existing) return false;
-    const agentId = this.getThreadRuntime(id)?.agentId;
+    const runtime = this.getThreadRuntime(id);
+    if (runtime?.runtimeVersion === "v2") {
+      throw new Error("V2 canary threads are retained while usage delivery is enabled.");
+    }
+    const agentId = runtime?.agentId;
     this.sql.exec("DELETE FROM threads WHERE id = ?", id);
     this.markMirrorDirty("thread", id);
     this.sql.exec("DELETE FROM thread_runtime WHERE thread_id = ?", id);
@@ -8664,7 +8688,7 @@ export class OrgDO extends DurableObject<DOEnv> {
   getThreadRuntime(threadId: string): ThreadRuntimeRecord | null {
     const row = this.sql
       .exec<ThreadRuntimeRow>(
-        "SELECT thread_id, agent_id, model, key_scope, configured_json, pending_first_message, created_at, updated_at FROM thread_runtime WHERE thread_id = ?",
+        "SELECT thread_id, runtime_version, agent_id, model, key_scope, configured_json, pending_first_message, created_at, updated_at FROM thread_runtime WHERE thread_id = ?",
         threadId,
       )
       .toArray()[0];
@@ -8707,13 +8731,14 @@ export class OrgDO extends DurableObject<DOEnv> {
    * (a row already there keeps its message); false when the thread does not
    * exist.
    */
-  pinThreadRuntime(threadId: string, pendingFirstMessage?: string | null): boolean {
+  pinThreadRuntime(threadId: string, pendingFirstMessage?: string | null, runtimeVersion: "v1" | "v2" = "v1"): boolean {
     if (!this.getThread(threadId)) return false;
     const now = Date.now();
     this.sql.exec(
-      "INSERT OR IGNORE INTO thread_runtime (thread_id, pending_first_message, created_at, updated_at) VALUES (?, ?, ?, ?)",
+      "INSERT OR IGNORE INTO thread_runtime (thread_id, pending_first_message, runtime_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
       threadId,
       pendingFirstMessage?.trim() ? pendingFirstMessage : null,
+      runtimeVersion,
       now,
       now,
     );
@@ -8798,6 +8823,29 @@ export class OrgDO extends DurableObject<DOEnv> {
     );
     const row = this.getThreadRuntime(threadId);
     return row ? { row, claimed: row.agentId === agentId } : null;
+  }
+
+  /** Publish a verified copy only while the thread still belongs to the legacy exporter. */
+  claimLegacyThreadForV2(
+    threadId: string,
+    expectedModel: string | null,
+    update: ThreadRuntimeAgentUpdate,
+    preview: Record<string, unknown>,
+  ): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      const thread = this.getThread(threadId);
+      if (!thread || !v2WorkspaceEnabled(this.env, thread.workspace_id) ||
+        thread.source === "channel" || thread.channel_kind ||
+        (thread.model ?? null) !== expectedModel || this.getThreadRuntime(threadId)) return false;
+      const now = Date.now();
+      this.sql.exec(
+        `INSERT INTO thread_runtime (thread_id, agent_id, model, key_scope, configured_json, runtime_version, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'v2', ?, ?)`,
+        threadId, update.agentId, update.model, update.keyScope, JSON.stringify(update.configured ?? null), now, now,
+      );
+      if (!this.getThreadUiState(threadId)) this.setThreadUiState(threadId, preview);
+      return true;
+    });
   }
 
   /** A direct runtime thread's preview tabs, or null when none were saved. */

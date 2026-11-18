@@ -36,7 +36,7 @@ import { assertUserLlmUsageAccess, UserLlmUsageLimitError } from "../user-llm-us
 import { createPiSystemPrompt } from "../pi-system-prompt";
 import { resolveAgentSkillCatalog } from "../selfhost-agent-pack";
 import { RUNTIME_PROMPT_PREAMBLE, type RuntimeRunConfig } from "./runtime-prompt";
-import { runtimeModelRoute, type RuntimeModelRoute } from "./model-routes";
+import { runtimeModelRoute, v2HostedModelMatches, type RuntimeModelRoute } from "./model-routes";
 import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, selfhostOperatorEndpointOrigin, syncOrgKeyScope } from "./key-scopes";
 
 type OrgInfoLike = {
@@ -135,7 +135,7 @@ function orgStub(env: ChatEnv, orgId: string): OrgStub {
 export async function resolveThreadRuntimeRoute(
   env: ChatEnv,
   context: ChatContextState,
-  options: { persistFallback?: boolean } = {},
+  options: { persistFallback?: boolean; allowFallback?: boolean } = {},
 ): Promise<ThreadRuntimeRoute> {
   const org = orgStub(env, context.orgId);
   const [thread, llmProviderRecord, orgInfo] = await Promise.all([
@@ -167,6 +167,9 @@ export async function resolveThreadRuntimeRoute(
       ),
       onBillingResolved: () => {},
       onHostedModelFallback: async (requestedModel, fallbackModel, reason) => {
+        if (options.allowFallback === false) {
+          throw new RuntimeRunRefused("The stored model is unavailable at its current credit level", "hosted_access");
+        }
         ranOn = fallbackModel;
         if (options.persistFallback === false) return;
         const updated = await org.updateThreadModel(
@@ -235,16 +238,20 @@ export async function prepareThreadRuntimeRun(
   context: ChatContextState,
   userId: string | null,
   timings?: SendTimings,
+  runtimeVersion?: "v2",
 ): Promise<PreparedRuntimeRun> {
   let resolved: ThreadRuntimeRoute;
   try {
-    resolved = await timed(timings, "route", () => resolveThreadRuntimeRoute(env, context));
+    resolved = await timed(timings, "route", () => resolveThreadRuntimeRoute(env, context, runtimeVersion ? { persistFallback: false } : undefined));
   } catch (error) {
     if (error instanceof HostedModelFallbackRequiredError) throw new RuntimeRunRefused(error.message, "hosted_access");
     throw error;
   }
   const { route, config, threadModel, fallback } = resolved;
   if (!route) throw new RuntimeRunRefused("This thread's model cannot run on the agent runtime; switch models to continue.", "no_route");
+  if (runtimeVersion === "v2" && !v2HostedModelMatches(route, env.AGENT_RUNTIME_V2_MODELS)) {
+    throw new RuntimeRunRefused("Choose a hosted model enabled for v2 to continue this thread.", "no_route");
+  }
   const org = orgStub(env, context.orgId);
   const access = async () => {
     if (!userId) return;
@@ -268,7 +275,7 @@ export async function prepareThreadRuntimeRun(
       throw error;
     }
   };
-  const keyScope = () => syncRouteKeyScope(env, context, resolved);
+  const keyScope = () => runtimeVersion === "v2" ? Promise.resolve() : syncRouteKeyScope(env, context, resolved);
   const credit = async () => config.billingSource === "hosted" && config.creditChargeable
     ? await hostedCreditRemainingUsd(org)
     : null;
@@ -341,7 +348,7 @@ async function hostedCreditRemainingUsd(org: OrgStub): Promise<number | null> {
 }
 
 /** The instructions a new runtime agent is created with: the runtime preamble, then chiridion's prompt. */
-export function runtimeSystemPromptAppend(env: ChatEnv, context: ChatContextState): string {
+export function runtimeSystemPromptAppend(env: ChatEnv, context: ChatContextState, runtimeVersion?: "v2"): string {
   const catalog = resolveAgentSkillCatalog(env);
   const base = createPiSystemPrompt(context, {
     skillNames: catalog.skillNames,
@@ -350,5 +357,8 @@ export function runtimeSystemPromptAppend(env: ChatEnv, context: ChatContextStat
     promptAppend: catalog.promptAppend,
     deployedConnectionsBindingEnabled: connectionsBindingEnabled(env),
   });
-  return `${RUNTIME_PROMPT_PREAMBLE}\n\n${base}`;
+  const scratch = runtimeVersion === "v2"
+    ? "\n\nOn camelRun v2, use codemode's fs.readFile, fs.writeFile and fs.readdir for the thread's scratch workspace."
+    : "";
+  return `${RUNTIME_PROMPT_PREAMBLE}${scratch}\n\n${base}`;
 }

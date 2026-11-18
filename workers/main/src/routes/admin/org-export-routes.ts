@@ -61,7 +61,7 @@ function filePath(value: string) {
   return value;
 }
 async function runtimeRead(c: Ctx, path: string): Promise<Response> {
-  const result = await fetch(`${runtimeUrl(c.env)}${path}`, { headers: { Authorization: `Bearer ${c.env.AGENT_RUNTIME_API_TOKEN ?? ''}` }, redirect: 'error' });
+  const result = await fetch(`${runtimeUrl(c.env)}${path}`, { headers: { Authorization: `Bearer ${c.env.AGENT_RUNTIME_API_TOKEN ?? ''}` }, redirect: 'manual' });
   if (!result.ok) {
     await result.body?.cancel();
     throw new HTTPException(result.status === 404 ? 404 : result.status === 429 ? 429 : 502, { message: 'Runtime export read failed' });

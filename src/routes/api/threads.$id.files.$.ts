@@ -10,6 +10,7 @@ import {
 } from "./text-preview-stream";
 import { scratchVolumePath } from "@/lib/agent-runtime-shared";
 import { fetchScratchFile, threadScratchVolume } from "../../../workers/main/src/agent-runtime/thread-runtime";
+import { fetchV2Scratch } from "../../../workers/main/src/agent-runtime/runtime-v2";
 
 /**
  * GET /api/threads/:id/files/workspace/<path>: a file of a runtime thread's
@@ -29,9 +30,15 @@ export async function loader({ request, context, params }: LoaderFunctionArgs) {
   const shown = `/${(params["*"] ?? "").split("/").map((segment) => decodeURIComponent(segment)).join("/")}`;
   const volumePath = scratchVolumePath(shown);
   if (!volumePath) return Response.json({ error: "Not a scratch file" }, { status: 400 });
-  const volumeId = await threadScratchVolume(env, threadContext, row);
+  const isV2 = row.runtimeVersion === "v2";
+  const volumeId = isV2 ? row.agentId : await threadScratchVolume(env, threadContext, row);
   if (!volumeId) return Response.json({ error: "File not found" }, { status: 404 });
-  const upstream = await fetchScratchFile(env, volumeId, volumePath, request.headers.get("range"));
+  const range = request.headers.get("range");
+  const upstream = isV2
+    ? await fetchV2Scratch(env, volumeId, volumePath, range)
+    : await fetchScratchFile(env, volumeId, volumePath, range);
+  if (upstream.status === 416) return upstream;
+  if (upstream.status === 413) return Response.json({ error: "Scratch file exceeds the v2 test limit" }, { status: 413 });
   if (upstream.status === 404 || upstream.status === 400) {
     await upstream.body?.cancel();
     return Response.json({ error: "File not found" }, { status: 404 });

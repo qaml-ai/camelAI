@@ -28,6 +28,7 @@ import { handleAdminMcp } from './routes/admin-mcp.js';
 import { handleAgentMcp } from './routes/agent-mcp.js';
 import { handleAgentRuntimeLlm } from './routes/agent-runtime-llm.js';
 import { handleAgentRuntimeEvents } from './routes/agent-runtime-events.js';
+import { handleAgentRuntimeV2Events } from './routes/agent-runtime-v2-events.js';
 import { handleOAuthStart, handleOAuthCallback } from './routes/oauth.js';
 import {
   handleSlackOAuthStart,
@@ -62,6 +63,7 @@ export {
 export { ChatThreadDO } from './chat-thread-do.js';
 export { CodeModeToolsBinding } from './code-mode-tools.js';
 export { UserDO, OrgDO } from './auth.js';
+export { StagingV2Migration } from './agent-runtime/staging-v2-migration.js';
 export { EmailHandleDO } from './email-handle-registry.js';
 export { SignupDO } from './signup-do.js';
 export {
@@ -213,10 +215,12 @@ const routes: Route[] = [
 
   // MCP tools for the hosted agent runtime (runtime identity-token auth)
   { method: 'ALL', path: /^\/mcp\/agent$/, handler: handleAgentMcp },
+  { method: 'ALL', path: /^\/mcp\/agent\/v2$/, handler: (context) => handleAgentMcp(context, 'v2') },
   // The runtime's Codex calls: the one model route chiridion still forwards (same token)
   { method: 'POST', path: /^\/agent-runtime\/llm\/openai-codex\/.+$/, handler: handleAgentRuntimeLlm },
   // The runtime's webhook events: runs, inputs and usage (Standard Webhooks signature)
   { method: 'POST', path: /^\/agent-runtime\/events$/, handler: handleAgentRuntimeEvents },
+  { method: 'POST', path: /^\/agent-runtime\/events\/v2$/, handler: handleAgentRuntimeV2Events },
 
   // Stripe billing webhook
   { method: 'POST', path: /^\/api\/billing\/stripe\/webhook$/, handler: handleStripeWebhook },

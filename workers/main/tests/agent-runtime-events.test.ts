@@ -8,6 +8,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { handleAgentRuntimeEventsRequest } from "../src/routes/agent-runtime-events";
+import { handleAgentRuntimeV2Events } from "../src/routes/agent-runtime-v2-events";
 import { runtimeAgentThreadKey } from "../src/agent-runtime/thread-runtime";
 import type { Env } from "../src/types";
 import { createOrg, createUser, type TestEnv } from "./test-helpers";
@@ -40,9 +41,9 @@ async function delivery(event: Record<string, unknown>, signature?: string) {
 
 const email = () => `rt-evt-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`;
 
-async function setup(options: { source?: "channel" | "scheduled" } = {}) {
+async function setup(options: { source?: "channel" | "scheduled"; v2?: boolean } = {}) {
   const { userId } = await createUser(testEnv, email(), "password123", "Evt User");
-  const { org, defaultWorkspaceId } = await createOrg(testEnv, "Evt Org", userId);
+  const { org, defaultWorkspaceId } = await createOrg(testEnv, "Evt Org", userId, options.v2 ? { billingPlan: "starter" } : {});
   const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
   const thread = await orgStub.createThread(
     defaultWorkspaceId as string,
@@ -55,7 +56,12 @@ async function setup(options: { source?: "channel" | "scheduled" } = {}) {
       : options.source === "scheduled" ? { source: "scheduled" } : {},
   );
   const agentId = `client_${crypto.randomUUID().replaceAll("-", "")}`;
-  await orgStub.setThreadRuntimeAgent(thread.id, { agentId, model: "m", keyScope: null });
+  if (options.v2) await orgStub.pinThreadRuntime(thread.id, null, "v2");
+  await orgStub.setThreadRuntimeAgent(thread.id, {
+    agentId,
+    model: options.v2 ? "openrouter/openai/gpt-4.1" : "m",
+    keyScope: options.v2 ? "hosted" : null,
+  });
   const streaming = vi.fn(async () => {});
   const runEnv = {
     ...(testEnv as unknown as Env),
@@ -65,7 +71,7 @@ async function setup(options: { source?: "channel" | "scheduled" } = {}) {
     WORKSPACE: { idFromName: (name: string) => name, get: () => ({ recordThreadStreaming: streaming }) },
   } as unknown as Env;
   const metadata = { source: "web", org: org.id, workspace: defaultWorkspaceId as string, thread: thread.id };
-  return { orgStub, threadId: thread.id, workspaceId: defaultWorkspaceId as string, orgId: org.id, agentId, runEnv, streaming, metadata };
+  return { orgStub, threadId: thread.id, workspaceId: defaultWorkspaceId as string, orgId: org.id, agentId, userId, runEnv, streaming, metadata };
 }
 
 async function deliver(runEnv: Env, event: Record<string, unknown>, signature?: string) {
@@ -78,6 +84,66 @@ async function deliver(runEnv: Env, event: Record<string, unknown>, signature?: 
 const eventId = () => `evt_${crypto.randomUUID().replaceAll("-", "").slice(0, 24)}`;
 
 afterEach(() => vi.restoreAllMocks());
+
+describe("usage.recorded on POST /agent-runtime/events/v2", () => {
+  const secret = "chiridion-v2-test-secret";
+  const tenant = "chiridion-v2-test";
+
+  async function signedRequest(event: object, key = secret, timestamp = Math.floor(Date.now() / 1000)) {
+    const body = JSON.stringify(event);
+    const encoder = new TextEncoder();
+    const signingKey = await crypto.subtle.importKey("raw", encoder.encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const hash = await crypto.subtle.sign("HMAC", signingKey, encoder.encode(`${timestamp}.${body}`));
+    const hex = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    return new Request("https://camel.test/agent-runtime/events/v2", {
+      method: "POST",
+      headers: { "x-camelrun-signature": `t=${timestamp},v1=${hex}`, "content-type": "application/json" },
+      body,
+    });
+  }
+
+  it("charges the acting user once and rejects unbound or unverified deliveries", async () => {
+    const { orgStub, agentId, metadata, runEnv, userId, threadId, workspaceId } = await setup({ v2: true });
+    const configured = { ...runEnv, AGENT_RUNTIME_V2_TENANT: tenant, AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET: secret };
+    const event = {
+      id: eventId(),
+      tenantId: tenant,
+      type: "usage.recorded",
+      createdAt: Date.now(),
+      data: {
+        agentId,
+        actor: userId,
+        model: "openrouter/openai/gpt-4.1",
+        kind: "response",
+        input: 100,
+        output: 20,
+        cost: { usd: 0.00036, source: "catalog" },
+        context: metadata,
+      },
+    };
+    const send = async (req: Request) => (await handleAgentRuntimeV2Events({ req, env: configured })).status;
+    expect(await send(await signedRequest(event, "incorrect"))).toBe(401);
+    expect(await send(await signedRequest(event, secret, Math.floor(Date.now() / 1000) - 600))).toBe(401);
+    expect(await send(await signedRequest({ ...event, tenantId: "other" }))).toBe(403);
+    expect(await send(await signedRequest({ ...event, data: { ...event.data, actor: null } }))).toBe(400);
+    expect(await send(await signedRequest({ ...event, data: { ...event.data, agentId: "agt_other" } }))).toBe(409);
+    expect(await send(await signedRequest({ ...event, data: { ...event.data, context: { ...metadata, workspace: "ws_other" } } }))).toBe(409);
+    expect((await orgStub.getUsageLog()).entries).toHaveLength(0);
+    expect(await send(await signedRequest(event))).toBe(204);
+    expect(await send(await signedRequest(event))).toBe(204);
+    expect((await orgStub.getUsageLog()).entries).toMatchObject([{
+      user_id: userId,
+      workspace_id: workspaceId,
+      thread_id: threadId,
+      provider: "openrouter",
+      model: "openai/gpt-4.1",
+      credit_chargeable: 1,
+      input_tokens: 100,
+      output_tokens: 20,
+      source_id: `v2:${event.id}`,
+    }]);
+  });
+});
 
 /** The runtime's input routes, as the webhook handler calls them with the tenant token. */
 function fakeInputs(inputs: Array<Record<string, unknown>>, failure?: { method: "GET" | "POST"; status: number }) {

@@ -27,6 +27,8 @@ describe('OrgDO browser-session registry', () => {
     await orgStub.recordBrowserSession(workspaceId, 's1');
     await orgStub.recordBrowserSession(workspaceId, 's2');
     await orgStub.recordBrowserSession(otherWorkspace, 's3');
+    expect(await orgStub.hasBrowserSession(workspaceId, 's1')).toBe(true);
+    expect(await orgStub.hasBrowserSession(workspaceId, 's3')).toBe(false);
 
     // All three are still live -> workspace sees only its own two.
     const count = await orgStub.reconcileBrowserSessions(workspaceId, ['s1', 's2', 's3']);
@@ -72,6 +74,7 @@ describe('OrgDO browser-session registry', () => {
     await orgStub.recordBrowserSession(workspaceId, 'keep');
     await orgStub.recordBrowserSession(workspaceId, 'drop');
     await orgStub.removeBrowserSession('drop');
+    expect(await orgStub.hasBrowserSession(workspaceId, 'drop')).toBe(false);
     expect(await orgStub.reconcileBrowserSessions(workspaceId, ['keep', 'drop'])).toBe(1);
   });
 

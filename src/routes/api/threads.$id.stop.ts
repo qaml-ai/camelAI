@@ -12,6 +12,6 @@ export async function action({ request, context, params }: ActionFunctionArgs) {
   }
   const { env, row } = await requireRuntimeThread(request, context, params.id, requestWorkspaceId(request));
   if (!row.agentId) return Response.json({ stopped: false });
-  await abortRuntimeThread(env, row.agentId);
+  await abortRuntimeThread(env, row.agentId, row.runtimeVersion);
   return Response.json({ stopped: true });
 }

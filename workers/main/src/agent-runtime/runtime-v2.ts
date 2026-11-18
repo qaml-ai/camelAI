@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { parseUploadRefs } from "../../../../src/lib/chat-attachment-refs";
+import { getMimeType } from "../../../../src/lib/file-content-headers";
 import { buildWorkspaceScopedR2Key } from "../../../../src/lib/workspace-r2-paths";
 import { RUNTIME_TOOL_SERVER } from "../../../../src/lib/agent-runtime-shared";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types";
@@ -145,7 +146,11 @@ export async function fetchV2Scratch(
     if (result.size > MAX_FILE_BYTES) return new Response(null, { status: 413 });
     const bytes = result.base64 === null ? new TextEncoder().encode(result.content ?? "") : new Uint8Array(Buffer.from(result.base64, "base64"));
     if (bytes.byteLength !== result.size) throw new RuntimeApiError("camelRun v2 returned an incomplete file", 502);
-    const headers = new Headers({ "Accept-Ranges": "bytes", "Content-Length": String(result.size) });
+    const headers = new Headers({
+      "Accept-Ranges": "bytes",
+      "Content-Length": String(result.size),
+      "Content-Type": getMimeType(volumePath),
+    });
     if (!range) return new Response(bytes, { headers });
     const match = range.match(/^bytes=(\d*)-(\d*)$/);
     const start = match?.[1] ? Number(match[1]) : Math.max(0, result.size - Number(match?.[2]));

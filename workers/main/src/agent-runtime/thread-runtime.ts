@@ -98,7 +98,8 @@ export async function pinNewThreadToRuntime(
   }
   if (!route) return null;
   const org = orgStub(env, context.orgId);
-  const canary = options.web && context.workspaceId === env.AGENT_RUNTIME_V2_WORKSPACE &&
+  const stagingWorkspaces = env.AGENT_RUNTIME_V2_WORKSPACE === "*" && env.WORKER_BASE_URL === "https://staging.camelai.dev";
+  const canary = options.web && (stagingWorkspaces || context.workspaceId === env.AGENT_RUNTIME_V2_WORKSPACE) &&
     route.kind === "scope" && route.keyScope === HOSTED_KEY_SCOPE && route.model === env.AGENT_RUNTIME_V2_MODEL;
   const firstMessage = options.pendingFirstMessage ?? null;
   const pinned = canary

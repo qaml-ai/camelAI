@@ -235,16 +235,22 @@ export async function prepareThreadRuntimeRun(
   context: ChatContextState,
   userId: string | null,
   timings?: SendTimings,
+  runtimeVersion?: "v2",
 ): Promise<PreparedRuntimeRun> {
   let resolved: ThreadRuntimeRoute;
   try {
-    resolved = await timed(timings, "route", () => resolveThreadRuntimeRoute(env, context));
+    resolved = await timed(timings, "route", () => resolveThreadRuntimeRoute(env, context, runtimeVersion ? { persistFallback: false } : undefined));
   } catch (error) {
     if (error instanceof HostedModelFallbackRequiredError) throw new RuntimeRunRefused(error.message, "hosted_access");
     throw error;
   }
   const { route, config, threadModel, fallback } = resolved;
   if (!route) throw new RuntimeRunRefused("This thread's model cannot run on the agent runtime; switch models to continue.", "no_route");
+  if (runtimeVersion === "v2" && (
+    route.kind !== "scope" || route.keyScope !== HOSTED_KEY_SCOPE || route.model !== env.AGENT_RUNTIME_V2_MODEL
+  )) {
+    throw new RuntimeRunRefused("This v2 test workspace only supports its configured hosted model.", "unsupported_v2_model");
+  }
   const org = orgStub(env, context.orgId);
   const access = async () => {
     if (!userId) return;
@@ -268,7 +274,7 @@ export async function prepareThreadRuntimeRun(
       throw error;
     }
   };
-  const keyScope = () => syncRouteKeyScope(env, context, resolved);
+  const keyScope = () => runtimeVersion === "v2" ? Promise.resolve() : syncRouteKeyScope(env, context, resolved);
   const credit = async () => config.billingSource === "hosted" && config.creditChargeable
     ? await hostedCreditRemainingUsd(org)
     : null;
@@ -341,7 +347,7 @@ async function hostedCreditRemainingUsd(org: OrgStub): Promise<number | null> {
 }
 
 /** The instructions a new runtime agent is created with: the runtime preamble, then chiridion's prompt. */
-export function runtimeSystemPromptAppend(env: ChatEnv, context: ChatContextState): string {
+export function runtimeSystemPromptAppend(env: ChatEnv, context: ChatContextState, runtimeVersion?: "v2"): string {
   const catalog = resolveAgentSkillCatalog(env);
   const base = createPiSystemPrompt(context, {
     skillNames: catalog.skillNames,
@@ -350,5 +356,8 @@ export function runtimeSystemPromptAppend(env: ChatEnv, context: ChatContextStat
     promptAppend: catalog.promptAppend,
     deployedConnectionsBindingEnabled: connectionsBindingEnabled(env),
   });
-  return `${RUNTIME_PROMPT_PREAMBLE}\n\n${base}`;
+  const scratch = runtimeVersion === "v2"
+    ? "\n\nOn camelRun v2, use codemode's fs.readFile, fs.writeFile and fs.readdir for the thread's scratch workspace."
+    : "";
+  return `${RUNTIME_PROMPT_PREAMBLE}${scratch}\n\n${base}`;
 }

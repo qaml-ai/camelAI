@@ -23,6 +23,7 @@ import { HOSTED_KEY_SCOPE } from "./key-scopes";
 import { runtimeRunLimits } from "./model-routes";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
 import { RuntimeApiError, runtimeApi, runtimeUrl } from "./runtime-api";
+import { attachV2Uploads, createV2ThreadAgent, V2_BROWSER_SESSION, v2AgentPath, v2Json, type V2Run } from "./runtime-v2";
 import { codexError, codexRoute, codexUpstreamCall, forwardedResponseHeaders } from "./codex-forwarder";
 import { HostedModelFallbackRequiredError } from "../chat-thread/pi-model-config";
 import { assertUserLlmUsageAccess, UserLlmUsageLimitError } from "../user-llm-usage-policy";
@@ -85,7 +86,7 @@ export function runtimeDirectThreadsEnabled(env: Partial<ChatEnv>): boolean {
 export async function pinNewThreadToRuntime(
   env: ChatEnv,
   context: ChatContextState,
-  options: { pendingFirstMessage?: string | null } = {},
+  options: { pendingFirstMessage?: string | null; web?: boolean } = {},
 ): Promise<ThreadRuntimeRecord | null> {
   if (!runtimeDirectThreadsEnabled(env)) return null;
   let route: Awaited<ReturnType<typeof resolveThreadRuntimeRoute>>["route"];
@@ -97,7 +98,13 @@ export async function pinNewThreadToRuntime(
   }
   if (!route) return null;
   const org = orgStub(env, context.orgId);
-  if (!await org.pinThreadRuntime(context.threadId, options.pendingFirstMessage ?? null)) return null;
+  const canary = options.web && context.workspaceId === env.AGENT_RUNTIME_V2_WORKSPACE &&
+    route.kind === "scope" && route.keyScope === HOSTED_KEY_SCOPE && route.model === env.AGENT_RUNTIME_V2_MODEL;
+  const firstMessage = options.pendingFirstMessage ?? null;
+  const pinned = canary
+    ? await org.pinThreadRuntime(context.threadId, firstMessage, "v2")
+    : await org.pinThreadRuntime(context.threadId, firstMessage);
+  if (!pinned) return null;
   return await org.getThreadRuntime(context.threadId);
 }
 
@@ -105,7 +112,7 @@ function orgStub(env: ChatEnv, orgId: string) {
   return env.ORG.get(env.ORG.idFromName(orgId)) as unknown as {
     getThread(id: string): Promise<{ created_by?: string | null } | null>;
     getThreadRuntime(threadId: string): Promise<ThreadRuntimeRecord | null>;
-    pinThreadRuntime(threadId: string, pendingFirstMessage?: string | null): Promise<boolean>;
+    pinThreadRuntime(threadId: string, pendingFirstMessage?: string | null, version?: "v1" | "v2"): Promise<boolean>;
     clearThreadPendingFirstMessage(threadId: string): Promise<void>;
     claimThreadRuntimeAgent(threadId: string, agentId: string, configuration?: {
       model: string | null;
@@ -228,9 +235,11 @@ async function createThreadAgent(
   env: ChatEnv,
   context: ChatContextState,
   run: PreparedRuntimeRun,
+  runtimeVersion?: "v2",
 ): Promise<string> {
   const thread = await orgStub(env, context.orgId).getThread(context.threadId);
   const subject = thread?.created_by?.trim() || context.userId || "";
+  if (runtimeVersion === "v2") return await createV2ThreadAgent(env, context, subject, run.model);
   const runLimits = runtimeRunLimits(run.model);
   const created = await runtimeApi(env, "POST", "/v1/agents", {
     definition: env.AGENT_RUNTIME_DEFINITION,
@@ -288,14 +297,14 @@ export async function prewarmThreadAgent(
     }
     let run: PreparedRuntimeRun;
     try {
-      run = await prepareThreadRuntimeRun(env, context, userId);
+      run = await prepareThreadRuntimeRun(env, context, userId, undefined, row.runtimeVersion);
     } catch (error) {
       if (!(error instanceof RuntimeRunRefused)) throw error;
       recordRuntimeAgentPrewarm(env, context, { status: "refused", code: error.code, durationMs: Date.now() - startedAt });
       return null;
     }
     const createStartedAt = Date.now();
-    const agentId = await onceMore("prewarm_agent", () => createThreadAgent(env, context, run));
+    const agentId = await onceMore("prewarm_agent", () => createThreadAgent(env, context, run, row.runtimeVersion));
     createMs = Date.now() - createStartedAt;
     // Recorded compare-and-set: a send that recorded the agent first keeps its
     // row as it wrote it.
@@ -335,11 +344,19 @@ async function ensureConfiguredAgent(
 ): Promise<string> {
   const org = orgStub(env, context.orgId);
   if (!row.agentId) {
-    const agentId = await createThreadAgent(env, context, run);
+    const agentId = await createThreadAgent(env, context, run, row.runtimeVersion);
     await org.setThreadRuntimeAgent(context.threadId, { agentId, ...madeConfiguration(run) });
     return agentId;
   }
   const id = row.agentId;
+  if (row.runtimeVersion === "v2") {
+    if (row.model !== run.model || row.configured?.promptVersion !== RUNTIME_PROMPT_VERSION) {
+      const updated = await createThreadAgent(env, context, run, "v2");
+      if (updated !== id) throw new RuntimeApiError("Chiridion's pinned v2 agent changed", 409, "v2_agent_mismatch");
+      await org.setThreadRuntimeAgent(context.threadId, { agentId: id, ...madeConfiguration(run) });
+    }
+    return id;
+  }
   const modelChanged = row.model !== run.model;
   // A model with run limits of chiridion's own (camelCode's context cap) sets
   // them; leaving it removes them, so they never outlive the model.
@@ -452,7 +469,7 @@ async function sendRuntimeTurn(
   if (!text) return { status: "error", error: "Empty message" };
   const [banned, prepared] = await Promise.all([
     timed(timings, "ban", () => isOrgBanned(env.APP_KV, { orgId: context.orgId })),
-    timed(timings, "prepare", () => prepareThreadRuntimeRun(env, context, sender.userId, timings)).then(
+    timed(timings, "prepare", () => prepareThreadRuntimeRun(env, context, sender.userId, timings, input.row.runtimeVersion)).then(
       (run) => ({ run }),
       (error: unknown) => {
         if (error instanceof RuntimeRunRefused) return { refused: error };
@@ -476,11 +493,29 @@ async function sendRuntimeTurn(
       onceMore("configure_agent", () => ensureConfiguredAgent(env, context, input.row, run, input.clientMessageId, timings)));
     // The message's uploads, attached as runtime files too (native images and
     // PDFs); alongside the configuration when the agent already exists.
+    const v2 = input.row.runtimeVersion === "v2";
+    const attach = v2 ? attachV2Uploads : attachUploads;
     const files = (input.row.agentId ? Promise.resolve(input.row.agentId) : configured)
-      .then((id) => timed(timings, "uploads", () => attachUploads(env, context, id, input.clientMessageId, text)));
+      .then((id) => timed(timings, "uploads", () => attach(env, context, id, input.clientMessageId, text)));
     const [id, attached, promptText] = await Promise.all([configured, files, modelText(env, context, text), marked]);
     agentId = id;
-    request = await timed(timings, "prompt", () => runtimeApi(env, "POST", `/v1/agents/${encodeURIComponent(id)}/prompt`, {
+    request = v2
+      ? await timed(timings, "prompt", () => v2Json<V2Run>(env, v2AgentPath(id) + "/runs", {
+        method: "POST",
+        body: {
+          prompt: promptText,
+          actor: sender.userId,
+          idempotencyKey: input.clientMessageId,
+          whileRunning: "queue",
+          wait: false,
+          ...(attached.length > 0 ? { files: attached } : {}),
+          ...(run.spendLimitUsd === null ? {} : { spendLimitUsd: run.spendLimitUsd }),
+        },
+      })).then((result) => ({
+        id: result.idempotencyKey ?? result.id,
+        state: ["completed", "failed", "cancelled"].includes(result.status) ? "completed" : result.status,
+      }))
+      : await timed(timings, "prompt", () => runtimeApi(env, "POST", `/v1/agents/${encodeURIComponent(id)}/prompt`, {
       text: promptText,
       ...(attached.length > 0 ? { files: attached } : {}),
       from: { id: sender.userId, ...(name ? { name: name.slice(0, 200) } : {}) },
@@ -576,6 +611,15 @@ export async function mintRuntimeBrowserToken(
   readProxy?: string,
   signal?: AbortSignal,
 ): Promise<BrowserToken> {
+  if (row.runtimeVersion === "v2") {
+    if (!readProxy) throw new RuntimeApiError("The v2 browser session needs a read proxy", 500);
+    return {
+      token: V2_BROWSER_SESSION,
+      expiresAt: Date.now() + BROWSER_TOKEN_TTL_SECONDS * 1000,
+      agentId: row.agentId,
+      url: readProxy,
+    };
+  }
   const minted = await runtimeApi(env, "POST", `/v1/agents/${encodeURIComponent(row.agentId)}/browser-tokens`, {
     ttlSeconds: BROWSER_TOKEN_TTL_SECONDS,
     scopes: ["events", "state", "history", "inputs"],
@@ -618,9 +662,22 @@ export async function answerRuntimeInput(
   inputId: string,
   answer: RuntimeInputAnswer,
   sender: RuntimeThreadSender,
+  runtimeVersion?: "v2",
 ): Promise<{ status: number; body: unknown }> {
   const name = resolveMessageAuthorDisplayName(sender.userName, sender.userEmail);
   try {
+    if (runtimeVersion === "v2") {
+      let content = answer.content;
+      if (answer.action === "accept" && content && typeof content === "object" && "answers" in content &&
+          content.answers && typeof content.answers === "object") {
+        content = Object.values(content.answers)[0];
+      }
+      const body = await v2Json(env, v2AgentPath(agentId) + "/inputs/" + encodeURIComponent(inputId), {
+        method: "POST",
+        body: { actor: sender.userId, approved: answer.action === "accept", answer: content, wait: false },
+      });
+      return { status: 200, body };
+    }
     const body = await runtimeApi(env, "POST", `/v1/agents/${encodeURIComponent(agentId)}/inputs/${encodeURIComponent(inputId)}`, {
       action: answer.action,
       ...(answer.content !== undefined ? { content: answer.content } : {}),
@@ -628,7 +685,7 @@ export async function answerRuntimeInput(
     });
     return { status: 200, body };
   } catch (error) {
-    if (error instanceof RuntimeApiError && [400, 403, 404, 409].includes(error.status)) {
+    if (error instanceof RuntimeApiError && [400, 403, 404, 409, 410].includes(error.status)) {
       return { status: error.status, body: { error: error.message } };
     }
     throw error;
@@ -640,8 +697,12 @@ export async function answerRuntimeInput(
  * the end), and the messages queued behind it: the runtime cancels them too,
  * each ending as run.failed with code "cancelled" (routes/agent-runtime-events.ts).
  */
-export async function abortRuntimeThread(env: ChatEnv, agentId: string): Promise<void> {
-  await runtimeApi(env, "POST", `/v1/agents/${encodeURIComponent(agentId)}/abort`);
+export async function abortRuntimeThread(env: ChatEnv, agentId: string, runtimeVersion?: "v2"): Promise<void> {
+  if (runtimeVersion === "v2") {
+    await v2Json(env, v2AgentPath(agentId) + "/abort", { method: "POST", body: {} });
+  } else {
+    await runtimeApi(env, "POST", `/v1/agents/${encodeURIComponent(agentId)}/abort`);
+  }
 }
 
 /**

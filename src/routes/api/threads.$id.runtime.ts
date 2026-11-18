@@ -4,6 +4,8 @@ import { RUNTIME_BROWSER_READS } from "@/lib/agent-runtime-shared";
 import { getEnv } from "@/lib/cloudflare.server";
 import { isSelfhostRuntime } from "@/lib/selfhost-runtime";
 import { runtimeUrl } from "../../../workers/main/src/agent-runtime/runtime-api";
+import { V2_BROWSER_SESSION } from "../../../workers/main/src/agent-runtime/runtime-v2";
+import { readV2Thread } from "../../../workers/main/src/agent-runtime/v2-thread-read";
 
 /** Request headers a read passes on: the browser token, and what the event stream resumes by. */
 const FORWARDED = ["authorization", "accept", "last-event-id"];
@@ -31,12 +33,18 @@ const PASSED_TYPES = new Set(["application/json", "text/event-stream"]);
  * stream, never a type the browser would render on chiridion's origin.
  */
 export async function loader({ request, context, params }: LoaderFunctionArgs) {
-  if (!isSelfhostRuntime(getEnv(context))) return Response.json({ error: "Not found" }, { status: 404 });
-  const { env, row } = await requireRuntimeThread(request, context, params.id, params.workspaceId);
+  const v2Session = request.headers.get("authorization") === `Bearer ${V2_BROWSER_SESSION}`;
+  if (!v2Session && !isSelfhostRuntime(getEnv(context))) return Response.json({ error: "Not found" }, { status: 404 });
+  const { env, row, sender } = await requireRuntimeThread(request, context, params.id, params.workspaceId);
   const read = params.read ?? "";
   if (!RUNTIME_BROWSER_READS.has(read) || !row.agentId || params.agentId !== row.agentId) {
     return Response.json({ error: "Not found" }, { status: 404 });
   }
+  if (v2Session) {
+    if (row.runtimeVersion !== "v2") return Response.json({ error: "Not found" }, { status: 404 });
+    return readV2Thread(env, row.agentId, sender.userId, read, request);
+  }
+  if (row.runtimeVersion === "v2") return Response.json({ error: "A v2 session is required" }, { status: 401 });
   if (!/^Bearer\s+\S+$/i.test(request.headers.get("authorization") ?? "")) {
     return Response.json({ error: "A browser token is required" }, { status: 401 });
   }

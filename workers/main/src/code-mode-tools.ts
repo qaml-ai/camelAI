@@ -3218,22 +3218,11 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
    * AGENT_RUNTIME_URL: a link at either is read through AGENT_RUNTIME_URL.
    */
   private async importFile(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const runtimeOrigin = new URL((this.env as { AGENT_RUNTIME_URL?: string }).AGENT_RUNTIME_URL || "https://agents.camelai.dev").origin;
-    const origins = HOSTED_RUNTIME_ORIGINS.includes(runtimeOrigin) ? HOSTED_RUNTIME_ORIGINS : [runtimeOrigin];
-    let source: URL | null = null;
-    try {
-      source = typeof args.source === "string" ? new URL(args.source) : null;
-    } catch {
-      source = null;
-    }
-    if (!source || !origins.includes(source.origin) || !source.pathname.startsWith("/v1/links/")) {
-      throw new Error('source must be a scratch file, passed as { "$file": "/workspace/<path>" }');
-    }
     const destination = this.normalizeMoveEndpoint(args.destination, "destination");
     if (destination.location === "r2") {
       this.resolveCodeModeR2Path(destination as unknown as Record<string, unknown>, { requireWritable: true });
     }
-    const response = await fetch(`${runtimeOrigin}${source.pathname}${source.search}`);
+    const response = await this.readRuntimeImportSource(args.source);
     if (!response.ok) {
       await response.body?.cancel();
       throw new Error(`Could not read the scratch file (HTTP ${response.status}); its link may have expired, so pass { "$file": … } again`);
@@ -3258,6 +3247,29 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         bytes: written.bytes,
       },
     };
+  }
+
+  private async readRuntimeImportSource(input: unknown): Promise<Response> {
+    if (input && typeof input === "object" && "$file" in input && typeof input.$file === "string") {
+      const { threadId, workspaceId } = this.ctx.props;
+      const { scratchVolumePath } = await import("../../../src/lib/agent-runtime-shared");
+      const path = scratchVolumePath(input.$file);
+      if (threadId && path) {
+        const [thread, row] = await Promise.all([this.orgStub.getThread(threadId), this.orgStub.getThreadRuntime(threadId)]);
+        if (thread?.workspace_id === workspaceId && row?.runtimeVersion === "v2" && row.agentId) {
+          const { fetchV2Scratch } = await import("./agent-runtime/runtime-v2");
+          return fetchV2Scratch(this.env, row.agentId, path);
+        }
+      }
+    }
+    const runtimeOrigin = new URL(this.env.AGENT_RUNTIME_URL || "https://agents.camelai.dev").origin;
+    const origins = HOSTED_RUNTIME_ORIGINS.includes(runtimeOrigin) ? HOSTED_RUNTIME_ORIGINS : [runtimeOrigin];
+    let source: URL | null = null;
+    try { source = typeof input === "string" ? new URL(input) : null; } catch { source = null; }
+    if (!source || !origins.includes(source.origin) || !source.pathname.startsWith("/v1/links/")) {
+      throw new Error('source must be a scratch file, passed as { "$file": "/workspace/<path>" }');
+    }
+    return fetch(`${runtimeOrigin}${source.pathname}${source.search}`);
   }
 
   private async getAppUrl(script: WorkerScript): Promise<string> {

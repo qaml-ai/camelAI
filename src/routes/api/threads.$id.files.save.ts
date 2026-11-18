@@ -32,7 +32,8 @@ export async function action({ request, context, params }: ActionFunctionArgs) {
   const shown = typeof body?.path === "string" ? body.path : "";
   const volumePath = scratchVolumePath(shown);
   if (!volumePath) return Response.json({ error: "Not a scratch file" }, { status: 400 });
-  const volumeId = await threadScratchVolume(env, threadContext, row);
+  const isV2 = row.runtimeVersion === "v2";
+  const volumeId = isV2 ? row.agentId : await threadScratchVolume(env, threadContext, row);
   if (!volumeId) return Response.json({ error: "File not found" }, { status: 404 });
   const name = volumePath.split("/").pop() ?? "file";
   const destination = { location: "r2" as const, path: `outputs/${name}` };
@@ -48,7 +49,7 @@ export async function action({ request, context, params }: ActionFunctionArgs) {
     },
   });
   const saved = await tools.callToolEnvelope("import_file", {
-    source: await scratchFileLink(env, volumeId, volumePath),
+    source: isV2 ? { $file: shown } : await scratchFileLink(env, volumeId, volumePath),
     destination,
   });
   if (!saved.ok) return Response.json({ error: saved.error.message }, { status: 502 });

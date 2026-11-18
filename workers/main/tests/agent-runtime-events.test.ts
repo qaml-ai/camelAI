@@ -43,7 +43,7 @@ const email = () => `rt-evt-${Date.now()}-${Math.random().toString(36).slice(2)}
 
 async function setup(options: { source?: "channel" | "scheduled"; v2?: boolean } = {}) {
   const { userId } = await createUser(testEnv, email(), "password123", "Evt User");
-  const { org, defaultWorkspaceId } = await createOrg(testEnv, "Evt Org", userId);
+  const { org, defaultWorkspaceId } = await createOrg(testEnv, "Evt Org", userId, options.v2 ? { billingPlan: "starter" } : {});
   const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
   const thread = await orgStub.createThread(
     defaultWorkspaceId as string,

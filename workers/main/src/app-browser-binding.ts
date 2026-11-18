@@ -650,6 +650,7 @@ export async function launchAppBrowserSession(
   env: AppBrowserBindingEnv,
   context: AppBrowserBindingProps,
   input: AppBrowserLaunchInput,
+  options: { reconnectable?: boolean } = {},
 ): Promise<AppBrowserSession> {
   const scriptName = input.scriptName?.trim();
   if (!scriptName) {
@@ -705,7 +706,9 @@ export async function launchAppBrowserSession(
     assertWorkspaceBrowserSessionCapacity(workspaceSessionCount);
   }
 
-  const browser = await puppeteer.launch(env.BROWSER);
+  const browser = await puppeteer.launch(env.BROWSER, options.reconnectable
+    ? { keep_alive: BROWSER_SESSION_MAX_LIFETIME_MS }
+    : undefined);
   const browserSessionId =
     typeof browser.sessionId === 'function' ? browser.sessionId() : null;
   try {
@@ -747,6 +750,7 @@ export async function launchAppBrowserSession(
       await orgStub
         .recordBrowserSession(context.workspaceId, browserSessionId)
         .catch((error) => {
+          if (options.reconnectable) throw error;
           console.warn('[app-browser] failed to record browser session', {
             ...logContext,
             error: truncateError(error),
@@ -788,6 +792,9 @@ export async function connectAppBrowserSession(
   if (!script.is_public && !env.DISPATCHER) {
     throw new Error('Browser sessions for private apps require the DISPATCHER binding');
   }
+  if (!await orgStub.hasBrowserSession(context.workspaceId, sessionId)) {
+    throw new Error('Browser session is unavailable in this workspace. Launch a new browser.');
+  }
 
   const baseUrl = new URL(await buildWorkspaceAppUrl(env, context, scriptName, '/'));
   const logContext = {
@@ -797,7 +804,19 @@ export async function connectAppBrowserSession(
     browserSessionId: sessionId,
   };
   const { default: puppeteer } = await import('@cloudflare/puppeteer');
-  const browser = await puppeteer.connect(env.BROWSER, sessionId);
+  let browser: Browser;
+  try {
+    browser = await puppeteer.connect(env.BROWSER, sessionId);
+  } catch (cause) {
+    const ended = await puppeteer.history(env.BROWSER)
+      .then((sessions) => sessions.find((session) => session.sessionId === sessionId && session.endTime), () => undefined);
+    if (ended) {
+      await orgStub.removeBrowserSession(sessionId);
+      const reason = ended.closeReasonText ? ` (${ended.closeReasonText})` : '';
+      throw new Error(`Browser session ended${reason}. Launch a new browser to continue.`, { cause });
+    }
+    throw new Error('Could not reconnect to the browser session. Retry the action on this session.', { cause });
+  }
   try {
     const hostIndex = await buildWorkspaceAppHostIndex(env, context);
     const pages = await browser.pages();

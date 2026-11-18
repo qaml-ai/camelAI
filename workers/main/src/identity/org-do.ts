@@ -6130,6 +6130,14 @@ export class OrgDO extends DurableObject<DOEnv> {
     );
   }
 
+  hasBrowserSession(workspaceId: string, sessionId: string): boolean {
+    return this.sql.exec(
+      "SELECT 1 FROM workspace_browser_sessions WHERE session_id = ? AND workspace_id = ?",
+      sessionId,
+      workspaceId,
+    ).toArray().length > 0;
+  }
+
   /** Drop a browser session from the registry (best-effort, on session close). */
   async removeBrowserSession(sessionId: string): Promise<void> {
     if (!sessionId) return;

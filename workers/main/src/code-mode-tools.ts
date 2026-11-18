@@ -4683,7 +4683,7 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const session = await launchAppBrowserSession(this.env, {
       orgId: this.ctx.props.orgId,
       workspaceId: this.ctx.props.workspaceId,
-    }, this.browserLaunchInput(args));
+    }, this.browserLaunchInput(args), { reconnectable: true });
     try {
       const sessionId = session.sessionId();
       if (!sessionId) {

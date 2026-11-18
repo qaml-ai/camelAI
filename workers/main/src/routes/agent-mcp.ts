@@ -20,6 +20,7 @@ import { getOrgStub } from "../helpers/stubs.js";
 import { recordWorkspaceThreadStreaming } from "../thread-status.js";
 
 const DEFAULT_RUNTIME = "https://agents.camelai.dev";
+const V2_RUNTIME = "https://run.camelai.com/v2";
 
 /**
  * CodeModeToolsBinding tools the runtime does NOT get (none now: the old
@@ -59,6 +60,7 @@ export type ToolsFactory = (props: CodeModeToolsProps) => ToolsBinding;
 export interface AgentMcpOptions {
   /** Where the runtime's keys are fetched from; tests pass `testRuntime().fetch`. */
   fetch?: typeof globalThis.fetch;
+  version?: "v2";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -82,8 +84,12 @@ function toolError(message: string): CallToolResult {
 export async function authorizeRuntimeIdentity(
   env: Env,
   identity: RuntimeIdentity,
+  version?: "v2",
 ): Promise<CodeModeToolsProps | { error: string }> {
-  const expectedTenant = env.AGENT_RUNTIME_TENANT?.trim();
+  const expectedTenant = (version === "v2" ? env.AGENT_RUNTIME_V2_TENANT : env.AGENT_RUNTIME_TENANT)?.trim();
+  if (version === "v2" && (!expectedTenant || !identity.actor)) {
+    return { error: "Forbidden: the v2 call has no configured tenant or signed sender" };
+  }
   if (expectedTenant && identity.tenant !== expectedTenant) {
     return { error: "Forbidden: the agent belongs to another runtime tenant" };
   }
@@ -97,6 +103,9 @@ export async function authorizeRuntimeIdentity(
   const access = await getOrgStub(env, orgId).validateChatWebSocketAccess(userId, workspaceId, threadId);
   if (!access.ok) return { error: `Forbidden (${access.reason})` };
   if (access.orgId !== orgId) return { error: "Forbidden (org_mismatch)" };
+  if (version === "v2" && (!identity.agent || access.runtime?.agentId !== identity.agent)) {
+    return { error: "Forbidden (agent_mismatch)" };
+  }
   return {
     orgId,
     workspaceId,
@@ -202,14 +211,14 @@ function runningHeartbeat(env: Env, workspaceId: string, threadId: string | unde
   return () => clearInterval(timer);
 }
 
-export function agentToolServer(env: Env, tools: ToolsFactory): ToolServer {
+export function agentToolServer(env: Env, tools: ToolsFactory, version?: "v2"): ToolServer {
   return {
     listTools: agentMcpTools,
     async callTool(name, args, context) {
       if (!AGENT_MCP_TOOL_NAMES.has(name)) throw new Error(`Unknown tool: ${name}`);
       // serveTools always verifies a token and sets the identity.
       if (!context.identity) return toolError("Forbidden: no runtime identity");
-      const props = await authorizeRuntimeIdentity(env, context.identity);
+      const props = await authorizeRuntimeIdentity(env, context.identity, version);
       if ("error" in props) return toolError(props.error);
       // The model's tool call (the js_exec call, for calls from code): the
       // binding streams build progress and records artifacts under it, into
@@ -276,14 +285,16 @@ async function connectionSetupFallback(
 
 export function agentMcpHandler(env: Env, tools: ToolsFactory, options: AgentMcpOptions = {}) {
   // The SDK refuses tokens of other tenants' agents, and so needs ours.
-  const tenant = env.AGENT_RUNTIME_TENANT?.trim();
+  const v2 = options.version === "v2";
+  const tenant = (v2 ? env.AGENT_RUNTIME_V2_TENANT : env.AGENT_RUNTIME_TENANT)?.trim();
   if (!tenant) {
     return async (_req: Request) => Response.json({ error: "The agent runtime is not configured" }, { status: 503 });
   }
-  const serve = serveTools(observedToolServer(env, agentToolServer(env, tools)), {
+  const audience = v2 ? undefined : env.AGENT_RUNTIME_MCP_AUDIENCE;
+  const serve = serveTools(observedToolServer(env, agentToolServer(env, tools, options.version)), {
     tenant,
-    runtime: env.AGENT_RUNTIME_URL || DEFAULT_RUNTIME,
-    ...(env.AGENT_RUNTIME_MCP_AUDIENCE ? { audience: env.AGENT_RUNTIME_MCP_AUDIENCE } : {}),
+    runtime: v2 ? V2_RUNTIME : env.AGENT_RUNTIME_URL || DEFAULT_RUNTIME,
+    ...(audience ? { audience } : {}),
     ...(options.fetch ? { fetch: options.fetch } : {}),
     metadata: false,
     serverInfo: { name: "camelai", version: "1.0.0" },
@@ -348,9 +359,9 @@ export function observedToolServer(env: Env, server: ToolServer): ToolServer {
   };
 }
 
-export async function handleAgentMcp({ req, env, ctx }: RouteContext): Promise<Response> {
+export async function handleAgentMcp({ req, env, ctx }: RouteContext, version?: "v2"): Promise<Response> {
   const exports = (ctx as unknown as {
     exports: { CodeModeToolsBinding(init: { props: CodeModeToolsProps }): ToolsBinding };
   }).exports;
-  return agentMcpHandler(env, (props) => exports.CodeModeToolsBinding({ props }))(req);
+  return agentMcpHandler(env, (props) => exports.CodeModeToolsBinding({ props }), { version })(req);
 }

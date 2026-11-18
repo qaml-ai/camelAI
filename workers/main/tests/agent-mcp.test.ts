@@ -93,6 +93,51 @@ describe("agent MCP", () => {
     }
   });
 
+  it("scopes v2 tool calls to the signed sender and the thread's current agent", async () => {
+    const runtime = await testRuntime({ url: "https://run.camelai.com/v2" });
+    const url = `${MCP_URL}/v2`;
+    const identity: TestIdentity = { ...ALICE, tenant: "chiridion-v2", agent: "agt_v2", actor: "user2" };
+    const validate = vi.fn(async (user: string, workspaceId: string, threadId: string) => ({
+      ...allowed(user, workspaceId, threadId),
+      runtime: { agentId: "agt_v2" },
+    }));
+    const env = {
+      AGENT_RUNTIME_URL: rt.url,
+      AGENT_RUNTIME_TENANT: "chiridion",
+      AGENT_RUNTIME_V2_TENANT: "chiridion-v2",
+      ORG: { idFromName: (name: string) => name, get: () => ({ validateChatWebSocketAccess: validate }) },
+      WORKSPACE: { idFromName: (name: string) => name, get: () => ({ recordThreadStreaming: async () => {} }) },
+    } as unknown as Env;
+    const callToolEnvelope = vi.fn(async () => ({ ok: true as const, data: { projects: ["a"] } }));
+    const tools: ToolsFactory = () => ({ callToolEnvelope, describeDestructiveConfirmation: async () => null });
+    const options = { version: "v2", fetch: runtime.fetch } as const;
+    const handler = agentMcpHandler(env, tools, options);
+    const list = { jsonrpc: "2.0", id: 1, method: "tools/list" };
+
+    const disabled = agentMcpHandler({ ...env, AGENT_RUNTIME_V2_TENANT: undefined }, tools, options);
+    expect((await disabled(await runtime.request(url, list, identity))).status).toBe(503);
+    expect((await handler(await runtime.request(url, list, { ...identity, actor: undefined }))).status).toBe(200);
+    expect((await handler(await runtime.request(url, list, { ...identity, tenant: "chiridion" }))).status).toBe(401);
+    const wrongAudience = await runtime.request(url, list, identity);
+    wrongAudience.headers.set("Authorization", `Bearer ${await runtime.token(identity, MCP_URL)}`);
+    expect((await handler(wrongAudience)).status).toBe(401);
+    const v1Issuer = await runtime.token(identity, url, { claims: { iss: "https://agents.camelai.dev" } });
+    const wrongIssuer = await runtime.request(url, list, identity);
+    wrongIssuer.headers.set("Authorization", `Bearer ${v1Issuer}`);
+    expect((await handler(wrongIssuer)).status).toBe(401);
+
+    expect(await runtime.callTool(handler, url, "list_projects", {}, { ...identity, actor: undefined }))
+      .toMatchObject({ isError: true });
+    expect(validate).not.toHaveBeenCalled();
+    expect(await runtime.callTool(handler, url, "list_projects", {}, { ...identity, agent: "agt_other" }))
+      .toMatchObject({ isError: true, content: [{ text: "Forbidden (agent_mismatch)" }] });
+    expect(callToolEnvelope).not.toHaveBeenCalled();
+    expect(await runtime.callTool(handler, url, "list_projects", {}, identity))
+      .toMatchObject({ structuredContent: { projects: ["a"] } });
+    expect(validate).toHaveBeenLastCalledWith("user2", "ws1", "thread1");
+    expect(callToolEnvelope).toHaveBeenCalledOnce();
+  });
+
   it("lists the served tools with JSON schemas", async () => {
     const { handler } = setup();
     const response = await handler(await rt.request(MCP_URL, { jsonrpc: "2.0", id: 1, method: "tools/list" }, ALICE));

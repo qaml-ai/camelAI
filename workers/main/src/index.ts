@@ -213,6 +213,7 @@ const routes: Route[] = [
 
   // MCP tools for the hosted agent runtime (runtime identity-token auth)
   { method: 'ALL', path: /^\/mcp\/agent$/, handler: handleAgentMcp },
+  { method: 'ALL', path: /^\/mcp\/agent\/v2$/, handler: (context) => handleAgentMcp(context, 'v2') },
   // The runtime's Codex calls: the one model route chiridion still forwards (same token)
   { method: 'POST', path: /^\/agent-runtime\/llm\/openai-codex\/.+$/, handler: handleAgentRuntimeLlm },
   // The runtime's webhook events: runs, inputs and usage (Standard Webhooks signature)

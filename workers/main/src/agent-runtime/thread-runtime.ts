@@ -537,6 +537,10 @@ async function sendRuntimeTurn(
     if (error instanceof RuntimeApiError && error.status === 429) {
       return { status: "busy", error: "The agent has too many messages queued; try again when it finishes." };
     }
+    if ((input.source === "discord" || input.source === "telegram") &&
+        error instanceof RuntimeApiError && error.code === "AGENT_V2_CUTOVER") {
+      return { status: "busy", error: "The agent is moving to the new runtime. Retry with the same message ID." };
+    }
     throw error;
   }
   // A retry of a request that already finished starts no run, whose events

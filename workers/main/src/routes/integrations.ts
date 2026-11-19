@@ -1709,6 +1709,7 @@ async function processTelegramMessage(
       userName: telegramSenderName(message),
       userEmail: null,
       message: userMessage,
+      clientMessageId: `telegram:${remoteMessageId}`,
     });
 
     if (enqueueResult.status !== "accepted") {

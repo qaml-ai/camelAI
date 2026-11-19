@@ -177,7 +177,7 @@ describe('handleTelegramWebhook', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it('enqueues connected Telegram text messages as channel messages', async () => {
+  it('retries a connected Telegram text message with the same id while the thread switches runtimes', async () => {
     const binding: TelegramChatBinding = {
       workspaceId: 'ws-1',
       orgId: 'org-1',
@@ -187,9 +187,10 @@ describe('handleTelegramWebhook', () => {
       'channel_thread:telegram:ws-1:telegram-int:12345': 'thread-1',
     }) as KVNamespace & { _store: Map<string, string> };
     const registry = createTelegramRegistryStub({ binding });
-    const startInitialUserMessage = vi.fn(async () => ({ status: 'accepted' }));
+    const startInitialUserMessage = vi.fn(async () => ({ status: 'accepted' }))
+      .mockResolvedValueOnce({ status: 'busy' });
 
-    const response = await handleTelegramWebhook({
+    const send = () => handleTelegramWebhook({
       req: telegramRequest({
         update_id: 2,
         message: {
@@ -227,7 +228,11 @@ describe('handleTelegramWebhook', () => {
       match: [] as unknown as RegExpMatchArray,
     });
 
-    expect(response.status).toBe(200);
+    await expect(send()).rejects.toThrow('Channel Telegram message was not accepted (busy)');
+    expect(kv._store.has('channel_event:telegram:ws-1:12345:101')).toBe(false);
+    expect((await send()).status).toBe(200);
+    expect((await send()).status).toBe(200);
+    expect(startInitialUserMessage).toHaveBeenCalledTimes(2);
     expect(startInitialUserMessage).toHaveBeenCalledWith({
       threadId: 'thread-1',
       workspaceId: 'ws-1',
@@ -236,6 +241,7 @@ describe('handleTelegramWebhook', () => {
       userEmail: null,
       messageSource: 'telegram',
       message: expect.stringContaining('send_telegram_message'),
+      clientMessageId: 'telegram:12345:101',
     });
     expect(startInitialUserMessage.mock.calls[0][0].message).toContain('hello from Telegram');
     expect(kv._store.get('channel_event:telegram:ws-1:12345:101')).toBe('done');

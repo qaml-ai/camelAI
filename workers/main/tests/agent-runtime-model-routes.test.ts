@@ -25,13 +25,22 @@ const GATEWAY = "https://gateway.ai.cloudflare.com/v1/acct/gw";
 const org = { orgId: "org1" };
 
 describe("v2WorkspaceEnabled", () => {
-  it("requires a selected workspace in production", () => {
+  it("accepts explicitly selected production workspaces", () => {
     const production = { WORKER_BASE_URL: "https://camelai.dev", AGENT_RUNTIME_V2_WORKSPACE: "ws1" };
     expect(v2WorkspaceEnabled(production, "ws1")).toBe(true);
     expect(v2WorkspaceEnabled(production, "ws2")).toBe(false);
     expect(v2WorkspaceEnabled(production, undefined)).toBe(false);
     expect(v2WorkspaceEnabled({ ...production, AGENT_RUNTIME_V2_WORKSPACE: "*" }, "ws1")).toBe(false);
     expect(v2WorkspaceEnabled({}, undefined)).toBe(false);
+    expect(v2WorkspaceEnabled({ ...production, AGENT_RUNTIME_V2_WORKSPACE: "ws1, ws3" }, "ws3")).toBe(true);
+    expect(v2WorkspaceEnabled({ ...production, AGENT_RUNTIME_V2_WORKSPACE: "ws1, ws3" }, "ws2")).toBe(false);
+  });
+
+  it("includes every identified production workspace when explicitly enabled", () => {
+    const production = { WORKER_BASE_URL: "https://camelai.dev", AGENT_RUNTIME_V2_WORKSPACE: "all" };
+    expect(v2WorkspaceEnabled(production, "ws1")).toBe(true);
+    expect(v2WorkspaceEnabled(production, "ws2")).toBe(true);
+    expect(v2WorkspaceEnabled(production, undefined)).toBe(false);
   });
 
   it("accepts the staging wildcard for legacy exports with no saved workspace", () => {

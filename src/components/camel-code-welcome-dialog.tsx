@@ -36,7 +36,7 @@ export function CamelCodeWelcomeDialog({
             </DialogTitle>
             <DialogDescription className="mx-auto max-w-[44ch] text-pretty text-sm/relaxed">
               <span className="block">
-                Test out camelAI with our self-hosted model, camelCode.
+                Test out camelAI with camelCode, our free coding model. New chats use GPT-6.2 Sol.
                 It&apos;s shared with other free users, so{" "}
                 <span className="font-medium text-foreground">
                   replies can slow down at busy times.

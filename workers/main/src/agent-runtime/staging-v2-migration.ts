@@ -181,7 +181,7 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
     const context: ChatContextState = {
       orgId, threadId, workspaceId: thread.workspace_id, userId: thread.created_by || null, userName: null, userEmail: null,
     };
-    const resolved = await resolveThreadRuntimeRoute(env, context, { persistFallback: false, allowFallback: false })
+    const resolved = await resolveThreadRuntimeRoute(env, context, { persistFallback: false, allowFallback: false, configuredModel: row.model })
       .catch((error: unknown) => {
         if (error instanceof RuntimeRunRefused) return null;
         throw error;

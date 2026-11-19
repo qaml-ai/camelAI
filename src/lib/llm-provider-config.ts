@@ -13,6 +13,7 @@ export const DEFAULT_OPENROUTER_MODEL: LlmModel = "gpt-6-luna";
 /** The default for keys that cannot run Luna (Anthropic, Claude-only Bedrock). */
 export const DEFAULT_ANTHROPIC_MODEL: LlmModel = "sonnet";
 export const CUSTOM_LLM_MODEL: LlmModel = "custom";
+export const CAMEL_CODE_MODEL_DESCRIPTION = "Free coding model. New chats use GPT-6.2 Sol.";
 export const THREAD_MODEL_LOCK_MESSAGE =
   "This thread is locked to its original model. Start a new thread to use a different model.";
 
@@ -137,7 +138,7 @@ export const OPENAI_COMPATIBLE_LLM_MODEL_OPTIONS: ReadonlyArray<{
   {
     value: "deepseek-v4-auto",
     label: "camelCode",
-    description: "camelAI hosted model with automatic routing",
+    description: CAMEL_CODE_MODEL_DESCRIPTION,
   },
   {
     value: "deepseek-v4.1-flash",

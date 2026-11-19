@@ -254,7 +254,7 @@ describe('ModelPicker metadata card state', () => {
 
     fireEvent.focus(getModelItem('camelCode'));
     expect(screen.getByRole('tooltip')).toHaveTextContent(
-      'Free and always included',
+      'Free coding model. New chats use GPT-6.2 Sol. Always included.',
     );
     fireEvent.focus(getModelItem('GPT-6.1 Sol'));
     expect(screen.getByRole('tooltip')).toHaveTextContent(

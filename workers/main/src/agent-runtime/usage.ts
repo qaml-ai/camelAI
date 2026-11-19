@@ -13,6 +13,7 @@ import type { Env } from "../types.js";
 import {
   CAMEL_CODE_RUNTIME_MODEL,
   FREE_TIER_RUNTIME_MODEL,
+  PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL,
   PREVIOUS_CAMEL_CODE_RUNTIME_MODEL,
   RUNTIME_MODEL_ENDPOINT,
 } from "./model-routes.js";
@@ -73,10 +74,13 @@ export function usageRowFor(eventId: string, data: RuntimeUsageRecorded, org: { 
   // scope model providers (`bedrock-openai-<region>`) included.
   if (provider === "amazon-bedrock" || provider.startsWith("bedrock-openai-")) provider = "bedrock";
   const runtimeModel = `${provider}/${model}`.replace(/:nitro$/, "");
-  // camelCode is free, on its current model and on its previous one: the runtime's fallback when Azure's
-  // content filter blocks a response, and runs in flight at the switch.
-  const freeTier = [FREE_TIER_RUNTIME_MODEL, CAMEL_CODE_RUNTIME_MODEL, PREVIOUS_CAMEL_CODE_RUNTIME_MODEL]
-    .some((free) => runtimeModel === free.replace(/:nitro$/, ""));
+  // Delayed usage from earlier camelCode models also stays credit-free.
+  const freeTier = [
+    FREE_TIER_RUNTIME_MODEL,
+    CAMEL_CODE_RUNTIME_MODEL,
+    PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL,
+    PREVIOUS_CAMEL_CODE_RUNTIME_MODEL,
+  ].some((free) => runtimeModel === free.replace(/:nitro$/, ""));
   const context = data.context ?? {};
   return {
     workspace_id: text(context.workspace),

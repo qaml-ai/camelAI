@@ -45,12 +45,13 @@ export async function forkRuntimeThread(
   };
   // The fork runs its source's model on its key scope, as the runtime copies
   // them, recorded on its row; a hosted fork's model headers name its own thread.
+  const thinkingLevel = source.configured?.thinkingLevel;
   const agentModel: RuntimeAgentModel | null = source.model
     ? {
       model: source.model,
       keyScope: source.keyScope ?? null,
       modelHeaders: source.keyScope === HOSTED_KEY_SCOPE ? hostedModelHeaders(target) : null,
-      thinkingLevel: source.configured?.thinkingLevel === "high" ? "high" : "medium",
+      thinkingLevel: thinkingLevel === "low" || thinkingLevel === "high" ? thinkingLevel : "medium",
     }
     : null;
   let agentId: string | null = null;

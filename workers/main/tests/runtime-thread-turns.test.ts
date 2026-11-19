@@ -13,7 +13,7 @@ import { buildWorkspaceScopedR2Key } from "../../../src/lib/workspace-r2-paths";
 import type { ChatEnv } from "../src/chat-thread/types";
 import { RUNTIME_PROMPT_VERSION } from "../src/agent-runtime/runtime-prompt";
 import { CAMEL_CODE_LLM_MODEL } from "../../../src/lib/llm-provider-config";
-import { CAMEL_CODE_RUNTIME_MODEL, PREVIOUS_CAMEL_CODE_RUNTIME_MODEL } from "../src/agent-runtime/model-routes";
+import { CAMEL_CODE_RUNTIME_MODEL, PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL } from "../src/agent-runtime/model-routes";
 import {
   abortRuntimeThread,
   answerRuntimeInput,
@@ -39,12 +39,12 @@ const runtimeEnv = {
 
 type Call = { method: string; path: string; body: any; raw?: string; headers: Headers };
 
-function fakeRuntime(responses: Record<string, (call: Call) => Response | Promise<Response>> = {}) {
+function fakeRuntime(responses: Record<string, (call: Call) => Response | Promise<Response>> = {}, origin = RUNTIME) {
   const calls: Call[] = [];
   const original = globalThis.fetch;
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
-    if (url.origin !== RUNTIME) return original(input, init);
+    if (url.origin !== origin) return original(input, init);
     const headers = new Headers(init?.headers);
     const json = (headers.get("content-type") ?? "").includes("json");
     const raw = init?.body !== undefined && init?.body !== null && !json ? await new Response(init.body as BodyInit).text() : undefined;
@@ -247,26 +247,63 @@ describe("startRuntimeTurn", () => {
     let calls = fakeRuntime();
     expect(await sendWith(fresh, "first", "cm_cc1")).toMatchObject({ status: "accepted" });
     const create = calls.find((call) => call.method === "POST" && call.path === "/v1/agents")!;
-    expect(create.body).toMatchObject({ model: CAMEL_CODE_RUNTIME_MODEL, keyScope: "hosted", runLimits: { contextTokens: 262_144 } });
+    expect(create.body).toMatchObject({ model: CAMEL_CODE_RUNTIME_MODEL, keyScope: "hosted", thinkingLevel: "low", runLimits: { contextTokens: 262_144 } });
 
-    // An existing camelCode thread (its agent on the previous model) gets the cap with the new model.
+    // An existing camelCode thread keeps its previous model and cap.
     const existing = await runtimeThread();
     await existing.orgStub.updateThreadModel(existing.threadId, CAMEL_CODE_LLM_MODEL);
     await existing.orgStub.setThreadRuntimeAgent(existing.threadId, {
-      agentId: "agt_1", model: PREVIOUS_CAMEL_CODE_RUNTIME_MODEL, keyScope: "hosted", configured: { promptVersion: RUNTIME_PROMPT_VERSION },
+      agentId: "agt_1", model: PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL, keyScope: "hosted", configured: { promptVersion: RUNTIME_PROMPT_VERSION },
     });
     calls = fakeRuntime();
     expect(await sendWith(existing, "again", "cm_cc2")).toMatchObject({ status: "accepted" });
-    let configure = calls.find((call) => call.path === "/v1/agents/agt_1/configuration")!;
-    expect(configure.body).toMatchObject({ model: CAMEL_CODE_RUNTIME_MODEL, runLimits: { contextTokens: 262_144 } });
+    expect(calls.some((call) => call.path.endsWith("/configuration"))).toBe(false);
+    expect(await existing.orgStub.getThreadRuntime(existing.threadId)).toMatchObject({ model: PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL });
 
     // Switched to another model, the cap goes.
     await existing.orgStub.updateThreadModel(existing.threadId, "opus");
     calls = fakeRuntime();
     expect(await sendWith(existing, "on opus", "cm_cc3")).toMatchObject({ status: "accepted" });
-    configure = calls.find((call) => call.path === "/v1/agents/agt_1/configuration")!;
+    const configure = calls.find((call) => call.path === "/v1/agents/agt_1/configuration")!;
     expect(configure.body.model).not.toBe(CAMEL_CODE_RUNTIME_MODEL);
     expect(configure.body).toHaveProperty("runLimits", null);
+  });
+
+  it.each([false, true])("uses Sol for a new v2 camelCode agent and keeps the existing one (configured: %s)", async (configured) => {
+    const setup = await runtimeThread();
+    const { orgStub, context, sender } = setup;
+    const thread = await orgStub.createThread(context.workspaceId, "V2 camelCode", sender.userId);
+    await orgStub.updateThreadModel(thread.id, CAMEL_CODE_LLM_MODEL);
+    await orgStub.pinThreadRuntime(thread.id, null, "v2");
+    if (configured) {
+      await orgStub.setThreadRuntimeAgent(thread.id, {
+        agentId: "agt_1", model: PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL, keyScope: "hosted",
+        configured: { promptVersion: RUNTIME_PROMPT_VERSION, thinkingLevel: "high" },
+      });
+    }
+    const hostedEnv = {
+      ...runtimeEnv, CF_ACCOUNT_ID: "acct", CF_GATEWAY_NAME: "gw", AI_GATEWAY_AUTH_TOKEN: "gw-token",
+      WORKER_BASE_URL: "https://camelai.dev", AGENT_RUNTIME_V2_TENANT: "test-v2", AGENT_RUNTIME_V2_API_TOKEN: "test-key",
+      AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET: "test-secret",
+      AGENT_RUNTIME_V2_MODELS: `${CAMEL_CODE_RUNTIME_MODEL},${PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL}`,
+    };
+    const agentPath = `/v2/agents/chiridion-thread-${thread.id}`;
+    const calls = fakeRuntime({
+      [`PUT ${agentPath}`]: () => Response.json({ id: "agt_1" }),
+      "POST /v2/agents/agt_1/runs": () => Response.json({ id: "run_1", status: "queued" }),
+    }, "https://run.camelai.com");
+    const row = (await orgStub.getThreadRuntime(thread.id))!;
+    const result = await startRuntimeTurn(hostedEnv, {
+      context: { ...context, threadId: thread.id }, row, sender, text: "hello", clientMessageId: "cm_1", waitUntil: () => {},
+    });
+    expect(result).toMatchObject({ status: "accepted", agentId: "agt_1" });
+    expect(calls.map((call) => `${call.method} ${call.path}`)).toEqual(configured
+      ? ["POST /v2/agents/agt_1/runs"]
+      : [`PUT ${agentPath}`, "POST /v2/agents/agt_1/runs"]);
+    if (!configured) expect(calls[0].body).toMatchObject({ model: CAMEL_CODE_RUNTIME_MODEL });
+    expect(await orgStub.getThreadRuntime(thread.id)).toMatchObject({
+      agentId: "agt_1", model: configured ? PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL : CAMEL_CODE_RUNTIME_MODEL,
+    });
   });
 
   it("leaves run limits alone when neither model is camelCode", async () => {

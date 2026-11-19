@@ -62,6 +62,13 @@ describe("calculateUsageCostUsd", () => {
       cacheReadInputTokens: 1_000_000, cacheCreationInputTokens: 0 })).toBeCloseTo(1.506);
   });
 
+  it.each(["azure/gpt-6.2-sol", "gpt-6.2-sol"])("prices Azure Sol usage as %s", (model) => {
+    const usage = { model, outputTokens: 100, cacheReadInputTokens: 100, cacheCreationInputTokens: 100 };
+    expect(lookupPricingOrNull(model)).toMatchObject({ inputPerToken: 0.000002, outputPerToken: 0.00001 });
+    expect(calculateUsageCostUsd({ ...usage, inputTokens: 100 })).toBeCloseTo(0.00146, 8);
+    expect(calculateUsageCostUsd({ ...usage, inputTokens: 300_000 })).toBeCloseTo(1.20202, 8);
+  });
+
   it("keeps strict lookup separate from the legacy Sonnet fallback", () => {
     expect(lookupPricingOrNull("camel/anthropic/claude-sonnet-5:nitro")).toEqual(
       lookupPricing("claude-sonnet-5"),

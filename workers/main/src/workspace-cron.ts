@@ -204,6 +204,7 @@ export interface ReportScheduledRunOutcomeInput {
 export interface FinishScheduledRunInput {
   workspaceId: string;
   runId: string;
+  threadId?: string;
   /** The run's error when it failed; null when it completed. */
   error?: string | null;
   completedAt?: number | null;
@@ -2194,7 +2195,7 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
         input.runId,
       )
       .toArray() as unknown as AutomationRunRow[])[0];
-    if (!run) return false;
+    if (!run || (input.threadId !== undefined && input.threadId !== run.thread_id)) return false;
     const reported = run.reported_status && run.reported_summary
       ? { status: run.reported_status, summary: run.reported_summary }
       : null;

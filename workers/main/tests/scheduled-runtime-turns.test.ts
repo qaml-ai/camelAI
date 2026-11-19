@@ -7,12 +7,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 
-const { startRuntimeTurnMock, directEnabledMock, directRowMock, moveOnSendMock, runtimeApiMock } = vi.hoisted(() => ({
+const { startRuntimeTurnMock, directEnabledMock, directRowMock, moveOnSendMock, runtimeApiMock, v2JsonMock } = vi.hoisted(() => ({
   startRuntimeTurnMock: vi.fn(),
   directEnabledMock: vi.fn(() => true),
   directRowMock: vi.fn(),
   moveOnSendMock: vi.fn(),
   runtimeApiMock: vi.fn(),
+  v2JsonMock: vi.fn(),
 }));
 
 vi.mock("../src/agent-runtime/thread-runtime.js", async (importOriginal) => ({
@@ -28,6 +29,10 @@ vi.mock("../src/agent-runtime/thread-migration.js", async (importOriginal) => ({
 vi.mock("../src/agent-runtime/runtime-api.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   runtimeApi: runtimeApiMock,
+}));
+vi.mock("../src/agent-runtime/runtime-v2.js", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  v2Json: v2JsonMock,
 }));
 
 import { RUNTIME_AUTOMATION_OUTCOME_INSTRUCTION, startScheduledRuntimeTurn } from "../src/agent-runtime/scheduled-turns";
@@ -92,6 +97,34 @@ describe("startScheduledRuntimeTurn", () => {
   it("is busy while the agent is in a turn, rather than steer into it", async () => {
     runtimeApiMock.mockResolvedValue({ requests: [{ state: "running", method: "prompt" }] });
     expect(await startScheduledRuntimeTurn({} as ChatEnv, request)).toEqual({ status: "busy", error: "Thread is busy with another run" });
+    expect(startRuntimeTurnMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["queued", "running", "input_required"])("leaves the schedule alone while the v2 agent is %s", async (status) => {
+    directRowMock.mockResolvedValue({ ...ROW, runtimeVersion: "v2" });
+    v2JsonMock.mockResolvedValue({ activeRunId: null, lastRun: { status } });
+    expect(await startScheduledRuntimeTurn({} as ChatEnv, request)).toEqual({ status: "busy", error: "Thread is busy with another run" });
+    expect(v2JsonMock).toHaveBeenCalledWith(expect.anything(), `/agents/${ROW.agentId}`);
+    expect(runtimeApiMock).not.toHaveBeenCalled();
+    expect(startRuntimeTurnMock).not.toHaveBeenCalled();
+  });
+
+  it("submits the idle v2 agent's scheduled prompt with its original run id", async () => {
+    const row = { ...ROW, runtimeVersion: "v2" };
+    directRowMock.mockResolvedValue(row);
+    v2JsonMock.mockResolvedValueOnce({ activeRunId: null, lastRun: { status: "completed" } })
+      .mockResolvedValueOnce({ runs: [] });
+    expect(await startScheduledRuntimeTurn({} as ChatEnv, request)).toEqual({ status: "accepted" });
+    expect(startRuntimeTurnMock.mock.calls[0][1]).toMatchObject({ row, clientMessageId: request.runId });
+    expect(runtimeApiMock).not.toHaveBeenCalled();
+  });
+
+  it("recognizes a paused v2 run when a newer queue entry was cancelled", async () => {
+    directRowMock.mockResolvedValue({ ...ROW, runtimeVersion: "v2" });
+    v2JsonMock.mockResolvedValueOnce({ activeRunId: null, lastRun: { status: "cancelled" } })
+      .mockResolvedValueOnce({ runs: [{ status: "input_required" }] });
+    expect(await startScheduledRuntimeTurn({} as ChatEnv, request)).toEqual({ status: "busy", error: "Thread is busy with another run" });
+    expect(v2JsonMock).toHaveBeenLastCalledWith(expect.anything(), `/agents/${ROW.agentId}/inputs`);
     expect(startRuntimeTurnMock).not.toHaveBeenCalled();
   });
 });
@@ -174,7 +207,8 @@ describe("WorkspaceCronDO scheduled run outcomes for direct threads", () => {
       .toEqual({ status: "success", text: "Automation outcome recorded: success" });
     expect(await rejection(cron.reportScheduledRunOutcome({ workspaceId, threadId, status: "failed", summary: "again" })))
       .toContain("already reported");
-    expect(await cron.finishScheduledRun({ workspaceId, runId, completedAt: 5_000 })).toBe(true);
+    expect(await cron.finishScheduledRun({ workspaceId, runId, threadId: "another-thread" })).toBe(false);
+    expect(await cron.finishScheduledRun({ workspaceId, runId, threadId, completedAt: 5_000 })).toBe(true);
     expect(await latestRun(cron, workspaceId, promptId)).toMatchObject({ status: "success", message: "Digest sent", completed_at: 5_000 });
     // Finished: another end of the same run changes nothing.
     expect(await cron.finishScheduledRun({ workspaceId, runId })).toBe(false);

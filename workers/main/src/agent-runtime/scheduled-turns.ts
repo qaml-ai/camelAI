@@ -8,6 +8,7 @@
 import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import { RUNTIME_TOOL_PREFIX } from "../../../../src/lib/agent-runtime-shared.js";
 import { runtimeApi } from "./runtime-api.js";
+import { v2AgentPath, v2Json, type V2Agent, type V2Run } from "./runtime-v2.js";
 import { directRuntimeRow, moveThreadForSend, type UnmovableReason } from "./thread-migration.js";
 import { runtimeDirectThreadsEnabled, startRuntimeTurn } from "./thread-runtime.js";
 
@@ -45,7 +46,17 @@ export type ScheduledTurnResult =
   | { status: "unmovable"; reason: UnmovableReason };
 
 /** Whether the agent is in a turn, which a scheduled run must not steer into. */
-async function agentRunning(env: ChatEnv, agentId: string): Promise<boolean> {
+async function agentRunning(env: ChatEnv, agentId: string, runtimeVersion?: "v1" | "v2"): Promise<boolean> {
+  if (runtimeVersion === "v2") {
+    const path = v2AgentPath(agentId);
+    const state = await v2Json<V2Agent>(env, path);
+    if (state.activeRunId) return true;
+    if (!state.lastRun) return false;
+    if (["queued", "running", "input_required"].includes(state.lastRun.status)) return true;
+    // A newer cancelled queue entry can hide the earlier paused run in lastRun.
+    const { runs } = await v2Json<{ runs: V2Run[] }>(env, `${path}/inputs`);
+    return runs.length > 0;
+  }
   const state = await runtimeApi(env, "GET", `/v1/agents/${encodeURIComponent(agentId)}/state`) as {
     requests?: Array<{ state?: string; method?: string }>;
   } | null;
@@ -76,7 +87,7 @@ export async function startScheduledRuntimeTurn(env: ChatEnv, request: Scheduled
     row = moved.row;
   }
   if (!row) return null;
-  if (row.agentId && await agentRunning(env, row.agentId)) {
+  if (row.agentId && await agentRunning(env, row.agentId, row.runtimeVersion)) {
     return { status: "busy", error: "Thread is busy with another run" };
   }
   const pending: Promise<unknown>[] = [];

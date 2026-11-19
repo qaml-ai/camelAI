@@ -1,9 +1,11 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { parseUploadRefs } from "../../../../src/lib/chat-attachment-refs";
+import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
+import { CAMEL_CODE_LLM_MODEL } from "../../../../src/lib/llm-provider-config";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types";
 import type { Env } from "../types";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
-import { v2HostedModelMatches } from "./model-routes";
+import { CAMEL_CODE_RUNTIME_MODEL, isPreviousCamelCodeRuntimeModel, v2HostedModelMatches } from "./model-routes";
 import { resolveThreadRuntimeRoute, runtimeAgentModel, RuntimeRunRefused } from "./run-gates";
 import { runtimeApi, runtimeUrl, RuntimeApiError, v2WorkspaceEnabled } from "./runtime-api";
 import { attachV2Uploads, createV2ThreadAgent, v2AgentPath, v2Json, type V2Agent } from "./runtime-v2";
@@ -108,6 +110,26 @@ async function verifyHistory(env: ChatEnv, agentPath: string, messages: ImportMe
 
 /** The first migration source is immutable. Its old conversation ID and workspace remain the same. */
 export class StagingV2Migration extends WorkerEntrypoint<Env> {
+  async listCamelCodeModelMigrationOrgs(after: string | null, limit = 100) {
+    if (!this.env.APP_DB) throw new Error("APP_DB binding is not configured");
+    const size = Math.max(1, Math.min(Math.floor(limit) || 1, 100));
+    const { results } = await this.env.APP_DB.prepare("SELECT id FROM orgs WHERE id > ? ORDER BY id LIMIT ?")
+      .bind(after ?? "", size).all<{ id: string }>();
+    return results.map(({ id }) => id);
+  }
+
+  async listCamelCodeModelMigrationThreads(orgId: string, after: string | null, limit = 100) {
+    const org = this.env.ORG.idFromName(orgId);
+    return retryTransientDurableObjectRpc("listCamelCodeModelMigrationThreads", () =>
+      this.env.ORG.get(org).listCamelCodeModelMigrationThreads(after, limit));
+  }
+
+  async moveCamelCodeThreadToSol(orgId: string, threadId: string, apply = false) {
+    const org = this.env.ORG.idFromName(orgId);
+    return retryTransientDurableObjectRpc("moveCamelCodeThreadToSol", () =>
+      this.env.ORG.get(org).moveCamelCodeThreadToSol(threadId, apply));
+  }
+
   async moveLegacyThread(orgId: string, threadId: string, dryRun = true) {
     const env = this.env as unknown as ChatEnv;
     const org = env.ORG.get(env.ORG.idFromName(orgId));
@@ -116,6 +138,7 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
     if (!v2WorkspaceEnabled(env, thread.workspace_id)) return { status: "workspace_disabled" };
     if (existing) return { status: existing.runtimeVersion ?? "v1" };
     if (thread.source === "channel" || thread.channel_kind) return { status: "channel" };
+    if (thread.source === "scheduled" && thread.model === CAMEL_CODE_LLM_MODEL) return { status: "scheduled_handoff" };
     const context: ChatContextState = {
       orgId, threadId, workspaceId: thread.workspace_id,
       userId: thread.created_by || null, userName: null, userEmail: null,
@@ -181,7 +204,15 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
     const context: ChatContextState = {
       orgId, threadId, workspaceId: thread.workspace_id, userId: thread.created_by || null, userName: null, userEmail: null,
     };
-    const resolved = await resolveThreadRuntimeRoute(env, context, { persistFallback: false, allowFallback: false, configuredModel: row.model })
+    // The fenced handoff stages a private destination. Its model can use Sol
+    // from the start, including when v2 cannot serve the old backing model.
+    const sol = thread.model === CAMEL_CODE_LLM_MODEL && isPreviousCamelCodeRuntimeModel(row.model) &&
+      v2HostedModelMatches({ kind: "scope", keyScope: HOSTED_KEY_SCOPE, model: CAMEL_CODE_RUNTIME_MODEL }, env);
+    // Scheduled turns still consult v1 for activity and record completion from v1 webhooks.
+    if (thread.source === "scheduled" && thread.model === CAMEL_CODE_LLM_MODEL) return { status: "scheduled_handoff" };
+    const resolved = await resolveThreadRuntimeRoute(env, context, {
+      persistFallback: false, allowFallback: false, configuredModel: sol ? CAMEL_CODE_RUNTIME_MODEL : row.model,
+    })
       .catch((error: unknown) => {
         if (error instanceof RuntimeRunRefused) return null;
         throw error;

@@ -99,6 +99,26 @@ describe('OrgDO thread_runtime', () => {
     expect(await orgStub.setThreadRuntimeAgent('missing-thread', { agentId: 'x', model: null, keyScope: null })).toBeNull();
   });
 
+  it('publishes the v2 copy only from the expected v1 placement and rejects a late v1 write', async () => {
+    const { orgStub, threadId } = await freshThread();
+    const thread = (await orgStub.getThread(threadId))!;
+    const source = { agentId: 'agt_v1', model: 'model/v1', keyScope: 'hosted', configured: { scratchVolumeId: 'vol_v1' } };
+    const destination = { agentId: 'agt_v2', model: 'model/v2', keyScope: 'hosted', configured: { promptVersion: 1 } };
+    await orgStub.pinThreadRuntime(threadId, 'pending send');
+    const saved = (await orgStub.setThreadRuntimeAgent(threadId, source))!;
+    const expected = { agentId: source.agentId, workspaceId: thread.workspace_id, threadModel: thread.model ?? null, updatedAt: saved.updatedAt };
+    expect(await orgStub.publishV1ThreadInV2(threadId, expected, destination)).toBe(false);
+    await orgStub.clearThreadPendingFirstMessage(threadId);
+    expect(await orgStub.publishV1ThreadInV2(threadId, { ...expected, agentId: 'other' }, destination)).toBe(false);
+    expect(await orgStub.publishV1ThreadInV2(threadId, { ...expected, threadModel: 'other' }, destination)).toBe(false);
+    expect(await orgStub.publishV1ThreadInV2(threadId, { ...expected, updatedAt: expected.updatedAt - 1 }, destination)).toBe(false);
+    expect(await orgStub.publishV1ThreadInV2(threadId, expected, destination)).toBe(true);
+    expect(await orgStub.publishV1ThreadInV2(threadId, expected, destination)).toBe(true);
+    expect(await orgStub.publishV1ThreadInV2(threadId, expected, { ...destination, agentId: 'other' })).toBe(false);
+    expect(await orgStub.setThreadRuntimeAgent(threadId, source)).toBeNull();
+    expect(await orgStub.getThreadRuntime(threadId)).toMatchObject({ runtimeVersion: 'v2', ...destination });
+  });
+
   it('goes with its thread', async () => {
     const { orgStub, threadId, userId } = await freshThread();
     await orgStub.setThreadRuntimeAgent(threadId, { agentId: 'agt_2', model: 'm', keyScope: null });

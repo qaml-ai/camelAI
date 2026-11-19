@@ -8756,12 +8756,12 @@ export class OrgDO extends DurableObject<DOEnv> {
   /**
    * Record the thread's runtime agent and the configuration last applied to
    * it (model, key scope, and the rest as JSON). Pins the thread if it was
-   * not yet; null when the thread does not exist.
+   * not yet; null when the thread is gone or another v2 agent already owns it.
    */
   setThreadRuntimeAgent(threadId: string, update: ThreadRuntimeAgentUpdate): ThreadRuntimeRecord | null {
     if (!this.getThread(threadId)) return null;
     const now = Date.now();
-    this.sql.exec(
+    const written = this.sql.exec(
       `INSERT INTO thread_runtime (thread_id, agent_id, model, key_scope, configured_json, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(thread_id) DO UPDATE SET
@@ -8769,7 +8769,11 @@ export class OrgDO extends DurableObject<DOEnv> {
          model = excluded.model,
          key_scope = excluded.key_scope,
          configured_json = excluded.configured_json,
-         updated_at = excluded.updated_at`,
+         updated_at = excluded.updated_at
+       WHERE thread_runtime.runtime_version <> 'v2'
+          OR thread_runtime.agent_id IS NULL
+          OR thread_runtime.agent_id = excluded.agent_id
+       RETURNING thread_id`,
       threadId,
       update.agentId,
       update.model,
@@ -8778,7 +8782,7 @@ export class OrgDO extends DurableObject<DOEnv> {
       now,
       now,
     );
-    return this.getThreadRuntime(threadId);
+    return written.toArray().length === 0 ? null : this.getThreadRuntime(threadId);
   }
 
   /**
@@ -8823,6 +8827,32 @@ export class OrgDO extends DurableObject<DOEnv> {
     );
     const row = this.getThreadRuntime(threadId);
     return row ? { row, claimed: row.agentId === agentId } : null;
+  }
+
+  /** Switch a fenced v1 web thread to its verified v2 copy. */
+  publishV1ThreadInV2(
+    threadId: string,
+    expected: { agentId: string; workspaceId: string; threadModel: string | null; updatedAt: number },
+    replacement: ThreadRuntimeAgentUpdate,
+  ): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      const thread = this.getThread(threadId);
+      const runtime = this.getThreadRuntime(threadId);
+      if (runtime?.runtimeVersion === "v2") return runtime.agentId === replacement.agentId;
+      if (!thread || thread.workspace_id !== expected.workspaceId ||
+          thread.source === "channel" || thread.channel_kind ||
+          (thread.model ?? null) !== expected.threadModel ||
+          runtime?.agentId !== expected.agentId || runtime.updatedAt !== expected.updatedAt ||
+          runtime.pendingFirstMessage || runtime.keyScope !== "hosted" || replacement.keyScope !== "hosted") return false;
+
+      const updated = this.sql.exec(
+        `UPDATE thread_runtime SET runtime_version = 'v2', agent_id = ?, model = ?, key_scope = ?, configured_json = ?, updated_at = ?
+         WHERE thread_id = ? RETURNING thread_id`,
+        replacement.agentId, replacement.model, replacement.keyScope,
+        JSON.stringify(replacement.configured ?? null), Date.now(), threadId,
+      );
+      return updated.toArray().length === 1;
+    });
   }
 
   /** Publish a verified copy only while the thread still belongs to the legacy exporter. */

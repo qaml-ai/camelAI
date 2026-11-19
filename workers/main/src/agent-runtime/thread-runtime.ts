@@ -377,7 +377,7 @@ async function ensureConfiguredAgent(
     ...(scopeChanged ? { keyScope: run.keyScope, modelHeaders: run.modelHeaders } : {}),
     ...(promptChanged ? { systemPromptAppend: runtimeSystemPromptAppend(env, context) } : {}),
   }));
-  await org.setThreadRuntimeAgent(context.threadId, {
+  const saved = await org.setThreadRuntimeAgent(context.threadId, {
     agentId: id,
     model: run.model,
     keyScope: run.keyScope,
@@ -387,6 +387,7 @@ async function ensureConfiguredAgent(
       promptVersion: RUNTIME_PROMPT_VERSION,
     },
   });
+  if (!saved) throw new RuntimeApiError("The chat runtime changed. Refresh and retry the message.", 409, "runtime_changed");
   return id;
 }
 

@@ -7,16 +7,21 @@
 
 import { describe, it, expect } from 'vitest';
 import { env } from 'cloudflare:test';
+import { CAMEL_CODE_LLM_MODEL } from '../../../src/lib/llm-provider-config';
+import { CAMEL_CODE_RUNTIME_MODEL, PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL } from '../src/agent-runtime/model-routes';
 import { createUser, createOrg, type TestEnv } from './test-helpers';
 
 const testEnv = env as unknown as TestEnv;
 const testEmail = () => `rt-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`;
 
-async function freshThread() {
+async function freshThread(channel?: "discord" | "telegram") {
   const { userId } = await createUser(testEnv, testEmail(), 'password', 'Runtime User');
   const { org, defaultWorkspaceId } = await createOrg(testEnv, 'Runtime Org', userId);
   const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
-  const thread = await orgStub.createThread(defaultWorkspaceId as string, 'Runtime thread', userId);
+  const thread = await orgStub.createThread(defaultWorkspaceId as string, 'Runtime thread', userId, undefined,
+    channel ? CAMEL_CODE_LLM_MODEL : undefined, channel ? {
+      source: "channel", channelKind: channel, channelConnectionId: "connection-1", channelConversationId: "conversation-1",
+    } : undefined);
   return { orgStub, threadId: thread.id, userId };
 }
 
@@ -117,6 +122,27 @@ describe('OrgDO thread_runtime', () => {
     expect(await orgStub.publishV1ThreadInV2(threadId, expected, { ...destination, agentId: 'other' })).toBe(false);
     expect(await orgStub.setThreadRuntimeAgent(threadId, source)).toBeNull();
     expect(await orgStub.getThreadRuntime(threadId)).toMatchObject({ runtimeVersion: 'v2', ...destination });
+  });
+
+  it.each(["discord", "telegram"] as const)('publishes a fenced free %s chat only with the original channel binding', async (kind) => {
+    const { orgStub, threadId } = await freshThread(kind);
+    const thread = (await orgStub.getThread(threadId))!;
+    const source = { agentId: 'agt_v1', model: PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL, keyScope: 'hosted', configured: null };
+    const replacement = { ...source, agentId: 'agt_v2', model: CAMEL_CODE_RUNTIME_MODEL };
+    const saved = (await orgStub.setThreadRuntimeAgent(threadId, source))!;
+    const channel = { kind, connectionId: "connection-1", remoteConversationId: "conversation-1" };
+    const expected = { agentId: source.agentId, workspaceId: thread.workspace_id, threadModel: thread.model, updatedAt: saved.updatedAt };
+    expect(await orgStub.publishV1ThreadInV2(threadId, expected, replacement)).toBe(false);
+    expect(await orgStub.publishV1ThreadInV2(threadId, {
+      ...expected, channel: { ...channel, remoteConversationId: "different-conversation" },
+    }, replacement)).toBe(false);
+    expect(await orgStub.publishV1ThreadInV2(threadId, { ...expected, channel }, { ...replacement, model: "other" })).toBe(false);
+    expect(await orgStub.publishV1ThreadInV2(threadId, { ...expected, channel }, replacement)).toBe(true);
+    expect(await orgStub.getThread(threadId)).toMatchObject({
+      id: threadId, source: "channel", channel_kind: kind,
+      channel_connection_id: "connection-1", channel_conversation_id: "conversation-1",
+    });
+    expect(await orgStub.getThreadRuntime(threadId)).toMatchObject({ runtimeVersion: 'v2', ...replacement });
   });
 
   it('goes with its thread', async () => {

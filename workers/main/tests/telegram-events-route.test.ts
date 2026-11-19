@@ -236,6 +236,7 @@ describe('handleTelegramWebhook', () => {
       userEmail: null,
       messageSource: 'telegram',
       message: expect.stringContaining('send_telegram_message'),
+      clientMessageId: 'telegram:12345:101',
     });
     expect(startInitialUserMessage.mock.calls[0][0].message).toContain('hello from Telegram');
     expect(kv._store.get('channel_event:telegram:ws-1:12345:101')).toBe('done');

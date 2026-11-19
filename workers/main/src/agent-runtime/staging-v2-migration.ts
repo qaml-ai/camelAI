@@ -2,8 +2,11 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import { parseUploadRefs } from "../../../../src/lib/chat-attachment-refs";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
 import { CAMEL_CODE_LLM_MODEL } from "../../../../src/lib/llm-provider-config";
+import { getChannelThreadMapKey } from "../channels";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types";
 import type { Env } from "../types";
+import { channelHandoffBinding, type HandoffChannel } from "./channel-handoff";
+import type { OrgThread, ThreadRuntimeRecord } from "../identity/org-do";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
 import { CAMEL_CODE_RUNTIME_MODEL, isPreviousCamelCodeRuntimeModel, v2HostedModelMatches } from "./model-routes";
 import { resolveThreadRuntimeRoute, runtimeAgentModel, RuntimeRunRefused } from "./run-gates";
@@ -15,11 +18,22 @@ import { RUNTIME_PROMPT_VERSION } from "./runtime-prompt";
 type ImportBlock = { type: string; text?: string; path?: string; volume?: string; version?: number; size?: number; contentType?: string };
 type ImportMessage = { role: string; content: string | ImportBlock[] };
 type CopiedWorkspace = { volume: string; repoId: string; seq: number; head: string };
-type V1Handoff = { phase: "inspect" } | { phase: "prepare" } | {
+type V1Handoff = ({ phase: "inspect" } | { phase: "prepare" } | {
   phase: "publish";
   fencedAgentId: string;
   workspace?: CopiedWorkspace;
-};
+}) & { channel?: HandoffChannel };
+
+async function v1ThreadHandoffBinding(
+  env: ChatEnv, orgId: string, thread: OrgThread, row: ThreadRuntimeRecord, channel: HandoffChannel | undefined,
+) {
+  if (channel === undefined) return thread.source === "channel" || thread.channel_kind ? false : null;
+  if (thread.model !== CAMEL_CODE_LLM_MODEL || !isPreviousCamelCodeRuntimeModel(row.model)) return false;
+  const binding = channelHandoffBinding(thread, channel);
+  return binding && await env.APP_KV.get(getChannelThreadMapKey({
+    ...binding, orgId, workspaceId: thread.workspace_id,
+  })) === thread.id ? binding : false;
+}
 
 
 async function readV1History(env: ChatEnv, agentPath: string): Promise<ImportMessage[]> {
@@ -198,7 +212,9 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
     if (row.runtimeVersion === "v2") return { status: "v2", agentId: row.agentId };
     if (handoff.phase === "publish" && row.agentId !== handoff.fencedAgentId) return { status: "source_changed" };
     if (!v2WorkspaceEnabled(env, thread.workspace_id)) return { status: "workspace_disabled" };
-    if (thread.source === "channel" || thread.channel_kind || row.keyScope !== HOSTED_KEY_SCOPE) return { status: "ineligible" };
+    if (row.keyScope !== HOSTED_KEY_SCOPE) return { status: "ineligible" };
+    const channel = await v1ThreadHandoffBinding(env, orgId, thread, row, handoff.channel);
+    if (channel === false) return { status: "ineligible" };
     if (row.pendingFirstMessage) return { status: "pending_first_message" };
 
     const context: ChatContextState = {
@@ -218,10 +234,15 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
         throw error;
       });
     const route = resolved?.route;
-    if (!resolved || !route || !v2HostedModelMatches(route, env)) return { status: "model_unavailable" };
+    if (!resolved || !route || !v2HostedModelMatches(route, env) || (channel && !sol)) return { status: "model_unavailable" };
     const model = runtimeAgentModel(context, route, resolved.threadModel);
-    const subject = await migrationSubject(env, thread, context);
-    if (!subject) return { status: "missing_owner" };
+    const connection = channel
+      ? await env.WORKSPACE.get(env.WORKSPACE.idFromName(thread.workspace_id)).getIntegration(channel.connectionId)
+      : null;
+    const subject = channel
+      ? connection?.integration_type === channel.kind ? connection.created_by : null
+      : await migrationSubject(env, thread, context);
+    if (!subject || (channel && !await org.getMember(subject))) return { status: "missing_owner" };
 
     const sourcePath = `/v1/agents/${encodeURIComponent(row.agentId)}`;
     const [mounts, state, pending] = await Promise.all([
@@ -271,8 +292,10 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
       const volume = await runtimeApi(env, "GET", `/v1/volumes/${encodeURIComponent(workspace.volume)}`) as { seq: number };
       if (volume.seq !== workspace.seq) return { status: "source_workspace_changed" };
     }
+    if (channel && !await v1ThreadHandoffBinding(env, orgId, thread, row, handoff.channel)) return { status: "source_changed" };
     const moved = await org.publishV1ThreadInV2(threadId, {
       agentId: handoff.fencedAgentId, workspaceId: thread.workspace_id, threadModel: thread.model ?? null, updatedAt: row.updatedAt,
+      ...(channel ? { channel } : {}),
     }, {
       agentId, model: model.model, keyScope: HOSTED_KEY_SCOPE,
       configured: { thinkingLevel: model.thinkingLevel, promptVersion: RUNTIME_PROMPT_VERSION },
@@ -281,12 +304,12 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
   }
 
   /** Read only the thread's own scratch volume, with the v1 credential kept inside the app. */
-  async readV1ThreadVolume(orgId: string, threadId: string, sourceVolume: string, path: string, query: string): Promise<Response> {
+  async readV1ThreadVolume(orgId: string, threadId: string, sourceVolume: string, path: string, query: string, channel?: HandoffChannel): Promise<Response> {
     const env = this.env as unknown as ChatEnv;
     const org = env.ORG.get(env.ORG.idFromName(orgId));
     const [thread, row] = await Promise.all([org.getThread(threadId), org.getThreadRuntime(threadId)]);
     if (!thread || !row?.agentId || row.runtimeVersion || !v2WorkspaceEnabled(env, thread.workspace_id) ||
-        thread.source === "channel" || thread.channel_kind || row.keyScope !== HOSTED_KEY_SCOPE) {
+        row.keyScope !== HOSTED_KEY_SCOPE || await v1ThreadHandoffBinding(env, orgId, thread, row, channel) === false) {
       return new Response(null, { status: 404 });
     }
     const mounts = await runtimeApi(env, "GET", `/v1/agents/${encodeURIComponent(row.agentId)}/mounts`) as

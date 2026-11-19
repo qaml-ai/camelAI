@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { readOrgExportManifest, readOrgExportPage, readExportRecord, ORG_EXPORT_SETS, type OrgExportSet } from "../org-export.js";
 import { moveCamelCodeThreadToSol } from "../agent-runtime/camelcode-sol-migration";
+import { channelHandoffBinding, type ChannelHandoffBinding } from "../agent-runtime/channel-handoff";
 import { syncOrgKeyScope, type KeyScopeEnv } from "../agent-runtime/key-scopes";
 import { CAMEL_CODE_RUNTIME_MODEL, isPreviousCamelCodeRuntimeModel, PREVIOUS_CAMEL_CODE_RUNTIME_MODELS } from "../agent-runtime/model-routes";
 import { RuntimeApiError, runtimeApi, v2WorkspaceEnabled } from "../agent-runtime/runtime-api";
@@ -8908,10 +8909,10 @@ export class OrgDO extends DurableObject<DOEnv> {
     return row ? { row, claimed: row.agentId === agentId } : null;
   }
 
-  /** Switch a fenced v1 web thread to its verified v2 copy. */
+  /** Switch a fenced v1 thread to its verified v2 copy. */
   publishV1ThreadInV2(
     threadId: string,
-    expected: { agentId: string; workspaceId: string; threadModel: string | null; updatedAt: number },
+    expected: { agentId: string; workspaceId: string; threadModel: string | null; updatedAt: number; channel?: ChannelHandoffBinding },
     replacement: ThreadRuntimeAgentUpdate,
   ): boolean {
     return this.ctx.storage.transactionSync(() => {
@@ -8919,10 +8920,16 @@ export class OrgDO extends DurableObject<DOEnv> {
       const runtime = this.getThreadRuntime(threadId);
       if (runtime?.runtimeVersion === "v2") return runtime.agentId === replacement.agentId;
       if (!thread || thread.workspace_id !== expected.workspaceId ||
-          thread.source === "channel" || thread.channel_kind ||
           (thread.model ?? null) !== expected.threadModel ||
           runtime?.agentId !== expected.agentId || runtime.updatedAt !== expected.updatedAt ||
           runtime.pendingFirstMessage || runtime.keyScope !== "hosted" || replacement.keyScope !== "hosted") return false;
+      if (expected.channel) {
+        const channel = channelHandoffBinding(thread, expected.channel.kind);
+        if (!channel || channel.connectionId !== expected.channel.connectionId ||
+            channel.remoteConversationId !== expected.channel.remoteConversationId ||
+            thread.model !== CAMEL_CODE_LLM_MODEL || !isPreviousCamelCodeRuntimeModel(runtime.model) ||
+            replacement.model !== CAMEL_CODE_RUNTIME_MODEL) return false;
+      } else if (thread.source === "channel" || thread.channel_kind) return false;
 
       const updated = this.sql.exec(
         `UPDATE thread_runtime SET runtime_version = 'v2', agent_id = ?, model = ?, key_scope = ?, configured_json = ?, updated_at = ?

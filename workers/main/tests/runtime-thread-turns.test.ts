@@ -101,7 +101,7 @@ async function runtimeThread() {
   return { orgStub, context, sender: { userId, userName: "Runtime Sender", userEmail: null }, threadId: thread.id };
 }
 
-async function send(setup: Awaited<ReturnType<typeof runtimeThread>>, text: string, clientMessageId: string) {
+async function send(setup: Awaited<ReturnType<typeof runtimeThread>>, text: string, clientMessageId: string, source?: string) {
   const pending: Promise<unknown>[] = [];
   const row = (await setup.orgStub.getThreadRuntime(setup.threadId))!;
   const result = await startRuntimeTurn(runtimeEnv, {
@@ -110,6 +110,7 @@ async function send(setup: Awaited<ReturnType<typeof runtimeThread>>, text: stri
     sender: setup.sender,
     text,
     clientMessageId,
+    source,
     waitUntil: (promise) => { pending.push(promise); },
   });
   await Promise.allSettled(pending);
@@ -712,6 +713,17 @@ describe("sends while the runtime rolls its tasks", () => {
     });
     await expect(send(setup, "Hello", "cm_down")).rejects.toMatchObject({ status: 503 });
     expect(calls.filter((call) => call.path === "/v1/agents/agt_1/prompt")).toHaveLength(3);
+  });
+
+  it("lets channel delivery retry the original message when the legacy agent is fenced", async () => {
+    const setup = await runtimeThread();
+    const calls = fakeRuntime({
+      "POST /v1/agents/agt_1/prompt": () => Response.json({ error: "Between runtimes", code: "AGENT_V2_CUTOVER" }, { status: 503 }),
+    });
+    await expect(send(setup, "Hello", "telegram_123_456", "telegram")).resolves.toMatchObject({ status: "busy" });
+    const prompts = calls.filter((call) => call.path === "/v1/agents/agt_1/prompt");
+    expect(prompts).toHaveLength(3);
+    expect(prompts.every((call) => call.body.requestId === "telegram_123_456")).toBe(true);
   });
 
   it("does not retry other errors", async () => {

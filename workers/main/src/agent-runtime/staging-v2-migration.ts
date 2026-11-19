@@ -5,7 +5,7 @@ import { CAMEL_CODE_LLM_MODEL } from "../../../../src/lib/llm-provider-config";
 import { getChannelThreadMapKey } from "../channels";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types";
 import type { Env } from "../types";
-import { channelHandoffBinding, type HandoffChannel } from "./channel-handoff";
+import { channelHandoffBinding, channelHandoffOwner, type HandoffChannel } from "./channel-handoff";
 import type { OrgThread, ThreadRuntimeRecord } from "../identity/org-do";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
 import { CAMEL_CODE_RUNTIME_MODEL, isPreviousCamelCodeRuntimeModel, v2HostedModelMatches } from "./model-routes";
@@ -239,9 +239,7 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
     const connection = channel
       ? await env.WORKSPACE.get(env.WORKSPACE.idFromName(thread.workspace_id)).getIntegration(channel.connectionId)
       : null;
-    const subject = channel
-      ? connection?.integration_type === channel.kind ? connection.created_by : null
-      : await migrationSubject(env, thread, context);
+    const subject = channel ? channelHandoffOwner(channel.kind, connection) : await migrationSubject(env, thread, context);
     if (!subject || (channel && !await org.getMember(subject))) return { status: "missing_owner" };
 
     const sourcePath = `/v1/agents/${encodeURIComponent(row.agentId)}`;

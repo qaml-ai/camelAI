@@ -5,24 +5,29 @@
  * Run with: bun run test:workers
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { env } from 'cloudflare:test';
+import { testRuntime } from '@camelai/run/testing';
 import { CAMEL_CODE_LLM_MODEL } from '../../../src/lib/llm-provider-config';
 import { CAMEL_CODE_RUNTIME_MODEL, PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL } from '../src/agent-runtime/model-routes';
+import { ChannelTools } from '../src/chat-channels';
+import type { ChatEnv } from '../src/chat-thread/types';
+import { agentMcpHandler } from '../src/routes/agent-mcp';
+import type { Env } from '../src/types';
 import { createUser, createOrg, type TestEnv } from './test-helpers';
 
 const testEnv = env as unknown as TestEnv;
 const testEmail = () => `rt-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`;
 
-async function freshThread(channel?: "discord" | "telegram") {
+async function freshThread(channel?: "discord" | "telegram", conversation = "conversation-1") {
   const { userId } = await createUser(testEnv, testEmail(), 'password', 'Runtime User');
   const { org, defaultWorkspaceId } = await createOrg(testEnv, 'Runtime Org', userId);
   const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
   const thread = await orgStub.createThread(defaultWorkspaceId as string, 'Runtime thread', userId, undefined,
     channel ? CAMEL_CODE_LLM_MODEL : undefined, channel ? {
-      source: "channel", channelKind: channel, channelConnectionId: "connection-1", channelConversationId: "conversation-1",
+      source: "channel", channelKind: channel, channelConnectionId: "connection-1", channelConversationId: conversation,
     } : undefined);
-  return { orgStub, threadId: thread.id, userId };
+  return { orgStub, orgId: org.id, threadId: thread.id, userId };
 }
 
 describe('OrgDO thread_runtime', () => {
@@ -143,6 +148,75 @@ describe('OrgDO thread_runtime', () => {
       channel_connection_id: "connection-1", channel_conversation_id: "conversation-1",
     });
     expect(await orgStub.getThreadRuntime(threadId)).toMatchObject({ runtimeVersion: 'v2', ...replacement });
+  });
+
+  it.each(["discord", "telegram"] as const)("delivers a signed v2 reply to the original %s conversation after publication", async (kind) => {
+    const conversation = kind === "discord" ? "guild-1:thread-2" : "-123456";
+    const { orgStub, orgId, threadId, userId } = await freshThread(kind, conversation);
+    const thread = (await orgStub.getThread(threadId))!;
+    const source = { agentId: "agt_v1", model: PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL, keyScope: "hosted", configured: null };
+    const replacement = { ...source, agentId: "agt_v2", model: CAMEL_CODE_RUNTIME_MODEL };
+    const saved = (await orgStub.setThreadRuntimeAgent(threadId, source))!;
+    const connectionId = "connection-1";
+    const workspaceId = thread.workspace_id;
+    const tenant = "chiridion-v2-test";
+    const runtime = await testRuntime({ url: "https://run.camelai.com/v2" });
+    const mcpUrl = "https://camel.test/mcp/agent/v2";
+    const integration = { integration_type: "discord_channel", name: "Synthetic Discord" };
+    const outbound = vi.fn(async (message: unknown) => message);
+    const bridgeFetch = async (request: Request) => {
+      if (request.method === "GET") return Response.json({ ok: true, binding: {
+        guildId: "guild-1", parentChannelId: "parent-1", integrationId: connectionId, orgId, workspaceId,
+      } });
+      await outbound(await request.json());
+      return Response.json({ ok: true, integrationId: connectionId, threadId: "thread-2", messageIds: ["reply-1"], chunkCount: 1 });
+    };
+    const handlerEnv = {
+      ...testEnv,
+      AGENT_RUNTIME_V2_TENANT: tenant,
+      TELEGRAM_BOT_TOKEN: "fixture",
+      DISCORD_BRIDGE: { fetch: bridgeFetch },
+      ORG: { idFromName: (name: string) => name, get: () => ({
+        getThread: (id: string) => orgStub.getThread(id),
+        validateChatWebSocketAccess: (user: string, workspace: string, id: string) => orgStub.validateChatWebSocketAccess(user, workspace, id),
+        getWorkspaceIntegration: async () => integration,
+        recordThreadChannelUsed: async () => {},
+      }) },
+    } as unknown as Env;
+    const handler = agentMcpHandler(handlerEnv, (props) => ({
+      describeDestructiveConfirmation: async () => null,
+      callToolEnvelope: async (name, args) => {
+        const tools = new ChannelTools(handlerEnv as unknown as ChatEnv);
+        const context = { ...props, userName: null, userEmail: null };
+        const data = name === "send_discord_message" ? await tools.sendChannelDiscordMessageTool(context, args)
+          : await tools.sendChannelTelegramMessageTool(context, args);
+        return { ok: true, data };
+      },
+    }), { fetch: runtime.fetch, version: "v2" });
+    const original = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (String(input) !== "https://api.telegram.org/botfixture/sendMessage") return original(input, init);
+      await outbound(JSON.parse(String(init?.body)));
+      return Response.json({ ok: true, result: { message_id: 19 } });
+    });
+    const signedReply = (agent: string) => runtime.callTool(handler, mcpUrl, `send_${kind}_message`, { text: "Hello" }, {
+      tenant, agent, subject: userId, actor: userId, context: { org: orgId, workspace: workspaceId, thread: threadId },
+    });
+    try {
+      expect(await signedReply(replacement.agentId)).toMatchObject({ isError: true });
+      expect(outbound).not.toHaveBeenCalled();
+      expect(await orgStub.publishV1ThreadInV2(threadId, {
+        agentId: source.agentId, workspaceId, threadModel: thread.model, updatedAt: saved.updatedAt,
+        channel: { kind, connectionId, remoteConversationId: conversation },
+      }, replacement)).toBe(true);
+      expect(await signedReply(source.agentId)).toMatchObject({ isError: true });
+      expect(await signedReply(replacement.agentId)).toMatchObject({ structuredContent: { status: "sent", channel: kind } });
+      expect(outbound).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(kind === "discord"
+        ? { integrationId: connectionId, threadId: "thread-2", text: "Hello" }
+        : { chat_id: conversation, text: "Hello" }));
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it('goes with its thread', async () => {

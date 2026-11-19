@@ -281,7 +281,7 @@ export async function pinNewWebThread(
   context: ChatContextState,
   options: { pendingFirstMessage?: string | null } = {},
 ): Promise<ThreadRuntimeRecord | null> {
-  return await pinNewThreadToRuntime(getEnv(loadContext) as unknown as ChatEnv, context, { ...options, web: true });
+  return await pinNewThreadToRuntime(getEnv(loadContext) as unknown as ChatEnv, context, { ...options, v2Eligible: true });
 }
 
 /**

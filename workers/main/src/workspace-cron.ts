@@ -12,6 +12,7 @@ import type { WorkspaceDO } from "./workspace";
 import type { WorkspaceFilesystemDO } from "./workspace-filesystem-do";
 import type { ProjectBuildContainer } from "./project-build-container";
 import {
+  CAMEL_CODE_LLM_MODEL,
   getDefaultLlmModel,
   getStoredBedrockAwsRegion,
   getStoredCustomLlmProviderApi,
@@ -1125,7 +1126,7 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       model,
       { source: "scheduled" },
     )) as OrgThread;
-    await this.pinScheduledThread(workspace, created.id);
+    await this.pinScheduledThread(workspace, created.id, model);
     return created.id;
   }
 
@@ -1142,7 +1143,7 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
   }
 
   /** A new prompt thread runs directly on the runtime where new threads do. */
-  private async pinScheduledThread(workspace: WorkspaceInfo, threadId: string): Promise<void> {
+  private async pinScheduledThread(workspace: WorkspaceInfo, threadId: string, model: LlmModel): Promise<void> {
     await pinNewThreadToRuntime(this.env as unknown as ChatEnv, {
       orgId: workspace.org_id,
       workspaceId: workspace.id,
@@ -1150,7 +1151,9 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       userId: null,
       userName: null,
       userEmail: null,
-    }).catch((error) => console.warn("[WorkspaceCronDO] could not pin a new prompt thread to the agent runtime", error));
+    }, { v2Eligible: model === CAMEL_CODE_LLM_MODEL }).catch(
+      (error) => console.warn("[WorkspaceCronDO] could not pin a new prompt thread to the agent runtime", error),
+    );
   }
 
   private async ensureRunnableThread(
@@ -1182,7 +1185,7 @@ export class WorkspaceCronDO extends DurableObject<WorkspaceCronEnv> {
       model,
       { source: "scheduled" },
     )) as OrgThread;
-    await this.pinScheduledThread(workspace, created.id);
+    await this.pinScheduledThread(workspace, created.id, model);
 
     this.sql.exec(
       "UPDATE scheduled_prompts SET thread_id = ?, updated_at = ? WHERE id = ?",

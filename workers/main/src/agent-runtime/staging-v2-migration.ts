@@ -18,7 +18,8 @@ import { RUNTIME_PROMPT_VERSION } from "./runtime-prompt";
 type ImportBlock = { type: string; text?: string; path?: string; volume?: string; version?: number; size?: number; contentType?: string };
 type ImportMessage = { role: string; content: string | ImportBlock[] };
 type CopiedWorkspace = { volume: string; repoId: string; seq: number; head: string };
-type V1Handoff = ({ phase: "inspect" } | { phase: "prepare" } | {
+type HandoffSelection = { expectedThreadModel?: string };
+type V1Handoff = HandoffSelection & ({ phase: "inspect" } | { phase: "prepare" } | {
   phase: "publish";
   fencedAgentId: string;
   workspace?: CopiedWorkspace;
@@ -144,11 +145,14 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
       this.env.ORG.get(org).moveCamelCodeThreadToSol(threadId, apply));
   }
 
-  async moveLegacyThread(orgId: string, threadId: string, dryRun = true) {
+  async moveLegacyThread(orgId: string, threadId: string, dryRun = true, selection: HandoffSelection = {}) {
     const env = this.env as unknown as ChatEnv;
     const org = env.ORG.get(env.ORG.idFromName(orgId));
     const [thread, existing] = await Promise.all([org.getThread(threadId), org.getThreadRuntime(threadId)]);
     if (!thread) return { status: "missing" };
+    if (selection.expectedThreadModel !== undefined && thread.model !== selection.expectedThreadModel) {
+      return { status: "source_changed" };
+    }
     if (!v2WorkspaceEnabled(env, thread.workspace_id)) return { status: "workspace_disabled" };
     if (existing) return { status: existing.runtimeVersion ?? "v1" };
     if (thread.source === "channel" || thread.channel_kind) return { status: "channel" };
@@ -209,6 +213,9 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
     const org = env.ORG.get(env.ORG.idFromName(orgId));
     const [thread, row] = await Promise.all([org.getThread(threadId), org.getThreadRuntime(threadId)]);
     if (!thread || !row?.agentId) return { status: "missing" };
+    if (handoff.expectedThreadModel !== undefined && thread.model !== handoff.expectedThreadModel) {
+      return { status: "source_changed" };
+    }
     if (row.runtimeVersion === "v2") return { status: "v2", agentId: row.agentId };
     if (handoff.phase === "publish" && row.agentId !== handoff.fencedAgentId) return { status: "source_changed" };
     if (!v2WorkspaceEnabled(env, thread.workspace_id)) return { status: "workspace_disabled" };

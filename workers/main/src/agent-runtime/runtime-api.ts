@@ -44,9 +44,10 @@ export function v2WorkspaceEnabled(
   env: { WORKER_BASE_URL?: string; AGENT_RUNTIME_V2_WORKSPACE?: string },
   workspaceId: string | undefined,
 ): boolean {
-  const selected = env.AGENT_RUNTIME_V2_WORKSPACE;
+  const selected = env.AGENT_RUNTIME_V2_WORKSPACE?.trim();
   if (selected === "*") return env.WORKER_BASE_URL === "https://staging.camelai.dev";
-  return Boolean(selected && selected === workspaceId);
+  if (selected === "all") return Boolean(workspaceId);
+  return Boolean(workspaceId && selected?.split(",").some((entry) => entry.trim() === workspaceId));
 }
 
 /**

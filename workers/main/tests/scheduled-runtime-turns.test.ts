@@ -7,19 +7,21 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 
-const { startRuntimeTurnMock, directEnabledMock, directRowMock, moveOnSendMock, runtimeApiMock, v2JsonMock } = vi.hoisted(() => ({
+const { startRuntimeTurnMock, directEnabledMock, directRowMock, moveOnSendMock, runtimeApiMock, v2JsonMock, pinNewThreadMock } = vi.hoisted(() => ({
   startRuntimeTurnMock: vi.fn(),
   directEnabledMock: vi.fn(() => true),
   directRowMock: vi.fn(),
   moveOnSendMock: vi.fn(),
   runtimeApiMock: vi.fn(),
   v2JsonMock: vi.fn(),
+  pinNewThreadMock: vi.fn(async () => null),
 }));
 
 vi.mock("../src/agent-runtime/thread-runtime.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   startRuntimeTurn: startRuntimeTurnMock,
   runtimeDirectThreadsEnabled: directEnabledMock,
+  pinNewThreadToRuntime: pinNewThreadMock,
 }));
 vi.mock("../src/agent-runtime/thread-migration.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -36,6 +38,7 @@ vi.mock("../src/agent-runtime/runtime-v2.js", async (importOriginal) => ({
 }));
 
 import { RUNTIME_AUTOMATION_OUTCOME_INSTRUCTION, startScheduledRuntimeTurn } from "../src/agent-runtime/scheduled-turns";
+import { CAMEL_CODE_LLM_MODEL } from "../../../src/lib/llm-provider-config";
 import type { ChatEnv } from "../src/chat-thread/types";
 import type { WorkspaceCronDO } from "../src/workspace-cron";
 import { createOrg, createUser, listUserWorkspaces, type TestEnv } from "./test-helpers";
@@ -160,6 +163,34 @@ describe("WorkspaceCronDO scheduled run outcomes for direct threads", () => {
     const runs = await cron.listAutomationRuns(workspaceId, { limitPerAutomation: 5 });
     return runs[`scheduled_prompt:${promptId}`]![0]!;
   }
+
+  it.each([CAMEL_CODE_LLM_MODEL, "gpt-6-luna"] as const)(
+    "checks native eligibility for a new %s scheduled chat and preserves an existing schedule's thread",
+    async (model) => {
+      const { userId } = await createUser(testEnv, `cron-placement-${crypto.randomUUID()}@example.com`, "password123", "Cron Owner");
+      const { org } = await createOrg(testEnv, "Cron Org", userId);
+      const workspaceId = (await listUserWorkspaces(testEnv, userId, org.id))[0]!.id;
+      const orgStub = testEnv.ORG.get(testEnv.ORG.idFromName(org.id));
+      await orgStub.setModelPickerConfig({
+        use_platform_defaults: false,
+        default_model: model,
+        models: [{ id: model, added_at: Date.now() }],
+      });
+      const cron = testEnv.WORKSPACE_CRON.get(testEnv.WORKSPACE_CRON.idFromName(workspaceId));
+      const prompt = await cron.createScheduledPrompt({
+        workspaceId, name: "Digest", prompt: "Summarize.", cronExpression: "0 9 * * *", createdBy: userId, enabled: false,
+      });
+      expect(pinNewThreadMock).toHaveBeenCalledExactlyOnceWith(
+        expect.anything(),
+        expect.objectContaining({ threadId: prompt.thread_id, workspaceId }),
+        { v2Eligible: model === CAMEL_CODE_LLM_MODEL },
+      );
+
+      await cron.runScheduledPromptNow(workspaceId, prompt.id);
+      expect(pinNewThreadMock).toHaveBeenCalledTimes(1);
+      expect((await latestRun(cron, workspaceId, prompt.id)).thread_id).toBe(prompt.thread_id);
+    },
+  );
 
   it("runs a system prompt on the runtime as the org's owner", async () => {
     const { userId } = await createUser(testEnv, `cron-sys-${crypto.randomUUID()}@example.com`, "password123", "Cron Owner");

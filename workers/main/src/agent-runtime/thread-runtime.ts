@@ -86,7 +86,7 @@ export function runtimeDirectThreadsEnabled(env: Partial<ChatEnv>): boolean {
 export async function pinNewThreadToRuntime(
   env: ChatEnv,
   context: ChatContextState,
-  options: { pendingFirstMessage?: string | null; web?: boolean } = {},
+  options: { pendingFirstMessage?: string | null; v2Eligible?: boolean } = {},
 ): Promise<ThreadRuntimeRecord | null> {
   if (!runtimeDirectThreadsEnabled(env)) return null;
   let route: Awaited<ReturnType<typeof resolveThreadRuntimeRoute>>["route"];
@@ -98,7 +98,7 @@ export async function pinNewThreadToRuntime(
   }
   if (!route) return null;
   const org = orgStub(env, context.orgId);
-  const canary = options.web && v2WorkspaceEnabled(env, context.workspaceId) &&
+  const canary = options.v2Eligible && v2WorkspaceEnabled(env, context.workspaceId) &&
     v2HostedModelMatches(route, env);
   const firstMessage = options.pendingFirstMessage ?? null;
   const pinned = canary

@@ -107,6 +107,7 @@ export interface ChatEnv extends WorkspaceFilesystemEnv {
   AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET?: string;
   AGENT_RUNTIME_V2_WORKSPACE?: string;
   AGENT_RUNTIME_V2_MODELS?: string;
+  AGENT_RUNTIME_V2_ADDITIONAL_MODELS?: string;
   R2_BUCKET: R2Bucket;
   IMAGES?: ImagesBinding;
   AI: Ai;

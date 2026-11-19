@@ -19,6 +19,7 @@
  * `bedrock-openai-<region>/<model id>`.
  */
 import type { PiResolvedModelConfig } from "../chat-thread/pi-model-config";
+import type { ChatEnv } from "../chat-thread/types";
 import { CAMEL_CODE_LLM_MODEL } from "../../../../src/lib/llm-provider-config";
 import { codexRoute } from "./codex-forwarder";
 import {
@@ -35,9 +36,13 @@ export type RuntimeModelRoute =
   | { kind: "scope"; model: string; keyScope: string }
   | { kind: "codex"; model: string };
 
-export function v2HostedModelMatches(route: RuntimeModelRoute, models: string | undefined): boolean {
+export function v2HostedModelMatches(
+  route: RuntimeModelRoute,
+  env: Pick<ChatEnv, "AGENT_RUNTIME_V2_MODELS" | "AGENT_RUNTIME_V2_ADDITIONAL_MODELS">,
+): boolean {
   return route.kind === "scope" && route.keyScope === HOSTED_KEY_SCOPE &&
-    (models?.split(",").some((model) => model.trim() === route.model) ?? false);
+    [env.AGENT_RUNTIME_V2_MODELS, env.AGENT_RUNTIME_V2_ADDITIONAL_MODELS]
+      .some((models) => models?.split(",").some((model) => model.trim() === route.model));
 }
 
 /** The tenant model endpoint in the runtime that is chiridion's Codex forwarder. */

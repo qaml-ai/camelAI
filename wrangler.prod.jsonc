@@ -35,6 +35,7 @@
     // next opened or sent to: agent-runtime/thread-migration.ts).
     "AGENT_RUNTIME_TENANT": "chiridion-prod",
     "AGENT_RUNTIME_DEFINITION": "def_1691d4d5174202254235",
+    "AGENT_RUNTIME_V2_ADDITIONAL_MODELS": "azure/gpt-6.2-sol",
     "AI_VIRTUAL_MODEL": "google/gemini-3.8-flash",
     // Static-IP database egress relay (docs/db-egress-relay.md). SOCKS + Access
     // service-token credentials are secrets (DB_EGRESS_RELAY_SOCKS_* /

@@ -99,7 +99,7 @@ export async function pinNewThreadToRuntime(
   if (!route) return null;
   const org = orgStub(env, context.orgId);
   const canary = options.web && v2WorkspaceEnabled(env, context.workspaceId) &&
-    v2HostedModelMatches(route, env.AGENT_RUNTIME_V2_MODELS);
+    v2HostedModelMatches(route, env);
   const firstMessage = options.pendingFirstMessage ?? null;
   const pinned = canary
     ? await org.pinThreadRuntime(context.threadId, firstMessage, "v2")

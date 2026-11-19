@@ -126,7 +126,7 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
         throw error;
       });
     const route = resolved?.route;
-    if (!resolved || !route || !v2HostedModelMatches(route, env.AGENT_RUNTIME_V2_MODELS)) return { status: "model_unavailable" };
+    if (!resolved || !route || !v2HostedModelMatches(route, env)) return { status: "model_unavailable" };
     const source = await env.CHAT_THREAD.get(env.CHAT_THREAD.idFromName(threadId)).exportLegacyThreadForV2();
     if (source.status !== "exported") return { status: source.status };
     if (!source.messages.length && (thread.user_message_count ?? 0) > 0) return { status: "missing_history" };
@@ -187,7 +187,7 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
         throw error;
       });
     const route = resolved?.route;
-    if (!resolved || !route || !v2HostedModelMatches(route, env.AGENT_RUNTIME_V2_MODELS)) return { status: "model_unavailable" };
+    if (!resolved || !route || !v2HostedModelMatches(route, env)) return { status: "model_unavailable" };
     const model = runtimeAgentModel(context, route, resolved.threadModel);
     const subject = await migrationSubject(env, thread, context);
     if (!subject) return { status: "missing_owner" };

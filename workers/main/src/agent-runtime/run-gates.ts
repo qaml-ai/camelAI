@@ -255,7 +255,7 @@ export async function prepareThreadRuntimeRun(
   }
   const { route, config, threadModel, fallback } = resolved;
   if (!route) throw new RuntimeRunRefused("This thread's model cannot run on the agent runtime; switch models to continue.", "no_route");
-  if (runtimeVersion === "v2" && !v2HostedModelMatches(route, env.AGENT_RUNTIME_V2_MODELS)) {
+  if (runtimeVersion === "v2" && !v2HostedModelMatches(route, env)) {
     throw new RuntimeRunRefused("Choose a hosted model enabled for v2 to continue this thread.", "no_route");
   }
   const org = orgStub(env, context.orgId);

@@ -285,7 +285,8 @@ describe("startRuntimeTurn", () => {
       ...runtimeEnv, CF_ACCOUNT_ID: "acct", CF_GATEWAY_NAME: "gw", AI_GATEWAY_AUTH_TOKEN: "gw-token",
       WORKER_BASE_URL: "https://camelai.dev", AGENT_RUNTIME_V2_TENANT: "test-v2", AGENT_RUNTIME_V2_API_TOKEN: "test-key",
       AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET: "test-secret",
-      AGENT_RUNTIME_V2_MODELS: `${CAMEL_CODE_RUNTIME_MODEL},${PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL}`,
+      AGENT_RUNTIME_V2_MODELS: PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL,
+      AGENT_RUNTIME_V2_ADDITIONAL_MODELS: CAMEL_CODE_RUNTIME_MODEL,
     };
     const agentPath = `/v2/agents/chiridion-thread-${thread.id}`;
     const calls = fakeRuntime({

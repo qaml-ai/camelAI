@@ -1,7 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 import { readOrgExportManifest, readOrgExportPage, readExportRecord, ORG_EXPORT_SETS, type OrgExportSet } from "../org-export.js";
+import { moveCamelCodeThreadToSol } from "../agent-runtime/camelcode-sol-migration";
 import { syncOrgKeyScope, type KeyScopeEnv } from "../agent-runtime/key-scopes";
+import { CAMEL_CODE_RUNTIME_MODEL, isPreviousCamelCodeRuntimeModel, PREVIOUS_CAMEL_CODE_RUNTIME_MODELS } from "../agent-runtime/model-routes";
 import { RuntimeApiError, runtimeApi, v2WorkspaceEnabled } from "../agent-runtime/runtime-api";
+import type { ChatEnv } from "../chat-thread/types";
 import type { DOEnv } from "./env";
 import {
   WorkspaceDO,
@@ -50,6 +53,7 @@ import type {
   ThreadCompletionSummaryStatus,
 } from "../../../../src/types";
 import {
+  CAMEL_CODE_LLM_MODEL,
   getDefaultLlmModel,
   getStoredBedrockAwsRegion,
   getStoredCustomLlmProviderApi,
@@ -957,6 +961,7 @@ export interface OrgSsoIdentityRecord {
 // User Durable Object - one per user
 export class OrgDO extends DurableObject<DOEnv> {
   private sql: SqlStorage;
+  private readonly camelCodeModelUpdates = new Map<string, Promise<{ status: string }>>();
   private usageControlsInstance?: OrgUsageControls;
   private workerScriptsHasPreviewColumns = true;
   private static readonly ACCESS_MAPPED_ORG_ID_KEY = "accessMappedOrgId";
@@ -8466,12 +8471,14 @@ export class OrgDO extends DurableObject<DOEnv> {
     return updated;
   }
 
-  updateThreadModel(
+  async updateThreadModel(
     id: string,
     model: LlmModel,
     actorId?: string,
     expectedModel?: LlmModel,
-  ): OrgThread | null {
+  ): Promise<OrgThread | null> {
+    const migration = this.camelCodeModelUpdates.get(id);
+    if (migration) await migration.catch(() => {});
     const existing = this.getThread(id);
     if (!existing) return null;
     if (
@@ -8561,11 +8568,13 @@ export class OrgDO extends DurableObject<DOEnv> {
   /**
    * Admin: Update thread with arbitrary fields
    */
-  adminUpdateThread(
+  async adminUpdateThread(
     id: string,
     updates: { title?: string; created_by?: string; model?: LlmModel },
     actorId?: string,
-  ): OrgThread | null {
+  ): Promise<OrgThread | null> {
+    const migration = updates.model && this.camelCodeModelUpdates.get(id);
+    if (migration) await migration.catch(() => {});
     const existing = this.getThread(id);
     if (!existing) return null;
     const normalizedModel =
@@ -8693,6 +8702,76 @@ export class OrgDO extends DurableObject<DOEnv> {
       )
       .toArray()[0];
     return row ? threadRuntimeRecord(row) : null;
+  }
+
+  /** Metadata only, ordered by thread ID for the camelCode model migration. */
+  listCamelCodeModelMigrationThreads(after: string | null, limit: number) {
+    const size = Math.max(1, Math.min(Math.floor(limit) || 1, 100));
+    return this.sql.exec<{
+      thread_id: string;
+      workspace_id: string;
+      agent_id: string | null;
+      runtime_version: "v1" | "v2" | null;
+      model: string | null;
+    }>(
+      `SELECT t.id AS thread_id, t.workspace_id, r.agent_id, r.runtime_version, r.model
+       FROM threads t LEFT JOIN thread_runtime r ON r.thread_id = t.id
+       WHERE t.id > ? AND t.model = ? AND (
+         r.thread_id IS NULL OR (r.key_scope = 'hosted' AND r.agent_id IS NOT NULL AND r.model IN (?, ?, ?, ?))
+       )
+       ORDER BY t.id LIMIT ?`,
+      after ?? "", CAMEL_CODE_LLM_MODEL, ...PREVIOUS_CAMEL_CODE_RUNTIME_MODELS, CAMEL_CODE_RUNTIME_MODEL, size,
+    ).toArray();
+  }
+
+  async moveCamelCodeThreadToSol(threadId: string, apply = false): Promise<{ status: string }> {
+    const active = this.camelCodeModelUpdates.get(threadId);
+    if (apply && active) return active;
+    const env = this.env as unknown as ChatEnv;
+    const thread = this.getThread(threadId);
+    const row = this.getThreadRuntime(threadId);
+    if (!apply) return moveCamelCodeThreadToSol(env, thread, row, false);
+
+    // Serialize picker changes for this thread while the runtime's backing
+    // model and our placement record are changed. Turns use CamelRun's idle
+    // check, and other threads in the same organization can keep working.
+    const migration = (async () => {
+      const outcome = await moveCamelCodeThreadToSol(env, thread, row, true);
+      if (row?.agentId && row.model && (outcome.status === "moved" || outcome.status === "reconciled")) {
+        const recorded = this.recordCamelCodeSolModel(threadId, {
+          agentId: row.agentId, model: row.model, updatedAt: row.updatedAt,
+        });
+        if (!recorded) return { status: "source_changed" };
+      }
+      return outcome;
+    })();
+    this.camelCodeModelUpdates.set(threadId, migration);
+    try {
+      return await migration;
+    } finally {
+      this.camelCodeModelUpdates.delete(threadId);
+    }
+  }
+
+  /** Mirror the confirmed runtime model while the same hosted placement still owns the thread. */
+  private recordCamelCodeSolModel(
+    threadId: string,
+    expected: { agentId: string; model: string; updatedAt: number },
+  ): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      const thread = this.getThread(threadId);
+      const row = this.getThreadRuntime(threadId);
+      if (thread?.model !== CAMEL_CODE_LLM_MODEL || row?.runtimeVersion !== "v2" ||
+          row.agentId !== expected.agentId || row.keyScope !== "hosted") return false;
+      if (row.model === CAMEL_CODE_RUNTIME_MODEL) return true;
+      if (row.model !== expected.model || !isPreviousCamelCodeRuntimeModel(row.model) ||
+          row.updatedAt !== expected.updatedAt) return false;
+      this.sql.exec(
+        "UPDATE thread_runtime SET model = ?, configured_json = ?, updated_at = ? WHERE thread_id = ?",
+        CAMEL_CODE_RUNTIME_MODEL, JSON.stringify({ ...row.configured, thinkingLevel: "low" }), Date.now(), threadId,
+      );
+      return true;
+    });
   }
 
   /**

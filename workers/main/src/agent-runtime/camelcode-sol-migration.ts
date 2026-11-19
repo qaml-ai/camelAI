@@ -16,11 +16,12 @@ export async function moveCamelCodeThreadToSol(
 ) {
   if (!thread) return { status: "missing" };
   if (thread.model !== CAMEL_CODE_LLM_MODEL) return { status: "ineligible" };
-  if (!row) return { status: "needs_legacy_handoff" };
+  if (!row) return { status: thread.source === "scheduled" ? "scheduled_handoff" : "needs_legacy_handoff" };
   if (!row.agentId || row.keyScope !== HOSTED_KEY_SCOPE) return { status: "ineligible" };
   if (row.model === CAMEL_CODE_RUNTIME_MODEL) return { status: "already_sol" };
   if (!isPreviousCamelCodeRuntimeModel(row.model)) return { status: "ineligible" };
   if (!row.runtimeVersion) {
+    if (thread.source === "scheduled") return { status: "scheduled_handoff" };
     return { status: thread.source === "channel" || thread.channel_kind ? "v1_channel" : "needs_v1_handoff" };
   }
   if (row.pendingFirstMessage) return { status: "pending_first_message" };

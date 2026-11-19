@@ -138,6 +138,7 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
     if (!v2WorkspaceEnabled(env, thread.workspace_id)) return { status: "workspace_disabled" };
     if (existing) return { status: existing.runtimeVersion ?? "v1" };
     if (thread.source === "channel" || thread.channel_kind) return { status: "channel" };
+    if (thread.source === "scheduled" && thread.model === CAMEL_CODE_LLM_MODEL) return { status: "scheduled_handoff" };
     const context: ChatContextState = {
       orgId, threadId, workspaceId: thread.workspace_id,
       userId: thread.created_by || null, userName: null, userEmail: null,
@@ -207,6 +208,8 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
     // from the start, including when v2 cannot serve the old backing model.
     const sol = thread.model === CAMEL_CODE_LLM_MODEL && isPreviousCamelCodeRuntimeModel(row.model) &&
       v2HostedModelMatches({ kind: "scope", keyScope: HOSTED_KEY_SCOPE, model: CAMEL_CODE_RUNTIME_MODEL }, env);
+    // Scheduled turns still consult v1 for activity and record completion from v1 webhooks.
+    if (thread.source === "scheduled" && thread.model === CAMEL_CODE_LLM_MODEL) return { status: "scheduled_handoff" };
     const resolved = await resolveThreadRuntimeRoute(env, context, {
       persistFallback: false, allowFallback: false, configuredModel: sol ? CAMEL_CODE_RUNTIME_MODEL : row.model,
     })

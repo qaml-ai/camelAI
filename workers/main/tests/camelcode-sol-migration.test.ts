@@ -38,13 +38,14 @@ async function fixture() {
   async function chat(options: {
     version?: "v1" | "v2";
     channel?: boolean;
+    scheduled?: boolean;
     keyScope?: string;
     backing?: string;
     product?: LlmModel;
   } = {}) {
     const thread = await orgStub.createThread(
       defaultWorkspaceId as string, "Synthetic chat", userId, undefined, options.product ?? CAMEL_CODE_LLM_MODEL,
-      options.channel ? { source: "channel", channelKind: "slack" } : {},
+      options.channel ? { source: "channel", channelKind: "slack" } : options.scheduled ? { source: "scheduled" } : {},
     );
     if (options.version) {
       await orgStub.pinThreadRuntime(thread.id, null, options.version);
@@ -123,6 +124,20 @@ describe("idle camelCode backing model migration", () => {
       expect(await org.moveCamelCodeThreadToSol(luna.id)).toEqual({ status: "candidate" });
       expect(await org.moveCamelCodeThreadToSol(paid.id, true)).toEqual({ status: "ineligible" });
       expect(await org.moveCamelCodeThreadToSol(byok.id, true)).toEqual({ status: "ineligible" });
+      expect(patch).not.toHaveBeenCalled();
+    });
+  });
+
+  it("keeps scheduled chats on their existing runtime while allowing a v2 model-only change", async () => {
+    const { orgStub, chat } = await fixture();
+    const local = await chat({ scheduled: true });
+    const v1 = await chat({ scheduled: true, version: "v1" });
+    const v2 = await chat({ scheduled: true, version: "v2" });
+    await withRuntime(orgStub, async (org) => {
+      const patch = vi.spyOn(globalThis, "fetch");
+      expect(await org.moveCamelCodeThreadToSol(local.id, true)).toEqual({ status: "scheduled_handoff" });
+      expect(await org.moveCamelCodeThreadToSol(v1.id, true)).toEqual({ status: "scheduled_handoff" });
+      expect(await org.moveCamelCodeThreadToSol(v2.id)).toEqual({ status: "candidate" });
       expect(patch).not.toHaveBeenCalled();
     });
   });

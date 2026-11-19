@@ -85,7 +85,7 @@ const eventId = () => `evt_${crypto.randomUUID().replaceAll("-", "").slice(0, 24
 
 afterEach(() => vi.restoreAllMocks());
 
-describe("usage.recorded on POST /agent-runtime/events/v2", () => {
+describe("POST /agent-runtime/events/v2", () => {
   const secret = "chiridion-v2-test-secret";
   const tenant = "chiridion-v2-test";
 
@@ -142,6 +142,65 @@ describe("usage.recorded on POST /agent-runtime/events/v2", () => {
       output_tokens: 20,
       source_id: `v2:${event.id}`,
     }]);
+  });
+
+  it("settles the matching scheduled run even when a newer completion is already indexed", async () => {
+    const { orgStub, runEnv, agentId, metadata, userId, streaming } = await setup({ source: "scheduled", v2: true });
+    const fixture = {
+      id: eventId(), tenantId: tenant, type: "run.failed", createdAt: Date.now() - 60_000,
+      data: { agentId, runId: "native_run", actor: userId, context: metadata, error: { message: "Model failed" } },
+    };
+    const finish = vi.fn(async () => true);
+    const configured = {
+      ...runEnv,
+      AGENT_RUNTIME_V2_TENANT: tenant,
+      AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET: secret,
+      AGENT_RUNTIME_V2_API_TOKEN: "v2-tenant-test",
+      WORKSPACE_CRON: { idFromName: (name: string) => name, get: () => ({ finishScheduledRun: finish }) },
+    } as unknown as Env;
+    const original = globalThis.fetch;
+    const read = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (String(input) !== `https://run.camelai.com/v2/agents/${agentId}/runs/native_run`) return original(input, init);
+      expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer v2-tenant-test");
+      return Response.json({ id: "native_run", actor: userId, idempotencyKey: "scheduler_request" });
+    });
+    await orgStub.recordThreadAssistantCompletion(metadata.thread, { completedAt: Date.now(), summary: null });
+    expect((await handleAgentRuntimeV2Events({ req: await signedRequest(fixture), env: configured })).status).toBe(204);
+    expect(read).toHaveBeenCalledWith(`https://run.camelai.com/v2/agents/${agentId}/runs/native_run`, expect.objectContaining({ method: "GET" }));
+    expect(finish).toHaveBeenCalledWith({
+      workspaceId: metadata.workspace, threadId: metadata.thread, runId: "scheduler_request",
+      error: "Model failed", completedAt: fixture.createdAt,
+    });
+    expect(streaming).not.toHaveBeenCalled();
+  });
+
+  it.each(["scheduled", "channel", undefined] as const)("only declines the current run's pending inputs on unattended %s threads", async (source) => {
+    const { runEnv, agentId, metadata, userId } = await setup({ source, v2: true });
+    const configured = { ...runEnv, AGENT_RUNTIME_V2_TENANT: tenant, AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET: secret, AGENT_RUNTIME_V2_API_TOKEN: "v2-tenant-test" };
+    const event = {
+      id: eventId(), tenantId: tenant, type: "run.input_required", createdAt: Date.now(),
+      data: { agentId, runId: "native_run", actor: userId, context: metadata },
+    };
+    const path = `https://run.camelai.com/v2/agents/${agentId}`;
+    const sent: Array<{ url: string; body: unknown }> = [];
+    const original = globalThis.fetch;
+    const calls = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (!url.startsWith(path)) return original(input, init);
+      if (url === `${path}/runs/native_run`) {
+        return Response.json({ id: "native_run", actor: userId, inputs: [
+          { id: "in_pending", status: "pending" }, { id: "in_answered", status: "answered" },
+        ] });
+      }
+      sent.push({ url, body: JSON.parse(String(init?.body)) });
+      return sent.length === 1 ? Response.json({ id: "native_run", status: "running" })
+        : Response.json({ error: { code: "input_already_resolved" } }, { status: 409 });
+    });
+    expect((await handleAgentRuntimeV2Events({ req: await signedRequest(event), env: configured })).status).toBe(204);
+    expect((await handleAgentRuntimeV2Events({ req: await signedRequest(event), env: configured })).status).toBe(204);
+    expect(calls.mock.calls.filter(([input]) => String(input).startsWith(path))).toHaveLength(source ? 4 : 0);
+    const decline = { url: `${path}/inputs/in_pending`, body: { actor: userId, approved: false, wait: false } };
+    expect(sent).toEqual(source ? [decline, decline] : []);
   });
 });
 

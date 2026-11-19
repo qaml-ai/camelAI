@@ -1,4 +1,6 @@
 import { HOSTED_KEY_SCOPE } from "../agent-runtime/key-scopes.js";
+import { RuntimeApiError } from "../agent-runtime/runtime-api.js";
+import { v2AgentPath, v2Json, type V2Run } from "../agent-runtime/runtime-v2.js";
 import { runtimeThreadMetadata } from "../agent-runtime/thread-metadata.js";
 import { recordRuntimeUsage } from "../agent-runtime/usage.js";
 import { verifyV2Webhook } from "../agent-runtime/webhooks.js";
@@ -9,7 +11,22 @@ const text = (value: unknown) => typeof value === "string" ? value.trim() : "";
 const tokenCount = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
-/** Receives usage from Chiridion's dedicated hosted v2 tenant. */
+async function declineUnattendedInput(env: RouteContext["env"], path: string, run: V2Run, actor: string) {
+  for (const input of run.inputs) {
+    if (input.status !== "pending") continue;
+    try {
+      await v2Json(env, `${path}/inputs/${encodeURIComponent(input.id)}`, {
+        method: "POST", body: { actor, approved: false, wait: false },
+      });
+    } catch (error) {
+      if (!(error instanceof RuntimeApiError) || !["input_already_resolved", "input_expired"].includes(error.code ?? "")) {
+        throw error;
+      }
+    }
+  }
+}
+
+/** Receives usage and run lifecycle events from Chiridion's dedicated hosted v2 tenant. */
 export async function handleAgentRuntimeV2Events({ req, env, ctx }: Pick<RouteContext, "req" | "env"> & Partial<Pick<RouteContext, "ctx">>): Promise<Response> {
   const secret = env.AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET?.trim();
   const tenant = env.AGENT_RUNTIME_V2_TENANT?.trim();
@@ -26,6 +43,7 @@ export async function handleAgentRuntimeV2Events({ req, env, ctx }: Pick<RouteCo
     createdAt?: unknown;
     data?: {
       agentId?: unknown;
+      runId?: unknown;
       actor?: unknown;
       model?: unknown;
       kind?: unknown;
@@ -67,6 +85,26 @@ export async function handleAgentRuntimeV2Events({ req, env, ctx }: Pick<RouteCo
     return Response.json({ error: "Event does not match a hosted v2 thread" }, { status: 409 });
   }
   if (event.type !== "usage.recorded") {
+    const scheduled = thread.source === "scheduled";
+    const terminal = event.type === "run.completed" || event.type === "run.failed" || event.type === "run.cancelled";
+    const unattendedInput = (scheduled || thread.source === "channel") && event.type === "run.input_required";
+    if (unattendedInput || (scheduled && terminal && env.WORKSPACE_CRON)) {
+      const runId = text(usage?.runId);
+      if (!runId) return Response.json({ error: "Run event is missing its run id" }, { status: 400 });
+      const path = v2AgentPath(agentId);
+      const run = await v2Json<V2Run>(env, `${path}/runs/${encodeURIComponent(runId)}`);
+      if (run.id !== runId || run.actor !== actor) {
+        return Response.json({ error: "Event does not match a hosted v2 run" }, { status: 409 });
+      }
+      if (unattendedInput) {
+        await declineUnattendedInput(env, path, run, actor);
+      } else if (run.idempotencyKey && env.WORKSPACE_CRON) {
+        const error = event.type === "run.failed" ? text(usage?.error?.message) || "The scheduled run failed"
+          : event.type === "run.cancelled" ? "The scheduled run was cancelled" : null;
+        const cron = env.WORKSPACE_CRON.get(env.WORKSPACE_CRON.idFromName(workspaceId));
+        await cron.finishScheduledRun({ workspaceId, threadId, runId: run.idempotencyKey, error, completedAt: event.createdAt });
+      }
+    }
     const completedAt = thread.last_assistant_completed_at ?? 0;
     if (completedAt >= event.createdAt) return new Response(null, { status: 204 });
     if (event.type === "run.started" || event.type === "run.resumed") {

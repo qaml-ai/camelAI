@@ -10,11 +10,13 @@ import { attachV2Uploads, createV2ThreadAgent, v2AgentPath, v2Json, type V2Agent
 import { MAX_IMPORT_BYTES, migrationSubject } from "./thread-migration";
 import { RUNTIME_PROMPT_VERSION } from "./runtime-prompt";
 
-type ImportMessage = { role: string; content: string | Array<{ type: string; text?: string }> };
+type ImportBlock = { type: string; text?: string; path?: string; volume?: string; version?: number; size?: number; contentType?: string };
+type ImportMessage = { role: string; content: string | ImportBlock[] };
+type CopiedWorkspace = { volume: string; repoId: string; seq: number; head: string };
 type V1Handoff = { phase: "inspect" } | { phase: "prepare" } | {
   phase: "publish";
   fencedAgentId: string;
-  workspace?: { volume: string; repoId: string; seq: number; head: string };
+  workspace?: CopiedWorkspace;
 };
 
 
@@ -45,11 +47,35 @@ async function readV1History(env: ChatEnv, agentPath: string): Promise<ImportMes
   }
 }
 
-async function copyHistory(env: ChatEnv, context: ChatContextState, agentId: string, source: string, messages: ImportMessage[], uploadPrefix = "legacy") {
+async function pinnedV1Files(env: ChatEnv, files: ImportBlock[], workspace: CopiedWorkspace | undefined) {
+  return await Promise.all(files.map(async (file) => {
+    if (!workspace || file.volume !== workspace.volume || !file.path?.startsWith("/workspace/") ||
+        !Number.isSafeInteger(file.version) || !Number.isSafeInteger(file.size) || !file.contentType) {
+      throw new RuntimeApiError("A v1 attachment is outside the copied workspace", 422, "attachment_outside_workspace");
+    }
+    const path = file.path.slice("/workspace".length);
+    const query = new URLSearchParams({ prefix: path, limit: "1" });
+    const entry = await runtimeApi(env, "GET", `/v1/volumes/${encodeURIComponent(workspace.volume)}/files?${query}`) as {
+      files: Array<{ path: string; version: number; size: number }>;
+    };
+    const current = entry.files[0];
+    if (current?.path !== path || current.version !== file.version || current.size !== file.size) {
+      throw new RuntimeApiError("A v1 attachment has changed since it was sent", 422, "attachment_version_changed");
+    }
+    return { path: path.slice(1), contentType: file.contentType, commit: workspace.head };
+  }));
+}
+
+async function copyHistory(env: ChatEnv, context: ChatContextState, agentId: string, source: string, messages: ImportMessage[], uploadPrefix = "legacy", workspace?: CopiedWorkspace) {
   const agentPath = v2AgentPath(agentId);
   const attachments = [];
   for (const [messageIndex, message] of messages.entries()) {
     if (message.role !== "user") continue;
+    const nativeFiles = Array.isArray(message.content) ? message.content.filter(block => block.type === "file") : [];
+    if (nativeFiles.length) {
+      attachments.push({ messageIndex, files: await pinnedV1Files(env, nativeFiles, workspace) });
+      continue;
+    }
     const text = typeof message.content === "string" ? message.content :
       message.content.flatMap(block => block.type === "text" ? [block.text] : []).join("\n");
     if (!parseUploadRefs(text).refs.some(ref => ref.kind === "user_upload")) continue;
@@ -199,9 +225,14 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
       if (files.commit !== workspace.head) return { status: "destination_workspace_changed" };
     }
     if (target.messageCount && target.messageCount !== messages.length) return { status: "destination_changed" };
-    const copy = target.messageCount
-      ? await verifyHistory(env, targetPath, messages)
-      : await copyHistory(env, context, agentId, `chiridion-v1:${handoff.fencedAgentId}`, messages, `v1-migration-${crypto.randomUUID()}`);
+    const copy = await (target.messageCount
+      ? verifyHistory(env, targetPath, messages)
+      : copyHistory(env, context, agentId, `chiridion-v1:${handoff.fencedAgentId}`, messages, `v1-migration-${crypto.randomUUID()}`, workspace)
+    ).catch((error: unknown) => {
+      if (error instanceof RuntimeApiError && error.status === 422) return { refused: error.code ?? "copy_refused" };
+      throw error;
+    });
+    if ("refused" in copy) return { status: copy.refused };
     const latest = await readV1History(env, sourcePath);
     if (JSON.stringify(latest) !== JSON.stringify(messages)) return { status: "source_changed" };
     if (workspace) {

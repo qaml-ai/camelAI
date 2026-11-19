@@ -70,12 +70,13 @@ async function copyHistory(env: ChatEnv, context: ChatContextState, agentId: str
   const agentPath = v2AgentPath(agentId);
   const attachments = [];
   for (const [messageIndex, message] of messages.entries()) {
-    if (message.role !== "user") continue;
+    if (message.role !== "user" && message.role !== "toolResult") continue;
     const nativeFiles = Array.isArray(message.content) ? message.content.filter(block => block.type === "file") : [];
     if (nativeFiles.length) {
       attachments.push({ messageIndex, files: await pinnedV1Files(env, nativeFiles, workspace) });
       continue;
     }
+    if (message.role !== "user") continue;
     const text = typeof message.content === "string" ? message.content :
       message.content.flatMap(block => block.type === "text" ? [block.text] : []).join("\n");
     if (!parseUploadRefs(text).refs.some(ref => ref.kind === "user_upload")) continue;

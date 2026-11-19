@@ -201,6 +201,7 @@
     { "binding": "DISCORD_BRIDGE", "service": "chiridion-discord-bridge-staging" }
   ],
   "durable_objects": {
+    "code_update_strategy": { "mode": "deferred", "max_delay": 86400 },
     "bindings": [
       { "name": "CHAT_THREAD", "class_name": "ChatThreadDO" },
       { "name": "USER", "class_name": "UserDO" },

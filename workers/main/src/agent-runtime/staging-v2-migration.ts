@@ -5,7 +5,7 @@ import type { Env } from "../types";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
 import { v2HostedModelMatches } from "./model-routes";
 import { resolveThreadRuntimeRoute, runtimeAgentModel, RuntimeRunRefused } from "./run-gates";
-import { runtimeApi, RuntimeApiError, v2WorkspaceEnabled } from "./runtime-api";
+import { runtimeApi, runtimeUrl, RuntimeApiError, v2WorkspaceEnabled } from "./runtime-api";
 import { attachV2Uploads, createV2ThreadAgent, v2AgentPath, v2Json, type V2Agent } from "./runtime-v2";
 import { MAX_IMPORT_BYTES, migrationSubject } from "./thread-migration";
 import { RUNTIME_PROMPT_VERSION } from "./runtime-prompt";
@@ -45,7 +45,7 @@ async function readV1History(env: ChatEnv, agentPath: string): Promise<ImportMes
   }
 }
 
-async function copyHistory(env: ChatEnv, context: ChatContextState, agentId: string, source: string, messages: ImportMessage[]) {
+async function copyHistory(env: ChatEnv, context: ChatContextState, agentId: string, source: string, messages: ImportMessage[], uploadPrefix = "legacy") {
   const agentPath = v2AgentPath(agentId);
   const attachments = [];
   for (const [messageIndex, message] of messages.entries()) {
@@ -53,7 +53,7 @@ async function copyHistory(env: ChatEnv, context: ChatContextState, agentId: str
     const text = typeof message.content === "string" ? message.content :
       message.content.flatMap(block => block.type === "text" ? [block.text] : []).join("\n");
     if (!parseUploadRefs(text).refs.some(ref => ref.kind === "user_upload")) continue;
-    const files = await attachV2Uploads(env, context, agentId, `legacy-${messageIndex}`, text);
+    const files = await attachV2Uploads(env, context, agentId, `${uploadPrefix}-${messageIndex}`, text);
     attachments.push({ messageIndex, files });
   }
   const receipt = await v2Json<{ count: number; receipt: string }>(env, agentPath + "/history/import", {
@@ -196,12 +196,12 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
     }
     if (workspace) {
       const files = await v2Json<{ commit: string }>(env, `/repos/${encodeURIComponent(workspace.repoId)}/ls?at=${encodeURIComponent(target.branch)}`);
-      if (files.commit !== workspace.head && !target.messageCount) return { status: "destination_workspace_changed" };
+      if (files.commit !== workspace.head) return { status: "destination_workspace_changed" };
     }
     if (target.messageCount && target.messageCount !== messages.length) return { status: "destination_changed" };
     const copy = target.messageCount
       ? await verifyHistory(env, targetPath, messages)
-      : await copyHistory(env, context, agentId, `chiridion-v1:${handoff.fencedAgentId}`, messages);
+      : await copyHistory(env, context, agentId, `chiridion-v1:${handoff.fencedAgentId}`, messages, `v1-migration-${crypto.randomUUID()}`);
     const latest = await readV1History(env, sourcePath);
     if (JSON.stringify(latest) !== JSON.stringify(messages)) return { status: "source_changed" };
     if (workspace) {
@@ -215,5 +215,33 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
       configured: { thinkingLevel: model.thinkingLevel, promptVersion: RUNTIME_PROMPT_VERSION },
     });
     return { status: moved ? "moved" : "source_changed", agentId, messages: messages.length, ...copy };
+  }
+
+  /** Read only the thread's own scratch volume, with the v1 credential kept inside the app. */
+  async readV1ThreadVolume(orgId: string, threadId: string, sourceVolume: string, path: string, query: string): Promise<Response> {
+    const env = this.env as unknown as ChatEnv;
+    const org = env.ORG.get(env.ORG.idFromName(orgId));
+    const [thread, row] = await Promise.all([org.getThread(threadId), org.getThreadRuntime(threadId)]);
+    if (!thread || !row?.agentId || row.runtimeVersion || !v2WorkspaceEnabled(env, thread.workspace_id) ||
+        thread.source === "channel" || thread.channel_kind || row.keyScope !== HOSTED_KEY_SCOPE) {
+      return new Response(null, { status: 404 });
+    }
+    const mounts = await runtimeApi(env, "GET", `/v1/agents/${encodeURIComponent(row.agentId)}/mounts`) as
+      Array<{ volumeId: string; path: string; mode: string; subpath?: string }>;
+    if (mounts.length !== 1 || mounts[0]?.volumeId !== sourceVolume || mounts[0].path !== "/workspace" ||
+        mounts[0].mode !== "rw" || mounts[0].subpath) return new Response(null, { status: 404 });
+    const root = `/v1/volumes/${encodeURIComponent(sourceVolume)}`;
+    const url = new URL(root + path, runtimeUrl(env));
+    if (url.pathname !== root && url.pathname !== root + "/snapshots" && url.pathname !== root + "/files" &&
+        !url.pathname.startsWith(root + "/files/")) return new Response(null, { status: 404 });
+    url.search = query;
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${env.AGENT_RUNTIME_API_TOKEN ?? ""}` }, redirect: "manual",
+    });
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel();
+      throw new Error("Unexpected redirect reading the v1 scratch volume");
+    }
+    return response;
   }
 }

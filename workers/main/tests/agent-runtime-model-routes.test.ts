@@ -30,7 +30,6 @@ describe("v2WorkspaceEnabled", () => {
     expect(v2WorkspaceEnabled(production, "ws1")).toBe(true);
     expect(v2WorkspaceEnabled(production, "ws2")).toBe(false);
     expect(v2WorkspaceEnabled(production, undefined)).toBe(false);
-    expect(v2WorkspaceEnabled({ ...production, AGENT_RUNTIME_V2_WORKSPACE: "*" }, "ws1")).toBe(false);
     expect(v2WorkspaceEnabled({}, undefined)).toBe(false);
     expect(v2WorkspaceEnabled({ ...production, AGENT_RUNTIME_V2_WORKSPACE: "ws1, ws3" }, "ws3")).toBe(true);
     expect(v2WorkspaceEnabled({ ...production, AGENT_RUNTIME_V2_WORKSPACE: "ws1, ws3" }, "ws2")).toBe(false);
@@ -41,6 +40,14 @@ describe("v2WorkspaceEnabled", () => {
     expect(v2WorkspaceEnabled(production, "ws1")).toBe(true);
     expect(v2WorkspaceEnabled(production, "ws2")).toBe(true);
     expect(v2WorkspaceEnabled(production, undefined)).toBe(false);
+  });
+
+  it("enables production workspaces when the rollout flag is a wildcard", () => {
+    const production = { WORKER_BASE_URL: "https://camelai.dev", AGENT_RUNTIME_V2_WORKSPACE: "*" };
+    expect(v2WorkspaceEnabled(production, "ws1")).toBe(true);
+    expect(v2WorkspaceEnabled(production, "ws2")).toBe(true);
+    expect(v2WorkspaceEnabled(production, undefined)).toBe(false);
+    expect(v2WorkspaceEnabled({ ...production, WORKER_BASE_URL: "https://dev.camelai.dev" }, "ws1")).toBe(false);
   });
 
   it("accepts the staging wildcard for legacy exports with no saved workspace", () => {

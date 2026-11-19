@@ -1,10 +1,9 @@
 import type { LoaderFunctionArgs } from "react-router";
 import { requireRuntimeThread } from "@/lib/runtime-threads.server";
-import { RUNTIME_BROWSER_READS } from "@/lib/agent-runtime-shared";
+import { RUNTIME_BROWSER_READS, V2_BROWSER_SESSION } from "@/lib/agent-runtime-shared";
 import { getEnv } from "@/lib/cloudflare.server";
 import { isSelfhostRuntime } from "@/lib/selfhost-runtime";
 import { runtimeUrl } from "../../../workers/main/src/agent-runtime/runtime-api";
-import { V2_BROWSER_SESSION } from "../../../workers/main/src/agent-runtime/runtime-v2";
 import { readV2Thread } from "../../../workers/main/src/agent-runtime/v2-thread-read";
 
 /** Request headers a read passes on: the browser token, and what the event stream resumes by. */

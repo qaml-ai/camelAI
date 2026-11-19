@@ -14,7 +14,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { AgentMessage } from "@/lib/agent-messages";
 import type { Message, PreviewTarget } from "@/types";
-import { localToolName, runtimeInputQuestions, runtimeSpendLimitError, type RuntimeInput } from "@/lib/agent-runtime-shared";
+import { localToolName, runtimeInputQuestions, runtimeSpendLimitError, V2_BROWSER_SESSION, type RuntimeInput } from "@/lib/agent-runtime-shared";
 import { latestRuntimeTodos, piRender, type PiRenderMemo } from "@/lib/pi-render";
 import { getPreviewTabId } from "@/components/preview-panel/preview-utils";
 import { watchAgent, type AgentView, type Watcher } from "@camelai/run/watch";
@@ -295,6 +295,7 @@ export function useRuntimeThread(options: {
         url: initial.url,
         agentId,
         token: initial.token,
+        transport: initial.token === V2_BROWSER_SESSION ? "sse" : undefined,
         expiresAt: initial.expiresAt ?? undefined,
         getToken,
         onEvent: (event: { type?: string; index?: unknown }) => {

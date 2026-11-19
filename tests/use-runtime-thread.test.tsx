@@ -46,6 +46,7 @@ vi.mock("@/lib/chat-sse-telemetry", async (importOriginal) => ({
 }));
 
 import { useRuntimeThread, type RuntimeThreadSeed } from "@/lib/use-runtime-thread";
+import { V2_BROWSER_SESSION } from "@/lib/agent-runtime-shared";
 
 const fetchCalls: Array<{ url: string; method: string; body: any }> = [];
 let responses: Record<string, unknown> = {};
@@ -128,6 +129,7 @@ describe("useRuntimeThread", () => {
     await waitFor(() => expect(callbacks.current.onOpen).toHaveBeenCalled());
     await waitFor(() => expect(watchers).toHaveLength(1));
     expect(watchers[0].options).toMatchObject({ url: "https://agents.test", agentId: "agt_1", token: "abt_seed" });
+    expect(watchers[0].options.transport).toBeUndefined();
     expect(fetchCalls).toHaveLength(0);
 
     act(() => watchers[0].emit({
@@ -139,6 +141,17 @@ describe("useRuntimeThread", () => {
     await waitFor(() => expect(result.current.chat.isStreaming).toBe(true));
     // A response after a finished answer is a new turn (a run no message of ours started).
     expect(result.current.chat.streamingMessageId).toBe("rt:2");
+  });
+
+  it("keeps v2 watchers on SSE through reconnection", async () => {
+    const url = "/api/threads/t1/runtime/w1";
+    responses["/api/threads/t1/token"] = { token: V2_BROWSER_SESSION, expiresAt: Date.now() + 900_000, url, agentId: "agt_1" };
+    mount({ ...seed, token: V2_BROWSER_SESSION, url });
+    await waitFor(() => expect(watchers).toHaveLength(1));
+    expect(watchers[0].options.transport).toBe("sse");
+    act(() => watchers[0].emit({ expired: true, connected: false }));
+    await waitFor(() => expect(watchers).toHaveLength(2), { timeout: 3_000 });
+    expect(watchers[1].options.transport).toBe("sse");
   });
 
   it("recovers a null seed page through the watcher using the successful seed token", async () => {

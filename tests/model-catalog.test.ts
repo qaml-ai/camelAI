@@ -62,8 +62,11 @@ describe('MODEL_CATALOG', () => {
     expect(
       OPENAI_COMPATIBLE_LLM_MODEL_OPTIONS.find(
         (option) => option.value === 'deepseek-v4-auto',
-      )?.label,
-    ).toBe('camelCode');
+      ),
+    ).toMatchObject({
+      label: 'camelCode',
+      description: 'Free coding model. New chats use GPT-6.2 Sol.',
+    });
   });
 
   it('has one entry for every supported LlmModel', () => {

@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { runtimeModelRoute } from "../src/agent-runtime/model-routes";
 import { PiModelMapping } from "../src/pi-model-resolution";
 import type { PiResolvedModelConfig } from "../src/chat-thread/pi-model-config";
-import { resolveThreadRuntimeRoute } from "../src/agent-runtime/run-gates";
+import { resolveThreadRuntimeRoute, runtimeAgentModel } from "../src/agent-runtime/run-gates";
 import { v2WorkspaceEnabled } from "../src/agent-runtime/runtime-api";
 
 const b64url = (value: unknown) => btoa(JSON.stringify(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -58,7 +58,7 @@ describe("v2WorkspaceEnabled", () => {
 });
 
 describe("runtimeModelRoute", () => {
-  it.each([true, false])("runs camelCode on DeepSeek Flash on the platform's Azure deployment (free tier: %s)", async (freeTier) => {
+  it.each([true, false])("runs camelCode on GPT-6.2 Sol on the platform's Azure deployment (free tier: %s)", async (freeTier) => {
     const orgStub = {
       getThread: async () => ({ model: "deepseek-v4-auto", workspace_id: "ws1" }),
       getInfo: async () => ({ billing_status: freeTier ? "inactive" : "active", billing_plan: "payg" }),
@@ -75,8 +75,8 @@ describe("runtimeModelRoute", () => {
     expect(resolved.usageProvider).toBe("compat");
     expect(threadModel).toBe("deepseek-v4-auto");
     expect(resolved.creditChargeable).toBe(false);
-    expect(route)
-      .toEqual({ kind: "scope", model: "azure/deepseek-v4.1-flash", keyScope: "hosted" });
+    expect(route).toEqual({ kind: "scope", model: "azure/gpt-6.2-sol", keyScope: "hosted" });
+    expect(runtimeAgentModel(context, route!, threadModel)).toMatchObject({ thinkingLevel: "low" });
   });
 
   it("runs hosted models with the hosted key scope and their OpenRouter id", () => {

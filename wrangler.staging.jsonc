@@ -41,6 +41,7 @@
     // next opened or sent to: agent-runtime/thread-migration.ts).
     "AGENT_RUNTIME_TENANT": "chiridion-staging",
     "AGENT_RUNTIME_DEFINITION": "def_afd1ef916ceb70b5f97e",
+    "AGENT_RUNTIME_V2_ADDITIONAL_MODELS": "azure/gpt-6.2-sol",
     // Static-IP database egress relay (docs/db-egress-relay.md). SOCKS + Access
     // service-token credentials are secrets (DB_EGRESS_RELAY_SOCKS_* /
     // DB_EGRESS_RELAY_ACCESS_*); this hostname is the tunnel public host gost

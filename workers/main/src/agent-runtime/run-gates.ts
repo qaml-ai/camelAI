@@ -20,6 +20,7 @@ import { getEffectiveLlmProviderConfig, isSelfhostRuntime } from "../../../../sr
 import { connectionsBindingEnabled } from "../../../../src/lib/connections-binding";
 import type { LlmModel } from "../../../../src/types";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types";
+import type { ThreadRuntimeRecord } from "../identity/org-do";
 import {
   checkHostedPiModelAccess,
   HostedModelFallbackRequiredError,
@@ -36,7 +37,7 @@ import { assertUserLlmUsageAccess, UserLlmUsageLimitError } from "../user-llm-us
 import { createPiSystemPrompt } from "../pi-system-prompt";
 import { resolveAgentSkillCatalog } from "../selfhost-agent-pack";
 import { RUNTIME_PROMPT_PREAMBLE, type RuntimeRunConfig } from "./runtime-prompt";
-import { runtimeModelRoute, v2HostedModelMatches, type RuntimeModelRoute } from "./model-routes";
+import { CAMEL_CODE_RUNTIME_MODEL, runtimeModelRoute, v2HostedModelMatches, type RuntimeModelRoute } from "./model-routes";
 import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, selfhostOperatorEndpointOrigin, syncOrgKeyScope } from "./key-scopes";
 
 type OrgInfoLike = {
@@ -135,7 +136,7 @@ function orgStub(env: ChatEnv, orgId: string): OrgStub {
 export async function resolveThreadRuntimeRoute(
   env: ChatEnv,
   context: ChatContextState,
-  options: { persistFallback?: boolean; allowFallback?: boolean } = {},
+  options: { persistFallback?: boolean; allowFallback?: boolean; configuredModel?: string | null } = {},
 ): Promise<ThreadRuntimeRoute> {
   const org = orgStub(env, context.orgId);
   const [thread, llmProviderRecord, orgInfo] = await Promise.all([
@@ -191,6 +192,7 @@ export async function resolveThreadRuntimeRoute(
   const route = runtimeModelRoute(config, {
     orgId: context.orgId,
     threadModel,
+    configuredModel: options.configuredModel,
     freeTier: isCreditFreeHostedModel(threadModel),
     operatorEndpointOrigin: selfhostOperatorEndpointOrigin(env),
   });
@@ -206,7 +208,7 @@ export class RuntimeRunRefused extends Error {
 
 export interface PreparedRuntimeRun extends RuntimeRunConfig {
   threadModel: LlmModel;
-  thinkingLevel: "medium" | "high";
+  thinkingLevel: RuntimeAgentModel["thinkingLevel"];
   fallback: ThreadModelFallback | null;
 }
 
@@ -237,19 +239,23 @@ export async function prepareThreadRuntimeRun(
   env: ChatEnv,
   context: ChatContextState,
   userId: string | null,
+  placement: Pick<ThreadRuntimeRecord, "agentId" | "runtimeVersion" | "model" | "keyScope">,
   timings?: SendTimings,
-  runtimeVersion?: "v2",
 ): Promise<PreparedRuntimeRun> {
+  const { runtimeVersion } = placement;
   let resolved: ThreadRuntimeRoute;
   try {
-    resolved = await timed(timings, "route", () => resolveThreadRuntimeRoute(env, context, runtimeVersion ? { persistFallback: false } : undefined));
+    resolved = await timed(timings, "route", () => resolveThreadRuntimeRoute(env, context, {
+      persistFallback: runtimeVersion === "v2" ? false : undefined,
+      configuredModel: placement.agentId && placement.keyScope === HOSTED_KEY_SCOPE ? placement.model : undefined,
+    }));
   } catch (error) {
     if (error instanceof HostedModelFallbackRequiredError) throw new RuntimeRunRefused(error.message, "hosted_access");
     throw error;
   }
   const { route, config, threadModel, fallback } = resolved;
   if (!route) throw new RuntimeRunRefused("This thread's model cannot run on the agent runtime; switch models to continue.", "no_route");
-  if (runtimeVersion === "v2" && !v2HostedModelMatches(route, env.AGENT_RUNTIME_V2_MODELS)) {
+  if (runtimeVersion === "v2" && !v2HostedModelMatches(route, env)) {
     throw new RuntimeRunRefused("Choose a hosted model enabled for v2 to continue this thread.", "no_route");
   }
   const org = orgStub(env, context.orgId);
@@ -303,7 +309,7 @@ export interface RuntimeAgentModel {
   model: string;
   keyScope: string | null;
   modelHeaders: Record<string, string> | null;
-  thinkingLevel: "medium" | "high";
+  thinkingLevel: "low" | "medium" | "high";
 }
 
 export function runtimeAgentModel(context: ChatContextState, route: RuntimeModelRoute, threadModel: LlmModel): RuntimeAgentModel {
@@ -311,7 +317,7 @@ export function runtimeAgentModel(context: ChatContextState, route: RuntimeModel
     model: route.model,
     keyScope: route.kind === "scope" ? route.keyScope : null,
     modelHeaders: route.kind === "scope" && route.keyScope === HOSTED_KEY_SCOPE ? hostedModelHeaders(context) : null,
-    thinkingLevel: primaryPiThinkingLevel(threadModel),
+    thinkingLevel: route.model === CAMEL_CODE_RUNTIME_MODEL ? "low" : primaryPiThinkingLevel(threadModel),
   };
 }
 

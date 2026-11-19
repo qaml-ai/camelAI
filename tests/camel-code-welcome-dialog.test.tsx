@@ -20,7 +20,7 @@ describe("CamelCodeWelcomeDialog", () => {
       screen.getByRole("heading", { name: "You're on camelCode" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/self-hosted model, camelCode/),
+      screen.getByText(/our free coding model\. New chats use GPT-6\.2 Sol/),
     ).toBeInTheDocument();
     expect(
       screen.getByText(/priority access to camelCode/),

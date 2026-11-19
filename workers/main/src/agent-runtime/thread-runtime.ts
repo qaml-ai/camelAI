@@ -99,7 +99,7 @@ export async function pinNewThreadToRuntime(
   if (!route) return null;
   const org = orgStub(env, context.orgId);
   const canary = options.web && v2WorkspaceEnabled(env, context.workspaceId) &&
-    v2HostedModelMatches(route, env.AGENT_RUNTIME_V2_MODELS);
+    v2HostedModelMatches(route, env);
   const firstMessage = options.pendingFirstMessage ?? null;
   const pinned = canary
     ? await org.pinThreadRuntime(context.threadId, firstMessage, "v2")
@@ -297,7 +297,7 @@ export async function prewarmThreadAgent(
     }
     let run: PreparedRuntimeRun;
     try {
-      run = await prepareThreadRuntimeRun(env, context, userId, undefined, row.runtimeVersion);
+      run = await prepareThreadRuntimeRun(env, context, userId, row);
     } catch (error) {
       if (!(error instanceof RuntimeRunRefused)) throw error;
       recordRuntimeAgentPrewarm(env, context, { status: "refused", code: error.code, durationMs: Date.now() - startedAt });
@@ -470,7 +470,7 @@ async function sendRuntimeTurn(
   if (!text) return { status: "error", error: "Empty message" };
   const [banned, prepared] = await Promise.all([
     timed(timings, "ban", () => isOrgBanned(env.APP_KV, { orgId: context.orgId })),
-    timed(timings, "prepare", () => prepareThreadRuntimeRun(env, context, sender.userId, timings, input.row.runtimeVersion)).then(
+    timed(timings, "prepare", () => prepareThreadRuntimeRun(env, context, sender.userId, input.row, timings)).then(
       (run) => ({ run }),
       (error: unknown) => {
         if (error instanceof RuntimeRunRefused) return { refused: error };

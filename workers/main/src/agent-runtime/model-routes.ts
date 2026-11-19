@@ -19,6 +19,7 @@
  * `bedrock-openai-<region>/<model id>`.
  */
 import type { PiResolvedModelConfig } from "../chat-thread/pi-model-config";
+import type { ChatEnv } from "../chat-thread/types";
 import { CAMEL_CODE_LLM_MODEL } from "../../../../src/lib/llm-provider-config";
 import { codexRoute } from "./codex-forwarder";
 import {
@@ -35,9 +36,13 @@ export type RuntimeModelRoute =
   | { kind: "scope"; model: string; keyScope: string }
   | { kind: "codex"; model: string };
 
-export function v2HostedModelMatches(route: RuntimeModelRoute, models: string | undefined): boolean {
+export function v2HostedModelMatches(
+  route: RuntimeModelRoute,
+  env: Pick<ChatEnv, "AGENT_RUNTIME_V2_MODELS" | "AGENT_RUNTIME_V2_ADDITIONAL_MODELS">,
+): boolean {
   return route.kind === "scope" && route.keyScope === HOSTED_KEY_SCOPE &&
-    (models?.split(",").some((model) => model.trim() === route.model) ?? false);
+    [env.AGENT_RUNTIME_V2_MODELS, env.AGENT_RUNTIME_V2_ADDITIONAL_MODELS]
+      .some((models) => models?.split(",").some((model) => model.trim() === route.model));
 }
 
 /** The tenant model endpoint in the runtime that is chiridion's Codex forwarder. */
@@ -51,33 +56,41 @@ export const RUNTIME_MODEL_ENDPOINT = "chiridion";
 export const FREE_TIER_RUNTIME_MODEL = "openrouter/openai/gpt-6-luna";
 
 /**
- * camelCode's hosted runtime model, independent of its legacy gateway route:
- * DeepSeek V4.1 Flash on camelRun's platform Azure deployment (paid from Azure
- * credits). The hosted key scope holds no `azure` entry, so the runtime calls
- * it on the platform's key, which chiridion's admin tenant uses (it is unbilled
- * and does not set `platformKeys: false`).
+ * camelCode uses camelRun's platform Azure deployment. The hosted key scope
+ * holds no `azure` entry, so camelRun uses its platform credential.
  */
-export const CAMEL_CODE_RUNTIME_MODEL = "azure/deepseek-v4.1-flash";
+export const CAMEL_CODE_RUNTIME_MODEL = "azure/gpt-6.2-sol";
+
+/** The prior Azure route, retained for existing camelCode agents. */
+export const PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL = "azure/deepseek-v4.1-flash";
 
 /**
- * camelCode's runtime model until 2026-10-28 (now CAMEL_CODE_RUNTIME_MODEL),
- * and still the runtime's content-filter fallback for it: a request Azure's
- * content filter blocks is made again on this model, on the hosted scope's
- * OpenRouter key (camelRun's AGENT_CONTENT_FILTER_FALLBACKS default). usage.ts
- * treats its usage as free, as camelCode's.
+ * camelCode's prior OpenRouter model and the legacy Azure DeepSeek route's
+ * content-filter fallback. Delayed usage on that route stays credit-free.
  */
 export const PREVIOUS_CAMEL_CODE_RUNTIME_MODEL = "openrouter/deepseek/deepseek-v4.1-flash-1017:nitro";
 
+export const PREVIOUS_CAMEL_CODE_RUNTIME_MODELS = [
+  PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL,
+  PREVIOUS_CAMEL_CODE_RUNTIME_MODEL,
+  FREE_TIER_RUNTIME_MODEL,
+] as const;
+
+export function isPreviousCamelCodeRuntimeModel(model: string | null | undefined): model is typeof PREVIOUS_CAMEL_CODE_RUNTIME_MODELS[number] {
+  return PREVIOUS_CAMEL_CODE_RUNTIME_MODELS.some((previous) => previous === model);
+}
+
 /**
  * The most context one camelCode request carries: the runtime compacts before
- * a request would pass it, well below the model's 1M window, since each
- * request reads (and pays for) its whole context.
+ * a request would pass it, below Azure's 272K long-context pricing threshold.
  */
 export const CAMEL_CODE_CONTEXT_TOKENS = 262_144;
 
 /** The runtime run limits an agent on `model` gets of chiridion's own: only camelCode has any. */
 export function runtimeRunLimits(model: string | null | undefined): { contextTokens: number } | null {
-  return model === CAMEL_CODE_RUNTIME_MODEL ? { contextTokens: CAMEL_CODE_CONTEXT_TOKENS } : null;
+  return model === CAMEL_CODE_RUNTIME_MODEL || model === PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL
+    ? { contextTokens: CAMEL_CODE_CONTEXT_TOKENS }
+    : null;
 }
 
 /**
@@ -132,6 +145,8 @@ export function runtimeModelRoute(
     freeTier?: boolean;
     /** Persisted picker id, after any hosted-credit fallback. */
     threadModel?: string;
+    /** Model of an already configured hosted agent. */
+    configuredModel?: string | null;
     /**
      * The origin of a self-host operator's own custom endpoint
      * (key-scopes.ts, selfhostOperatorEndpointOrigin), the one endpoint the
@@ -143,7 +158,11 @@ export function runtimeModelRoute(
   const { model } = config;
   if (model.provider === "cloudflare-ai-gateway") {
     if (context.threadModel === CAMEL_CODE_LLM_MODEL) {
-      return { kind: "scope", model: CAMEL_CODE_RUNTIME_MODEL, keyScope: HOSTED_KEY_SCOPE };
+      const previous = context.configuredModel;
+      const hostedModel = isPreviousCamelCodeRuntimeModel(previous)
+        ? previous
+        : CAMEL_CODE_RUNTIME_MODEL;
+      return { kind: "scope", model: hostedModel, keyScope: HOSTED_KEY_SCOPE };
     }
     if (context.freeTier && config.usageProvider === "compat") {
       return { kind: "scope", model: FREE_TIER_RUNTIME_MODEL, keyScope: HOSTED_KEY_SCOPE };

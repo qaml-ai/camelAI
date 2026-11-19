@@ -11,6 +11,12 @@ import { MAX_IMPORT_BYTES, migrationSubject } from "./thread-migration";
 import { RUNTIME_PROMPT_VERSION } from "./runtime-prompt";
 
 type ImportMessage = { role: string; content: string | Array<{ type: string; text?: string }> };
+type V1Handoff = { phase: "inspect" } | { phase: "prepare" } | {
+  phase: "publish";
+  fencedAgentId: string;
+  workspace?: { volume: string; repoId: string; seq: number; head: string };
+};
+
 
 async function readV1History(env: ChatEnv, agentPath: string): Promise<ImportMessage[]> {
   const messages: ImportMessage[] = [];
@@ -133,14 +139,14 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
     }
   }
 
-  /** The operator holds the v1 run-admission fence for the named source until this call settles. */
-  async moveIdleV1Thread(orgId: string, threadId: string, fencedAgentId?: string) {
+  /** The operator fences the source and verifies the workspace copy before requesting publication. */
+  async moveIdleV1Thread(orgId: string, threadId: string, handoff: V1Handoff = { phase: "inspect" }) {
     const env = this.env as unknown as ChatEnv;
     const org = env.ORG.get(env.ORG.idFromName(orgId));
     const [thread, row] = await Promise.all([org.getThread(threadId), org.getThreadRuntime(threadId)]);
     if (!thread || !row?.agentId) return { status: "missing" };
     if (row.runtimeVersion === "v2") return { status: "v2", agentId: row.agentId };
-    if (fencedAgentId && row.agentId !== fencedAgentId) return { status: "source_changed" };
+    if (handoff.phase === "publish" && row.agentId !== handoff.fencedAgentId) return { status: "source_changed" };
     if (!v2WorkspaceEnabled(env, thread.workspace_id)) return { status: "workspace_disabled" };
     if (thread.source === "channel" || thread.channel_kind || row.keyScope !== HOSTED_KEY_SCOPE) return { status: "ineligible" };
     if (row.pendingFirstMessage) return { status: "pending_first_message" };
@@ -161,28 +167,49 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
 
     const sourcePath = `/v1/agents/${encodeURIComponent(row.agentId)}`;
     const [mounts, state, pending] = await Promise.all([
-      runtimeApi(env, "GET", sourcePath + "/mounts") as Promise<unknown[]>,
+      runtimeApi(env, "GET", sourcePath + "/mounts") as Promise<Array<{ volumeId: string; path: string; mode: string; subpath?: string }>>,
       runtimeApi(env, "GET", sourcePath + "/state") as Promise<{ requests: Array<{ state: string }> }>,
       runtimeApi(env, "GET", sourcePath + "/inputs?state=pending") as Promise<unknown[]>,
     ]);
-    if (mounts.length) return { status: "mounted_workspace" };
+    const mount = mounts[0];
+    if (mounts.length > 1 || (mount && (mount.path !== "/workspace" || mount.mode !== "rw" || mount.subpath))) {
+      return { status: "unsupported_mounts" };
+    }
     if (pending.length || state.requests.some(({ state }) => state === "running" || state === "queued")) return { status: "busy" };
     const messages = await readV1History(env, sourcePath);
     if (!messages.length && (thread.user_message_count ?? 0) > 0) return { status: "missing_history" };
-    if (!fencedAgentId) return { status: "ready", agentId: row.agentId, model: model.model, messages: messages.length };
+    if (handoff.phase === "inspect") {
+      return { status: "ready", agentId: row.agentId, model: model.model, messages: messages.length, volume: mount?.volumeId };
+    }
 
     const agentId = await createV2ThreadAgent(env, context, subject, model.model);
     const targetPath = v2AgentPath(agentId);
     const target = await v2Json<V2Agent & { messageCount: number }>(env, targetPath);
     if (target.activeRunId || target.lastRun) return { status: "destination_active" };
+    if (handoff.phase === "prepare") {
+      const repo = mount && await v2Json<{ repoId: string; branch: string }>(env, targetPath + "/repo", { method: "PUT" });
+      return { status: "prepared", agentId, sourceAgentId: row.agentId, volume: mount?.volumeId, repo: repo || null };
+    }
+    const workspace = handoff.workspace;
+    if (mount?.volumeId !== workspace?.volume || (workspace && target.repoId !== workspace.repoId)) {
+      return { status: "workspace_copy_required" };
+    }
+    if (workspace) {
+      const files = await v2Json<{ commit: string }>(env, `/repos/${encodeURIComponent(workspace.repoId)}/ls?at=${encodeURIComponent(target.branch)}`);
+      if (files.commit !== workspace.head && !target.messageCount) return { status: "destination_workspace_changed" };
+    }
     if (target.messageCount && target.messageCount !== messages.length) return { status: "destination_changed" };
     const copy = target.messageCount
       ? await verifyHistory(env, targetPath, messages)
-      : await copyHistory(env, context, agentId, `chiridion-v1:${fencedAgentId}`, messages);
+      : await copyHistory(env, context, agentId, `chiridion-v1:${handoff.fencedAgentId}`, messages);
     const latest = await readV1History(env, sourcePath);
     if (JSON.stringify(latest) !== JSON.stringify(messages)) return { status: "source_changed" };
+    if (workspace) {
+      const volume = await runtimeApi(env, "GET", `/v1/volumes/${encodeURIComponent(workspace.volume)}`) as { seq: number };
+      if (volume.seq !== workspace.seq) return { status: "source_workspace_changed" };
+    }
     const moved = await org.publishV1ThreadInV2(threadId, {
-      agentId: fencedAgentId, workspaceId: thread.workspace_id, threadModel: thread.model ?? null, updatedAt: row.updatedAt,
+      agentId: handoff.fencedAgentId, workspaceId: thread.workspace_id, threadModel: thread.model ?? null, updatedAt: row.updatedAt,
     }, {
       agentId, model: model.model, keyScope: HOSTED_KEY_SCOPE,
       configured: { thinkingLevel: model.thinkingLevel, promptVersion: RUNTIME_PROMPT_VERSION },

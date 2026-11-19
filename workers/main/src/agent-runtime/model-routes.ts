@@ -70,6 +70,16 @@ export const PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL = "azure/deepseek-v4.1-flas
  */
 export const PREVIOUS_CAMEL_CODE_RUNTIME_MODEL = "openrouter/deepseek/deepseek-v4.1-flash-1017:nitro";
 
+export const PREVIOUS_CAMEL_CODE_RUNTIME_MODELS = [
+  PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL,
+  PREVIOUS_CAMEL_CODE_RUNTIME_MODEL,
+  FREE_TIER_RUNTIME_MODEL,
+] as const;
+
+export function isPreviousCamelCodeRuntimeModel(model: string | null | undefined): model is typeof PREVIOUS_CAMEL_CODE_RUNTIME_MODELS[number] {
+  return PREVIOUS_CAMEL_CODE_RUNTIME_MODELS.some((previous) => previous === model);
+}
+
 /**
  * The most context one camelCode request carries: the runtime compacts before
  * a request would pass it, below Azure's 272K long-context pricing threshold.
@@ -149,7 +159,7 @@ export function runtimeModelRoute(
   if (model.provider === "cloudflare-ai-gateway") {
     if (context.threadModel === CAMEL_CODE_LLM_MODEL) {
       const previous = context.configuredModel;
-      const hostedModel = previous === PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL || previous === PREVIOUS_CAMEL_CODE_RUNTIME_MODEL
+      const hostedModel = isPreviousCamelCodeRuntimeModel(previous)
         ? previous
         : CAMEL_CODE_RUNTIME_MODEL;
       return { kind: "scope", model: hostedModel, keyScope: HOSTED_KEY_SCOPE };

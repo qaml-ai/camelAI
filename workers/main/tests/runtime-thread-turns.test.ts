@@ -13,7 +13,7 @@ import { buildWorkspaceScopedR2Key } from "../../../src/lib/workspace-r2-paths";
 import type { ChatEnv } from "../src/chat-thread/types";
 import { RUNTIME_PROMPT_VERSION } from "../src/agent-runtime/runtime-prompt";
 import { CAMEL_CODE_LLM_MODEL } from "../../../src/lib/llm-provider-config";
-import { CAMEL_CODE_RUNTIME_MODEL, PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL } from "../src/agent-runtime/model-routes";
+import { CAMEL_CODE_RUNTIME_MODEL, PREVIOUS_CAMEL_CODE_RUNTIME_MODELS, PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL } from "../src/agent-runtime/model-routes";
 import {
   abortRuntimeThread,
   answerRuntimeInput,
@@ -269,7 +269,7 @@ describe("startRuntimeTurn", () => {
     expect(configure.body).toHaveProperty("runLimits", null);
   });
 
-  it.each([false, true])("uses Sol for a new v2 camelCode agent and keeps the existing one (configured: %s)", async (configured) => {
+  it.each([null, ...PREVIOUS_CAMEL_CODE_RUNTIME_MODELS])("uses Sol for a new v2 camelCode agent and keeps the existing model (%s)", async (configured) => {
     const setup = await runtimeThread();
     const { orgStub, context, sender } = setup;
     const thread = await orgStub.createThread(context.workspaceId, "V2 camelCode", sender.userId);
@@ -277,7 +277,7 @@ describe("startRuntimeTurn", () => {
     await orgStub.pinThreadRuntime(thread.id, null, "v2");
     if (configured) {
       await orgStub.setThreadRuntimeAgent(thread.id, {
-        agentId: "agt_1", model: PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL, keyScope: "hosted",
+        agentId: "agt_1", model: configured, keyScope: "hosted",
         configured: { promptVersion: RUNTIME_PROMPT_VERSION, thinkingLevel: "high" },
       });
     }
@@ -285,7 +285,7 @@ describe("startRuntimeTurn", () => {
       ...runtimeEnv, CF_ACCOUNT_ID: "acct", CF_GATEWAY_NAME: "gw", AI_GATEWAY_AUTH_TOKEN: "gw-token",
       WORKER_BASE_URL: "https://camelai.dev", AGENT_RUNTIME_V2_TENANT: "test-v2", AGENT_RUNTIME_V2_API_TOKEN: "test-key",
       AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET: "test-secret",
-      AGENT_RUNTIME_V2_MODELS: PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL,
+      AGENT_RUNTIME_V2_MODELS: PREVIOUS_CAMEL_CODE_RUNTIME_MODELS.join(","),
       AGENT_RUNTIME_V2_ADDITIONAL_MODELS: CAMEL_CODE_RUNTIME_MODEL,
     };
     const agentPath = `/v2/agents/chiridion-thread-${thread.id}`;
@@ -303,7 +303,7 @@ describe("startRuntimeTurn", () => {
       : [`PUT ${agentPath}`, "POST /v2/agents/agt_1/runs"]);
     if (!configured) expect(calls[0].body).toMatchObject({ model: CAMEL_CODE_RUNTIME_MODEL });
     expect(await orgStub.getThreadRuntime(thread.id)).toMatchObject({
-      agentId: "agt_1", model: configured ? PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL : CAMEL_CODE_RUNTIME_MODEL,
+      agentId: "agt_1", model: configured ?? CAMEL_CODE_RUNTIME_MODEL,
     });
   });
 

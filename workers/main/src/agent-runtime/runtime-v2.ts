@@ -8,7 +8,6 @@ import { isUnsafeUploadPath } from "../file-safety";
 import { RuntimeApiError, v2RuntimeUrl } from "./runtime-api";
 import { runtimeSystemPromptAppend } from "./run-gates";
 
-export const V2_BROWSER_SESSION = "chiridion-v2-session";
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 
 export interface V2Input {

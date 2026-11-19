@@ -33,6 +33,9 @@ export function runtimeDirectThreadsEnabled(env: {
 /** The agent reads a browser token allows, which chiridion's read proxy passes through. */
 export const RUNTIME_BROWSER_READS: ReadonlySet<string> = new Set(["events", "history", "state", "inputs"]);
 
+/** The browser marker for v2 reads authenticated by the Chiridion session. */
+export const V2_BROWSER_SESSION = "chiridion-v2-session";
+
 /**
  * Where the browser reads a runtime thread's agent when the runtime is
  * private (self-host): through chiridion, at this base on its own origin

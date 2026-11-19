@@ -8,7 +8,7 @@
  * token after the caller checked access.
  */
 import { resolveMessageAuthorDisplayName } from "../../../../src/lib/message-author";
-import { SCRATCH_MOUNT, runtimeDirectThreadsEnabled as directThreadsEnabled, type RuntimeInputAnswer } from "../../../../src/lib/agent-runtime-shared";
+import { SCRATCH_MOUNT, V2_BROWSER_SESSION, runtimeDirectThreadsEnabled as directThreadsEnabled, type RuntimeInputAnswer } from "../../../../src/lib/agent-runtime-shared";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types";
 import type { ThreadRuntimeRecord } from "../identity/org-do";
 import { ChatThreadMetadata, type ChatThreadMetadataEnv } from "../chat-thread/metadata";
@@ -23,7 +23,7 @@ import { HOSTED_KEY_SCOPE } from "./key-scopes";
 import { runtimeRunLimits, v2HostedModelMatches } from "./model-routes";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
 import { RuntimeApiError, runtimeApi, runtimeUrl, v2WorkspaceEnabled } from "./runtime-api";
-import { attachV2Uploads, createV2ThreadAgent, V2_BROWSER_SESSION, v2AgentPath, v2Json, type V2Run } from "./runtime-v2";
+import { attachV2Uploads, createV2ThreadAgent, v2AgentPath, v2Json, type V2Run } from "./runtime-v2";
 import { codexError, codexRoute, codexUpstreamCall, forwardedResponseHeaders } from "./codex-forwarder";
 import { HostedModelFallbackRequiredError } from "../chat-thread/pi-model-config";
 import { assertUserLlmUsageAccess, UserLlmUsageLimitError } from "../user-llm-usage-policy";

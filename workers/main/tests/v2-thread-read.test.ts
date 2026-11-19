@@ -45,9 +45,13 @@ it("delivers a tool snapshot and a text delta while the run is still active", as
       ));
     },
   });
-  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => String(input).endsWith("after=latest")
-    ? Response.json({ nextAfter: 1 })
-    : new Response(pending, { headers: { "content-type": "text/event-stream" } }));
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const query = new URL(String(input)).searchParams;
+    if (query.get("after") === "latest") return Response.json({ nextAfter: 1 });
+    expect(query.get("after")).toBe("1");
+    expect(query.get("follow")).toBe("1");
+    return new Response(pending, { headers: { "content-type": "text/event-stream" } });
+  });
   const response = await readV2Thread(env, agentId, "viewer", "events", request("events"));
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();

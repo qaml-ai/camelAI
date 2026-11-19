@@ -143,7 +143,7 @@ async function v2Events(env: ChatEnv, agentId: string, viewer: string, req: Requ
     }
     return Response.json({ cursor: page.nextAfter, events }, { headers: { "Cache-Control": "no-store" } });
   }
-  const upstream = await v2Fetch(env, resource + "?after=" + cursor, { signal, headers: { Accept: "text/event-stream" } });
+  const upstream = await v2Fetch(env, resource + "?after=" + cursor + "&follow=1", { signal, headers: { Accept: "text/event-stream" } });
   if (!upstream.ok || !upstream.body || !upstream.headers.get("content-type")?.includes("text/event-stream")) {
     await upstream.body?.cancel();
     return Response.json({ error: "Could not open the v2 event stream" }, { status: 502 });

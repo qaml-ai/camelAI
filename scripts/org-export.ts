@@ -7,7 +7,7 @@
  * Base URL: WORKER_BASE_URL in wrangler.<env>.jsonc. See ORG_EXPORT.md.
  */
 import path from 'node:path';
-import { ExportClient, ExportWriter, EXPORT_USAGE, accessHeaders, parseExportArgs, redactError } from './lib/org-export';
+import { ExportClient, ExportWriter, EXPORT_USAGE, accessHeaders, exitNonZeroIfUnsettled, parseExportArgs, redactError } from './lib/org-export';
 import { findExportDirectory, finishExport, walkExport } from './lib/org-export-run';
 
 const envSecrets = () => ['ADMIN_API_KEY', 'CF_ACCESS_TOKEN', 'CF_ACCESS_CLIENT_ID', 'CF_ACCESS_CLIENT_SECRET'].map(name => process.env[name]?.trim() ?? '');
@@ -31,7 +31,9 @@ async function main() {
   console.log(`${result.archive}: ${Object.keys(writer.state.finished).length} completed items; ${result.warnings} warnings. See manifest.json.`);
   return result.warnings ? 1 : 0;
 }
-main().then(code => { process.exitCode = code; }).catch(error => {
+const task = main();
+exitNonZeroIfUnsettled(task, 'The export stopped before it finished: a request never completed. Run the same command again to resume from the checkpoint.');
+task.then(code => { process.exitCode = code; }).catch(error => {
   console.error(`${redactError(error, envSecrets())}\n${EXPORT_USAGE}`);
   process.exitCode = 1;
 });

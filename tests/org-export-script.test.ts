@@ -1,15 +1,21 @@
 /** Offline operator-script tests; fake HTTP, local files and local tar only. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { ExportClient, ExportHttpError, ExportWriter, accessHeaders, boundedMap, command, digest, listLocalFiles, parseExportArgs, portableSegment, redactError, retry, writeChecksums } from '../scripts/lib/org-export';
+import { ExportClient, ExportHttpError, ExportWriter, accessHeaders, boundedMap, command, digest, exitNonZeroIfUnsettled, listLocalFiles, parseExportArgs, portableSegment, redactError, retry, writeChecksums } from '../scripts/lib/org-export';
 import { exportGit, exportHistory, findExportDirectory, finishExport, walkExport } from '../scripts/lib/org-export-run';
 
 const roots: string[] = [];
 async function writer() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'org-export-test-')); roots.push(root);
   return ExportWriter.open(path.join(root, 'camelai-export-org-20260101'), 'org', 'https://api.invalid', ['admin-secret', 'git-secret']);
+}
+function stalledDownload() {
+  return new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new TextEncoder().encode('partial')); },
+    cancel: () => new Promise<void>(() => {}),
+  }));
 }
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
 
@@ -119,6 +125,27 @@ describe('portable output paths', () => {
 });
 
 describe('resumption, retries and warnings', () => {
+  it('exits non-zero with a message when the export is still pending at beforeExit', () => {
+    const exitCode = process.exitCode, error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const cleanup = exitNonZeroIfUnsettled(new Promise(() => {}), 'Export stopped');
+    try {
+      process.exitCode = 0;
+      process.emit('beforeExit', 0);
+      expect(process.exitCode).toBe(1); expect(error).toHaveBeenCalledWith('Export stopped');
+    } finally { cleanup(); error.mockRestore(); process.exitCode = exitCode; }
+  });
+  it('removes the beforeExit listener once the export has settled', async () => {
+    const listeners = process.listeners('beforeExit'), exitCode = process.exitCode;
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {}), task = Promise.resolve();
+    const cleanup = exitNonZeroIfUnsettled(task, 'Export stopped');
+    try {
+      process.exitCode = 0;
+      await task;
+      expect(process.listeners('beforeExit')).toEqual(listeners);
+      process.emit('beforeExit', 0);
+      expect(process.exitCode).toBe(0); expect(error).not.toHaveBeenCalled();
+    } finally { cleanup(); error.mockRestore(); process.exitCode = exitCode; }
+  });
   it('skips completed items, retries failures and recovers missing files', async () => {
     const w = await writer(), action = vi.fn(async () => w.write('file.txt', 'value'));
     await w.item('file', ['file.txt'], action); await w.item('file', ['file.txt'], action); expect(action).toHaveBeenCalledTimes(1);
@@ -136,6 +163,27 @@ describe('resumption, retries and warnings', () => {
     expect(await retry(work, { sleep })).toBe('ok'); expect(sleep.mock.calls.map(call => call[0])).toEqual([2000, 1000, 2000]);
     const permanent = vi.fn(async () => { throw new ExportHttpError(403); });
     await expect(retry(permanent, { sleep })).rejects.toThrow('403'); expect(permanent).toHaveBeenCalledTimes(1);
+  });
+  it('aborts and retries a stalled download and writes the complete response', async () => {
+    const w = await writer();
+    const fetcher = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => new Response('complete'))
+      .mockImplementationOnce(async () => stalledDownload());
+    const client = new ExportClient('https://api.invalid', 'org', 'admin-secret', fetcher, async () => {});
+    client.downloadIdleMs = 20;
+    await client.download(w, 'file.txt', '/file');
+    expect(fetcher).toHaveBeenCalledTimes(2); expect(fetcher.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    expect(await readFile(path.join(w.root, 'file.txt'), 'utf8')).toBe('complete');
+    expect(w.state.warnings).toEqual({});
+  });
+  it('warns after repeated download stalls and removes the staging directories', async () => {
+    const w = await writer(), fetcher = vi.fn(async () => stalledDownload());
+    const client = new ExportClient('https://api.invalid', 'org', 'admin-secret', fetcher, async () => {});
+    client.downloadIdleMs = 20;
+    await client.download(w, 'file.txt', '/file');
+    expect(fetcher).toHaveBeenCalledTimes(5);
+    expect(w.state.warnings['file.txt']).toContain('Export download stalled');
+    await expect(readFile(path.join(w.root, 'file.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await readdir(path.dirname(w.root))).filter(name => name.startsWith('.org-export-download-'))).toEqual([]);
   });
   it('bounds concurrency and serializes checkpoints without losing finished entries', async () => {
     const w = await writer(); let active = 0, max = 0;

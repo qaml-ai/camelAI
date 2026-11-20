@@ -343,6 +343,7 @@ describe("useRuntimeThread", () => {
   it("refreshes an existing tab's watcher when token renewal discovers a different agent", async () => {
     const { result } = mount();
     await waitFor(() => expect(watchers).toHaveLength(1));
+    act(() => watchers[0].options.onEvent({ type: "turn_opened", index: 999 }));
     responses["/api/threads/t1/token"] = {
       token: V2_BROWSER_SESSION, expiresAt: Date.now() + 900_000,
       url: "/api/threads/t1/runtime/w1", agentId: "agt_v2",
@@ -352,6 +353,20 @@ describe("useRuntimeThread", () => {
     expect(watchers[0].closed).toBe(true);
     expect(watchers[1].options).toMatchObject({ agentId: "agt_v2", token: V2_BROWSER_SESSION, transport: "sse" });
     expect(result.current.chat.messages).toHaveLength(2);
+    act(() => watchers[1].emit({ messages: seed.page!.entries.map((entry) => entry.message), indexes: [40, 41], running: true }));
+    await waitFor(() => expect(result.current.chat.streamingMessageId).toBe("rt:41"));
+    // A source run anchor cannot survive the identity change or overwrite the
+    // destination's new anchor when the closed watcher delivers late events.
+    act(() => {
+      watchers[1].options.onEvent({ type: "turn_opened", index: 42 });
+      watchers[0].options.onEvent({ type: "agent_end" });
+      watchers[0].options.onEvent({ type: "turn_opened", index: 0 });
+      watchers[0].emit({ expired: true });
+      watchers[1].emit({ running: true });
+    });
+    await waitFor(() => expect(result.current.chat.streamingMessageId).toBeNull());
+    expect(watchers[1].closed).toBe(false);
+    expect(watchers).toHaveLength(2);
   });
 
   it("does not let an older token response switch back from a published agent", async () => {

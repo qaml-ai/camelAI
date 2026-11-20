@@ -203,6 +203,7 @@ export function useRuntimeThread(options: {
   }));
   const [fallbackNotice, setFallbackNotice] = useState<RuntimeThreadState["modelFallbackNotice"]>(null);
   const watcherRef = useRef<Watcher | null>(null);
+  const watcherAgentRef = useRef<string | null>(null);
   /** Messages this tab sent and has not seen come back, oldest first. */
   const sentRef = useRef<Array<{ clientMessageId: string; text: string; sentAt: number; afterIndex: number }>>([]);
   /** The client message id of each user message this tab matched to its send, by history index. */
@@ -237,6 +238,8 @@ export function useRuntimeThread(options: {
   // Watch the agent once it exists; its first send creates it.
   useEffect(() => {
     if (!enabled || !threadId || !agentId) return;
+    if (watcherAgentRef.current !== agentId) runStartRef.current = undefined;
+    watcherAgentRef.current = agentId;
     let cancelled = false;
     let frame: number | null = null;
     let latest: AgentView | null = null;
@@ -306,11 +309,12 @@ export function useRuntimeThread(options: {
         expiresAt: initial.expiresAt ?? undefined,
         getToken,
         onEvent: (event: { type?: string; index?: unknown }) => {
+          if (cancelled || mine !== generation) return;
           if (event?.type === "turn_opened" && typeof event.index === "number") runStartRef.current = event.index;
           else if (event?.type === "agent_end") runStartRef.current = undefined;
         },
         onChange: (state) => {
-          if (mine !== generation) return;
+          if (cancelled || mine !== generation) return;
           // The watcher stops when its token cannot be renewed: watch again
           // with a new one, backing off while the token route keeps failing.
           if (state.expired) {
@@ -340,6 +344,7 @@ export function useRuntimeThread(options: {
           if (frame === null) frame = requestAnimationFrame(flush);
         },
         onError: (error) => {
+          if (cancelled || mine !== generation) return;
           console.warn("[runtime-thread] watcher", error.message);
           trackRuntimeWatchError(threadId, error, "watch");
         },

@@ -187,6 +187,8 @@ export function useRuntimeThread(options: {
   const { threadId, workspaceId, seed, enabled, callbacks } = options;
   const [view, setView] = useState<View>(() => seedView(seed));
   const [agentId, setAgentId] = useState<string | null>(seed?.agentId ?? null);
+  const agentIdRef = useRef(agentId);
+  agentIdRef.current = agentId;
   const [submittedAt, setSubmittedAt] = useState<number | null>(null);
   const [reconnecting, setReconnecting] = useState(false);
   /** Bumped when this tab sends: the view places a starting turn after messages on their way. */
@@ -201,6 +203,7 @@ export function useRuntimeThread(options: {
   }));
   const [fallbackNotice, setFallbackNotice] = useState<RuntimeThreadState["modelFallbackNotice"]>(null);
   const watcherRef = useRef<Watcher | null>(null);
+  const watcherAgentRef = useRef<string | null>(null);
   /** Messages this tab sent and has not seen come back, oldest first. */
   const sentRef = useRef<Array<{ clientMessageId: string; text: string; sentAt: number; afterIndex: number }>>([]);
   /** The client message id of each user message this tab matched to its send, by history index. */
@@ -222,14 +225,21 @@ export function useRuntimeThread(options: {
   }, [seed]);
 
   const getToken = useCallback(async () => {
+    const requestedAgent = agentIdRef.current;
     const minted = await postJson(`${base}/token${query}`);
     if (!minted.ok) throw Object.assign(new Error(minted.data?.error ?? `token: HTTP ${minted.status}`), { status: minted.status });
-    return minted.data as { token: string; expiresAt: number; url: string; agentId: string };
+    const token = minted.data as { token: string; expiresAt: number; url: string; agentId: string };
+    // A handoff changes the agent behind this thread. Retire the old watcher;
+    // a token request started before a newer placement must not switch it back.
+    setAgentId((current) => current === requestedAgent ? token.agentId : current);
+    return token;
   }, [base, query]);
 
   // Watch the agent once it exists; its first send creates it.
   useEffect(() => {
     if (!enabled || !threadId || !agentId) return;
+    if (watcherAgentRef.current !== agentId) runStartRef.current = undefined;
+    watcherAgentRef.current = agentId;
     let cancelled = false;
     let frame: number | null = null;
     let latest: AgentView | null = null;
@@ -286,9 +296,9 @@ export function useRuntimeThread(options: {
     document.addEventListener("visibilitychange", onVisibility);
     const start = async (fresh = false) => {
       const initial = !fresh && seed?.token && seed.agentId === agentId && seed.url && (seed.expiresAt ?? 0) - Date.now() > 60_000
-        ? { token: seed.token, expiresAt: seed.expiresAt ?? undefined, url: seed.url }
+        ? { token: seed.token, expiresAt: seed.expiresAt ?? undefined, url: seed.url, agentId: seed.agentId }
         : await getToken();
-      if (cancelled) return;
+      if (cancelled || initial.agentId !== agentId) return;
       const mine = ++generation;
       let opened = false;
       watcherRef.current = watchAgent({
@@ -299,11 +309,12 @@ export function useRuntimeThread(options: {
         expiresAt: initial.expiresAt ?? undefined,
         getToken,
         onEvent: (event: { type?: string; index?: unknown }) => {
+          if (cancelled || mine !== generation) return;
           if (event?.type === "turn_opened" && typeof event.index === "number") runStartRef.current = event.index;
           else if (event?.type === "agent_end") runStartRef.current = undefined;
         },
         onChange: (state) => {
-          if (mine !== generation) return;
+          if (cancelled || mine !== generation) return;
           // The watcher stops when its token cannot be renewed: watch again
           // with a new one, backing off while the token route keeps failing.
           if (state.expired) {
@@ -333,6 +344,7 @@ export function useRuntimeThread(options: {
           if (frame === null) frame = requestAnimationFrame(flush);
         },
         onError: (error) => {
+          if (cancelled || mine !== generation) return;
           console.warn("[runtime-thread] watcher", error.message);
           trackRuntimeWatchError(threadId, error, "watch");
         },
@@ -415,8 +427,6 @@ export function useRuntimeThread(options: {
 
   const latestViewRef = useRef(view);
   latestViewRef.current = view;
-  const agentIdRef = useRef(agentId);
-  agentIdRef.current = agentId;
   /**
    * A run ended, or a send's submitted window ran out, and no message past
    * `knownMax` is on screen in a visible page: the watcher missed the end of
@@ -606,6 +616,7 @@ export function useRuntimeThread(options: {
     switch (method) {
       case "sendMessage": {
         const [text, clientMessageId] = args as [string, string];
+        const requestedAgent = agentIdRef.current;
         // A retry of the same message keeps its one entry.
         if (!sentRef.current.some((entry) => entry.clientMessageId === clientMessageId)) {
           const known = viewRef.current.indexes;
@@ -628,7 +639,9 @@ export function useRuntimeThread(options: {
         const result = sent.data;
         if (result.status === "accepted") {
           setSubmittedAt(Date.now());
-          if (typeof result.agentId === "string") setAgentId((current) => current ?? (result.agentId as string));
+          if (typeof result.agentId === "string") {
+            setAgentId((current) => current === requestedAgent ? result.agentId as string : current);
+          }
           const fallback = result.fallback as { fromModel: string; toModel: string; reason: "hosted_credits_exhausted" | "hosted_subscription_unavailable" } | null;
           if (fallback) setFallbackNotice({ id: `rt-fallback:${clientMessageId}`, ...fallback, createdAt: Date.now() });
         } else {

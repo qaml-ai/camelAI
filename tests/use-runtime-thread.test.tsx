@@ -279,6 +279,118 @@ describe("useRuntimeThread", () => {
     expect(watchers[0].options).toMatchObject({ agentId: "agt_new", token: "abt_new" });
   });
 
+  it("retries the same fenced web send once on its published agent and replaces the old history", async () => {
+    responses["/api/threads/t1/messages"] = { error: "Between runtimes", code: "AGENT_V2_CUTOVER", retryable: true };
+    statuses["/api/threads/t1/messages"] = 503;
+    const { result } = mount();
+    await waitFor(() => expect(watchers).toHaveLength(1));
+    await expect(result.current.client.call("sendMessage", ["Deploy it", "cm_move"])).rejects.toThrow("Between runtimes");
+    expect(watchers[0].closed).toBe(false);
+
+    responses["/api/threads/t1/messages"] = { status: "accepted", requestId: "cm_move", agentId: "agt_v2", fallback: null };
+    statuses["/api/threads/t1/messages"] = 200;
+    responses["/api/threads/t1/token"] = {
+      token: V2_BROWSER_SESSION, expiresAt: Date.now() + 900_000,
+      url: "/api/threads/t1/runtime/w1", agentId: "agt_v2",
+    };
+    await act(async () => {
+      expect(await result.current.client.call("sendMessage", ["Deploy it", "cm_move"])).toMatchObject({ status: "accepted", requestId: "cm_move" });
+    });
+    await waitFor(() => expect(watchers).toHaveLength(2));
+    expect(watchers[0].closed).toBe(true);
+    expect(watchers[1].options).toMatchObject({ agentId: "agt_v2", token: V2_BROWSER_SESSION, transport: "sse" });
+    expect(fetchCalls.filter((call) => call.url.startsWith("/api/threads/t1/messages"))).toEqual([
+      expect.objectContaining({ body: { text: "Deploy it", clientMessageId: "cm_move" } }),
+      expect.objectContaining({ body: { text: "Deploy it", clientMessageId: "cm_move" } }),
+    ]);
+    // Keep the existing paint until the replacement has its authoritative page.
+    act(() => watchers[1].emit({ loaded: false }));
+    expect(result.current.chat.messages).toHaveLength(2);
+    act(() => watchers[1].emit({
+      loaded: true,
+      messages: [
+        ...seed.page!.entries.map((entry) => entry.message),
+        { role: "user", content: "Deploy it", requestId: "cm_move", timestamp: 5 },
+        { role: "assistant", content: [{ type: "text", text: "Deployed" }], stopReason: "stop", timestamp: 6 },
+      ],
+      indexes: [40, 41, 42, 43],
+    }));
+    await waitFor(() => expect(result.current.chat.messages).toHaveLength(4));
+    expect(result.current.chat.messages.filter((message) => message.clientMessageId === "cm_move")).toHaveLength(1);
+    act(() => watchers[0].emit({ messages: [{ role: "user", content: "stale source frame", timestamp: 7 }], indexes: [99] }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(JSON.stringify(result.current.chat.messages)).not.toContain("stale source frame");
+    expect(result.current.chat.messages).toHaveLength(4);
+  });
+
+  it("keeps the current watcher when a fenced send resumes on the restored v1 agent", async () => {
+    responses["/api/threads/t1/messages"] = { error: "Between runtimes", code: "AGENT_V2_CUTOVER", retryable: true };
+    statuses["/api/threads/t1/messages"] = 503;
+    const { result } = mount();
+    await waitFor(() => expect(watchers).toHaveLength(1));
+    await expect(result.current.client.call("sendMessage", ["Keep going", "cm_restore"])).rejects.toThrow("Between runtimes");
+    statuses["/api/threads/t1/messages"] = 200;
+    responses["/api/threads/t1/messages"] = { status: "accepted", requestId: "cm_restore", agentId: "agt_1", fallback: null };
+    await act(async () => {
+      await result.current.client.call("sendMessage", ["Keep going", "cm_restore"]);
+    });
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].closed).toBe(false);
+    expect(fetchCalls.filter((call) => call.url.includes("/token"))).toHaveLength(0);
+    expect(fetchCalls.filter((call) => call.url.includes("/messages")).map((call) => call.body.clientMessageId)).toEqual(["cm_restore", "cm_restore"]);
+  });
+
+  it("refreshes an existing tab's watcher when token renewal discovers a different agent", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(watchers).toHaveLength(1));
+    act(() => watchers[0].options.onEvent({ type: "turn_opened", index: 999 }));
+    responses["/api/threads/t1/token"] = {
+      token: V2_BROWSER_SESSION, expiresAt: Date.now() + 900_000,
+      url: "/api/threads/t1/runtime/w1", agentId: "agt_v2",
+    };
+    await act(async () => { await watchers[0].options.getToken(); });
+    await waitFor(() => expect(watchers).toHaveLength(2));
+    expect(watchers[0].closed).toBe(true);
+    expect(watchers[1].options).toMatchObject({ agentId: "agt_v2", token: V2_BROWSER_SESSION, transport: "sse" });
+    expect(result.current.chat.messages).toHaveLength(2);
+    act(() => watchers[1].emit({ messages: seed.page!.entries.map((entry) => entry.message), indexes: [40, 41], running: true }));
+    await waitFor(() => expect(result.current.chat.streamingMessageId).toBe("rt:41"));
+    // A source run anchor cannot survive the identity change or overwrite the
+    // destination's new anchor when the closed watcher delivers late events.
+    act(() => {
+      watchers[1].options.onEvent({ type: "turn_opened", index: 42 });
+      watchers[0].options.onEvent({ type: "agent_end" });
+      watchers[0].options.onEvent({ type: "turn_opened", index: 0 });
+      watchers[0].emit({ expired: true });
+      watchers[1].emit({ running: true });
+    });
+    await waitFor(() => expect(result.current.chat.streamingMessageId).toBeNull());
+    expect(watchers[1].closed).toBe(false);
+    expect(watchers).toHaveLength(2);
+  });
+
+  it("does not let an older token response switch back from a published agent", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(watchers).toHaveLength(1));
+    let releaseToken!: (response: Response) => void;
+    vi.mocked(fetch).mockImplementationOnce(() => new Promise<Response>((resolve) => { releaseToken = resolve; }));
+    const oldToken = watchers[0].options.getToken();
+    responses["/api/threads/t1/messages"] = { status: "accepted", requestId: "cm_move", agentId: "agt_v2", fallback: null };
+    responses["/api/threads/t1/token"] = {
+      token: V2_BROWSER_SESSION, expiresAt: Date.now() + 900_000,
+      url: "/api/threads/t1/runtime/w1", agentId: "agt_v2",
+    };
+    await act(async () => { await result.current.client.call("sendMessage", ["Continue", "cm_move"]); });
+    await waitFor(() => expect(watchers).toHaveLength(2));
+    await act(async () => {
+      releaseToken(Response.json({ token: "abt_old", expiresAt: Date.now() + 900_000, url: "https://agents.test", agentId: "agt_1" }));
+      await oldToken;
+    });
+    expect(watchers).toHaveLength(2);
+    expect(watchers[1].closed).toBe(false);
+    expect(watchers[1].options.agentId).toBe("agt_v2");
+  });
+
   it("asks a pending input as the chat's question card and answers it through the route", async () => {
     const { result, callbacks } = mount();
     await waitFor(() => expect(watchers).toHaveLength(1));
@@ -501,6 +613,7 @@ describe("useRuntimeThread", () => {
     it("says nothing for a hidden page, whose watcher pauses, and does not watch again meanwhile", async () => {
       vi.useFakeTimers({ shouldAdvanceTime: true });
       try {
+        responses["/api/threads/t1/token"] = { token: "abt_reopen", expiresAt: Date.now() + 900_000, url: "https://agents.test", agentId: "agt_1" };
         mount();
         await waitFor(() => expect(watchers).toHaveLength(1));
         const base = seed.page!.entries.map((entry) => entry.message);

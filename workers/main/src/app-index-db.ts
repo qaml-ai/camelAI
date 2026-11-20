@@ -358,21 +358,51 @@ export type MirrorEntity =
   | 'org_membership'
   | 'workspace_member';
 
-const MIRROR_FANOUT_COLUMN_STATEMENTS = [
-  'ALTER TABLE users ADD COLUMN email_verified_at INTEGER',
-  'ALTER TABLE users ADD COLUMN orphaned_at INTEGER',
-  'ALTER TABLE org_memberships ADD COLUMN workspace_access_default TEXT',
-  'ALTER TABLE workspaces ADD COLUMN email_handle TEXT',
-  // Thread-list projection: previews truncated exactly like the list mapper.
-  'ALTER TABLE threads ADD COLUMN first_user_message_preview TEXT',
-  'ALTER TABLE threads ADD COLUMN last_user_message_preview TEXT',
-  'ALTER TABLE threads ADD COLUMN last_assistant_completed_at INTEGER',
-  'ALTER TABLE threads ADD COLUMN last_assistant_summary TEXT',
-  'ALTER TABLE threads ADD COLUMN last_assistant_summary_status TEXT',
-  'ALTER TABLE threads ADD COLUMN channel_connection_id TEXT',
-  'ALTER TABLE threads ADD COLUMN channel_conversation_id TEXT',
-  'ALTER TABLE threads ADD COLUMN channel_message_id TEXT',
-];
+// Existing databases can predate these columns, including the thread-list
+// previews and the mirrored org member, user, and workspace fields.
+const APP_INDEX_ADDED_COLUMNS = {
+  apps: {
+    project_id: 'TEXT',
+  },
+  orgs: {
+    billing_plan: 'TEXT',
+  },
+  threads: {
+    user_message_count: 'INTEGER',
+    first_user_message: 'TEXT',
+    last_user_message_at: 'INTEGER',
+    source: 'TEXT',
+    channel_kind: 'TEXT',
+    channel_kinds: 'TEXT',
+    chat_error_count: 'INTEGER NOT NULL DEFAULT 0',
+    last_chat_error_at: 'INTEGER',
+    last_chat_error_message: 'TEXT',
+    last_chat_error_source: 'TEXT',
+    last_chat_error_status: 'INTEGER',
+    last_chat_error_provider: 'TEXT',
+    last_chat_error_model: 'TEXT',
+    model_history: 'TEXT',
+    last_model_changed_at: 'INTEGER',
+    first_user_message_preview: 'TEXT',
+    last_user_message_preview: 'TEXT',
+    last_assistant_completed_at: 'INTEGER',
+    last_assistant_summary: 'TEXT',
+    last_assistant_summary_status: 'TEXT',
+    channel_connection_id: 'TEXT',
+    channel_conversation_id: 'TEXT',
+    channel_message_id: 'TEXT',
+  },
+  users: {
+    email_verified_at: 'INTEGER',
+    orphaned_at: 'INTEGER',
+  },
+  org_memberships: {
+    workspace_access_default: 'TEXT',
+  },
+  workspaces: {
+    email_handle: 'TEXT',
+  },
+};
 
 export interface MirroredUserProfile {
   id: string;
@@ -517,6 +547,35 @@ export class AppIndexDatabase {
     } catch (error) {
       for (const statement of statements) await this.runSchemaStatement(statement);
       console.warn('[app-index] the schema batch failed, but each statement succeeded on its own', error);
+    }
+  }
+
+  private async ensureAddedColumns(): Promise<void> {
+    const tables = Object.entries(APP_INDEX_ADDED_COLUMNS);
+    const statements = tables.map(([table]) => `PRAGMA table_info(${table})`);
+    let columns: D1Result<{ name: string }>[];
+    try {
+      columns = await this.db.batch<{ name: string }>(statements.map((statement) => this.db.prepare(statement)));
+    } catch (error) {
+      throw new AppIndexSchemaError(statements.join('; '), error);
+    }
+
+    for (const [index, [table, definitions]] of tables.entries()) {
+      const existing = new Set(columns[index].results.map(({ name }) => name));
+      for (const [column, definition] of Object.entries(definitions)) {
+        if (existing.has(column)) continue;
+        const statement = `ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`;
+        try {
+          await this.db.prepare(statement).run();
+        } catch (error) {
+          // Another isolate may have added this exact column since the PRAGMA.
+          const duplicate = `duplicate column name: ${column}`;
+          if (!(error instanceof Error) || !(error.message.endsWith(duplicate) ||
+            error.message.endsWith(`${duplicate}: SQLITE_ERROR`))) {
+            throw new AppIndexSchemaError(statement, error);
+          }
+        }
+      }
     }
   }
 
@@ -694,66 +753,7 @@ export class AppIndexDatabase {
         .filter(Boolean),
     )
       .then(async () => {
-        try {
-          await this.db.prepare("ALTER TABLE apps ADD COLUMN project_id TEXT").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE orgs ADD COLUMN billing_plan TEXT").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN user_message_count INTEGER").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN first_user_message TEXT").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN last_user_message_at INTEGER").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN source TEXT").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN channel_kind TEXT").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN channel_kinds TEXT").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN chat_error_count INTEGER NOT NULL DEFAULT 0").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN last_chat_error_at INTEGER").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN last_chat_error_message TEXT").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN last_chat_error_source TEXT").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN last_chat_error_status INTEGER").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN last_chat_error_provider TEXT").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN last_chat_error_model TEXT").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN model_history TEXT").run();
-        } catch {}
-        try {
-          await this.db.prepare("ALTER TABLE threads ADD COLUMN last_model_changed_at INTEGER").run();
-        } catch {}
-        // Columns the fan-out reads (org members, user orgs, thread lists,
-        // workspace switcher) need to be served from D1. Added here rather than
-        // in migrations/ because SQLite has no ADD COLUMN IF NOT EXISTS and this
-        // runtime path may already have run against a database.
-        for (const statement of MIRROR_FANOUT_COLUMN_STATEMENTS) {
-          try {
-            await this.db.prepare(statement).run();
-          } catch {}
-        }
+        await this.ensureAddedColumns();
         for (const statement of [
           "CREATE INDEX IF NOT EXISTS idx_apps_project_updated_at ON apps(project_id, updated_at DESC)",
           "CREATE INDEX IF NOT EXISTS idx_threads_updated_at ON threads(updated_at DESC)",

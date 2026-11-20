@@ -6,7 +6,11 @@ import { AppIndexDatabase } from '../src/app-index-db';
  * `workspace_members` table (no org_id) failed `CREATE INDEX ... (org_id)` in
  * prod: a batch fails as a whole, naming no statement.
  */
-function fakeD1(broken: RegExp, options: { batchFailsOnce?: boolean } = {}) {
+function fakeD1(broken: RegExp, options: {
+  batchFailsOnce?: boolean;
+  columns?: Record<string, string[]>;
+  error?: string;
+} = {}) {
   const ran: string[] = [];
   let batchFails = options.batchFailsOnce ?? false;
   let failing = true;
@@ -15,8 +19,8 @@ function fakeD1(broken: RegExp, options: { batchFailsOnce?: boolean } = {}) {
     sql,
     bind: () => statement(sql),
     run: async () => {
-      if (fail(sql)) throw new Error('D1_ERROR: no such column: org_id: SQLITE_ERROR');
       ran.push(sql);
+      if (fail(sql)) throw new Error(options.error ?? 'D1_ERROR: no such column: org_id: SQLITE_ERROR');
       return { success: true, results: [] };
     },
     first: async () => null,
@@ -31,7 +35,11 @@ function fakeD1(broken: RegExp, options: { batchFailsOnce?: boolean } = {}) {
       }
       if (statements.some((entry) => fail(entry.sql))) throw new Error('D1_ERROR: no such column: org_id: SQLITE_ERROR');
       ran.push(...statements.map((entry) => entry.sql));
-      return statements.map(() => ({ success: true, results: [] }));
+      return statements.map(({ sql }) => {
+        const table = /^PRAGMA table_info\((\w+)\)$/.exec(sql)?.[1];
+        const columns = table ? options.columns?.[table] ?? [] : [];
+        return { success: true, results: columns.map((name) => ({ name })) };
+      });
     },
   };
   return { db, ran, repair: () => { failing = false; } };
@@ -79,6 +87,30 @@ describe('AppIndexDatabase.ensureSchema', () => {
 
     await expect(index.ensureSchema()).rejects.toThrow(/idx_threads_chat_error_updated_at/);
     expect(events.points.some((point) => String(point.blobs?.[16]).includes('idx_threads_chat_error_updated_at'))).toBe(true);
+  });
+
+  it('adds only absent columns and tolerates another isolate adding the same one', async () => {
+    const { db, ran } = fakeD1(/ADD COLUMN billing_plan /, {
+      columns: { apps: ['project_id'], threads: ['first_user_message_preview'] },
+      error: 'D1_ERROR: duplicate column name: billing_plan: SQLITE_ERROR',
+    });
+    const index = new AppIndexDatabase(db as never);
+
+    await expect(index.ensureSchema()).resolves.toBeUndefined();
+
+    expect(ran).not.toContain('ALTER TABLE apps ADD COLUMN project_id TEXT');
+    expect(ran).not.toContain('ALTER TABLE threads ADD COLUMN first_user_message_preview TEXT');
+    expect(ran).toContain('ALTER TABLE orgs ADD COLUMN billing_plan TEXT');
+    expect(ran).toContain('ALTER TABLE threads ADD COLUMN chat_error_count INTEGER NOT NULL DEFAULT 0');
+  });
+
+  it('propagates other column migration failures and retries on the next call', async () => {
+    const { db, repair } = fakeD1(/ADD COLUMN billing_plan /);
+    const index = new AppIndexDatabase(db as never);
+
+    await expect(index.ensureSchema()).rejects.toThrow(/ALTER TABLE orgs ADD COLUMN billing_plan TEXT/);
+    repair();
+    await expect(index.ensureSchema()).resolves.toBeUndefined();
   });
 
   it('takes a batch D1 failed on its own as done when each statement then succeeds', async () => {

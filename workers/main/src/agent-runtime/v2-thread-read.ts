@@ -129,11 +129,16 @@ function translateEvents(env: ChatEnv, agentId: string, viewer: string, signal: 
 async function v2Events(env: ChatEnv, agentId: string, viewer: string, req: Request) {
   const resource = v2AgentPath(agentId) + "/events";
   const supplied = req.headers.get("Last-Event-ID");
-  if (supplied && !/^\d{1,16}$/.test(supplied)) return Response.json({ error: "Invalid event cursor" }, { status: 400 });
+  if (supplied && (!/^\d{1,16}$/.test(supplied) || !Number.isSafeInteger(Number(supplied)))) return Response.json({ error: "Invalid event cursor" }, { status: 400 });
   const { signal } = req;
-  const cursor = supplied ?? String((await v2Json<{ nextAfter: number }>(env, resource + "?after=latest", { signal })).nextAfter);
   const translate = translateEvents(env, agentId, viewer, signal);
   const query = new URL(req.url).searchParams;
+  if (query.has("poll")) {
+    const wait = Number(query.get("wait") ?? 0);
+    if (!Number.isFinite(wait) || wait < 0) return Response.json({ error: "Invalid event wait" }, { status: 400 });
+    if (wait > 0) return pollV2Events(env, agentId, viewer, supplied, req.signal, Math.min(wait, 25) * 1000);
+  }
+  const cursor = supplied ?? String((await v2Json<{ nextAfter: number }>(env, resource + "?after=latest", { signal })).nextAfter);
   if (query.has("poll")) {
     const page = await v2Json<{ events: V2Event[]; nextAfter: number }>(env, resource + "?after=" + cursor, { signal });
     const events = [];
@@ -177,6 +182,97 @@ async function v2Events(env: ChatEnv, agentId: string, viewer: string, req: Requ
   return new Response(upstream.body.pipeThrough(stream), {
     headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no" },
   });
+}
+
+/** Wait in the front Worker on the native hibernatable event subscription, never by polling the DO. */
+async function pollV2Events(
+  env: ChatEnv,
+  agentId: string,
+  viewer: string,
+  cursor: string | null,
+  signal: AbortSignal,
+  waitMs: number,
+) {
+  const controller = new AbortController();
+  const upstreamSignal = AbortSignal.any([signal, controller.signal]);
+  const resource = v2AgentPath(agentId) + "/events";
+  const translate = translateEvents(env, agentId, viewer, upstreamSignal);
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let timedOut = false;
+  let waiting = false;
+  let nextAfter = Number(cursor ?? 0);
+  const events: Array<{ id: string; data: BrowserFrame }> = cursor === null ? [{ id: "", data: snapshot }] : [];
+  const cancel = () => { void reader?.cancel().catch(() => {}); };
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, waitMs);
+  const response = () => Response.json({ cursor: nextAfter, events }, { headers: { "Cache-Control": "no-store" } });
+  async function page() {
+    const page = await v2Json<{ events: V2Event[]; nextAfter: number }>(env, resource + "?after=" + nextAfter, { signal: upstreamSignal });
+    if (!Number.isSafeInteger(page.nextAfter) || page.nextAfter < nextAfter) throw new Error("Invalid v2 event cursor");
+    for (const event of page.events) {
+      if (!Number.isSafeInteger(event.seq) || event.seq <= 0) throw new Error("Invalid v2 event sequence");
+      for (const data of await translate(event)) events.push({ id: String(event.seq), data });
+    }
+    nextAfter = page.nextAfter;
+  }
+  try {
+    signal.throwIfAborted();
+    if (cursor === null) nextAfter = (await v2Json<{ nextAfter: number }>(env, resource + "?after=latest", { signal: upstreamSignal })).nextAfter;
+    if (!Number.isSafeInteger(nextAfter) || nextAfter < 0) throw new Error("Invalid v2 event cursor");
+    await page();
+    if (events.length > (cursor === null ? 1 : 0)) return response();
+    const upstream = await v2Fetch(env, resource + "?after=" + nextAfter + "&follow=1", {
+      signal: upstreamSignal, headers: { Accept: "text/event-stream" },
+    });
+    upstreamSignal.throwIfAborted();
+    if (!upstream.ok || !upstream.body || !upstream.headers.get("content-type")?.includes("text/event-stream")) {
+      await upstream.body?.cancel();
+      return Response.json({ error: "Could not open the v2 event stream" }, { status: 502 });
+    }
+    reader = upstream.body.getReader();
+    upstreamSignal.addEventListener("abort", cancel, { once: true });
+    if (upstreamSignal.aborted) cancel();
+    const decoder = new TextDecoder();
+    let pending = "";
+    waiting = true;
+    for (;;) {
+      const { done, value } = await reader.read();
+      signal.throwIfAborted();
+      if (done) {
+        if (!timedOut) throw new Error("The v2 event stream ended before the poll completed");
+        return response();
+      }
+      pending += decoder.decode(value, { stream: true });
+      for (let end; (end = pending.indexOf("\n\n")) !== -1;) {
+        const packet = pending.slice(0, end);
+        pending = pending.slice(end + 2);
+        const data = packet.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
+        if (!data) continue; // Native front-Worker heartbeats must not finish an empty poll.
+        const event = JSON.parse(data) as V2Event;
+        if (!Number.isSafeInteger(event.seq) || event.seq <= 0) throw new Error("Invalid v2 event sequence");
+        if (event.seq <= nextAfter) continue;
+        // The native stream subscribes before replay and persists each event
+        // before publishing it. Read its canonical page to preserve batching
+        // and projection, including a burst of deltas from one model step.
+        waiting = false;
+        await page();
+        if (nextAfter < event.seq) throw new Error("The v2 event page did not include the subscribed event");
+        if (events.length > (cursor === null ? 1 : 0)) return response();
+        waiting = true;
+      }
+    }
+  } catch (error) {
+    if (!timedOut || signal.aborted || (error !== upstreamSignal.reason && !(error instanceof DOMException && error.name === "AbortError"))) throw error;
+    if (waiting) return response();
+    return Response.json({ error: "Could not complete the v2 event poll" }, { status: 502 });
+  } finally {
+    clearTimeout(timer);
+    upstreamSignal.removeEventListener("abort", cancel);
+    controller.abort();
+    void reader?.cancel().catch(() => {});
+  }
 }
 
 /** Expose the fields used by the existing watcher after the app has authenticated the thread. */

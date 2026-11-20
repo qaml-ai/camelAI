@@ -1696,6 +1696,7 @@ async function processTelegramMessage(
       remoteConversationId: chatId,
       title: telegramChatTitle(message),
       createdBy: "telegram",
+      inbound: true,
       firstUserMessage: userMessage,
       firstRemoteMessageId: remoteMessageId,
     });

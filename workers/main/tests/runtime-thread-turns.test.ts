@@ -14,6 +14,7 @@ import type { ChatEnv } from "../src/chat-thread/types";
 import { RUNTIME_PROMPT_VERSION } from "../src/agent-runtime/runtime-prompt";
 import { CAMEL_CODE_LLM_MODEL } from "../../../src/lib/llm-provider-config";
 import { CAMEL_CODE_RUNTIME_MODEL, PREVIOUS_CAMEL_CODE_RUNTIME_MODELS, PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL } from "../src/agent-runtime/model-routes";
+import { getOrCreateChannelThread } from "../src/channels";
 import {
   abortRuntimeThread,
   answerRuntimeInput,
@@ -417,6 +418,35 @@ describe("runtime thread reads and writes", () => {
 });
 
 describe("pinNewThreadToRuntime", () => {
+  it.each([
+    ["discord", true, CAMEL_CODE_RUNTIME_MODEL, "v2"],
+    ["telegram", true, CAMEL_CODE_RUNTIME_MODEL, "v2"],
+    ["discord", false, CAMEL_CODE_RUNTIME_MODEL, "v1"],
+    ["telegram", true, "azure/other-model", "v1"],
+  ] as const)("pins a new free %s thread with workspace selected=%s and enabled model %s to %s", async (kind, workspaceSelected, enabledModel, runtimeVersion) => {
+    const { context, orgStub } = await runtimeThread();
+    await orgStub.setModelPickerConfig({
+      use_platform_defaults: false,
+      default_model: CAMEL_CODE_LLM_MODEL,
+      models: [{ id: CAMEL_CODE_LLM_MODEL, added_at: Date.now() }],
+    });
+    const hostedEnv = {
+      ...runtimeEnv,
+      CF_ACCOUNT_ID: "acct", CF_GATEWAY_NAME: "gw", AI_GATEWAY_AUTH_TOKEN: "gw-token",
+      WORKER_BASE_URL: "https://camelai.dev",
+      AGENT_RUNTIME_V2_WORKSPACE: workspaceSelected ? context.workspaceId : "unselected-workspace",
+      AGENT_RUNTIME_V2_MODELS: "",
+      AGENT_RUNTIME_V2_ADDITIONAL_MODELS: enabledModel,
+    };
+    const { threadId } = await getOrCreateChannelThread(hostedEnv as Parameters<typeof getOrCreateChannelThread>[0], {
+      kind, workspaceId: context.workspaceId, orgId: context.orgId, connectionId: "integration-1",
+      remoteConversationId: "conversation-1", title: "Channel chat", inbound: true,
+    });
+    const runtime = await orgStub.getThreadRuntime(threadId);
+    expect(runtime).toMatchObject({ agentId: null });
+    expect(runtime?.runtimeVersion ?? "v1").toBe(runtimeVersion);
+  });
+
   it("pins a new thread wherever the agent runtime is configured", async () => {
     const setup = await runtimeThread();
     const thread = await setup.orgStub.createThread(setup.context.workspaceId, "Fresh", setup.sender.userId);

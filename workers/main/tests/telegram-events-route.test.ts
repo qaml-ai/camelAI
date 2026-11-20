@@ -190,7 +190,7 @@ describe('handleTelegramWebhook', () => {
     const startInitialUserMessage = vi.fn(async () => ({ status: 'accepted' }))
       .mockResolvedValueOnce({ status: 'busy' });
 
-    const send = () => handleTelegramWebhook({
+    const send = (secret = 'telegram-secret') => handleTelegramWebhook({
       req: telegramRequest({
         update_id: 2,
         message: {
@@ -199,7 +199,7 @@ describe('handleTelegramWebhook', () => {
           chat: { id: 12345, type: 'private', first_name: 'Ada' },
           from: { id: 777, first_name: 'Ada' },
         },
-      }),
+      }, secret),
       env: {
         APP_KV: kv,
         TELEGRAM_BOT_TOKEN: 'bot-token',
@@ -228,6 +228,9 @@ describe('handleTelegramWebhook', () => {
       match: [] as unknown as RegExpMatchArray,
     });
 
+    expect((await send('wrong-secret')).status).toBe(401);
+    expect(registry.stub.getChatBinding).not.toHaveBeenCalled();
+    expect(startInitialUserMessage).not.toHaveBeenCalled();
     await expect(send()).rejects.toThrow('Channel Telegram message was not accepted (busy)');
     expect(kv._store.has('channel_event:telegram:ws-1:12345:101')).toBe(false);
     expect((await send()).status).toBe(200);

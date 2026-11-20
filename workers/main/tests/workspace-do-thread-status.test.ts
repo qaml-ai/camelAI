@@ -582,9 +582,40 @@ describe("WorkspaceDO thread status", () => {
     }
   });
 
-  it("requires an internal WebSocket upgrade instead of holding SSE in the DO", async () => {
+  it("keeps old Worker direct SSE and new Worker socket viewers in sync during overlap", async () => {
     const workspaceStub = await createWorkspaceStatusStub();
-    expect((await workspaceStub.fetch("https://workspace/status/stream")).status).toBe(426);
+    // Older Workers forward request headers. Even a browser Upgrade header
+    // must retain their SSE contract on the fixed queryless internal URL.
+    const legacyResponse = await workspaceStub.fetch("https://workspace/status/stream", {
+      headers: { Upgrade: "WebSocket" },
+    });
+    expect(legacyResponse.status).toBe(200);
+    const legacy = readStatusStream(legacyResponse);
+    const current = readStatusStream(await bridgeWorkspaceStatusStream(workspaceStub, new AbortController().signal));
+    const threadId = crypto.randomUUID();
+    try {
+      await waitForFrames(legacy.frames, 1);
+      await waitForFrames(current.frames, 1);
+      await workspaceStub.recordThreadStreaming(threadId, true);
+      await waitForFrames(legacy.frames, 2);
+      await waitForFrames(current.frames, 2);
+      expect(legacy.frames[1]).toEqual(current.frames[1]);
+      expect(current.frames[1]).toMatchObject({ type: "thread_status", threadId, status: "running" });
+    } finally {
+      await legacy.cancel();
+      await current.cancel();
+    }
+  });
+
+  it("passes through an old DO SSE response while its update is deferred", async () => {
+    const original = new Response('data: {"type":"thread_status_snapshot","runningThreadIds":[]}\n\n', {
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    });
+    const fetch = vi.fn(async () => original);
+    const response = await bridgeWorkspaceStatusStream({ fetch }, new AbortController().signal);
+    expect(response).toBe(original);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(await response.text()).toContain('thread_status_snapshot');
   });
 
   it("closes the internal socket when an SSE reader stops draining", async () => {

@@ -7,11 +7,18 @@ export async function bridgeWorkspaceStatusStream(
   stub: Pick<DurableObjectStub, 'fetch'>,
   signal: AbortSignal,
 ): Promise<Response> {
-  const upstream = await stub.fetch('https://workspace/status/stream', {
+  const upstream = await stub.fetch('https://workspace/status/stream?transport=socket', {
     headers: { Upgrade: 'websocket' },
   });
   const socket = upstream.webSocket;
+  // An active DO can keep the previous code during a deferred/gradual update.
+  // That version ignores Upgrade and serves its existing SSE response. Return
+  // it intact rather than failing or opening a second long-lived request.
+  if (upstream.status === 200 && upstream.headers.get('content-type')?.startsWith('text/event-stream')) {
+    return upstream;
+  }
   if (upstream.status !== 101 || !socket) {
+    await upstream.body?.cancel();
     throw new Error('Workspace status WebSocket upgrade failed');
   }
 

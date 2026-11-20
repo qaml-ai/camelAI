@@ -52,6 +52,27 @@ const WORKSPACE_STATUS_BRIDGE_TAG = 'status-sse';
 // 1012 (service restart) is the honest reason and is non-terminal, which is
 // what we want: the stale client reconnects, gets a 404, and is counted.
 const WORKSPACE_STATUS_SOCKET_RETIRED_CLOSE_CODE = 1012;
+// Compatibility for older front Workers during version overlap. The current
+// Worker always requests a hibernatable socket; only legacy GETs use this
+// direct SSE registry and its heartbeat until their viewers reconnect.
+const WORKSPACE_STATUS_HEARTBEAT_MS = 25 * 1000;
+const WORKSPACE_STATUS_SSE_HEADERS = {
+  'content-type': 'text/event-stream; charset=utf-8',
+  'cache-control': 'no-cache, no-transform',
+  connection: 'keep-alive',
+  // Self-hosted deployments can sit behind a buffering proxy, which would make
+  // the sidebar look frozen until the response completed.
+  'x-accel-buffering': 'no',
+} as const;
+// A write that has not drained in this long belongs to a viewer that is gone.
+const WORKSPACE_STATUS_STREAM_STALL_MS = 30 * 1000;
+const workspaceStatusEncoder = new TextEncoder();
+
+interface WorkspaceStatusStream {
+  writer: WritableStreamDefaultWriter<Uint8Array>;
+  pending: number;
+  pendingSince: number;
+}
 type BroadcastThreadStatus = 'running' | 'idle' | 'unread';
 
 export interface WorkspaceRunningThreadStatus {
@@ -218,6 +239,8 @@ export interface WorkspaceEnv {
 export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
   private sql: SqlStorage;
   private lastThreadStatusBroadcasts = new Map<string, string>();
+  private statusStreams = new Set<WorkspaceStatusStream>();
+  private statusHeartbeat: ReturnType<typeof setInterval> | null = null;
 
   constructor(ctx: DurableObjectState, env: WorkspaceEnv) {
     super(ctx, env);
@@ -729,6 +752,10 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
   }
 
   private publishThreadStatusEvent(event: string): void {
+    if (this.statusStreams.size > 0) {
+      const chunk = workspaceStatusEncoder.encode(event);
+      for (const stream of this.statusStreams) this.writeThreadStatusEvent(stream, chunk);
+    }
     // The runtime restores these sockets after hibernation; an in-memory
     // subscriber registry would lose the still-connected sidebar viewers.
     for (const socket of this.ctx.getWebSockets(WORKSPACE_STATUS_BRIDGE_TAG)) {
@@ -739,6 +766,84 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
         try { socket.close(1011, 'Status transport failed'); } catch {}
       }
     }
+  }
+
+  private writeThreadStatusEvent(
+    stream: WorkspaceStatusStream,
+    chunk: Uint8Array,
+  ): void {
+    try {
+      stream.pending += 1;
+      if (stream.pending === 1) stream.pendingSince = Date.now();
+      // Writes queue in call order, so the snapshot cannot be overtaken.
+      // A rejection means the viewer is gone: drop the stream, never throw.
+      void stream.writer.write(chunk).then(
+        () => {
+          stream.pending -= 1;
+          if (stream.pending === 0) stream.pendingSince = 0;
+        },
+        () => {
+          this.removeThreadStatusStream(stream);
+        },
+      );
+    } catch {
+      this.removeThreadStatusStream(stream);
+    }
+  }
+
+  private removeThreadStatusStream(stream: WorkspaceStatusStream): void {
+    if (!this.statusStreams.delete(stream)) return;
+    try {
+      void stream.writer.close().catch(() => {});
+    } catch {}
+    if (this.statusStreams.size === 0 && this.statusHeartbeat !== null) {
+      clearInterval(this.statusHeartbeat);
+      this.statusHeartbeat = null;
+    }
+  }
+
+  private sweepStalledThreadStatusStreams(): void {
+    const now = Date.now();
+    for (const stream of this.statusStreams) {
+      if (
+        stream.pending > 0 &&
+        now - stream.pendingSince >= WORKSPACE_STATUS_STREAM_STALL_MS
+      ) {
+        this.removeThreadStatusStream(stream);
+      }
+    }
+  }
+
+  private openThreadStatusStream(): Response {
+    const snapshot = this.threadStatusSnapshotPayload();
+    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+    const stream: WorkspaceStatusStream = {
+      writer: writable.getWriter(),
+      pending: 0,
+      pendingSince: 0,
+    };
+    this.statusStreams.add(stream);
+    stream.writer.closed.catch(() => {
+      this.removeThreadStatusStream(stream);
+    });
+    // The snapshot is the only resync mechanism on this seam: it has to be
+    // queued before the response escapes, never deferred to a later task, or an
+    // incremental frame can land ahead of it.
+    this.writeThreadStatusEvent(
+      stream,
+      workspaceStatusEncoder.encode(`data: ${snapshot}\n\n`),
+    );
+    if (this.statusHeartbeat === null) {
+      this.statusHeartbeat = setInterval(() => {
+        // A viewer that disappears without cancelling the body leaves its
+        // writes pending forever (the runtime does not always propagate the
+        // cancel into the DO), so the heartbeat doubles as the liveness probe.
+        this.sweepStalledThreadStatusStreams();
+        const heartbeat = workspaceStatusEncoder.encode(':hb\n\n');
+        for (const stream of this.statusStreams) this.writeThreadStatusEvent(stream, heartbeat);
+      }, WORKSPACE_STATUS_HEARTBEAT_MS);
+    }
+    return new Response(readable, { headers: WORKSPACE_STATUS_SSE_HEADERS });
   }
 
   private openThreadStatusSocket(): Response {
@@ -759,10 +864,12 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
     const url = new URL(request.url);
     this.retireLegacyStatusSockets();
     if (url.pathname === '/status/stream' && request.method === 'GET') {
-      if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
-        return new Response('Expected WebSocket upgrade', { status: 426 });
-      }
-      return this.openThreadStatusSocket();
+      // Older Workers forward browser headers to the fixed queryless URL.
+      // Only our current bridge chooses this internal transport explicitly.
+      return url.searchParams.get('transport') === 'socket' &&
+        request.headers.get('Upgrade')?.toLowerCase() === 'websocket'
+        ? this.openThreadStatusSocket()
+        : this.openThreadStatusStream();
     }
     // The retired public '/status' WebSocket route remains absent.
     return new Response('Not found', { status: 404 });

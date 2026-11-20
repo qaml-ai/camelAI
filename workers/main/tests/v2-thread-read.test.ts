@@ -219,13 +219,13 @@ describe("v2 browser long polls", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("bounds opening the subscription and never turns an opening timeout into empty success", async () => {
+  it.each([false, true])("bounds opening the subscription without empty success (platform error: %s)", async (platformError) => {
     vi.useFakeTimers();
     const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation((_url, init) => {
       if (!new URL(String(_url)).searchParams.has("follow")) return Promise.resolve(Response.json({ events: [], nextAfter: 10 }));
       return new Promise((_resolve, reject) => {
         const signal = init?.signal;
-        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        signal?.addEventListener("abort", () => reject(platformError ? new Error("Request cancelled") : signal.reason), { once: true });
       });
     });
     const pending = readV2Thread(env, agentId, "viewer", "events", poll());
@@ -235,14 +235,14 @@ describe("v2 browser long polls", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("bounds a terminal-run lookup without acknowledging any unprojected cursor", async () => {
+  it.each([false, true])("bounds terminal-run lookup without acknowledging a cursor (platform error: %s)", async (platformError) => {
     vi.useFakeTimers();
     const f = fixture();
     const original = f.fetcher.getMockImplementation()!;
     f.fetcher.mockImplementation((url, init) => String(url).includes("/runs/")
       ? new Promise((_resolve, reject) => {
         const signal = init?.signal;
-        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        signal?.addEventListener("abort", () => reject(platformError ? new Error("Request cancelled") : signal.reason), { once: true });
       }) : original(url, init));
     const pending = readV2Thread(env, agentId, "viewer", "events", poll());
     await vi.advanceTimersByTimeAsync(1);

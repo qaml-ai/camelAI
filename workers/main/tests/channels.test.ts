@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CAMEL_CODE_LLM_MODEL } from "../../../src/lib/llm-provider-config";
 
 const {
   getOrgStubMock,
@@ -104,23 +105,75 @@ describe("channels", () => {
     expect(startInitialUserMessageMock).not.toHaveBeenCalled();
   });
 
-  it("pins a new channel thread to the runtime", async () => {
+  it.each([
+    ["discord", CAMEL_CODE_LLM_MODEL, true, true],
+    ["telegram", CAMEL_CODE_LLM_MODEL, true, true],
+    ["discord", "gpt-6-luna", true, false],
+    ["telegram", "gpt-6-luna", true, false],
+    ["slack", CAMEL_CODE_LLM_MODEL, true, false],
+    ["discord", CAMEL_CODE_LLM_MODEL, undefined, false],
+    ["telegram", CAMEL_CODE_LLM_MODEL, undefined, false],
+  ] as const)("checks v2 eligibility for a new %s thread on %s (inbound: %s)", async (kind, model, inbound, v2Eligible) => {
     const kv = createMockKvStore();
-    getOrgStubMock.mockReturnValue({
+    const orgStub = {
       getLlmProviderConfig: vi.fn().mockResolvedValue(null),
-      getModelPickerConfig: vi.fn().mockResolvedValue(defaultOrgModelPickerConfig()),
+      getModelPickerConfig: vi.fn().mockResolvedValue({
+        use_platform_defaults: false,
+        default_model: model,
+        models: [{ id: model, added_at: 1 }],
+      }),
       createThread: vi.fn().mockResolvedValue({ id: "thread-9", title: "Chat" }),
-    });
+      getThread: vi.fn().mockResolvedValue({ id: "thread-9", title: "Chat" }),
+    };
+    getOrgStubMock.mockReturnValue(orgStub);
     getWorkspaceStubMock.mockReturnValue({
       getModelPickerConfig: vi.fn().mockResolvedValue(defaultWorkspaceModelPickerConfig()),
     });
-    await getOrCreateChannelThread({ APP_KV: kv } as never, {
-      kind: "telegram", workspaceId: "ws-1", orgId: "org-1", connectionId: "int-1",
-      remoteConversationId: "42", title: "Chat", createdBy: "telegram",
+    const getIntegration = vi.fn(async () => ({ id: "int-1", created_by: "owner-1" }));
+    const env = {
+      APP_KV: kv,
+      WORKSPACE: { idFromName: (id: string) => id, get: () => ({ getIntegration }) },
+    } as never;
+    const input = {
+      kind, workspaceId: "ws-1", orgId: "org-1", connectionId: "int-1",
+      remoteConversationId: "42", title: "Chat", createdBy: kind, inbound,
+    };
+    const firstThread = await getOrCreateChannelThread(env, input);
+    expect(firstThread).toEqual({
+      threadId: "thread-9", title: "Chat", created: true,
     });
-    expect(pinNewThreadToRuntimeMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+    expect(pinNewThreadToRuntimeMock).toHaveBeenCalledExactlyOnceWith(env, expect.objectContaining({
       orgId: "org-1", workspaceId: "ws-1", threadId: "thread-9",
-    }));
+    }), { v2Eligible });
+
+    if (v2Eligible) {
+      startChannelRuntimeTurnMock.mockResolvedValue({ status: "accepted" });
+      const send = async (threadId: string, clientMessageId: string) => {
+        return await enqueueChannelMessage(env, {
+          channelKind: kind, threadId, workspaceId: input.workspaceId,
+          orgId: input.orgId, connectionId: input.connectionId, userName: "Channel Sender",
+          message: "Hello", clientMessageId,
+        });
+      };
+      const sendToExistingThread = async (clientMessageId: string) => {
+        const thread = await getOrCreateChannelThread(env, input);
+        expect(thread).toEqual({ threadId: firstThread.threadId, title: "Chat", created: false });
+        return await send(thread.threadId, clientMessageId);
+      };
+      const requestId = `${kind}:message-1`;
+      expect(await send(firstThread.threadId, requestId)).toEqual({ status: "accepted" });
+      expect(await sendToExistingThread(requestId)).toEqual({ status: "accepted" });
+      const nextIds = [`${kind}:message-2`, `${kind}:message-3`];
+      expect(await Promise.all(nextIds.map(sendToExistingThread)))
+        .toEqual([{ status: "accepted" }, { status: "accepted" }]);
+      expect(getIntegration.mock.calls).toEqual([[input.connectionId], [input.connectionId], [input.connectionId], [input.connectionId]]);
+      const requests = startChannelRuntimeTurnMock.mock.calls
+        .map((call) => (call as unknown[])[1] as { clientMessageId: string; threadId: string; userId: string });
+      expect(requests.map((request) => request.clientMessageId).sort()).toEqual([requestId, requestId, ...nextIds]);
+      expect(requests.every((request) => request.threadId === firstThread.threadId && request.userId === "owner-1")).toBe(true);
+      expect(orgStub.createThread).toHaveBeenCalledOnce();
+      expect(pinNewThreadToRuntimeMock).toHaveBeenCalledOnce();
+    }
   });
 
   it("normalizes channel thread map keys", () => {
@@ -514,7 +567,9 @@ describe("channels", () => {
     expect(await enqueueChannelMessage(env, request)).toEqual({ status: "accepted" });
     // A new thread for the same channel conversation, pinned, and the mapping points at it.
     expect(createThread).toHaveBeenCalledOnce();
-    expect(pinNewThreadToRuntimeMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ threadId: "thread-new" }));
+    expect(pinNewThreadToRuntimeMock).toHaveBeenCalledWith(
+      expect.anything(), expect.objectContaining({ threadId: "thread-new" }), { v2Eligible: false },
+    );
     expect(kv._store.get(getChannelThreadMapKey(address))).toBe("thread-new");
     // The message ran there, its first message carrying a note linking the old thread.
     const second = (startChannelRuntimeTurnMock.mock.calls[1] as unknown[])[1] as { threadId: string; systemMessage: string };

@@ -4,6 +4,7 @@ import type {
 } from "./chat-thread/types.js";
 import { getOrgStub, getWorkspaceStub } from "./helpers/stubs.js";
 import {
+  CAMEL_CODE_LLM_MODEL,
   getDefaultLlmModel,
   getStoredBedrockAwsRegion,
   getStoredCustomLlmProviderApi,
@@ -44,6 +45,7 @@ export interface ChannelThreadInput extends ChannelAddress {
   firstUserMessage?: string | null;
   firstRemoteMessageId?: string | null;
   mapTtlSeconds?: number;
+  inbound?: boolean;
 }
 
 export interface ChannelThreadResolution {
@@ -336,6 +338,9 @@ export async function getOrCreateChannelThread(
     userId: null,
     userName: null,
     userEmail: null,
+  }, {
+    v2Eligible: input.inbound === true && model === CAMEL_CODE_LLM_MODEL &&
+      (input.kind === "discord" || input.kind === "telegram"),
   }).catch((error) => console.warn("[channels] could not pin a new channel thread to the agent runtime", error));
   await env.APP_KV.put(mapKey, thread.id, ttlOptions(input.mapTtlSeconds));
 

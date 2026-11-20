@@ -495,6 +495,7 @@ async function processClaimedDelivery(
       remoteConversationId,
       title: discordThreadTitle(normalizedText),
       createdBy: "discord",
+      inbound: true,
       firstUserMessage: userMessage,
       firstRemoteMessageId: payload.discordMessageId,
     });

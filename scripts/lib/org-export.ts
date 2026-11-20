@@ -3,12 +3,19 @@ import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { Readable } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { spawn } from 'node:child_process';
 
 export const EXPORT_USAGE = 'bun run org-export -- --env staging|prod --org <orgId> --out <dir> [--concurrency 4]';
 export type Row = Record<string, any>;
+export function exitNonZeroIfUnsettled(task: Promise<unknown>, message: string) {
+  const beforeExit = () => { console.error(message); process.exitCode = 1; };
+  const cleanup = () => { process.removeListener('beforeExit', beforeExit); };
+  process.once('beforeExit', beforeExit);
+  void task.then(cleanup, cleanup);
+  return cleanup;
+}
 export function parseExportArgs(args: string[]) {
   const values: Record<string, string> = {};
   for (let i = 0; i < args.length; i++) {
@@ -197,14 +204,15 @@ export class ExportWriter {
 }
 
 export class ExportClient {
+  downloadIdleMs = 120_000;
   constructor(readonly baseUrl: string, readonly orgId: string, private readonly key: string, readonly fetcher: typeof fetch = fetch, readonly sleep?: (ms: number) => Promise<void>, private readonly access: Record<string, string> = {}) {}
-  async response(endpoint: string, query: Record<string, string | number | undefined> = {}, method = 'GET') {
+  async response(endpoint: string, query: Record<string, string | number | undefined> = {}, method = 'GET', signal?: AbortSignal) {
     const url = new URL(`${this.baseUrl}/api/admin/org-export/${encodeURIComponent(this.orgId)}${endpoint}`);
     for (const [key, value] of Object.entries(query)) if (value !== undefined) url.searchParams.set(key, String(value));
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 120_000);
     let response: Response;
-    try { response = await this.fetcher(url, { method, headers: { ...this.access, Authorization: `Bearer ${this.key}` }, redirect: 'error', signal: controller.signal }); }
+    try { response = await this.fetcher(url, { method, headers: { ...this.access, Authorization: `Bearer ${this.key}` }, redirect: 'error', signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal }); }
     finally { clearTimeout(timer); } // Bound response setup, not the transfer time of a large streamed object.
     if (!response.ok) {
       await response.body?.cancel();
@@ -240,9 +248,24 @@ export class ExportClient {
       const target = await writer.target(relative);
       const staging = await mkdtemp(path.join(path.dirname(writer.root), '.org-export-download-')), temp = path.join(staging, 'content');
       try {
-        const response = await this.response(endpoint, query);
+        const controller = new AbortController(), ms = this.downloadIdleMs;
+        const response = await this.response(endpoint, query, 'GET', controller.signal);
         if (!response.body) throw new Error('Export object has no body');
-        await pipeline(Readable.fromWeb(response.body as import('node:stream/web').ReadableStream), createWriteStream(temp, { flags: 'wx', mode: 0o600 }));
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const activity = new Transform({ transform(chunk, _encoding, callback) {
+          timer?.refresh();
+          callback(null, chunk);
+        } });
+        const idle = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`Export download stalled: no data for ${Math.round(ms / 1000)}s`));
+            controller.abort();
+          }, ms);
+        });
+        try {
+          // The race handles a later pipeline rejection even if abort does not settle it promptly.
+          await Promise.race([idle, pipeline(Readable.fromWeb(response.body as import('node:stream/web').ReadableStream), activity, createWriteStream(temp, { flags: 'wx', mode: 0o600 }), { signal: controller.signal })]);
+        } finally { clearTimeout(timer); timer = undefined; }
         await rename(temp, target);
       } finally { await rm(staging, { recursive: true, force: true }); }
     }, { sleep: this.sleep }));

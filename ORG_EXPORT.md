@@ -43,7 +43,9 @@ Already finished metadata and file contents remain from the original run. Use a
 fresh `--out` for a new backup. Use only one process per output directory.
 
 429, 5xx and network failures retry up to five attempts with exponential backoff,
-capped at 30 seconds. The concurrency limit is 1–16. A failed item is recorded in
+capped at 30 seconds. Downloads that receive no data for two minutes are retried,
+and a run that stops before finishing exits non-zero and can be resumed with the
+same command. The concurrency limit is 1–16. A failed item is recorded in
 `manifest.json.warnings`; other items continue. An incomplete archive is still
 packaged for inspection and the command exits non-zero. Do not deliver an archive
 until its warnings are resolved or its incompleteness is explicitly accepted.

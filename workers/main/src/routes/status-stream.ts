@@ -7,6 +7,7 @@ import { requireSession } from '../helpers/auth.js';
 import { getOrgStub, getWorkspaceStub } from '../helpers/stubs.js';
 import { text } from '../helpers/response.js';
 import { ENTERPRISE_OIDC_AUTH_SOURCE } from '../signed-session.js';
+import { bridgeWorkspaceStatusStream } from '../workspace-status-stream.js';
 
 export async function handleWorkspaceStatusStream({
   req,
@@ -47,13 +48,7 @@ export async function handleWorkspaceStatusStream({
       return text('Forbidden', 403);
     }
 
-    // Return the DO response unmodified — buffering it would defeat the stream.
-    return wsStub.fetch(
-      new Request('https://workspace/status/stream', {
-        method: 'GET',
-        headers: req.headers,
-      }),
-    );
+    return await bridgeWorkspaceStatusStream(wsStub, req.signal);
   } catch {
     // Not an authoritative denial. The client reconnects with backoff, so a
     // retryable status keeps a DO blip from reading as "you lost access".

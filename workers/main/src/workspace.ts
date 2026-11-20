@@ -43,16 +43,18 @@ const TOKEN_REFRESH_RATE_LIMIT_DEFAULT_MS = 2 * 60 * 1000;
 const THREAD_STREAMING_LEASE_TTL_MS = 5 * 60 * 1000;
 // Fire the lease-sweep alarm just past the earliest possible expiry.
 const THREAD_STREAMING_LEASE_ALARM_SLACK_MS = 1000;
-// Tag of the retired hibernatable status socket. No socket is accepted with it
-// any more; it survives only so sockets a previous release accepted can be
-// found and closed (see retireLegacyStatusSockets).
+// Older versions close this tag on their next fetch/broadcast. Include it on
+// internal bridge sockets too so rollback reconnects them to the old transport.
 const WORKSPACE_STATUS_SOCKET_TAG = 'status';
+// Internal Worker bridge sockets are separate from the retired browser route.
+const WORKSPACE_STATUS_BRIDGE_TAG = 'status-sse';
+const WORKSPACE_STATUS_BRIDGE_ATTACHMENT = 'worker-status-sse-v1';
 // 1012 (service restart) is the honest reason and is non-terminal, which is
 // what we want: the stale client reconnects, gets a 404, and is counted.
 const WORKSPACE_STATUS_SOCKET_RETIRED_CLOSE_CODE = 1012;
-// SSE streams cannot hibernate and nothing else writes bytes while a workspace
-// is quiet, so a comment heartbeat is the only thing keeping intermediaries
-// from dropping an idle sidebar stream.
+// Compatibility for older front Workers during version overlap. The current
+// Worker always requests a hibernatable socket; only legacy GETs use this
+// direct SSE registry and its heartbeat until their viewers reconnect.
 const WORKSPACE_STATUS_HEARTBEAT_MS = 25 * 1000;
 const WORKSPACE_STATUS_SSE_HEADERS = {
   'content-type': 'text/event-stream; charset=utf-8',
@@ -705,16 +707,19 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
   private retireLegacyStatusSockets(): void {
     for (const socket of this.ctx.getWebSockets(WORKSPACE_STATUS_SOCKET_TAG)) {
       if (socket.readyState !== WebSocket.OPEN) continue;
+      let bridge = false;
+      try { bridge = socket.deserializeAttachment()?.transport === WORKSPACE_STATUS_BRIDGE_ATTACHMENT; } catch {}
+      if (bridge) continue;
       try {
+        // Only this server can set attachments. Missing/malformed attachments
+        // are old browser sockets; the current internal bridge stays attached.
         socket.close(WORKSPACE_STATUS_SOCKET_RETIRED_CLOSE_CODE, 'status transport retired');
       } catch {}
     }
   }
 
-  // Hibernation handlers for those same legacy sockets. No socket is ever
-  // accepted by this class any more, so these only ever see a stale bundle's
-  // frame/close: answer by retiring the socket rather than faulting the isolate
-  // on an unhandled delivery.
+  // The internal bridge never sends data. A frame from the retired browser
+  // transport still gets its restart close, including after hibernation.
   webSocketMessage(socket: WebSocket): void {
     if (socket.readyState !== WebSocket.OPEN) return;
     try {
@@ -722,9 +727,17 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
     } catch {}
   }
 
-  webSocketClose(): void {}
+  webSocketClose(socket: WebSocket, code: number, reason: string): void {
+    try {
+      if (code >= 1000 && code < 5000 && ![1004, 1005, 1006, 1015].includes(code)) {
+        socket.close(code, reason);
+      } else socket.close();
+    } catch {}
+  }
 
-  webSocketError(): void {}
+  webSocketError(socket: WebSocket): void {
+    try { socket.close(1011, 'Status transport failed'); } catch {}
+  }
 
   private threadStatusSnapshotPayload(): string {
     const runningThreads = this.listStreamingThreadStatuses();
@@ -744,12 +757,19 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
   }
 
   private publishThreadStatusEvent(event: string): void {
-    if (this.statusStreams.size === 0) return;
-    const chunk = workspaceStatusEncoder.encode(event);
-    // Removals happen in async write callbacks, so mutation during this loop is
-    // limited to the current entry.
-    for (const stream of this.statusStreams) {
-      this.writeThreadStatusEvent(stream, chunk);
+    if (this.statusStreams.size > 0) {
+      const chunk = workspaceStatusEncoder.encode(event);
+      for (const stream of this.statusStreams) this.writeThreadStatusEvent(stream, chunk);
+    }
+    // The runtime restores these sockets after hibernation; an in-memory
+    // subscriber registry would lose the still-connected sidebar viewers.
+    for (const socket of this.ctx.getWebSockets(WORKSPACE_STATUS_BRIDGE_TAG)) {
+      if (socket.readyState !== WebSocket.OPEN) continue;
+      try {
+        socket.send(event);
+      } catch {
+        try { socket.close(1011, 'Status transport failed'); } catch {}
+      }
     }
   }
 
@@ -800,6 +820,7 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
   }
 
   private openThreadStatusStream(): Response {
+    const snapshot = this.threadStatusSnapshotPayload();
     const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
     const stream: WorkspaceStatusStream = {
       writer: writable.getWriter(),
@@ -815,7 +836,7 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
     // incremental frame can land ahead of it.
     this.writeThreadStatusEvent(
       stream,
-      workspaceStatusEncoder.encode(`data: ${this.threadStatusSnapshotPayload()}\n\n`),
+      workspaceStatusEncoder.encode(`data: ${snapshot}\n\n`),
     );
     if (this.statusHeartbeat === null) {
       this.statusHeartbeat = setInterval(() => {
@@ -823,22 +844,40 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
         // writes pending forever (the runtime does not always propagate the
         // cancel into the DO), so the heartbeat doubles as the liveness probe.
         this.sweepStalledThreadStatusStreams();
-        this.publishThreadStatusEvent(':hb\n\n');
+        const heartbeat = workspaceStatusEncoder.encode(':hb\n\n');
+        for (const stream of this.statusStreams) this.writeThreadStatusEvent(stream, heartbeat);
       }, WORKSPACE_STATUS_HEARTBEAT_MS);
     }
     return new Response(readable, { headers: WORKSPACE_STATUS_SSE_HEADERS });
   }
 
+  private openThreadStatusSocket(): Response {
+    // Reading the snapshot can prune an expired lease and broadcast idle to
+    // existing viewers. Do that before attaching this viewer, so its first
+    // frame remains the authoritative snapshot even on that cleanup path.
+    const snapshot = this.threadStatusSnapshotPayload();
+    const [client, server] = Object.values(new WebSocketPair());
+    this.ctx.acceptWebSocket(server, [WORKSPACE_STATUS_BRIDGE_TAG, WORKSPACE_STATUS_SOCKET_TAG]);
+    server.serializeAttachment({ transport: WORKSPACE_STATUS_BRIDGE_ATTACHMENT });
+    // No await between attach, snapshot and response: every connection starts
+    // with the authoritative running snapshot before any incremental frame.
+    // Reconnecting clients resync the same way as the former SSE transport.
+    server.send(`data: ${snapshot}\n\n`);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    // Cheapest reliable moment to catch a socket restored from hibernation onto
-    // this instance: any fetch means the DO is awake and running new code.
     this.retireLegacyStatusSockets();
     if (url.pathname === '/status/stream' && request.method === 'GET') {
-      return this.openThreadStatusStream();
+      // Older Workers forward browser headers to the fixed queryless URL.
+      // Only our current bridge chooses this internal transport explicitly.
+      return url.searchParams.get('transport') === 'socket' &&
+        request.headers.get('Upgrade')?.toLowerCase() === 'websocket'
+        ? this.openThreadStatusSocket()
+        : this.openThreadStatusStream();
     }
-    // The status SSE stream is the only transport this DO serves over fetch;
-    // the retired '/status' WebSocket upgrade lands here as a plain 404.
+    // The retired public '/status' WebSocket route remains absent.
     return new Response('Not found', { status: 404 });
   }
 

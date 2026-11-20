@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   env,
+  evictDurableObject,
   runDurableObjectAlarm,
   runInDurableObject,
   SELF,
@@ -12,6 +13,7 @@ import {
   listOrgWorkspaces,
   type TestEnv,
 } from "./test-helpers";
+import { bridgeWorkspaceStatusStream } from "../src/workspace-status-stream";
 import {
   createSignedSession,
   type SignedSessionData,
@@ -431,9 +433,7 @@ describe("WorkspaceDO thread status", () => {
       activityAt: 4242,
     });
 
-    const response = await workspaceStub.fetch(
-      "https://workspace/status/stream",
-    );
+    const response = await bridgeWorkspaceStatusStream(workspaceStub, new AbortController().signal);
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toBe(
       "text/event-stream; charset=utf-8",
@@ -471,10 +471,10 @@ describe("WorkspaceDO thread status", () => {
     const threadId = crypto.randomUUID();
 
     const first = readStatusStream(
-      await workspaceStub.fetch("https://workspace/status/stream"),
+      await bridgeWorkspaceStatusStream(workspaceStub, new AbortController().signal),
     );
     const second = readStatusStream(
-      await workspaceStub.fetch("https://workspace/status/stream"),
+      await bridgeWorkspaceStatusStream(workspaceStub, new AbortController().signal),
     );
 
     try {
@@ -515,41 +515,130 @@ describe("WorkspaceDO thread status", () => {
     }
   });
 
-  it("drops an abandoned stream once its writes stop draining", async () => {
+  it("starts with the snapshot when attaching also expires a stale running lease", async () => {
     const workspaceStub = await createWorkspaceStatusStub();
     const threadId = crypto.randomUUID();
-
+    await workspaceStub.recordThreadStreaming(threadId, true);
+    await runInDurableObject(workspaceStub, (instance) => {
+      (instance as unknown as { sql: SqlStorage }).sql.exec(
+        "UPDATE thread_streaming_status SET updated_at = ? WHERE thread_id = ?",
+        Date.now() - 6 * 60 * 1000,
+        threadId,
+      );
+    });
     const stream = readStatusStream(
-      await workspaceStub.fetch("https://workspace/status/stream"),
+      await bridgeWorkspaceStatusStream(workspaceStub, new AbortController().signal),
+    );
+    try {
+      await waitForFrames(stream.frames, 1);
+      expect(stream.frames[0]).toMatchObject({ type: "thread_status_snapshot", runningThreadIds: [] });
+    } finally {
+      await stream.cancel();
+    }
+  });
+
+  it("closes the internal socket when the SSE reader cancels", async () => {
+    const workspaceStub = await createWorkspaceStatusStub();
+    const stream = readStatusStream(
+      await bridgeWorkspaceStatusStream(workspaceStub, new AbortController().signal),
     );
     await waitForFrames(stream.frames, 1);
     await stream.cancel();
+    for (let i = 0; i < 100; i++) {
+      const count = await runInDurableObject(workspaceStub, (_instance, state) =>
+        state.getWebSockets("status-sse").filter((socket) => socket.readyState === WebSocket.OPEN).length,
+      );
+      if (count === 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error("Cancelled status stream left an internal socket open");
+  });
 
-    await workspaceStub.recordThreadStreaming(threadId, true);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(stream.frames).toHaveLength(1);
-
-    // The runtime does not propagate the cancel into the DO, so the stall sweep
-    // (heartbeat-driven in production) is what reclaims the writer.
-    const streamCount = await runInDurableObject(
-      workspaceStub,
-      async (instance) => {
-        const internals = instance as unknown as {
-          statusStreams: Set<{ pending: number; pendingSince: number }>;
-          sweepStalledThreadStatusStreams: () => void;
-          publishThreadStatusEvent: (event: string) => void;
-        };
-        internals.publishThreadStatusEvent(":hb\n\n");
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        for (const entry of internals.statusStreams) {
-          expect(entry.pending).toBeGreaterThan(0);
-          entry.pendingSince -= 60_000;
-        }
-        internals.sweepStalledThreadStatusStreams();
-        return internals.statusStreams.size;
-      },
+  it("keeps the same SSE stream through idle hibernation and a new status", async () => {
+    const workspaceStub = await createWorkspaceStatusStub();
+    const threadId = crypto.randomUUID();
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const stream = readStatusStream(
+      await bridgeWorkspaceStatusStream(workspaceStub, new AbortController().signal),
     );
-    expect(streamCount).toBe(0);
+    try {
+      await waitForFrames(stream.frames, 1);
+      expect(stream.frames[0]).toMatchObject({ type: "thread_status_snapshot", runningThreadIds: [] });
+      // A direct SSE response prevents this eviction from draining. The new
+      // internal socket hibernates while the front Worker response stays open.
+      await evictDurableObject(workspaceStub, { webSockets: "hibernate" });
+      await vi.advanceTimersByTimeAsync(25_000);
+      expect(stream.comments).toContain(":hb");
+      await workspaceStub.recordThreadStreaming(threadId, true);
+      await waitForFrames(stream.frames, 2);
+      expect(stream.frames[1]).toMatchObject({ type: "thread_status", threadId, status: "running" });
+      await workspaceStub.recordThreadStreaming(threadId, false);
+      await waitForFrames(stream.frames, 3);
+      expect(stream.frames[2]).toMatchObject({ type: "thread_status", threadId, status: "idle" });
+      expect(stream.frames.filter((frame) => frame.type === "thread_status_snapshot")).toHaveLength(1);
+    } finally {
+      await stream.cancel();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps old Worker direct SSE and new Worker socket viewers in sync during overlap", async () => {
+    const workspaceStub = await createWorkspaceStatusStub();
+    // Older Workers forward request headers. Even a browser Upgrade header
+    // must retain their SSE contract on the fixed queryless internal URL.
+    const legacyResponse = await workspaceStub.fetch("https://workspace/status/stream", {
+      headers: { Upgrade: "WebSocket" },
+    });
+    expect(legacyResponse.status).toBe(200);
+    const legacy = readStatusStream(legacyResponse);
+    const current = readStatusStream(await bridgeWorkspaceStatusStream(workspaceStub, new AbortController().signal));
+    const threadId = crypto.randomUUID();
+    try {
+      await waitForFrames(legacy.frames, 1);
+      await waitForFrames(current.frames, 1);
+      await workspaceStub.recordThreadStreaming(threadId, true);
+      await waitForFrames(legacy.frames, 2);
+      await waitForFrames(current.frames, 2);
+      expect(legacy.frames[1]).toEqual(current.frames[1]);
+      expect(current.frames[1]).toMatchObject({ type: "thread_status", threadId, status: "running" });
+    } finally {
+      await legacy.cancel();
+      await current.cancel();
+    }
+  });
+
+  it("passes through an old DO SSE response while its update is deferred", async () => {
+    const original = new Response('data: {"type":"thread_status_snapshot","runningThreadIds":[]}\n\n', {
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    });
+    const fetch = vi.fn(async () => original);
+    const response = await bridgeWorkspaceStatusStream({ fetch }, new AbortController().signal);
+    expect(response).toBe(original);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(await response.text()).toContain('thread_status_snapshot');
+  });
+
+  it("closes the internal socket when an SSE reader stops draining", async () => {
+    const workspaceStub = await createWorkspaceStatusStub();
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    let response: Response | undefined;
+    try {
+      response = await bridgeWorkspaceStatusStream(workspaceStub, new AbortController().signal);
+      // Leave the snapshot write pending, as a disconnected buffering proxy can.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await vi.advanceTimersByTimeAsync(50_000);
+      for (let i = 0; i < 100; i++) {
+        const count = await runInDurableObject(workspaceStub, (_instance, state) =>
+          state.getWebSockets("status-sse").filter((socket) => socket.readyState === WebSocket.OPEN).length,
+        );
+        if (count === 0) return;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      throw new Error("Stalled status reader left an internal socket open");
+    } finally {
+      await response?.body?.cancel().catch(() => {});
+      vi.useRealTimers();
+    }
   });
 
   it("404s unknown durable object paths", async () => {
@@ -671,12 +760,12 @@ describe("WorkspaceDO thread status", () => {
     expect(closes[0]).toBe(1012);
   });
 
-  it("keeps fanning out after the websocket branch was removed", async () => {
+  it("fans out through hibernatable internal sockets while the public websocket stays removed", async () => {
     const workspaceStub = await createWorkspaceStatusStub();
     const threadId = crypto.randomUUID();
 
     const stream = readStatusStream(
-      await workspaceStub.fetch("https://workspace/status/stream"),
+      await bridgeWorkspaceStatusStream(workspaceStub, new AbortController().signal),
     );
     await waitForFrames(stream.frames, 1);
     expect(stream.frames[0]).toMatchObject({
@@ -684,8 +773,7 @@ describe("WorkspaceDO thread status", () => {
       runningThreadIds: [],
     });
 
-    // The SSE registry is the only status transport now: an incremental frame
-    // must still reach it with no hibernatable socket loop in broadcast.
+    // The public SSE shape is unchanged while the internal socket can hibernate.
     await workspaceStub.recordThreadStreaming(threadId, true);
     await waitForFrames(stream.frames, 2);
     expect(stream.frames[1]).toMatchObject({
@@ -694,14 +782,30 @@ describe("WorkspaceDO thread status", () => {
       status: "running",
     });
 
-    // No socket was ever accepted, so nothing is left hibernating on the DO.
+    // Only the new internal bridge is registered; retired browser tags stay absent.
     const socketCount = await runInDurableObject(
       workspaceStub,
-      (_instance, state) => state.getWebSockets().length,
+      (_instance, state) => ({ bridge: state.getWebSockets("status-sse").length, legacy: state.getWebSockets("status").filter(socket => socket.deserializeAttachment()?.transport !== 'worker-status-sse-v1').length }),
     );
-    expect(socketCount).toBe(0);
+    expect(socketCount).toEqual({ bridge: 1, legacy: 0 });
 
     await stream.cancel();
+  });
+
+  it("lets the old DO retirement sweep close restored bridge sockets on rollback", async () => {
+    const workspaceStub = await createWorkspaceStatusStub();
+    const response = await bridgeWorkspaceStatusStream(workspaceStub, new AbortController().signal);
+    const reader = response.body!.getReader();
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain('thread_status_snapshot');
+    await evictDurableObject(workspaceStub, { webSockets: "hibernate" });
+    // Exact retirement behavior in the deployed 4b878056 code. It cannot read
+    // the new bridge protocol, so it must close rather than silently strand it.
+    await runInDurableObject(workspaceStub, (_instance, state) => {
+      for (const socket of state.getWebSockets('status')) {
+        if (socket.readyState === WebSocket.OPEN) socket.close(1012, 'status transport retired');
+      }
+    });
+    expect((await reader.read()).done).toBe(true);
   });
 
   it("records each expired running lease it sweeps, with its age", async () => {
@@ -758,7 +862,7 @@ describe("WorkspaceDO thread status", () => {
     await workspaceStub.recordThreadStreaming(threadId, true);
 
     const stream = readStatusStream(
-      await workspaceStub.fetch("https://workspace/status/stream"),
+      await bridgeWorkspaceStatusStream(workspaceStub, new AbortController().signal),
     );
     const frames = stream.frames;
     await waitForFrames(frames, 1);

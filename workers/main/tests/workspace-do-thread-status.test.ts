@@ -785,11 +785,27 @@ describe("WorkspaceDO thread status", () => {
     // Only the new internal bridge is registered; retired browser tags stay absent.
     const socketCount = await runInDurableObject(
       workspaceStub,
-      (_instance, state) => ({ bridge: state.getWebSockets("status-sse").length, legacy: state.getWebSockets("status").length }),
+      (_instance, state) => ({ bridge: state.getWebSockets("status-sse").length, legacy: state.getWebSockets("status").filter(socket => socket.deserializeAttachment()?.transport !== 'worker-status-sse-v1').length }),
     );
     expect(socketCount).toEqual({ bridge: 1, legacy: 0 });
 
     await stream.cancel();
+  });
+
+  it("lets the old DO retirement sweep close restored bridge sockets on rollback", async () => {
+    const workspaceStub = await createWorkspaceStatusStub();
+    const response = await bridgeWorkspaceStatusStream(workspaceStub, new AbortController().signal);
+    const reader = response.body!.getReader();
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain('thread_status_snapshot');
+    await evictDurableObject(workspaceStub, { webSockets: "hibernate" });
+    // Exact retirement behavior in the deployed 4b878056 code. It cannot read
+    // the new bridge protocol, so it must close rather than silently strand it.
+    await runInDurableObject(workspaceStub, (_instance, state) => {
+      for (const socket of state.getWebSockets('status')) {
+        if (socket.readyState === WebSocket.OPEN) socket.close(1012, 'status transport retired');
+      }
+    });
+    expect((await reader.read()).done).toBe(true);
   });
 
   it("records each expired running lease it sweeps, with its age", async () => {

@@ -43,12 +43,12 @@ const TOKEN_REFRESH_RATE_LIMIT_DEFAULT_MS = 2 * 60 * 1000;
 const THREAD_STREAMING_LEASE_TTL_MS = 5 * 60 * 1000;
 // Fire the lease-sweep alarm just past the earliest possible expiry.
 const THREAD_STREAMING_LEASE_ALARM_SLACK_MS = 1000;
-// Tag of the retired hibernatable status socket. No socket is accepted with it
-// any more; it survives only so sockets a previous release accepted can be
-// found and closed (see retireLegacyStatusSockets).
+// Older versions close this tag on their next fetch/broadcast. Include it on
+// internal bridge sockets too so rollback reconnects them to the old transport.
 const WORKSPACE_STATUS_SOCKET_TAG = 'status';
 // Internal Worker bridge sockets are separate from the retired browser route.
 const WORKSPACE_STATUS_BRIDGE_TAG = 'status-sse';
+const WORKSPACE_STATUS_BRIDGE_ATTACHMENT = 'worker-status-sse-v1';
 // 1012 (service restart) is the honest reason and is non-terminal, which is
 // what we want: the stale client reconnects, gets a 404, and is counted.
 const WORKSPACE_STATUS_SOCKET_RETIRED_CLOSE_CODE = 1012;
@@ -707,7 +707,12 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
   private retireLegacyStatusSockets(): void {
     for (const socket of this.ctx.getWebSockets(WORKSPACE_STATUS_SOCKET_TAG)) {
       if (socket.readyState !== WebSocket.OPEN) continue;
+      let bridge = false;
+      try { bridge = socket.deserializeAttachment()?.transport === WORKSPACE_STATUS_BRIDGE_ATTACHMENT; } catch {}
+      if (bridge) continue;
       try {
+        // Only this server can set attachments. Missing/malformed attachments
+        // are old browser sockets; the current internal bridge stays attached.
         socket.close(WORKSPACE_STATUS_SOCKET_RETIRED_CLOSE_CODE, 'status transport retired');
       } catch {}
     }
@@ -852,7 +857,8 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
     // frame remains the authoritative snapshot even on that cleanup path.
     const snapshot = this.threadStatusSnapshotPayload();
     const [client, server] = Object.values(new WebSocketPair());
-    this.ctx.acceptWebSocket(server, [WORKSPACE_STATUS_BRIDGE_TAG]);
+    this.ctx.acceptWebSocket(server, [WORKSPACE_STATUS_BRIDGE_TAG, WORKSPACE_STATUS_SOCKET_TAG]);
+    server.serializeAttachment({ transport: WORKSPACE_STATUS_BRIDGE_ATTACHMENT });
     // No await between attach, snapshot and response: every connection starts
     // with the authoritative running snapshot before any incremental frame.
     // Reconnecting clients resync the same way as the former SSE transport.

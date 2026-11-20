@@ -81,9 +81,9 @@ describe("v2 browser long polls", () => {
   const wire = (value: ReturnType<typeof event>) =>
     `id: ${value.seq}\nevent: ${value.type}\ndata: ${JSON.stringify(value)}\n\n`;
 
-  function fixture(records: ReturnType<typeof event>[] = [], onSubscribe?: () => void) {
+  function fixture(records: ReturnType<typeof event>[] = [], onSubscribe?: () => void, readCancellation?: Error) {
     let current!: { push: (text: string) => void; cancelled: ReturnType<typeof vi.fn> };
-    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const query = new URL(String(input)).searchParams;
       if (query.get("after") === "latest") return Response.json({ nextAfter: records.at(-1)?.seq ?? 0 });
       const after = Number(query.get("after"));
@@ -92,6 +92,7 @@ describe("v2 browser long polls", () => {
         let controller!: ReadableStreamDefaultController<Uint8Array>;
         const cancelled = vi.fn();
         const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; }, cancel: cancelled });
+        if (readCancellation) init?.signal?.addEventListener("abort", () => controller.error(readCancellation), { once: true });
         current = { push: (text) => controller.enqueue(new TextEncoder().encode(text)), cancelled };
         current.push(": connected\n\n" + records.filter((item) => item.seq > after).map(wire).join(""));
         return new Response(stream, { headers: { "content-type": "text/event-stream" } });
@@ -126,6 +127,20 @@ describe("v2 browser long polls", () => {
     expect(await response.json()).toEqual({ cursor: 10, events: [] });
     expect(f.source().cancelled).toHaveBeenCalledTimes(1);
     expect(f.fetcher.mock.calls[1][1]?.signal?.aborted).toBe(true);
+  });
+
+  it("returns the idle deadline response when upstream cancellation rejects read with a platform Error", async () => {
+    vi.useFakeTimers();
+    const f = fixture([], undefined, new Error("Reader cancelled"));
+    const pending = readV2Thread(env, agentId, "viewer", "events", poll());
+    // Fetch response bodies may reject reads with a platform Error, rather
+    // than the AbortSignal reason or a DOMException named AbortError.
+    const result = pending.then(value => ({ response: value }), error => ({ error }));
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(await result).not.toHaveProperty("error");
+    expect(await ((await result) as { response: Response }).response.json()).toEqual({ cursor: 10, events: [] });
+    expect(f.fetcher).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("also bounds repeated empty polls at cursor zero, which the SDK omits from Last-Event-ID", async () => {
@@ -204,13 +219,13 @@ describe("v2 browser long polls", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("bounds opening the subscription and never turns an opening timeout into empty success", async () => {
+  it.each([false, true])("bounds opening the subscription without empty success (platform error: %s)", async (platformError) => {
     vi.useFakeTimers();
     const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation((_url, init) => {
       if (!new URL(String(_url)).searchParams.has("follow")) return Promise.resolve(Response.json({ events: [], nextAfter: 10 }));
       return new Promise((_resolve, reject) => {
         const signal = init?.signal;
-        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        signal?.addEventListener("abort", () => reject(platformError ? new Error("Request cancelled") : signal.reason), { once: true });
       });
     });
     const pending = readV2Thread(env, agentId, "viewer", "events", poll());
@@ -220,14 +235,14 @@ describe("v2 browser long polls", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("bounds a terminal-run lookup without acknowledging any unprojected cursor", async () => {
+  it.each([false, true])("bounds terminal-run lookup without acknowledging a cursor (platform error: %s)", async (platformError) => {
     vi.useFakeTimers();
     const f = fixture();
     const original = f.fetcher.getMockImplementation()!;
     f.fetcher.mockImplementation((url, init) => String(url).includes("/runs/")
       ? new Promise((_resolve, reject) => {
         const signal = init?.signal;
-        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        signal?.addEventListener("abort", () => reject(platformError ? new Error("Request cancelled") : signal.reason), { once: true });
       }) : original(url, init));
     const pending = readV2Thread(env, agentId, "viewer", "events", poll());
     await vi.advanceTimersByTimeAsync(1);

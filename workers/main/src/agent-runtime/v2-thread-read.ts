@@ -264,7 +264,9 @@ async function pollV2Events(
       }
     }
   } catch (error) {
-    if (!timedOut || signal.aborted || (error !== upstreamSignal.reason && !(error instanceof DOMException && error.name === "AbortError"))) throw error;
+    // Workerd can reject a cancelled fetch-body read with a generic Error.
+    // Our own deadline, not that platform error's identity, owns this result.
+    if (!timedOut || signal.aborted) throw error;
     if (waiting) return response();
     return Response.json({ error: "Could not complete the v2 event poll" }, { status: 502 });
   } finally {

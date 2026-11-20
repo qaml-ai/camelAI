@@ -100,6 +100,20 @@ describe('chat API error classification', () => {
     });
   });
 
+  it.each([
+    'Tenant credit balance is exhausted',
+    '402 {"error":{"code":"insufficient_credits","message":"Tenant credit balance is exhausted"}}',
+  ])('shows a service error for an exhausted shared runtime balance', (error) => {
+    const presentation = getChatApiErrorPresentation(error, { billingSource: 'hosted' });
+
+    expect(presentation).toEqual({
+      kind: 'generic',
+      title: 'Couldn’t complete your turn',
+      message: 'The chat service is temporarily unavailable. Try sending your message again.',
+    });
+    expect(isChatBillingOrCreditError(error)).toBe(false);
+  });
+
   it('classifies hosted credit exhaustion with a top-up action', () => {
     const raw =
       'Hosted model credits are used up. You have used 0.00 credits of 0.00 credits.';

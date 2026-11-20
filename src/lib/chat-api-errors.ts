@@ -191,7 +191,10 @@ function isHostedCreditExhaustedMessage(lowerMessage: string): boolean {
   return lowerMessage.includes("credits are used up");
 }
 
+const RUNTIME_BALANCE_ERROR = "tenant credit balance is exhausted";
+
 function isBillingOrCreditError(lowerMessage: string): boolean {
+  if (lowerMessage === RUNTIME_BALANCE_ERROR) return false;
   return (
     lowerMessage.includes("credit") ||
     lowerMessage.includes("billing") ||
@@ -265,6 +268,14 @@ export function getChatApiErrorPresentation(
         "Claude Fable 5.1 on Bedrock requires provider data sharing. Ask an AWS admin to grant bedrock-mantle:PutAccountDataRetention, then set Bedrock Mantle data retention to provider_data_share. Account-level API: PUT https://bedrock-mantle.<region>.api.aws/v1/data_retention with {\"mode\":\"provider_data_share\"}. Project-level API: POST https://bedrock-mantle.<region>.api.aws/v1/organization/projects/{project_id} with {\"data_retention\":{\"mode\":\"provider_data_share\"}}. This is an AWS data-sharing setting, so camelAI cannot enable it automatically.",
       actionHref: BEDROCK_DATA_RETENTION_DOCS_URL,
       actionLabel: "Open AWS data retention docs",
+    };
+  }
+
+  if (lowerMessage === RUNTIME_BALANCE_ERROR) {
+    return {
+      kind: "generic",
+      title: "Couldn’t complete your turn",
+      message: "The chat service is temporarily unavailable. Try sending your message again.",
     };
   }
 

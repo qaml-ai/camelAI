@@ -6,7 +6,13 @@ import { attachV2Uploads, v2AgentPath, v2Json, type V2Agent } from "./runtime-v2
 
 export type ImportBlock = { type: string; text?: string; path?: string; volume?: string; version?: number; size?: number; contentType?: string };
 export type ImportMessage = { role: string; content: string | ImportBlock[] };
-export type CopiedWorkspace = { volume: string; repoId: string; seq: number; head: string };
+export type CopiedWorkspace = {
+  volume: string;
+  repoId: string;
+  seq: number;
+  head: string;
+  copiedFiles?: Map<string, { version: number; size: number }>;
+};
 
 export const HISTORY_CHUNK_TARGET_BYTES = 550 * 1024;
 const MAX_SINGLE_TEXT_CHARS = 500_000;
@@ -14,6 +20,9 @@ const MAX_PINNED_IMAGE_BYTES = 3_000_000;
 const MAX_AUTO_WORKSPACE_FILES = 200;
 const MAX_AUTO_WORKSPACE_BYTES = 16 * 1024 * 1024;
 const MAX_AUTO_SINGLE_FILE_BYTES = 4 * 1024 * 1024;
+const RECENT_R2_UPLOAD_WINDOW = 20;
+const WORKSPACE_COPY_CONCURRENCY = 8;
+const HISTORY_PAGE_LIMIT = 500;
 
 export function trimOversizedMessage(message: ImportMessage): ImportMessage {
   if (typeof message.content === "string") {
@@ -61,12 +70,12 @@ export async function copyV1WorkspaceToV2Repo(
   const volInfo = await runtimeApi(env, "GET", volPath).catch(() => null) as { seq?: number } | null;
   if (!volInfo) return undefined;
 
-  const listed: Array<{ path: string; size: number }> = [];
+  const listed: Array<{ path: string; version: number; size: number }> = [];
   let after: string | undefined;
   while (listed.length < MAX_AUTO_WORKSPACE_FILES) {
     const query = new URLSearchParams({ limit: "100", ...(after ? { after } : {}) });
     const page = await runtimeApi(env, "GET", `${volPath}/files?${query}`).catch(() => null) as {
-      files?: Array<{ path: string; size: number }>;
+      files?: Array<{ path: string; version: number; size: number }>;
       next?: string;
     } | null;
     if (!page?.files?.length) break;
@@ -78,45 +87,66 @@ export async function copyV1WorkspaceToV2Repo(
 
   const repo = await v2Json<{ repoId: string; branch: string }>(env, v2AgentPath(v2AgentId) + "/repo", { method: "PUT" });
   const puts: Array<{ path: string; base64: string }> = [];
+  const pendingMeta: Array<{ path: string; version: number; size: number }> = [];
+  const copiedFiles = new Map<string, { version: number; size: number }>();
   let batchBytes = 0;
   let totalBytes = 0;
   let head = "";
 
   const flush = async () => {
     if (!puts.length) return;
+    const batchPuts = puts.splice(0, puts.length);
+    const batchMeta = pendingMeta.splice(0, pendingMeta.length);
     const res = await v2Json<{ commit: string }>(env, `/repos/${encodeURIComponent(repo.repoId)}/write`, {
       method: "POST",
-      body: { ref: repo.branch, puts: puts.splice(0, puts.length), message: `Migrate v1 workspace ${mount.volumeId}` },
+      body: { ref: repo.branch, puts: batchPuts, message: `Migrate v1 workspace ${mount.volumeId}` },
     });
     head = res.commit;
+    for (const m of batchMeta) copiedFiles.set(m.path, { version: m.version, size: m.size });
     batchBytes = 0;
   };
 
+  const candidates: Array<{ cleanPath: string; version: number; size: number }> = [];
+  let plannedBytes = 0;
   for (const entry of listed.slice(0, MAX_AUTO_WORKSPACE_FILES)) {
     const cleanPath = entry.path.replace(/^\/+/, "");
     if (!cleanPath || entry.size > MAX_AUTO_SINGLE_FILE_BYTES) continue;
-    if (totalBytes + entry.size > MAX_AUTO_WORKSPACE_BYTES) break;
-    const encodedPath = cleanPath.split("/").map(encodeURIComponent).join("/");
-    const fileRes = await fetch(`${runtimeUrl(env)}${volPath}/files/${encodedPath}`, {
-      headers: { Authorization: `Bearer ${env.AGENT_RUNTIME_API_TOKEN ?? ""}` },
-      redirect: "manual",
-    }).catch(() => null);
-    if (!fileRes?.ok) {
-      await fileRes?.body?.cancel().catch(() => {});
-      continue;
+    if (plannedBytes + entry.size > MAX_AUTO_WORKSPACE_BYTES) break;
+    plannedBytes += entry.size;
+    candidates.push({ cleanPath, version: entry.version, size: entry.size });
+  }
+
+  for (let i = 0; i < candidates.length; i += WORKSPACE_COPY_CONCURRENCY) {
+    const slice = candidates.slice(i, i + WORKSPACE_COPY_CONCURRENCY);
+    const fetched = await Promise.all(slice.map(async (entry) => {
+      const encodedPath = entry.cleanPath.split("/").map(encodeURIComponent).join("/");
+      const fileRes = await fetch(`${runtimeUrl(env)}${volPath}/files/${encodedPath}`, {
+        headers: { Authorization: `Bearer ${env.AGENT_RUNTIME_API_TOKEN ?? ""}` },
+        redirect: "manual",
+      }).catch(() => null);
+      if (!fileRes?.ok) {
+        await fileRes?.body?.cancel().catch(() => {});
+        return null;
+      }
+      const bytes = new Uint8Array(await fileRes.arrayBuffer());
+      return { entry, bytes };
+    }));
+    for (const item of fetched) {
+      if (!item) continue;
+      if (totalBytes + item.bytes.byteLength > MAX_AUTO_WORKSPACE_BYTES) continue;
+      totalBytes += item.bytes.byteLength;
+      const b64 = Buffer.from(item.bytes).toString("base64");
+      if (puts.length > 0 && batchBytes + b64.length > 3 * 1024 * 1024) {
+        await flush();
+      }
+      puts.push({ path: item.entry.cleanPath, base64: b64 });
+      pendingMeta.push({ path: item.entry.cleanPath, version: item.entry.version, size: item.bytes.byteLength });
+      batchBytes += b64.length;
     }
-    const bytes = new Uint8Array(await fileRes.arrayBuffer());
-    totalBytes += bytes.byteLength;
-    const b64 = Buffer.from(bytes).toString("base64");
-    if (puts.length > 0 && batchBytes + b64.length > 3 * 1024 * 1024) {
-      await flush();
-    }
-    puts.push({ path: cleanPath, base64: b64 });
-    batchBytes += b64.length;
   }
   await flush();
   if (!head) return undefined;
-  return { volume: mount.volumeId, repoId: repo.repoId, seq: Number(volInfo.seq ?? 0), head };
+  return { volume: mount.volumeId, repoId: repo.repoId, seq: Number(volInfo.seq ?? 0), head, copiedFiles };
 }
 
 export async function pinnedV1Files(env: ChatEnv, files: ImportBlock[], workspace: CopiedWorkspace | undefined) {
@@ -131,7 +161,16 @@ export async function pinnedV1Files(env: ChatEnv, files: ImportBlock[], workspac
     if (isImage && ((file.size ?? 0) <= 0 || imageBytes + (file.size ?? 0) > MAX_PINNED_IMAGE_BYTES)) {
       continue;
     }
-    const path = file.path.slice("/workspace".length);
+    const cleanPath = file.path.slice("/workspace/".length).replace(/^\/+/, "");
+    if (!cleanPath) continue;
+    if (workspace.copiedFiles) {
+      const copied = workspace.copiedFiles.get(cleanPath);
+      if (!copied || copied.version !== file.version || copied.size !== file.size) continue;
+      if (isImage) imageBytes += copied.size;
+      pinned.push({ path: cleanPath, contentType: file.contentType, commit: workspace.head });
+      continue;
+    }
+    const path = `/${cleanPath}`;
     const query = new URLSearchParams({ prefix: path, limit: "1" });
     const entry = await runtimeApi(env, "GET", `/v1/volumes/${encodeURIComponent(workspace.volume)}/files?${query}`) as {
       files: Array<{ path: string; version: number; size: number }>;
@@ -141,7 +180,7 @@ export async function pinnedV1Files(env: ChatEnv, files: ImportBlock[], workspac
       continue;
     }
     if (isImage) imageBytes += current.size;
-    pinned.push({ path: path.slice(1), contentType: file.contentType, commit: workspace.head });
+    pinned.push({ path: cleanPath, contentType: file.contentType, commit: workspace.head });
   }
   return pinned;
 }
@@ -151,6 +190,7 @@ async function resolveMessageAttachments(
   context: ChatContextState,
   agentId: string,
   messageIndex: number,
+  totalMessages: number,
   message: ImportMessage,
   uploadPrefix: string,
   workspace?: CopiedWorkspace,
@@ -161,6 +201,7 @@ async function resolveMessageAttachments(
     return await pinnedV1Files(env, nativeFiles, workspace).catch(() => []);
   }
   if (message.role !== "user") return [];
+  if (totalMessages - messageIndex > RECENT_R2_UPLOAD_WINDOW) return [];
   const text = typeof message.content === "string" ? message.content :
     message.content.flatMap(block => block.type === "text" ? [block.text] : []).join("\n");
   if (!parseUploadRefs(text).refs.some(ref => ref.kind === "user_upload")) return [];
@@ -232,7 +273,7 @@ export async function streamV1HistoryToV2(
 
   let cursor = offset;
   while (cursor < totalMessages) {
-    const page = await runtimeApi(env, "GET", `${sourcePath}/history?after=${cursor}&limit=100`) as {
+    const page = await runtimeApi(env, "GET", `${sourcePath}/history?after=${cursor}&limit=${HISTORY_PAGE_LIMIT}`) as {
       entries: Array<{ index: number; message: ImportMessage }>;
       total: number;
       truncated: boolean;
@@ -245,7 +286,7 @@ export async function streamV1HistoryToV2(
     for (const { index, message } of page.entries) {
       if (index !== cursor) throw new Error("V1 history is missing a message");
       const trimmed = trimOversizedMessage(message);
-      const att = await resolveMessageAttachments(env, context, agentId, cursor, trimmed, uploadPrefix, workspace);
+      const att = await resolveMessageAttachments(env, context, agentId, cursor, totalMessages, trimmed, uploadPrefix, workspace);
       const est = encoder.encode(JSON.stringify(trimmed)).byteLength + (att.length ? encoder.encode(JSON.stringify(att)).byteLength + 64 : 0) + 16;
       if (chunkMessages.length > 0 && chunkBytes + est > HISTORY_CHUNK_TARGET_BYTES) {
         await flushChunk();

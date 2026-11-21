@@ -25,11 +25,16 @@ type V1Handoff = HandoffSelection & ({ phase: "inspect" } | { phase: "prepare" }
   workspace?: CopiedWorkspace;
 }) & { channel?: HandoffChannel };
 
-const MAX_CHUNKED_IMPORT_BYTES = 80 * 1024 * 1024;
-const HISTORY_CHUNK_TARGET_BYTES = 600 * 1024;
+const HISTORY_CHUNK_TARGET_BYTES = 550 * 1024;
+const MAX_SINGLE_TEXT_CHARS = 500_000;
 const MAX_PINNED_IMAGE_BYTES = 3_000_000;
 
-function trimOversizedInlineImages(message: ImportMessage): ImportMessage {
+function trimOversizedMessage(message: ImportMessage): ImportMessage {
+  if (typeof message.content === "string") {
+    return message.content.length > MAX_SINGLE_TEXT_CHARS
+      ? { ...message, content: `${message.content.slice(0, MAX_SINGLE_TEXT_CHARS)}\n[truncated during migration]` }
+      : message;
+  }
   if (!Array.isArray(message.content)) return message;
   let changed = false;
   const content = message.content.map((block) => {
@@ -37,6 +42,10 @@ function trimOversizedInlineImages(message: ImportMessage): ImportMessage {
     if (block.type === "image" && typeof data === "string" && data.length > 500_000) {
       changed = true;
       return { ...block, data: "", omittedBytes: data.length };
+    }
+    if (block.type === "text" && typeof block.text === "string" && block.text.length > MAX_SINGLE_TEXT_CHARS) {
+      changed = true;
+      return { ...block, text: `${block.text.slice(0, MAX_SINGLE_TEXT_CHARS)}\n[truncated during migration]` };
     }
     return block;
   });
@@ -55,32 +64,135 @@ async function v1ThreadHandoffBinding(
 }
 
 
-async function readV1History(env: ChatEnv, agentPath: string): Promise<ImportMessage[]> {
-  const messages: ImportMessage[] = [];
+async function readV1HistoryTotal(env: ChatEnv, agentPath: string): Promise<number> {
+  const page = await runtimeApi(env, "GET", `${agentPath}/history?after=0&limit=1`) as {
+    total: number;
+    truncated: boolean;
+  };
+  if (page.truncated) throw new Error("V1 history is truncated");
+  return page.total;
+}
+
+async function resolveMessageAttachments(
+  env: ChatEnv,
+  context: ChatContextState,
+  agentId: string,
+  messageIndex: number,
+  message: ImportMessage,
+  uploadPrefix: string,
+  workspace?: CopiedWorkspace,
+): Promise<Array<{ path: string; contentType: string; commit: string }>> {
+  if (message.role !== "user" && message.role !== "toolResult") return [];
+  const nativeFiles = Array.isArray(message.content) ? message.content.filter(block => block.type === "file") : [];
+  if (nativeFiles.length) {
+    return await pinnedV1Files(env, nativeFiles, workspace).catch(() => []);
+  }
+  if (message.role !== "user") return [];
+  const text = typeof message.content === "string" ? message.content :
+    message.content.flatMap(block => block.type === "text" ? [block.text] : []).join("\n");
+  if (!parseUploadRefs(text).refs.some(ref => ref.kind === "user_upload")) return [];
+  return await attachV2Uploads(env, context, agentId, `${uploadPrefix}-${messageIndex}`, text).catch(() => []);
+}
+
+async function streamV1HistoryToV2(
+  env: ChatEnv,
+  context: ChatContextState,
+  sourcePath: string,
+  agentId: string,
+  source: string,
+  totalMessages: number,
+  uploadPrefix: string,
+  workspace?: CopiedWorkspace,
+  existingCount = 0,
+) {
+  const agentPath = v2AgentPath(agentId);
   const encoder = new TextEncoder();
-  let bytes = 2;
-  let total: number | undefined;
-  for (;;) {
-    const page = await runtimeApi(env, "GET", `${agentPath}/history?after=${messages.length}&limit=200`) as {
+  let offset = 0;
+  let finalCount = 0;
+  let previous: string | undefined;
+  if (existingCount > 0) {
+    const proof = await v2Json<{ source: string; receipt: string; messageCount: number }>(env, agentPath + "/history/import")
+      .catch(() => null);
+    if (proof && proof.source === source && proof.messageCount > 0 && proof.messageCount <= totalMessages) {
+      if (proof.messageCount === totalMessages) {
+        return { messagesWithAttachments: 0 };
+      }
+      offset = proof.messageCount;
+      finalCount = proof.messageCount;
+      previous = proof.receipt;
+    }
+  }
+  if (totalMessages === 0) {
+    const receipt = await v2Json<{ count: number; receipt: string }>(env, agentPath + "/history/import", {
+      method: "PUT",
+      body: { source, messages: [], attachments: [], repair: true },
+    });
+    if (!receipt.receipt) throw new Error("Incomplete v2 import receipt");
+    return { messagesWithAttachments: 0 };
+  }
+
+  let chunkMessages: ImportMessage[] = [];
+  let chunkAttachments: Array<{ messageIndex: number; files: Array<{ path: string; contentType: string; commit: string }> }> = [];
+  let chunkBytes = 256;
+  let messagesWithAttachments = 0;
+
+  const flushChunk = async () => {
+    if (!chunkMessages.length) return;
+    const res = await v2Json<{ count: number; receipt: string }>(env, agentPath + "/history/import/chunk", {
+      method: "PUT",
+      body: {
+        source,
+        ...(previous ? { previous } : {}),
+        appendAfter: finalCount,
+        messages: chunkMessages,
+        attachments: chunkAttachments,
+        repair: true,
+      },
+    });
+    if (!res.receipt) throw new Error("Incomplete v2 chunk receipt");
+    previous = res.receipt;
+    finalCount = res.count;
+    chunkMessages = [];
+    chunkAttachments = [];
+    chunkBytes = 256;
+  };
+
+  let cursor = offset;
+  while (cursor < totalMessages) {
+    const page = await runtimeApi(env, "GET", `${sourcePath}/history?after=${cursor}&limit=100`) as {
       entries: Array<{ index: number; message: ImportMessage }>;
       total: number;
       truncated: boolean;
       nextAfter: number;
     };
-    total ??= page.total;
-    if (page.truncated || page.total !== total || messages.length + page.entries.length > total) {
+    if (page.truncated || page.total !== totalMessages || cursor + page.entries.length > totalMessages) {
       throw new Error("V1 history changed or has a gap");
     }
+    if (!page.entries.length) break;
     for (const { index, message } of page.entries) {
-      if (index !== messages.length) throw new Error("V1 history is missing a message");
-      const trimmed = trimOversizedInlineImages(message);
-      bytes += encoder.encode(JSON.stringify(trimmed)).byteLength + 1;
-      if (bytes > MAX_CHUNKED_IMPORT_BYTES) throw new RuntimeApiError("V1 history is too large to import", 413, "large_history");
-      messages.push(trimmed);
+      if (index !== cursor) throw new Error("V1 history is missing a message");
+      const trimmed = trimOversizedMessage(message);
+      const att = await resolveMessageAttachments(env, context, agentId, cursor, trimmed, uploadPrefix, workspace);
+      const est = encoder.encode(JSON.stringify(trimmed)).byteLength + (att.length ? encoder.encode(JSON.stringify(att)).byteLength + 64 : 0) + 16;
+      if (chunkMessages.length > 0 && chunkBytes + est > HISTORY_CHUNK_TARGET_BYTES) {
+        await flushChunk();
+      }
+      if (att.length) {
+        chunkAttachments.push({ messageIndex: chunkMessages.length, files: att });
+        messagesWithAttachments += 1;
+      }
+      chunkMessages.push(trimmed);
+      chunkBytes += est;
+      cursor += 1;
     }
-    if (!page.entries.length && messages.length === total) return messages;
-    if (!page.entries.length || page.nextAfter !== messages.length) throw new Error("V1 history cursor did not advance");
+    if (page.nextAfter !== cursor) throw new Error("V1 history cursor did not advance");
   }
+  await flushChunk();
+  const state = await v2Json<V2Agent & { messageCount: number }>(env, agentPath);
+  if (state.messageCount !== finalCount) {
+    throw new Error("The copied chat history does not match its source");
+  }
+  return { messagesWithAttachments };
 }
 
 async function pinnedV1Files(env: ChatEnv, files: ImportBlock[], workspace: CopiedWorkspace | undefined) {
@@ -209,10 +321,6 @@ async function verifyHistoryCount(env: ChatEnv, agentPath: string, expectedCount
     messagesWithAttachments += page.messages.filter(({ content }) => content.files?.length).length;
   }
   return { messagesWithAttachments };
-}
-
-async function verifyHistory(env: ChatEnv, agentPath: string, messages: ImportMessage[]) {
-  return verifyHistoryCount(env, agentPath, messages.length);
 }
 
 /** The first migration source is immutable. Its old conversation ID and workspace remain the same. */
@@ -351,10 +459,10 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
       return { status: "unsupported_mounts" };
     }
     if (pending.length || state.requests.some(({ state }) => state === "running" || state === "queued")) return { status: "busy" };
-    const messages = await readV1History(env, sourcePath);
-    if (!messages.length && (thread.user_message_count ?? 0) > 0) return { status: "missing_history" };
+    const totalMessages = await readV1HistoryTotal(env, sourcePath);
+    if (!totalMessages && (thread.user_message_count ?? 0) > 0) return { status: "missing_history" };
     if (handoff.phase === "inspect") {
-      return { status: "ready", agentId: row.agentId, model: model.model, messages: messages.length, volume: mount?.volumeId };
+      return { status: "ready", agentId: row.agentId, model: model.model, messages: totalMessages, volume: mount?.volumeId };
     }
 
     await syncV2RouteKeyScope(env, context, resolved);
@@ -374,16 +482,23 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
       const files = await v2Json<{ commit: string }>(env, `/repos/${encodeURIComponent(workspace.repoId)}/ls?at=${encodeURIComponent(target.branch)}`);
       if (files.commit !== workspace.head) return { status: "destination_workspace_changed" };
     }
-    const copy = await (target.messageCount > 0 && target.messageCount === messages.length
-      ? verifyHistory(env, targetPath, messages)
-      : copyHistory(env, context, agentId, `chiridion-v1:${handoff.fencedAgentId}`, messages, `v1-migration-${crypto.randomUUID()}`, workspace, target.messageCount)
+    const copy = await streamV1HistoryToV2(
+      env,
+      context,
+      sourcePath,
+      agentId,
+      `chiridion-v1:${handoff.fencedAgentId}`,
+      totalMessages,
+      `v1-migration-${crypto.randomUUID()}`,
+      workspace,
+      target.messageCount,
     ).catch((error: unknown) => {
       if (error instanceof RuntimeApiError && [400, 404, 409, 413, 422].includes(error.status)) return { refused: error.code ?? "copy_refused" };
       throw error;
     });
     if ("refused" in copy) return { status: copy.refused };
-    const latest = await readV1History(env, sourcePath);
-    if (JSON.stringify(latest) !== JSON.stringify(messages)) return { status: "source_changed" };
+    const latestTotal = await readV1HistoryTotal(env, sourcePath);
+    if (latestTotal !== totalMessages) return { status: "source_changed" };
     if (workspace) {
       const volume = await runtimeApi(env, "GET", `/v1/volumes/${encodeURIComponent(workspace.volume)}`) as { seq: number };
       if (volume.seq !== workspace.seq) return { status: "source_workspace_changed" };
@@ -396,7 +511,7 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
       agentId, model: model.model, keyScope: model.keyScope ?? HOSTED_KEY_SCOPE,
       configured: { thinkingLevel: model.thinkingLevel, promptVersion: RUNTIME_PROMPT_VERSION },
     });
-    return { status: moved ? "moved" : "source_changed", agentId, messages: messages.length, ...copy };
+    return { status: moved ? "moved" : "source_changed", agentId, messages: totalMessages, ...copy };
   }
 
   /** Read only the thread's own scratch volume, with the v1 credential kept inside the app. */

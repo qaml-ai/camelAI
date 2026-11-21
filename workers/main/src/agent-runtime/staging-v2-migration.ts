@@ -1,4 +1,3 @@
-import { Buffer } from "node:buffer";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { parseUploadRefs } from "../../../../src/lib/chat-attachment-refs";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
@@ -15,43 +14,21 @@ import { runtimeApi, runtimeUrl, RuntimeApiError, v2WorkspaceEnabled } from "./r
 import { attachV2Uploads, createV2ThreadAgent, v2AgentPath, v2Json, type V2Agent } from "./runtime-v2";
 import { MAX_IMPORT_BYTES, migrationSubject } from "./thread-migration";
 import { RUNTIME_PROMPT_VERSION } from "./runtime-prompt";
+import {
+  HISTORY_CHUNK_TARGET_BYTES,
+  pinnedV1Files,
+  readV1HistoryTotal,
+  streamV1HistoryToV2,
+  type CopiedWorkspace,
+  type ImportMessage,
+} from "./v1-history-copy";
 
-type ImportBlock = { type: string; text?: string; path?: string; volume?: string; version?: number; size?: number; contentType?: string };
-type ImportMessage = { role: string; content: string | ImportBlock[] };
-type CopiedWorkspace = { volume: string; repoId: string; seq: number; head: string };
 type HandoffSelection = { expectedThreadModel?: string };
 type V1Handoff = HandoffSelection & ({ phase: "inspect" } | { phase: "prepare" } | {
   phase: "publish";
   fencedAgentId: string;
   workspace?: CopiedWorkspace;
 }) & { channel?: HandoffChannel };
-
-const HISTORY_CHUNK_TARGET_BYTES = 550 * 1024;
-const MAX_SINGLE_TEXT_CHARS = 500_000;
-const MAX_PINNED_IMAGE_BYTES = 3_000_000;
-
-function trimOversizedMessage(message: ImportMessage): ImportMessage {
-  if (typeof message.content === "string") {
-    return message.content.length > MAX_SINGLE_TEXT_CHARS
-      ? { ...message, content: `${message.content.slice(0, MAX_SINGLE_TEXT_CHARS)}\n[truncated during migration]` }
-      : message;
-  }
-  if (!Array.isArray(message.content)) return message;
-  let changed = false;
-  const content = message.content.map((block) => {
-    const data = (block as { data?: unknown }).data;
-    if (block.type === "image" && typeof data === "string" && data.length > 500_000) {
-      changed = true;
-      return { ...block, data: "", omittedBytes: data.length };
-    }
-    if (block.type === "text" && typeof block.text === "string" && block.text.length > MAX_SINGLE_TEXT_CHARS) {
-      changed = true;
-      return { ...block, text: `${block.text.slice(0, MAX_SINGLE_TEXT_CHARS)}\n[truncated during migration]` };
-    }
-    return block;
-  });
-  return changed ? { ...message, content } : message;
-}
 
 async function v1ThreadHandoffBinding(
   env: ChatEnv, orgId: string, thread: OrgThread, row: ThreadRuntimeRecord, channel: HandoffChannel | undefined,
@@ -62,241 +39,6 @@ async function v1ThreadHandoffBinding(
   return binding && await env.APP_KV.get(getChannelThreadMapKey({
     ...binding, orgId, workspaceId: thread.workspace_id,
   })) === thread.id ? binding : false;
-}
-
-
-export async function readV1HistoryTotal(env: ChatEnv, agentPath: string): Promise<number> {
-  const page = await runtimeApi(env, "GET", `${agentPath}/history?after=0&limit=1`) as {
-    total: number;
-    truncated: boolean;
-  };
-  if (page.truncated) throw new Error("V1 history is truncated");
-  return page.total;
-}
-
-const MAX_AUTO_WORKSPACE_FILES = 200;
-const MAX_AUTO_WORKSPACE_BYTES = 16 * 1024 * 1024;
-const MAX_AUTO_SINGLE_FILE_BYTES = 4 * 1024 * 1024;
-
-export async function copyV1WorkspaceToV2Repo(
-  env: ChatEnv,
-  v1AgentId: string,
-  v2AgentId: string,
-): Promise<CopiedWorkspace | undefined> {
-  const mounts = await runtimeApi(env, "GET", `/v1/agents/${encodeURIComponent(v1AgentId)}/mounts`).catch(() => null) as
-    Array<{ volumeId: string; path: string; mode: string; subpath?: string }> | null;
-  const mount = mounts?.find((m) => m.path === "/workspace" && !m.subpath);
-  if (!mount?.volumeId) return undefined;
-
-  const volPath = `/v1/volumes/${encodeURIComponent(mount.volumeId)}`;
-  const volInfo = await runtimeApi(env, "GET", volPath).catch(() => null) as { seq?: number } | null;
-  if (!volInfo) return undefined;
-
-  const listed: Array<{ path: string; size: number }> = [];
-  let after: string | undefined;
-  while (listed.length < MAX_AUTO_WORKSPACE_FILES) {
-    const query = new URLSearchParams({ limit: "100", ...(after ? { after } : {}) });
-    const page = await runtimeApi(env, "GET", `${volPath}/files?${query}`).catch(() => null) as {
-      files?: Array<{ path: string; size: number }>;
-      next?: string;
-    } | null;
-    if (!page?.files?.length) break;
-    listed.push(...page.files);
-    after = page.next;
-    if (!after) break;
-  }
-  if (!listed.length) return undefined;
-
-  const repo = await v2Json<{ repoId: string; branch: string }>(env, v2AgentPath(v2AgentId) + "/repo", { method: "PUT" });
-  const puts: Array<{ path: string; base64: string }> = [];
-  let batchBytes = 0;
-  let totalBytes = 0;
-  let head = "";
-
-  const flush = async () => {
-    if (!puts.length) return;
-    const res = await v2Json<{ commit: string }>(env, `/repos/${encodeURIComponent(repo.repoId)}/write`, {
-      method: "POST",
-      body: { ref: repo.branch, puts: puts.splice(0, puts.length), message: `Migrate v1 workspace ${mount.volumeId}` },
-    });
-    head = res.commit;
-    batchBytes = 0;
-  };
-
-  for (const entry of listed.slice(0, MAX_AUTO_WORKSPACE_FILES)) {
-    const cleanPath = entry.path.replace(/^\/+/, "");
-    if (!cleanPath || entry.size > MAX_AUTO_SINGLE_FILE_BYTES) continue;
-    if (totalBytes + entry.size > MAX_AUTO_WORKSPACE_BYTES) break;
-    const encodedPath = cleanPath.split("/").map(encodeURIComponent).join("/");
-    const fileRes = await fetch(`${runtimeUrl(env)}${volPath}/files/${encodedPath}`, {
-      headers: { Authorization: `Bearer ${env.AGENT_RUNTIME_API_TOKEN ?? ""}` },
-      redirect: "manual",
-    }).catch(() => null);
-    if (!fileRes?.ok) {
-      await fileRes?.body?.cancel().catch(() => {});
-      continue;
-    }
-    const bytes = new Uint8Array(await fileRes.arrayBuffer());
-    totalBytes += bytes.byteLength;
-    const b64 = Buffer.from(bytes).toString("base64");
-    if (puts.length > 0 && batchBytes + b64.length > 3 * 1024 * 1024) {
-      await flush();
-    }
-    puts.push({ path: cleanPath, base64: b64 });
-    batchBytes += b64.length;
-  }
-  await flush();
-  if (!head) return undefined;
-  return { volume: mount.volumeId, repoId: repo.repoId, seq: Number(volInfo.seq ?? 0), head };
-}
-
-async function resolveMessageAttachments(
-  env: ChatEnv,
-  context: ChatContextState,
-  agentId: string,
-  messageIndex: number,
-  message: ImportMessage,
-  uploadPrefix: string,
-  workspace?: CopiedWorkspace,
-): Promise<Array<{ path: string; contentType: string; commit: string }>> {
-  if (message.role !== "user" && message.role !== "toolResult") return [];
-  const nativeFiles = Array.isArray(message.content) ? message.content.filter(block => block.type === "file") : [];
-  if (nativeFiles.length) {
-    return await pinnedV1Files(env, nativeFiles, workspace).catch(() => []);
-  }
-  if (message.role !== "user") return [];
-  const text = typeof message.content === "string" ? message.content :
-    message.content.flatMap(block => block.type === "text" ? [block.text] : []).join("\n");
-  if (!parseUploadRefs(text).refs.some(ref => ref.kind === "user_upload")) return [];
-  return await attachV2Uploads(env, context, agentId, `${uploadPrefix}-${messageIndex}`, text).catch(() => []);
-}
-
-export async function streamV1HistoryToV2(
-  env: ChatEnv,
-  context: ChatContextState,
-  sourcePath: string,
-  agentId: string,
-  source: string,
-  totalMessages: number,
-  uploadPrefix: string,
-  workspace?: CopiedWorkspace,
-  existingCount = 0,
-) {
-  const agentPath = v2AgentPath(agentId);
-  const encoder = new TextEncoder();
-  let offset = 0;
-  let finalCount = 0;
-  let previous: string | undefined;
-  if (existingCount > 0) {
-    const proof = await v2Json<{ source: string; receipt: string; messageCount: number }>(env, agentPath + "/history/import")
-      .catch(() => null);
-    if (proof && proof.source === source && proof.messageCount > 0 && proof.messageCount <= totalMessages) {
-      if (proof.messageCount === totalMessages) {
-        return { messagesWithAttachments: 0 };
-      }
-      offset = proof.messageCount;
-      finalCount = proof.messageCount;
-      previous = proof.receipt;
-    }
-  }
-  if (totalMessages === 0) {
-    const receipt = await v2Json<{ count: number; receipt: string }>(env, agentPath + "/history/import", {
-      method: "PUT",
-      body: { source, messages: [], attachments: [], repair: true },
-    });
-    if (!receipt.receipt) throw new Error("Incomplete v2 import receipt");
-    return { messagesWithAttachments: 0 };
-  }
-
-  let chunkMessages: ImportMessage[] = [];
-  let chunkAttachments: Array<{ messageIndex: number; files: Array<{ path: string; contentType: string; commit: string }> }> = [];
-  let chunkBytes = 256;
-  let messagesWithAttachments = 0;
-
-  const flushChunk = async () => {
-    if (!chunkMessages.length) return;
-    const res = await v2Json<{ count: number; receipt: string }>(env, agentPath + "/history/import/chunk", {
-      method: "PUT",
-      body: {
-        source,
-        ...(previous ? { previous } : {}),
-        appendAfter: finalCount,
-        messages: chunkMessages,
-        attachments: chunkAttachments,
-        repair: true,
-      },
-    });
-    if (!res.receipt) throw new Error("Incomplete v2 chunk receipt");
-    previous = res.receipt;
-    finalCount = res.count;
-    chunkMessages = [];
-    chunkAttachments = [];
-    chunkBytes = 256;
-  };
-
-  let cursor = offset;
-  while (cursor < totalMessages) {
-    const page = await runtimeApi(env, "GET", `${sourcePath}/history?after=${cursor}&limit=100`) as {
-      entries: Array<{ index: number; message: ImportMessage }>;
-      total: number;
-      truncated: boolean;
-      nextAfter: number;
-    };
-    if (page.truncated || page.total !== totalMessages || cursor + page.entries.length > totalMessages) {
-      throw new Error("V1 history changed or has a gap");
-    }
-    if (!page.entries.length) break;
-    for (const { index, message } of page.entries) {
-      if (index !== cursor) throw new Error("V1 history is missing a message");
-      const trimmed = trimOversizedMessage(message);
-      const att = await resolveMessageAttachments(env, context, agentId, cursor, trimmed, uploadPrefix, workspace);
-      const est = encoder.encode(JSON.stringify(trimmed)).byteLength + (att.length ? encoder.encode(JSON.stringify(att)).byteLength + 64 : 0) + 16;
-      if (chunkMessages.length > 0 && chunkBytes + est > HISTORY_CHUNK_TARGET_BYTES) {
-        await flushChunk();
-      }
-      if (att.length) {
-        chunkAttachments.push({ messageIndex: chunkMessages.length, files: att });
-        messagesWithAttachments += 1;
-      }
-      chunkMessages.push(trimmed);
-      chunkBytes += est;
-      cursor += 1;
-    }
-    if (page.nextAfter !== cursor) throw new Error("V1 history cursor did not advance");
-  }
-  await flushChunk();
-  const state = await v2Json<V2Agent & { messageCount: number }>(env, agentPath);
-  if (state.messageCount !== finalCount) {
-    throw new Error("The copied chat history does not match its source");
-  }
-  return { messagesWithAttachments };
-}
-
-async function pinnedV1Files(env: ChatEnv, files: ImportBlock[], workspace: CopiedWorkspace | undefined) {
-  let imageBytes = 0;
-  const pinned: Array<{ path: string; contentType: string; commit: string }> = [];
-  for (const file of files) {
-    if (!workspace || file.volume !== workspace.volume || !file.path?.startsWith("/workspace/") ||
-        !Number.isSafeInteger(file.version) || !Number.isSafeInteger(file.size) || !file.contentType) {
-      continue;
-    }
-    const isImage = /^image\/(png|jpeg|gif|webp)$/i.test(file.contentType);
-    if (isImage && ((file.size ?? 0) <= 0 || imageBytes + (file.size ?? 0) > MAX_PINNED_IMAGE_BYTES)) {
-      continue;
-    }
-    const path = file.path.slice("/workspace".length);
-    const query = new URLSearchParams({ prefix: path, limit: "1" });
-    const entry = await runtimeApi(env, "GET", `/v1/volumes/${encodeURIComponent(workspace.volume)}/files?${query}`) as {
-      files: Array<{ path: string; version: number; size: number }>;
-    };
-    const current = entry.files[0];
-    if (current?.path !== path || current.version !== file.version || current.size !== file.size) {
-      continue;
-    }
-    if (isImage) imageBytes += current.size;
-    pinned.push({ path: path.slice(1), contentType: file.contentType, commit: workspace.head });
-  }
-  return pinned;
 }
 
 async function copyHistory(

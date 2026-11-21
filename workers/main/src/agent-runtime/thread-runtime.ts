@@ -24,7 +24,7 @@ import { runtimeRunLimits, v2RouteSupported, v2WireKeyScope } from "./model-rout
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
 import { RuntimeApiError, runtimeApi, runtimeUrl, v2WorkspaceEnabled } from "./runtime-api";
 import { attachV2Uploads, createV2ThreadAgent, v2AgentPath, v2Json, type V2Agent, type V2Run } from "./runtime-v2";
-import { copyV1WorkspaceToV2Repo, readV1HistoryTotal, streamV1HistoryToV2 } from "./staging-v2-migration";
+import { copyV1WorkspaceToV2Repo, readV1HistoryTotal, streamV1HistoryToV2 } from "./v1-history-copy";
 import { codexError, codexRoute, codexUpstreamCall, forwardedResponseHeaders } from "./codex-forwarder";
 import { HostedModelFallbackRequiredError } from "../chat-thread/pi-model-config";
 import { assertUserLlmUsageAccess, UserLlmUsageLimitError } from "../user-llm-usage-policy";

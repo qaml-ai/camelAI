@@ -10,6 +10,7 @@ vi.mock("@/lib/runtime-threads.server", () => ({
   requireRuntimeThread: requireRuntimeThreadMock,
 }));
 vi.mock("../workers/main/src/agent-runtime/thread-runtime", () => ({
+  ensureLegacyThreadPromotedToV2: vi.fn(async (_env: unknown, _ctx: unknown, row: unknown) => row),
   mintRuntimeBrowserToken: mintRuntimeBrowserTokenMock,
 }));
 vi.mock("../workers/main/src/agent-runtime/runtime-thread-telemetry", () => ({

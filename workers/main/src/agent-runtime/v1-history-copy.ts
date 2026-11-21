@@ -53,27 +53,25 @@ export function trimOversizedMessage(message: ImportMessage): ImportMessage {
   if (typeof slim.content === "string" && slim.content.length > 200_000) {
     slim.content = `${slim.content.slice(0, 200_000)}\n[truncated during migration]`;
   } else if (Array.isArray(slim.content)) {
-    slim.content = (slim.content as Array<Record<string, unknown>>).map((block) => {
+    slim.content = (slim.content as Array<Record<string, unknown>>).flatMap((block) => {
       if (block.type === "text" && typeof block.text === "string" && block.text.length > 150_000) {
-        return { ...block, text: `${block.text.slice(0, 150_000)}\n[truncated during migration]` };
+        return [{ ...block, text: `${block.text.slice(0, 150_000)}\n[truncated during migration]` }];
       }
       if (block.type === "image" && typeof block.data === "string" && block.data.length > 50_000) {
-        return { ...block, data: "", omittedBytes: block.data.length };
+        return [{ ...block, data: "", omittedBytes: block.data.length }];
       }
       if (block.type === "thinking") {
+        const text = typeof block.thinking === "string" ? block.thinking : "";
+        if (!text.trim()) return [];
         const next: Record<string, unknown> = { ...block };
-        if (typeof next.thinkingSignature === "string" && next.thinkingSignature.length > 50_000) {
-          delete next.thinkingSignature;
-        }
-        if (typeof next.thinking === "string" && next.thinking.length > 150_000) {
-          next.thinking = `${next.thinking.slice(0, 150_000)}\n[truncated during migration]`;
-        }
-        return next;
+        delete next.thinkingSignature;
+        if (text.length > 150_000) next.thinking = `${text.slice(0, 150_000)}\n[truncated during migration]`;
+        return [next];
       }
       if (block.type === "toolCall" && block.arguments && JSON.stringify(block.arguments).length > 150_000) {
-        return { ...block, arguments: { _truncated: true } };
+        return [{ ...block, arguments: { _truncated: true } }];
       }
-      return block;
+      return [block];
     });
   }
   return slim as unknown as ImportMessage;

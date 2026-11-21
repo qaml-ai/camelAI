@@ -1,11 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { encryptCredentials } from "../../../src/lib/integration-crypto";
 import { LLM_MODEL_OPTIONS } from "../../../src/lib/llm-provider-config";
 import { PiModelMapping } from "../src/pi-model-resolution";
 import { runtimeModelRoute } from "../src/agent-runtime/model-routes";
 import type { PiResolvedModelConfig } from "../src/chat-thread/pi-model-config";
-import { customEndpointRunsOnRuntime, hostedModelHeaders, hostedScopeProviders, orgScopeProviders, selfhostOperatorEndpointOrigin, syncKeyScope, syncOrgKeyScope, type KeyScopeEnv } from "../src/agent-runtime/key-scopes";
+import { customEndpointRunsOnRuntime, hostedModelHeaders, hostedScopeProviders, orgScopeProviders, selfhostOperatorEndpointOrigin, syncKeyScope, syncOrgKeyScope, syncV2OrgKeyScope, type KeyScopeEnv } from "../src/agent-runtime/key-scopes";
 
 const SECRET = "test-integration-secret-key-for-key-scope-tests";
 
@@ -353,5 +353,84 @@ describe("self-host key scopes", () => {
     }))).toEqual({ providers: {}, modelProviders: {} });
     // The operator's own endpoint may be on loopback (a vLLM beside the app).
     expect(customEndpointRunsOnRuntime("openai-completions", "bearer", "http://127.0.0.1:8000/v1", "http://127.0.0.1:8000")).toBe(true);
+  });
+});
+
+describe("syncV2OrgKeyScope", () => {
+  it("syncs Bedrock Mantle, custom bearer Anthropic, and Codex credentials to v2 key scopes", async () => {
+    const { kv } = memoryKv();
+    const calls: Array<{ method: string; path: string; body?: unknown; auth: string | null }> = [];
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      calls.push({
+        method: init?.method ?? "GET",
+        path: url.pathname,
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        auth: new Headers(init?.headers).get("authorization"),
+      });
+      return Response.json({ ok: true });
+    });
+    try {
+      const v2Env = {
+        ...env(kv),
+        AGENT_RUNTIME_V2_URL: "https://v2.runtime.test",
+        AGENT_RUNTIME_V2_API_TOKEN: "v2-token",
+      } as never;
+
+      await syncV2OrgKeyScope(v2Env, "v2org_bedrock", await record("bedrock", { bearer_token: "bedrock-key" }, { aws_region: "eu-west-1" }));
+      expect(calls).toEqual([
+        {
+          method: "PUT",
+          path: "/v2/key-scopes/org_v2org_bedrock/providers/amazon-bedrock",
+          body: { apiKey: "bedrock-key", baseUrl: "https://bedrock-mantle.eu-west-1.api.aws/anthropic", apiStyle: "anthropic" },
+          auth: "Bearer v2-token",
+        },
+        {
+          method: "PUT",
+          path: "/v2/key-scopes/org_v2org_bedrock/providers/bedrock-openai-us-east-1",
+          body: { apiKey: "bedrock-key", baseUrl: "https://bedrock-mantle.us-east-1.api.aws/openai/v1", apiStyle: "openai-responses" },
+          auth: "Bearer v2-token",
+        },
+      ]);
+
+      calls.length = 0;
+      await syncV2OrgKeyScope(v2Env, "v2org_custom", await record("custom", { api_key: "sk-custom" }, {
+        custom_api: "anthropic-messages",
+        custom_base_url: "https://llm.acme.example",
+        custom_auth_type: "bearer",
+      }));
+      expect(calls).toEqual([{
+        method: "PUT",
+        path: "/v2/key-scopes/org_v2org_custom/providers/custom",
+        body: {
+          apiKey: "",
+          baseUrl: "https://llm.acme.example",
+          apiStyle: "anthropic",
+          headers: { Authorization: "Bearer sk-custom" },
+        },
+        auth: "Bearer v2-token",
+      }]);
+
+      calls.length = 0;
+      await syncV2OrgKeyScope(v2Env, "v2org_codex", null, {
+        credential: "eyJ.codex.jwt",
+        accountId: "acct_123",
+        upstreamBase: "https://chatgpt.com/backend-api/codex",
+        headers: { "x-extra": "1" },
+      });
+      expect(calls).toEqual([{
+        method: "PUT",
+        path: "/v2/key-scopes/org_v2org_codex/providers/openai-codex",
+        body: {
+          apiKey: "eyJ.codex.jwt",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          apiStyle: "openai-codex",
+          headers: { "x-extra": "1", "chatgpt-account-id": "acct_123" },
+        },
+        auth: "Bearer v2-token",
+      }]);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

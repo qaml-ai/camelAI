@@ -81,8 +81,8 @@ export async function handleAgentRuntimeV2Events({ req, env, ctx }: Pick<RouteCo
   const org = env.ORG.get(env.ORG.idFromName(orgId));
   const [thread, runtime] = await Promise.all([org.getThread(threadId), org.getThreadRuntime(threadId)]);
   if (thread?.workspace_id !== workspaceId || runtime?.agentId !== agentId ||
-      runtime.runtimeVersion !== "v2" || runtime.keyScope !== HOSTED_KEY_SCOPE) {
-    return Response.json({ error: "Event does not match a hosted v2 thread" }, { status: 409 });
+      runtime.runtimeVersion !== "v2") {
+    return Response.json({ error: "Event does not match a v2 thread" }, { status: 409 });
   }
   if (event.type !== "usage.recorded") {
     const scheduled = thread.source === "scheduled";
@@ -141,7 +141,7 @@ export async function handleAgentRuntimeV2Events({ req, env, ctx }: Pick<RouteCo
     agentId,
     actor,
     context: { org: orgId, workspace: workspaceId, thread: threadId },
-    keyScope: HOSTED_KEY_SCOPE,
+    keyScope: runtime.keyScope ?? HOSTED_KEY_SCOPE,
     provider: modelRoute.slice(0, separator),
     model: modelRoute.slice(separator + 1),
     kind: usage.kind,

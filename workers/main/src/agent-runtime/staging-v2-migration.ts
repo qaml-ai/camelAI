@@ -8,8 +8,8 @@ import type { Env } from "../types";
 import { channelHandoffBinding, channelHandoffOwner, type HandoffChannel } from "./channel-handoff";
 import type { OrgThread, ThreadRuntimeRecord } from "../identity/org-do";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
-import { CAMEL_CODE_RUNTIME_MODEL, isPreviousCamelCodeRuntimeModel, v2HostedModelMatches } from "./model-routes";
-import { resolveThreadRuntimeRoute, runtimeAgentModel, RuntimeRunRefused } from "./run-gates";
+import { CAMEL_CODE_RUNTIME_MODEL, isPreviousCamelCodeRuntimeModel, v2ByokEnabled, v2HostedModelMatches, v2RouteSupported } from "./model-routes";
+import { resolveThreadRuntimeRoute, runtimeAgentModel, RuntimeRunRefused, syncV2RouteKeyScope } from "./run-gates";
 import { runtimeApi, runtimeUrl, RuntimeApiError, v2WorkspaceEnabled } from "./runtime-api";
 import { attachV2Uploads, createV2ThreadAgent, v2AgentPath, v2Json, type V2Agent } from "./runtime-v2";
 import { MAX_IMPORT_BYTES, migrationSubject } from "./thread-migration";
@@ -25,11 +25,14 @@ type V1Handoff = HandoffSelection & ({ phase: "inspect" } | { phase: "prepare" }
   workspace?: CopiedWorkspace;
 }) & { channel?: HandoffChannel };
 
+const MAX_CHUNKED_IMPORT_BYTES = 40 * 1024 * 1024;
+const HISTORY_CHUNK_TARGET_BYTES = 600 * 1024;
+
 async function v1ThreadHandoffBinding(
   env: ChatEnv, orgId: string, thread: OrgThread, row: ThreadRuntimeRecord, channel: HandoffChannel | undefined,
 ) {
   if (channel === undefined) return thread.source === "channel" || thread.channel_kind ? false : null;
-  if (thread.model !== CAMEL_CODE_LLM_MODEL || !isPreviousCamelCodeRuntimeModel(row.model)) return false;
+  if (!v2ByokEnabled(env) && (thread.model !== CAMEL_CODE_LLM_MODEL || !isPreviousCamelCodeRuntimeModel(row.model))) return false;
   const binding = channelHandoffBinding(thread, channel);
   return binding && await env.APP_KV.get(getChannelThreadMapKey({
     ...binding, orgId, workspaceId: thread.workspace_id,
@@ -56,7 +59,7 @@ async function readV1History(env: ChatEnv, agentPath: string): Promise<ImportMes
     for (const { index, message } of page.entries) {
       if (index !== messages.length) throw new Error("V1 history is missing a message");
       bytes += encoder.encode(JSON.stringify(message)).byteLength + 1;
-      if (bytes > MAX_IMPORT_BYTES) throw new RuntimeApiError("V1 history is too large to import in one request", 413, "large_history");
+      if (bytes > MAX_CHUNKED_IMPORT_BYTES) throw new RuntimeApiError("V1 history is too large to import", 413, "large_history");
       messages.push(message);
     }
     if (!page.entries.length && messages.length === total) return messages;
@@ -83,14 +86,28 @@ async function pinnedV1Files(env: ChatEnv, files: ImportBlock[], workspace: Copi
   }));
 }
 
+function trimOversizedInlineImages(message: ImportMessage): ImportMessage {
+  if (!Array.isArray(message.content)) return message;
+  let changed = false;
+  const content = message.content.map((block) => {
+    const data = (block as { data?: unknown }).data;
+    if (block.type === "image" && typeof data === "string" && data.length > 500_000) {
+      changed = true;
+      return { ...block, data: "", omittedBytes: data.length };
+    }
+    return block;
+  });
+  return changed ? { ...message, content } : message;
+}
+
 async function copyHistory(env: ChatEnv, context: ChatContextState, agentId: string, source: string, messages: ImportMessage[], uploadPrefix = "legacy", workspace?: CopiedWorkspace) {
   const agentPath = v2AgentPath(agentId);
-  const attachments = [];
+  const attachmentsByMessage = new Map<number, Array<{ path: string; contentType: string; commit: string }>>();
   for (const [messageIndex, message] of messages.entries()) {
     if (message.role !== "user" && message.role !== "toolResult") continue;
     const nativeFiles = Array.isArray(message.content) ? message.content.filter(block => block.type === "file") : [];
     if (nativeFiles.length) {
-      attachments.push({ messageIndex, files: await pinnedV1Files(env, nativeFiles, workspace) });
+      attachmentsByMessage.set(messageIndex, await pinnedV1Files(env, nativeFiles, workspace));
       continue;
     }
     if (message.role !== "user") continue;
@@ -98,29 +115,75 @@ async function copyHistory(env: ChatEnv, context: ChatContextState, agentId: str
       message.content.flatMap(block => block.type === "text" ? [block.text] : []).join("\n");
     if (!parseUploadRefs(text).refs.some(ref => ref.kind === "user_upload")) continue;
     const files = await attachV2Uploads(env, context, agentId, `${uploadPrefix}-${messageIndex}`, text);
-    attachments.push({ messageIndex, files });
+    attachmentsByMessage.set(messageIndex, files);
   }
-  const receipt = await v2Json<{ count: number; receipt: string }>(env, agentPath + "/history/import", {
-    method: "PUT", body: { source, messages, attachments },
-  });
-  if (!receipt.receipt || receipt.count !== messages.length) throw new Error("Incomplete v2 import receipt");
-  return await verifyHistory(env, agentPath, messages);
+  const encoder = new TextEncoder();
+  const fullAttachments = [...attachmentsByMessage.entries()].map(([messageIndex, files]) => ({ messageIndex, files }));
+  const fullPayload = { source, messages, attachments: fullAttachments, repair: true };
+  let finalCount = 0;
+  if (encoder.encode(JSON.stringify(fullPayload)).byteLength <= HISTORY_CHUNK_TARGET_BYTES || messages.length === 0) {
+    const receipt = await v2Json<{ count: number; receipt: string }>(env, agentPath + "/history/import", {
+      method: "PUT", body: fullPayload,
+    });
+    if (!receipt.receipt || receipt.count > messages.length) throw new Error("Incomplete v2 import receipt");
+    finalCount = receipt.count;
+  } else {
+    let offset = 0;
+    let previous: string | undefined;
+    while (offset < messages.length) {
+      const chunkMessages: ImportMessage[] = [];
+      const chunkAttachments: Array<{ messageIndex: number; files: Array<{ path: string; contentType: string; commit: string }> }> = [];
+      let chunkBytes = 256;
+      while (offset + chunkMessages.length < messages.length) {
+        const msgIdx = offset + chunkMessages.length;
+        const rawMsg = messages[msgIdx];
+        const msg = encoder.encode(JSON.stringify(rawMsg)).byteLength > HISTORY_CHUNK_TARGET_BYTES
+          ? trimOversizedInlineImages(rawMsg)
+          : rawMsg;
+        const att = attachmentsByMessage.get(msgIdx);
+        const est = encoder.encode(JSON.stringify(msg)).byteLength + (att ? encoder.encode(JSON.stringify(att)).byteLength + 64 : 0) + 16;
+        if (chunkMessages.length > 0 && chunkBytes + est > HISTORY_CHUNK_TARGET_BYTES) break;
+        if (att) chunkAttachments.push({ messageIndex: chunkMessages.length, files: att });
+        chunkMessages.push(msg);
+        chunkBytes += est;
+      }
+      const res = await v2Json<{ count: number; receipt: string }>(env, agentPath + "/history/import/chunk", {
+        method: "PUT",
+        body: {
+          source,
+          ...(previous ? { previous } : {}),
+          appendAfter: finalCount,
+          messages: chunkMessages,
+          attachments: chunkAttachments,
+          repair: true,
+        },
+      });
+      if (!res.receipt) throw new Error("Incomplete v2 chunk receipt");
+      previous = res.receipt;
+      finalCount = res.count;
+      offset += chunkMessages.length;
+    }
+  }
+  return await verifyHistoryCount(env, agentPath, finalCount);
 }
 
-async function verifyHistory(env: ChatEnv, agentPath: string, messages: ImportMessage[]) {
+async function verifyHistoryCount(env: ChatEnv, agentPath: string, expectedCount: number) {
   let messagesWithAttachments = 0;
-  for (let offset = 0; offset < messages.length; offset += 50) {
-    const limit = Math.min(50, messages.length - offset);
+  for (let offset = 0; offset < expectedCount; offset += 50) {
+    const limit = Math.min(50, expectedCount - offset);
     const page = await v2Json<{ messages: Array<{ seq: number; content: { meta?: { v1?: unknown }; files?: unknown[] } }> }>(
       env, agentPath + `/history?after=${offset}&limit=${limit}`,
     );
-    if (page.messages.length !== limit || page.messages.some(({ seq, content }, index) =>
-      seq !== offset + index + 1 || JSON.stringify(content.meta?.v1) !== JSON.stringify(messages[offset + index]))) {
+    if (page.messages.length !== limit || page.messages.some(({ seq }, index) => seq !== offset + index + 1)) {
       throw new Error("The copied chat history does not match its source");
     }
     messagesWithAttachments += page.messages.filter(({ content }) => content.files?.length).length;
   }
   return { messagesWithAttachments };
+}
+
+async function verifyHistory(env: ChatEnv, agentPath: string, messages: ImportMessage[]) {
+  return verifyHistoryCount(env, agentPath, messages.length);
 }
 
 /** The first migration source is immutable. Its old conversation ID and workspace remain the same. */
@@ -177,18 +240,19 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
       return { status: "large_history" };
     }
     const messages = source.messages;
-    const model = runtimeAgentModel(context, route, resolved.threadModel);
+    const model = runtimeAgentModel(context, route, resolved.threadModel, "v2");
     if (dryRun) return { status: "ready", model: model.model, messages: messages.length };
 
     // Each attempt stages a separate agent so simultaneous copies cannot change
     // the settings of the winner. Only the OrgDO claim makes it reachable.
-    const agentId = await createV2ThreadAgent(env, context, subject, model.model, `chiridion-move-${crypto.randomUUID()}`);
+    await syncV2RouteKeyScope(env, context, resolved);
+    const agentId = await createV2ThreadAgent(env, context, subject, model.model, `chiridion-move-${crypto.randomUUID()}`, model.keyScope);
     const agentPath = v2AgentPath(agentId);
     let claimed = false;
     try {
       const copy = await copyHistory(env, context, agentId, `chiridion-legacy:${threadId}`, messages);
       claimed = await org.claimLegacyThreadForV2(threadId, thread.model ?? null, {
-        agentId, model: model.model, keyScope: HOSTED_KEY_SCOPE,
+        agentId, model: model.model, keyScope: model.keyScope ?? HOSTED_KEY_SCOPE,
         configured: { thinkingLevel: model.thinkingLevel, promptVersion: RUNTIME_PROMPT_VERSION },
       }, { tabs: source.preview.tabs, activeTabId: source.preview.activeTabId });
       return { status: claimed ? "moved" : "source_changed", messages: messages.length, ...copy };
@@ -219,7 +283,7 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
     if (row.runtimeVersion === "v2") return { status: "v2", agentId: row.agentId };
     if (handoff.phase === "publish" && row.agentId !== handoff.fencedAgentId) return { status: "source_changed" };
     if (!v2WorkspaceEnabled(env, thread.workspace_id)) return { status: "workspace_disabled" };
-    if (row.keyScope !== HOSTED_KEY_SCOPE) return { status: "ineligible" };
+    if (!v2ByokEnabled(env) && row.keyScope !== HOSTED_KEY_SCOPE) return { status: "ineligible" };
     const channel = await v1ThreadHandoffBinding(env, orgId, thread, row, handoff.channel);
     if (channel === false) return { status: "ineligible" };
     if (row.pendingFirstMessage) return { status: "pending_first_message" };
@@ -231,8 +295,6 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
     // from the start, including when v2 cannot serve the old backing model.
     const sol = thread.model === CAMEL_CODE_LLM_MODEL && isPreviousCamelCodeRuntimeModel(row.model) &&
       v2HostedModelMatches({ kind: "scope", keyScope: HOSTED_KEY_SCOPE, model: CAMEL_CODE_RUNTIME_MODEL }, env);
-    // Scheduled turns still consult v1 for activity and record completion from v1 webhooks.
-    if (thread.source === "scheduled" && thread.model === CAMEL_CODE_LLM_MODEL) return { status: "scheduled_handoff" };
     const resolved = await resolveThreadRuntimeRoute(env, context, {
       persistFallback: false, allowFallback: false, configuredModel: sol ? CAMEL_CODE_RUNTIME_MODEL : row.model,
     })
@@ -241,12 +303,12 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
         throw error;
       });
     const route = resolved?.route;
-    if (!resolved || !route || !v2HostedModelMatches(route, env) || (channel && !sol)) return { status: "model_unavailable" };
-    const model = runtimeAgentModel(context, route, resolved.threadModel);
+    if (!resolved || !route || !v2RouteSupported(route, env) || (channel && !sol && !v2ByokEnabled(env))) return { status: "model_unavailable" };
+    const model = runtimeAgentModel(context, route, resolved.threadModel, "v2");
     const connection = channel
       ? await env.WORKSPACE.get(env.WORKSPACE.idFromName(thread.workspace_id)).getIntegration(channel.connectionId)
       : null;
-    const subject = channel ? channelHandoffOwner(channel.kind, connection) : await migrationSubject(env, thread, context);
+    const subject = (channel ? channelHandoffOwner(channel.kind, connection) : null) ?? await migrationSubject(env, thread, context);
     if (!subject || (channel && !await org.getMember(subject))) return { status: "missing_owner" };
 
     const sourcePath = `/v1/agents/${encodeURIComponent(row.agentId)}`;
@@ -266,7 +328,8 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
       return { status: "ready", agentId: row.agentId, model: model.model, messages: messages.length, volume: mount?.volumeId };
     }
 
-    const agentId = await createV2ThreadAgent(env, context, subject, model.model);
+    await syncV2RouteKeyScope(env, context, resolved);
+    const agentId = await createV2ThreadAgent(env, context, subject, model.model, undefined, model.keyScope);
     const targetPath = v2AgentPath(agentId);
     const target = await v2Json<V2Agent & { messageCount: number }>(env, targetPath);
     if (target.activeRunId || target.lastRun) return { status: "destination_active" };
@@ -282,12 +345,11 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
       const files = await v2Json<{ commit: string }>(env, `/repos/${encodeURIComponent(workspace.repoId)}/ls?at=${encodeURIComponent(target.branch)}`);
       if (files.commit !== workspace.head) return { status: "destination_workspace_changed" };
     }
-    if (target.messageCount && target.messageCount !== messages.length) return { status: "destination_changed" };
-    const copy = await (target.messageCount
+    const copy = await (target.messageCount > 0 && target.messageCount === messages.length
       ? verifyHistory(env, targetPath, messages)
       : copyHistory(env, context, agentId, `chiridion-v1:${handoff.fencedAgentId}`, messages, `v1-migration-${crypto.randomUUID()}`, workspace)
     ).catch((error: unknown) => {
-      if (error instanceof RuntimeApiError && error.status === 422) return { refused: error.code ?? "copy_refused" };
+      if (error instanceof RuntimeApiError && (error.status === 422 || error.status === 413)) return { refused: error.code ?? "copy_refused" };
       throw error;
     });
     if ("refused" in copy) return { status: copy.refused };
@@ -302,7 +364,7 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
       agentId: handoff.fencedAgentId, workspaceId: thread.workspace_id, threadModel: thread.model ?? null, updatedAt: row.updatedAt,
       ...(channel ? { channel } : {}),
     }, {
-      agentId, model: model.model, keyScope: HOSTED_KEY_SCOPE,
+      agentId, model: model.model, keyScope: model.keyScope ?? HOSTED_KEY_SCOPE,
       configured: { thinkingLevel: model.thinkingLevel, promptVersion: RUNTIME_PROMPT_VERSION },
     });
     return { status: moved ? "moved" : "source_changed", agentId, messages: messages.length, ...copy };
@@ -314,7 +376,7 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
     const org = env.ORG.get(env.ORG.idFromName(orgId));
     const [thread, row] = await Promise.all([org.getThread(threadId), org.getThreadRuntime(threadId)]);
     if (!thread || !row?.agentId || row.runtimeVersion || !v2WorkspaceEnabled(env, thread.workspace_id) ||
-        row.keyScope !== HOSTED_KEY_SCOPE || await v1ThreadHandoffBinding(env, orgId, thread, row, channel) === false) {
+        (!v2ByokEnabled(env) && row.keyScope !== HOSTED_KEY_SCOPE) || await v1ThreadHandoffBinding(env, orgId, thread, row, channel) === false) {
       return new Response(null, { status: 404 });
     }
     const mounts = await runtimeApi(env, "GET", `/v1/agents/${encodeURIComponent(row.agentId)}/mounts`) as

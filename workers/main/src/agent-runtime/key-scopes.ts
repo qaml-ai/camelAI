@@ -38,6 +38,9 @@ import {
   type KeyScopeProvider,
   type RuntimeApiEnv,
 } from "./runtime-api";
+import { v2Json } from "./runtime-v2";
+import type { ChatEnv } from "../chat-thread/types";
+import type { CodexRoute } from "./codex-forwarder";
 
 export const HOSTED_KEY_SCOPE = "hosted";
 
@@ -460,4 +463,144 @@ export async function ensureHostedKeyScope(env: KeyScopeEnv, fetcher?: typeof gl
   if (!providers) return false;
   await syncKeyScope(env, HOSTED_KEY_SCOPE, { providers }, fetcher);
   return true;
+}
+
+type V2ScopeProviderPayload = {
+  apiKey: string;
+  baseUrl?: string | null;
+  headers?: Record<string, string>;
+  apiStyle?: "openai-chat" | "openai-responses" | "openai-codex" | "anthropic" | "gemini";
+};
+
+function v2EntriesFromScope(entries: ScopeEntries, codex?: CodexRoute | null): Record<string, V2ScopeProviderPayload> {
+  const out: Record<string, V2ScopeProviderPayload> = {};
+  for (const [name, entry] of Object.entries(entries.providers)) {
+    if (name === "amazon-bedrock") {
+      // Bedrock Mantle serves standard Anthropic Messages API at /anthropic/v1/messages with the Bedrock bearer key.
+      const regionMatch = /^https:\/\/bedrock-runtime\.([a-z0-9-]+)\.amazonaws\.com\/?$/.exec(entry.baseUrl ?? "");
+      const region = regionMatch?.[1] ?? "us-east-1";
+      out["amazon-bedrock"] = {
+        apiKey: entry.apiKey ?? "",
+        baseUrl: `https://bedrock-mantle.${region}.api.aws/anthropic`,
+        apiStyle: "anthropic",
+      };
+      continue;
+    }
+    const headers = entry.headers && Object.keys(entry.headers).length > 0 ? { ...entry.headers } : undefined;
+    const baseUrl = name === "openrouter" && entry.baseUrl && !entry.baseUrl.endsWith("/v1")
+      ? `${entry.baseUrl.replace(/\/+$/, "")}/v1`
+      : entry.baseUrl ?? null;
+    out[name] = {
+      apiKey: entry.apiKey ?? "",
+      ...(baseUrl ? { baseUrl } : {}),
+      ...(headers ? { headers } : {}),
+      ...(name === "openrouter" ? { apiStyle: "openai-chat" as const } : {}),
+    };
+  }
+  for (const [name, mp] of Object.entries(entries.modelProviders ?? {})) {
+    const apiStyle = mp.type === "anthropic-messages"
+      ? "anthropic"
+      : mp.type === "openai-responses"
+        ? "openai-responses"
+        : "openai-chat";
+    const headers: Record<string, string> = { ...mp.headers };
+    let apiKey = mp.apiKey ?? "";
+    if (mp.type === "anthropic-messages" && mp.auth === "bearer" && apiKey) {
+      headers.Authorization = `Bearer ${apiKey}`;
+      apiKey = "";
+    }
+    out[name] = {
+      apiKey,
+      baseUrl: mp.baseUrl,
+      apiStyle,
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    };
+  }
+  if (codex) {
+    out["openai-codex"] = {
+      apiKey: codex.credential,
+      baseUrl: codex.upstreamBase,
+      apiStyle: "openai-codex",
+      headers: {
+        ...codex.headers,
+        "chatgpt-account-id": codex.accountId,
+      },
+    };
+  }
+  return out;
+}
+
+const syncedV2Key = (scope: string) => `agent_runtime_v2_key_scope:${scope}`;
+const syncedV2Here = new Map<string, { print: string; at: number }>();
+
+async function fingerprintV2(entries: Record<string, V2ScopeProviderPayload>): Promise<string> {
+  const canonical = JSON.stringify(canonicalOf(entries));
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export async function syncV2KeyScope(
+  env: ChatEnv,
+  scope: string,
+  entries: ScopeEntries,
+  codex?: CodexRoute | null,
+): Promise<void> {
+  const mapped = v2EntriesFromScope(entries, codex);
+  const print = await fingerprintV2(mapped);
+  const seen = syncedV2Here.get(scope);
+  if (seen?.print === print && Date.now() - seen.at < SYNCED_HERE_TTL_MS) return;
+  const synced = await env.APP_KV.get<{ fingerprint: string; providers: string[] }>(syncedV2Key(scope), "json");
+  if (synced?.fingerprint === print) {
+    if (syncedV2Here.size >= SYNCED_HERE_MAX) syncedV2Here.clear();
+    syncedV2Here.set(scope, { print, at: Date.now() });
+    return;
+  }
+  const names = Object.keys(mapped);
+  if (names.length === 0) {
+    if (synced) await v2Json(env, `/key-scopes/${encodeURIComponent(scope)}`, { method: "DELETE" }).catch(() => undefined);
+    await env.APP_KV.delete(syncedV2Key(scope));
+    syncedV2Here.set(scope, { print, at: Date.now() });
+    return;
+  }
+  for (const name of names) {
+    await v2Json(env, `/key-scopes/${encodeURIComponent(scope)}/providers/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: mapped[name],
+    });
+  }
+  for (const stale of synced?.providers ?? []) {
+    if (!names.includes(stale)) {
+      await v2Json(env, `/key-scopes/${encodeURIComponent(scope)}/providers/${encodeURIComponent(stale)}`, {
+        method: "DELETE",
+      }).catch(() => undefined);
+    }
+  }
+  await env.APP_KV.put(syncedV2Key(scope), JSON.stringify({ fingerprint: print, providers: names }));
+  if (syncedV2Here.size >= SYNCED_HERE_MAX) syncedV2Here.clear();
+  syncedV2Here.set(scope, { print, at: Date.now() });
+}
+
+export async function ensureV2HostedKeyScope(env: ChatEnv): Promise<boolean> {
+  const providers = hostedScopeProviders(env);
+  if (!providers) return false;
+  await syncV2KeyScope(env, HOSTED_KEY_SCOPE, { providers });
+  return true;
+}
+
+export async function syncV2OrgKeyScope(
+  env: ChatEnv,
+  orgId: string,
+  record?: ProviderRecord,
+  codex?: CodexRoute | null,
+): Promise<void> {
+  const selfhost = await selfhostScopeProviders(env);
+  if (selfhost) {
+    await syncV2KeyScope(env, orgKeyScope(orgId), selfhost, codex);
+    return;
+  }
+  const current = record !== undefined
+    ? record
+    : await (env.ORG.get(env.ORG.idFromName(orgId)) as unknown as { getLlmProviderConfig(): Promise<ProviderRecord> })
+        .getLlmProviderConfig();
+  await syncV2KeyScope(env, orgKeyScope(orgId), await orgScopeProviders(env, current), codex);
 }

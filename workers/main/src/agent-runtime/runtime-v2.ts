@@ -6,6 +6,7 @@ import { RUNTIME_TOOL_SERVER } from "../../../../src/lib/agent-runtime-shared";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types";
 import { isUnsafeUploadPath } from "../file-safety";
 import { RuntimeApiError, v2RuntimeUrl } from "./runtime-api";
+import { v2WireKeyScope } from "./model-routes";
 import { runtimeSystemPromptAppend } from "./run-gates";
 
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
@@ -80,15 +81,18 @@ export async function createV2ThreadAgent(
   subject: string,
   model: string,
   key = `chiridion-thread-${context.threadId}`,
+  keyScope?: string | null,
 ) {
   if (!env.WORKER_BASE_URL || !env.AGENT_RUNTIME_V2_TENANT || !env.AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET) {
     throw new RuntimeApiError("Chiridion's v2 tenant and callback URLs are required", 503, "v2_not_configured");
   }
   const url = new URL("/mcp/agent/v2", env.WORKER_BASE_URL).toString();
+  const wireKeyScope = v2WireKeyScope(keyScope);
   const agent = await v2Json<{ id: string }>(env, v2AgentPath(key), {
     method: "PUT",
     body: {
       model,
+      ...(wireKeyScope ? { keyScope: wireKeyScope } : keyScope === null ? { keyScope: null } : {}),
       instructions: runtimeSystemPromptAppend(env, context, "v2"),
       builtins: ["codemode", "web_search", "web_fetch", "human"],
       mcpServers: [{ name: RUNTIME_TOOL_SERVER, url, audience: url, auth: { type: "runtime" } }],

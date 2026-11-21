@@ -2,8 +2,8 @@ import { DurableObject } from "cloudflare:workers";
 import { readOrgExportManifest, readOrgExportPage, readExportRecord, ORG_EXPORT_SETS, type OrgExportSet } from "../org-export.js";
 import { moveCamelCodeThreadToSol } from "../agent-runtime/camelcode-sol-migration";
 import { channelHandoffBinding, type ChannelHandoffBinding } from "../agent-runtime/channel-handoff";
-import { syncOrgKeyScope, type KeyScopeEnv } from "../agent-runtime/key-scopes";
-import { CAMEL_CODE_RUNTIME_MODEL, isPreviousCamelCodeRuntimeModel, PREVIOUS_CAMEL_CODE_RUNTIME_MODELS } from "../agent-runtime/model-routes";
+import { syncOrgKeyScope, syncV2OrgKeyScope, type KeyScopeEnv } from "../agent-runtime/key-scopes";
+import { CAMEL_CODE_RUNTIME_MODEL, isPreviousCamelCodeRuntimeModel, PREVIOUS_CAMEL_CODE_RUNTIME_MODELS, v2ByokEnabled } from "../agent-runtime/model-routes";
 import { RuntimeApiError, runtimeApi, v2WorkspaceEnabled } from "../agent-runtime/runtime-api";
 import type { ChatEnv } from "../chat-thread/types";
 import type { DOEnv } from "./env";
@@ -8919,16 +8919,18 @@ export class OrgDO extends DurableObject<DOEnv> {
       const thread = this.getThread(threadId);
       const runtime = this.getThreadRuntime(threadId);
       if (runtime?.runtimeVersion === "v2") return runtime.agentId === replacement.agentId;
+      const allowAllV2 = v2ByokEnabled(this.env as unknown as ChatEnv);
       if (!thread || thread.workspace_id !== expected.workspaceId ||
           (thread.model ?? null) !== expected.threadModel ||
           runtime?.agentId !== expected.agentId || runtime.updatedAt !== expected.updatedAt ||
-          runtime.pendingFirstMessage || runtime.keyScope !== "hosted" || replacement.keyScope !== "hosted") return false;
+          runtime.pendingFirstMessage ||
+          (!allowAllV2 && (runtime.keyScope !== "hosted" || replacement.keyScope !== "hosted"))) return false;
       if (expected.channel) {
         const channel = channelHandoffBinding(thread, expected.channel.kind);
         if (!channel || channel.connectionId !== expected.channel.connectionId ||
             channel.remoteConversationId !== expected.channel.remoteConversationId ||
-            thread.model !== CAMEL_CODE_LLM_MODEL || !isPreviousCamelCodeRuntimeModel(runtime.model) ||
-            replacement.model !== CAMEL_CODE_RUNTIME_MODEL) return false;
+            (!allowAllV2 && (thread.model !== CAMEL_CODE_LLM_MODEL || !isPreviousCamelCodeRuntimeModel(runtime.model) ||
+            replacement.model !== CAMEL_CODE_RUNTIME_MODEL))) return false;
       } else if (thread.source === "channel" || thread.channel_kind) return false;
 
       const updated = this.sql.exec(
@@ -9518,11 +9520,23 @@ export class OrgDO extends DurableObject<DOEnv> {
   /** The org's provider keys changed: keep the runtime's key scope in step (threads pick them up on their next run). */
   async notifyByokChanged(): Promise<number> {
     const env = this.env as unknown as KeyScopeEnv;
+    const chatEnv = this.env as unknown as ChatEnv;
     const orgId = this.getInfoSync()?.id;
+    const providerConfig = this.getLlmProviderConfig();
     if (orgId && env.AGENT_RUNTIME_API_TOKEN) {
       this.ctx.waitUntil(
-        syncOrgKeyScope(env, orgId, this.getLlmProviderConfig()).catch((error) => {
+        syncOrgKeyScope(env, orgId, providerConfig).catch((error) => {
           console.error("[OrgDO] agent runtime key scope sync failed", {
+            orgId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }),
+      );
+    }
+    if (orgId && v2ByokEnabled(chatEnv) && chatEnv.AGENT_RUNTIME_V2_API_TOKEN) {
+      this.ctx.waitUntil(
+        syncV2OrgKeyScope(chatEnv, orgId, providerConfig).catch((error) => {
+          console.error("[OrgDO] agent runtime v2 key scope sync failed", {
             orgId,
             error: error instanceof Error ? error.message : String(error),
           });

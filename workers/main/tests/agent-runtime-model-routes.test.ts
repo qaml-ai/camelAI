@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { runtimeModelRoute } from "../src/agent-runtime/model-routes";
+import { runtimeModelRoute, v2RouteSupported, v2RuntimeRouteTarget, v2WireKeyScope } from "../src/agent-runtime/model-routes";
 import { PiModelMapping } from "../src/pi-model-resolution";
 import type { PiResolvedModelConfig } from "../src/chat-thread/pi-model-config";
 import { resolveThreadRuntimeRoute, runtimeAgentModel } from "../src/agent-runtime/run-gates";
@@ -197,5 +197,30 @@ describe("runtimeModelRoute", () => {
     expect(runtimeModelRoute(config({ usageProvider: "bedrock", apiKey: "", model: { provider: "custom", api: "openai-responses", id: modelId, baseUrl } }), org)).toBeNull();
     // Another address (the E2E replay stub): no route.
     expect(runtimeModelRoute(config({ usageProvider: "bedrock", model: { provider: "custom", api: "openai-responses", id: modelId, baseUrl: "http://127.0.0.1:8788" } }), org)).toBeNull();
+  });
+});
+
+describe("v2 BYOK and Codex routing", () => {
+  it("gates BYOK and Codex routes behind AGENT_RUNTIME_V2_BYOK", () => {
+    const byok = { kind: "scope" as const, model: "anthropic/claude-opus-5-5", keyScope: "org_1" };
+    const codex = { kind: "codex" as const, model: "chiridion/openai-codex/gpt-6-luna" };
+    const hosted = { kind: "scope" as const, model: "azure/gpt-6.2-sol", keyScope: "hosted" };
+    expect(v2RouteSupported(byok, { AGENT_RUNTIME_V2_MODELS: "azure/gpt-6.2-sol" })).toBe(false);
+    expect(v2RouteSupported(codex, { AGENT_RUNTIME_V2_MODELS: "azure/gpt-6.2-sol" })).toBe(false);
+    expect(v2RouteSupported(hosted, { AGENT_RUNTIME_V2_MODELS: "azure/gpt-6.2-sol" })).toBe(true);
+    expect(v2RouteSupported(byok, { AGENT_RUNTIME_V2_BYOK: "true" })).toBe(true);
+    expect(v2RouteSupported(codex, { AGENT_RUNTIME_V2_BYOK: "true" })).toBe(true);
+  });
+
+  it("maps Codex, Bedrock Mantle, and hosted wire scopes for v2", () => {
+    expect(v2RuntimeRouteTarget({ kind: "codex", model: "chiridion/openai-codex/gpt-6-luna" }, "org1"))
+      .toEqual({ model: "openai-codex/gpt-6-luna", keyScope: "org_org1" });
+    expect(v2RuntimeRouteTarget({ kind: "scope", model: "amazon-bedrock/us.anthropic.claude-opus-5-5", keyScope: "org_org1" }, "org1"))
+      .toEqual({ model: "amazon-bedrock/anthropic.claude-opus-5-5", keyScope: "org_org1" });
+    expect(v2RuntimeRouteTarget({ kind: "scope", model: "amazon-bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0", keyScope: "org_org1" }, "org1"))
+      .toEqual({ model: "amazon-bedrock/anthropic.claude-haiku-4-5", keyScope: "org_org1" });
+    expect(v2WireKeyScope("hosted")).toBeNull();
+    expect(v2WireKeyScope("org_org1")).toBe("org_org1");
+    expect(v2WireKeyScope(null)).toBeNull();
   });
 });

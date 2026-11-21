@@ -45,6 +45,41 @@ export function v2HostedModelMatches(
       .some((models) => models?.split(",").some((model) => model.trim() === route.model));
 }
 
+export function v2ByokEnabled(env: Pick<ChatEnv, "AGENT_RUNTIME_V2_BYOK">): boolean {
+  return env.AGENT_RUNTIME_V2_BYOK?.trim().toLowerCase() === "true";
+}
+
+export function v2RouteSupported(
+  route: RuntimeModelRoute,
+  env: Pick<ChatEnv, "AGENT_RUNTIME_V2_MODELS" | "AGENT_RUNTIME_V2_ADDITIONAL_MODELS" | "AGENT_RUNTIME_V2_BYOK">,
+): boolean {
+  if (v2HostedModelMatches(route, env)) return true;
+  if (!v2ByokEnabled(env)) return false;
+  return route.kind === "scope" || route.kind === "codex";
+}
+
+export function v2WireKeyScope(keyScope: string | null | undefined): string | null {
+  return keyScope && keyScope !== HOSTED_KEY_SCOPE ? keyScope : null;
+}
+
+export function v2RuntimeRouteTarget(
+  route: RuntimeModelRoute,
+  orgId: string,
+): { model: string; keyScope: string | null } {
+  if (route.kind === "codex") {
+    const prefix = `${RUNTIME_MODEL_ENDPOINT}/openai-codex/`;
+    const modelId = route.model.startsWith(prefix) ? route.model.slice(prefix.length) : route.model;
+    return { model: `openai-codex/${modelId}`, keyScope: orgKeyScope(orgId) };
+  }
+  if (route.model.startsWith("amazon-bedrock/")) {
+    const rest = route.model.slice("amazon-bedrock/".length);
+    const stripped = rest.replace(/^(?:us|eu|apac|jp|au|global)\./, "");
+    const bare = BEDROCK_MANTLE_IDS[stripped] ?? stripped;
+    return { model: `amazon-bedrock/${bare}`, keyScope: route.keyScope };
+  }
+  return { model: route.model, keyScope: route.keyScope };
+}
+
 /** The tenant model endpoint in the runtime that is chiridion's Codex forwarder. */
 export const RUNTIME_MODEL_ENDPOINT = "chiridion";
 
@@ -100,6 +135,10 @@ export function runtimeRunLimits(model: string | null | undefined): { contextTok
 const BEDROCK_CONVERSE_IDS: Record<string, string> = {
   "anthropic.claude-haiku-4-5": "anthropic.claude-haiku-4-5-20251001-v1:0",
 };
+
+const BEDROCK_MANTLE_IDS: Record<string, string> = Object.fromEntries(
+  Object.entries(BEDROCK_CONVERSE_IDS).map(([mantleId, converseId]) => [converseId, mantleId]),
+);
 
 /**
  * The geographic cross-region inference profiles Bedrock offers for each Claude model chiridion

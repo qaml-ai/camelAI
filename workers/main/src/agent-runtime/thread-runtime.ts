@@ -20,7 +20,7 @@ import { buildWorkspaceScopedR2Key } from "../../../../src/lib/workspace-r2-path
 import { applyMentionContext } from "../mention-context";
 import { WorkspaceFilesystemClient } from "../workspace-filesystem-do";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
-import { runtimeRunLimits, v2HostedModelMatches } from "./model-routes";
+import { runtimeRunLimits, v2RouteSupported, v2WireKeyScope } from "./model-routes";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
 import { RuntimeApiError, runtimeApi, runtimeUrl, v2WorkspaceEnabled } from "./runtime-api";
 import { attachV2Uploads, createV2ThreadAgent, v2AgentPath, v2Json, type V2Run } from "./runtime-v2";
@@ -99,7 +99,7 @@ export async function pinNewThreadToRuntime(
   if (!route) return null;
   const org = orgStub(env, context.orgId);
   const canary = options.v2Eligible && v2WorkspaceEnabled(env, context.workspaceId) &&
-    v2HostedModelMatches(route, env);
+    v2RouteSupported(route, env);
   const firstMessage = options.pendingFirstMessage ?? null;
   const pinned = canary
     ? await org.pinThreadRuntime(context.threadId, firstMessage, "v2")
@@ -239,7 +239,7 @@ async function createThreadAgent(
 ): Promise<string> {
   const thread = await orgStub(env, context.orgId).getThread(context.threadId);
   const subject = thread?.created_by?.trim() || context.userId || "";
-  if (runtimeVersion === "v2") return await createV2ThreadAgent(env, context, subject, run.model);
+  if (runtimeVersion === "v2") return await createV2ThreadAgent(env, context, subject, run.model, undefined, run.keyScope);
   const runLimits = runtimeRunLimits(run.model);
   const created = await runtimeApi(env, "POST", "/v1/agents", {
     definition: env.AGENT_RUNTIME_DEFINITION,
@@ -350,8 +350,16 @@ async function ensureConfiguredAgent(
   }
   const id = row.agentId;
   if (row.runtimeVersion === "v2") {
-    if (row.model !== run.model || row.configured?.promptVersion !== RUNTIME_PROMPT_VERSION) {
-      const updated = await createThreadAgent(env, context, run, "v2");
+    if (row.model !== run.model || (row.keyScope ?? null) !== (run.keyScope ?? null) || row.configured?.promptVersion !== RUNTIME_PROMPT_VERSION) {
+      const clearScope = Boolean(v2WireKeyScope(row.keyScope)) && !v2WireKeyScope(run.keyScope);
+      const updated = await createV2ThreadAgent(
+        env,
+        context,
+        context.userId ?? context.orgId,
+        run.model,
+        undefined,
+        clearScope ? null : (v2WireKeyScope(run.keyScope) ?? undefined),
+      );
       if (updated !== id) throw new RuntimeApiError("Chiridion's pinned v2 agent changed", 409, "v2_agent_mismatch");
       await org.setThreadRuntimeAgent(context.threadId, { agentId: id, ...madeConfiguration(run) });
     }
@@ -500,12 +508,14 @@ async function sendRuntimeTurn(
       .then((id) => timed(timings, "uploads", () => attach(env, context, id, input.clientMessageId, text)));
     const [id, attached, promptText] = await Promise.all([configured, files, modelText(env, context, text), marked]);
     agentId = id;
+    const wireKeyScope = v2WireKeyScope(run.keyScope);
     request = v2
       ? await timed(timings, "prompt", () => v2Json<V2Run>(env, v2AgentPath(id) + "/runs", {
         method: "POST",
         body: {
           prompt: promptText,
           actor: sender.userId,
+          ...(wireKeyScope ? { keyScope: wireKeyScope } : {}),
           idempotencyKey: input.clientMessageId,
           whileRunning: "queue",
           wait: false,

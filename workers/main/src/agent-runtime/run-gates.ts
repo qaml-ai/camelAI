@@ -37,8 +37,9 @@ import { assertUserLlmUsageAccess, UserLlmUsageLimitError } from "../user-llm-us
 import { createPiSystemPrompt } from "../pi-system-prompt";
 import { resolveAgentSkillCatalog } from "../selfhost-agent-pack";
 import { RUNTIME_PROMPT_PREAMBLE, type RuntimeRunConfig } from "./runtime-prompt";
-import { CAMEL_CODE_RUNTIME_MODEL, runtimeModelRoute, v2HostedModelMatches, type RuntimeModelRoute } from "./model-routes";
-import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, selfhostOperatorEndpointOrigin, syncOrgKeyScope } from "./key-scopes";
+import { CAMEL_CODE_RUNTIME_MODEL, runtimeModelRoute, v2RouteSupported, v2RuntimeRouteTarget, type RuntimeModelRoute } from "./model-routes";
+import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, selfhostOperatorEndpointOrigin, syncOrgKeyScope, syncV2OrgKeyScope } from "./key-scopes";
+import { codexRoute } from "./codex-forwarder";
 
 type OrgInfoLike = {
   billing_status?: string | null;
@@ -255,7 +256,7 @@ export async function prepareThreadRuntimeRun(
   }
   const { route, config, threadModel, fallback } = resolved;
   if (!route) throw new RuntimeRunRefused("This thread's model cannot run on the agent runtime; switch models to continue.", "no_route");
-  if (runtimeVersion === "v2" && !v2HostedModelMatches(route, env)) {
+  if (runtimeVersion === "v2" && !v2RouteSupported(route, env)) {
     throw new RuntimeRunRefused("Choose a hosted model enabled for v2 to continue this thread.", "no_route");
   }
   const org = orgStub(env, context.orgId);
@@ -281,7 +282,9 @@ export async function prepareThreadRuntimeRun(
       throw error;
     }
   };
-  const keyScope = () => runtimeVersion === "v2" ? Promise.resolve() : syncRouteKeyScope(env, context, resolved);
+  const keyScope = () => runtimeVersion === "v2"
+    ? syncV2RouteKeyScope(env, context, resolved)
+    : syncRouteKeyScope(env, context, resolved);
   const credit = async () => config.billingSource === "hosted" && config.creditChargeable
     ? await hostedCreditRemainingUsd(org)
     : null;
@@ -297,7 +300,7 @@ export async function prepareThreadRuntimeRun(
   ]);
   const budgets = [...(creditLeft !== null ? [creditLeft] : []), ...userHeadroom];
   return {
-    ...runtimeAgentModel(context, route, threadModel),
+    ...runtimeAgentModel(context, route, threadModel, runtimeVersion),
     spendLimitUsd: budgets.length > 0 ? Math.max(0, Math.min(...budgets)) : null,
     threadModel,
     fallback,
@@ -312,13 +315,46 @@ export interface RuntimeAgentModel {
   thinkingLevel: "low" | "medium" | "high";
 }
 
-export function runtimeAgentModel(context: ChatContextState, route: RuntimeModelRoute, threadModel: LlmModel): RuntimeAgentModel {
+export function runtimeAgentModel(
+  context: ChatContextState,
+  route: RuntimeModelRoute,
+  threadModel: LlmModel,
+  runtimeVersion?: "v1" | "v2",
+): RuntimeAgentModel {
+  if (runtimeVersion === "v2") {
+    const target = v2RuntimeRouteTarget(route, context.orgId);
+    return {
+      model: target.model,
+      keyScope: target.keyScope,
+      modelHeaders: null,
+      thinkingLevel: target.model === CAMEL_CODE_RUNTIME_MODEL ? "low" : primaryPiThinkingLevel(threadModel),
+    };
+  }
   return {
     model: route.model,
     keyScope: route.kind === "scope" ? route.keyScope : null,
     modelHeaders: route.kind === "scope" && route.keyScope === HOSTED_KEY_SCOPE ? hostedModelHeaders(context) : null,
     thinkingLevel: route.model === CAMEL_CODE_RUNTIME_MODEL ? "low" : primaryPiThinkingLevel(threadModel),
   };
+}
+
+export async function syncV2RouteKeyScope(
+  env: ChatEnv,
+  context: ChatContextState,
+  { route, config, llmProviderRecord }: Pick<ThreadRuntimeRoute, "route" | "config" | "llmProviderRecord">,
+): Promise<void> {
+  if (!route) return;
+  if (route.kind === "codex") {
+    const codex = codexRoute(config);
+    if (!codex) throw new RuntimeRunRefused("ChatGPT subscription credentials are unavailable.", "no_route");
+    await syncV2OrgKeyScope(env, context.orgId, llmProviderRecord, codex);
+    return;
+  }
+  if (route.keyScope === HOSTED_KEY_SCOPE) {
+    // Hosted models on v2 run on the tenant/platform provider credentials (no scoped override).
+    return;
+  }
+  await syncV2OrgKeyScope(env, context.orgId, llmProviderRecord);
 }
 
 /**

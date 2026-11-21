@@ -65,10 +65,12 @@ export function usageRowFor(eventId: string, data: RuntimeUsageRecorded, org: { 
   const hosted = data.keyScope === HOSTED_KEY_SCOPE;
   let provider = text(data.provider);
   let model = text(data.model);
-  // The Codex forwarder is a tenant endpoint: `chiridion/openai-codex/<model>`.
+  // The Codex forwarder is a tenant endpoint (`chiridion/openai-codex/<model>`), and v2 runs `openai-codex/<model>`.
   if (provider === RUNTIME_MODEL_ENDPOINT && model.startsWith("openai-codex/")) {
     provider = "openai";
     model = model.slice("openai-codex/".length);
+  } else if (provider === "openai-codex") {
+    provider = "openai";
   }
   // chiridion's usage and pricing name Bedrock `bedrock`, its OpenAI models'
   // scope model providers (`bedrock-openai-<region>`) included.

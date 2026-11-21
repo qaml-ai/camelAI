@@ -44,7 +44,29 @@ export function trimOversizedMessage(message: ImportMessage): ImportMessage {
     }
     return block;
   });
-  return changed ? { ...message, content } : message;
+  const result = changed ? { ...message, content } : message;
+  const serialized = JSON.stringify(result);
+  if (serialized.length <= 750_000) return result;
+  // A single message with massive tool details or multi-block payload would exceed v2's 1 MiB chunk cap.
+  const slim: Record<string, unknown> = { ...(result as Record<string, unknown>) };
+  if ("details" in slim) delete slim.details;
+  if (typeof slim.content === "string" && slim.content.length > 200_000) {
+    slim.content = `${slim.content.slice(0, 200_000)}\n[truncated during migration]`;
+  } else if (Array.isArray(slim.content)) {
+    slim.content = (slim.content as Array<Record<string, unknown>>).map((block) => {
+      if (block.type === "text" && typeof block.text === "string" && block.text.length > 150_000) {
+        return { ...block, text: `${block.text.slice(0, 150_000)}\n[truncated during migration]` };
+      }
+      if (block.type === "image" && typeof block.data === "string" && block.data.length > 50_000) {
+        return { ...block, data: "", omittedBytes: block.data.length };
+      }
+      if (block.type === "toolCall" && block.arguments && JSON.stringify(block.arguments).length > 150_000) {
+        return { ...block, arguments: { _truncated: true } };
+      }
+      return block;
+    });
+  }
+  return slim as unknown as ImportMessage;
 }
 
 export async function readV1HistoryTotal(env: ChatEnv, agentPath: string): Promise<number> {
@@ -252,17 +274,41 @@ export async function streamV1HistoryToV2(
 
   const flushChunk = async () => {
     if (!chunkMessages.length) return;
-    const res = await v2Json<{ count: number; receipt: string }>(env, agentPath + "/history/import/chunk", {
-      method: "PUT",
-      body: {
-        source,
-        ...(previous ? { previous } : {}),
+    let res: { count: number; receipt: string };
+    try {
+      res = await v2Json<{ count: number; receipt: string }>(env, agentPath + "/history/import/chunk", {
+        method: "PUT",
+        body: {
+          source,
+          ...(previous ? { previous } : {}),
+          appendAfter: finalCount,
+          messages: chunkMessages,
+          attachments: chunkAttachments,
+          repair: true,
+        },
+      });
+    } catch (error) {
+      // Historical v1 attachments occasionally have mismatched MIME/magic bytes or oversized images;
+      // drop pinned attachments on this chunk rather than blocking the user's entire chat history.
+      if (!chunkAttachments.length) throw error;
+      console.warn("[v1-history-copy] chunk import failed with attachments, retrying without attachments", {
+        agentId,
         appendAfter: finalCount,
-        messages: chunkMessages,
-        attachments: chunkAttachments,
-        repair: true,
-      },
-    });
+        attachments: chunkAttachments.length,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      res = await v2Json<{ count: number; receipt: string }>(env, agentPath + "/history/import/chunk", {
+        method: "PUT",
+        body: {
+          source,
+          ...(previous ? { previous } : {}),
+          appendAfter: finalCount,
+          messages: chunkMessages,
+          attachments: [],
+          repair: true,
+        },
+      });
+    }
     if (!res.receipt) throw new Error("Incomplete v2 chunk receipt");
     previous = res.receipt;
     finalCount = res.count;

@@ -166,6 +166,7 @@ import {
   type CopyFilePathTarget,
 } from "@/lib/file-path-copy";
 import { uploadWorkspaceFile } from "@/lib/workspace-upload.client";
+import { optimizeImageForUpload } from "@/lib/image-upload-resize.client";
 import { isManualCompactCommand } from "@/lib/slash-commands";
 import { buildAppThreadFallbackTitle } from "@/lib/thread-title";
 import { buildAppWorkSystemMessage } from "@/lib/app-chat-context";
@@ -3477,7 +3478,24 @@ export default function Chat({
         ]);
 
         try {
-          const data = await uploadWorkspaceFile(resolvedWorkspaceId, file, {
+          const { file: uploadFile } = await optimizeImageForUpload(file);
+          if (uploadFile !== file) {
+            setAttachments((prev) =>
+              prev.map((a) =>
+                a.id === id
+                  ? {
+                      ...a,
+                      name: uploadFile.name,
+                      originalName: uploadFile.name,
+                      size: uploadFile.size,
+                      contentType: uploadFile.type || a.contentType,
+                    }
+                  : a,
+              ),
+            );
+          }
+
+          const data = await uploadWorkspaceFile(resolvedWorkspaceId, uploadFile, {
             onProgress: (progressPercent) => {
               setAttachments((prev) =>
                 prev.map((a) =>

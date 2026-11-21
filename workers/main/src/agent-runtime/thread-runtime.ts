@@ -23,7 +23,7 @@ import { HOSTED_KEY_SCOPE } from "./key-scopes";
 import { runtimeRunLimits, v2RouteSupported, v2WireKeyScope } from "./model-routes";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
 import { RuntimeApiError, runtimeApi, runtimeUrl, v2WorkspaceEnabled } from "./runtime-api";
-import { attachV2Uploads, createV2ThreadAgent, v2AgentPath, v2Json, type V2Agent, type V2Run } from "./runtime-v2";
+import { attachV2Uploads, createV2ThreadAgent, isV2NativeImageContentType, v2AgentPath, v2Json, type V2Agent, type V2Run } from "./runtime-v2";
 import { copyV1WorkspaceToV2Repo, readV1HistoryTotal, streamV1HistoryToV2 } from "./v1-history-copy";
 import { codexError, codexRoute, codexUpstreamCall, forwardedResponseHeaders } from "./codex-forwarder";
 import { HostedModelFallbackRequiredError } from "../chat-thread/pi-model-config";
@@ -706,20 +706,46 @@ async function sendRuntimeTurn(
     const [id, attached, promptText] = await Promise.all([configured, files, modelText(env, context, text), marked]);
     agentId = id;
     const wireKeyScope = v2WireKeyScope(run.keyScope);
+    const startV2Run = async (runFiles: typeof attached) => await v2Json<V2Run>(env, v2AgentPath(id) + "/runs", {
+      method: "POST",
+      body: {
+        prompt: promptText,
+        actor: sender.userId,
+        ...(wireKeyScope ? { keyScope: wireKeyScope } : {}),
+        idempotencyKey: input.clientMessageId,
+        whileRunning: "queue",
+        wait: false,
+        ...(runFiles.length > 0 ? { files: runFiles } : {}),
+        ...(run.spendLimitUsd === null ? {} : { spendLimitUsd: run.spendLimitUsd }),
+      },
+    });
     request = v2
-      ? await timed(timings, "prompt", () => v2Json<V2Run>(env, v2AgentPath(id) + "/runs", {
-        method: "POST",
-        body: {
-          prompt: promptText,
-          actor: sender.userId,
-          ...(wireKeyScope ? { keyScope: wireKeyScope } : {}),
-          idempotencyKey: input.clientMessageId,
-          whileRunning: "queue",
-          wait: false,
-          ...(attached.length > 0 ? { files: attached } : {}),
-          ...(run.spendLimitUsd === null ? {} : { spendLimitUsd: run.spendLimitUsd }),
-        },
-      })).then((result) => ({
+      ? await timed(timings, "prompt", async () => {
+        try {
+          return await startV2Run(attached);
+        } catch (error) {
+          // Defense-in-depth: if CamelRun v2 still rejects an image attachment as oversized,
+          // retry without native image attachments so the user's thread is never permanently bricked
+          // (the uploaded files remain in R2 and referenced in promptText).
+          if (
+            error instanceof RuntimeApiError &&
+            error.status === 413 &&
+            error.code === "attachment_size" &&
+            attached.some((file) => "contentType" in file && typeof file.contentType === "string" && isV2NativeImageContentType(file.contentType))
+          ) {
+            const nonImageFiles = attached.filter(
+              (file) => !("contentType" in file && typeof file.contentType === "string" && isV2NativeImageContentType(file.contentType)),
+            );
+            console.warn("[runtime-thread] v2 rejected oversized image attachment; retrying without native image attachments", {
+              threadId: context.threadId,
+              agentId: id,
+              droppedImages: attached.length - nonImageFiles.length,
+            });
+            return await startV2Run(nonImageFiles);
+          }
+          throw error;
+        }
+      }).then((result) => ({
         id: result.idempotencyKey ?? result.id,
         state: ["completed", "failed", "cancelled"].includes(result.status) ? "completed" : result.status,
       }))

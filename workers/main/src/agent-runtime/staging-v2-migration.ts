@@ -25,8 +25,23 @@ type V1Handoff = HandoffSelection & ({ phase: "inspect" } | { phase: "prepare" }
   workspace?: CopiedWorkspace;
 }) & { channel?: HandoffChannel };
 
-const MAX_CHUNKED_IMPORT_BYTES = 40 * 1024 * 1024;
+const MAX_CHUNKED_IMPORT_BYTES = 80 * 1024 * 1024;
 const HISTORY_CHUNK_TARGET_BYTES = 600 * 1024;
+const MAX_PINNED_IMAGE_BYTES = 3_000_000;
+
+function trimOversizedInlineImages(message: ImportMessage): ImportMessage {
+  if (!Array.isArray(message.content)) return message;
+  let changed = false;
+  const content = message.content.map((block) => {
+    const data = (block as { data?: unknown }).data;
+    if (block.type === "image" && typeof data === "string" && data.length > 500_000) {
+      changed = true;
+      return { ...block, data: "", omittedBytes: data.length };
+    }
+    return block;
+  });
+  return changed ? { ...message, content } : message;
+}
 
 async function v1ThreadHandoffBinding(
   env: ChatEnv, orgId: string, thread: OrgThread, row: ThreadRuntimeRecord, channel: HandoffChannel | undefined,
@@ -46,7 +61,7 @@ async function readV1History(env: ChatEnv, agentPath: string): Promise<ImportMes
   let bytes = 2;
   let total: number | undefined;
   for (;;) {
-    const page = await runtimeApi(env, "GET", `${agentPath}/history?after=${messages.length}&limit=100`) as {
+    const page = await runtimeApi(env, "GET", `${agentPath}/history?after=${messages.length}&limit=200`) as {
       entries: Array<{ index: number; message: ImportMessage }>;
       total: number;
       truncated: boolean;
@@ -58,9 +73,10 @@ async function readV1History(env: ChatEnv, agentPath: string): Promise<ImportMes
     }
     for (const { index, message } of page.entries) {
       if (index !== messages.length) throw new Error("V1 history is missing a message");
-      bytes += encoder.encode(JSON.stringify(message)).byteLength + 1;
+      const trimmed = trimOversizedInlineImages(message);
+      bytes += encoder.encode(JSON.stringify(trimmed)).byteLength + 1;
       if (bytes > MAX_CHUNKED_IMPORT_BYTES) throw new RuntimeApiError("V1 history is too large to import", 413, "large_history");
-      messages.push(message);
+      messages.push(trimmed);
     }
     if (!page.entries.length && messages.length === total) return messages;
     if (!page.entries.length || page.nextAfter !== messages.length) throw new Error("V1 history cursor did not advance");
@@ -68,10 +84,16 @@ async function readV1History(env: ChatEnv, agentPath: string): Promise<ImportMes
 }
 
 async function pinnedV1Files(env: ChatEnv, files: ImportBlock[], workspace: CopiedWorkspace | undefined) {
-  return await Promise.all(files.map(async (file) => {
+  let imageBytes = 0;
+  const pinned: Array<{ path: string; contentType: string; commit: string }> = [];
+  for (const file of files) {
     if (!workspace || file.volume !== workspace.volume || !file.path?.startsWith("/workspace/") ||
         !Number.isSafeInteger(file.version) || !Number.isSafeInteger(file.size) || !file.contentType) {
-      throw new RuntimeApiError("A v1 attachment is outside the copied workspace", 422, "attachment_outside_workspace");
+      continue;
+    }
+    const isImage = /^image\/(png|jpeg|gif|webp)$/i.test(file.contentType);
+    if (isImage && ((file.size ?? 0) <= 0 || imageBytes + (file.size ?? 0) > MAX_PINNED_IMAGE_BYTES)) {
+      continue;
     }
     const path = file.path.slice("/workspace".length);
     const query = new URLSearchParams({ prefix: path, limit: "1" });
@@ -80,66 +102,73 @@ async function pinnedV1Files(env: ChatEnv, files: ImportBlock[], workspace: Copi
     };
     const current = entry.files[0];
     if (current?.path !== path || current.version !== file.version || current.size !== file.size) {
-      throw new RuntimeApiError("A v1 attachment has changed since it was sent", 422, "attachment_version_changed");
+      continue;
     }
-    return { path: path.slice(1), contentType: file.contentType, commit: workspace.head };
-  }));
+    if (isImage) imageBytes += current.size;
+    pinned.push({ path: path.slice(1), contentType: file.contentType, commit: workspace.head });
+  }
+  return pinned;
 }
 
-function trimOversizedInlineImages(message: ImportMessage): ImportMessage {
-  if (!Array.isArray(message.content)) return message;
-  let changed = false;
-  const content = message.content.map((block) => {
-    const data = (block as { data?: unknown }).data;
-    if (block.type === "image" && typeof data === "string" && data.length > 500_000) {
-      changed = true;
-      return { ...block, data: "", omittedBytes: data.length };
-    }
-    return block;
-  });
-  return changed ? { ...message, content } : message;
-}
-
-async function copyHistory(env: ChatEnv, context: ChatContextState, agentId: string, source: string, messages: ImportMessage[], uploadPrefix = "legacy", workspace?: CopiedWorkspace) {
+async function copyHistory(
+  env: ChatEnv,
+  context: ChatContextState,
+  agentId: string,
+  source: string,
+  messages: ImportMessage[],
+  uploadPrefix = "legacy",
+  workspace?: CopiedWorkspace,
+  existingCount = 0,
+) {
   const agentPath = v2AgentPath(agentId);
+  let resumeOffset = 0;
+  let resumePrevious: string | undefined;
+  if (existingCount > 0) {
+    const proof = await v2Json<{ source: string; receipt: string; messageCount: number }>(env, agentPath + "/history/import")
+      .catch(() => null);
+    if (proof && proof.source === source && proof.messageCount > 0 && proof.messageCount <= messages.length) {
+      if (proof.messageCount === messages.length) return await verifyHistoryCount(env, agentPath, proof.messageCount);
+      resumeOffset = proof.messageCount;
+      resumePrevious = proof.receipt;
+    }
+  }
   const attachmentsByMessage = new Map<number, Array<{ path: string; contentType: string; commit: string }>>();
-  for (const [messageIndex, message] of messages.entries()) {
+  for (let messageIndex = resumeOffset; messageIndex < messages.length; messageIndex++) {
+    const message = messages[messageIndex];
     if (message.role !== "user" && message.role !== "toolResult") continue;
     const nativeFiles = Array.isArray(message.content) ? message.content.filter(block => block.type === "file") : [];
     if (nativeFiles.length) {
-      attachmentsByMessage.set(messageIndex, await pinnedV1Files(env, nativeFiles, workspace));
+      const pinned = await pinnedV1Files(env, nativeFiles, workspace).catch(() => []);
+      if (pinned.length) attachmentsByMessage.set(messageIndex, pinned);
       continue;
     }
     if (message.role !== "user") continue;
     const text = typeof message.content === "string" ? message.content :
       message.content.flatMap(block => block.type === "text" ? [block.text] : []).join("\n");
     if (!parseUploadRefs(text).refs.some(ref => ref.kind === "user_upload")) continue;
-    const files = await attachV2Uploads(env, context, agentId, `${uploadPrefix}-${messageIndex}`, text);
-    attachmentsByMessage.set(messageIndex, files);
+    const files = await attachV2Uploads(env, context, agentId, `${uploadPrefix}-${messageIndex}`, text).catch(() => []);
+    if (files.length) attachmentsByMessage.set(messageIndex, files);
   }
   const encoder = new TextEncoder();
   const fullAttachments = [...attachmentsByMessage.entries()].map(([messageIndex, files]) => ({ messageIndex, files }));
   const fullPayload = { source, messages, attachments: fullAttachments, repair: true };
-  let finalCount = 0;
-  if (encoder.encode(JSON.stringify(fullPayload)).byteLength <= HISTORY_CHUNK_TARGET_BYTES || messages.length === 0) {
+  let finalCount = resumeOffset;
+  if (resumeOffset === 0 && (encoder.encode(JSON.stringify(fullPayload)).byteLength <= HISTORY_CHUNK_TARGET_BYTES || messages.length === 0)) {
     const receipt = await v2Json<{ count: number; receipt: string }>(env, agentPath + "/history/import", {
       method: "PUT", body: fullPayload,
     });
     if (!receipt.receipt || receipt.count > messages.length) throw new Error("Incomplete v2 import receipt");
     finalCount = receipt.count;
   } else {
-    let offset = 0;
-    let previous: string | undefined;
+    let offset = resumeOffset;
+    let previous = resumePrevious;
     while (offset < messages.length) {
       const chunkMessages: ImportMessage[] = [];
       const chunkAttachments: Array<{ messageIndex: number; files: Array<{ path: string; contentType: string; commit: string }> }> = [];
       let chunkBytes = 256;
       while (offset + chunkMessages.length < messages.length) {
         const msgIdx = offset + chunkMessages.length;
-        const rawMsg = messages[msgIdx];
-        const msg = encoder.encode(JSON.stringify(rawMsg)).byteLength > HISTORY_CHUNK_TARGET_BYTES
-          ? trimOversizedInlineImages(rawMsg)
-          : rawMsg;
+        const msg = messages[msgIdx];
         const att = attachmentsByMessage.get(msgIdx);
         const est = encoder.encode(JSON.stringify(msg)).byteLength + (att ? encoder.encode(JSON.stringify(att)).byteLength + 64 : 0) + 16;
         if (chunkMessages.length > 0 && chunkBytes + est > HISTORY_CHUNK_TARGET_BYTES) break;
@@ -347,9 +376,9 @@ export class StagingV2Migration extends WorkerEntrypoint<Env> {
     }
     const copy = await (target.messageCount > 0 && target.messageCount === messages.length
       ? verifyHistory(env, targetPath, messages)
-      : copyHistory(env, context, agentId, `chiridion-v1:${handoff.fencedAgentId}`, messages, `v1-migration-${crypto.randomUUID()}`, workspace)
+      : copyHistory(env, context, agentId, `chiridion-v1:${handoff.fencedAgentId}`, messages, `v1-migration-${crypto.randomUUID()}`, workspace, target.messageCount)
     ).catch((error: unknown) => {
-      if (error instanceof RuntimeApiError && (error.status === 422 || error.status === 413)) return { refused: error.code ?? "copy_refused" };
+      if (error instanceof RuntimeApiError && [400, 404, 409, 413, 422].includes(error.status)) return { refused: error.code ?? "copy_refused" };
       throw error;
     });
     if ("refused" in copy) return { status: copy.refused };

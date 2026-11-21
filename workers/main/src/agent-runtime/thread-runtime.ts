@@ -140,8 +140,7 @@ export async function ensureLegacyThreadPromotedToV2(
       const resolved = await resolveThreadRuntimeRoute(env, context);
       if (resolved.route) {
         model = resolved.route.model;
-        keyScope = resolved.route.keyScope;
-        thinkingLevel = resolved.route.thinkingLevel;
+        keyScope = resolved.route.kind === "scope" ? resolved.route.keyScope : null;
       }
     } catch {
       // Fall back to stored or default hosted model below so the thread still opens cleanly.

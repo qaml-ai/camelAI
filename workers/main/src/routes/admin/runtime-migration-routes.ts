@@ -26,6 +26,7 @@ import type { Env } from "../../types.js";
 import type { ChatEnv } from "../../chat-thread/types.js";
 import type { OrgThread } from "../../identity/org-do.js";
 import { migrateThreadToRuntime, reconcileRuntimeMigrationOrphans } from "../../agent-runtime/thread-migration.js";
+import { recoverPromotedV1Thread } from "../../agent-runtime/thread-runtime.js";
 import { getCloudSweepReport, pauseCloudSweep, runCloudSweepStep, startCloudSweep } from "../../agent-runtime/cloud-sweep.js";
 import { getOrgStub } from "./helpers.js";
 
@@ -120,5 +121,25 @@ runtimeMigrationRoutes.post(
     if (action === "pause") return c.json(await pauseCloudSweep(env));
     if (action === "step") return c.json(await runCloudSweepStep(env, { budgetMs }));
     return c.json(await getCloudSweepReport(env));
+  },
+);
+
+runtimeMigrationRoutes.post(
+  "/runtime-migration/recover-v1",
+  openApi({
+    summary: "Restore v1 history and workspace files into a fresh v2 agent for a legacy v1 thread",
+    request: {
+      json: z.object({
+        org_id: z.string().min(1),
+        thread_id: z.string().min(1),
+        v1_agent_id: z.string().min(1),
+        force: z.boolean().optional(),
+      }),
+    },
+    responses: { 200: z.record(z.string(), z.unknown()) },
+  }),
+  async (c) => {
+    const { org_id: orgId, thread_id: threadId, v1_agent_id: v1AgentId, force } = c.req.valid("json");
+    return c.json(await recoverPromotedV1Thread(c.env as unknown as ChatEnv, orgId, threadId, v1AgentId, force === true));
   },
 );

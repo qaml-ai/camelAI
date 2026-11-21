@@ -8962,6 +8962,31 @@ export class OrgDO extends DurableObject<DOEnv> {
     });
   }
 
+  /** Replace a thread's v2 runtime agent after recovering its v1 history into a fresh v2 agent. */
+  replaceThreadRuntimeV2Agent(
+    threadId: string,
+    update: ThreadRuntimeAgentUpdate,
+  ): ThreadRuntimeRecord | null {
+    return this.ctx.storage.transactionSync(() => {
+      if (!this.getThread(threadId)) return null;
+      const now = Date.now();
+      this.sql.exec(
+        `INSERT INTO thread_runtime (thread_id, agent_id, model, key_scope, configured_json, runtime_version, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'v2', ?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET
+           runtime_version = 'v2',
+           agent_id = excluded.agent_id,
+           model = excluded.model,
+           key_scope = excluded.key_scope,
+           configured_json = excluded.configured_json,
+           pending_first_message = NULL,
+           updated_at = excluded.updated_at`,
+        threadId, update.agentId, update.model, update.keyScope, JSON.stringify(update.configured ?? null), now, now,
+      );
+      return this.getThreadRuntime(threadId);
+    });
+  }
+
   /** Publish a verified copy only while the thread still belongs to the legacy exporter. */
   claimLegacyThreadForV2(
     threadId: string,

@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { parseUploadRefs } from "../../../../src/lib/chat-attachment-refs";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
@@ -64,13 +65,89 @@ async function v1ThreadHandoffBinding(
 }
 
 
-async function readV1HistoryTotal(env: ChatEnv, agentPath: string): Promise<number> {
+export async function readV1HistoryTotal(env: ChatEnv, agentPath: string): Promise<number> {
   const page = await runtimeApi(env, "GET", `${agentPath}/history?after=0&limit=1`) as {
     total: number;
     truncated: boolean;
   };
   if (page.truncated) throw new Error("V1 history is truncated");
   return page.total;
+}
+
+const MAX_AUTO_WORKSPACE_FILES = 200;
+const MAX_AUTO_WORKSPACE_BYTES = 16 * 1024 * 1024;
+const MAX_AUTO_SINGLE_FILE_BYTES = 4 * 1024 * 1024;
+
+export async function copyV1WorkspaceToV2Repo(
+  env: ChatEnv,
+  v1AgentId: string,
+  v2AgentId: string,
+): Promise<CopiedWorkspace | undefined> {
+  const mounts = await runtimeApi(env, "GET", `/v1/agents/${encodeURIComponent(v1AgentId)}/mounts`).catch(() => null) as
+    Array<{ volumeId: string; path: string; mode: string; subpath?: string }> | null;
+  const mount = mounts?.find((m) => m.path === "/workspace" && !m.subpath);
+  if (!mount?.volumeId) return undefined;
+
+  const volPath = `/v1/volumes/${encodeURIComponent(mount.volumeId)}`;
+  const volInfo = await runtimeApi(env, "GET", volPath).catch(() => null) as { seq?: number } | null;
+  if (!volInfo) return undefined;
+
+  const listed: Array<{ path: string; size: number }> = [];
+  let after: string | undefined;
+  while (listed.length < MAX_AUTO_WORKSPACE_FILES) {
+    const query = new URLSearchParams({ limit: "100", ...(after ? { after } : {}) });
+    const page = await runtimeApi(env, "GET", `${volPath}/files?${query}`).catch(() => null) as {
+      files?: Array<{ path: string; size: number }>;
+      next?: string;
+    } | null;
+    if (!page?.files?.length) break;
+    listed.push(...page.files);
+    after = page.next;
+    if (!after) break;
+  }
+  if (!listed.length) return undefined;
+
+  const repo = await v2Json<{ repoId: string; branch: string }>(env, v2AgentPath(v2AgentId) + "/repo", { method: "PUT" });
+  const puts: Array<{ path: string; base64: string }> = [];
+  let batchBytes = 0;
+  let totalBytes = 0;
+  let head = "";
+
+  const flush = async () => {
+    if (!puts.length) return;
+    const res = await v2Json<{ commit: string }>(env, `/repos/${encodeURIComponent(repo.repoId)}/write`, {
+      method: "POST",
+      body: { ref: repo.branch, puts: puts.splice(0, puts.length), message: `Migrate v1 workspace ${mount.volumeId}` },
+    });
+    head = res.commit;
+    batchBytes = 0;
+  };
+
+  for (const entry of listed.slice(0, MAX_AUTO_WORKSPACE_FILES)) {
+    const cleanPath = entry.path.replace(/^\/+/, "");
+    if (!cleanPath || entry.size > MAX_AUTO_SINGLE_FILE_BYTES) continue;
+    if (totalBytes + entry.size > MAX_AUTO_WORKSPACE_BYTES) break;
+    const encodedPath = cleanPath.split("/").map(encodeURIComponent).join("/");
+    const fileRes = await fetch(`${runtimeUrl(env)}${volPath}/files/${encodedPath}`, {
+      headers: { Authorization: `Bearer ${env.AGENT_RUNTIME_API_TOKEN ?? ""}` },
+      redirect: "manual",
+    }).catch(() => null);
+    if (!fileRes?.ok) {
+      await fileRes?.body?.cancel().catch(() => {});
+      continue;
+    }
+    const bytes = new Uint8Array(await fileRes.arrayBuffer());
+    totalBytes += bytes.byteLength;
+    const b64 = Buffer.from(bytes).toString("base64");
+    if (puts.length > 0 && batchBytes + b64.length > 3 * 1024 * 1024) {
+      await flush();
+    }
+    puts.push({ path: cleanPath, base64: b64 });
+    batchBytes += b64.length;
+  }
+  await flush();
+  if (!head) return undefined;
+  return { volume: mount.volumeId, repoId: repo.repoId, seq: Number(volInfo.seq ?? 0), head };
 }
 
 async function resolveMessageAttachments(
@@ -94,7 +171,7 @@ async function resolveMessageAttachments(
   return await attachV2Uploads(env, context, agentId, `${uploadPrefix}-${messageIndex}`, text).catch(() => []);
 }
 
-async function streamV1HistoryToV2(
+export async function streamV1HistoryToV2(
   env: ChatEnv,
   context: ChatContextState,
   sourcePath: string,

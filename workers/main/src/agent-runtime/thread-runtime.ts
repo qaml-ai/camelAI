@@ -23,7 +23,8 @@ import { HOSTED_KEY_SCOPE } from "./key-scopes";
 import { runtimeRunLimits, v2RouteSupported, v2WireKeyScope } from "./model-routes";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
 import { RuntimeApiError, runtimeApi, runtimeUrl, v2WorkspaceEnabled } from "./runtime-api";
-import { attachV2Uploads, createV2ThreadAgent, v2AgentPath, v2Json, type V2Run } from "./runtime-v2";
+import { attachV2Uploads, createV2ThreadAgent, v2AgentPath, v2Json, type V2Agent, type V2Run } from "./runtime-v2";
+import { copyV1WorkspaceToV2Repo, readV1HistoryTotal, streamV1HistoryToV2 } from "./staging-v2-migration";
 import { codexError, codexRoute, codexUpstreamCall, forwardedResponseHeaders } from "./codex-forwarder";
 import { HostedModelFallbackRequiredError } from "../chat-thread/pi-model-config";
 import { assertUserLlmUsageAccess, UserLlmUsageLimitError } from "../user-llm-usage-policy";
@@ -117,8 +118,9 @@ function v2RuntimeConfigured(env: ChatEnv): boolean {
 }
 
 /**
- * Promote a retired v1 thread row to CamelRun v2 on first open or send so
- * legacy threads never hit HTTP 410 against the shut-down v1 runtime.
+ * Promote a retired v1 thread row to CamelRun v2 on first open or send,
+ * preserving its full v1 conversation history and /workspace files before
+ * switching OrgDO to the v2 agent so users never hit HTTP 410 or lose history.
  */
 export async function ensureLegacyThreadPromotedToV2(
   env: ChatEnv,
@@ -147,14 +149,45 @@ export async function ensureLegacyThreadPromotedToV2(
     }
   }
   model ||= row.model || "azure/gpt-6.2-sol";
+  const v1AgentId = row.agentId?.startsWith("client_") ? row.agentId : null;
+  const agentKey = v1AgentId ? `chiridion-thread-${context.threadId}-v2` : `chiridion-thread-${context.threadId}`;
   const agentId = await createV2ThreadAgent(
     env,
     context,
     subject,
     model,
-    undefined,
+    agentKey,
     v2WireKeyScope(keyScope),
   );
+  if (v1AgentId) {
+    const sourcePath = `/v1/agents/${encodeURIComponent(v1AgentId)}`;
+    let totalMessages = 0;
+    try {
+      totalMessages = await readV1HistoryTotal(env, sourcePath);
+    } catch (error) {
+      if (!(error instanceof RuntimeApiError) || (error.status !== 404 && error.status !== 410)) {
+        throw error;
+      }
+    }
+    const workspace = await copyV1WorkspaceToV2Repo(env, v1AgentId, agentId).catch((error) => {
+      console.warn("[runtime-thread] v1 workspace copy skipped during auto-promote", { threadId: context.threadId, v1AgentId, error });
+      return undefined;
+    });
+    if (totalMessages > 0) {
+      const target = await v2Json<V2Agent & { messageCount?: number }>(env, v2AgentPath(agentId));
+      await streamV1HistoryToV2(
+        env,
+        context,
+        sourcePath,
+        agentId,
+        `chiridion-v1:${v1AgentId}`,
+        totalMessages,
+        `v1-auto-${context.threadId}`,
+        workspace,
+        target.messageCount ?? 0,
+      );
+    }
+  }
   const promoted = await onceMore("promote_v2", () =>
     org.promoteLegacyThreadToV2(context.threadId, {
       agentId,
@@ -163,9 +196,97 @@ export async function ensureLegacyThreadPromotedToV2(
       configured: {
         thinkingLevel,
         promptVersion: RUNTIME_PROMPT_VERSION,
+        ...(v1AgentId ? { migratedFromV1AgentId: v1AgentId } : {}),
       },
     }));
   return promoted ?? { ...row, runtimeVersion: "v2", agentId, model, keyScope };
+}
+
+/**
+ * Recover a legacy v1 thread whose OrgDO row was promoted to v2 without importing
+ * its v1 history/workspace: stages a fresh v2 agent, copies v1 workspace + full v1
+ * history, then points OrgDO at the recovered v2 agent.
+ */
+export async function recoverPromotedV1Thread(
+  env: ChatEnv,
+  orgId: string,
+  threadId: string,
+  v1AgentId: string,
+  force = false,
+): Promise<{
+  status: string;
+  agentId?: string;
+  v1AgentId: string;
+  messages?: number;
+  workspaceCopied?: boolean;
+}> {
+  if (!v2RuntimeConfigured(env)) return { status: "v2_not_configured", v1AgentId };
+  const org = orgStub(env, orgId);
+  const [thread, row] = await Promise.all([
+    org.getThread(threadId) as Promise<{ created_by?: string | null; workspace_id?: string | null } | null>,
+    org.getThreadRuntime(threadId),
+  ]);
+  if (!thread || !row) return { status: "missing", v1AgentId };
+  if (!force && row.configured?.migratedFromV1AgentId === v1AgentId) {
+    return { status: "already_recovered", agentId: row.agentId ?? undefined, v1AgentId };
+  }
+  const context: ChatContextState = {
+    orgId,
+    workspaceId: thread.workspace_id || "",
+    threadId,
+    userId: thread.created_by || null,
+    userName: null,
+    userEmail: null,
+  };
+  const subject = thread.created_by?.trim() || orgId;
+  let model = row.model || "azure/gpt-6.2-sol";
+  let keyScope = row.keyScope ?? null;
+  const thinkingLevel = typeof row.configured?.thinkingLevel === "string" ? row.configured.thinkingLevel : "medium";
+  try {
+    const resolved = await resolveThreadRuntimeRoute(env, context);
+    if (resolved.route) {
+      model = resolved.route.model;
+      keyScope = resolved.route.kind === "scope" ? resolved.route.keyScope : null;
+    }
+  } catch {
+    // Keep existing model/keyScope
+  }
+  const sourcePath = `/v1/agents/${encodeURIComponent(v1AgentId)}`;
+  const totalMessages = await readV1HistoryTotal(env, sourcePath);
+  const agentKey = `chiridion-thread-${threadId}-v1rec${force ? `-${Date.now()}` : ""}`;
+  const agentId = await createV2ThreadAgent(
+    env,
+    context,
+    subject,
+    model,
+    agentKey,
+    v2WireKeyScope(keyScope),
+  );
+  const workspace = await copyV1WorkspaceToV2Repo(env, v1AgentId, agentId).catch(() => undefined);
+  const target = await v2Json<V2Agent & { messageCount?: number }>(env, v2AgentPath(agentId));
+  await streamV1HistoryToV2(
+    env,
+    context,
+    sourcePath,
+    agentId,
+    `chiridion-v1:${v1AgentId}`,
+    totalMessages,
+    `v1-recover-${threadId}`,
+    workspace,
+    target.messageCount ?? 0,
+  );
+  await org.replaceThreadRuntimeV2Agent(threadId, {
+    agentId,
+    model,
+    keyScope,
+    configured: {
+      ...(row.configured ?? {}),
+      thinkingLevel,
+      promptVersion: RUNTIME_PROMPT_VERSION,
+      migratedFromV1AgentId: v1AgentId,
+    },
+  });
+  return { status: "recovered", agentId, v1AgentId, messages: totalMessages, workspaceCopied: Boolean(workspace) };
 }
 
 function orgStub(env: ChatEnv, orgId: string) {
@@ -186,6 +307,12 @@ function orgStub(env: ChatEnv, orgId: string) {
       configured?: Record<string, unknown> | null;
     }): Promise<ThreadRuntimeRecord | null>;
     promoteLegacyThreadToV2(threadId: string, update: {
+      agentId: string;
+      model: string | null;
+      keyScope: string | null;
+      configured?: Record<string, unknown> | null;
+    }): Promise<ThreadRuntimeRecord | null>;
+    replaceThreadRuntimeV2Agent(threadId: string, update: {
       agentId: string;
       model: string | null;
       keyScope: string | null;

@@ -117,9 +117,9 @@ export async function loadRuntimeThreadSeed(
   const org = env.ORG.get(env.ORG.idFromName(input.orgId)) as unknown as {
     getThreadUiState(threadId: string): Promise<{ preview: Record<string, unknown> | null } | null>;
   };
-  const row = input.row.runtimeVersion === "v2" || !input.row.agentId
+  const row = input.row.runtimeVersion === "v2" || !input.row.agentId || typeof ensureLegacyThreadPromotedToV2 !== "function"
     ? input.row
-    : await ensureLegacyThreadPromotedToV2(
+    : (await ensureLegacyThreadPromotedToV2(
         env,
         {
           threadId: input.threadId,
@@ -131,7 +131,7 @@ export async function loadRuntimeThreadSeed(
         },
         input.row,
         input.userId,
-      ).catch(() => input.row);
+      ).catch(() => input.row)) ?? input.row;
   const agentId = row.agentId;
   const [uiState, reads, startError] = await Promise.all([
     org.getThreadUiState(input.threadId).catch(() => null),

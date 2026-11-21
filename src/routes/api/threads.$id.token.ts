@@ -22,9 +22,9 @@ export async function action({ request, context, params }: ActionFunctionArgs) {
     return Response.json({ error: "The thread has no agent yet" }, { status: 404 });
   }
   try {
-    const row = initialRow.runtimeVersion === "v2"
+    const row = initialRow.runtimeVersion === "v2" || typeof ensureLegacyThreadPromotedToV2 !== "function"
       ? initialRow
-      : await ensureLegacyThreadPromotedToV2(env, threadContext, initialRow, sender.userId);
+      : (await ensureLegacyThreadPromotedToV2(env, threadContext, initialRow, sender.userId)) ?? initialRow;
     if (!row.agentId) {
       recordRuntimeTokenMintFailure(env, threadContext, "token_route", { status: "no_agent", statusCode: 404 });
       return Response.json({ error: "The thread has no agent yet" }, { status: 404 });

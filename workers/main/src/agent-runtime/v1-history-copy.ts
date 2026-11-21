@@ -60,6 +60,16 @@ export function trimOversizedMessage(message: ImportMessage): ImportMessage {
       if (block.type === "image" && typeof block.data === "string" && block.data.length > 50_000) {
         return { ...block, data: "", omittedBytes: block.data.length };
       }
+      if (block.type === "thinking") {
+        const next: Record<string, unknown> = { ...block };
+        if (typeof next.thinkingSignature === "string" && next.thinkingSignature.length > 50_000) {
+          delete next.thinkingSignature;
+        }
+        if (typeof next.thinking === "string" && next.thinking.length > 150_000) {
+          next.thinking = `${next.thinking.slice(0, 150_000)}\n[truncated during migration]`;
+        }
+        return next;
+      }
       if (block.type === "toolCall" && block.arguments && JSON.stringify(block.arguments).length > 150_000) {
         return { ...block, arguments: { _truncated: true } };
       }

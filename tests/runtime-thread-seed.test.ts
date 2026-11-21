@@ -7,6 +7,7 @@ vi.mock("@/lib/auth.server", () => ({ requireSession: vi.fn() }));
 vi.mock("@/lib/cloudflare.server", () => ({ getEnv: vi.fn() }));
 vi.mock("@/lib/auth-helpers", () => ({ getAuthEnv: vi.fn() }));
 vi.mock("../workers/main/src/agent-runtime/thread-runtime", () => ({
+  ensureLegacyThreadPromotedToV2: vi.fn(async (_env, _context, row) => row),
   mintRuntimeBrowserToken: mint, runtimeHistoryPage: history, pinNewThreadToRuntime: vi.fn(), prewarmThreadAgent: vi.fn(),
 }));
 vi.mock("../workers/main/src/agent-runtime/thread-migration", () => ({ classifyMove: vi.fn(), migrateThreadToRuntime: vi.fn() }));

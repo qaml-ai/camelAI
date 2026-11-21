@@ -108,6 +108,67 @@ export async function pinNewThreadToRuntime(
   return await org.getThreadRuntime(context.threadId);
 }
 
+function v2RuntimeConfigured(env: ChatEnv): boolean {
+  return Boolean(
+    env.WORKER_BASE_URL &&
+    env.AGENT_RUNTIME_V2_TENANT &&
+    env.AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET,
+  );
+}
+
+/**
+ * Promote a retired v1 thread row to CamelRun v2 on first open or send so
+ * legacy threads never hit HTTP 410 against the shut-down v1 runtime.
+ */
+export async function ensureLegacyThreadPromotedToV2(
+  env: ChatEnv,
+  context: ChatContextState,
+  row: ThreadRuntimeRecord,
+  userId: string | null,
+  preparedRun?: PreparedRuntimeRun,
+): Promise<ThreadRuntimeRecord> {
+  if (row.runtimeVersion === "v2" && row.agentId) return row;
+  if (!v2RuntimeConfigured(env)) return row;
+  const org = orgStub(env, context.orgId);
+  const thread = await org.getThread(context.threadId).catch(() => null);
+  const subject = thread?.created_by?.trim() || userId || context.userId || context.orgId;
+  let model = preparedRun?.model ?? null;
+  let keyScope = preparedRun ? preparedRun.keyScope : (row.keyScope ?? null);
+  let thinkingLevel = preparedRun?.thinkingLevel ?? (typeof row.configured?.thinkingLevel === "string" ? row.configured.thinkingLevel : "medium");
+  if (!preparedRun) {
+    try {
+      const resolved = await resolveThreadRuntimeRoute(env, context);
+      if (resolved.route) {
+        model = resolved.route.model;
+        keyScope = resolved.route.keyScope;
+        thinkingLevel = resolved.route.thinkingLevel;
+      }
+    } catch {
+      // Fall back to stored or default hosted model below so the thread still opens cleanly.
+    }
+  }
+  model ||= row.model || "azure/gpt-6.2-sol";
+  const agentId = await createV2ThreadAgent(
+    env,
+    context,
+    subject,
+    model,
+    undefined,
+    v2WireKeyScope(keyScope),
+  );
+  const promoted = await onceMore("promote_v2", () =>
+    org.promoteLegacyThreadToV2(context.threadId, {
+      agentId,
+      model,
+      keyScope,
+      configured: {
+        thinkingLevel,
+        promptVersion: RUNTIME_PROMPT_VERSION,
+      },
+    }));
+  return promoted ?? { ...row, runtimeVersion: "v2", agentId, model, keyScope };
+}
+
 function orgStub(env: ChatEnv, orgId: string) {
   return env.ORG.get(env.ORG.idFromName(orgId)) as unknown as {
     getThread(id: string): Promise<{ created_by?: string | null } | null>;
@@ -120,6 +181,12 @@ function orgStub(env: ChatEnv, orgId: string) {
       configured?: Record<string, unknown> | null;
     }): Promise<{ row: ThreadRuntimeRecord; claimed: boolean } | null>;
     setThreadRuntimeAgent(threadId: string, update: {
+      agentId: string;
+      model: string | null;
+      keyScope: string | null;
+      configured?: Record<string, unknown> | null;
+    }): Promise<ThreadRuntimeRecord | null>;
+    promoteLegacyThreadToV2(threadId: string, update: {
       agentId: string;
       model: string | null;
       keyScope: string | null;
@@ -496,15 +563,19 @@ async function sendRuntimeTurn(
   let agentId: string;
   let request: { id?: unknown; state?: unknown; steeredInto?: unknown };
   try {
+    const row = input.row.runtimeVersion === "v2"
+      ? input.row
+      : await timed(timings, "configure", () =>
+          ensureLegacyThreadPromotedToV2(env, context, input.row, sender.userId, run));
     // Configuring is idempotent (the agent's Idempotency-Key, PUT/PATCH), so
     // a Durable Object reset under it (a deploy) is ridden out, once.
     const configured = timed(timings, "configure", () =>
-      onceMore("configure_agent", () => ensureConfiguredAgent(env, context, input.row, run, input.clientMessageId, timings)));
+      onceMore("configure_agent", () => ensureConfiguredAgent(env, context, row, run, input.clientMessageId, timings)));
     // The message's uploads, attached as runtime files too (native images and
     // PDFs); alongside the configuration when the agent already exists.
-    const v2 = input.row.runtimeVersion === "v2";
+    const v2 = row.runtimeVersion === "v2";
     const attach = v2 ? attachV2Uploads : attachUploads;
-    const files = (input.row.agentId ? Promise.resolve(input.row.agentId) : configured)
+    const files = (row.agentId ? Promise.resolve(row.agentId) : configured)
       .then((id) => timed(timings, "uploads", () => attach(env, context, id, input.clientMessageId, text)));
     const [id, attached, promptText] = await Promise.all([configured, files, modelText(env, context, text), marked]);
     agentId = id;

@@ -11,6 +11,7 @@ import { getAuthEnv } from "@/lib/auth-helpers";
 import type { ChatContextState, ChatEnv } from "../../workers/main/src/chat-thread/types";
 import type { OrgChatWebSocketAccessResult, ThreadRuntimeRecord } from "../../workers/main/src/identity/org-do";
 import {
+  ensureLegacyThreadPromotedToV2,
   mintRuntimeBrowserToken,
   pinNewThreadToRuntime,
   runtimeHistoryPage,
@@ -116,19 +117,34 @@ export async function loadRuntimeThreadSeed(
   const org = env.ORG.get(env.ORG.idFromName(input.orgId)) as unknown as {
     getThreadUiState(threadId: string): Promise<{ preview: Record<string, unknown> | null } | null>;
   };
-  const agentId = input.row.agentId;
+  const row = input.row.runtimeVersion === "v2" || !input.row.agentId
+    ? input.row
+    : await ensureLegacyThreadPromotedToV2(
+        env,
+        {
+          threadId: input.threadId,
+          workspaceId: input.workspaceId,
+          orgId: input.orgId,
+          userId: input.userId,
+          userName: null,
+          userEmail: null,
+        },
+        input.row,
+        input.userId,
+      ).catch(() => input.row);
+  const agentId = row.agentId;
   const [uiState, reads, startError] = await Promise.all([
     org.getThreadUiState(input.threadId).catch(() => null),
     agentId
       ? Promise.all([
-          mintRuntimeBrowserToken(env, { ...input.row, agentId }, input.userId, runtimeReadProxyBase(input.threadId, input.workspaceId), AbortSignal.timeout(SEED_REQUEST_TIMEOUT_MS)).then(
+          mintRuntimeBrowserToken(env, { ...row, agentId }, input.userId, runtimeReadProxyBase(input.threadId, input.workspaceId), AbortSignal.timeout(SEED_REQUEST_TIMEOUT_MS)).then(
             (token) => ({ token, error: null }),
             (error: unknown) => {
               recordRuntimeTokenMintFailure(env, input, "page_seed", { error });
               return { token: null, error: "Can't reach the agent service. Try again in a moment." };
             },
           ),
-          loadSeedHistory(env, agentId, input, input.row.runtimeVersion),
+          loadSeedHistory(env, agentId, input, row.runtimeVersion),
         ]).then(([tokenResult, page]) => ({ ...tokenResult, page }))
       : Promise.resolve({ token: null, page: null, error: null }),
     runtimeStartError(org, input.threadId),

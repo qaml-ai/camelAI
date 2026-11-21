@@ -8943,6 +8943,25 @@ export class OrgDO extends DurableObject<DOEnv> {
     });
   }
 
+  /** Promote a retired v1 runtime thread to a v2 agent so users never hit HTTP 410. */
+  promoteLegacyThreadToV2(
+    threadId: string,
+    update: ThreadRuntimeAgentUpdate,
+  ): ThreadRuntimeRecord | null {
+    return this.ctx.storage.transactionSync(() => {
+      const existing = this.getThreadRuntime(threadId);
+      if (!existing) return null;
+      if (existing.runtimeVersion === "v2" && existing.agentId) return existing;
+      const now = Date.now();
+      this.sql.exec(
+        `UPDATE thread_runtime SET runtime_version = 'v2', agent_id = ?, model = ?, key_scope = ?, configured_json = ?, pending_first_message = NULL, updated_at = ?
+         WHERE thread_id = ? AND (runtime_version <> 'v2' OR agent_id IS NULL)`,
+        update.agentId, update.model, update.keyScope, JSON.stringify(update.configured ?? null), now, threadId,
+      );
+      return this.getThreadRuntime(threadId);
+    });
+  }
+
   /** Publish a verified copy only while the thread still belongs to the legacy exporter. */
   claimLegacyThreadForV2(
     threadId: string,

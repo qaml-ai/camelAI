@@ -42,6 +42,22 @@ const GPT_SOL_STANDARD_PRICING: ModelPricing = {
   ],
 };
 
+const GPT_TERRA_STANDARD_PRICING: ModelPricing = {
+  inputPerToken: 0.000001,
+  outputPerToken: 0.000005,
+  cacheCreationPerToken: 0.00000125,
+  cacheReadPerToken: 0.00000005,
+  tiers: [
+    {
+      inputTokensAbove: 272_000,
+      inputPerToken: 0.000002,
+      outputPerToken: 0.0000075,
+      cacheCreationPerToken: 0.0000025,
+      cacheReadPerToken: 0.0000001,
+    },
+  ],
+};
+
 const modelPricingTable: Record<string, ModelPricing> = {
   // OpenRouter /api/v1/models and runtime catalog pricing, 2026-09-28.
   "claude-fable-5-1": {
@@ -343,7 +359,10 @@ const modelPricingTable: Record<string, ModelPricing> = {
   },
   // OpenRouter list prices, 2026-10-08: GPT-6 Sol's, with cache reads halved.
   "gpt-6.1-sol": GPT_SOL_STANDARD_PRICING,
-  // Microsoft Foundry Global Standard list prices, 2026-11-17.
+  // Microsoft Foundry Global Standard list prices, 2026-11-22.
+  "azure/gpt-6.1-terra": GPT_TERRA_STANDARD_PRICING,
+  "gpt-6.1-terra": GPT_TERRA_STANDARD_PRICING,
+  // Microsoft Foundry Global Standard list prices, 2026-11-17 (historical camelCode).
   "azure/gpt-6.2-sol": GPT_SOL_STANDARD_PRICING,
   "gpt-6.2-sol": GPT_SOL_STANDARD_PRICING,
   // OpenRouter list prices, 2026-09-28; the long-context tier follows GPT-6 Luna.
@@ -622,6 +641,9 @@ export function lookupPricingOrNull(model: string): ModelPricing | null {
 
   if (normalized.startsWith("gpt-5.6-terra")) {
     return modelPricingTable["gpt-5.6-terra"];
+  }
+  if (normalized.startsWith("gpt-6.1-terra")) {
+    return modelPricingTable["gpt-6.1-terra"];
   }
   if (normalized.startsWith("gpt-6.1-sol")) {
     return modelPricingTable["gpt-6.1-sol"];

@@ -58,7 +58,7 @@ describe("v2WorkspaceEnabled", () => {
 });
 
 describe("runtimeModelRoute", () => {
-  it.each([true, false])("runs camelCode on GPT-6.2 Sol on the platform's Azure deployment (free tier: %s)", async (freeTier) => {
+  it.each([true, false])("runs camelCode on GPT-6.1 Terra on the platform's Azure deployment (free tier: %s)", async (freeTier) => {
     const orgStub = {
       getThread: async () => ({ model: "deepseek-v4-auto", workspace_id: "ws1" }),
       getInfo: async () => ({ billing_status: freeTier ? "inactive" : "active", billing_plan: "payg" }),
@@ -75,8 +75,9 @@ describe("runtimeModelRoute", () => {
     expect(resolved.usageProvider).toBe("compat");
     expect(threadModel).toBe("deepseek-v4-auto");
     expect(resolved.creditChargeable).toBe(false);
-    expect(route).toEqual({ kind: "scope", model: "azure/gpt-6.2-sol", keyScope: "hosted" });
+    expect(route).toEqual({ kind: "scope", model: "azure/gpt-6.1-terra", keyScope: "hosted" });
     expect(runtimeAgentModel(context, route!, threadModel)).toMatchObject({ thinkingLevel: "low" });
+    expect(runtimeAgentModel(context, route!, threadModel, "v2")).toMatchObject({ model: "azure/gpt-6.1-terra", thinkingLevel: "low" });
   });
 
   it("runs hosted models with the hosted key scope and their OpenRouter id", () => {
@@ -204,10 +205,13 @@ describe("v2 BYOK and Codex routing", () => {
   it("gates BYOK and Codex routes behind AGENT_RUNTIME_V2_BYOK", () => {
     const byok = { kind: "scope" as const, model: "anthropic/claude-opus-5-5", keyScope: "org_1" };
     const codex = { kind: "codex" as const, model: "chiridion/openai-codex/gpt-6-luna" };
-    const hosted = { kind: "scope" as const, model: "azure/gpt-6.2-sol", keyScope: "hosted" };
-    expect(v2RouteSupported(byok, { AGENT_RUNTIME_V2_MODELS: "azure/gpt-6.2-sol" })).toBe(false);
-    expect(v2RouteSupported(codex, { AGENT_RUNTIME_V2_MODELS: "azure/gpt-6.2-sol" })).toBe(false);
-    expect(v2RouteSupported(hosted, { AGENT_RUNTIME_V2_MODELS: "azure/gpt-6.2-sol" })).toBe(true);
+    const hosted = { kind: "scope" as const, model: "azure/gpt-6.1-terra", keyScope: "hosted" };
+    const hostedSol = { kind: "scope" as const, model: "azure/gpt-6.2-sol", keyScope: "hosted" };
+    expect(v2RouteSupported(byok, { AGENT_RUNTIME_V2_MODELS: "azure/gpt-6.1-terra" })).toBe(false);
+    expect(v2RouteSupported(codex, { AGENT_RUNTIME_V2_MODELS: "azure/gpt-6.1-terra" })).toBe(false);
+    expect(v2RouteSupported(hosted, { AGENT_RUNTIME_V2_MODELS: "azure/gpt-6.1-terra" })).toBe(true);
+    expect(v2RouteSupported(hosted, { AGENT_RUNTIME_V2_ADDITIONAL_MODELS: "azure/gpt-6.1-terra,azure/gpt-6.2-sol" })).toBe(true);
+    expect(v2RouteSupported(hostedSol, { AGENT_RUNTIME_V2_ADDITIONAL_MODELS: "azure/gpt-6.1-terra,azure/gpt-6.2-sol" })).toBe(true);
     expect(v2RouteSupported(byok, { AGENT_RUNTIME_V2_BYOK: "true" })).toBe(true);
     expect(v2RouteSupported(codex, { AGENT_RUNTIME_V2_BYOK: "true" })).toBe(true);
   });

@@ -271,7 +271,7 @@ describe("startRuntimeTurn", () => {
     expect(configure.body).toHaveProperty("runLimits", null);
   });
 
-  it.each([null, ...PREVIOUS_CAMEL_CODE_RUNTIME_MODELS])("uses Sol for a new v2 camelCode agent and keeps the existing model (%s)", async (configured) => {
+  it.each([null, ...PREVIOUS_CAMEL_CODE_RUNTIME_MODELS])("uses Terra for a new v2 camelCode agent and keeps the existing model (%s)", async (configured) => {
     const setup = await runtimeThread();
     const { orgStub, context, sender } = setup;
     const thread = await orgStub.createThread(context.workspaceId, "V2 camelCode", sender.userId);

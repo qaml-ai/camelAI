@@ -13,7 +13,7 @@ export const DEFAULT_OPENROUTER_MODEL: LlmModel = "gpt-6-luna";
 /** The default for keys that cannot run Luna (Anthropic, Claude-only Bedrock). */
 export const DEFAULT_ANTHROPIC_MODEL: LlmModel = "sonnet";
 export const CUSTOM_LLM_MODEL: LlmModel = "custom";
-export const CAMEL_CODE_MODEL_DESCRIPTION = "Free coding model. New chats use GPT-6.2 Sol.";
+export const CAMEL_CODE_MODEL_DESCRIPTION = "Free coding model. New chats use GPT-6.1 Terra.";
 export const THREAD_MODEL_LOCK_MESSAGE =
   "This thread is locked to its original model. Start a new thread to use a different model.";
 

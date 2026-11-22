@@ -37,7 +37,7 @@ import { assertUserLlmUsageAccess, UserLlmUsageLimitError } from "../user-llm-us
 import { createPiSystemPrompt } from "../pi-system-prompt";
 import { resolveAgentSkillCatalog } from "../selfhost-agent-pack";
 import { RUNTIME_PROMPT_PREAMBLE, type RuntimeRunConfig } from "./runtime-prompt";
-import { CAMEL_CODE_RUNTIME_MODEL, runtimeModelRoute, v2RouteSupported, v2RuntimeRouteTarget, type RuntimeModelRoute } from "./model-routes";
+import { CAMEL_CODE_RUNTIME_MODEL, PREVIOUS_AZURE_SOL_CAMEL_CODE_RUNTIME_MODEL, runtimeModelRoute, v2RouteSupported, v2RuntimeRouteTarget, type RuntimeModelRoute } from "./model-routes";
 import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, selfhostOperatorEndpointOrigin, syncOrgKeyScope, syncV2OrgKeyScope } from "./key-scopes";
 import { codexRoute } from "./codex-forwarder";
 
@@ -321,20 +321,22 @@ export function runtimeAgentModel(
   threadModel: LlmModel,
   runtimeVersion?: "v1" | "v2",
 ): RuntimeAgentModel {
+  const isLowReasoningCamelCode = (model: string) =>
+    model === CAMEL_CODE_RUNTIME_MODEL || model === PREVIOUS_AZURE_SOL_CAMEL_CODE_RUNTIME_MODEL;
   if (runtimeVersion === "v2") {
     const target = v2RuntimeRouteTarget(route, context.orgId);
     return {
       model: target.model,
       keyScope: target.keyScope,
       modelHeaders: null,
-      thinkingLevel: target.model === CAMEL_CODE_RUNTIME_MODEL ? "low" : primaryPiThinkingLevel(threadModel),
+      thinkingLevel: isLowReasoningCamelCode(target.model) ? "low" : primaryPiThinkingLevel(threadModel),
     };
   }
   return {
     model: route.model,
     keyScope: route.kind === "scope" ? route.keyScope : null,
     modelHeaders: route.kind === "scope" && route.keyScope === HOSTED_KEY_SCOPE ? hostedModelHeaders(context) : null,
-    thinkingLevel: route.model === CAMEL_CODE_RUNTIME_MODEL ? "low" : primaryPiThinkingLevel(threadModel),
+    thinkingLevel: isLowReasoningCamelCode(route.model) ? "low" : primaryPiThinkingLevel(threadModel),
   };
 }
 

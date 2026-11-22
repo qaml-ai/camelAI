@@ -8708,6 +8708,8 @@ export class OrgDO extends DurableObject<DOEnv> {
   /** Metadata only, ordered by thread ID for the camelCode model migration. */
   listCamelCodeModelMigrationThreads(after: string | null, limit: number) {
     const size = Math.max(1, Math.min(Math.floor(limit) || 1, 100));
+    const camelCodeModels = [...PREVIOUS_CAMEL_CODE_RUNTIME_MODELS, CAMEL_CODE_RUNTIME_MODEL];
+    const placeholders = camelCodeModels.map(() => "?").join(", ");
     return this.sql.exec<{
       thread_id: string;
       workspace_id: string;
@@ -8718,10 +8720,10 @@ export class OrgDO extends DurableObject<DOEnv> {
       `SELECT t.id AS thread_id, t.workspace_id, r.agent_id, r.runtime_version, r.model
        FROM threads t LEFT JOIN thread_runtime r ON r.thread_id = t.id
        WHERE t.id > ? AND t.model = ? AND (
-         r.thread_id IS NULL OR (r.key_scope = 'hosted' AND r.agent_id IS NOT NULL AND r.model IN (?, ?, ?, ?))
+         r.thread_id IS NULL OR (r.key_scope = 'hosted' AND r.agent_id IS NOT NULL AND r.model IN (${placeholders}))
        )
        ORDER BY t.id LIMIT ?`,
-      after ?? "", CAMEL_CODE_LLM_MODEL, ...PREVIOUS_CAMEL_CODE_RUNTIME_MODELS, CAMEL_CODE_RUNTIME_MODEL, size,
+      after ?? "", CAMEL_CODE_LLM_MODEL, ...camelCodeModels, size,
     ).toArray();
   }
 

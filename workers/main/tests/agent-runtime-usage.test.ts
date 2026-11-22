@@ -81,7 +81,7 @@ describe("usageRowFor", () => {
       .toMatchObject({ credit_chargeable: true });
   });
 
-  it.each(["gpt-6.2-sol", "deepseek-v4.1-flash"])("meters camelCode on Azure as %s without charging credits", (model) => {
+  it.each(["gpt-6.1-terra", "gpt-6.2-sol", "deepseek-v4.1-flash"])("meters camelCode on Azure as %s without charging credits", (model) => {
     for (const billing_status of ["inactive", "active"]) {
       expect(usageRowFor("evt", { ...data, provider: "azure", model }, { billing_status }))
         .toMatchObject({ provider: "azure", model, billing_source: "hosted", credit_chargeable: false });

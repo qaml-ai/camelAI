@@ -12,9 +12,7 @@
 import type { Env } from "../types.js";
 import {
   CAMEL_CODE_RUNTIME_MODEL,
-  FREE_TIER_RUNTIME_MODEL,
-  PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL,
-  PREVIOUS_CAMEL_CODE_RUNTIME_MODEL,
+  PREVIOUS_CAMEL_CODE_RUNTIME_MODELS,
   RUNTIME_MODEL_ENDPOINT,
 } from "./model-routes.js";
 import { HOSTED_KEY_SCOPE } from "./key-scopes.js";
@@ -78,10 +76,8 @@ export function usageRowFor(eventId: string, data: RuntimeUsageRecorded, org: { 
   const runtimeModel = `${provider}/${model}`.replace(/:nitro$/, "");
   // Delayed usage from earlier camelCode models also stays credit-free.
   const freeTier = [
-    FREE_TIER_RUNTIME_MODEL,
     CAMEL_CODE_RUNTIME_MODEL,
-    PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL,
-    PREVIOUS_CAMEL_CODE_RUNTIME_MODEL,
+    ...PREVIOUS_CAMEL_CODE_RUNTIME_MODELS,
   ].some((free) => runtimeModel === free.replace(/:nitro$/, ""));
   const context = data.context ?? {};
   return {

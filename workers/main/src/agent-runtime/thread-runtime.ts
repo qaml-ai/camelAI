@@ -20,7 +20,7 @@ import { buildWorkspaceScopedR2Key } from "../../../../src/lib/workspace-r2-path
 import { applyMentionContext } from "../mention-context";
 import { WorkspaceFilesystemClient } from "../workspace-filesystem-do";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
-import { runtimeRunLimits, v2RouteSupported, v2WireKeyScope } from "./model-routes";
+import { CAMEL_CODE_RUNTIME_MODEL, runtimeRunLimits, v2RouteSupported, v2WireKeyScope } from "./model-routes";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
 import { RuntimeApiError, runtimeApi, runtimeUrl, v2WorkspaceEnabled } from "./runtime-api";
 import { attachV2Uploads, createV2ThreadAgent, isV2NativeImageContentType, v2AgentPath, v2Json, type V2Agent, type V2Run } from "./runtime-v2";
@@ -136,7 +136,7 @@ export async function ensureLegacyThreadPromotedToV2(
   const subject = thread?.created_by?.trim() || userId || context.userId || context.orgId;
   let model = preparedRun?.model ?? null;
   let keyScope = preparedRun ? preparedRun.keyScope : (row.keyScope ?? null);
-  let thinkingLevel = preparedRun?.thinkingLevel ?? (typeof row.configured?.thinkingLevel === "string" ? row.configured.thinkingLevel : "medium");
+  let thinkingLevel = preparedRun?.thinkingLevel ?? (typeof row.configured?.thinkingLevel === "string" ? row.configured.thinkingLevel : null);
   if (!preparedRun) {
     try {
       const resolved = await resolveThreadRuntimeRoute(env, context);
@@ -148,7 +148,8 @@ export async function ensureLegacyThreadPromotedToV2(
       // Fall back to stored or default hosted model below so the thread still opens cleanly.
     }
   }
-  model ||= row.model || "azure/gpt-6.2-sol";
+  model ||= row.model || CAMEL_CODE_RUNTIME_MODEL;
+  thinkingLevel ||= model === CAMEL_CODE_RUNTIME_MODEL ? "low" : "medium";
   const v1AgentId = row.agentId?.startsWith("client_") ? row.agentId : null;
   const agentKey = v1AgentId ? `chiridion-thread-${context.threadId}-v2` : `chiridion-thread-${context.threadId}`;
   const agentId = await createV2ThreadAgent(
@@ -239,7 +240,7 @@ export async function recoverPromotedV1Thread(
     userEmail: null,
   };
   const subject = thread.created_by?.trim() || orgId;
-  let model = row.model || "azure/gpt-6.2-sol";
+  let model = row.model || CAMEL_CODE_RUNTIME_MODEL;
   let keyScope = row.keyScope ?? null;
   const thinkingLevel = typeof row.configured?.thinkingLevel === "string" ? row.configured.thinkingLevel : "medium";
   try {

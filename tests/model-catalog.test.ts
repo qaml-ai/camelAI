@@ -65,7 +65,7 @@ describe('MODEL_CATALOG', () => {
       ),
     ).toMatchObject({
       label: 'camelCode',
-      description: 'Free coding model. New chats use GPT-6.2 Sol.',
+      description: 'Free coding model. New chats use GPT-6.1 Terra.',
     });
   });
 

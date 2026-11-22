@@ -94,9 +94,10 @@ export const FREE_TIER_RUNTIME_MODEL = "openrouter/openai/gpt-6-luna";
  * camelCode uses camelRun's platform Azure deployment. The hosted key scope
  * holds no `azure` entry, so camelRun uses its platform credential.
  */
-export const CAMEL_CODE_RUNTIME_MODEL = "azure/gpt-6.2-sol";
+export const CAMEL_CODE_RUNTIME_MODEL = "azure/gpt-6.1-terra";
 
-/** The prior Azure route, retained for existing camelCode agents. */
+/** Prior Azure camelCode routes, retained for existing camelCode agents. */
+export const PREVIOUS_AZURE_SOL_CAMEL_CODE_RUNTIME_MODEL = "azure/gpt-6.2-sol";
 export const PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL = "azure/deepseek-v4.1-flash";
 
 /**
@@ -106,6 +107,7 @@ export const PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL = "azure/deepseek-v4.1-flas
 export const PREVIOUS_CAMEL_CODE_RUNTIME_MODEL = "openrouter/deepseek/deepseek-v4.1-flash-1017:nitro";
 
 export const PREVIOUS_CAMEL_CODE_RUNTIME_MODELS = [
+  PREVIOUS_AZURE_SOL_CAMEL_CODE_RUNTIME_MODEL,
   PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL,
   PREVIOUS_CAMEL_CODE_RUNTIME_MODEL,
   FREE_TIER_RUNTIME_MODEL,
@@ -123,7 +125,9 @@ export const CAMEL_CODE_CONTEXT_TOKENS = 262_144;
 
 /** The runtime run limits an agent on `model` gets of chiridion's own: only camelCode has any. */
 export function runtimeRunLimits(model: string | null | undefined): { contextTokens: number } | null {
-  return model === CAMEL_CODE_RUNTIME_MODEL || model === PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL
+  return model === CAMEL_CODE_RUNTIME_MODEL ||
+    model === PREVIOUS_AZURE_SOL_CAMEL_CODE_RUNTIME_MODEL ||
+    model === PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL
     ? { contextTokens: CAMEL_CODE_CONTEXT_TOKENS }
     : null;
 }

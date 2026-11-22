@@ -62,6 +62,13 @@ describe("calculateUsageCostUsd", () => {
       cacheReadInputTokens: 1_000_000, cacheCreationInputTokens: 0 })).toBeCloseTo(1.506);
   });
 
+  it.each(["azure/gpt-6.1-terra", "gpt-6.1-terra"])("prices Azure Terra usage as %s", (model) => {
+    const usage = { model, outputTokens: 100, cacheReadInputTokens: 100, cacheCreationInputTokens: 100 };
+    expect(lookupPricingOrNull(model)).toMatchObject({ inputPerToken: 0.000001, outputPerToken: 0.000005, cacheReadPerToken: 0.00000005, cacheCreationPerToken: 0.00000125 });
+    expect(calculateUsageCostUsd({ ...usage, inputTokens: 100 })).toBeCloseTo(0.00073, 8);
+    expect(calculateUsageCostUsd({ ...usage, inputTokens: 300_000 })).toBeCloseTo(0.60101, 8);
+  });
+
   it.each(["azure/gpt-6.2-sol", "gpt-6.2-sol"])("prices Azure Sol usage as %s", (model) => {
     const usage = { model, outputTokens: 100, cacheReadInputTokens: 100, cacheCreationInputTokens: 100 };
     expect(lookupPricingOrNull(model)).toMatchObject({ inputPerToken: 0.000002, outputPerToken: 0.00001 });

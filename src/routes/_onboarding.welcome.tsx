@@ -59,7 +59,7 @@ export async function loader({ request, context }: Route.LoaderArgs) {
   } satisfies WelcomeLoaderData;
 }
 
-export function meta(_: Route.MetaArgs) {
+export function meta() {
   return [
     { title: "Welcome - camelAI" },
     { name: "description", content: "Welcome to camelAI onboarding" },

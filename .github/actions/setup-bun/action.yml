@@ -1,0 +1,85 @@
+name: Setup Bun and install dependencies
+description: Install pinned Bun with retry fallback on transient GitHub release errors, restore the Bun package cache, and run bun install.
+
+inputs:
+  bun-version:
+    description: Exact Bun version to install
+    required: false
+    default: '1.4.5'
+  install:
+    description: Run bun install --frozen-lockfile after setup
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Bun
+      id: setup-bun
+      uses: oven-sh/setup-bun@v2
+      continue-on-error: true
+      with:
+        bun-version: ${{ inputs.bun-version }}
+
+    - name: Fallback Bun install with retries
+      if: steps.setup-bun.outcome != 'success'
+      shell: bash
+      env:
+        BUN_VERSION: ${{ inputs.bun-version }}
+      run: |
+        set -euo pipefail
+        case "$(uname -s)" in
+          Linux) os="linux" ;;
+          Darwin) os="darwin" ;;
+          *) echo "::error::Unsupported OS: $(uname -s)"; exit 1 ;;
+        esac
+        case "$(uname -m)" in
+          x86_64|amd64) arch="x64" ;;
+          aarch64|arm64) arch="aarch64" ;;
+          *) echo "::error::Unsupported arch: $(uname -m)"; exit 1 ;;
+        esac
+
+        url="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-${os}-${arch}.zip"
+        tmp_dir="$(mktemp -d)"
+        trap 'rm -rf "$tmp_dir"' EXIT
+
+        for attempt in 1 2 3; do
+          echo "Downloading Bun ${BUN_VERSION} (attempt ${attempt}/3): ${url}"
+          if curl -fsSL --connect-timeout 15 --max-time 120 "$url" -o "$tmp_dir/bun.zip" \
+            && unzip -o -q "$tmp_dir/bun.zip" -d "$tmp_dir"; then
+            mkdir -p "$HOME/.bun/bin"
+            install -m 755 "$tmp_dir/bun-${os}-${arch}/bun" "$HOME/.bun/bin/bun"
+            ln -sf "$HOME/.bun/bin/bun" "$HOME/.bun/bin/bunx"
+            echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+            "$HOME/.bun/bin/bun" --revision
+            exit 0
+          fi
+          rm -rf "$tmp_dir/bun.zip" "$tmp_dir/bun-${os}-${arch}"
+          if [ "$attempt" -lt 3 ]; then
+            backoff=$((attempt * 5))
+            echo "::warning::Bun download failed on attempt ${attempt}; retrying in ${backoff}s..."
+            sleep "$backoff"
+          fi
+        done
+
+        echo "::error::Failed to install Bun ${BUN_VERSION} after 3 attempts"
+        exit 1
+
+    - name: Verify Bun installation
+      shell: bash
+      run: bun --revision
+
+    - name: Cache Bun packages
+      if: inputs.install == 'true'
+      uses: actions/cache@v4
+      with:
+        path: ~/.bun/install/cache
+        key: bun-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.bun-version }}-${{ hashFiles('bun.lock') }}
+        restore-keys: |
+          bun-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.bun-version }}-
+          bun-cache-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Install dependencies
+      if: inputs.install == 'true'
+      shell: bash
+      run: bun install --frozen-lockfile

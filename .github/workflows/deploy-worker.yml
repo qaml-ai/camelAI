@@ -86,10 +86,7 @@ jobs:
           node-version: '22'
 
       - if: steps.preflight.outputs.ready == 'true'
-        uses: oven-sh/setup-bun@v2
-
-      - if: steps.preflight.outputs.ready == 'true'
-        run: bun install --frozen-lockfile
+        uses: ./.github/actions/setup-bun
 
       - name: Check Docker
         if: steps.preflight.outputs.ready == 'true' && !inputs.worker_only

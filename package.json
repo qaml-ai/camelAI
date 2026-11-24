@@ -47,7 +47,7 @@
 		"check:unused": "bun run check:unused:app && bun run check:unused:source",
 		"check:unused:app": "tsc --noEmit --noUnusedLocals --noUnusedParameters --incremental false",
 		"check:unused:source": "oxlint src workers/main/src workers/discord-bridge/src workers/dispatcher/src workers/user-logs-tail/src workers/e2e-reports/src workers/eval-reports/src workers/eval-reports/app scripts sandbox/create-worker/renderer sandbox/create-worker/templates/starter workers/main/db-query-sandbox-assets/runner -A all -D no-unused-vars",
-		"typecheck": "react-router typegen && tsc --incremental --tsBuildInfoFile node_modules/.cache/chiridion-typecheck.tsbuildinfo && tsc -p workers/app-usage-guard/tsconfig.json --noEmit && bun run typecheck:discord-bridge",
+		"typecheck": "react-router typegen && tsc --incremental --tsBuildInfoFile node_modules/.cache/chiridion-typecheck.tsbuildinfo && tsc -p workers/app-usage-guard/tsconfig.json --noEmit && bun run typecheck:discord-bridge && tsc -p workers/e2e-reports/tsconfig.json --noEmit && tsc -p workers/eval-reports/tsconfig.json --noEmit",
 		"typecheck:discord-bridge": "tsc -p workers/discord-bridge/tsconfig.json --noEmit",
 		"org-export": "bun scripts/org-export.ts",
 		"backfill:user-app-cost-controls": "bun scripts/backfill-user-app-cost-controls.ts",

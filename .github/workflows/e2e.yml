@@ -18,18 +18,43 @@ concurrency:
   group: e2e-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   e2e:
     # Playwright 1.60 cannot install Chromium dependencies on Ubuntu 26.04.
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile
-      - run: bunx playwright install --with-deps chromium
+      - uses: ./.github/actions/setup-bun
+      - name: Resolve Playwright version
+        id: playwright-version
+        run: |
+          version="$(node -e '
+            const fs = require("fs");
+            const lock = fs.readFileSync("bun.lock", "utf8");
+            const m = lock.match(/"@playwright\/test@([^"]+)"/);
+            if (!m) throw new Error("Could not find @playwright/test version in bun.lock");
+            console.log(m[1]);
+          ')"
+          echo "Playwright version: ${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright-version.outputs.version }}
+      - name: Install Playwright system dependencies
+        run: bunx playwright install-deps chromium
+      - name: Install Playwright Chromium
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: bunx playwright install chromium
       - name: Dummy dev vars for the local bypass boot
         # Not real secrets — just non-empty values so the bypass session can be
         # signed locally. LOCAL_AUTH_BYPASS + the fake LLM mean no real creds are

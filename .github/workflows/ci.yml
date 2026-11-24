@@ -2,15 +2,98 @@ name: CI
 
 on:
   push:
-    branches: [main, production]
+    branches: [main]
   workflow_dispatch:
   pull_request:
     branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
 
 jobs:
+  changes:
+    name: detect self-host changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      selfhost: ${{ steps.filter.outputs.selfhost }}
+      selfhost_runtime: ${{ steps.filter.outputs.selfhost_runtime }}
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Classify changed paths
+        id: filter
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "Non-PR event (${{ github.event_name }}): enabling self-host jobs."
+            echo "selfhost=true" >> "$GITHUB_OUTPUT"
+            echo "selfhost_runtime=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git rev-parse --verify HEAD^1 >/dev/null 2>&1; then
+            echo "::warning::Could not resolve HEAD^1 for PR diff; running self-host jobs."
+            echo "selfhost=true" >> "$GITHUB_OUTPUT"
+            echo "selfhost_runtime=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed="$(git diff --name-only HEAD^1 HEAD)"
+          selfhost="false"
+          selfhost_runtime="false"
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+              docker-compose.selfhost*|\
+              infra/selfhost/*|\
+              scripts/*|\
+              wrangler*.jsonc|\
+              migrations/*|\
+              workers/dispatcher/*|\
+              package.json|\
+              bun.lock|\
+              vite.config.*|\
+              react-router.config.*|\
+              .github/workflows/ci.yml|\
+              .github/workflows/selfhost-images.yml|\
+              .github/actions/setup-bun/*)
+                selfhost="true"
+                ;;
+            esac
+            case "$file" in
+              workers/main/*-container.Dockerfile|\
+              workers/main/analysis-sandbox-assets/*|\
+              workers/main/db-query-sandbox-assets/*|\
+              workers/main/project-build-sandbox-warmup/*|\
+              workers/main/project-build-sandbox-assets/*|\
+              workers/main/eval-egress-fix/*|\
+              infra/selfhost/*|\
+              docker-compose.selfhost*|\
+              scripts/selfhost-*|\
+              scripts/test-selfhost-*|\
+              package.json|\
+              bun.lock|\
+              .github/workflows/ci.yml|\
+              .github/actions/setup-bun/*)
+                selfhost_runtime="true"
+                ;;
+            esac
+          done <<< "$changed"
+
+          echo "selfhost=${selfhost}"
+          echo "selfhost_runtime=${selfhost_runtime}"
+          echo "selfhost=${selfhost}" >> "$GITHUB_OUTPUT"
+          echo "selfhost_runtime=${selfhost_runtime}" >> "$GITHUB_OUTPUT"
+
   build:
     name: typecheck and build
     runs-on: ubuntu-latest
@@ -20,21 +103,25 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile
+      - uses: ./.github/actions/setup-bun
+      - run: bun run check:unbounded-pi-core
+      - run: bun run lint
       - run: bun run typecheck
+      - run: bun run test:discord-bridge
       - run: bun run build
 
   selfhost:
     name: self-host Docker and workerd
+    needs: changes
+    if: needs.changes.outputs.selfhost == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile
+      - uses: ./.github/actions/setup-bun
       - run: bun run selfhost:init
       - run: docker compose --env-file .env.selfhost -f docker-compose.selfhost.yml config --quiet
       - name: Smoke bundled agent runtime
@@ -101,15 +188,17 @@ jobs:
 
   selfhost-runtime:
     name: self-host attached container runtimes
+    needs: changes
+    if: needs.changes.outputs.selfhost_runtime == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
       - uses: docker/setup-buildx-action@v3
-      - run: bun install --frozen-lockfile
       - name: Build self-host project sandbox
         run: >
           docker buildx build
@@ -178,6 +267,5 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile
+      - uses: ./.github/actions/setup-bun
       - run: bun run ${{ matrix.command }} -- --shard=${{ matrix.shard }}/${{ matrix.total }} --maxWorkers=2

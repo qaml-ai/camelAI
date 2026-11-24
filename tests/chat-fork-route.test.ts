@@ -134,6 +134,29 @@ describe('chat fork route', () => {
     expect(deleteThreadMock).not.toHaveBeenCalled();
   });
 
+  it('forks a v2 runtime thread on CamelRun v2', async () => {
+    const source = { threadId: 'thread_source', agentId: 'agt_src', runtimeVersion: 'v2' as const, model: 'azure/gpt-6.1-terra', keyScope: null, configured: null, createdAt: 1, updatedAt: 1 };
+    orgGetThreadRuntimeMock.mockResolvedValue(source);
+    forkRuntimeThreadMock.mockResolvedValue({ status: 'forked', row: { ...source, threadId: 'thread_fork', agentId: 'agt_fork' } });
+    const response = await action({
+      request: new Request('https://camelai.com/api/workspaces/ws_123/chat/thread_source/fork', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messageId: 'rt:7', renderedMessageId: 'rt:7' }),
+      }),
+      context: {},
+      params: { id: 'ws_123', threadId: 'thread_source' },
+    } as never);
+
+    expect(response.status).toBe(200);
+    expect(forkRuntimeThreadMock).toHaveBeenCalledWith(expect.anything(), {
+      source,
+      target: { orgId: 'org_123', workspaceId: 'ws_123', threadId: 'thread_fork', userId: 'user_123', userName: null, userEmail: null },
+      forkEntryId: 'rt:7',
+    });
+    expect(deleteThreadMock).not.toHaveBeenCalled();
+  });
+
   it('deletes the new thread when a runtime fork point is not found', async () => {
     orgGetThreadRuntimeMock.mockResolvedValue({ threadId: 'thread_source', agentId: 'agt_src', model: null, keyScope: null, configured: null, createdAt: 1, updatedAt: 1 });
     forkRuntimeThreadMock.mockResolvedValue({ status: 'not_found', error: 'Fork target not found in the thread\'s history' });

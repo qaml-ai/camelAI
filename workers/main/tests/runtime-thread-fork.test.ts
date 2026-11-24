@@ -6,10 +6,19 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { runtimeApiMock } = vi.hoisted(() => ({ runtimeApiMock: vi.fn() }));
+const { runtimeApiMock, v2JsonMock, v2FetchMock } = vi.hoisted(() => ({
+  runtimeApiMock: vi.fn(),
+  v2JsonMock: vi.fn(),
+  v2FetchMock: vi.fn(),
+}));
 vi.mock("../src/agent-runtime/runtime-api.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   runtimeApi: runtimeApiMock,
+}));
+vi.mock("../src/agent-runtime/runtime-v2.js", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  v2Json: v2JsonMock,
+  v2Fetch: v2FetchMock,
 }));
 
 import { forkRuntimeThread } from "../src/agent-runtime/thread-fork";
@@ -27,6 +36,7 @@ function fakeEnv() {
     getThread: vi.fn(async () => ({ created_by: "u1" })),
     getThreadUiState: vi.fn(async () => ({ preview: { tabs: [{ kind: "app", scriptName: "shop", isPublic: true }], activeTabId: "app:shop" } })),
     setThreadUiState: vi.fn(async () => ({})),
+    pinThreadRuntime: vi.fn(async () => true),
     claimThreadRuntimeAgent: vi.fn(async (threadId: string, agentId: string) => ({ row: { ...SOURCE, threadId, agentId, model: null, keyScope: null }, claimed: true })),
   };
   const env = {
@@ -43,6 +53,11 @@ beforeEach(() => {
     if (method === "POST" && path === "/v1/agents/agt_src/fork") return { id: "agt_fork", forkedFrom: { agentId: "agt_src", atMessage: 3 } };
     return {};
   });
+  v2JsonMock.mockImplementation(async (_env: unknown, path: string, init?: { method?: string }) => {
+    if (init?.method === "POST" && path === "/agents/agt_src/fork") return { id: "agt_v2_fork", forkedFrom: { agentId: "agt_src", atSeq: 7 } };
+    return {};
+  });
+  v2FetchMock.mockResolvedValue(new Response(null, { status: 200 }));
 });
 
 describe("forkRuntimeThread", () => {
@@ -98,5 +113,45 @@ describe("forkRuntimeThread", () => {
     org.claimThreadRuntimeAgent.mockResolvedValueOnce({ row: { ...SOURCE, threadId: "fork1", agentId: "agt_fork" }, claimed: false } as never);
     expect(await forkRuntimeThread(env, { source: SOURCE, target, forkEntryId: "rt:3" })).toMatchObject({ status: "forked", row: { agentId: "agt_fork" } });
     expect(runtimeApiMock.mock.calls.some((call) => call[1] === "DELETE")).toBe(false);
+  });
+
+  it("forks a v2 thread via CamelRun v2, pins runtimeVersion v2, and passes target thread instructions & toolIdentity", async () => {
+    const { env, org } = fakeEnv();
+    const v2Source = { ...SOURCE, runtimeVersion: "v2" as const, model: "azure/gpt-6.1-terra", keyScope: null };
+    org.claimThreadRuntimeAgent.mockResolvedValueOnce({ row: { ...v2Source, threadId: "fork1", agentId: "agt_v2_fork" }, claimed: true } as never);
+    const result = await forkRuntimeThread(env, { source: v2Source, target, forkEntryId: "rt:7" });
+    expect(result).toMatchObject({ status: "forked", row: { threadId: "fork1", agentId: "agt_v2_fork", runtimeVersion: "v2" } });
+    expect(runtimeApiMock).not.toHaveBeenCalled();
+    expect(v2JsonMock).toHaveBeenCalledTimes(1);
+    const [, path, init] = v2JsonMock.mock.calls[0]!;
+    expect(path).toBe("/agents/agt_src/fork");
+    expect(init.method).toBe("POST");
+    expect(init.body).toMatchObject({
+      key: "chiridion-thread-fork1",
+      atSeq: 7,
+      forkRepo: true,
+      toolIdentity: { subject: "u1", context: { org: "org1", workspace: "ws1", thread: "fork1" } },
+    });
+    expect(init.body.instructions).toContain("Thread ID: fork1");
+    expect(org.pinThreadRuntime).toHaveBeenCalledWith("fork1", null, "v2");
+    expect(org.claimThreadRuntimeAgent).toHaveBeenCalledWith("fork1", "agt_v2_fork", {
+      model: "azure/gpt-6.1-terra",
+      keyScope: null,
+      configured: { thinkingLevel: "medium", promptVersion: RUNTIME_PROMPT_VERSION },
+    });
+  });
+
+  it("maps v2 fork_point_invalid and fork_point_running and cleans up via v2 DELETE on claim failure", async () => {
+    const { env, org } = fakeEnv();
+    const v2Source = { ...SOURCE, runtimeVersion: "v2" as const };
+    v2JsonMock.mockRejectedValueOnce(new RuntimeApiError("Fork target not found", 404, "fork_point_invalid"));
+    expect(await forkRuntimeThread(env, { source: v2Source, target, forkEntryId: "rt:99" })).toMatchObject({ status: "not_found" });
+
+    v2JsonMock.mockRejectedValueOnce(new RuntimeApiError("Still running", 409, "fork_point_running"));
+    expect(await forkRuntimeThread(env, { source: v2Source, target, forkEntryId: "rt:7" })).toMatchObject({ status: "failed", error: expect.stringMatching(/still running/) });
+
+    org.claimThreadRuntimeAgent.mockRejectedValueOnce(new Error("OrgDO down"));
+    expect(await forkRuntimeThread(env, { source: v2Source, target, forkEntryId: "rt:7" })).toMatchObject({ status: "failed", error: "OrgDO down" });
+    expect(v2FetchMock).toHaveBeenCalledWith(env, "/agents/agt_v2_fork", { method: "DELETE" });
   });
 });

@@ -80,9 +80,6 @@ export async function action({ request, context, params }: Route.ActionArgs) {
       { status: 409 },
     );
   }
-  if (sourceRuntime.runtimeVersion === 'v2') {
-    return Response.json({ error: 'Forking is unavailable for v2 canary conversations.' }, { status: 409 });
-  }
 
   let targetGroupId: string | null = null;
   if (groupId) {

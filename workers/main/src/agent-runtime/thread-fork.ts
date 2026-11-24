@@ -1,10 +1,11 @@
 /**
  * Forking a runtime thread: the runtime forks the source thread's agent
- * (POST /v1/agents/{id}/fork) into the new thread's, with its history through
- * the fork point and a copy of its workspace; the source's preview tabs come
- * along here. The fork point is a history index (`rt:<index>`, pi-render's
- * forkEntryId); the runtime keeps a turn's tool results after it, so no call
- * is left unanswered, and refuses a point in a turn still running.
+ * (POST /v2/agents/{id}/fork for v2 threads, POST /v1/agents/{id}/fork for v1)
+ * into the new thread's, with its history through the fork point and a copy of
+ * its workspace; the source's preview tabs come along here. The fork point is a
+ * history index (`rt:<index>`, pi-render's forkEntryId); the runtime keeps a
+ * turn's tool results after it, so no call is left unanswered, and refuses a
+ * point in a turn still running.
  */
 import type { ChatContextState, ChatEnv } from "../chat-thread/types.js";
 import type { ThreadRuntimeRecord } from "../identity/org-do.js";
@@ -12,6 +13,7 @@ import { RuntimeApiError, runtimeApi } from "./runtime-api.js";
 import { runtimeSystemPromptAppend, type RuntimeAgentModel } from "./run-gates.js";
 import { HOSTED_KEY_SCOPE, hostedModelHeaders } from "./key-scopes.js";
 import { RUNTIME_PROMPT_VERSION } from "./runtime-prompt.js";
+import { v2AgentPath, v2Fetch, v2Json } from "./runtime-v2.js";
 
 export type RuntimeForkResult =
   | { status: "forked"; row: ThreadRuntimeRecord }
@@ -30,6 +32,7 @@ export async function forkRuntimeThread(
   input: { source: ThreadRuntimeRecord & { agentId: string }; target: ChatContextState; forkEntryId: string },
 ): Promise<RuntimeForkResult> {
   const { source, target } = input;
+  const isV2 = source.runtimeVersion === "v2";
   const index = forkIndex(input.forkEntryId);
   if (index === null) return { status: "not_found", error: NOT_FOUND };
 
@@ -37,6 +40,7 @@ export async function forkRuntimeThread(
     getThread(threadId: string): Promise<{ created_by?: string | null } | null>;
     getThreadUiState(threadId: string): Promise<{ preview?: { tabs?: unknown[]; activeTabId?: string | null } | null } | null>;
     setThreadUiState(threadId: string, preview: Record<string, unknown> | null): Promise<unknown>;
+    pinThreadRuntime(threadId: string, pendingFirstMessage?: string | null, runtimeVersion?: "v1" | "v2"): Promise<boolean>;
     claimThreadRuntimeAgent(
       threadId: string,
       agentId: string,
@@ -57,10 +61,16 @@ export async function forkRuntimeThread(
   let agentId: string | null = null;
   try {
     const thread = await org.getThread(target.threadId);
-    agentId = await forkAgent(env, source.agentId, target, thread?.created_by?.trim() || target.userId || null, index, agentModel);
+    const subject = thread?.created_by?.trim() || target.userId || null;
+    agentId = isV2
+      ? await forkV2Agent(env, source.agentId, target, subject, index)
+      : await forkAgent(env, source.agentId, target, subject, index, agentModel);
     const preview = (await org.getThreadUiState(source.threadId))?.preview;
     if (preview?.tabs?.length) {
       await org.setThreadUiState(target.threadId, { tabs: preview.tabs, activeTabId: preview.activeTabId ?? null });
+    }
+    if (isV2) {
+      await org.pinThreadRuntime(target.threadId, null, "v2");
     }
     const claim = await org.claimThreadRuntimeAgent(target.threadId, agentId, agentModel
       ? {
@@ -74,13 +84,39 @@ export async function forkRuntimeThread(
     if (!claim.claimed && claim.row.agentId !== agentId) throw new Error("The fork already has an agent");
     return { status: "forked", row: claim.row };
   } catch (error) {
-    if (agentId) await deleteAgent(env, agentId);
-    if (error instanceof RuntimeApiError && error.code === "FORK_POINT_INVALID") return { status: "not_found", error: NOT_FOUND };
-    if (error instanceof RuntimeApiError && error.code === "FORK_POINT_RUNNING") {
+    if (agentId) await deleteAgent(env, agentId, isV2);
+    if (error instanceof RuntimeApiError && (error.code === "FORK_POINT_INVALID" || error.code === "fork_point_invalid")) {
+      return { status: "not_found", error: NOT_FOUND };
+    }
+    if (error instanceof RuntimeApiError && (error.code === "FORK_POINT_RUNNING" || error.code === "fork_point_running")) {
       return { status: "failed", error: "That message's turn is still running; fork it once the turn ends" };
     }
     return { status: "failed", error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+async function forkV2Agent(
+  env: ChatEnv,
+  sourceAgentId: string,
+  context: ChatContextState,
+  subject: string | null,
+  atSeq: number,
+): Promise<string> {
+  const forked = await v2Json<{ id?: unknown }>(env, `${v2AgentPath(sourceAgentId)}/fork`, {
+    method: "POST",
+    body: {
+      key: `chiridion-thread-${context.threadId}`,
+      atSeq,
+      forkRepo: true,
+      instructions: runtimeSystemPromptAppend(env, context, "v2"),
+      toolIdentity: {
+        subject: subject || context.userId || "unknown",
+        context: { org: context.orgId, workspace: context.workspaceId, thread: context.threadId },
+      },
+    },
+  });
+  if (typeof forked?.id !== "string") throw new Error("Agent runtime v2 returned no agent id");
+  return forked.id;
 }
 
 /**
@@ -112,7 +148,13 @@ async function forkAgent(
   return forked.id;
 }
 
-async function deleteAgent(env: ChatEnv, agentId: string): Promise<void> {
+async function deleteAgent(env: ChatEnv, agentId: string, isV2 = false): Promise<void> {
+  if (isV2) {
+    await v2Fetch(env, v2AgentPath(agentId), { method: "DELETE" }).then((res) => res.body?.cancel()).catch((cause: unknown) => {
+      if (!(cause instanceof RuntimeApiError && cause.status === 404)) console.warn("[runtime-thread] could not delete a failed v2 fork's agent", cause);
+    });
+    return;
+  }
   await runtimeApi(env, "DELETE", `/v1/agents/${encodeURIComponent(agentId)}`).catch((cause: unknown) => {
     if (!(cause instanceof RuntimeApiError && cause.status === 404)) console.warn("[runtime-thread] could not delete a failed fork's agent", cause);
   });

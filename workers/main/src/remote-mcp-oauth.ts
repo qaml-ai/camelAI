@@ -6,6 +6,10 @@ import {
 type FetchLike = typeof fetch;
 
 export class RemoteMcpOAuthError extends Error {
+  public readonly permanent: boolean;
+  public readonly status?: number;
+  public readonly retryAfterHeader?: string | null;
+
   constructor(
     message: string,
     public readonly code:
@@ -16,9 +20,13 @@ export class RemoteMcpOAuthError extends Error {
       | "token_exchange_failed"
       | "refresh_failed",
     public readonly details?: Record<string, unknown>,
+    options: { permanent?: boolean; status?: number; retryAfterHeader?: string | null } = {},
   ) {
     super(message);
     this.name = "RemoteMcpOAuthError";
+    this.permanent = options.permanent ?? false;
+    this.status = options.status;
+    this.retryAfterHeader = options.retryAfterHeader;
   }
 }
 
@@ -460,7 +468,12 @@ export async function refreshRemoteMcpOAuthToken(
     : "none";
   const resource = typeof credentials.oauth_resource === "string" ? credentials.oauth_resource : "";
   if (!refreshToken || !tokenEndpoint || !clientId || !resource) {
-    throw new Error("Remote MCP OAuth credentials are missing refresh metadata");
+    throw new RemoteMcpOAuthError(
+      "Remote MCP OAuth credentials are missing refresh metadata",
+      "refresh_failed",
+      undefined,
+      { permanent: true },
+    );
   }
 
   const body = new URLSearchParams({
@@ -472,9 +485,20 @@ export async function refreshRemoteMcpOAuthToken(
   const response = await oauthFetch(fetchFn, tokenEndpoint, { method: "POST", headers, body });
   const payload = await readBoundedText(response).then(text => JSON.parse(text)).catch(() => ({})) as RemoteMcpOAuthTokenResponse;
   if (!response.ok || !payload.access_token) {
+    const permanent =
+      (response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429) ||
+      payload.error === "invalid_grant" ||
+      payload.error === "invalid_client" ||
+      payload.error === "unauthorized_client";
     throw new RemoteMcpOAuthError(
       "Remote MCP OAuth token refresh failed",
       "refresh_failed",
+      undefined,
+      {
+        permanent,
+        status: response.status,
+        retryAfterHeader: response.status === 429 ? response.headers.get("Retry-After") : null,
+      },
     );
   }
   const expiresAt = Date.now() + (payload.expires_in ?? 3600) * 1000;

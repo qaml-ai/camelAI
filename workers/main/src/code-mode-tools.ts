@@ -7,6 +7,7 @@ import {
   isWorkspaceAppHostname,
   type WorkspaceAppHostIndex,
 } from "./workspace-app-fetcher";
+import { Buffer } from "node:buffer";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { OrgDO, WorkerScript } from "./auth";
 import type { ThreadRuntimeRecord } from "./identity/org-do";
@@ -129,15 +130,47 @@ export interface AIVirtualBindingProps {
 }
 
 /**
- * Size of a tool result for telemetry only. Never throws and never retains the
- * serialized copy: an unserializable or oversized result reports 0 rather than
- * failing the tool call it is measuring.
+ * Approximate serialized size of a tool result for telemetry only.
+ * Walks values without calling `JSON.stringify` so multi-megabyte results
+ * (query outputs, base64 images) never allocate a throwaway string copy in the
+ * 128 MB Worker isolate.
  */
+const MEASURE_RESULT_MAX_DEPTH = 32;
+const MEASURE_RESULT_MAX_NODES = 100_000;
+
 function measureResultChars(value: unknown): number {
   if (value === undefined || value === null) return 0;
   if (typeof value === "string") return value.length;
+  let nodes = 0;
+  const walk = (node: unknown, depth: number): number => {
+    if (node === null || node === undefined) return 4;
+    const kind = typeof node;
+    if (kind === "string") return (node as string).length + 2;
+    if (kind === "number" || kind === "boolean") return String(node).length;
+    if (kind !== "object") return 0;
+    if (depth >= MEASURE_RESULT_MAX_DEPTH || nodes >= MEASURE_RESULT_MAX_NODES) return 0;
+    nodes += 1;
+    if (node instanceof Uint8Array) return node.byteLength;
+    if (Array.isArray(node)) {
+      let total = 2;
+      for (let i = 0; i < node.length; i += 1) {
+        if (nodes >= MEASURE_RESULT_MAX_NODES) break;
+        total += walk(node[i], depth + 1) + (i > 0 ? 1 : 0);
+      }
+      return total;
+    }
+    let total = 2;
+    let first = true;
+    for (const [key, entry] of Object.entries(node as Record<string, unknown>)) {
+      if (entry === undefined) continue;
+      if (nodes >= MEASURE_RESULT_MAX_NODES) break;
+      total += (first ? 0 : 1) + key.length + 3 + walk(entry, depth + 1);
+      first = false;
+    }
+    return total;
+  };
   try {
-    return JSON.stringify(value)?.length ?? 0;
+    return walk(value, 0);
   } catch {
     return 0;
   }
@@ -273,8 +306,50 @@ export function assertNotBase64IntoBinaryFile(path: string, content: string): vo
   );
 }
 const CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES = 10 * 1024 * 1024;
+/** Max size of an R2 object materialized into Worker RAM when moving to workspace/project DOs. */
+const CODE_MODE_MOVE_MAX_IN_MEMORY_BYTES = 16 * 1024 * 1024;
 /** The largest scratch file import_file copies into the workspace (a volume file is at most 256 MiB). */
 const IMPORT_FILE_MAX_BYTES = 64 * 1024 * 1024;
+const IMPORT_FILE_FETCH_TIMEOUT_MS = 60_000;
+
+async function readResponseBytesBounded(response: Response, maxBytes: number): Promise<Uint8Array> {
+  if (!response.body) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > maxBytes) {
+      throw new Error(`The file is too large to import (${bytes.byteLength} bytes; at most ${maxBytes})`);
+    }
+    return bytes;
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  let done = false;
+  try {
+    while (!done) {
+      const chunk = await reader.read();
+      done = chunk.done;
+      if (done) break;
+      totalBytes += chunk.value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error(`The file is too large to import (${totalBytes} bytes; at most ${maxBytes})`);
+      }
+      chunks.push(chunk.value);
+    }
+  } finally {
+    if (!done) {
+      await reader.cancel().catch(() => undefined);
+    }
+    reader.releaseLock();
+  }
+  const combined = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return combined;
+}
 
 const JS_EXEC_EXCLUDED_TOOL_NAMES = new Set([
   // This tool waits for human input and can outlive js_exec's short sandbox
@@ -364,12 +439,7 @@ function joinMoveDestinationPath(location: CodeModeFileLocation, root: string, c
 }
 
 function bytesToBase64ForMove(bytes: Uint8Array): string {
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
 }
 
 // Warn (not block) when a notebook is deployed without any cell outputs — the
@@ -391,12 +461,7 @@ function notebookHasCellOutputs(notebookBytes: Uint8Array): boolean {
 }
 
 function base64ToBytesForMove(value: string): Uint8Array {
-  const binary = atob(value.replace(/\s/g, ""));
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
+  return new Uint8Array(Buffer.from(value.replace(/\s/g, ""), "base64"));
 }
 
 function normalizeTodoStatus(value: unknown): NormalizedTodoStatus {
@@ -3068,6 +3133,12 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const target = this.resolveCodeModeR2Path({ ...source, path: file.path });
     const object = await this.env.R2_BUCKET.get(target.key);
     if (!object) throw new Error(`R2 object not found: ${target.path}`);
+    if (object.size > CODE_MODE_MOVE_MAX_IN_MEMORY_BYTES) {
+      await object.body?.cancel().catch(() => undefined);
+      throw new Error(
+        `R2 object ${target.path} is too large to copy into workspace/project storage (${object.size} bytes; max ${CODE_MODE_MOVE_MAX_IN_MEMORY_BYTES} bytes). Keep large files in R2 or process them in the analysis sandbox.`,
+      );
+    }
     return {
       bytes: new Uint8Array(await object.arrayBuffer()),
       contentType: object.httpMetadata?.contentType ?? file.contentType,
@@ -3185,6 +3256,26 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       const destinationPath = useDestinationAsRoot
         ? joinMoveDestinationPath(destination.location, destination.path, file.relativePath)
         : destination.path;
+      if (source.location === "r2" && destination.location === "r2") {
+        const srcTarget = this.resolveCodeModeR2Path({ ...source, path: file.path });
+        const dstTarget = this.resolveCodeModeR2Path({ ...destination, path: destinationPath }, { requireWritable: true });
+        const object = await this.env.R2_BUCKET.get(srcTarget.key);
+        if (!object) throw new Error(`R2 object not found: ${srcTarget.path}`);
+        await this.env.R2_BUCKET.put(dstTarget.key, object.body, {
+          httpMetadata: {
+            contentType: destination.contentType ?? object.httpMetadata?.contentType ?? file.contentType ?? "application/octet-stream",
+          },
+          customMetadata: {
+            type: "code-mode-move-file",
+            orgId: this.ctx.props.orgId,
+            workspaceId: this.ctx.props.workspaceId,
+            threadId: this.ctx.props.threadId ?? "",
+          },
+        });
+        totalBytes += object.size;
+        copied.push({ from: file.path, to: dstTarget.path, bytes: object.size });
+        continue;
+      }
       const read = await this.readMoveSourceFile(source, file);
       const written = await this.writeMoveDestinationFile(destination, destinationPath, read.bytes, read.contentType);
       totalBytes += written.bytes;
@@ -3226,15 +3317,13 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       await response.body?.cancel();
       throw new Error(`Could not read the scratch file (HTTP ${response.status}); its link may have expired, so pass { "$file": … } again`);
     }
+    const maxBytes = destination.location === "r2" ? IMPORT_FILE_MAX_BYTES : CODE_MODE_MOVE_MAX_IN_MEMORY_BYTES;
     const declared = Number(response.headers.get("content-length") ?? 0);
-    if (declared > IMPORT_FILE_MAX_BYTES) {
+    if (declared > maxBytes) {
       await response.body?.cancel();
-      throw new Error(`The file is too large to import (${declared} bytes; at most ${IMPORT_FILE_MAX_BYTES})`);
+      throw new Error(`The file is too large to import (${declared} bytes; at most ${maxBytes})`);
     }
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > IMPORT_FILE_MAX_BYTES) {
-      throw new Error(`The file is too large to import (${bytes.byteLength} bytes; at most ${IMPORT_FILE_MAX_BYTES})`);
-    }
+    const bytes = await readResponseBytesBounded(response, maxBytes);
     const contentType = destination.contentType ?? response.headers.get("content-type")?.split(";")[0]?.trim() ?? undefined;
     const written = await this.writeMoveDestinationFile(destination, destination.path, bytes, contentType || undefined);
     const text = `Saved ${written.bytes} bytes to ${destination.location} ${written.path}`;
@@ -3273,7 +3362,9 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     if (!source || source.origin !== runtimeOrigin || !source.pathname.startsWith("/v1/links/")) {
       throw new Error('source must be a scratch file, passed as { "$file": "/workspace/<path>" }');
     }
-    return fetch(`${runtimeOrigin}${source.pathname}${source.search}`);
+    return fetch(`${runtimeOrigin}${source.pathname}${source.search}`, {
+      signal: AbortSignal.timeout(IMPORT_FILE_FETCH_TIMEOUT_MS),
+    });
   }
 
   private async getAppUrl(script: WorkerScript): Promise<string> {

@@ -15,8 +15,8 @@ import {
   type OpenAiSubscriptionCredentials,
   refreshOpenAiSubscriptionCredentials,
 } from "../../../../src/lib/openai-subscription.server";
-import { mintBigQueryAccessTokenFromServiceAccount } from "../google-service-account";
-import { refreshRemoteMcpOAuthToken } from "../remote-mcp-oauth";
+import { mintBigQueryAccessTokenFromServiceAccount, ServiceAccountTokenError } from "../google-service-account";
+import { refreshRemoteMcpOAuthToken, RemoteMcpOAuthError } from "../remote-mcp-oauth";
 import {
   generateDefaultAvatar,
   validateAvatarContent,
@@ -5670,12 +5670,19 @@ export class OrgDO extends DurableObject<DOEnv> {
           typeof serviceAccountJson !== "string" ||
           serviceAccountJson.trim().length === 0
         ) {
-          console.warn("[OrgDO] Missing service_account_json for BigQuery integration", {
-            integrationId: integration.id,
-          });
-          return;
+          throw new PermanentRefreshError(
+            `Missing service_account_json for BigQuery integration ${integration.id}`,
+          );
         }
-        const token = await mintBigQueryAccessTokenFromServiceAccount(serviceAccountJson);
+        let token: Awaited<ReturnType<typeof mintBigQueryAccessTokenFromServiceAccount>>;
+        try {
+          token = await mintBigQueryAccessTokenFromServiceAccount(serviceAccountJson);
+        } catch (error) {
+          if (error instanceof ServiceAccountTokenError && error.permanent) {
+            throw new PermanentRefreshError(error.message);
+          }
+          throw error;
+        }
         newCredentials = {
           ...credentials,
           access_token: token.accessToken,
@@ -5687,10 +5694,33 @@ export class OrgDO extends DurableObject<DOEnv> {
       }
       case "remote_mcp": {
         if ((credentials.auth_type as string | undefined) && credentials.auth_type !== "oauth") {
+          this.sql.exec(
+            `UPDATE integrations SET token_expires_at = NULL, updated_at = ? WHERE workspace_id = ? AND id = ?`,
+            Date.now(),
+            integration.workspace_id ?? "",
+            integration.id,
+          );
           return;
         }
-        ({ credentials: newCredentials, expiresAt: newExpiresAt } =
-          await refreshRemoteMcpOAuthToken(credentials));
+        try {
+          ({ credentials: newCredentials, expiresAt: newExpiresAt } =
+            await refreshRemoteMcpOAuthToken(credentials));
+        } catch (error) {
+          if (error instanceof RemoteMcpOAuthError) {
+            if (error.permanent) {
+              throw new PermanentRefreshError(error.message);
+            }
+            if (error.status === 429) {
+              const now = Date.now();
+              const retryAfter = parseRetryAfterToRetryAtMs(error.retryAfterHeader ?? null, now);
+              throw new RetryableRefreshError(
+                error.message,
+                clampRetryAtMs(retryAfter ?? now + TOKEN_REFRESH_RATE_LIMIT_DEFAULT_MS, now),
+              );
+            }
+          }
+          throw error;
+        }
         break;
       }
       default:
@@ -5698,6 +5728,12 @@ export class OrgDO extends DurableObject<DOEnv> {
           integrationId: integration.id,
           integrationType: integration.integration_type,
         });
+        this.sql.exec(
+          `UPDATE integrations SET token_expires_at = NULL, updated_at = ? WHERE workspace_id = ? AND id = ?`,
+          Date.now(),
+          integration.workspace_id ?? "",
+          integration.id,
+        );
         return;
     }
 
@@ -5746,6 +5782,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         grant_type: "refresh_token",
         refresh_token: refreshToken,
       }),
+      signal: AbortSignal.timeout(15_000),
     });
 
     if (!response.ok) {
@@ -5818,6 +5855,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         client_id: clientId,
         client_secret: clientSecret,
       }),
+      signal: AbortSignal.timeout(15_000),
     });
     const data = await response.json() as {
       access_token?: string;

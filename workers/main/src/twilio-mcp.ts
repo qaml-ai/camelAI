@@ -1,6 +1,6 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { boundedInteger } from './mcp-bounded-integer.js';
-import { requireString, textToolResult } from './mcp-values.js';
+import { fetchMcpHttp, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue =
@@ -186,13 +186,13 @@ function twilioListParams(
 }
 
 async function twilioFetch<T>(client: TwilioClient, path: string): Promise<T> {
-  const response = await fetch(`${TWILIO_API_BASE}/Accounts/${encodeURIComponent(client.accountSid)}${path}`, {
+  const response = await fetchMcpHttp(`${TWILIO_API_BASE}/Accounts/${encodeURIComponent(client.accountSid)}${path}`, {
     headers: {
       authorization: client.authorization,
       accept: 'application/json',
     },
   });
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   const payload: T & { message?: unknown } = text
     ? JSON.parse(text) as T & { message?: unknown }
     : {} as T & { message?: unknown };

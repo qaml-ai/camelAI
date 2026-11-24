@@ -282,3 +282,194 @@ describe("v2 browser long polls", () => {
     expect(f.source().cancelled).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("v2 input_required and input_resolved event projection", () => {
+  const runRecord = {
+    id: "run_abc",
+    actor: "viewer",
+    idempotencyKey: "req_123",
+    status: "input_required",
+    inputs: [],
+    startedAt: 1_700_000_000_000,
+    error: null,
+  };
+
+  function streamFixture(events: Array<{ seq: number; type: string; data: Record<string, unknown> }>) {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const payload = events
+          .map(({ seq, type, data }) =>
+            `id: ${seq}\nevent: ${type}\ndata: ${JSON.stringify({ seq, type, runId: "run_abc", createdAt: 123, data })}\n\n`,
+          )
+          .join("");
+        controller.enqueue(new TextEncoder().encode(payload));
+        controller.close();
+      },
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/runs/run_abc")) return Response.json(runRecord);
+      if (url.searchParams.get("after") === "latest") return Response.json({ nextAfter: 1 });
+      return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+    });
+  }
+
+  async function readAllSseFrames(response: Response): Promise<Array<Record<string, unknown>>> {
+    const text = await response.text();
+    const frames: Array<Record<string, unknown>> = [];
+    for (const block of text.split("\n\n")) {
+      const dataLine = block.split("\n").find((line) => line.startsWith("data: "));
+      if (!dataLine) continue;
+      const parsed = JSON.parse(dataLine.slice(6)) as Record<string, unknown>;
+      if (Object.keys(parsed).length > 0) frames.push(parsed);
+    }
+    return frames;
+  }
+
+  it("projects flat camelrun-v2 input_required payloads on SSE stream without crashing", async () => {
+    streamFixture([
+      {
+        seq: 2,
+        type: "input_required",
+        data: {
+          inputId: "inp_flat_1",
+          toolCallId: "call_delete_1",
+          kind: "approval",
+          prompt: { message: 'Delete app "demo"?' },
+          expiresAt: 1_795_000_000_000,
+        },
+      },
+      {
+        seq: 3,
+        type: "input_resolved",
+        data: { inputId: "inp_flat_1", status: "approved" },
+      },
+    ]);
+
+    const response = await readV2Thread(env, agentId, "viewer", "events", request("events"));
+    const frames = await readAllSseFrames(response);
+    expect(frames).toContainEqual({
+      type: "event",
+      event: {
+        type: "input_required",
+        input: {
+          id: "inp_flat_1",
+          agent: agentId,
+          requestId: "req_123",
+          toolCallId: "call_delete_1",
+          kind: "approval",
+          message: 'Delete app "demo"?',
+          state: "pending",
+          detail: {},
+          responders: { audience: ["viewer"] },
+          createdAt: 1_700_000_000_000,
+          expiresAt: 1_795_000_000_000,
+        },
+      },
+    });
+    expect(frames).toContainEqual({
+      type: "response",
+      id: "req_123",
+      outcome: { stopped: "input_required" },
+    });
+    expect(frames).toContainEqual({
+      type: "event",
+      event: { type: "input_resolved", id: "inp_flat_1", state: "approved" },
+    });
+  });
+
+  it("projects nested event.data.input payloads and question options", async () => {
+    streamFixture([
+      {
+        seq: 2,
+        type: "input_required",
+        data: {
+          input: {
+            id: "inp_nested_1",
+            toolCallId: "call_q_1",
+            kind: "question",
+            status: "pending",
+            prompt: { question: "Pick a region", options: ["us-east", "eu-west"] },
+            expiresAt: 1_795_000_000_123,
+          },
+        },
+      },
+      {
+        seq: 3,
+        type: "input_resolved",
+        data: { id: "inp_nested_1", status: "answered" },
+      },
+    ]);
+
+    const response = await readV2Thread(env, agentId, "viewer", "events", request("events"));
+    const frames = await readAllSseFrames(response);
+    expect(frames).toContainEqual({
+      type: "event",
+      event: {
+        type: "input_required",
+        input: expect.objectContaining({
+          id: "inp_nested_1",
+          kind: "question",
+          message: "Pick a region",
+          detail: {
+            questions: [
+              {
+                question: "Pick a region",
+                options: [
+                  { label: "us-east", description: "" },
+                  { label: "eu-west", description: "" },
+                ],
+                allowOther: true,
+              },
+            ],
+          },
+        }),
+      },
+    });
+    expect(frames).toContainEqual({
+      type: "event",
+      event: { type: "input_resolved", id: "inp_nested_1", state: "answered" },
+    });
+  });
+
+  it("skips missing or malformed input_required payloads without crashing the SSE stream", async () => {
+    streamFixture([
+      { seq: 2, type: "input_required", data: {} },
+      { seq: 3, type: "input_required", data: { input: null } },
+      { seq: 4, type: "input_required", data: { inputId: "inp_no_prompt", kind: "approval" } },
+      { seq: 5, type: "input_required", data: { inputId: "inp_bad_prompt", prompt: "not-an-object" } },
+    ]);
+
+    const response = await readV2Thread(env, agentId, "viewer", "events", request("events"));
+    const frames = await readAllSseFrames(response);
+    // Stream completed cleanly: emitted snapshot + response frames, skipped invalid input_required events.
+    expect(frames.filter((frame) => frame.type === "event")).toEqual([]);
+    expect(frames.filter((frame) => frame.type === "response")).toHaveLength(4);
+  });
+
+  it("skips malformed pending inputs when reading /inputs", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({
+      runs: [
+        {
+          ...runRecord,
+          inputs: [
+            { id: "inp_missing_prompt", status: "pending" },
+            {
+              inputId: "inp_valid_flat",
+              toolCallId: "call_1",
+              kind: "approval",
+              status: "pending",
+              prompt: { message: "Confirm?" },
+              expiresAt: 1_795_000_000_000,
+            },
+          ],
+        },
+      ],
+    }));
+
+    const response = await readV2Thread(env, agentId, "viewer", "inputs", request("inputs"));
+    const inputs = await response.json() as Array<{ id: string; message: string }>;
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]).toMatchObject({ id: "inp_valid_flat", message: "Confirm?" });
+  });
+});

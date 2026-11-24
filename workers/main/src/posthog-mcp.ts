@@ -1,6 +1,6 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { boundedInteger } from './mcp-bounded-integer.js';
-import { parseJsonObject, requireString, textToolResult } from './mcp-values.js';
+import { fetchMcpHttp, parseJsonObject, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue =
@@ -185,7 +185,7 @@ async function postHogFetch<T>(
   path: string,
   init: { method?: string; body?: unknown } = {}
 ): Promise<T> {
-  const response = await fetch(`${client.host}${path}`, {
+  const response = await fetchMcpHttp(`${client.host}${path}`, {
     method: init.method ?? 'GET',
     headers: {
       authorization: `Bearer ${client.token}`,
@@ -194,7 +194,7 @@ async function postHogFetch<T>(
     },
     body: init.body === undefined ? undefined : JSON.stringify(init.body),
   });
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   const payload = text ? JSON.parse(text) as T & { detail?: string; error?: string } : {} as T;
   if (!response.ok) {
     throw Object.assign(

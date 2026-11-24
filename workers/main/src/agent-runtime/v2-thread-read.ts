@@ -59,17 +59,48 @@ export async function v2HistoryPage(env: ChatEnv, agentId: string, page: {
   return { entries: result.messages.map((row) => ({ index: row.seq, message: message(row) })), next: result.nextBefore };
 }
 
-function browserInput(agentId: string, run: V2Run, input: V2Input): AgentInput {
+function extractV2Input(raw: unknown): V2Input | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  const nested = record.input;
+  const candidate = (
+    nested && typeof nested === "object" && !Array.isArray(nested)
+      ? nested
+      : record
+  ) as Record<string, unknown>;
+  const prompt = candidate.prompt;
+  if (!prompt || typeof prompt !== "object" || Array.isArray(prompt)) return null;
+  const id = typeof candidate.id === "string" && candidate.id.trim()
+    ? candidate.id
+    : typeof candidate.inputId === "string" && candidate.inputId.trim()
+      ? candidate.inputId
+      : "";
+  if (!id) return null;
+  const rawPrompt = prompt as V2Input["prompt"];
+  return {
+    id,
+    toolCallId: typeof candidate.toolCallId === "string" ? candidate.toolCallId : "",
+    kind: candidate.kind === "approval" ? "approval" : "question",
+    status: typeof candidate.status === "string" ? candidate.status : "pending",
+    prompt: rawPrompt,
+    expiresAt: typeof candidate.expiresAt === "number" ? candidate.expiresAt : 0,
+  };
+}
+
+function browserInput(agentId: string, run: V2Run, raw: unknown): AgentInput | null {
+  const input = extractV2Input(raw);
+  if (!input || !input.prompt) return null;
   const prompt = input.prompt;
   const message = prompt.message ?? prompt.question ?? "Input requested";
   const kind = prompt.elicitation?.mode ?? input.kind;
+  const options = Array.isArray(prompt.options) ? prompt.options : [];
   return {
     id: input.id, agent: agentId, requestId: run.idempotencyKey ?? run.id, toolCallId: input.toolCallId,
     kind, message, state: "pending",
     detail: {
       ...(kind === "question" ? { questions: [{
         question: message,
-        options: (prompt.options ?? []).map((label) => ({ label, description: "" })),
+        options: options.map((label) => ({ label, description: "" })),
         allowOther: true,
       }] } : {}),
       ...(kind === "form" ? { requestedSchema: prompt.elicitation?.requestedSchema } : {}),
@@ -82,8 +113,11 @@ function browserInput(agentId: string, run: V2Run, input: V2Input): AgentInput {
 
 async function pendingInputs(env: ChatEnv, agentId: string, viewer: string, signal: AbortSignal) {
   const { runs } = await v2Json<{ runs: V2Run[] }>(env, v2AgentPath(agentId) + "/inputs", { signal });
-  return runs.filter((run) => run.actor === viewer).flatMap((run) =>
-    run.inputs.filter((input) => input.status === "pending").map((input) => browserInput(agentId, run, input)));
+  return (runs ?? []).filter((run) => run.actor === viewer).flatMap((run) =>
+    (run.inputs ?? [])
+      .filter((input) => input?.status === "pending")
+      .map((input) => browserInput(agentId, run, input))
+      .filter((input): input is AgentInput => input !== null));
 }
 
 type BrowserFrame = Record<string, unknown>;
@@ -93,7 +127,8 @@ const eventFrame = (event: BrowserFrame) => ({ type: "event", event });
 function translateEvents(env: ChatEnv, agentId: string, viewer: string, signal: AbortSignal) {
   let partialStep: unknown = null;
   return async (event: V2Event): Promise<BrowserFrame[]> => {
-    const { data, type, runId, createdAt } = event;
+    const { type, runId, createdAt } = event;
+    const data = event.data && typeof event.data === "object" && !Array.isArray(event.data) ? event.data : {};
     if (type === "text_delta") {
       const start = partialStep !== data.step || partialStep === null;
       partialStep = data.step;
@@ -107,15 +142,18 @@ function translateEvents(env: ChatEnv, agentId: string, viewer: string, signal: 
       // v2 persists assistant and tool messages before publishing these events.
       return [snapshot];
     }
-    if (type === "input_resolved") return [eventFrame({ type, id: data.id, state: data.status })];
+    if (type === "input_resolved") {
+      const resolvedId = data.id ?? data.inputId;
+      return resolvedId !== undefined ? [eventFrame({ type, id: resolvedId, state: data.status })] : [];
+    }
     if (!runId || !["run_completed", "run_failed", "run_cancelled", "input_required"].includes(type)) return [];
     const run = await v2Json<V2Run>(env, v2AgentPath(agentId) + "/runs/" + encodeURIComponent(runId), { signal });
     const id = run.idempotencyKey ?? runId;
     if (type === "input_required") {
-      const input = data.input as V2Input;
+      const projected = run.actor === viewer ? browserInput(agentId, run, data) : null;
       return [
         snapshot,
-        ...(run.actor === viewer ? [eventFrame({ type, input: browserInput(agentId, run, input) })] : []),
+        ...(projected ? [eventFrame({ type, input: projected })] : []),
         { type: "response", id, outcome: { stopped: "input_required" } },
       ];
     }

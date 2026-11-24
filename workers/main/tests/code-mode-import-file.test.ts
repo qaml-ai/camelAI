@@ -86,4 +86,25 @@ describe("import_file", () => {
       .rejects.toThrow(/too large/);
     expect(writes).toHaveLength(0);
   });
+
+  it("aborts chunked workspace imports exceeding the in-memory limit without buffering unbounded streams", async () => {
+    const cancelled = vi.fn();
+    let chunksSent = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        chunksSent += 1;
+        controller.enqueue(new Uint8Array(4 * 1024 * 1024));
+      },
+      cancel: cancelled,
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(stream, { headers: { "Content-Type": "application/octet-stream" } }));
+    const { instance, writes } = binding();
+    await expect(methods.importFile.call(instance, {
+      source: `${RUNTIME}/v1/links/tok/huge.bin`,
+      destination: { location: "workspace", path: "/huge.bin" },
+    })).rejects.toThrow(/too large/);
+    expect(cancelled).toHaveBeenCalledTimes(1);
+    expect(chunksSent).toBeLessThanOrEqual(5);
+    expect(writes).toHaveLength(0);
+  });
 });

@@ -1,5 +1,5 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
-import { objectArg, parseJsonObject, requireString, textToolResult } from './mcp-values.js';
+import { fetchMcpHttp, objectArg, parseJsonObject, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue = null | string | number | boolean | JsonValue[] | { [key: string]: JsonValue };
@@ -109,7 +109,7 @@ async function createTursoClient(env: TursoMcpEnv, record: WorkspaceIntegrationR
 }
 
 async function executeTursoSql(client: TursoClient, sql: string, args: unknown[]): Promise<JsonValue> {
-  const response = await fetch(`${client.endpoint}/v2/pipeline`, {
+  const response = await fetchMcpHttp(`${client.endpoint}/v2/pipeline`, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${client.token}`,
@@ -128,7 +128,7 @@ async function executeTursoSql(client: TursoClient, sql: string, args: unknown[]
       ],
     }),
   });
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   const payload = text ? JSON.parse(text) as JsonValue & { error?: string; message?: string } : {} as JsonValue;
   if (!response.ok) {
     const message = typeof (payload as { error?: unknown }).error === 'string'

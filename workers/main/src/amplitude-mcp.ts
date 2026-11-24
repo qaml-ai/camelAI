@@ -1,5 +1,5 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
-import { parseJsonObject, requireString, textToolResult } from './mcp-values.js';
+import { fetchMcpHttp, parseJsonObject, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue =
@@ -134,13 +134,13 @@ async function createAmplitudeClient(
 }
 
 async function amplitudeFetch(client: AmplitudeClient, path: string): Promise<JsonValue> {
-  const response = await fetch(`${amplitudeBase(client)}${path}`, {
+  const response = await fetchMcpHttp(`${amplitudeBase(client)}${path}`, {
     headers: {
       authorization: `Basic ${btoa(`${client.apiKey}:${client.secretKey}`)}`,
       accept: 'application/json',
     },
   });
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   const payload = text ? JSON.parse(text) as JsonValue : null;
   if (!response.ok) {
     throw Object.assign(new Error(`Amplitude API request failed with HTTP ${response.status}: ${text}`), {

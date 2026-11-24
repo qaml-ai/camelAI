@@ -1,6 +1,6 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { boundedInteger } from './mcp-bounded-integer.js';
-import { objectArg, parseJsonObject, requireString, textToolResult } from './mcp-values.js';
+import { fetchMcpHttp, objectArg, parseJsonObject, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue = null | string | number | boolean | JsonValue[] | { [key: string]: JsonValue };
@@ -152,7 +152,7 @@ function scanCommand(args: Record<string, unknown>): string[] {
 }
 
 async function redisCommand(client: RedisClient, command: string[]): Promise<JsonValue> {
-  const response = await fetch(client.restUrl, {
+  const response = await fetchMcpHttp(client.restUrl, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${client.token}`,
@@ -161,7 +161,7 @@ async function redisCommand(client: RedisClient, command: string[]): Promise<Jso
     },
     body: JSON.stringify(command),
   });
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   const payload = text ? JSON.parse(text) as JsonValue & { error?: string } : {} as JsonValue;
   if (!response.ok) {
     const message = typeof (payload as { error?: unknown }).error === 'string'

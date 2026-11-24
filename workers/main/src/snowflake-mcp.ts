@@ -1,6 +1,6 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { boundedInteger } from './mcp-bounded-integer.js';
-import { objectArg, parseJsonObject, requireString, textToolResult } from './mcp-values.js';
+import { ANALYTICS_MCP_HTTP_TIMEOUT_MS, fetchMcpHttp, objectArg, parseJsonObject, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue = null | string | number | boolean | JsonValue[] | { [key: string]: JsonValue };
@@ -141,7 +141,7 @@ async function createSnowflakeClient(env: SnowflakeMcpEnv, record: WorkspaceInte
 
 async function executeSnowflakeSql(client: SnowflakeClient, statement: string): Promise<JsonValue> {
   const token = await snowflakeJwt(client);
-  const response = await fetch(`https://${client.account}.snowflakecomputing.com/api/v2/statements`, {
+  const response = await fetchMcpHttp(`https://${client.account}.snowflakecomputing.com/api/v2/statements`, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${token}`,
@@ -156,8 +156,8 @@ async function executeSnowflakeSql(client: SnowflakeClient, statement: string): 
       database: client.database ?? undefined,
       schema: client.schema ?? undefined,
     }),
-  });
-  const text = await response.text();
+  }, ANALYTICS_MCP_HTTP_TIMEOUT_MS);
+  const text = await readBoundedResponseText(response);
   const payload = text ? JSON.parse(text) as JsonValue & { message?: string; code?: string } : {} as JsonValue;
   if (!response.ok) {
     throw Object.assign(new Error((payload as { message?: string }).message || `Snowflake SQL API request failed with HTTP ${response.status}`), { status: response.status });

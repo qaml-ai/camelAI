@@ -1,6 +1,6 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { boundedInteger } from './mcp-bounded-integer.js';
-import { parseJsonObject, requireString, textToolResult } from './mcp-values.js';
+import { fetchMcpHttp, parseJsonObject, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue =
@@ -199,13 +199,13 @@ async function createSentryClient(
 }
 
 async function sentryFetch<T>(client: SentryClient, path: string): Promise<T> {
-  const response = await fetch(`${SENTRY_API_BASE}${path}`, {
+  const response = await fetchMcpHttp(`${SENTRY_API_BASE}${path}`, {
     headers: {
       authorization: `Bearer ${client.token}`,
       accept: 'application/json',
     },
   });
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   const payload = text ? JSON.parse(text) as T & { detail?: string } : {} as T & { detail?: string };
   if (!response.ok) {
     throw Object.assign(

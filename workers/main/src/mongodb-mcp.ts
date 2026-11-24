@@ -1,6 +1,6 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { boundedInteger } from './mcp-bounded-integer.js';
-import { objectArg, parseJsonObject, requireString, textToolResult } from './mcp-values.js';
+import { fetchMcpHttp, objectArg, parseJsonObject, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue = null | string | number | boolean | JsonValue[] | { [key: string]: JsonValue };
@@ -132,7 +132,7 @@ async function createMongoDbClient(env: MongoDbMcpEnv, record: WorkspaceIntegrat
 }
 
 async function mongoDbAction(client: MongoDbClient, action: string, body: Record<string, unknown>): Promise<JsonValue> {
-  const response = await fetch(`${client.dataApiUrl}/action/${action}`, {
+  const response = await fetchMcpHttp(`${client.dataApiUrl}/action/${action}`, {
     method: 'POST',
     headers: {
       'api-key': client.apiKey,
@@ -145,7 +145,7 @@ async function mongoDbAction(client: MongoDbClient, action: string, body: Record
       ...dropUndefined(body),
     }),
   });
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   const payload = text ? JSON.parse(text) as JsonValue & { error?: string } : {} as JsonValue;
   if (!response.ok) {
     const message = typeof (payload as { error?: unknown }).error === 'string'

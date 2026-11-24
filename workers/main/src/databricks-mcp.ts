@@ -1,6 +1,6 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { boundedInteger } from './mcp-bounded-integer.js';
-import { objectArg, parseJsonObject, requireString, textToolResult } from './mcp-values.js';
+import { ANALYTICS_MCP_HTTP_TIMEOUT_MS, fetchMcpHttp, objectArg, parseJsonObject, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue = null | string | number | boolean | JsonValue[] | { [key: string]: JsonValue };
@@ -166,7 +166,7 @@ async function databricksFetch<T>(
   path: string,
   init: { method?: string; body?: unknown } = {}
 ): Promise<T> {
-  const response = await fetch(`${client.workspaceUrl}${path}`, {
+  const response = await fetchMcpHttp(`${client.workspaceUrl}${path}`, {
     method: init.method ?? 'GET',
     headers: {
       authorization: `Bearer ${client.token}`,
@@ -174,8 +174,8 @@ async function databricksFetch<T>(
       ...(init.body === undefined ? {} : { 'content-type': 'application/json' }),
     },
     body: init.body === undefined ? undefined : JSON.stringify(init.body),
-  });
-  const text = await response.text();
+  }, ANALYTICS_MCP_HTTP_TIMEOUT_MS);
+  const text = await readBoundedResponseText(response);
   const payload = text ? JSON.parse(text) as T & { message?: string; error_code?: string } : {} as T;
   if (!response.ok) {
     throw Object.assign(new Error((payload as { message?: string }).message || `Databricks API request failed with HTTP ${response.status}`), { status: response.status });

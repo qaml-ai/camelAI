@@ -7,7 +7,7 @@ import type {
 } from '../../../src/types';
 import type { OrgDO } from './auth';
 import { decryptCredentials, encryptCredentials } from '../../../src/lib/integration-crypto';
-import { mintBigQueryAccessTokenFromServiceAccount } from './google-service-account';
+import { mintBigQueryAccessTokenFromServiceAccount, ServiceAccountTokenError } from './google-service-account';
 import type { WorkspaceCronDO } from './workspace-cron';
 import { generateEmailHandle } from '../../../src/lib/workspace-email';
 import type { EmailHandleDO } from './email-handle-registry';
@@ -15,7 +15,7 @@ import {
   defaultWorkspaceModelPickerConfig,
   parseWorkspaceModelPickerConfig,
 } from '../../../src/lib/model-picker-config';
-import { refreshRemoteMcpOAuthToken } from './remote-mcp-oauth';
+import { refreshRemoteMcpOAuthToken, RemoteMcpOAuthError } from './remote-mcp-oauth';
 import { recordObservabilityEvent } from './observability';
 
 // Buffer time before token expiry to trigger refresh (10 minutes)
@@ -1717,11 +1717,20 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
       case BIGQUERY_INTEGRATION_TYPE: {
         const serviceAccountJson = credentials.service_account_json;
         if (typeof serviceAccountJson !== 'string' || serviceAccountJson.trim().length === 0) {
-          console.warn(`[WorkspaceDO] Missing service_account_json for BigQuery integration ${integration.id}`);
-          return;
+          throw new PermanentRefreshError(
+            `Missing service_account_json for BigQuery integration ${integration.id}`
+          );
         }
 
-        const token = await mintBigQueryAccessTokenFromServiceAccount(serviceAccountJson);
+        let token: Awaited<ReturnType<typeof mintBigQueryAccessTokenFromServiceAccount>>;
+        try {
+          token = await mintBigQueryAccessTokenFromServiceAccount(serviceAccountJson);
+        } catch (err) {
+          if (err instanceof ServiceAccountTokenError && err.permanent) {
+            throw new PermanentRefreshError(err.message);
+          }
+          throw err;
+        }
         newCredentials = {
           ...credentials,
           access_token: token.accessToken,
@@ -1734,9 +1743,31 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
 
       case 'remote_mcp': {
         if ((credentials.auth_type as string | undefined) && credentials.auth_type !== 'oauth') {
+          this.sql.exec(
+            `UPDATE integrations SET token_expires_at = NULL, updated_at = ? WHERE id = ?`,
+            Date.now(),
+            integration.id
+          );
           return;
         }
-        ({ credentials: newCredentials, expiresAt: newExpiresAt } = await refreshRemoteMcpOAuthToken(credentials));
+        try {
+          ({ credentials: newCredentials, expiresAt: newExpiresAt } = await refreshRemoteMcpOAuthToken(credentials));
+        } catch (err) {
+          if (err instanceof RemoteMcpOAuthError) {
+            if (err.permanent) {
+              throw new PermanentRefreshError(err.message);
+            }
+            if (err.status === 429) {
+              const now = Date.now();
+              const retryAfter = parseRetryAfterToRetryAtMs(err.retryAfterHeader ?? null, now);
+              throw new RetryableRefreshError(
+                err.message,
+                clampRetryAtMs(retryAfter ?? (now + TOKEN_REFRESH_RATE_LIMIT_DEFAULT_MS), now)
+              );
+            }
+          }
+          throw err;
+        }
         break;
       }
 
@@ -1747,6 +1778,11 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
 
       default:
         console.warn(`[WorkspaceDO] Unknown integration type for token refresh: ${integration.integration_type}`);
+        this.sql.exec(
+          `UPDATE integrations SET token_expires_at = NULL, updated_at = ? WHERE id = ?`,
+          Date.now(),
+          integration.id
+        );
         return;
     }
 
@@ -1798,6 +1834,7 @@ export class WorkspaceDO extends DurableObject<WorkspaceEnv> {
         grant_type: 'refresh_token',
         refresh_token: refreshToken,
       }),
+      signal: AbortSignal.timeout(15_000),
     });
 
     if (!response.ok) {

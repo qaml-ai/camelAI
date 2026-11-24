@@ -1,6 +1,6 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { boundedInteger } from './mcp-bounded-integer.js';
-import { objectArg, parseJsonObject, requireString, textToolResult } from './mcp-values.js';
+import { fetchMcpHttp, objectArg, parseJsonObject, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue = null | string | number | boolean | JsonValue[] | { [key: string]: JsonValue };
@@ -154,7 +154,7 @@ async function createShopifyClient(env: ShopifyMcpEnv, record: WorkspaceIntegrat
 }
 
 async function shopifyGraphql(client: ShopifyClient, query: string, variables: Record<string, unknown> = {}): Promise<JsonValue> {
-  const response = await fetch(`https://${client.shopDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+  const response = await fetchMcpHttp(`https://${client.shopDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
     method: 'POST',
     headers: {
       'x-shopify-access-token': client.token,
@@ -163,7 +163,7 @@ async function shopifyGraphql(client: ShopifyClient, query: string, variables: R
     },
     body: JSON.stringify({ query, variables }),
   });
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   const payload = text ? JSON.parse(text) as JsonValue & { errors?: Array<{ message?: string }> } : {} as JsonValue;
   if (!response.ok || Array.isArray((payload as { errors?: unknown }).errors)) {
     const message = Array.isArray((payload as { errors?: Array<{ message?: string }> }).errors)

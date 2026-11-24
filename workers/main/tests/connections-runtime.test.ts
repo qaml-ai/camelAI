@@ -13,6 +13,7 @@ import {
   verifyConnection,
   type ConnectionsRuntimeEnv,
 } from '../src/connections-runtime.js';
+import { fetchMcpHttp, readBoundedResponseText } from '../src/mcp-values.js';
 import type { WorkspaceIntegrationRecord } from '../src/workspace.js';
 import { fakeDbQueryContainerNamespace } from './fake-db-query-container.js';
 
@@ -33,6 +34,29 @@ describe('bounded native MCP responses', () => {
     await expect(readBoundedMcpResponseText(streamed, 10)).rejects.toThrow(
       'Native MCP response exceeded 10 byte limit',
     );
+  });
+
+  it('bounds hosted MCP HTTP responses and times out hung upstreams with 504', async () => {
+    const oversized = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('123456'));
+        controller.enqueue(new TextEncoder().encode('789012'));
+        controller.close();
+      },
+    }));
+    await expect(readBoundedResponseText(oversized, 10)).rejects.toMatchObject({
+      status: 502,
+      message: 'Upstream response exceeded 10 byte limit',
+    });
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason ?? new Error('aborted')), { once: true });
+    }));
+    await expect(fetchMcpHttp('https://slow.example/api', {}, 25)).rejects.toMatchObject({
+      status: 504,
+      message: 'Upstream connection request timed out after 25ms',
+    });
+    vi.restoreAllMocks();
   });
 });
 

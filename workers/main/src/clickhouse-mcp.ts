@@ -1,5 +1,5 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
-import { parseJsonObject, requireString, textToolResult } from './mcp-values.js';
+import { ANALYTICS_MCP_HTTP_TIMEOUT_MS, fetchMcpHttp, parseJsonObject, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 import { warehouseExportKey, stageWarehouseExport } from './warehouse-export.js';
 
@@ -211,15 +211,15 @@ async function executeClickHouseJson(client: ClickHouseClient, query: string): P
   // `readonly=2` makes ClickHouse reject any write/DDL statement server-side (a
   // readonly-labelled method must not be a write path), while still allowing the
   // `default_format` setting we pass (mode 1 would reject setting changes).
-  const response = await fetch(`${client.endpoint}/?database=${encodeURIComponent(client.database)}&default_format=JSON&readonly=2`, {
+  const response = await fetchMcpHttp(`${client.endpoint}/?database=${encodeURIComponent(client.database)}&default_format=JSON&readonly=2`, {
     method: 'POST',
     headers: {
       authorization: `Basic ${btoa(`${client.username}:${client.password}`)}`,
       'content-type': 'text/plain; charset=utf-8',
     },
     body: query,
-  });
-  const text = await response.text();
+  }, ANALYTICS_MCP_HTTP_TIMEOUT_MS);
+  const text = await readBoundedResponseText(response);
   if (!response.ok) {
     throw Object.assign(new Error(text || `ClickHouse request failed with HTTP ${response.status}`), {
       status: response.status,
@@ -238,16 +238,16 @@ async function executeClickHouseJson(client: ClickHouseClient, query: string): P
  */
 async function executeClickHouseParquet(client: ClickHouseClient, query: string): Promise<Response> {
   // `readonly=2`: reject writes/DDL server-side while allowing the default_format setting.
-  const response = await fetch(`${client.endpoint}/?database=${encodeURIComponent(client.database)}&default_format=Parquet&readonly=2`, {
+  const response = await fetchMcpHttp(`${client.endpoint}/?database=${encodeURIComponent(client.database)}&default_format=Parquet&readonly=2`, {
     method: 'POST',
     headers: {
       authorization: `Basic ${btoa(`${client.username}:${client.password}`)}`,
       'content-type': 'text/plain; charset=utf-8',
     },
     body: query,
-  });
+  }, ANALYTICS_MCP_HTTP_TIMEOUT_MS);
   if (!response.ok) {
-    const text = await response.text();
+    const text = await readBoundedResponseText(response, 64 * 1024);
     throw Object.assign(new Error(text || `ClickHouse request failed with HTTP ${response.status}`), {
       status: response.status,
     });

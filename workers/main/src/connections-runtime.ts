@@ -16,6 +16,12 @@ import {
   type ProviderMcpDefinition,
 } from '../../../src/lib/provider-mcp-registry';
 import {
+  DEFAULT_MCP_HTTP_TIMEOUT_MS,
+  DEFAULT_MCP_MAX_RESPONSE_BYTES,
+  fetchMcpHttp,
+  readBoundedResponseText,
+} from './mcp-values.js';
+import {
   getHostedConnectionAdapter,
   getHostedConnectionVerificationProbe,
 } from './connection-adapters.js';
@@ -1775,7 +1781,7 @@ async function callAuthenticatedConnectionFetch(
 
   const response = config.restrict_to_base_origin === true
     ? await fetchPinnedOrigin(requestUrl, init, baseUrl.origin)
-    : await fetch(requestUrl, init);
+    : await fetchMcpHttp(requestUrl, init, DEFAULT_MCP_HTTP_TIMEOUT_MS);
   // Self-heal stale auth status: a successful authenticated fetch proves the
   // connection is usable again, so clear a previously recorded setup/reauth
   // problem. This covers config-only fixes (e.g. switching an "other" connection
@@ -1803,12 +1809,31 @@ async function callAuthenticatedConnectionFetch(
 
 async function fetchPinnedOrigin(url: URL, init: RequestInit, allowedOrigin: string): Promise<Response> {
   let requestUrl = url;
-  let requestInit = { ...init, redirect: 'manual' as const };
+  const deadline = AbortSignal.timeout(DEFAULT_MCP_HTTP_TIMEOUT_MS);
+  const combinedSignal = init.signal ? AbortSignal.any([init.signal, deadline]) : deadline;
+  let requestInit: RequestInit = { ...init, redirect: 'manual' as const, signal: combinedSignal };
   for (let redirects = 0; redirects <= 5; redirects += 1) {
-    const response = await fetch(requestUrl, requestInit);
+    let response: Response;
+    try {
+      response = await fetch(requestUrl, requestInit);
+    } catch (error) {
+      if (
+        deadline.aborted ||
+        (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError'))
+      ) {
+        throw Object.assign(
+          new Error(`Upstream connection request timed out after ${DEFAULT_MCP_HTTP_TIMEOUT_MS}ms`),
+          { status: 504 },
+        );
+      }
+      throw error;
+    }
     if (![301, 302, 303, 307, 308].includes(response.status)) return response;
     const location = response.headers.get('location');
     if (!location) return response;
+    // Drain/cancel the unconsumed redirect body before following or throwing so
+    // Workers never leaks outbound connection slots.
+    await response.body?.cancel().catch(() => undefined);
     if (redirects === 5) {
       throw Object.assign(new Error('Imported API request exceeded the redirect limit.'), { status: 502 });
     }
@@ -2062,12 +2087,14 @@ async function callSlackWebApi(
     init.body = JSON.stringify(request.params);
   }
 
-  const response = await fetch(url, init);
-  const responseJson = await response.json().catch(() => null) as {
-    ok?: boolean;
-    error?: string;
-    [key: string]: unknown;
-  } | null;
+  const response = await fetchMcpHttp(url, init, DEFAULT_MCP_HTTP_TIMEOUT_MS);
+  const rawBody = await readBoundedResponseText(response, DEFAULT_MCP_MAX_RESPONSE_BYTES);
+  let responseJson: { ok?: boolean; error?: string; [key: string]: unknown } | null = null;
+  try {
+    responseJson = rawBody ? (JSON.parse(rawBody) as { ok?: boolean; error?: string; [key: string]: unknown }) : null;
+  } catch {
+    responseJson = null;
+  }
   if (!response.ok || responseJson?.ok !== true) {
     throw Object.assign(
       new Error(`Slack API ${method} failed: ${responseJson?.error || response.statusText}`),
@@ -2299,21 +2326,31 @@ async function boundedResponseText(response: Response, limit: number): Promise<{
   const decoder = new TextDecoder();
   let text = '';
   let truncated = false;
-  while (text.length < limit) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    text += decoder.decode(value, { stream: true });
-    if (text.length > limit) {
-      truncated = true;
-      await reader.cancel().catch(() => {});
-      break;
+  let done = false;
+  try {
+    while (text.length < limit) {
+      const chunk = await reader.read();
+      done = chunk.done;
+      if (done) break;
+      text += decoder.decode(chunk.value, { stream: true });
+      if (text.length > limit) {
+        truncated = true;
+        await reader.cancel().catch(() => {});
+        done = true;
+        break;
+      }
     }
+    if (!done) {
+      await reader.cancel().catch(() => {});
+    }
+    text += decoder.decode();
+    return {
+      text: text.length > limit ? text.slice(0, limit) : text,
+      truncated,
+    };
+  } finally {
+    reader.releaseLock();
   }
-  text += decoder.decode();
-  return {
-    text: text.length > limit ? text.slice(0, limit) : text,
-    truncated,
-  };
 }
 
 function responseHeadersObject(headers: Headers): Record<string, string> {

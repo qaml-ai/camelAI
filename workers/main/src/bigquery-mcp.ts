@@ -3,6 +3,7 @@ import { getProviderMcpDefinition } from '../../../src/lib/provider-mcp-registry
 import { mintBigQueryAccessTokenFromServiceAccount } from './google-service-account';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 import { warehouseExportKey, stageWarehouseExport } from './warehouse-export.js';
+import { ANALYTICS_MCP_HTTP_TIMEOUT_MS, fetchMcpHttp, readBoundedResponseText } from './mcp-values.js';
 
 /** Minimal context the export path needs to namespace the R2 staging key. */
 export interface BigQueryMcpContext {
@@ -747,7 +748,7 @@ async function bigQueryFetch<T>(
   path: string,
   init: { method?: string; body?: unknown } = {}
 ): Promise<T> {
-  const response = await fetch(`${BIGQUERY_API_BASE}${path}`, {
+  const response = await fetchMcpHttp(`${BIGQUERY_API_BASE}${path}`, {
     method: init.method ?? 'GET',
     headers: {
       authorization: `Bearer ${client.token}`,
@@ -755,8 +756,8 @@ async function bigQueryFetch<T>(
       ...(client.config?.projectId ? { 'x-goog-user-project': client.config.projectId } : {}),
     },
     body: init.body === undefined ? undefined : JSON.stringify(init.body),
-  });
-  const text = await response.text();
+  }, ANALYTICS_MCP_HTTP_TIMEOUT_MS);
+  const text = await readBoundedResponseText(response);
   const payload = text ? JSON.parse(text) as T & BigQueryErrorResponse : {} as T & BigQueryErrorResponse;
 
   if (!response.ok) {

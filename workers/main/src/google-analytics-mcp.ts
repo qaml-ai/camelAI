@@ -1,5 +1,6 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
+import { fetchMcpHttp, readBoundedResponseText } from './mcp-values.js';
 
 export const GOOGLE_ANALYTICS_INTEGRATION_TYPE = 'google_analytics';
 
@@ -50,8 +51,8 @@ async function googleRequest(
   headers.set('authorization', `Bearer ${token}`);
   headers.set('accept', 'application/json');
   if (init.body && !headers.has('content-type')) headers.set('content-type', 'application/json');
-  const response = await fetch(url, { ...init, headers });
-  const text = await response.text();
+  const response = await fetchMcpHttp(url, { ...init, headers });
+  const text = await readBoundedResponseText(response);
   let payload: unknown = text;
   try {
     payload = text ? JSON.parse(text) : {};

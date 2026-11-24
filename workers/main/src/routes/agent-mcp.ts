@@ -126,7 +126,9 @@ const DIRECT_FIRST = new Set([
   ...CODE_MODE_PI_PASSTHROUGH_TOOL_DEFINITIONS.map((definition) => definition.name),
 ]);
 
-export function agentMcpTools() {
+let cachedAgentMcpTools: ReturnType<typeof buildAgentMcpTools> | null = null;
+
+function buildAgentMcpTools() {
   const served = CODE_MODE_TOOL_DEFINITIONS.filter((definition) => AGENT_MCP_TOOL_NAMES.has(definition.name));
   return [
     ...served.filter((definition) => DIRECT_FIRST.has(definition.name)),
@@ -145,6 +147,10 @@ export function agentMcpTools() {
       // TypeBox schemas are JSON Schema; the round trip drops its symbol keys.
       inputSchema: JSON.parse(JSON.stringify(definition.parameters)) as Record<string, unknown>,
     }));
+}
+
+export function agentMcpTools() {
+  return (cachedAgentMcpTools ??= buildAgentMcpTools());
 }
 
 function isContentBlock(block: unknown): block is Record<string, unknown> {

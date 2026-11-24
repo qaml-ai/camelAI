@@ -1,6 +1,6 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { boundedInteger } from './mcp-bounded-integer.js';
-import { objectArg, parseJsonObject, requireString, textToolResult } from './mcp-values.js';
+import { fetchMcpHttp, objectArg, parseJsonObject, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue = null | string | number | boolean | JsonValue[] | { [key: string]: JsonValue };
@@ -134,12 +134,13 @@ async function getGraphToken(client: TeamsClient): Promise<string> {
     scope: 'https://graph.microsoft.com/.default',
     grant_type: 'client_credentials',
   });
-  const response = await fetch(`https://login.microsoftonline.com/${encodeURIComponent(client.tenantId)}/oauth2/v2.0/token`, {
+  const response = await fetchMcpHttp(`https://login.microsoftonline.com/${encodeURIComponent(client.tenantId)}/oauth2/v2.0/token`, {
     method: 'POST',
     headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
     body,
   });
-  const payload = await response.json() as { access_token?: string; error_description?: string; error?: string };
+  const tokenText = await readBoundedResponseText(response, 1024 * 1024);
+  const payload = (tokenText ? JSON.parse(tokenText) : {}) as { access_token?: string; error_description?: string; error?: string };
   if (!response.ok || !payload.access_token) {
     throw Object.assign(new Error(payload.error_description || payload.error || `Microsoft token request failed with HTTP ${response.status}`), { status: response.status });
   }
@@ -147,10 +148,10 @@ async function getGraphToken(client: TeamsClient): Promise<string> {
 }
 
 async function graphFetch<T>(token: string, path: string): Promise<T> {
-  const response = await fetch(`${GRAPH_BASE}${path}`, {
+  const response = await fetchMcpHttp(`${GRAPH_BASE}${path}`, {
     headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
   });
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   const payload = text ? JSON.parse(text) as T & { error?: { message?: string } } : {} as T;
   if (!response.ok) {
     throw Object.assign(new Error((payload as { error?: { message?: string } }).error?.message || `Microsoft Graph request failed with HTTP ${response.status}`), { status: response.status });

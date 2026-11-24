@@ -1,6 +1,6 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { boundedInteger } from './mcp-bounded-integer.js';
-import { parseJsonObject, requireString, textToolResult } from './mcp-values.js';
+import { fetchMcpHttp, parseJsonObject, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue =
@@ -182,7 +182,7 @@ async function mixpanelRequest(
   url: string,
   init: { method?: string; body?: URLSearchParams } = {}
 ): Promise<JsonValue> {
-  const response = await fetch(url, {
+  const response = await fetchMcpHttp(url, {
     method: init.method ?? 'GET',
     headers: {
       authorization: `Basic ${btoa(`${client.username}:${client.secret}`)}`,
@@ -191,7 +191,7 @@ async function mixpanelRequest(
     },
     body: init.body,
   });
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   const payload = text ? JSON.parse(text) as JsonValue : null;
   if (!response.ok) {
     throw Object.assign(new Error(`Mixpanel API request failed with HTTP ${response.status}: ${text}`), {

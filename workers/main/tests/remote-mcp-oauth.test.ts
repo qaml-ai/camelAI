@@ -219,3 +219,39 @@ it('bounds untrusted OAuth response bodies', async () => {
     metadata: { registration_endpoint: 'https://auth.example/register' }, resourceMetadata: null,
   }, 'https://app.example/callback', mock as typeof fetch)).rejects.toThrow('size limit');
 });
+
+it('marks permanent refresh failures (4xx / invalid_grant / missing metadata) so DO alarms stop retrying', async () => {
+  await expect(
+    refreshRemoteMcpOAuthToken({ refresh_token: '' }),
+  ).rejects.toMatchObject({ code: 'refresh_failed', permanent: true });
+
+  const revokedFetch = vi.fn(async () =>
+    Response.json({ error: 'invalid_grant' }, { status: 400 }),
+  );
+  await expect(
+    refreshRemoteMcpOAuthToken(
+      {
+        refresh_token: 'secret',
+        oauth_token_endpoint: 'https://auth.example/token',
+        oauth_client_id: 'client',
+        oauth_resource: 'https://mcp.example',
+      },
+      revokedFetch as typeof fetch,
+    ),
+  ).rejects.toMatchObject({ code: 'refresh_failed', permanent: true, status: 400 });
+
+  const serverErrorFetch = vi.fn(async () =>
+    new Response('upstream error', { status: 503 }),
+  );
+  await expect(
+    refreshRemoteMcpOAuthToken(
+      {
+        refresh_token: 'secret',
+        oauth_token_endpoint: 'https://auth.example/token',
+        oauth_client_id: 'client',
+        oauth_resource: 'https://mcp.example',
+      },
+      serverErrorFetch as typeof fetch,
+    ),
+  ).rejects.toMatchObject({ code: 'refresh_failed', permanent: false, status: 503 });
+});

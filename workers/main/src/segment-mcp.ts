@@ -1,6 +1,6 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { boundedInteger } from './mcp-bounded-integer.js';
-import { objectArg, requireString, textToolResult } from './mcp-values.js';
+import { fetchMcpHttp, objectArg, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue = null | string | number | boolean | JsonValue[] | { [key: string]: JsonValue };
@@ -100,10 +100,10 @@ async function createSegmentClient(env: SegmentMcpEnv, record: WorkspaceIntegrat
 }
 
 async function segmentFetch<T>(client: SegmentClient, path: string): Promise<T> {
-  const response = await fetch(`${SEGMENT_API_BASE}${path}`, {
+  const response = await fetchMcpHttp(`${SEGMENT_API_BASE}${path}`, {
     headers: { authorization: `Bearer ${client.token}`, accept: 'application/json' },
   });
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   const payload = text ? JSON.parse(text) as T & { message?: string; error?: string } : {} as T;
   if (!response.ok) {
     throw Object.assign(new Error((payload as { message?: string; error?: string }).message || (payload as { error?: string }).error || `Segment API request failed with HTTP ${response.status}`), { status: response.status });

@@ -1,6 +1,6 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { boundedInteger } from './mcp-bounded-integer.js';
-import { parseJsonObject, requireString, textToolResult } from './mcp-values.js';
+import { fetchMcpHttp, parseJsonObject, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue =
@@ -182,13 +182,13 @@ async function listCampaigns(
 }
 
 async function mailchimpFetch<T>(client: MailchimpClient, path: string): Promise<T> {
-  const response = await fetch(`${client.baseUrl}${path}`, {
+  const response = await fetchMcpHttp(`${client.baseUrl}${path}`, {
     headers: {
       authorization: client.authorization,
       accept: 'application/json',
     },
   });
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   const payload: T & { detail?: unknown; title?: unknown } = text
     ? JSON.parse(text) as T & { detail?: unknown; title?: unknown }
     : {} as T & { detail?: unknown; title?: unknown };

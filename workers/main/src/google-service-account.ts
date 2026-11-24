@@ -1,6 +1,19 @@
 const GOOGLE_OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const BIGQUERY_SCOPE = 'https://www.googleapis.com/auth/bigquery';
 const JWT_BEARER_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
+const GOOGLE_TOKEN_TIMEOUT_MS = 15_000;
+
+export class ServiceAccountTokenError extends Error {
+  readonly permanent: boolean;
+  readonly status?: number;
+
+  constructor(message: string, options: { permanent?: boolean; status?: number } = {}) {
+    super(message);
+    this.name = 'ServiceAccountTokenError';
+    this.permanent = options.permanent ?? false;
+    this.status = options.status;
+  }
+}
 
 interface GoogleServiceAccountKey {
   client_email: string;
@@ -33,18 +46,25 @@ function decodePemToBytes(pem: string): Uint8Array {
 }
 
 async function importPrivateKey(pem: string): Promise<CryptoKey> {
-  const keyBytes = decodePemToBytes(pem);
-  const keyBuffer = keyBytes.buffer.slice(
-    keyBytes.byteOffset,
-    keyBytes.byteOffset + keyBytes.byteLength
-  ) as ArrayBuffer;
-  return crypto.subtle.importKey(
-    'pkcs8',
-    keyBuffer,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
+  try {
+    const keyBytes = decodePemToBytes(pem);
+    const keyBuffer = keyBytes.buffer.slice(
+      keyBytes.byteOffset,
+      keyBytes.byteOffset + keyBytes.byteLength
+    ) as ArrayBuffer;
+    return await crypto.subtle.importKey(
+      'pkcs8',
+      keyBuffer,
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+  } catch (error) {
+    throw new ServiceAccountTokenError(
+      `service_account_json private_key is invalid: ${error instanceof Error ? error.message : String(error)}`,
+      { permanent: true }
+    );
+  }
 }
 
 function parseServiceAccountJson(serviceAccountJson: string): GoogleServiceAccountKey {
@@ -52,16 +72,16 @@ function parseServiceAccountJson(serviceAccountJson: string): GoogleServiceAccou
   try {
     parsed = JSON.parse(serviceAccountJson);
   } catch {
-    throw new Error('service_account_json is not valid JSON');
+    throw new ServiceAccountTokenError('service_account_json is not valid JSON', { permanent: true });
   }
 
   if (!parsed || typeof parsed !== 'object') {
-    throw new Error('service_account_json must be a JSON object');
+    throw new ServiceAccountTokenError('service_account_json must be a JSON object', { permanent: true });
   }
 
   const key = parsed as GoogleServiceAccountKey;
-  if (!key.client_email) throw new Error('service_account_json missing client_email');
-  if (!key.private_key) throw new Error('service_account_json missing private_key');
+  if (!key.client_email) throw new ServiceAccountTokenError('service_account_json missing client_email', { permanent: true });
+  if (!key.private_key) throw new ServiceAccountTokenError('service_account_json missing private_key', { permanent: true });
 
   return key;
 }
@@ -114,11 +134,16 @@ export async function mintBigQueryAccessTokenFromServiceAccount(serviceAccountJs
       grant_type: JWT_BEARER_GRANT_TYPE,
       assertion,
     }),
+    signal: AbortSignal.timeout(GOOGLE_TOKEN_TIMEOUT_MS),
   });
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Google token exchange failed: ${response.status} ${errorText}`);
+    const permanent = response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429;
+    throw new ServiceAccountTokenError(`Google token exchange failed: ${response.status} ${errorText}`, {
+      permanent,
+      status: response.status,
+    });
   }
 
   const data = (await response.json()) as GoogleTokenResponse;

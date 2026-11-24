@@ -1,6 +1,6 @@
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { boundedInteger } from './mcp-bounded-integer.js';
-import { requireString, textToolResult } from './mcp-values.js';
+import { fetchMcpHttp, readBoundedResponseText, requireString, textToolResult } from './mcp-values.js';
 import type { WorkspaceIntegrationRecord } from './workspace.js';
 
 type JsonValue =
@@ -146,13 +146,13 @@ async function createSendGridClient(
 }
 
 async function sendGridFetch<T>(client: SendGridClient, path: string): Promise<T> {
-  const response = await fetch(`${SENDGRID_API_BASE}${path}`, {
+  const response = await fetchMcpHttp(`${SENDGRID_API_BASE}${path}`, {
     headers: {
       authorization: `Bearer ${client.token}`,
       accept: 'application/json',
     },
   });
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   const payload: T & { errors?: Array<{ message?: string }> } = text
     ? JSON.parse(text) as T & { errors?: Array<{ message?: string }> }
     : {} as T & { errors?: Array<{ message?: string }> };

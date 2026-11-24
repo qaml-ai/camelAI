@@ -77,7 +77,7 @@ export function readOrgExportPage(sql: SqlStorage, set: OrgExportSet, cursor?: s
       if (field in row) row[field] = redactExportConfig(exportJson(row[field]));
     }
     if (set === 'threads') {
-      const runtime = readExportRecord(sql, 'thread_runtime', 'thread_id', String(row.id), 'agent_id model created_at updated_at');
+      const runtime = readExportRecord(sql, 'thread_runtime', 'thread_id', String(row.id), 'agent_id runtime_version model created_at updated_at');
       row.runtime = runtime;
       row.backend = runtime ? 'runtime' : 'chat_thread_do';
     }

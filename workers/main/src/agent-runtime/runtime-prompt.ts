@@ -1,7 +1,7 @@
 /**
  * What chiridion appends to a runtime agent's system prompt, and the version
  * of it (a send re-sends it when the version changes), plus a run's model
- * configuration and whether the hosted runtime is configured at all.
+ * configuration.
  */
 import { RUNTIME_TOOL_PREFIX as TOOL_PREFIX } from "../../../../src/lib/agent-runtime-shared";
 
@@ -42,13 +42,4 @@ export interface RuntimeRunConfig {
   spendLimitUsd: number | null;
   /** Non-secret headers on every model call (the hosted scope's gateway metadata); null for none. They follow the key scope. */
   modelHeaders: Record<string, string> | null;
-}
-
-/** The hosted runtime's tenant, operator token and agent definition are all set. */
-export function runtimeConfigured(env: {
-  AGENT_RUNTIME_API_TOKEN?: string;
-  AGENT_RUNTIME_TENANT?: string;
-  AGENT_RUNTIME_DEFINITION?: string;
-}): boolean {
-  return Boolean(env.AGENT_RUNTIME_API_TOKEN?.trim() && env.AGENT_RUNTIME_TENANT?.trim() && env.AGENT_RUNTIME_DEFINITION?.trim());
 }

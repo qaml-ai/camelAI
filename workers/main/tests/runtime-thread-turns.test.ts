@@ -287,8 +287,6 @@ describe("startRuntimeTurn", () => {
       ...runtimeEnv, CF_ACCOUNT_ID: "acct", CF_GATEWAY_NAME: "gw", AI_GATEWAY_AUTH_TOKEN: "gw-token",
       WORKER_BASE_URL: "https://camelai.dev", AGENT_RUNTIME_V2_TENANT: "test-v2", AGENT_RUNTIME_V2_API_TOKEN: "test-key",
       AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET: "test-secret",
-      AGENT_RUNTIME_V2_MODELS: PREVIOUS_CAMEL_CODE_RUNTIME_MODELS.join(","),
-      AGENT_RUNTIME_V2_ADDITIONAL_MODELS: CAMEL_CODE_RUNTIME_MODEL,
     };
     const agentPath = `/v2/agents/chiridion-thread-${thread.id}`;
     const calls = fakeRuntime({
@@ -419,11 +417,11 @@ describe("runtime thread reads and writes", () => {
 
 describe("pinNewThreadToRuntime", () => {
   it.each([
-    ["discord", true, CAMEL_CODE_RUNTIME_MODEL, "v2"],
-    ["telegram", true, CAMEL_CODE_RUNTIME_MODEL, "v2"],
-    ["discord", false, CAMEL_CODE_RUNTIME_MODEL, "v1"],
-    ["telegram", true, "azure/other-model", "v1"],
-  ] as const)("pins a new free %s thread with workspace selected=%s and enabled model %s to %s", async (kind, workspaceSelected, enabledModel, runtimeVersion) => {
+    ["discord", true, "v2"],
+    ["telegram", true, "v2"],
+    ["slack", true, "v2"],
+    ["discord", false, "v1"],
+  ] as const)("pins a new %s thread to %s when v2Configured=%s", async (kind, v2Configured, runtimeVersion) => {
     const { context, orgStub } = await runtimeThread();
     await orgStub.setModelPickerConfig({
       use_platform_defaults: false,
@@ -433,10 +431,12 @@ describe("pinNewThreadToRuntime", () => {
     const hostedEnv = {
       ...runtimeEnv,
       CF_ACCOUNT_ID: "acct", CF_GATEWAY_NAME: "gw", AI_GATEWAY_AUTH_TOKEN: "gw-token",
-      WORKER_BASE_URL: "https://camelai.dev",
-      AGENT_RUNTIME_V2_WORKSPACE: workspaceSelected ? context.workspaceId : "unselected-workspace",
-      AGENT_RUNTIME_V2_MODELS: "",
-      AGENT_RUNTIME_V2_ADDITIONAL_MODELS: enabledModel,
+      ...(v2Configured ? {
+        WORKER_BASE_URL: "https://camelai.dev",
+        AGENT_RUNTIME_V2_TENANT: "test-v2",
+        AGENT_RUNTIME_V2_API_TOKEN: "test-key",
+        AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET: "test-secret",
+      } : {}),
     };
     const { threadId } = await getOrCreateChannelThread(hostedEnv as Parameters<typeof getOrCreateChannelThread>[0], {
       kind, workspaceId: context.workspaceId, orgId: context.orgId, connectionId: "integration-1",
@@ -743,17 +743,6 @@ describe("sends while the runtime rolls its tasks", () => {
     });
     await expect(send(setup, "Hello", "cm_down")).rejects.toMatchObject({ status: 503 });
     expect(calls.filter((call) => call.path === "/v1/agents/agt_1/prompt")).toHaveLength(3);
-  });
-
-  it("lets channel delivery retry the original message when the legacy agent is fenced", async () => {
-    const setup = await runtimeThread();
-    const calls = fakeRuntime({
-      "POST /v1/agents/agt_1/prompt": () => Response.json({ error: "Between runtimes", code: "AGENT_V2_CUTOVER" }, { status: 503 }),
-    });
-    await expect(send(setup, "Hello", "telegram_123_456", "telegram")).resolves.toMatchObject({ status: "busy" });
-    const prompts = calls.filter((call) => call.path === "/v1/agents/agt_1/prompt");
-    expect(prompts).toHaveLength(3);
-    expect(prompts.every((call) => call.body.requestId === "telegram_123_456")).toBe(true);
   });
 
   it("does not retry other errors", async () => {

@@ -13,20 +13,45 @@
 export const RUNTIME_REQUEST_ID = /^[A-Za-z0-9_-]{1,80}$/;
 
 /**
- * Whether this deployment runs threads on the hosted agent runtime: its
- * runtime tenant (operator token, tenant id, agent definition) is set. Every
- * thread runs there (ChatThreadDO's own loop is gone); a thread still on
- * ChatThreadDO moves there when it is next opened or sent to.
+ * Whether CamelRun v2 is configured on this deployment (tenant, API token,
+ * webhook secret, and callback base URL).
+ */
+export function v2RuntimeConfigured(env: {
+  WORKER_BASE_URL?: string;
+  AGENT_RUNTIME_V2_TENANT?: string;
+  AGENT_RUNTIME_V2_API_TOKEN?: string;
+  AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET?: string;
+}): boolean {
+  return Boolean(
+    env.WORKER_BASE_URL?.trim() &&
+      env.AGENT_RUNTIME_V2_TENANT?.trim() &&
+      env.AGENT_RUNTIME_V2_API_TOKEN?.trim() &&
+      env.AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET?.trim(),
+  );
+}
+
+/**
+ * Whether this deployment runs threads on the hosted agent runtime: either
+ * CamelRun v2 (`AGENT_RUNTIME_V2_*`) or self-host v1 (`AGENT_RUNTIME_*`) is
+ * configured. Every thread runs there (ChatThreadDO's own loop is gone); a
+ * thread still on ChatThreadDO moves there when it is next opened or sent to.
  */
 export function runtimeDirectThreadsEnabled(env: {
+  WORKER_BASE_URL?: string;
   AGENT_RUNTIME_API_TOKEN?: string;
   AGENT_RUNTIME_TENANT?: string;
   AGENT_RUNTIME_DEFINITION?: string;
+  AGENT_RUNTIME_V2_TENANT?: string;
+  AGENT_RUNTIME_V2_API_TOKEN?: string;
+  AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET?: string;
 }): boolean {
-  return Boolean(
-    env.AGENT_RUNTIME_API_TOKEN?.trim() &&
-      env.AGENT_RUNTIME_TENANT?.trim() &&
-      env.AGENT_RUNTIME_DEFINITION?.trim(),
+  return (
+    v2RuntimeConfigured(env) ||
+    Boolean(
+      env.AGENT_RUNTIME_API_TOKEN?.trim() &&
+        env.AGENT_RUNTIME_TENANT?.trim() &&
+        env.AGENT_RUNTIME_DEFINITION?.trim(),
+    )
   );
 }
 

@@ -4,12 +4,14 @@ import { HTTPException } from 'hono/http-exception';
 import { openApi } from 'hono-zod-openapi';
 import { z } from 'zod';
 import type { Env } from '../../types.js';
+import type { ChatEnv } from '../../chat-thread/types.js';
 import type { OrgDO } from '../../identity/org-do.js';
 import type { UserDO } from '../../identity/user-do.js';
 import type { WorkspaceFilesystemDO } from '../../workspace-filesystem-do.js';
 import type { ChatThreadDO } from '../../chat-thread-do.js';
 import type { WorkspaceCronDO } from '../../workspace-cron.js';
-import { runtimeUrl } from '../../agent-runtime/runtime-api.js';
+import { RuntimeApiError, runtimeUrl } from '../../agent-runtime/runtime-api.js';
+import { v2HistoryPage } from '../../agent-runtime/v2-thread-read.js';
 import { normalizeGlobalProjectId } from '../../project-vm-protocol.js';
 import { allowedExportR2Key, exportCursor, readExportCursor, ORG_EXPORT_SETS, safeExportKey, type ExportRow, type OrgExportSet } from '../../org-export.js';
 
@@ -110,6 +112,17 @@ orgExportRoutes.get(`${base}/threads/:threadId/history`, openApi({ summary: 'Raw
   const placement = row.runtime as ExportRow | null;
   if (placement) {
     if (!placement.agent_id) return c.json({ entries: [], next: null });
+    if (placement.runtime_version === 'v2') {
+      try {
+        return c.json(await v2HistoryPage(c.env as unknown as ChatEnv, String(placement.agent_id), {
+          before: q.before,
+          limit: q.limit,
+        }));
+      } catch (error) {
+        const status = error instanceof RuntimeApiError && (error.status === 404 || error.status === 429) ? error.status : 502;
+        throw new HTTPException(status, { message: 'Runtime export read failed' });
+      }
+    }
     const query = new URLSearchParams({ limit: String(q.limit), maxBytes: '2000000' });
     if (q.before !== undefined) query.set('before', String(q.before));
     return c.json(await (await runtimeRead(c, `/v1/agents/${encodeURIComponent(String(placement.agent_id))}/history?${query}`)).json());
@@ -120,7 +133,9 @@ orgExportRoutes.get(`${base}/threads/:threadId/history`, openApi({ summary: 'Raw
 type Mount = { volumeId: string; path: string; mode: string; subpath?: string };
 async function mounts(c: Ctx): Promise<Mount[]> {
   const row = await thread(c), agentId = segment(c.req.param('agentId')!);
-  if ((row.runtime as ExportRow | null)?.agent_id !== agentId) throw notFound();
+  const placement = row.runtime as ExportRow | null;
+  if (placement?.agent_id !== agentId) throw notFound();
+  if (placement.runtime_version === 'v2') return [];
   return await (await runtimeRead(c, `/v1/agents/${encodeURIComponent(agentId)}/mounts`)).json() as Mount[];
 }
 const agentBase = `${base}/threads/:threadId/agents/:agentId/volumes`;

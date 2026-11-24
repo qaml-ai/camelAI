@@ -183,7 +183,6 @@ describe("WorkspaceCronDO scheduled run outcomes for direct threads", () => {
       expect(pinNewThreadMock).toHaveBeenCalledExactlyOnceWith(
         expect.anything(),
         expect.objectContaining({ threadId: prompt.thread_id, workspaceId }),
-        { v2Eligible: model === CAMEL_CODE_LLM_MODEL },
       );
 
       await cron.runScheduledPromptNow(workspaceId, prompt.id);

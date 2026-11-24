@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { env } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { testRuntime } from '@camelai/run/testing';
 import { CAMEL_CODE_LLM_MODEL } from '../../../src/lib/llm-provider-config';
 import { CAMEL_CODE_RUNTIME_MODEL, PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL } from '../src/agent-runtime/model-routes';
@@ -109,54 +109,13 @@ describe('OrgDO thread_runtime', () => {
     expect(await orgStub.setThreadRuntimeAgent('missing-thread', { agentId: 'x', model: null, keyScope: null })).toBeNull();
   });
 
-  it('publishes the v2 copy only from the expected v1 placement and rejects a late v1 write', async () => {
-    const { orgStub, threadId } = await freshThread();
-    const thread = (await orgStub.getThread(threadId))!;
-    const source = { agentId: 'agt_v1', model: 'model/v1', keyScope: 'hosted', configured: { scratchVolumeId: 'vol_v1' } };
-    const destination = { agentId: 'agt_v2', model: 'model/v2', keyScope: 'hosted', configured: { promptVersion: 1 } };
-    await orgStub.pinThreadRuntime(threadId, 'pending send');
-    const saved = (await orgStub.setThreadRuntimeAgent(threadId, source))!;
-    const expected = { agentId: source.agentId, workspaceId: thread.workspace_id, threadModel: thread.model ?? null, updatedAt: saved.updatedAt };
-    expect(await orgStub.publishV1ThreadInV2(threadId, expected, destination)).toBe(false);
-    await orgStub.clearThreadPendingFirstMessage(threadId);
-    expect(await orgStub.publishV1ThreadInV2(threadId, { ...expected, agentId: 'other' }, destination)).toBe(false);
-    expect(await orgStub.publishV1ThreadInV2(threadId, { ...expected, threadModel: 'other' }, destination)).toBe(false);
-    expect(await orgStub.publishV1ThreadInV2(threadId, { ...expected, updatedAt: expected.updatedAt - 1 }, destination)).toBe(false);
-    expect(await orgStub.publishV1ThreadInV2(threadId, expected, destination)).toBe(true);
-    expect(await orgStub.publishV1ThreadInV2(threadId, expected, destination)).toBe(true);
-    expect(await orgStub.publishV1ThreadInV2(threadId, expected, { ...destination, agentId: 'other' })).toBe(false);
-    expect(await orgStub.setThreadRuntimeAgent(threadId, source)).toBeNull();
-    expect(await orgStub.getThreadRuntime(threadId)).toMatchObject({ runtimeVersion: 'v2', ...destination });
-  });
-
-  it.each(["discord", "telegram"] as const)('publishes a fenced free %s chat only with the original channel binding', async (kind) => {
-    const { orgStub, threadId } = await freshThread(kind);
-    const thread = (await orgStub.getThread(threadId))!;
-    const source = { agentId: 'agt_v1', model: PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL, keyScope: 'hosted', configured: null };
-    const replacement = { ...source, agentId: 'agt_v2', model: CAMEL_CODE_RUNTIME_MODEL };
-    const saved = (await orgStub.setThreadRuntimeAgent(threadId, source))!;
-    const channel = { kind, connectionId: "connection-1", remoteConversationId: "conversation-1" };
-    const expected = { agentId: source.agentId, workspaceId: thread.workspace_id, threadModel: thread.model, updatedAt: saved.updatedAt };
-    expect(await orgStub.publishV1ThreadInV2(threadId, expected, replacement)).toBe(false);
-    expect(await orgStub.publishV1ThreadInV2(threadId, {
-      ...expected, channel: { ...channel, remoteConversationId: "different-conversation" },
-    }, replacement)).toBe(false);
-    expect(await orgStub.publishV1ThreadInV2(threadId, { ...expected, channel }, { ...replacement, model: "other" })).toBe(false);
-    expect(await orgStub.publishV1ThreadInV2(threadId, { ...expected, channel }, replacement)).toBe(true);
-    expect(await orgStub.getThread(threadId)).toMatchObject({
-      id: threadId, source: "channel", channel_kind: kind,
-      channel_connection_id: "connection-1", channel_conversation_id: "conversation-1",
-    });
-    expect(await orgStub.getThreadRuntime(threadId)).toMatchObject({ runtimeVersion: 'v2', ...replacement });
-  });
-
-  it.each(["discord", "telegram"] as const)("delivers a signed v2 reply to the original %s conversation after publication", async (kind) => {
+  it.each(["discord", "telegram"] as const)("delivers a signed v2 reply to the original %s conversation after promotion", async (kind) => {
     const conversation = kind === "discord" ? "guild-1:thread-2" : "-123456";
     const { orgStub, orgId, threadId, userId } = await freshThread(kind, conversation);
     const thread = (await orgStub.getThread(threadId))!;
     const source = { agentId: "agt_v1", model: PREVIOUS_AZURE_CAMEL_CODE_RUNTIME_MODEL, keyScope: "hosted", configured: null };
     const replacement = { ...source, agentId: "agt_v2", model: CAMEL_CODE_RUNTIME_MODEL };
-    const saved = (await orgStub.setThreadRuntimeAgent(threadId, source))!;
+    await orgStub.setThreadRuntimeAgent(threadId, source);
     const connectionId = "connection-1";
     const workspaceId = thread.workspace_id;
     const tenant = "chiridion-v2-test";
@@ -205,10 +164,11 @@ describe('OrgDO thread_runtime', () => {
     try {
       expect(await signedReply(replacement.agentId)).toMatchObject({ isError: true });
       expect(outbound).not.toHaveBeenCalled();
-      expect(await orgStub.publishV1ThreadInV2(threadId, {
-        agentId: source.agentId, workspaceId, threadModel: thread.model, updatedAt: saved.updatedAt,
-        channel: { kind, connectionId, remoteConversationId: conversation },
-      }, replacement)).toBe(true);
+      expect(await orgStub.promoteLegacyThreadToV2(threadId, replacement)).toMatchObject({
+        runtimeVersion: "v2",
+        agentId: replacement.agentId,
+      });
+      expect(await orgStub.setThreadRuntimeAgent(threadId, source)).toBeNull();
       expect(await signedReply(source.agentId)).toMatchObject({ isError: true });
       expect(await signedReply(replacement.agentId)).toMatchObject({ structuredContent: { status: "sent", channel: kind } });
       expect(outbound).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(kind === "discord"
@@ -219,13 +179,48 @@ describe('OrgDO thread_runtime', () => {
     }
   });
 
-  it('goes with its thread', async () => {
+  it('goes with its thread for both v1 and v2 rows, and allows hardDeleteOrg with v2 threads', async () => {
     const { orgStub, threadId, userId } = await freshThread();
     await orgStub.setThreadRuntimeAgent(threadId, { agentId: 'agt_2', model: 'm', keyScope: null });
     await orgStub.setThreadUiState(threadId, { tabs: [] });
     expect(await orgStub.deleteThread(threadId, userId)).toBe(true);
     expect(await orgStub.getThreadRuntime(threadId)).toBeNull();
     expect(await orgStub.getThreadUiState(threadId)).toBeNull();
+
+    const v2 = await freshThread();
+    await v2.orgStub.pinThreadRuntime(v2.threadId, null, 'v2');
+    await v2.orgStub.setThreadRuntimeAgent(v2.threadId, { agentId: 'agt_v2_del', model: 'm', keyScope: null });
+    const deletedUrls: Array<{ url: string; method?: string; auth: string | null }> = [];
+    const originalFetch = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.startsWith('https://run.camelai.com/v2/agents/')) {
+        deletedUrls.push({ url, method: init?.method, auth: new Headers(init?.headers).get('authorization') });
+        return new Response(null, { status: 204 });
+      }
+      return originalFetch(input, init);
+    });
+    try {
+      await runInDurableObject(v2.orgStub, async (instance) => {
+        (instance as unknown as { env: Record<string, unknown> }).env = {
+          ...(instance as unknown as { env: Record<string, unknown> }).env,
+          AGENT_RUNTIME_V2_API_TOKEN: 'v2-delete-token',
+        };
+        expect(instance.deleteThread(v2.threadId, v2.userId)).toBe(true);
+      });
+    } finally {
+      fetchSpy.mockRestore();
+    }
+    expect(await v2.orgStub.getThreadRuntime(v2.threadId)).toBeNull();
+    expect(deletedUrls).toEqual([
+      { url: 'https://run.camelai.com/v2/agents/agt_v2_del', method: 'DELETE', auth: 'Bearer v2-delete-token' },
+    ]);
+
+    const orgDel = await freshThread();
+    await orgDel.orgStub.pinThreadRuntime(orgDel.threadId, null, 'v2');
+    await orgDel.orgStub.setThreadRuntimeAgent(orgDel.threadId, { agentId: 'agt_v2_org', model: 'm', keyScope: null });
+    await expect(orgDel.orgStub.hardDeleteOrg(orgDel.userId)).resolves.toBeUndefined();
+    expect(await orgDel.orgStub.getThreadRuntime(orgDel.threadId)).toBeNull();
   });
 });
 

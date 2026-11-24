@@ -30,13 +30,6 @@
     // Bucket behind WAREHOUSE_EXPORT_BUCKET, which DbQueryContainer mounts over
     // S3 with the R2_S3_ACCESS_KEY_ID / R2_S3_SECRET_ACCESS_KEY secrets.
     "WAREHOUSE_EXPORT_BUCKET_NAME": "chiridion-warehouse-exports",
-    // Hosted agent runtime: with these plus the AGENT_RUNTIME_API_TOKEN secret,
-    // every thread runs on it (threads still on ChatThreadDO move there when
-    // next opened or sent to: agent-runtime/thread-migration.ts).
-    "AGENT_RUNTIME_TENANT": "chiridion-prod",
-    "AGENT_RUNTIME_DEFINITION": "def_1691d4d5174202254235",
-    "AGENT_RUNTIME_V2_ADDITIONAL_MODELS": "azure/gpt-6.1-terra,azure/gpt-6.2-sol",
-    "AGENT_RUNTIME_V2_BYOK": "true",
     "AI_VIRTUAL_MODEL": "google/gemini-3.8-flash",
     // Static-IP database egress relay (docs/db-egress-relay.md). SOCKS + Access
     // service-token credentials are secrets (DB_EGRESS_RELAY_SOCKS_* /

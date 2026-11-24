@@ -1,10 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { readOrgExportManifest, readOrgExportPage, readExportRecord, ORG_EXPORT_SETS, type OrgExportSet } from "../org-export.js";
-import { moveCamelCodeThreadToSol } from "../agent-runtime/camelcode-sol-migration";
-import { channelHandoffBinding, type ChannelHandoffBinding } from "../agent-runtime/channel-handoff";
 import { syncOrgKeyScope, syncV2OrgKeyScope, type KeyScopeEnv } from "../agent-runtime/key-scopes";
-import { CAMEL_CODE_RUNTIME_MODEL, isPreviousCamelCodeRuntimeModel, PREVIOUS_CAMEL_CODE_RUNTIME_MODELS, v2ByokEnabled } from "../agent-runtime/model-routes";
-import { RuntimeApiError, runtimeApi, v2WorkspaceEnabled } from "../agent-runtime/runtime-api";
+import { RuntimeApiError, runtimeApi } from "../agent-runtime/runtime-api";
+import { v2AgentPath, v2Fetch } from "../agent-runtime/runtime-v2";
 import type { ChatEnv } from "../chat-thread/types";
 import type { DOEnv } from "./env";
 import {
@@ -54,7 +52,6 @@ import type {
   ThreadCompletionSummaryStatus,
 } from "../../../../src/types";
 import {
-  CAMEL_CODE_LLM_MODEL,
   getDefaultLlmModel,
   getStoredBedrockAwsRegion,
   getStoredCustomLlmProviderApi,
@@ -962,7 +959,6 @@ export interface OrgSsoIdentityRecord {
 // User Durable Object - one per user
 export class OrgDO extends DurableObject<DOEnv> {
   private sql: SqlStorage;
-  private readonly camelCodeModelUpdates = new Map<string, Promise<{ status: string }>>();
   private usageControlsInstance?: OrgUsageControls;
   private workerScriptsHasPreviewColumns = true;
   private static readonly ACCESS_MAPPED_ORG_ID_KEY = "accessMappedOrgId";
@@ -3069,7 +3065,7 @@ export class OrgDO extends DurableObject<DOEnv> {
     const set = kind === "workspace" ? "workspaces" : kind === "thread" ? "threads" : "apps";
     const [table, fields] = ORG_EXPORT_SETS[set];
     const row = readExportRecord(this.ctx.storage.sql, table, kind === "app" ? "script_name" : "id", id, fields);
-    if (row && kind === "thread") row.runtime = readExportRecord(this.ctx.storage.sql, "thread_runtime", "thread_id", id, "agent_id model created_at updated_at");
+    if (row && kind === "thread") row.runtime = readExportRecord(this.ctx.storage.sql, "thread_runtime", "thread_id", id, "agent_id runtime_version model created_at updated_at");
     return row;
   }
 
@@ -7759,9 +7755,6 @@ export class OrgDO extends DurableObject<DOEnv> {
     if (!info) {
       return;
     }
-    if (this.sql.exec("SELECT 1 FROM thread_runtime WHERE runtime_version = 'v2' LIMIT 1").toArray().length > 0) {
-      throw new Error("This organization contains v2 canary threads. Their usage must be settled before deletion.");
-    }
 
     // Clean up slug→org KV mapping
     try {
@@ -7788,7 +7781,9 @@ export class OrgDO extends DurableObject<DOEnv> {
     this.sql.exec("DELETE FROM worker_scripts");
     this.sql.exec("DELETE FROM threads");
     this.deleteRuntimeAgents(
-      this.sql.exec<{ agent_id: string }>("SELECT agent_id FROM thread_runtime WHERE agent_id IS NOT NULL").toArray().map((row) => row.agent_id),
+      this.sql.exec<{ agent_id: string; runtime_version: "v1" | "v2" | null }>(
+        "SELECT agent_id, runtime_version FROM thread_runtime WHERE agent_id IS NOT NULL",
+      ).toArray().map((row) => ({ agentId: row.agent_id, runtimeVersion: row.runtime_version })),
     );
     this.sql.exec("DELETE FROM thread_runtime");
     this.sql.exec("DELETE FROM thread_ui_state");
@@ -8478,8 +8473,6 @@ export class OrgDO extends DurableObject<DOEnv> {
     actorId?: string,
     expectedModel?: LlmModel,
   ): Promise<OrgThread | null> {
-    const migration = this.camelCodeModelUpdates.get(id);
-    if (migration) await migration.catch(() => {});
     const existing = this.getThread(id);
     if (!existing) return null;
     if (
@@ -8574,8 +8567,6 @@ export class OrgDO extends DurableObject<DOEnv> {
     updates: { title?: string; created_by?: string; model?: LlmModel },
     actorId?: string,
   ): Promise<OrgThread | null> {
-    const migration = updates.model && this.camelCodeModelUpdates.get(id);
-    if (migration) await migration.catch(() => {});
     const existing = this.getThread(id);
     if (!existing) return null;
     const normalizedModel =
@@ -8656,9 +8647,6 @@ export class OrgDO extends DurableObject<DOEnv> {
     const existing = this.getThread(id);
     if (!existing) return false;
     const runtime = this.getThreadRuntime(id);
-    if (runtime?.runtimeVersion === "v2") {
-      throw new Error("V2 canary threads are retained while usage delivery is enabled.");
-    }
     const agentId = runtime?.agentId;
     this.sql.exec("DELETE FROM threads WHERE id = ?", id);
     this.markMirrorDirty("thread", id);
@@ -8670,16 +8658,36 @@ export class OrgDO extends DurableObject<DOEnv> {
       });
     }
     // A runtime thread's transcript lives only on its agent: delete it too.
-    if (agentId) this.deleteRuntimeAgents([agentId]);
+    if (agentId) this.deleteRuntimeAgents([{ agentId, runtimeVersion: runtime?.runtimeVersion }]);
     return true;
   }
 
   /** Delete deleted threads' agents on the runtime, in the background (a 404 is fine). */
-  private deleteRuntimeAgents(agentIds: string[]): void {
+  private deleteRuntimeAgents(agents: Array<{ agentId: string; runtimeVersion?: "v1" | "v2" | null }>): void {
     const runtimeEnv = this.env as unknown as KeyScopeEnv;
-    if (agentIds.length === 0 || !runtimeEnv.AGENT_RUNTIME_API_TOKEN) return;
+    const chatEnv = this.env as unknown as ChatEnv;
+    if (agents.length === 0) return;
     this.ctx.waitUntil((async () => {
-      for (const agentId of agentIds) {
+      for (const { agentId, runtimeVersion } of agents) {
+        if (runtimeVersion === "v2") {
+          if (!chatEnv.AGENT_RUNTIME_V2_API_TOKEN) continue;
+          await v2Fetch(chatEnv, v2AgentPath(agentId), { method: "DELETE" })
+            .then(async (res) => {
+              await res.body?.cancel();
+              if (!res.ok && res.status !== 404) {
+                console.error("[OrgDO] failed to delete a v2 runtime agent", { agentId, status: res.status });
+              }
+            })
+            .catch((error) => {
+              if (error instanceof RuntimeApiError && error.status === 404) return;
+              console.error("[OrgDO] failed to delete a v2 runtime agent", {
+                agentId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+          continue;
+        }
+        if (!runtimeEnv.AGENT_RUNTIME_API_TOKEN || !runtimeEnv.AGENT_RUNTIME_URL) continue;
         await runtimeApi(runtimeEnv, "DELETE", `/v1/agents/${encodeURIComponent(agentId)}`).catch((error) => {
           if (error instanceof RuntimeApiError && error.status === 404) return;
           console.error("[OrgDO] failed to delete a runtime agent", {
@@ -8703,78 +8711,6 @@ export class OrgDO extends DurableObject<DOEnv> {
       )
       .toArray()[0];
     return row ? threadRuntimeRecord(row) : null;
-  }
-
-  /** Metadata only, ordered by thread ID for the camelCode model migration. */
-  listCamelCodeModelMigrationThreads(after: string | null, limit: number) {
-    const size = Math.max(1, Math.min(Math.floor(limit) || 1, 100));
-    const camelCodeModels = [...PREVIOUS_CAMEL_CODE_RUNTIME_MODELS, CAMEL_CODE_RUNTIME_MODEL];
-    const placeholders = camelCodeModels.map(() => "?").join(", ");
-    return this.sql.exec<{
-      thread_id: string;
-      workspace_id: string;
-      agent_id: string | null;
-      runtime_version: "v1" | "v2" | null;
-      model: string | null;
-    }>(
-      `SELECT t.id AS thread_id, t.workspace_id, r.agent_id, r.runtime_version, r.model
-       FROM threads t LEFT JOIN thread_runtime r ON r.thread_id = t.id
-       WHERE t.id > ? AND t.model = ? AND (
-         r.thread_id IS NULL OR (r.key_scope = 'hosted' AND r.agent_id IS NOT NULL AND r.model IN (${placeholders}))
-       )
-       ORDER BY t.id LIMIT ?`,
-      after ?? "", CAMEL_CODE_LLM_MODEL, ...camelCodeModels, size,
-    ).toArray();
-  }
-
-  async moveCamelCodeThreadToSol(threadId: string, apply = false): Promise<{ status: string }> {
-    const active = this.camelCodeModelUpdates.get(threadId);
-    if (apply && active) return active;
-    const env = this.env as unknown as ChatEnv;
-    const thread = this.getThread(threadId);
-    const row = this.getThreadRuntime(threadId);
-    if (!apply) return moveCamelCodeThreadToSol(env, thread, row, false);
-
-    // Serialize picker changes for this thread while the runtime's backing
-    // model and our placement record are changed. Turns use CamelRun's idle
-    // check, and other threads in the same organization can keep working.
-    const migration = (async () => {
-      const outcome = await moveCamelCodeThreadToSol(env, thread, row, true);
-      if (row?.agentId && row.model && (outcome.status === "moved" || outcome.status === "reconciled")) {
-        const recorded = this.recordCamelCodeSolModel(threadId, {
-          agentId: row.agentId, model: row.model, updatedAt: row.updatedAt,
-        });
-        if (!recorded) return { status: "source_changed" };
-      }
-      return outcome;
-    })();
-    this.camelCodeModelUpdates.set(threadId, migration);
-    try {
-      return await migration;
-    } finally {
-      this.camelCodeModelUpdates.delete(threadId);
-    }
-  }
-
-  /** Mirror the confirmed runtime model while the same hosted placement still owns the thread. */
-  private recordCamelCodeSolModel(
-    threadId: string,
-    expected: { agentId: string; model: string; updatedAt: number },
-  ): boolean {
-    return this.ctx.storage.transactionSync(() => {
-      const thread = this.getThread(threadId);
-      const row = this.getThreadRuntime(threadId);
-      if (thread?.model !== CAMEL_CODE_LLM_MODEL || row?.runtimeVersion !== "v2" ||
-          row.agentId !== expected.agentId || row.keyScope !== "hosted") return false;
-      if (row.model === CAMEL_CODE_RUNTIME_MODEL) return true;
-      if (row.model !== expected.model || !isPreviousCamelCodeRuntimeModel(row.model) ||
-          row.updatedAt !== expected.updatedAt) return false;
-      this.sql.exec(
-        "UPDATE thread_runtime SET model = ?, configured_json = ?, updated_at = ? WHERE thread_id = ?",
-        CAMEL_CODE_RUNTIME_MODEL, JSON.stringify({ ...row.configured, thinkingLevel: "low" }), Date.now(), threadId,
-      );
-      return true;
-    });
   }
 
   /**
@@ -8911,40 +8847,6 @@ export class OrgDO extends DurableObject<DOEnv> {
     return row ? { row, claimed: row.agentId === agentId } : null;
   }
 
-  /** Switch a fenced v1 thread to its verified v2 copy. */
-  publishV1ThreadInV2(
-    threadId: string,
-    expected: { agentId: string; workspaceId: string; threadModel: string | null; updatedAt: number; channel?: ChannelHandoffBinding },
-    replacement: ThreadRuntimeAgentUpdate,
-  ): boolean {
-    return this.ctx.storage.transactionSync(() => {
-      const thread = this.getThread(threadId);
-      const runtime = this.getThreadRuntime(threadId);
-      if (runtime?.runtimeVersion === "v2") return runtime.agentId === replacement.agentId;
-      const allowAllV2 = v2ByokEnabled(this.env as unknown as ChatEnv);
-      if (!thread || thread.workspace_id !== expected.workspaceId ||
-          (thread.model ?? null) !== expected.threadModel ||
-          runtime?.agentId !== expected.agentId || runtime.updatedAt !== expected.updatedAt ||
-          runtime.pendingFirstMessage ||
-          (!allowAllV2 && (runtime.keyScope !== "hosted" || replacement.keyScope !== "hosted"))) return false;
-      if (expected.channel) {
-        const channel = channelHandoffBinding(thread, expected.channel.kind);
-        if (!channel || channel.connectionId !== expected.channel.connectionId ||
-            channel.remoteConversationId !== expected.channel.remoteConversationId ||
-            (!allowAllV2 && (thread.model !== CAMEL_CODE_LLM_MODEL || !isPreviousCamelCodeRuntimeModel(runtime.model) ||
-            replacement.model !== CAMEL_CODE_RUNTIME_MODEL))) return false;
-      } else if (thread.source === "channel" || thread.channel_kind) return false;
-
-      const updated = this.sql.exec(
-        `UPDATE thread_runtime SET runtime_version = 'v2', agent_id = ?, model = ?, key_scope = ?, configured_json = ?, updated_at = ?
-         WHERE thread_id = ? RETURNING thread_id`,
-        replacement.agentId, replacement.model, replacement.keyScope,
-        JSON.stringify(replacement.configured ?? null), Date.now(), threadId,
-      );
-      return updated.toArray().length === 1;
-    });
-  }
-
   /** Promote a retired v1 runtime thread to a v2 agent so users never hit HTTP 410. */
   promoteLegacyThreadToV2(
     threadId: string,
@@ -8961,54 +8863,6 @@ export class OrgDO extends DurableObject<DOEnv> {
         update.agentId, update.model, update.keyScope, JSON.stringify(update.configured ?? null), now, threadId,
       );
       return this.getThreadRuntime(threadId);
-    });
-  }
-
-  /** Replace a thread's v2 runtime agent after recovering its v1 history into a fresh v2 agent. */
-  replaceThreadRuntimeV2Agent(
-    threadId: string,
-    update: ThreadRuntimeAgentUpdate,
-  ): ThreadRuntimeRecord | null {
-    return this.ctx.storage.transactionSync(() => {
-      if (!this.getThread(threadId)) return null;
-      const now = Date.now();
-      this.sql.exec(
-        `INSERT INTO thread_runtime (thread_id, agent_id, model, key_scope, configured_json, runtime_version, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'v2', ?, ?)
-         ON CONFLICT(thread_id) DO UPDATE SET
-           runtime_version = 'v2',
-           agent_id = excluded.agent_id,
-           model = excluded.model,
-           key_scope = excluded.key_scope,
-           configured_json = excluded.configured_json,
-           pending_first_message = NULL,
-           updated_at = excluded.updated_at`,
-        threadId, update.agentId, update.model, update.keyScope, JSON.stringify(update.configured ?? null), now, now,
-      );
-      return this.getThreadRuntime(threadId);
-    });
-  }
-
-  /** Publish a verified copy only while the thread still belongs to the legacy exporter. */
-  claimLegacyThreadForV2(
-    threadId: string,
-    expectedModel: string | null,
-    update: ThreadRuntimeAgentUpdate,
-    preview: Record<string, unknown>,
-  ): boolean {
-    return this.ctx.storage.transactionSync(() => {
-      const thread = this.getThread(threadId);
-      if (!thread || !v2WorkspaceEnabled(this.env, thread.workspace_id) ||
-        thread.source === "channel" || thread.channel_kind ||
-        (thread.model ?? null) !== expectedModel || this.getThreadRuntime(threadId)) return false;
-      const now = Date.now();
-      this.sql.exec(
-        `INSERT INTO thread_runtime (thread_id, agent_id, model, key_scope, configured_json, runtime_version, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'v2', ?, ?)`,
-        threadId, update.agentId, update.model, update.keyScope, JSON.stringify(update.configured ?? null), now, now,
-      );
-      if (!this.getThreadUiState(threadId)) this.setThreadUiState(threadId, preview);
-      return true;
     });
   }
 
@@ -9569,7 +9423,7 @@ export class OrgDO extends DurableObject<DOEnv> {
     const chatEnv = this.env as unknown as ChatEnv;
     const orgId = this.getInfoSync()?.id;
     const providerConfig = this.getLlmProviderConfig();
-    if (orgId && env.AGENT_RUNTIME_API_TOKEN) {
+    if (orgId && env.AGENT_RUNTIME_API_TOKEN && env.AGENT_RUNTIME_URL) {
       this.ctx.waitUntil(
         syncOrgKeyScope(env, orgId, providerConfig).catch((error) => {
           console.error("[OrgDO] agent runtime key scope sync failed", {
@@ -9579,7 +9433,7 @@ export class OrgDO extends DurableObject<DOEnv> {
         }),
       );
     }
-    if (orgId && v2ByokEnabled(chatEnv) && chatEnv.AGENT_RUNTIME_V2_API_TOKEN) {
+    if (orgId && chatEnv.AGENT_RUNTIME_V2_API_TOKEN) {
       this.ctx.waitUntil(
         syncV2OrgKeyScope(chatEnv, orgId, providerConfig).catch((error) => {
           console.error("[OrgDO] agent runtime v2 key scope sync failed", {

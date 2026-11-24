@@ -275,8 +275,6 @@ export function assertNotBase64IntoBinaryFile(path: string, content: string): vo
 const CODE_MODE_R2_MAX_TEXT_OBJECT_BYTES = 10 * 1024 * 1024;
 /** The largest scratch file import_file copies into the workspace (a volume file is at most 256 MiB). */
 const IMPORT_FILE_MAX_BYTES = 64 * 1024 * 1024;
-/** The hosted agent runtime's origins: it serves both, and its signed links name its public one. */
-const HOSTED_RUNTIME_ORIGINS = ["https://run.camelai.com", "https://agents.camelai.dev"];
 
 const JS_EXEC_EXCLUDED_TOOL_NAMES = new Set([
   // This tool waits for human input and can outlive js_exec's short sandbox
@@ -3265,11 +3263,14 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         }
       }
     }
-    const runtimeOrigin = new URL(this.env.AGENT_RUNTIME_URL || "https://agents.camelai.dev").origin;
-    const origins = HOSTED_RUNTIME_ORIGINS.includes(runtimeOrigin) ? HOSTED_RUNTIME_ORIGINS : [runtimeOrigin];
+    const configuredUrl = this.env.AGENT_RUNTIME_URL?.trim();
+    if (!configuredUrl) {
+      throw new Error('source must be a scratch file, passed as { "$file": "/workspace/<path>" }');
+    }
+    const runtimeOrigin = new URL(configuredUrl).origin;
     let source: URL | null = null;
     try { source = typeof input === "string" ? new URL(input) : null; } catch { source = null; }
-    if (!source || !origins.includes(source.origin) || !source.pathname.startsWith("/v1/links/")) {
+    if (!source || source.origin !== runtimeOrigin || !source.pathname.startsWith("/v1/links/")) {
       throw new Error('source must be a scratch file, passed as { "$file": "/workspace/<path>" }');
     }
     return fetch(`${runtimeOrigin}${source.pathname}${source.search}`);

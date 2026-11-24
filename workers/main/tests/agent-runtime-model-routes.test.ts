@@ -1,10 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { runtimeModelRoute, v2RouteSupported, v2RuntimeRouteTarget, v2WireKeyScope } from "../src/agent-runtime/model-routes";
+import { runtimeModelRoute, v2RuntimeRouteTarget, v2WireKeyScope } from "../src/agent-runtime/model-routes";
 import { PiModelMapping } from "../src/pi-model-resolution";
 import type { PiResolvedModelConfig } from "../src/chat-thread/pi-model-config";
 import { resolveThreadRuntimeRoute, runtimeAgentModel } from "../src/agent-runtime/run-gates";
-import { v2WorkspaceEnabled } from "../src/agent-runtime/runtime-api";
 
 const b64url = (value: unknown) => btoa(JSON.stringify(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const CODEX_TOKEN = `${b64url({})}.${b64url({ "https://api.openai.com/auth": { chatgpt_account_id: "acct" } })}.sig`;
@@ -23,39 +22,6 @@ function config(overrides: { model: Record<string, unknown>; billingSource?: "ho
 
 const GATEWAY = "https://gateway.ai.cloudflare.com/v1/acct/gw";
 const org = { orgId: "org1" };
-
-describe("v2WorkspaceEnabled", () => {
-  it("accepts explicitly selected production workspaces", () => {
-    const production = { WORKER_BASE_URL: "https://camelai.dev", AGENT_RUNTIME_V2_WORKSPACE: "ws1" };
-    expect(v2WorkspaceEnabled(production, "ws1")).toBe(true);
-    expect(v2WorkspaceEnabled(production, "ws2")).toBe(false);
-    expect(v2WorkspaceEnabled(production, undefined)).toBe(false);
-    expect(v2WorkspaceEnabled({}, undefined)).toBe(false);
-    expect(v2WorkspaceEnabled({ ...production, AGENT_RUNTIME_V2_WORKSPACE: "ws1, ws3" }, "ws3")).toBe(true);
-    expect(v2WorkspaceEnabled({ ...production, AGENT_RUNTIME_V2_WORKSPACE: "ws1, ws3" }, "ws2")).toBe(false);
-  });
-
-  it("includes every identified production workspace when explicitly enabled", () => {
-    const production = { WORKER_BASE_URL: "https://camelai.dev", AGENT_RUNTIME_V2_WORKSPACE: "all" };
-    expect(v2WorkspaceEnabled(production, "ws1")).toBe(true);
-    expect(v2WorkspaceEnabled(production, "ws2")).toBe(true);
-    expect(v2WorkspaceEnabled(production, undefined)).toBe(false);
-  });
-
-  it("enables production workspaces when the rollout flag is a wildcard", () => {
-    const production = { WORKER_BASE_URL: "https://camelai.dev", AGENT_RUNTIME_V2_WORKSPACE: "*" };
-    expect(v2WorkspaceEnabled(production, "ws1")).toBe(true);
-    expect(v2WorkspaceEnabled(production, "ws2")).toBe(true);
-    expect(v2WorkspaceEnabled(production, undefined)).toBe(false);
-    expect(v2WorkspaceEnabled({ ...production, WORKER_BASE_URL: "https://dev.camelai.dev" }, "ws1")).toBe(false);
-  });
-
-  it("accepts the staging wildcard for legacy exports with no saved workspace", () => {
-    const staging = { WORKER_BASE_URL: "https://staging.camelai.dev", AGENT_RUNTIME_V2_WORKSPACE: "*" };
-    expect(v2WorkspaceEnabled(staging, "ws1")).toBe(true);
-    expect(v2WorkspaceEnabled(staging, undefined)).toBe(true);
-  });
-});
 
 describe("runtimeModelRoute", () => {
   it.each([true, false])("runs camelCode on GPT-6.1 Terra on the platform's Azure deployment (free tier: %s)", async (freeTier) => {
@@ -202,20 +168,6 @@ describe("runtimeModelRoute", () => {
 });
 
 describe("v2 BYOK and Codex routing", () => {
-  it("gates BYOK and Codex routes behind AGENT_RUNTIME_V2_BYOK", () => {
-    const byok = { kind: "scope" as const, model: "anthropic/claude-opus-5-5", keyScope: "org_1" };
-    const codex = { kind: "codex" as const, model: "chiridion/openai-codex/gpt-6-luna" };
-    const hosted = { kind: "scope" as const, model: "azure/gpt-6.1-terra", keyScope: "hosted" };
-    const hostedSol = { kind: "scope" as const, model: "azure/gpt-6.2-sol", keyScope: "hosted" };
-    expect(v2RouteSupported(byok, { AGENT_RUNTIME_V2_MODELS: "azure/gpt-6.1-terra" })).toBe(false);
-    expect(v2RouteSupported(codex, { AGENT_RUNTIME_V2_MODELS: "azure/gpt-6.1-terra" })).toBe(false);
-    expect(v2RouteSupported(hosted, { AGENT_RUNTIME_V2_MODELS: "azure/gpt-6.1-terra" })).toBe(true);
-    expect(v2RouteSupported(hosted, { AGENT_RUNTIME_V2_ADDITIONAL_MODELS: "azure/gpt-6.1-terra,azure/gpt-6.2-sol" })).toBe(true);
-    expect(v2RouteSupported(hostedSol, { AGENT_RUNTIME_V2_ADDITIONAL_MODELS: "azure/gpt-6.1-terra,azure/gpt-6.2-sol" })).toBe(true);
-    expect(v2RouteSupported(byok, { AGENT_RUNTIME_V2_BYOK: "true" })).toBe(true);
-    expect(v2RouteSupported(codex, { AGENT_RUNTIME_V2_BYOK: "true" })).toBe(true);
-  });
-
   it("maps Codex, Bedrock Mantle, and hosted wire scopes for v2", () => {
     expect(v2RuntimeRouteTarget({ kind: "codex", model: "chiridion/openai-codex/gpt-6-luna" }, "org1"))
       .toEqual({ model: "openai-codex/gpt-6-luna", keyScope: "org_org1" });

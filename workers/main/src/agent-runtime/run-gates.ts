@@ -37,7 +37,7 @@ import { assertUserLlmUsageAccess, UserLlmUsageLimitError } from "../user-llm-us
 import { createPiSystemPrompt } from "../pi-system-prompt";
 import { resolveAgentSkillCatalog } from "../selfhost-agent-pack";
 import { RUNTIME_PROMPT_PREAMBLE, type RuntimeRunConfig } from "./runtime-prompt";
-import { CAMEL_CODE_RUNTIME_MODEL, PREVIOUS_AZURE_SOL_CAMEL_CODE_RUNTIME_MODEL, runtimeModelRoute, v2RouteSupported, v2RuntimeRouteTarget, type RuntimeModelRoute } from "./model-routes";
+import { CAMEL_CODE_RUNTIME_MODEL, PREVIOUS_AZURE_SOL_CAMEL_CODE_RUNTIME_MODEL, runtimeModelRoute, v2RuntimeRouteTarget, type RuntimeModelRoute } from "./model-routes";
 import { HOSTED_KEY_SCOPE, ensureHostedKeyScope, hostedModelHeaders, selfhostOperatorEndpointOrigin, syncOrgKeyScope, syncV2OrgKeyScope } from "./key-scopes";
 import { codexRoute } from "./codex-forwarder";
 
@@ -256,9 +256,6 @@ export async function prepareThreadRuntimeRun(
   }
   const { route, config, threadModel, fallback } = resolved;
   if (!route) throw new RuntimeRunRefused("This thread's model cannot run on the agent runtime; switch models to continue.", "no_route");
-  if (runtimeVersion === "v2" && !v2RouteSupported(route, env)) {
-    throw new RuntimeRunRefused("Choose a hosted model enabled for v2 to continue this thread.", "no_route");
-  }
   const org = orgStub(env, context.orgId);
   const access = async () => {
     if (!userId) return;

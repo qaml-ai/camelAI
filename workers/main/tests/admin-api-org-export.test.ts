@@ -13,7 +13,14 @@ const manifest = { org: { id: 'org-a', name: 'A', slug: 'a' }, record_sets: [] }
 function fixture() {
   const ownership = vi.fn(async (kind: string, id: string) => {
     if (kind === 'workspace' && id === 'ws-a') return { id };
-    if (kind === 'thread' && ['thread-a', 'thread-do'].includes(id)) return { id, workspace_id: 'ws-a', runtime: id === 'thread-a' ? { agent_id: 'agent-a' } : null };
+    if (kind === 'thread' && ['thread-a', 'thread-v2', 'thread-do'].includes(id)) {
+      const runtime = id === 'thread-a'
+        ? { agent_id: 'agent-a', runtime_version: 'v1' }
+        : id === 'thread-v2'
+          ? { agent_id: 'agent-v2', runtime_version: 'v2' }
+          : null;
+      return { id, workspace_id: 'ws-a', runtime };
+    }
     if (kind === 'app' && id === 'app-a') return { script_name: id, workspace_id: 'ws-a' };
     return null;
   });
@@ -26,7 +33,7 @@ function fixture() {
   const chat = { readOrgExportHistory: vi.fn(async (before?: number) => before === 2 ? { entries: [{ index: 0, message: { role: 'user', content: 'old' } }], next: null } : { entries: [{ index: 2, message: { role: 'assistant', content: [] } }], next: 2 }) };
   const kv = { list: vi.fn(async () => ({ keys: [{ name: 'selfhost:user-kv/ws-a/app-a--a/default/key' }], list_complete: true })), get: vi.fn(async () => new Response('value').body) };
   const namespace = (stub: object) => ({ idFromName: (id: string) => `do-${id}`, get: vi.fn(() => stub) });
-  const testEnv = { ORG: namespace(org), WORKSPACE_FS: namespace(fs), CHAT_THREAD: namespace(chat), APP_KV: kv, R2_BUCKET: r2, ADMIN_API_KEY: 'test-key', AGENT_RUNTIME_URL: 'https://runtime.invalid', AGENT_RUNTIME_API_TOKEN: 'runtime-secret' } as unknown as Env;
+  const testEnv = { ORG: namespace(org), WORKSPACE_FS: namespace(fs), CHAT_THREAD: namespace(chat), APP_KV: kv, R2_BUCKET: r2, ADMIN_API_KEY: 'test-key', AGENT_RUNTIME_URL: 'https://runtime.invalid', AGENT_RUNTIME_API_TOKEN: 'runtime-secret', AGENT_RUNTIME_V2_API_TOKEN: 'v2-secret' } as unknown as Env;
   async function request(endpoint: string, method = 'GET', key = 'test-key') {
     const req = new Request(`http://local/api/admin/org-export/org-a${endpoint}`, { method, headers: { Authorization: `Bearer ${key}` } });
     return (await handleAdminApi({ req, env: testEnv, ctx: {} as ExecutionContext, url: new URL(req.url), match: [''] }))!;
@@ -81,6 +88,26 @@ describe('org export scope', () => {
     expect(await response.json()).toEqual({ entries: [{ index: 3, message }], next: 3 });
     expect(String(fetcher.mock.calls[0][0])).toContain('/v1/agents/agent-a/history?limit=2&maxBytes=2000000&before=12');
     expect(f.chat.readOrgExportHistory).not.toHaveBeenCalled();
+  });
+  it('pages v2 runtime history via /v2/agents/:id/history and returns empty mounts without calling v1', async () => {
+    const f = fixture();
+    const fetcher = vi.fn(async (_url: string) => Response.json({
+      messages: [{ seq: 5, createdAt: 1000, role: 'user', content: { text: 'hi' } }],
+      nextBefore: 4,
+    }));
+    vi.stubGlobal('fetch', fetcher);
+    const response = await f.request('/threads/thread-v2/history?before=10&limit=2');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      entries: [{ index: 5, message: { role: 'user', timestamp: 1000, content: 'hi' } }],
+      next: 4,
+    });
+    expect(String(fetcher.mock.calls[0][0])).toBe('https://run.camelai.com/v2/agents/agent-v2/history?before=10&limit=2');
+    fetcher.mockClear();
+    const volumes = await f.request('/threads/thread-v2/agents/agent-v2/volumes');
+    expect(volumes.status).toBe(200);
+    expect(await volumes.json()).toEqual({ items: [], cursor: null });
+    expect(fetcher).not.toHaveBeenCalled();
   });
   it('pages ChatThreadDO history and rejects invalid bounds', async () => {
     const f = fixture(); expect(await (await f.request('/threads/thread-do/history?limit=1')).json()).toMatchObject({ next: 2 });

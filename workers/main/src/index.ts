@@ -7,7 +7,6 @@
  * - /api/integrations/slack/events → Slack Events API webhook
  * - /api/integrations/telegram/webhook → Telegram Bot API webhook
  * - email() → Workspace email ingress (Cloudflare Email Routing)
- * - /agents/chat-thread/* → 410: the old in-DO chat transport (threads run on the agent runtime)
  * - * → React Router SSR
  */
 
@@ -26,7 +25,6 @@ import {
 // Route handlers
 import { handleAdminMcp } from './routes/admin-mcp.js';
 import { handleAgentMcp } from './routes/agent-mcp.js';
-import { handleAgentRuntimeLlm } from './routes/agent-runtime-llm.js';
 import { handleAgentRuntimeEvents } from './routes/agent-runtime-events.js';
 import { handleAgentRuntimeV2Events } from './routes/agent-runtime-v2-events.js';
 import { handleOAuthStart, handleOAuthCallback } from './routes/oauth.js';
@@ -63,7 +61,6 @@ export {
 export { ChatThreadDO } from './chat-thread-do.js';
 export { CodeModeToolsBinding } from './code-mode-tools.js';
 export { UserDO, OrgDO } from './auth.js';
-export { StagingV2Migration } from './agent-runtime/staging-v2-migration.js';
 export { EmailHandleDO } from './email-handle-registry.js';
 export { SignupDO } from './signup-do.js';
 export {
@@ -216,8 +213,6 @@ const routes: Route[] = [
   // MCP tools for the hosted agent runtime (runtime identity-token auth)
   { method: 'ALL', path: /^\/mcp\/agent$/, handler: handleAgentMcp },
   { method: 'ALL', path: /^\/mcp\/agent\/v2$/, handler: (context) => handleAgentMcp(context, 'v2') },
-  // The runtime's Codex calls: the one model route chiridion still forwards (same token)
-  { method: 'POST', path: /^\/agent-runtime\/llm\/openai-codex\/.+$/, handler: handleAgentRuntimeLlm },
   // The runtime's webhook events: runs, inputs and usage (Standard Webhooks signature)
   { method: 'POST', path: /^\/agent-runtime\/events$/, handler: handleAgentRuntimeEvents },
   { method: 'POST', path: /^\/agent-runtime\/events\/v2$/, handler: handleAgentRuntimeV2Events },
@@ -252,11 +247,7 @@ const routes: Route[] = [
   { method: 'GET', path: /^\/api\/integrations\/remote_mcp\/oauth$/, handler: handleRemoteMcpOAuthStart },
   { method: 'GET', path: /^\/api\/integrations\/remote_mcp\/callback$/, handler: handleRemoteMcpOAuthCallback },
 
-  // The old in-DO chat transport (WebSocket, SSE, polling, calls): every
-  // thread runs on the agent runtime now. A tab still open from before gets
-  // an answer its client heals from (see oldChatTransport).
-  { method: 'GET', path: /^\/agents\/chat-thread\/[^/]+$/, handler: async ({ req }) => oldChatTransport(req), websocket: true },
-  { method: 'ALL', path: /^\/agents\/chat-thread\//, handler: async ({ req }) => oldChatTransport(req) },
+  // Retired in-DO /agents/* routes return 404 instead of falling through to the SPA shell.
   { method: 'ALL', path: /^\/agents\//, handler: async () => text('Not Found', 404) },
 
   // Workspace thread-status SSE stream (replaces the status WebSocket).
@@ -276,35 +267,6 @@ const reactRouterHandler = createRequestHandler(
 // =============================================================================
 // Main Router
 // =============================================================================
-
-const CHAT_THREAD_MOVED = { status: 'moved', error: 'This conversation moved to the new chat engine; reload the page to continue it.' };
-
-/**
- * The old chat transport, for a tab whose page was loaded before the in-DO
- * loop was deleted. Its client (sse-agent-client) falls back from a failed
- * WebSocket to HTTP polling, and a poll that answers opens the connection,
- * which runs the page's version-skew check: the tab reloads itself (when no
- * draft or turn would be lost) or offers "camelAI has been updated, Reload".
- * So a poll answers an empty, well-formed batch (its cursor echoed, no
- * frames: the client keeps polling, cheaply, until it reloads), and a call
- * (a send) answers 503, which the client retries after reconnecting, keeping
- * the message. The WebSocket and the legacy SSE stream answer 410 "moved";
- * a 410 on a poll would read as "You no longer have access to this chat".
- */
-function oldChatTransport(req: Request): Response {
-  const url = new URL(req.url);
-  if (req.method === 'GET' && url.pathname.endsWith('/sse') && url.searchParams.get('transport') === 'poll') {
-    const cursor = Number(url.searchParams.get('cursor'));
-    return Response.json(
-      { cursor: Number.isSafeInteger(cursor) ? cursor : -1, frames: [] },
-      { headers: { 'Cache-Control': 'no-store' } },
-    );
-  }
-  if (req.method === 'POST' && url.pathname.endsWith('/call')) {
-    return Response.json(CHAT_THREAD_MOVED, { status: 503, headers: { 'Retry-After': '30' } });
-  }
-  return Response.json(CHAT_THREAD_MOVED, { status: 410 });
-}
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -342,13 +304,6 @@ export default {
   async scheduled(controller: ScheduledController, env: Env): Promise<void> {
     const { handleD1MirrorCron } = await import('./d1-mirror-cron.js');
     await handleD1MirrorCron(env, controller.scheduledTime);
-    // The cloud thread sweep, once an operator started it (agent-runtime/cloud-sweep.ts).
-    try {
-      const { runCloudSweepCron } = await import('./agent-runtime/cloud-sweep.js');
-      await runCloudSweepCron(env as unknown as Parameters<typeof runCloudSweepCron>[0]);
-    } catch (error) {
-      console.error('[runtime-migration-sweep] cron step failed', error);
-    }
   },
 
   async queue(

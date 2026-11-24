@@ -8,11 +8,17 @@
  * token after the caller checked access.
  */
 import { resolveMessageAuthorDisplayName } from "../../../../src/lib/message-author";
-import { SCRATCH_MOUNT, V2_BROWSER_SESSION, runtimeDirectThreadsEnabled as directThreadsEnabled, type RuntimeInputAnswer } from "../../../../src/lib/agent-runtime-shared";
+import {
+  SCRATCH_MOUNT,
+  V2_BROWSER_SESSION,
+  runtimeDirectThreadsEnabled as directThreadsEnabled,
+  v2RuntimeConfigured,
+  type RuntimeInputAnswer,
+} from "../../../../src/lib/agent-runtime-shared";
 import type { ChatContextState, ChatEnv } from "../chat-thread/types";
 import type { ThreadRuntimeRecord } from "../identity/org-do";
 import { ChatThreadMetadata, type ChatThreadMetadataEnv } from "../chat-thread/metadata";
-import { RUNTIME_PROMPT_VERSION, runtimeConfigured } from "./runtime-prompt";
+import { RUNTIME_PROMPT_VERSION } from "./runtime-prompt";
 import { isOrgBanned } from "../ban-list";
 import { injectFileSafetyMessage, isUnsafeUploadPath } from "../file-safety";
 import { parseUploadRefs } from "../../../../src/lib/chat-attachment-refs";
@@ -20,14 +26,10 @@ import { buildWorkspaceScopedR2Key } from "../../../../src/lib/workspace-r2-path
 import { applyMentionContext } from "../mention-context";
 import { WorkspaceFilesystemClient } from "../workspace-filesystem-do";
 import { HOSTED_KEY_SCOPE } from "./key-scopes";
-import { CAMEL_CODE_RUNTIME_MODEL, runtimeRunLimits, v2RouteSupported, v2WireKeyScope } from "./model-routes";
+import { CAMEL_CODE_RUNTIME_MODEL, runtimeRunLimits, v2WireKeyScope } from "./model-routes";
 import { retryTransientDurableObjectRpc } from "../../../../src/lib/do-rpc-retry.server";
-import { RuntimeApiError, runtimeApi, runtimeUrl, v2WorkspaceEnabled } from "./runtime-api";
-import { attachV2Uploads, createV2ThreadAgent, isV2NativeImageContentType, v2AgentPath, v2Json, type V2Agent, type V2Run } from "./runtime-v2";
-import { copyV1WorkspaceToV2Repo, readV1HistoryTotal, streamV1HistoryToV2 } from "./v1-history-copy";
-import { codexError, codexRoute, codexUpstreamCall, forwardedResponseHeaders } from "./codex-forwarder";
-import { HostedModelFallbackRequiredError } from "../chat-thread/pi-model-config";
-import { assertUserLlmUsageAccess, UserLlmUsageLimitError } from "../user-llm-usage-policy";
+import { RuntimeApiError, runtimeApi, runtimeUrl } from "./runtime-api";
+import { attachV2Uploads, createV2ThreadAgent, isV2NativeImageContentType, v2AgentPath, v2Json, type V2Run } from "./runtime-v2";
 import {
   prepareThreadRuntimeRun,
   resolveThreadRuntimeRoute,
@@ -67,12 +69,7 @@ export type RuntimeTurnResult =
   | { status: "accepted"; requestId: string; agentId: string; fallback: ThreadModelFallback | null }
   | { status: "busy" | "error"; error: string; code?: string };
 
-/** Whether this deployment can run threads on the runtime (its tenant, token and definition). */
-export function runtimeThreadsEnabled(env: Partial<ChatEnv>): boolean {
-  return runtimeConfigured(env as Parameters<typeof runtimeConfigured>[0]);
-}
-
-/** Whether threads run on the runtime here: its tenant is configured (every thread does then). */
+/** Whether threads run on the runtime here: either CamelRun v2 or self-host v1 is configured. */
 export function runtimeDirectThreadsEnabled(env: Partial<ChatEnv>): boolean {
   return directThreadsEnabled(env);
 }
@@ -87,7 +84,7 @@ export function runtimeDirectThreadsEnabled(env: Partial<ChatEnv>): boolean {
 export async function pinNewThreadToRuntime(
   env: ChatEnv,
   context: ChatContextState,
-  options: { pendingFirstMessage?: string | null; v2Eligible?: boolean } = {},
+  options: { pendingFirstMessage?: string | null } = {},
 ): Promise<ThreadRuntimeRecord | null> {
   if (!runtimeDirectThreadsEnabled(env)) return null;
   let route: Awaited<ReturnType<typeof resolveThreadRuntimeRoute>>["route"];
@@ -99,28 +96,17 @@ export async function pinNewThreadToRuntime(
   }
   if (!route) return null;
   const org = orgStub(env, context.orgId);
-  const canary = options.v2Eligible && v2WorkspaceEnabled(env, context.workspaceId) &&
-    v2RouteSupported(route, env);
   const firstMessage = options.pendingFirstMessage ?? null;
-  const pinned = canary
+  const pinned = v2RuntimeConfigured(env)
     ? await org.pinThreadRuntime(context.threadId, firstMessage, "v2")
     : await org.pinThreadRuntime(context.threadId, firstMessage);
   if (!pinned) return null;
   return await org.getThreadRuntime(context.threadId);
 }
 
-function v2RuntimeConfigured(env: ChatEnv): boolean {
-  return Boolean(
-    env.WORKER_BASE_URL &&
-    env.AGENT_RUNTIME_V2_TENANT &&
-    env.AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET,
-  );
-}
-
 /**
- * Promote a retired v1 thread row to CamelRun v2 on first open or send,
- * preserving its full v1 conversation history and /workspace files before
- * switching OrgDO to the v2 agent so users never hit HTTP 410 or lose history.
+ * Promote a dormant legacy v1 thread row to CamelRun v2 on first open or send,
+ * creating a v2 agent and switching OrgDO to it so users never hit retired v1.
  */
 export async function ensureLegacyThreadPromotedToV2(
   env: ChatEnv,
@@ -160,35 +146,6 @@ export async function ensureLegacyThreadPromotedToV2(
     agentKey,
     v2WireKeyScope(keyScope),
   );
-  if (v1AgentId) {
-    const sourcePath = `/v1/agents/${encodeURIComponent(v1AgentId)}`;
-    let totalMessages = 0;
-    try {
-      totalMessages = await readV1HistoryTotal(env, sourcePath);
-    } catch (error) {
-      if (!(error instanceof RuntimeApiError) || (error.status !== 404 && error.status !== 410)) {
-        throw error;
-      }
-    }
-    const workspace = await copyV1WorkspaceToV2Repo(env, v1AgentId, agentId).catch((error) => {
-      console.warn("[runtime-thread] v1 workspace copy skipped during auto-promote", { threadId: context.threadId, v1AgentId, error });
-      return undefined;
-    });
-    if (totalMessages > 0) {
-      const target = await v2Json<V2Agent & { messageCount?: number }>(env, v2AgentPath(agentId));
-      await streamV1HistoryToV2(
-        env,
-        context,
-        sourcePath,
-        agentId,
-        `chiridion-v1:${v1AgentId}`,
-        totalMessages,
-        `v1-auto-${context.threadId}`,
-        workspace,
-        target.messageCount ?? 0,
-      );
-    }
-  }
   const promoted = await onceMore("promote_v2", () =>
     org.promoteLegacyThreadToV2(context.threadId, {
       agentId,
@@ -201,93 +158,6 @@ export async function ensureLegacyThreadPromotedToV2(
       },
     }));
   return promoted ?? { ...row, runtimeVersion: "v2", agentId, model, keyScope };
-}
-
-/**
- * Recover a legacy v1 thread whose OrgDO row was promoted to v2 without importing
- * its v1 history/workspace: stages a fresh v2 agent, copies v1 workspace + full v1
- * history, then points OrgDO at the recovered v2 agent.
- */
-export async function recoverPromotedV1Thread(
-  env: ChatEnv,
-  orgId: string,
-  threadId: string,
-  v1AgentId: string,
-  force = false,
-): Promise<{
-  status: string;
-  agentId?: string;
-  v1AgentId: string;
-  messages?: number;
-  workspaceCopied?: boolean;
-}> {
-  if (!v2RuntimeConfigured(env)) return { status: "v2_not_configured", v1AgentId };
-  const org = orgStub(env, orgId);
-  const [thread, row] = await Promise.all([
-    org.getThread(threadId) as Promise<{ created_by?: string | null; workspace_id?: string | null } | null>,
-    org.getThreadRuntime(threadId),
-  ]);
-  if (!thread || !row) return { status: "missing", v1AgentId };
-  if (!force && row.configured?.migratedFromV1AgentId === v1AgentId) {
-    return { status: "already_recovered", agentId: row.agentId ?? undefined, v1AgentId };
-  }
-  const context: ChatContextState = {
-    orgId,
-    workspaceId: thread.workspace_id || "",
-    threadId,
-    userId: thread.created_by || null,
-    userName: null,
-    userEmail: null,
-  };
-  const subject = thread.created_by?.trim() || orgId;
-  let model = row.model || CAMEL_CODE_RUNTIME_MODEL;
-  let keyScope = row.keyScope ?? null;
-  const thinkingLevel = typeof row.configured?.thinkingLevel === "string" ? row.configured.thinkingLevel : "medium";
-  try {
-    const resolved = await resolveThreadRuntimeRoute(env, context);
-    if (resolved.route) {
-      model = resolved.route.model;
-      keyScope = resolved.route.kind === "scope" ? resolved.route.keyScope : null;
-    }
-  } catch {
-    // Keep existing model/keyScope
-  }
-  const sourcePath = `/v1/agents/${encodeURIComponent(v1AgentId)}`;
-  const totalMessages = await readV1HistoryTotal(env, sourcePath);
-  const agentKey = `chiridion-thread-${threadId}-v1rec${force ? `-${Date.now()}` : ""}`;
-  const agentId = await createV2ThreadAgent(
-    env,
-    context,
-    subject,
-    model,
-    agentKey,
-    v2WireKeyScope(keyScope),
-  );
-  const workspace = await copyV1WorkspaceToV2Repo(env, v1AgentId, agentId).catch(() => undefined);
-  const target = await v2Json<V2Agent & { messageCount?: number }>(env, v2AgentPath(agentId));
-  await streamV1HistoryToV2(
-    env,
-    context,
-    sourcePath,
-    agentId,
-    `chiridion-v1:${v1AgentId}`,
-    totalMessages,
-    `v1-recover-${threadId}`,
-    workspace,
-    target.messageCount ?? 0,
-  );
-  await org.replaceThreadRuntimeV2Agent(threadId, {
-    agentId,
-    model,
-    keyScope,
-    configured: {
-      ...(row.configured ?? {}),
-      thinkingLevel,
-      promptVersion: RUNTIME_PROMPT_VERSION,
-      migratedFromV1AgentId: v1AgentId,
-    },
-  });
-  return { status: "recovered", agentId, v1AgentId, messages: totalMessages, workspaceCopied: Boolean(workspace) };
 }
 
 function orgStub(env: ChatEnv, orgId: string) {
@@ -308,12 +178,6 @@ function orgStub(env: ChatEnv, orgId: string) {
       configured?: Record<string, unknown> | null;
     }): Promise<ThreadRuntimeRecord | null>;
     promoteLegacyThreadToV2(threadId: string, update: {
-      agentId: string;
-      model: string | null;
-      keyScope: string | null;
-      configured?: Record<string, unknown> | null;
-    }): Promise<ThreadRuntimeRecord | null>;
-    replaceThreadRuntimeV2Agent(threadId: string, update: {
       agentId: string;
       model: string | null;
       keyScope: string | null;
@@ -771,10 +635,6 @@ async function sendRuntimeTurn(
     if (error instanceof RuntimeApiError && error.status === 429) {
       return { status: "busy", error: "The agent has too many messages queued; try again when it finishes." };
     }
-    if ((input.source === "discord" || input.source === "telegram") &&
-        error instanceof RuntimeApiError && error.code === "AGENT_V2_CUTOVER") {
-      return { status: "busy", error: "The agent is moving to the new runtime. Retry with the same message ID." };
-    }
     throw error;
   }
   // A retry of a request that already finished starts no run, whose events
@@ -942,61 +802,6 @@ export async function abortRuntimeThread(env: ChatEnv, agentId: string, runtimeV
   } else {
     await runtimeApi(env, "POST", `/v1/agents/${encodeURIComponent(agentId)}/abort`);
   }
-}
-
-/**
- * One Codex call of a runtime thread's agent (routes/agent-runtime-llm.ts),
- * as ChatThreadDO.runtimeProviderRequest does it for the threads it hosts:
- * the acting user's limits, the org's ChatGPT subscription swapped in for the
- * runtime's credentials, and the bytes passed through both ways.
- */
-export async function forwardRuntimeThreadCodexCall(
-  env: ChatEnv,
-  request: { provider: string; path: string; search: string; method: string; headers: [string, string][]; body: ArrayBuffer | null },
-  caller: { orgId: string; workspaceId: string; threadId: string; userId: string },
-): Promise<Response> {
-  if (request.provider !== "openai-codex") {
-    return codexError(404, `chiridion forwards only openai-codex, not ${request.provider}`, "not_found");
-  }
-  const context: ChatContextState = { ...caller, userName: null, userEmail: null };
-  let config: Awaited<ReturnType<typeof resolveThreadRuntimeRoute>>["config"];
-  try {
-    ({ config } = await resolveThreadRuntimeRoute(env, context));
-    if (caller.userId) {
-      await assertUserLlmUsageAccess(env.ORG.get(env.ORG.idFromName(caller.orgId)) as never, {
-        env,
-        orgId: caller.orgId,
-        workspaceId: caller.workspaceId,
-        threadId: caller.threadId,
-        userId: caller.userId,
-        provider: config.usageProvider || config.model.provider,
-        model: config.model.id,
-      });
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (error instanceof UserLlmUsageLimitError) return codexError(429, message, "usage_limit");
-    if (error instanceof HostedModelFallbackRequiredError) return codexError(402, message, "insufficient_credits");
-    throw error;
-  }
-  const route = codexRoute(config);
-  if (!route) {
-    return codexError(409, "This thread's model no longer uses the ChatGPT subscription; send the message again.", "route_mismatch");
-  }
-  const body = request.body ? new Uint8Array(request.body) : new Uint8Array(0);
-  const call = codexUpstreamCall(route, request.path, request.search, request.headers, body);
-  if ("error" in call) return codexError(409, call.error, "route_mismatch");
-  const upstream = await fetch(call.url, {
-    method: request.method,
-    headers: call.headers,
-    // The bytes as the runtime sent them (zstd).
-    body: body.byteLength > 0 ? body : undefined,
-  });
-  return new Response(upstream.body, {
-    status: upstream.status,
-    statusText: upstream.statusText,
-    headers: forwardedResponseHeaders(upstream.headers),
-  });
 }
 
 /**

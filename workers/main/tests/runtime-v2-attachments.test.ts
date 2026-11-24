@@ -11,7 +11,6 @@ import { env } from "cloudflare:test";
 import { CAMEL_CODE_LLM_MODEL } from "../../../src/lib/llm-provider-config";
 import { buildWorkspaceScopedR2Key } from "../../../src/lib/workspace-r2-paths";
 import type { ChatContextState, ChatEnv } from "../src/chat-thread/types";
-import { CAMEL_CODE_RUNTIME_MODEL } from "../src/agent-runtime/model-routes";
 import { attachV2Uploads, V2_REQUEST_IMAGE_BYTES } from "../src/agent-runtime/runtime-v2";
 import { startRuntimeTurn } from "../src/agent-runtime/thread-runtime";
 import { createOrg, createUser, type TestEnv } from "./test-helpers";
@@ -82,7 +81,6 @@ function baseV2Env(overrides: Partial<ChatEnv> = {}): ChatEnv {
     AGENT_RUNTIME_V2_TENANT: "test-v2",
     AGENT_RUNTIME_V2_API_TOKEN: "test-v2-key",
     AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET: "test-v2-secret",
-    AGENT_RUNTIME_V2_ADDITIONAL_MODELS: CAMEL_CODE_RUNTIME_MODEL,
     CF_ACCOUNT_ID: "acct",
     CF_GATEWAY_NAME: "gw",
     AI_GATEWAY_AUTH_TOKEN: "gw-token",

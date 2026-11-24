@@ -580,13 +580,6 @@ export async function syncV2KeyScope(
   syncedV2Here.set(scope, { print, at: Date.now() });
 }
 
-export async function ensureV2HostedKeyScope(env: ChatEnv): Promise<boolean> {
-  const providers = hostedScopeProviders(env);
-  if (!providers) return false;
-  await syncV2KeyScope(env, HOSTED_KEY_SCOPE, { providers });
-  return true;
-}
-
 export async function syncV2OrgKeyScope(
   env: ChatEnv,
   orgId: string,

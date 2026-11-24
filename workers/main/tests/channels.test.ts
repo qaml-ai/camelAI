@@ -106,14 +106,12 @@ describe("channels", () => {
   });
 
   it.each([
-    ["discord", CAMEL_CODE_LLM_MODEL, true, true],
-    ["telegram", CAMEL_CODE_LLM_MODEL, true, true],
-    ["discord", "gpt-6-luna", true, false],
-    ["telegram", "gpt-6-luna", true, false],
-    ["slack", CAMEL_CODE_LLM_MODEL, true, false],
-    ["discord", CAMEL_CODE_LLM_MODEL, undefined, false],
-    ["telegram", CAMEL_CODE_LLM_MODEL, undefined, false],
-  ] as const)("checks v2 eligibility for a new %s thread on %s (inbound: %s)", async (kind, model, inbound, v2Eligible) => {
+    ["discord", CAMEL_CODE_LLM_MODEL, true],
+    ["telegram", CAMEL_CODE_LLM_MODEL, true],
+    ["discord", "gpt-6-luna", true],
+    ["slack", CAMEL_CODE_LLM_MODEL, true],
+    ["discord", CAMEL_CODE_LLM_MODEL, undefined],
+  ] as const)("pins a new %s thread on %s (inbound: %s) to the runtime", async (kind, model, inbound) => {
     const kv = createMockKvStore();
     const orgStub = {
       getLlmProviderConfig: vi.fn().mockResolvedValue(null),
@@ -144,9 +142,9 @@ describe("channels", () => {
     });
     expect(pinNewThreadToRuntimeMock).toHaveBeenCalledExactlyOnceWith(env, expect.objectContaining({
       orgId: "org-1", workspaceId: "ws-1", threadId: "thread-9",
-    }), { v2Eligible });
+    }));
 
-    if (v2Eligible) {
+    if (inbound === true && (kind === "discord" || kind === "telegram")) {
       startChannelRuntimeTurnMock.mockResolvedValue({ status: "accepted" });
       const send = async (threadId: string, clientMessageId: string) => {
         return await enqueueChannelMessage(env, {
@@ -568,7 +566,7 @@ describe("channels", () => {
     // A new thread for the same channel conversation, pinned, and the mapping points at it.
     expect(createThread).toHaveBeenCalledOnce();
     expect(pinNewThreadToRuntimeMock).toHaveBeenCalledWith(
-      expect.anything(), expect.objectContaining({ threadId: "thread-new" }), { v2Eligible: false },
+      expect.anything(), expect.objectContaining({ threadId: "thread-new" }),
     );
     expect(kv._store.get(getChannelThreadMapKey(address))).toBe("thread-new");
     // The message ran there, its first message carrying a note linking the old thread.

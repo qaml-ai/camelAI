@@ -30,10 +30,18 @@ describe("runtime request ids", () => {
 });
 
 describe("runtimeDirectThreadsEnabled", () => {
-  const tenant = { AGENT_RUNTIME_API_TOKEN: "t", AGENT_RUNTIME_TENANT: "x", AGENT_RUNTIME_DEFINITION: "d" };
-  it("is on wherever the runtime tenant is configured (every thread runs there)", () => {
-    expect(runtimeDirectThreadsEnabled(tenant)).toBe(true);
-    expect(runtimeDirectThreadsEnabled({ ...tenant, AGENT_RUNTIME_DEFINITION: "" })).toBe(false);
+  const v1 = { AGENT_RUNTIME_API_TOKEN: "t", AGENT_RUNTIME_TENANT: "x", AGENT_RUNTIME_DEFINITION: "d" };
+  const v2 = {
+    WORKER_BASE_URL: "https://camelai.dev",
+    AGENT_RUNTIME_V2_TENANT: "t-v2",
+    AGENT_RUNTIME_V2_API_TOKEN: "key-v2",
+    AGENT_RUNTIME_V2_EVENTS_WEBHOOK_SECRET: "whsec_v2",
+  };
+  it("is on wherever CamelRun v2 or self-host v1 is configured", () => {
+    expect(runtimeDirectThreadsEnabled(v1)).toBe(true);
+    expect(runtimeDirectThreadsEnabled(v2)).toBe(true);
+    expect(runtimeDirectThreadsEnabled({ ...v1, AGENT_RUNTIME_DEFINITION: "" })).toBe(false);
+    expect(runtimeDirectThreadsEnabled({ ...v2, AGENT_RUNTIME_V2_API_TOKEN: "" })).toBe(false);
     expect(runtimeDirectThreadsEnabled({})).toBe(false);
   });
 });

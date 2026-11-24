@@ -35,7 +35,7 @@ export const DEFAULT_AGENT_RUNTIME_POSTGRES_PORT = "15432";
 
 /** The definition every chat thread's agent is made from. */
 export const THREAD_DEFINITION_KEY = "camelai-thread";
-/** The events chiridion's /agent-runtime/events handles (scripts/agent-runtime-webhook.sh). */
+/** The events chiridion's /agent-runtime/events handles. */
 export const RUNTIME_WEBHOOK_EVENTS = [
   "run.started",
   "run.completed",

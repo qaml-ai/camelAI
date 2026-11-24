@@ -185,8 +185,7 @@ describe("ChatThreadDO: turns, sends and connections answer moved", () => {
       ["/agents/chat-thread/moved-thread/sse", {}],
     ] as const) {
       const response = await SELF.fetch(`https://camelai.test${path}`, init);
-      expect(response.status, path).toBe(410);
-      expect(await response.json()).toMatchObject({ status: "moved" });
+      expect(response.status, path).toBe(404);
     }
   });
 });

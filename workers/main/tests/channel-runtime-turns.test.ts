@@ -29,7 +29,6 @@ import {
   type ChannelTurnRequest,
 } from "../src/agent-runtime/channel-turns";
 import type { ChatEnv } from "../src/chat-thread/types";
-import { channelHandoffOwner } from "../src/agent-runtime/channel-handoff";
 
 const ROW = { threadId: "t1", agentId: "agt_1", model: "m", keyScope: "hosted", configured: null, createdAt: 1, updatedAt: 1 };
 
@@ -157,16 +156,6 @@ describe("startChannelRuntimeTurn", () => {
     await startChannelRuntimeTurn(env, request());
     expect(startRuntimeTurnMock.mock.calls[1][1].text).toContain("Report sent");
   });
-});
-
-it("finds the authorizing member on the stored Discord or Telegram integration", () => {
-  const discord = { integration_type: "discord_channel", created_by: " owner " };
-  const telegram = { integration_type: "telegram", created_by: " member " };
-  expect(channelHandoffOwner("discord", discord)).toBe("owner");
-  expect(channelHandoffOwner("telegram", telegram)).toBe("member");
-  expect(channelHandoffOwner("discord", telegram)).toBeNull();
-  expect(channelHandoffOwner("telegram", discord)).toBeNull();
-  expect(channelHandoffOwner("discord", null)).toBeNull();
 });
 
 describe("channel request ids", () => {

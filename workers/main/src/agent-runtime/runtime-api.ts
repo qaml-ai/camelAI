@@ -31,26 +31,15 @@ export function retryAfterMs(header: string | null | undefined, now = Date.now()
 }
 
 export function runtimeUrl(env: RuntimeApiEnv): string {
-  return (env.AGENT_RUNTIME_URL || "https://agents.camelai.dev").replace(/\/+$/, "");
+  const url = env.AGENT_RUNTIME_URL?.trim();
+  if (!url) throw new RuntimeApiError("AGENT_RUNTIME_URL is not configured", 503, "not_configured");
+  return url.replace(/\/+$/, "");
 }
 
 export function v2RuntimeUrl(env: { WORKER_BASE_URL?: string }): string {
   return env.WORKER_BASE_URL === "https://staging.camelai.dev"
     ? "https://camelrun-v2-chiridion-staging.miguel-85b.workers.dev/v2"
     : "https://run.camelai.com/v2";
-}
-
-export function v2WorkspaceEnabled(
-  env: { WORKER_BASE_URL?: string; AGENT_RUNTIME_V2_WORKSPACE?: string },
-  workspaceId: string | undefined,
-): boolean {
-  const selected = env.AGENT_RUNTIME_V2_WORKSPACE?.trim();
-  if (selected === "*") {
-    if (env.WORKER_BASE_URL === "https://staging.camelai.dev") return true;
-    return env.WORKER_BASE_URL === "https://camelai.dev" && Boolean(workspaceId);
-  }
-  if (selected === "all") return Boolean(workspaceId);
-  return Boolean(workspaceId && selected?.split(",").some((entry) => entry.trim() === workspaceId));
 }
 
 /**

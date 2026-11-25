@@ -667,22 +667,6 @@ export async function adminTransferOrgOwnership(
   await oldOwnerStub.updateOrgRole(orgId, "admin");
 }
 
-export async function adminAddOrgMember(
-  env: AuthEnv,
-  orgId: string,
-  userId: string,
-  role: "admin" | "member",
-  actorId: string,
-): Promise<void> {
-  const orgStub = env.ORG.get(env.ORG.idFromName(orgId));
-  await orgStub.addMember(userId, role, actorId);
-  const workspaces = await listOrgWorkspaces(env, orgId);
-  const lastWorkspaceId = workspaces[0]?.id ?? null;
-  const userStub = env.USER.get(env.USER.idFromName(userId));
-  await userStub.addOrg(orgId, role, lastWorkspaceId);
-  await userStub.setOrphaned(false);
-}
-
 export async function adminForceOrphanUser(
   env: AuthEnv,
   userId: string,

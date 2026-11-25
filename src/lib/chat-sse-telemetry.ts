@@ -371,32 +371,6 @@ export function trackChatStreamError(threadId: string, error?: unknown): void {
   });
 }
 
-/** The transport hit a terminal denial and will NOT reconnect — from the
- * user's perspective the thread is dead until a manual refresh. */
-export function trackChatStreamTerminalClose(
-  threadId: string,
-  error: { code?: number; reason?: string; wasClean?: boolean },
-): void {
-  const stats = statsFor(threadId);
-  const code = typeof error.code === "number" ? error.code : null;
-  reportClientEvent({
-    source: "chat_sse",
-    event: "chat_sse_terminal_close",
-    severity: "error",
-    status: code !== null ? String(code) : "terminal",
-    statusCode: code ?? undefined,
-    message: "Chat SSE stream closed terminally; client will not reconnect.",
-    threadId,
-    details: {
-      ...connectionContext(),
-      ...lifecycleCounts(stats),
-      code,
-      reason: error.reason || undefined,
-      wasClean: error.wasClean,
-    },
-  });
-}
-
 /** A reconnect flushed user messages that were composed while disconnected. */
 export function trackChatReconnectFlush(threadId: string, count: number): void {
   const stats = statsFor(threadId);
@@ -527,44 +501,6 @@ export function trackChatSendDispatched(opts: {
       });
     },
   };
-}
-
-/** The busy indicator has seen zero stream progress for `sinceMs` while the
- * hook still reports an active turn — early warning for a dead receive path. */
-export function reportChatStreamNoProgress(
-  threadId: string | undefined,
-  sinceMs: number,
-  status: string,
-): void {
-  reportClientEvent({
-    source: "chat_runner",
-    event: "chat_stream_no_progress",
-    severity: "warn",
-    status,
-    message: "Busy turn has made no observable stream progress.",
-    threadId: threadId ?? null,
-    durationMs: sinceMs,
-    details: connectionContext(),
-  });
-}
-
-/** The stall clamp fired: the stream was provably dead for the full stale
- * bound and the busy indicator was force-cleared. */
-export function reportChatStreamStallClamped(
-  threadId: string | undefined,
-  sinceMs: number,
-  status: string,
-): void {
-  reportClientEvent({
-    source: "chat_runner",
-    event: "chat_stream_stall_clamped",
-    severity: "error",
-    status,
-    message: "Stream stall clamp fired: busy with no progress past the bound.",
-    threadId: threadId ?? null,
-    durationMs: sinceMs,
-    details: connectionContext(),
-  });
 }
 
 /**

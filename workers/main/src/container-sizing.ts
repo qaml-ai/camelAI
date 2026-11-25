@@ -68,11 +68,9 @@ export const PROJECT_BUILD_ACTIVE_SESSION_MAX_WINDOW_MS = 30 * 60_000;
  */
 export const ANALYSIS_IDLE_TIMEOUT_MS = 5 * 60_000;
 
-/** Single-shot queries/exports; sleep promptly when the workspace goes quiet. */
-export const DB_QUERY_SLEEP_AFTER = "2m";
-
 /**
- * The same 2m idle window as a number, for the native-container db-query
- * container (DbQueryContainer), which sets it through `setInactivityTimeout()`.
+ * Single-shot queries/exports; sleep promptly when the workspace goes quiet.
+ * Applied to the native-container db-query container (DbQueryContainer) via
+ * `setInactivityTimeout()`.
  */
 export const DB_QUERY_IDLE_TIMEOUT_MS = 2 * 60_000;

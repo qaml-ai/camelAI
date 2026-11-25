@@ -71,15 +71,6 @@ export interface PiResolvedModelConfig {
   usageProvider: string;
 }
 
-/**
- * Mirror Pi's transformMessages image capability check. Pi replaces typed image
- * blocks for these models at request time; we use the same predicate earlier to
- * discard inline image data URLs before they bloat the persisted agent context.
- */
-export function isPiImageBlindModel(model: Pick<Model<any>, "input"> | null | undefined): boolean {
-  return !model?.input?.includes("image");
-}
-
 export interface ResolvePiModelDeps {
   env: ChatEnv;
   modelMapping: PiModelMapping;

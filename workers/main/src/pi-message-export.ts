@@ -94,43 +94,10 @@ export function piCoreMessageToParsedChatMessage(
   return [];
 }
 
-export function piCoreForkMessageIds(message: AgentMessage, index: number): string[] {
-  const record = message as unknown as Record<string, unknown>;
-  const role = record.role;
-  const timestamp = typeof record.timestamp === "number" && Number.isFinite(record.timestamp)
-    ? record.timestamp
-    : Date.now();
-  const ids: string[] = [];
-
-  if (role === "user") {
-    ids.push(`pi_user_${timestamp}_${index}`);
-  } else if (role === "assistant") {
-    const responseId = typeof record.responseId === "string" && record.responseId.trim()
-      ? record.responseId.trim()
-      : `pi_assistant_${timestamp}_${index}`;
-    ids.push(responseId);
-  }
-
-  if (typeof record.id === "string" && record.id.trim()) {
-    ids.push(record.id.trim());
-  }
-  return Array.from(new Set(ids));
-}
-
 export function isInternalPiClientMessage(message: unknown): boolean {
   if (!message || typeof message !== "object") return false;
   const record = message as Record<string, unknown>;
   return record.visibility === "hidden";
-}
-
-export function isCompactSummaryPiMessage(message: unknown): boolean {
-  if (!message || typeof message !== "object") return false;
-  const record = message as Record<string, unknown>;
-  if (record.isCompactSummary === true || record.isMeta === true) return true;
-  const metadata = record.metadata;
-  if (!metadata || typeof metadata !== "object") return false;
-  const meta = metadata as Record<string, unknown>;
-  return meta.compactSummary === true || meta.isCompactSummary === true;
 }
 
 export function piUserContentToChatContent(content: unknown): unknown {

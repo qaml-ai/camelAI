@@ -257,7 +257,6 @@ interface CodeModeMoveFile {
 
 export const CODE_MODE_COMPATIBILITY_DATE = "2026-05-11";
 export const CODE_MODE_MAX_TIMEOUT_MS = 600_000;
-export const CODE_MODE_DEFAULT_TIMEOUT_MS = CODE_MODE_MAX_TIMEOUT_MS;
 export const CODE_MODE_DEFAULT_MAX_OUTPUT_CHARACTERS = 60_000;
 export const CODE_MODE_MAX_OUTPUT_CHARACTERS = 200_000;
 const CODE_MODE_R2_READ_NOTICE_RESERVED_BYTES = 1024;
@@ -377,12 +376,6 @@ function listPage(args: Record<string, unknown>): { limit: number; offset: numbe
     limit: clampCodeModeInteger(args.limit, 20, 1, 100),
     offset: clampCodeModeInteger(args.offset, 0, 0, Number.MAX_SAFE_INTEGER),
   };
-}
-
-export function truncateCodeModeText(value: unknown, maxCharacters: number): string {
-  const text = String(value ?? "");
-  if (text.length <= maxCharacters) return text;
-  return `${text.slice(0, maxCharacters)}\n\n[Truncated: ${maxCharacters} of ${text.length} characters]`;
 }
 
 /**

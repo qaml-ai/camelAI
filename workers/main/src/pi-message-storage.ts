@@ -26,42 +26,14 @@ export function piUnsupportedImageText(mimeType: unknown): string {
   return `(image omitted: unsupported MIME type ${label})`;
 }
 
-export interface PiInlineImageDataStripResult {
-  text: string;
-  count: number;
-  bytes: number;
-}
-
-/** Remove inline image data URLs for model routes that cannot inspect images. */
-export function stripPiInlineImageDataUrls(text: string): PiInlineImageDataStripResult {
-  let count = 0;
-  let bytes = 0;
-  const stripped = text.replace(
-    /data:image\/[a-z0-9.+-]+(?:;[a-z0-9=.+-]+)*;base64,([A-Za-z0-9+/_=-]+)/gi,
-    (_match, data: string) => {
-      count += 1;
-      const imageBytes = Math.floor((data.length * 3) / 4);
-      bytes += imageBytes;
-      return `[inline image omitted: ${imageBytes} bytes; active model cannot inspect images]`;
-    },
-  );
-  return { text: stripped, count, bytes };
-}
-
-export const PI_SQLITE_STORAGE_SOFT_LIMIT_CHARS = 1_500_000;
 export const PI_MAX_PERSISTED_IMAGE_DATA_CHARS = 512_000;
 export const PI_MAX_PERSISTED_TEXT_CHARS = 200_000;
 export const PI_R2_IMAGE_REF_METADATA_KEY = "chiridionR2Image";
 export const PI_TOOL_RESULT_MAX_LINES = 2_000;
 export const PI_TOOL_RESULT_MAX_BYTES = 50 * 1024;
-export const PI_TOOL_RESULT_R2_REF_METADATA_KEY = "chiridionR2ToolResult";
 export const PI_TOOL_DETAILS_MAX_BYTES = 32 * 1024;
 export const PI_TOOL_DETAILS_MAX_ITEMS = 128;
 export const PI_TOOL_DETAILS_MAX_DEPTH = 6;
-// Tools whose oversized output is truncated from the head (keeping the most
-// recent lines) rather than the tail. Empty now that the shell `bash` tool is
-// gone; kept as an extension point for future streaming/log-style tools.
-export const PI_TAIL_TRUNCATED_TOOL_NAMES = new Set<string>();
 
 /**
  * Where an image reference came from, and therefore what it is allowed to do.
@@ -121,11 +93,6 @@ export interface PiSqlStorageStats {
   storedChars: number;
 }
 
-export interface PiSqlStorageSerialization {
-  payload: string;
-  stats: PiSqlStorageStats;
-}
-
 export function hasPiR2ImageReferenceMetadata(record: Record<string, unknown>): boolean {
   const metadata = record.metadata;
   if (!metadata || typeof metadata !== "object") return false;
@@ -148,17 +115,6 @@ export function piLargeImageStorageText(mimeType: unknown, dataChars: number): s
       ? mimeType.trim()
       : "unknown MIME type";
   return `(image data omitted from persisted transcript: ${label}, ${dataChars} base64 chars)`;
-}
-
-export function emptyPiSqlStorageStats(): PiSqlStorageStats {
-  return {
-    omittedImages: 0,
-    externalizedImages: 0,
-    truncatedStrings: 0,
-    omittedWholeMessage: false,
-    originalChars: 0,
-    storedChars: 0,
-  };
 }
 
 export function truncatePiStorageString(value: string, stats?: PiSqlStorageStats): string {
@@ -475,36 +431,4 @@ export function preparePiMessageForSqlStorage(message: AgentMessage, stats?: PiS
     next = { ...next, details: projectPiToolResultDetails(record.details) };
   }
   return shrinkPiValueForSqlStorage(next, 0, stats) as AgentMessage;
-}
-
-export function serializePiMessageForSqlStorageDetailed(message: AgentMessage): PiSqlStorageSerialization {
-  const stats = emptyPiSqlStorageStats();
-  let prepared = preparePiMessageForSqlStorage(message, stats);
-  let serialized = JSON.stringify(prepared);
-  // Avoid materializing the unbounded source solely for diagnostics.
-  stats.originalChars = serialized.length;
-  if (serialized.length <= PI_SQLITE_STORAGE_SOFT_LIMIT_CHARS) {
-    stats.storedChars = serialized.length;
-    return { payload: serialized, stats };
-  }
-
-  prepared = shrinkPiValueForSqlStorage(prepared, 4, stats) as AgentMessage;
-  serialized = JSON.stringify(prepared);
-  if (serialized.length <= PI_SQLITE_STORAGE_SOFT_LIMIT_CHARS) {
-    stats.storedChars = serialized.length;
-    return { payload: serialized, stats };
-  }
-
-  stats.omittedWholeMessage = true;
-  const payload = JSON.stringify({
-    role: (message as unknown as Record<string, unknown>).role ?? "user",
-    content: `[message omitted from persisted transcript: serialized size ${serialized.length} chars exceeded storage safety limit]`,
-    timestamp:
-      typeof (message as unknown as Record<string, unknown>).timestamp === "number"
-        ? (message as unknown as Record<string, unknown>).timestamp
-        : Date.now(),
-    metadata: { storageOmitted: true },
-  });
-  stats.storedChars = payload.length;
-  return { payload, stats };
 }

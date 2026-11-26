@@ -81,10 +81,11 @@ export class DynamicServiceBroker extends WorkerEntrypoint<Env> {
       throw new Error(`Virtual service entrypoint is not exported on chiridion-app: ${serviceName}`);
     }
     const stub = factory({ props });
-    const fn = stub?.[method];
-    if (typeof fn !== 'function') {
+    if (!stub || typeof stub[method] !== 'function') {
       throw new Error(`Method ${method} not found on ${serviceName}`);
     }
-    return fn.apply(stub, args);
+    // IMPORTANT: Call directly as `stub[method](...args)` — never `fn.apply(stub, args)`.
+    // On Cloudflare Workers JSRPC stubs, `.apply` is intercepted as a remote RPC method name.
+    return stub[method](...args);
   }
 }

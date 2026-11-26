@@ -4,6 +4,7 @@
 
 import { type Env } from '../types.js';
 import type { DeploySideEffectsInfo } from '../cf-api-proxy.js';
+import type { DynamicWorkerRegistryFields } from '../dynamic-worker-registry.js';
 import type { AppScreenshotJob } from '../screenshot-queue.js';
 import {
   resolveEnvPrefix,
@@ -87,9 +88,9 @@ export async function refreshAppRegistryAfterDeploy(
   info: DeploySideEffectsInfo,
   isPublic?: boolean,
 ): Promise<void> {
-  const { scriptName, dispatchScriptName, orgId, orgSlug, workspaceId, artifactCacheKey, scriptVersion } = info;
+  const { scriptName, dispatchScriptName, orgId, orgSlug, workspaceId, artifactCacheKey, scriptVersion, dynamicBundle } = info;
   const primaryRegistryKey = `${SCRIPT_PREFIX}${dispatchScriptName}`;
-  let existingRegistry: (UsageGuardRegistryFields & { org_id?: string; org_slug?: string; is_public?: boolean }) | null = null;
+  let existingRegistry: (UsageGuardRegistryFields & DynamicWorkerRegistryFields & { org_id?: string; org_slug?: string; is_public?: boolean }) | null = null;
   try {
     const stored = await env.APP_KV.get(primaryRegistryKey);
     existingRegistry = stored ? JSON.parse(stored) : null;
@@ -131,10 +132,32 @@ export async function refreshAppRegistryAfterDeploy(
     };
   }
 
+  const existingDynamicFields: DynamicWorkerRegistryFields = existingRegistry?.runtime_mode
+    ? {
+        runtime_mode: existingRegistry.runtime_mode,
+        ...(existingRegistry.bundle_r2_key ? { bundle_r2_key: existingRegistry.bundle_r2_key } : {}),
+        ...(existingRegistry.bundle_sha ? { bundle_sha: existingRegistry.bundle_sha } : {}),
+        ...(existingRegistry.env_version !== undefined ? { env_version: existingRegistry.env_version } : {}),
+        ...(existingRegistry.quota_tier ? { quota_tier: existingRegistry.quota_tier } : {}),
+        ...(existingRegistry.do_classes ? { do_classes: existingRegistry.do_classes } : {}),
+        ...(existingRegistry.has_assets !== undefined ? { has_assets: existingRegistry.has_assets } : {}),
+        ...(existingRegistry.migrated_at ? { migrated_at: existingRegistry.migrated_at } : {}),
+      }
+    : {};
+  const mergedDynamicFields: DynamicWorkerRegistryFields = dynamicBundle
+    ? { ...existingDynamicFields, ...dynamicBundle }
+    : existingDynamicFields;
+
   // Store in KV with namespaced key: script:{script-name}--{org-slug}
   // This allows the dispatcher to look up access info by dispatchScriptName
   await env.APP_KV.put(
     primaryRegistryKey,
-    JSON.stringify({ org_id: orgId, org_slug: orgSlug, is_public: isPublic ?? existingRegistry?.is_public ?? false, ...usageGuardFields })
+    JSON.stringify({
+      org_id: orgId,
+      org_slug: orgSlug,
+      is_public: isPublic ?? existingRegistry?.is_public ?? false,
+      ...usageGuardFields,
+      ...mergedDynamicFields,
+    }),
   );
 }

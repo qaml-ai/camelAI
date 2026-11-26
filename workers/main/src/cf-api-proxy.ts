@@ -8,6 +8,7 @@
  */
 
 import type { OrgDO } from "./auth.js";
+import type { DynamicWorkerRegistryFields } from "./dynamic-worker-registry.js";
 import type { WorkspaceDO } from "./workspace.js";
 import type { WorkspaceFilesystemDO } from "./workspace-filesystem-do.js";
 
@@ -203,6 +204,8 @@ export interface DeploySideEffectsInfo {
   artifactCacheKey?: string;
   /** Cloudflare deployment/version id returned by the successful upload. */
   scriptVersion?: string;
+  /** Populated when the deploy published to the Dynamic Workers runtime. */
+  dynamicBundle?: DynamicWorkerRegistryFields;
 }
 
 /**

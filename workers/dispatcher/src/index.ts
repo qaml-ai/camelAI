@@ -53,6 +53,8 @@ import {
 import { getSessionCookieName } from '../../main/src/cookies';
 import { parseSignedSession } from '../../main/src/signed-session';
 import type { OrgDO } from '../../main/src/auth';
+import type { WorkerLogsDO } from '../../main/src/worker-logs-do';
+import { isDynamicRuntimeMode } from '../../main/src/dynamic-worker-registry';
 import {
   selfhostWorkerKey,
   type SelfhostWorkerModule,
@@ -62,6 +64,9 @@ import {
   PLATFORM_DISPATCH_SCRIPT_HEADER,
   PLATFORM_DISPATCH_SCRIPT_NAME_HEADER,
 } from '../../main/src/workspace-app-fetcher.js';
+import { dispatchDynamicWorkerEdge } from './dynamic/edge-dispatch';
+import type { DynamicRuntimeExports } from './dynamic/bundle-store';
+import type { TenantObjectSupervisorDO } from './dynamic/supervisor-do';
 export { AIVirtualBinding } from '../../main/src/ai-virtual-binding';
 export { AssetsVirtualBinding } from '../../main/src/assets-virtual-binding';
 export { CamelAiService } from '../../main/src/camelai-service';
@@ -69,6 +74,15 @@ export { ConnectionsService } from '../../main/src/connections-service';
 export { DataProxyService } from '../../main/src/data-proxy-service';
 export { KVVirtualNamespace } from '../../main/src/kv-virtual-namespace';
 export { R2VirtualBucket } from '../../main/src/r2-virtual-bucket';
+export { TenantObjectSupervisorDO } from './dynamic/supervisor-do';
+export {
+  AlarmMediator,
+  CodemodeLoaderProxy,
+  QuotaReporter,
+  TenantDoRouter,
+  UserLogsTail,
+} from './dynamic/entrypoints';
+export { OutboundGate } from './dynamic/outbound-gate';
 
 interface Env {
   DISPATCHER: {
@@ -83,6 +97,10 @@ interface Env {
   APP_KV: KVNamespace;
   SESSIONS: KVNamespace;
   ORG: DurableObjectNamespace<OrgDO>;
+  WORKER_LOGS?: DurableObjectNamespace<WorkerLogsDO>;
+  USER_APP_LOADER?: WorkerLoader;
+  TENANT_DO_SUPERVISOR?: DurableObjectNamespace<TenantObjectSupervisorDO>;
+  APP_USAGE_AE?: AnalyticsEngineDataset;
   SELFHOST_WORKER_LOADER?: WorkerLoader;
   SELFHOST_APP_RUNNER?: DurableObjectNamespace<SelfhostAppRunner>;
   SELFHOST_DO_DISPATCH?: Fetcher;
@@ -1264,7 +1282,15 @@ export async function handleWorkerRequest(
   // Skip all auth checks in local development mode
   if (env.SKIP_AUTH === 'true') {
     console.log(`[dispatcher] SKIP_AUTH enabled, dispatching directly to: ${dispatchScriptName}`);
-    return dispatchToWorker(request, env, ctx, dispatchScriptName, scriptName);
+    let skipAuthAccessInfo: WorkerAccessInfo | null = null;
+    if (env.USER_APP_LOADER && env.APP_KV) {
+      try {
+        skipAuthAccessInfo = await getWorkerAccessInfo(env.APP_KV, dispatchScriptName);
+      } catch {
+        skipAuthAccessInfo = null;
+      }
+    }
+    return dispatchToWorker(request, env, ctx, dispatchScriptName, scriptName, skipAuthAccessInfo);
   }
 
   const cookieHeader = request.headers.get('Cookie');
@@ -1298,7 +1324,7 @@ export async function handleWorkerRequest(
   // In self-host mode the identity proxy leaves deployed-app hosts reachable,
   // and this dispatcher remains the enforcement point for private apps.
   if (isPublicAppRequest(accessInfo, env)) {
-    return dispatchToWorker(request, env, ctx, dispatchScriptName, scriptName);
+    return dispatchToWorker(request, env, ctx, dispatchScriptName, scriptName, accessInfo);
   }
 
   // Private worker - check session
@@ -1310,7 +1336,7 @@ export async function handleWorkerRequest(
     if (session && session.org_id === accessInfo.org_id) {
       try {
         if (await validateWorkerSessionForOrg(env, session, accessInfo.org_id)) {
-          return dispatchToWorker(request, env, ctx, dispatchScriptName, scriptName);
+          return dispatchToWorker(request, env, ctx, dispatchScriptName, scriptName, accessInfo);
         }
         await destroyDispatcherSession(env.SESSIONS, dispatcherSessionId);
       } catch (error) {
@@ -1369,7 +1395,7 @@ export async function handleWorkerRequest(
       }
 
       console.log(`[dispatcher] Same-site auth: user ${session.user_id} accessing ${scriptName} via main session`);
-      return dispatchToWorker(request, env, ctx, dispatchScriptName, scriptName);
+      return dispatchToWorker(request, env, ctx, dispatchScriptName, scriptName, accessInfo);
     } catch (e) {
       console.error(`[dispatcher] Error validating main session: ${e}`);
       return errorResponse(error503Page(getMainAppUrl(hostname, env.MAIN_APP_URL)));
@@ -1388,14 +1414,17 @@ export async function handleWorkerRequest(
 async function dispatchToWorker(
   request: Request,
   env: Env,
-  _ctx: ExecutionContext,
+  ctx: ExecutionContext,
   dispatchScriptName: string,
   userFacingScriptName: string,
+  accessInfo?: WorkerAccessInfo | null,
 ): Promise<Response> {
   try {
     console.log(`[dispatcher] Routing to worker: ${dispatchScriptName}`);
     const headers = new Headers(request.headers);
     stripPlatformAuthMaterial(headers, getRequestHostname(request, new URL(request.url)));
+    const sanitizedRequest = new Request(request, { headers });
+
     if (isSelfhostPublishingMode(env)) {
       if (!env.SELFHOST_APP_RUNNER) {
         throw new Error('Self-host app runner is not configured');
@@ -1409,8 +1438,29 @@ async function dispatchToWorker(
       );
     }
 
+    let resolvedAccess = accessInfo ?? null;
+    if (!resolvedAccess && env.USER_APP_LOADER && env.APP_KV) {
+      try {
+        resolvedAccess = await getWorkerAccessInfo(env.APP_KV, dispatchScriptName);
+      } catch {
+        resolvedAccess = null;
+      }
+    }
+
+    if (resolvedAccess && isDynamicRuntimeMode(resolvedAccess.runtime_mode)) {
+      const exports = ((ctx as unknown as { exports?: DynamicRuntimeExports })?.exports ?? {}) as DynamicRuntimeExports;
+      return await dispatchDynamicWorkerEdge({
+        request: sanitizedRequest,
+        env,
+        ctx,
+        exports,
+        dispatchScriptName,
+        accessInfo: resolvedAccess,
+      });
+    }
+
     const userWorker = getUserWorker(env, dispatchScriptName);
-    return fetchUserWorker(userWorker, new Request(request, { headers }));
+    return fetchUserWorker(userWorker, sanitizedRequest);
   } catch (e) {
     const error = e as Error;
     console.error('[dispatcher] failed to route user worker', {

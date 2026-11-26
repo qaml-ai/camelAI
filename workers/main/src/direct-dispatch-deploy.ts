@@ -17,6 +17,15 @@ import {
   type SelfhostWorkerModule,
   type SelfhostWorkerRecord,
 } from "./selfhost-worker-registry.js";
+import {
+  dynamicBundleObjectKey,
+  extractHasAssetsBinding,
+  extractHasCodemodeLoaderBinding,
+  extractLocalDoBindings,
+  isDynamicRuntimeMode,
+  type DynamicWorkerBundleRecord,
+  type DynamicWorkerRegistryFields,
+} from "./dynamic-worker-registry.js";
 import { resolveUploadedDispatchScriptVersion, withUsageGuardTracing } from "./usage-guard-config.js";
 import {
   userAppCostControlsConfig,
@@ -52,6 +61,7 @@ export interface DirectDispatchDeployEnv extends UserAppCostControlsEnv {
   CF_DISPATCH_NAMESPACE?: string;
   CF_WORKER_NAME?: string;
   TAIL_WORKER_NAME?: string;
+  DYNAMIC_WORKERS_NEW_APPS_ENABLED?: string;
   APP_KV?: KVNamespace;
   APP_DB?: D1Database;
   R2_BUCKET?: R2Bucket;
@@ -276,6 +286,23 @@ export async function deployWorkerModulesDirect(
       warnings,
       timings,
       startedAt,
+      options,
+    );
+  }
+  const existingDynamicMode = await resolveExistingDynamicRuntimeMode(env, dispatchScriptName);
+  if (
+    existingDynamicMode ||
+    env.DYNAMIC_WORKERS_NEW_APPS_ENABLED?.trim().toLowerCase() === "true"
+  ) {
+    return deployDynamicWorkerModulesDirect(
+      env,
+      request,
+      dispatchScriptName,
+      preparedAssets,
+      warnings,
+      timings,
+      startedAt,
+      existingDynamicMode ?? "dynamic",
       options,
     );
   }
@@ -639,6 +666,202 @@ async function deploySelfhostWorkerModulesDirect(
   };
 }
 
+async function resolveExistingDynamicRuntimeMode(
+  env: DirectDispatchDeployEnv,
+  dispatchScriptName: string,
+): Promise<"dynamic" | "dynamic_migrating" | null> {
+  if (!env.APP_KV) return null;
+  try {
+    const raw = await env.APP_KV.get(`script:${dispatchScriptName}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { runtime_mode?: string };
+    return isDynamicRuntimeMode(parsed.runtime_mode) ? parsed.runtime_mode : null;
+  } catch {
+    return null;
+  }
+}
+
+async function deployDynamicWorkerModulesDirect(
+  env: DirectDispatchDeployEnv,
+  request: DirectDispatchDeployRequest,
+  dispatchScriptName: string,
+  preparedAssets: PreparedDirectAsset[],
+  warnings: string[],
+  timings: DirectDispatchDeployTimings,
+  startedAt: number,
+  runtimeMode: "dynamic" | "dynamic_migrating",
+  options: {
+    fetcher?: typeof fetch;
+    onDeploySideEffects?: (info: DeploySideEffectsInfo) => Promise<void>;
+  },
+): Promise<DirectDispatchDeployResult> {
+  if (!env.R2_BUCKET) {
+    throw new Error("R2_BUCKET is required for Dynamic Worker publishing");
+  }
+  if (!env.APP_KV) {
+    throw new Error("APP_KV is required for Dynamic Worker publishing");
+  }
+
+  const workerServiceName = env.CF_WORKER_NAME?.trim() || "chiridion-app";
+  const normalizedBindings = normalizedDirectBindings(request.metadata);
+  const virtualizedBindings = mapDirectDispatchBindings(
+    normalizedBindings,
+    request.identity.workspaceId,
+    request.identity.orgId,
+    request.identity.userId,
+    workerServiceName,
+    dispatchScriptName,
+  ) as Array<Record<string, unknown>>;
+
+  const modules = selfhostWorkerModules(request.modules, request.metadata);
+  const doBindings = extractLocalDoBindings(virtualizedBindings);
+  const doClasses = [...new Set(Object.values(doBindings))];
+  const hasAssets = extractHasAssetsBinding(virtualizedBindings) || preparedAssets.length > 0;
+  const hasCodemodeLoader = extractHasCodemodeLoaderBinding(virtualizedBindings);
+  const costControls = userAppCostControlsForScript(
+    userAppCostControlsConfig(env),
+    dispatchScriptName,
+  );
+
+  const deterministicFingerprint = JSON.stringify({
+    mainModule: request.metadata.main_module,
+    compatibilityDate: request.metadata.compatibility_date ?? "2026-07-13",
+    compatibilityFlags: request.metadata.compatibility_flags ?? [],
+    bindings: virtualizedBindings,
+    modules: Object.keys(modules)
+      .sort()
+      .map((name) => [name, modules[name]!.type, modules[name]!.content]),
+  });
+  const bundleSha = (await sha256Hex(new TextEncoder().encode(deterministicFingerprint))).slice(0, 16);
+  const bundleR2Key = dynamicBundleObjectKey(dispatchScriptName, bundleSha);
+  const createdAt = new Date().toISOString();
+
+  const bundleRecord: DynamicWorkerBundleRecord = {
+    schemaVersion: 2,
+    appId: dispatchScriptName,
+    scriptName: request.scriptName,
+    dispatchScriptName,
+    orgId: request.identity.orgId,
+    orgSlug: request.identity.orgSlug,
+    workspaceId: request.identity.workspaceId,
+    bundleSha,
+    createdAt,
+    compatibilityDate:
+      typeof request.metadata.compatibility_date === "string" &&
+      request.metadata.compatibility_date.trim()
+        ? request.metadata.compatibility_date.trim()
+        : "2026-07-13",
+    compatibilityFlags: Array.isArray(request.metadata.compatibility_flags)
+      ? request.metadata.compatibility_flags.filter(
+          (flag): flag is string => typeof flag === "string",
+        )
+      : ["nodejs_compat"],
+    mainModule: request.metadata.main_module,
+    modules,
+    bindings: virtualizedBindings,
+    doBindings,
+    doClasses,
+    hasAssets,
+    hasCodemodeLoader,
+    ...(costControls.cpuMs > 0 ? { cpuMs: costControls.cpuMs } : {}),
+  };
+
+  const storeAssetsStartedAt = Date.now();
+  const preparedStore = prepareDirectAssetsRecord(
+    env,
+    dispatchScriptName,
+    request,
+    preparedAssets,
+  );
+  if (preparedStore.store) {
+    await preparedStore.store;
+  }
+  if (preparedStore.record) {
+    await publishDirectAssetsRecord(env, dispatchScriptName, preparedStore.record);
+  }
+  timings.storeAssetsMs = Date.now() - storeAssetsStartedAt;
+
+  const uploadStartedAt = Date.now();
+  await env.R2_BUCKET.put(bundleR2Key, JSON.stringify(bundleRecord), {
+    httpMetadata: { contentType: "application/json; charset=utf-8" },
+    customMetadata: {
+      type: "dynamic-worker-bundle",
+      orgId: request.identity.orgId,
+      workspaceId: request.identity.workspaceId,
+      scriptName: request.scriptName,
+      dispatchScriptName,
+      bundleSha,
+    },
+  });
+  timings.cloudflareUploadMs = Date.now() - uploadStartedAt;
+
+  let artifactCacheKey: string | undefined;
+  const artifactCacheStartedAt = Date.now();
+  try {
+    const preparedArtifactCache = await prepareDeployArtifactCache(env, {
+      scriptName: request.scriptName,
+      dispatchScriptName,
+      identity: request.identity,
+      metadata: request.metadata,
+      modules: request.modules,
+      assetsRecord: preparedStore.record,
+    });
+    if (preparedArtifactCache) {
+      await storePreparedDeployArtifactCache(env, preparedArtifactCache);
+      artifactCacheKey = preparedArtifactCache.key;
+    }
+  } catch (error) {
+    warnings.push(`Deploy artifact cache unavailable: ${errorMessage(error)}`);
+  }
+  timings.artifactCacheMs = Date.now() - artifactCacheStartedAt;
+  timings.totalMs = Date.now() - startedAt;
+
+  const dynamicBundle: DynamicWorkerRegistryFields = {
+    runtime_mode: runtimeMode,
+    bundle_r2_key: bundleR2Key,
+    bundle_sha: bundleSha,
+    do_classes: doClasses,
+    has_assets: hasAssets,
+  };
+
+  const sideEffects: DeploySideEffectsInfo = {
+    scriptName: request.scriptName,
+    dispatchScriptName,
+    orgId: request.identity.orgId,
+    orgSlug: request.identity.orgSlug,
+    workspaceId: request.identity.workspaceId,
+    hostname: request.hostname,
+    threadId: request.identity.threadId,
+    projectId: request.identity.projectId,
+    configPath:
+      typeof request.metadata.config_path === "string"
+        ? request.metadata.config_path
+        : undefined,
+    commitSha: request.commitSha,
+    artifactCacheKey,
+    scriptVersion: bundleSha,
+    dynamicBundle,
+  };
+  await options.onDeploySideEffects?.(sideEffects);
+
+  return {
+    success: true,
+    scriptName: request.scriptName,
+    dispatchScriptName,
+    status: 200,
+    timings,
+    sideEffects,
+    ...(warnings.length > 0 ? { warnings } : {}),
+    result: {
+      id: dispatchScriptName,
+      script_name: dispatchScriptName,
+      deployment_id: bundleSha,
+      bundle_r2_key: bundleR2Key,
+      source: "dynamic",
+    },
+  };
+}
+
 function formatMiB(bytes: number): string {
   return (bytes / (1024 * 1024)).toFixed(1);
 }
@@ -891,9 +1114,6 @@ export async function rollbackWorkerDeployFromArtifactCache(
   const dispatchNamespace = env.CF_DISPATCH_NAMESPACE?.trim();
   const tailWorkerName = env.TAIL_WORKER_NAME?.trim();
   const fetcher = options.fetcher ?? fetch;
-  if (!cfApiToken) throw new Error("CF_API_TOKEN is required for direct rollback");
-  if (!accountId) throw new Error("CF_ACCOUNT_ID is required for direct rollback");
-  if (!dispatchNamespace) throw new Error("CF_DISPATCH_NAMESPACE is required for direct rollback");
   if (!env.R2_BUCKET) throw new Error("R2_BUCKET is required for direct rollback");
 
   const artifactCacheKey = request.artifactCacheKey.trim();
@@ -910,6 +1130,66 @@ export async function rollbackWorkerDeployFromArtifactCache(
   if (request.expected?.scriptName && record.scriptName !== request.expected.scriptName) {
     throw new Error("Deploy artifact cache belongs to a different app");
   }
+
+  const existingDynamicMode = await resolveExistingDynamicRuntimeMode(env, record.dispatchScriptName);
+  if (
+    existingDynamicMode ||
+    env.DYNAMIC_WORKERS_NEW_APPS_ENABLED?.trim().toLowerCase() === "true"
+  ) {
+    if (record.assetsRecord) {
+      await publishDirectAssetsRecord(env, record.dispatchScriptName, record.assetsRecord);
+    }
+    const replayModules: DirectWorkerModule[] = record.modules.map((mod) => ({
+      name: mod.name,
+      contentType: mod.contentType,
+      content: base64ToBytes(mod.contentBase64),
+    }));
+    const replayRequest: DirectDispatchDeployRequest = {
+      scriptName: record.scriptName,
+      hostname: request.hostname,
+      identity: {
+        ...record.identity,
+        ...(request.threadId ? { threadId: request.threadId } : {}),
+      },
+      metadata: record.metadata,
+      modules: replayModules,
+    };
+    const replayResult = await deployDynamicWorkerModulesDirect(
+      env,
+      replayRequest,
+      record.dispatchScriptName,
+      [],
+      [],
+      {
+        totalMs: 0,
+        prepareAssetsMs: 0,
+        nativeAssetsMs: 0,
+        storeAssetsMs: 0,
+        migrationsMs: 0,
+        artifactCacheMs: 0,
+        cloudflareUploadMs: 0,
+        publishAssetsRecordMs: 0,
+        moduleCount: replayModules.length,
+        assetCount: record.assetsRecord ? Object.keys(record.assetsRecord.manifest).length : 0,
+        moduleBytes: replayModules.reduce((sum, mod) => sum + contentBytes(mod.content).byteLength, 0),
+        assetBytes: 0,
+      },
+      Date.now(),
+      existingDynamicMode ?? "dynamic",
+      options,
+    );
+    return {
+      ...replayResult,
+      sideEffects: {
+        ...replayResult.sideEffects,
+        artifactCacheKey,
+      },
+    };
+  }
+
+  if (!cfApiToken) throw new Error("CF_API_TOKEN is required for direct rollback");
+  if (!accountId) throw new Error("CF_ACCOUNT_ID is required for direct rollback");
+  if (!dispatchNamespace) throw new Error("CF_DISPATCH_NAMESPACE is required for direct rollback");
 
   let metadata = record.metadata;
   if (record.assetsRecord) {

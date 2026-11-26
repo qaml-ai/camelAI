@@ -8,7 +8,7 @@
 	"rules": [
 		{ "type": "Text", "globs": ["**/db-query-runner.mjs"], "fallthrough": true }
 	],
-	"compatibility_date": "2024-12-01",
+	"compatibility_date": "2026-07-13",
 	"compatibility_flags": ["nodejs_compat"],
 	"vars": {
 		"AI_VIRTUAL_MODEL": "dynamic/auto",
@@ -17,6 +17,15 @@
 		// production identity or registry state.
 		"SKIP_AUTH": "true"
 	},
+	"worker_loaders": [
+		{ "binding": "USER_APP_LOADER" }
+	],
+	"r2_buckets": [
+		{ "binding": "R2_BUCKET", "bucket_name": "chiridion-sandbox" }
+	],
+	"analytics_engine_datasets": [
+		{ "binding": "APP_USAGE_AE", "dataset": "chiridion_app_usage_evals" }
+	],
 	"routes": [
 		{ "pattern": "*.apps.evals.camelai.dev/*", "zone_name": "camelai.dev" },
 		{ "pattern": "*.evals.camelai.app/*", "zone_name": "camelai.app" }
@@ -33,7 +42,12 @@
 	],
 	"durable_objects": {
 		"bindings": [
-			{ "name": "ORG", "class_name": "OrgDO", "script_name": "chiridion-app-staging" }
+			{ "name": "ORG", "class_name": "OrgDO", "script_name": "chiridion-app-staging" },
+			{ "name": "WORKER_LOGS", "class_name": "WorkerLogsDO", "script_name": "chiridion-app-staging" },
+			{ "name": "TENANT_DO_SUPERVISOR", "class_name": "TenantObjectSupervisorDO" }
 		]
-	}
+	},
+	"migrations": [
+		{ "tag": "v1", "new_sqlite_classes": ["TenantObjectSupervisorDO"] }
+	]
 }

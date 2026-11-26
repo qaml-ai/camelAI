@@ -1,5 +1,7 @@
+import type { DynamicWorkerRegistryFields } from '../../main/src/dynamic-worker-registry';
+
 const SCRIPT_PREFIX = 'script:';
-export interface WorkerAccessInfo {
+export interface WorkerAccessInfo extends DynamicWorkerRegistryFields {
   is_public: boolean;
   org_id: string;
   org_slug?: string;

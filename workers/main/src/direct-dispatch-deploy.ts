@@ -289,11 +289,12 @@ export async function deployWorkerModulesDirect(
       options,
     );
   }
-  const existingDynamicMode = await resolveExistingDynamicRuntimeMode(env, dispatchScriptName);
-  if (
-    existingDynamicMode ||
-    env.DYNAMIC_WORKERS_NEW_APPS_ENABLED?.trim().toLowerCase() === "true"
-  ) {
+  const existingRuntime = await resolveExistingRuntimeState(env, dispatchScriptName);
+  const shouldDeployDynamic =
+    existingRuntime.dynamicMode !== null ||
+    (!existingRuntime.exists &&
+      env.DYNAMIC_WORKERS_NEW_APPS_ENABLED?.trim().toLowerCase() === "true");
+  if (shouldDeployDynamic) {
     return deployDynamicWorkerModulesDirect(
       env,
       request,
@@ -302,7 +303,7 @@ export async function deployWorkerModulesDirect(
       warnings,
       timings,
       startedAt,
-      existingDynamicMode ?? "dynamic",
+      existingRuntime.dynamicMode ?? "dynamic",
       options,
     );
   }
@@ -666,18 +667,21 @@ async function deploySelfhostWorkerModulesDirect(
   };
 }
 
-async function resolveExistingDynamicRuntimeMode(
+async function resolveExistingRuntimeState(
   env: DirectDispatchDeployEnv,
   dispatchScriptName: string,
-): Promise<"dynamic" | "dynamic_migrating" | null> {
-  if (!env.APP_KV) return null;
+): Promise<{ exists: boolean; dynamicMode: "dynamic" | "dynamic_migrating" | null }> {
+  if (!env.APP_KV) return { exists: false, dynamicMode: null };
   try {
     const raw = await env.APP_KV.get(`script:${dispatchScriptName}`);
-    if (!raw) return null;
+    if (!raw) return { exists: false, dynamicMode: null };
     const parsed = JSON.parse(raw) as { runtime_mode?: string };
-    return isDynamicRuntimeMode(parsed.runtime_mode) ? parsed.runtime_mode : null;
+    return {
+      exists: true,
+      dynamicMode: isDynamicRuntimeMode(parsed.runtime_mode) ? parsed.runtime_mode : null,
+    };
   } catch {
-    return null;
+    return { exists: false, dynamicMode: null };
   }
 }
 
@@ -1131,10 +1135,11 @@ export async function rollbackWorkerDeployFromArtifactCache(
     throw new Error("Deploy artifact cache belongs to a different app");
   }
 
-  const existingDynamicMode = await resolveExistingDynamicRuntimeMode(env, record.dispatchScriptName);
+  const existingRuntime = await resolveExistingRuntimeState(env, record.dispatchScriptName);
   if (
-    existingDynamicMode ||
-    env.DYNAMIC_WORKERS_NEW_APPS_ENABLED?.trim().toLowerCase() === "true"
+    existingRuntime.dynamicMode !== null ||
+    (!existingRuntime.exists &&
+      env.DYNAMIC_WORKERS_NEW_APPS_ENABLED?.trim().toLowerCase() === "true")
   ) {
     if (record.assetsRecord) {
       await publishDirectAssetsRecord(env, record.dispatchScriptName, record.assetsRecord);
@@ -1175,7 +1180,7 @@ export async function rollbackWorkerDeployFromArtifactCache(
         assetBytes: 0,
       },
       Date.now(),
-      existingDynamicMode ?? "dynamic",
+      existingRuntime.dynamicMode ?? "dynamic",
       options,
     );
     return {

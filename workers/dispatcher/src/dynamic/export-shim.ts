@@ -193,7 +193,7 @@ class ChiridionExportShimDO extends DurableObject {
     if (!(await verifyRequest(request, path))) {
       return new Response("Service temporarily migrating", {
         status: 503,
-        headers: { "Retry-After": "5" },
+        headers: { "Retry-After": "5", "X-Chiridion-Migrating": "1" },
       });
     }
 
@@ -345,7 +345,7 @@ export default {
     if (!url.pathname.startsWith("/__migrate/")) {
       return new Response("Service temporarily migrating", {
         status: 503,
-        headers: { "Retry-After": "5" },
+        headers: { "Retry-After": "5", "X-Chiridion-Migrating": "1" },
       });
     }
     const className = url.searchParams.get("className") || "";

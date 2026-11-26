@@ -49,6 +49,7 @@
     "ARTIFACTS_NAMESPACE": "prod",
     "CF_GATEWAY_NAME": "chiridion",
     "CF_DISPATCH_NAMESPACE": "chiridion-platform",
+    "DYNAMIC_WORKERS_NEW_APPS_ENABLED": "true",
     "WORKER_BASE_URL": "https://camelai.dev",
     "EMAIL_FROM_ADDRESS": "no-reply@mail.camelai.com",
     "WORKSPACE_EMAIL_DOMAIN": "camelai.dev",

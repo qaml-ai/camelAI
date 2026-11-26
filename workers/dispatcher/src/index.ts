@@ -1557,7 +1557,39 @@ async function dispatchToWorker(
     }
 
     const userWorker = getUserWorker(env, dispatchScriptName);
-    return fetchUserWorker(userWorker, sanitizedRequest);
+    const wfpResponse = await fetchUserWorker(userWorker, sanitizedRequest);
+    // Zero-503 Cohort B/C cutover guard: if a warm PoP cached stale `runtime_mode: "wfp"` in KV
+    // for up to 60s and hit the WfP Export Shim (503 + X-Chiridion-Migrating: 1), consult the
+    // strongly-consistent R2 cutover pointer immediately and serve from Dynamic Workers.
+    if (
+      wfpResponse.status === 503 &&
+      wfpResponse.headers.get('x-chiridion-migrating') === '1' &&
+      env.USER_APP_LOADER &&
+      env.R2_BUCKET
+    ) {
+      const pointerObj = await env.R2_BUCKET.get(
+        `dynamic-bundles/${encodeURIComponent(dispatchScriptName)}/latest.json`,
+      ).catch(() => null);
+      if (pointerObj) {
+        try {
+          const pointer = (await pointerObj.json()) as Partial<WorkerAccessInfo>;
+          if (isDynamicRuntimeMode(pointer.runtime_mode)) {
+            const exports = ((ctx as unknown as { exports?: DynamicRuntimeExports })?.exports ?? {}) as DynamicRuntimeExports;
+            return await dispatchDynamicWorkerEdge({
+              request: sanitizedRequest,
+              env,
+              ctx,
+              exports,
+              dispatchScriptName,
+              accessInfo: { ...(resolvedAccess ?? { org_id: '', is_public: false }), ...pointer },
+            });
+          }
+        } catch {
+          // Fall through to WfP 503 response if pointer JSON is unreadable.
+        }
+      }
+    }
+    return wfpResponse;
   } catch (e) {
     const error = e as Error;
     console.error('[dispatcher] failed to route user worker', {

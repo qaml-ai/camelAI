@@ -59,10 +59,12 @@ interface CliOptions {
   env: 'staging' | 'prod';
   cohort?: 'a' | 'b' | 'c';
   script?: string;
+  orgSlug?: string;
   rollback?: string;
   singletonIds: string[];
   dryRun: boolean;
   includeEnterprise: boolean;
+  skipMigrated: boolean;
   limit: number;
   logFile: string;
 }
@@ -92,6 +94,7 @@ function parseArgs(argv: string[]): CliOptions {
     singletonIds: ['name:default'],
     dryRun: false,
     includeEnterprise: false,
+    skipMigrated: true,
     limit: 20,
     logFile: path.resolve('migration-progress.jsonl'),
   };
@@ -104,6 +107,8 @@ function parseArgs(argv: string[]): CliOptions {
       if (c === 'a' || c === 'b' || c === 'c') opts.cohort = c;
     } else if (arg === '--script' && argv[i + 1]) {
       opts.script = argv[++i]!;
+    } else if (arg === '--org-slug' && argv[i + 1]) {
+      opts.orgSlug = argv[++i]!;
     } else if (arg === '--rollback' && argv[i + 1]) {
       opts.rollback = argv[++i]!;
     } else if (arg === '--singleton-ids' && argv[i + 1]) {
@@ -112,6 +117,8 @@ function parseArgs(argv: string[]): CliOptions {
       opts.dryRun = true;
     } else if (arg === '--include-enterprise') {
       opts.includeEnterprise = true;
+    } else if (arg === '--no-skip-migrated') {
+      opts.skipMigrated = false;
     } else if (arg === '--limit' && argv[i + 1]) {
       opts.limit = Math.max(1, Number(argv[++i]!) || 20);
     } else if (arg === '--log-file' && argv[i + 1]) {
@@ -357,6 +364,13 @@ async function migrateSingleScript(
     return { dispatchScriptName, status: 'skipped', reason: 'missing_kv_registry' };
   }
   const registry = JSON.parse(rawRegistry) as Record<string, unknown>;
+  if (
+    opts.skipMigrated &&
+    !opts.script &&
+    (registry.runtime_mode === 'dynamic' || registry.runtime_mode === 'hybrid_migrating')
+  ) {
+    return { dispatchScriptName, status: 'skipped', reason: 'already_migrated', runtime_mode: registry.runtime_mode };
+  }
 
   const settings = await cfFetch<{
     bindings?: Array<Record<string, unknown>>;
@@ -550,7 +564,7 @@ async function migrateSingleScript(
     }
   }
 
-  // 3. Atomic KV cutover
+  // 3. Strongly-consistent R2 cutover pointer + Atomic KV cutover
   const nextRegistry = {
     ...registry,
     runtime_mode: targetMode,
@@ -561,6 +575,13 @@ async function migrateSingleScript(
     has_assets: hasAssets,
     migrated_at: new Date().toISOString(),
   };
+  await r2PutJson(
+    apiToken,
+    cfg.accountId,
+    cfg.r2Bucket,
+    `dynamic-bundles/${encodeURIComponent(dispatchScriptName)}/latest.json`,
+    nextRegistry,
+  );
   await kvPut(apiToken, cfg.accountId, cfg.appKvId, registryKey, JSON.stringify(nextRegistry));
 
   return {
@@ -589,6 +610,10 @@ async function main() {
     if (!raw) throw new Error(`Registry key not found: ${key}`);
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     parsed.runtime_mode = 'wfp';
+    await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${cfg.accountId}/r2/buckets/${cfg.r2Bucket}/objects/${encodeURIComponent(`dynamic-bundles/${encodeURIComponent(opts.rollback)}/latest.json`)}`,
+      { method: 'DELETE', headers: { Authorization: `Bearer ${apiToken}` } },
+    ).catch(() => {});
     await kvPut(apiToken, cfg.accountId, cfg.appKvId, key, JSON.stringify(parsed));
     console.log(JSON.stringify({ ok: true, action: 'rollback', dispatchScriptName: opts.rollback, runtime_mode: 'wfp' }));
     return;
@@ -603,16 +628,40 @@ async function main() {
   if (opts.script) {
     targets = [opts.script];
   } else {
-    const scripts = await cfFetch<Array<{ id: string }>>(
-      apiToken,
-      `https://api.cloudflare.com/client/v4/accounts/${cfg.accountId}/workers/dispatch/namespaces/${cfg.dispatchNamespace}/scripts`,
-    );
-    targets = scripts.map((s) => s.id).slice(0, opts.limit);
+    const allScripts: Array<{ id: string; migration_tag?: string | null; modified_on?: string }> = [];
+    let cursor = '';
+    while (true) {
+      const url = `https://api.cloudflare.com/client/v4/accounts/${cfg.accountId}/workers/dispatch/namespaces/${cfg.dispatchNamespace}/scripts${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`;
+      const resp = await fetch(url, { headers: { Authorization: `Bearer ${apiToken}` } });
+      if (!resp.ok) throw new Error(`List WfP scripts failed (${resp.status}): ${await resp.text()}`);
+      const parsed = (await resp.json()) as {
+        result?: Array<{ id: string; migration_tag?: string | null; modified_on?: string }>;
+        result_info?: { cursor?: string };
+      };
+      const batch = parsed.result ?? [];
+      allScripts.push(...batch);
+      const next = parsed.result_info?.cursor ?? '';
+      if (!next || next === cursor || batch.length === 0) break;
+      cursor = next;
+    }
+    // Sort newest-first so active modern apps with R2/KV asset mirrors migrate first.
+    allScripts.sort((a, b) => String(b.modified_on ?? '').localeCompare(String(a.modified_on ?? '')));
+    targets = allScripts
+      .filter((s) => s.id.includes('--'))
+      .filter((s) => !opts.orgSlug || extractOrgSlugFromDispatchName(s.id) === opts.orgSlug)
+      .filter((s) => (opts.cohort === 'a' ? !s.migration_tag : Boolean(s.migration_tag)))
+      .filter((s) => opts.includeEnterprise || !isProtectedEnterpriseScript(s.id))
+      .map((s) => s.id);
   }
 
+  let matchedCount = 0;
   for (const script of targets) {
+    if (!opts.script && matchedCount >= opts.limit) break;
     try {
       const outcome = await migrateSingleScript(opts, apiToken, migrationHmacSecret, script);
+      if (outcome.status === 'migrated' || outcome.status === 'dry_run_ready') {
+        matchedCount += 1;
+      }
       const line = JSON.stringify({ ts: new Date().toISOString(), ...outcome });
       console.log(line);
       fs.appendFileSync(opts.logFile, `${line}\n`);

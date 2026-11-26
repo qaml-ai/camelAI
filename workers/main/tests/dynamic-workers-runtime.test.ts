@@ -27,7 +27,7 @@ import {
 } from "../../dispatcher/src/dynamic/quota-policy";
 import { classifyOutboundUrl } from "../../dispatcher/src/dynamic/outbound-gate";
 import { generateDynamicWorkerWrapperSource } from "../../dispatcher/src/dynamic/wrapper-generator";
-import { clearBundleStoreCachesForTest } from "../../dispatcher/src/dynamic/bundle-store";
+import { clearBundleStoreCachesForTest, loadDynamicUserWorker } from "../../dispatcher/src/dynamic/bundle-store";
 import {
   decodeTypedValue,
   encodeTypedValue,
@@ -37,6 +37,7 @@ import {
 import { buildWfpExportShimSource } from "../../dispatcher/src/dynamic/export-shim";
 import { MIGRATION_IMPORTER_FACET_SOURCE } from "../../dispatcher/src/dynamic/importer-facet";
 import { buildDynamicAppUsageSql, queryDynamicAppUsage } from "../src/dynamic-usage-analytics";
+import { hydrateMigratedBindings } from "../src/dynamic-migration-bindings";
 import { handleWorkerRequest } from "../../dispatcher/src/index";
 
 function makeAsset(path: string, body: string, contentType?: string): DirectDeployAsset {
@@ -569,5 +570,137 @@ describe("enterprise tier & zero-data-loss migration protocol", () => {
       rowsWritten: 4_200,
       quotaTrips: 0,
     });
+  });
+});
+
+describe("virtual binding props hydration & zero-drift broker routing", () => {
+  it("hydrates stripped WfP /settings props from R2 artifact cache (preserving exact R2/KV prefixes) and fails closed if unverified", () => {
+    const liveSettingsBindings: Array<Record<string, unknown>> = [
+      { type: "service", name: "UPLOADS", service: "chiridion-app", entrypoint: "R2VirtualBucket" },
+      { type: "service", name: "CACHE_KV", service: "chiridion-app", entrypoint: "KVVirtualNamespace" },
+      { type: "service", name: "CONNECTIONS", service: "chiridion-app", entrypoint: "ConnectionsService" },
+      { type: "service", name: "ANALYSIS", service: "chiridion-app", entrypoint: "AnalysisAppService" },
+      { type: "service", name: "AI", service: "chiridion-app", entrypoint: "AIVirtualBinding" },
+    ];
+    const artifactCacheBindings: Array<Record<string, unknown>> = [
+      {
+        type: "service",
+        name: "UPLOADS",
+        service: "chiridion-app",
+        entrypoint: "R2VirtualBucket",
+        props: { workspaceId: "ws-real", bucketName: "custom-uploads-bucket" },
+      },
+      {
+        type: "service",
+        name: "CACHE_KV",
+        service: "chiridion-app",
+        entrypoint: "KVVirtualNamespace",
+        props: { workspaceId: "ws-real", appId: "app--acme", namespaceId: "kv-custom-ns" },
+      },
+      {
+        type: "service",
+        name: "CONNECTIONS",
+        service: "chiridion-app",
+        entrypoint: "ConnectionsService",
+        props: { orgId: "org-real", workspaceId: "ws-real", userId: "usr-1" },
+      },
+    ];
+
+    const okRes = hydrateMigratedBindings({
+      dispatchScriptName: "app--acme",
+      orgId: "org-real",
+      workspaceId: "ws-real",
+      liveSettingsBindings,
+      artifactCacheBindings,
+    });
+    expect(okRes.ok).toBe(true);
+    if (okRes.ok) {
+      expect(okRes.source).toBe("artifact_cache");
+      const uploads = okRes.bindings.find((b) => b.name === "UPLOADS");
+      expect(uploads?.props).toEqual({ workspaceId: "ws-real", bucketName: "custom-uploads-bucket" });
+      const kv = okRes.bindings.find((b) => b.name === "CACHE_KV");
+      expect(kv?.props).toEqual({ workspaceId: "ws-real", appId: "app--acme", namespaceId: "kv-custom-ns" });
+      const analysis = okRes.bindings.find((b) => b.name === "ANALYSIS");
+      expect(analysis?.props).toEqual({ orgId: "org-real", workspaceId: "ws-real" });
+    }
+
+    // Without artifact cache, R2VirtualBucket / KVVirtualNamespace MUST fail closed rather than guessing prefix!
+    const failRes = hydrateMigratedBindings({
+      dispatchScriptName: "app--acme",
+      orgId: "org-real",
+      workspaceId: "ws-real",
+      liveSettingsBindings,
+      artifactCacheBindings: null,
+    });
+    expect(failRes).toEqual({
+      ok: false,
+      reason: "unverified_virtual_storage_props",
+      missingBindings: ["UPLOADS:R2VirtualBucket", "CACHE_KV:KVVirtualNamespace"],
+    });
+  });
+
+  it("routes platform services via zero-drift Dynamic* broker proxies while keeping R2/KV/Assets local on dispatcher", () => {
+    const brokerAi = vi.fn(({ props }) => ({ kind: "broker-ai", props }));
+    const brokerConn = vi.fn(({ props }) => ({ kind: "broker-conn", props }));
+    const brokerAnalysis = vi.fn(({ props }) => ({ kind: "broker-analysis", props }));
+    const localR2 = vi.fn(({ props }) => ({ kind: "local-r2", props }));
+    const localKv = vi.fn(({ props }) => ({ kind: "local-kv", props }));
+
+    let capturedCode: { env?: Record<string, unknown> } | undefined;
+    const loader = {
+      get: vi.fn((_id: string, getCode: () => { env?: Record<string, unknown> }) => {
+        capturedCode = getCode();
+        return { getEntrypoint: () => ({ fetch: vi.fn() }) };
+      }),
+    };
+
+    const record: DynamicWorkerBundleRecord = {
+      schemaVersion: 2,
+      appId: "app--acme",
+      scriptName: "app",
+      dispatchScriptName: "app--acme",
+      orgId: "org-1",
+      orgSlug: "acme",
+      workspaceId: "ws-1",
+      bundleSha: "1234567890abcdef",
+      createdAt: "2026-11-26T00:00:00Z",
+      compatibilityDate: "2026-07-13",
+      compatibilityFlags: ["nodejs_compat"],
+      mainModule: "index.js",
+      modules: { "index.js": { name: "index.js", type: "js", content: "export default {};" } },
+      bindings: [
+        { type: "service", name: "AI", entrypoint: "AIVirtualBinding", props: { orgId: "org-1", workspaceId: "ws-1" } },
+        { type: "service", name: "CONNECTIONS", entrypoint: "ConnectionsService", props: { orgId: "org-1", workspaceId: "ws-1" } },
+        { type: "service", name: "ANALYSIS", entrypoint: "AnalysisAppService", props: { orgId: "org-1", workspaceId: "ws-1" } },
+        { type: "service", name: "FILES", entrypoint: "R2VirtualBucket", props: { workspaceId: "ws-1", bucketName: "uploads" } },
+        { type: "service", name: "KV", entrypoint: "KVVirtualNamespace", props: { workspaceId: "ws-1", appId: "app--acme", namespaceId: "cache" } },
+      ],
+      doBindings: {},
+      doClasses: [],
+      hasAssets: false,
+      hasCodemodeLoader: false,
+    };
+
+    loadDynamicUserWorker({
+      loader: loader as unknown as WorkerLoader,
+      record,
+      exports: {
+        DynamicAIVirtualBinding: brokerAi,
+        DynamicConnectionsService: brokerConn,
+        DynamicAnalysisAppService: brokerAnalysis,
+        R2VirtualBucket: localR2,
+        KVVirtualNamespace: localKv,
+      },
+      managedOverlay: [],
+      envHash: "0",
+      quotaTier: "enterprise",
+      preferBroker: true,
+    });
+
+    expect(capturedCode?.env?.AI).toEqual({ kind: "broker-ai", props: { orgId: "org-1", workspaceId: "ws-1" } });
+    expect(capturedCode?.env?.CONNECTIONS).toEqual({ kind: "broker-conn", props: { orgId: "org-1", workspaceId: "ws-1" } });
+    expect(capturedCode?.env?.ANALYSIS).toEqual({ kind: "broker-analysis", props: { orgId: "org-1", workspaceId: "ws-1" } });
+    expect(capturedCode?.env?.FILES).toEqual({ kind: "local-r2", props: { workspaceId: "ws-1", bucketName: "uploads" } });
+    expect(capturedCode?.env?.KV).toEqual({ kind: "local-kv", props: { workspaceId: "ws-1", appId: "app--acme", namespaceId: "cache" } });
   });
 });

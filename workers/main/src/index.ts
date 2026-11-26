@@ -83,6 +83,7 @@ export {
   DynamicWorkflowBinding,
 } from './deterministic-automation-workflow.js';
 export { CamelAiService } from './camelai-service.js';
+export { DynamicServiceBroker } from './dynamic-service-broker.js';
 export { SecureFetchBinding } from './secure-fetch-service.js';
 export { AppScreenshotBinding } from './app-screenshot-binding.js';
 export { AppBrowserBinding } from './app-browser-binding.js';

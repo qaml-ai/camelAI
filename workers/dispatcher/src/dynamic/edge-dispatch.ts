@@ -7,6 +7,7 @@
  */
 
 import type { OrgDO } from '../../../main/src/auth';
+import type { DynamicServiceBroker } from '../../../main/src/dynamic-service-broker';
 import type { WorkerAccessInfo } from '../access-control';
 import {
   loadDynamicBundleRecord,
@@ -21,6 +22,7 @@ export interface EdgeDispatchEnv {
   ORG?: DurableObjectNamespace<OrgDO>;
   USER_APP_LOADER?: WorkerLoader;
   APP_USAGE_AE?: AnalyticsEngineDataset;
+  MAIN_APP_BROKER?: Service<DynamicServiceBroker>;
 }
 
 const STATIC_ASSET_PATHS = new Set([
@@ -157,6 +159,7 @@ export async function dispatchDynamicWorkerEdge(input: {
     managedOverlay,
     envHash,
     quotaTier,
+    preferBroker: Boolean(env.MAIN_APP_BROKER),
   });
 
   const response = await worker.getEntrypoint().fetch(request);

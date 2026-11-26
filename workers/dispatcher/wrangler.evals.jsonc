@@ -26,6 +26,9 @@
 	"analytics_engine_datasets": [
 		{ "binding": "APP_USAGE_AE", "dataset": "chiridion_app_usage_evals" }
 	],
+	"services": [
+		{ "binding": "MAIN_APP_BROKER", "service": "chiridion-app-staging", "entrypoint": "DynamicServiceBroker" }
+	],
 	"routes": [
 		{ "pattern": "*.apps.evals.camelai.dev/*", "zone_name": "camelai.dev" },
 		{ "pattern": "*.evals.camelai.app/*", "zone_name": "camelai.app" }

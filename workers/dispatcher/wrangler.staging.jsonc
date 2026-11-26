@@ -25,6 +25,9 @@
 	"analytics_engine_datasets": [
 		{ "binding": "APP_USAGE_AE", "dataset": "chiridion_app_usage_staging" }
 	],
+	"services": [
+		{ "binding": "MAIN_APP_BROKER", "service": "chiridion-app-staging", "entrypoint": "DynamicServiceBroker" }
+	],
 	"routes": [
 		// Canonical org-scoped iframe hostnames
 		{ "pattern": "*.apps.staging.camelai.dev/*", "zone_name": "camelai.dev" },

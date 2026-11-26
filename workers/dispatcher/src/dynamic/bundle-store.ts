@@ -18,6 +18,14 @@ export interface DynamicRuntimeExports {
   CamelAiService?: (options: { props: Record<string, unknown> }) => unknown;
   ConnectionsService?: (options: { props: Record<string, unknown> }) => unknown;
   DataProxyService?: (options: { props: Record<string, unknown> }) => unknown;
+  AnalysisAppService?: (options: { props: Record<string, unknown> }) => unknown;
+  WarehouseService?: (options: { props: Record<string, unknown> }) => unknown;
+  DynamicAIVirtualBinding?: (options: { props: Record<string, unknown> }) => unknown;
+  DynamicCamelAiService?: (options: { props: Record<string, unknown> }) => unknown;
+  DynamicConnectionsService?: (options: { props: Record<string, unknown> }) => unknown;
+  DynamicDataProxyService?: (options: { props: Record<string, unknown> }) => unknown;
+  DynamicAnalysisAppService?: (options: { props: Record<string, unknown> }) => unknown;
+  DynamicWarehouseService?: (options: { props: Record<string, unknown> }) => unknown;
   KVVirtualNamespace?: (options: { props: Record<string, unknown> }) => unknown;
   R2VirtualBucket?: (options: { props: Record<string, unknown> }) => unknown;
   TenantDoRouter?: (options: { props: Record<string, unknown> }) => unknown;
@@ -249,9 +257,36 @@ function buildPlainAndBlobEnv(
   return result;
 }
 
+const BROKERED_PROXY_NAME: Record<string, keyof DynamicRuntimeExports> = {
+  AIVirtualBinding: 'DynamicAIVirtualBinding',
+  CamelAiService: 'DynamicCamelAiService',
+  ConnectionsService: 'DynamicConnectionsService',
+  DataProxyService: 'DynamicDataProxyService',
+  AnalysisAppService: 'DynamicAnalysisAppService',
+  WarehouseService: 'DynamicWarehouseService',
+};
+
+function resolveServiceFactory(
+  entrypoint: string,
+  exports: DynamicRuntimeExports,
+  preferBroker: boolean,
+): ((opts: { props: Record<string, unknown> }) => unknown) | undefined {
+  if (preferBroker) {
+    const brokeredKey = BROKERED_PROXY_NAME[entrypoint];
+    if (brokeredKey && typeof exports[brokeredKey] === 'function') {
+      return exports[brokeredKey] as (opts: { props: Record<string, unknown> }) => unknown;
+    }
+  }
+  const direct = (
+    exports as Record<string, ((opts: { props: Record<string, unknown> }) => unknown) | undefined>
+  )[entrypoint];
+  return typeof direct === 'function' ? direct : undefined;
+}
+
 function buildVirtualBindingsEnv(
   record: DynamicWorkerBundleRecord,
   exports: DynamicRuntimeExports,
+  preferBroker: boolean,
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const binding of record.bindings) {
@@ -263,10 +298,8 @@ function buildVirtualBindingsEnv(
           ? (binding.props as Record<string, unknown>)
           : {};
       const entrypoint = typeof binding.entrypoint === 'string' ? binding.entrypoint : '';
-      const factory = (exports as Record<string, ((opts: { props: Record<string, unknown> }) => unknown) | undefined>)[
-        entrypoint
-      ];
-      if (typeof factory === 'function') {
+      const factory = resolveServiceFactory(entrypoint, exports, preferBroker);
+      if (factory) {
         result[binding.name] = factory({ props });
       }
       continue;
@@ -291,10 +324,13 @@ function buildVirtualBindingsEnv(
       result[binding.name] = exports.AssetsVirtualBinding({
         props: { appId: record.appId },
       });
-    } else if (binding.type === 'ai' && exports.AIVirtualBinding) {
-      result[binding.name] = exports.AIVirtualBinding({
-        props: { orgId: record.orgId, workspaceId: record.workspaceId },
-      });
+    } else if (binding.type === 'ai') {
+      const aiFactory = resolveServiceFactory('AIVirtualBinding', exports, preferBroker);
+      if (aiFactory) {
+        result[binding.name] = aiFactory({
+          props: { orgId: record.orgId, workspaceId: record.workspaceId },
+        });
+      }
     }
   }
   return result;
@@ -311,6 +347,7 @@ export interface LoadDynamicWorkerOptions {
   supervisorKey?: string;
   dailyRowsRead?: number;
   dailyRowsWritten?: number;
+  preferBroker?: boolean;
 }
 
 export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStub {
@@ -325,6 +362,7 @@ export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStu
     supervisorKey,
     dailyRowsRead = 0,
     dailyRowsWritten = 0,
+    preferBroker = false,
   } = opts;
 
   const isolateId = supervisorKey
@@ -341,7 +379,7 @@ export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStu
 
     const dynamicEnv: Record<string, unknown> = {
       ...buildPlainAndBlobEnv(record, managedOverlay),
-      ...buildVirtualBindingsEnv(record, exports),
+      ...buildVirtualBindingsEnv(record, exports, preferBroker),
       __CHIRIDION_APP_ID: record.dispatchScriptName,
       __CHIRIDION_DO_BINDINGS: record.doBindings,
     };

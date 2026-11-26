@@ -13,6 +13,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import type { OrgDO } from '../../../main/src/auth';
+import type { DynamicServiceBroker } from '../../../main/src/dynamic-service-broker';
 import {
   dynamicDoAliasKey,
   type AppQuotaTier,
@@ -72,6 +73,7 @@ export interface SupervisorEnv {
   ORG?: DurableObjectNamespace<OrgDO>;
   USER_APP_LOADER?: WorkerLoader;
   APP_USAGE_AE?: AnalyticsEngineDataset;
+  MAIN_APP_BROKER?: Service<DynamicServiceBroker>;
   MIGRATION_HMAC_SECRET?: string;
   TOKEN_SIGNING_SECRET?: string;
   DISPATCHER?: {
@@ -212,6 +214,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       supervisorKey: identity.supervisorKey,
       dailyRowsRead: quotaState.rowsRead,
       dailyRowsWritten: quotaState.rowsWritten,
+      preferBroker: Boolean(this.env.MAIN_APP_BROKER),
     });
 
     return this.ctx.facets.get('main', () => ({

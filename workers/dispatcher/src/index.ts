@@ -53,6 +53,7 @@ import {
 import { getSessionCookieName } from '../../main/src/cookies';
 import { parseSignedSession } from '../../main/src/signed-session';
 import type { OrgDO } from '../../main/src/auth';
+import type { DynamicServiceBroker } from '../../main/src/dynamic-service-broker';
 import type { WorkerLogsDO } from '../../main/src/worker-logs-do';
 import { isDynamicRuntimeMode } from '../../main/src/dynamic-worker-registry';
 import {
@@ -88,6 +89,14 @@ export {
   UserLogsTail,
 } from './dynamic/entrypoints';
 export { OutboundGate } from './dynamic/outbound-gate';
+export {
+  DynamicAIVirtualBinding,
+  DynamicAnalysisAppService,
+  DynamicCamelAiService,
+  DynamicConnectionsService,
+  DynamicDataProxyService,
+  DynamicWarehouseService,
+} from './dynamic/service-proxies';
 
 interface Env {
   DISPATCHER: {
@@ -106,6 +115,7 @@ interface Env {
   USER_APP_LOADER?: WorkerLoader;
   TENANT_DO_SUPERVISOR?: DurableObjectNamespace<TenantObjectSupervisorDO>;
   APP_USAGE_AE?: AnalyticsEngineDataset;
+  MAIN_APP_BROKER?: Service<DynamicServiceBroker>;
   SELFHOST_WORKER_LOADER?: WorkerLoader;
   SELFHOST_APP_RUNNER?: DurableObjectNamespace<SelfhostAppRunner>;
   SELFHOST_DO_DISPATCH?: Fetcher;

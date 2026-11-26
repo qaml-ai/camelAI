@@ -31,6 +31,7 @@ import {
   type DynamicWorkerBundleRecord,
   type DynamicWorkerModule,
 } from '../workers/main/src/dynamic-worker-registry.ts';
+import { hydrateMigratedBindings } from '../workers/main/src/dynamic-migration-bindings.ts';
 import { buildWfpExportShimSource } from '../workers/dispatcher/src/dynamic/export-shim.ts';
 import {
   MIGRATION_SIG_HEADER,
@@ -71,6 +72,7 @@ const ENV_CONFIG = {
     accountId: '85bbd288051330fb51ee1c86031a299b',
     dispatchNamespace: 'chiridion-platform-staging',
     appKvId: 'e894eb2caf1641ad8870da994b992fce',
+    appDbId: 'f73a764a-e6e2-4813-aa5c-6058b0212c51',
     r2Bucket: 'chiridion-sandbox',
     dispatcherOrigin: 'https://chiridion-dispatcher-staging.miguel-85b.workers.dev',
   },
@@ -78,6 +80,7 @@ const ENV_CONFIG = {
     accountId: '85bbd288051330fb51ee1c86031a299b',
     dispatchNamespace: 'chiridion-platform',
     appKvId: '0ee80299e67c4c7fa0c1ad618b7e7a9c',
+    appDbId: 'd4e6f5ca-08ec-4920-a4da-5651336beb79',
     r2Bucket: 'chiridion-sandbox',
     dispatcherOrigin: 'https://custom-domains.camelai.app',
   },
@@ -166,6 +169,60 @@ async function kvPut(apiToken: string, accountId: string, kvId: string, key: str
     body: value,
   });
   if (!resp.ok) throw new Error(`KV PUT ${key} failed (${resp.status}): ${await resp.text()}`);
+}
+
+async function r2GetJson<T>(
+  apiToken: string,
+  accountId: string,
+  bucket: string,
+  key: string,
+): Promise<T | null> {
+  const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/r2/buckets/${bucket}/objects/${encodeURIComponent(key)}`;
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${apiToken}` } });
+  if (resp.status === 404) return null;
+  if (!resp.ok) return null;
+  return (await resp.json()) as T;
+}
+
+interface AppDbMetadataRow {
+  org_id: string;
+  workspace_id: string;
+  created_by: string | null;
+  artifact_cache_key: string | null;
+  billing_plan: string | null;
+}
+
+async function queryAppDbMetadata(
+  apiToken: string,
+  accountId: string,
+  dbId: string,
+  orgId: string,
+  scriptName: string,
+): Promise<AppDbMetadataRow | null> {
+  const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database/${dbId}/query`;
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      sql: `
+        SELECT a.org_id, a.workspace_id, a.created_by,
+               g.artifact_cache_key AS artifact_cache_key,
+               o.billing_plan
+        FROM apps a
+        LEFT JOIN orgs o ON o.id = a.org_id
+        LEFT JOIN app_usage_guard_state g ON g.org_id = a.org_id AND g.script_name = a.script_name
+        WHERE a.org_id = ? AND a.script_name = ?
+        LIMIT 1
+      `,
+      params: [orgId, scriptName],
+    }),
+  });
+  if (!resp.ok) return null;
+  const data = (await resp.json()) as { result?: Array<{ results?: AppDbMetadataRow[] }> };
+  return data.result?.[0]?.results?.[0] ?? null;
 }
 
 async function r2PutJson(
@@ -337,9 +394,47 @@ async function migrateSingleScript(
 
   const orgSlug = extractOrgSlugFromDispatchName(dispatchScriptName);
   const scriptName = dispatchScriptName.slice(0, Math.max(0, dispatchScriptName.indexOf('--')));
-  const quotaTier: AppQuotaTier = isProtectedEnterpriseScript(dispatchScriptName)
-    ? 'enterprise'
-    : billingPlanToQuotaTier(registry.quota_tier as string | undefined);
+  const orgId = String(registry.org_id ?? '');
+
+  // Look up authoritative org/workspace/billing_plan/artifact_cache_key from APP_DB
+  // so R2VirtualBucket, KVVirtualNamespace, ConnectionsService, DataProxyService,
+  // AIVirtualBinding, CamelAiService, AnalysisAppService, and WarehouseService get
+  // 100% exact tenant `props` (Cloudflare /settings strips `props` from service bindings!).
+  const appDbRow = orgId
+    ? await queryAppDbMetadata(apiToken, cfg.accountId, cfg.appDbId, orgId, scriptName)
+    : null;
+  const workspaceId = appDbRow?.workspace_id ?? '';
+  const artifactRecord = appDbRow?.artifact_cache_key
+    ? await r2GetJson<{ metadata?: { bindings?: Array<Record<string, unknown>> } }>(
+        apiToken,
+        cfg.accountId,
+        cfg.r2Bucket,
+        appDbRow.artifact_cache_key,
+      )
+    : null;
+
+  const hydratedResult = hydrateMigratedBindings({
+    dispatchScriptName,
+    orgId,
+    workspaceId,
+    userId: appDbRow?.created_by ?? undefined,
+    liveSettingsBindings: bindings,
+    artifactCacheBindings: artifactRecord?.metadata?.bindings ?? null,
+  });
+  if (!hydratedResult.ok) {
+    return {
+      dispatchScriptName,
+      status: 'skipped',
+      reason: hydratedResult.reason,
+      missingBindings: hydratedResult.missingBindings,
+    };
+  }
+  const hydratedBindings = hydratedResult.bindings;
+
+  const quotaTier: AppQuotaTier =
+    isProtectedEnterpriseScript(dispatchScriptName) || appDbRow?.billing_plan === 'enterprise'
+      ? 'enterprise'
+      : billingPlanToQuotaTier(appDbRow?.billing_plan ?? (registry.quota_tier as string | undefined));
 
   if (opts.dryRun) {
     return {
@@ -350,6 +445,8 @@ async function migrateSingleScript(
       hasAssets,
       hasCodemodeLoader,
       quotaTier,
+      bindingPropsSource: hydratedResult.source,
+      workspaceId,
     };
   }
 
@@ -362,7 +459,7 @@ async function migrateSingleScript(
   );
   const bundleSha = crypto
     .createHash('sha256')
-    .update(JSON.stringify({ mainModule, bindings, modules }))
+    .update(JSON.stringify({ mainModule, bindings: hydratedBindings, modules }))
     .digest('hex')
     .slice(0, 16);
   const bundleR2Key = dynamicBundleObjectKey(dispatchScriptName, bundleSha);
@@ -372,16 +469,16 @@ async function migrateSingleScript(
     appId: dispatchScriptName,
     scriptName,
     dispatchScriptName,
-    orgId: String(registry.org_id ?? ''),
+    orgId,
     orgSlug,
-    workspaceId: '',
+    workspaceId,
     bundleSha,
     createdAt: new Date().toISOString(),
     compatibilityDate: settings.compatibility_date || '2026-07-13',
     compatibilityFlags: settings.compatibility_flags ?? ['nodejs_compat'],
     mainModule,
     modules,
-    bindings,
+    bindings: hydratedBindings,
     doBindings,
     doClasses,
     hasAssets,

@@ -25,6 +25,9 @@
 	"analytics_engine_datasets": [
 		{ "binding": "APP_USAGE_AE", "dataset": "chiridion_app_usage_prod" }
 	],
+	"services": [
+		{ "binding": "MAIN_APP_BROKER", "service": "chiridion-app", "entrypoint": "DynamicServiceBroker" }
+	],
 	"routes": [
 		// Cloudflare for SaaS custom hostnames enter the zone under the customer
 		// hostname, so a zone-wide route is required for grey-cloud CNAMEs.

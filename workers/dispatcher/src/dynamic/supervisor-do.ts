@@ -94,6 +94,52 @@ interface MeteredFacetStub {
   }>;
 }
 
+function sortTablesByForeignKeys<T extends { name: string }>(
+  tables: T[],
+  schema: Array<{ type: string; name: string; sql: string }>,
+): T[] {
+  const byLower = new Map<string, T>();
+  for (const t of tables) byLower.set(t.name.toLowerCase(), t);
+  const deps = new Map<string, Set<string>>();
+  for (const t of tables) deps.set(t.name.toLowerCase(), new Set());
+
+  for (const entry of schema) {
+    if (entry.type !== 'table' || !entry.sql) continue;
+    const child = entry.name.toLowerCase();
+    if (!deps.has(child)) continue;
+    for (const match of entry.sql.matchAll(/\bREFERENCES\s+(?:["`\[])?([A-Za-z0-9_]+)(?:["`\]])?/gi)) {
+      const parent = match[1]!.toLowerCase();
+      if (parent !== child && byLower.has(parent)) {
+        deps.get(child)!.add(parent);
+      }
+    }
+  }
+
+  const ordered: T[] = [];
+  const placed = new Set<string>();
+  const remaining = new Set(tables.map((t) => t.name.toLowerCase()));
+  while (remaining.size > 0) {
+    let progressed = false;
+    for (const key of [...remaining]) {
+      const reqs = deps.get(key)!;
+      if ([...reqs].every((p) => placed.has(p))) {
+        ordered.push(byLower.get(key)!);
+        placed.add(key);
+        remaining.delete(key);
+        progressed = true;
+      }
+    }
+    if (!progressed) {
+      // Break any circular FK cleanly by taking the first remaining table.
+      const nextKey = remaining.values().next().value!;
+      ordered.push(byLower.get(nextKey)!);
+      placed.add(nextKey);
+      remaining.delete(nextKey);
+    }
+  }
+  return ordered;
+}
+
 export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
   private identityCache: SupervisorIdentity | null = null;
   private quotaCache: PersistedShardQuotaState | null = null;
@@ -716,8 +762,9 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         throw new Error(`Importer schema replay failed: ${await schemaResp.text()}`);
       }
 
-      // 2. Stream every table in 500-row pages
-      for (const table of freeze.tables) {
+      // 2. Stream every table in 500-row pages (parent tables before FK-referencing child tables)
+      const orderedTables = sortTablesByForeignKeys(freeze.tables, freeze.schema);
+      for (const table of orderedTables) {
         if (table.rowCount === 0) continue;
         let cursor = -1;
         while (true) {

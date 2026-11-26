@@ -735,7 +735,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     } catch {}
     this.activeFacetBundleKey = null;
 
-    const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v1', () => ({
+    const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v2', () => ({
       compatibilityDate: '2026-07-13',
       compatibilityFlags: ['nodejs_compat'],
       mainModule: '__chiridion_importer.js',

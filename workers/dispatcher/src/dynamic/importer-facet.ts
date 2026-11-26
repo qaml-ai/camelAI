@@ -127,7 +127,7 @@ export class ChiridionMigrationImporterDO extends DurableObject {
         await this.ctx.storage.put(entry.key, decodeTyped(entry.value));
       }
 
-      // Recompute canonical table counts and SHA-256 digests to verify 100% parity.
+      // Recompute canonical table counts and streaming O(1)-RAM SHA-256 digests to verify 100% parity.
       const tableCounts = {};
       const tableDigests = {};
       const tableMetas = body.tables || [];
@@ -136,9 +136,25 @@ export class ChiridionMigrationImporterDO extends DurableObject {
         tableCounts[meta.name] = Number(countRow?.c ?? 0);
         const colSql = meta.columns.map(quoteIdent).join(", ");
         const orderClause = meta.hasRowid ? " ORDER BY rowid ASC" : "";
-        const rawRows = sql.exec("SELECT " + colSql + " FROM " + quoteIdent(meta.name) + orderClause).raw();
-        const serialized = [...rawRows].map((tuple) => tuple.map(encodeTyped));
-        tableDigests[meta.name] = await sha256Hex(JSON.stringify(serialized));
+        const cursor = sql.exec("SELECT " + colSql + " FROM " + quoteIdent(meta.name) + orderClause).raw();
+        let digest = "v2";
+        let chunk = [];
+        let chunkBytes = 0;
+        for (const tuple of cursor) {
+          const encoded = tuple.map(encodeTyped);
+          const sz = JSON.stringify(encoded).length;
+          if (chunk.length >= 200 || (chunk.length > 0 && chunkBytes + sz > 1024 * 1024)) {
+            digest = await sha256Hex(digest + ":" + JSON.stringify(chunk));
+            chunk = [];
+            chunkBytes = 0;
+          }
+          chunk.push(encoded);
+          chunkBytes += sz;
+        }
+        if (chunk.length > 0) {
+          digest = await sha256Hex(digest + ":" + JSON.stringify(chunk));
+        }
+        tableDigests[meta.name] = digest;
       }
       const kvAll = await this.ctx.storage.list();
       const kvCount = kvAll.size;

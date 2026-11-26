@@ -234,6 +234,9 @@ class ChiridionExportShimDO extends DurableObject {
       let nextCursor = null;
       let done = true;
 
+      const maxBytes = 2 * 1024 * 1024;
+      let approxBytes = 0;
+
       if (meta.hasRowid) {
         const raw = sql
           .exec(
@@ -244,15 +247,27 @@ class ChiridionExportShimDO extends DurableObject {
             limit + 1,
           )
           .raw();
-        const batch = [...raw];
-        done = batch.length <= limit;
-        const page = done ? batch : batch.slice(0, limit);
-        for (const tuple of page) {
+        let seen = 0;
+        let truncated = false;
+        for (const tuple of raw) {
+          seen += 1;
+          if (seen > limit) {
+            truncated = true;
+            break;
+          }
           const rowid = Number(tuple[0]);
           const values = tuple.slice(1).map(encodeTyped);
-          rows.push({ rowid, values });
+          const item = { rowid, values };
+          const itemBytes = JSON.stringify(item).length;
+          if (rows.length > 0 && approxBytes + itemBytes > maxBytes) {
+            truncated = true;
+            break;
+          }
+          rows.push(item);
+          approxBytes += itemBytes;
           nextCursor = rowid;
         }
+        done = !truncated;
       } else {
         const offset = Math.max(0, afterRowid < 0 ? 0 : afterRowid);
         const raw = sql
@@ -262,13 +277,25 @@ class ChiridionExportShimDO extends DurableObject {
             offset,
           )
           .raw();
-        const batch = [...raw];
-        done = batch.length <= limit;
-        const page = done ? batch : batch.slice(0, limit);
-        for (const tuple of page) {
-          rows.push({ rowid: null, values: tuple.map(encodeTyped) });
+        let seen = 0;
+        let truncated = false;
+        for (const tuple of raw) {
+          seen += 1;
+          if (seen > limit) {
+            truncated = true;
+            break;
+          }
+          const item = { rowid: null, values: tuple.map(encodeTyped) };
+          const itemBytes = JSON.stringify(item).length;
+          if (rows.length > 0 && approxBytes + itemBytes > maxBytes) {
+            truncated = true;
+            break;
+          }
+          rows.push(item);
+          approxBytes += itemBytes;
         }
-        nextCursor = done ? null : offset + page.length;
+        done = !truncated;
+        nextCursor = done ? null : offset + rows.length;
       }
 
       const pageDigest = await sha256Hex(JSON.stringify(rows));
@@ -291,11 +318,13 @@ class ChiridionExportShimDO extends DurableObject {
         ...(afterKey ? { startAfter: afterKey } : {}),
         limit: limit + 1,
       });
-      const allEntries = [...listed.entries()].filter(([k]) => k !== FROZEN_KEY);
-      const done = allEntries.length <= limit;
-      const page = done ? allEntries : allEntries.slice(0, limit);
-      const entries = page.map(([key, value]) => ({ key, value: encodeTyped(value) }));
+      const rawEntries = [...listed.entries()];
+      const done = rawEntries.length <= limit;
+      const page = done ? rawEntries : rawEntries.slice(0, limit);
       const nextAfterKey = done || page.length === 0 ? null : page[page.length - 1][0];
+      const entries = page
+        .filter(([k]) => k !== FROZEN_KEY)
+        .map(([key, value]) => ({ key, value: encodeTyped(value) }));
       return Response.json({ ok: true, entries, nextAfterKey, done });
     }
 
@@ -307,11 +336,27 @@ class ChiridionExportShimDO extends DurableObject {
         tableCounts[meta.name] = meta.rowCount;
         const colSql = meta.columns.map(quoteIdent).join(", ");
         const orderClause = meta.hasRowid ? " ORDER BY rowid ASC" : "";
-        const rows = sql
+        const cursor = sql
           .exec("SELECT " + colSql + " FROM " + quoteIdent(meta.name) + orderClause)
           .raw();
-        const serialized = [...rows].map((tuple) => tuple.map(encodeTyped));
-        tableDigests[meta.name] = await sha256Hex(JSON.stringify(serialized));
+        let digest = "v2";
+        let chunk = [];
+        let chunkBytes = 0;
+        for (const tuple of cursor) {
+          const encoded = tuple.map(encodeTyped);
+          const sz = JSON.stringify(encoded).length;
+          if (chunk.length >= 200 || (chunk.length > 0 && chunkBytes + sz > 1024 * 1024)) {
+            digest = await sha256Hex(digest + ":" + JSON.stringify(chunk));
+            chunk = [];
+            chunkBytes = 0;
+          }
+          chunk.push(encoded);
+          chunkBytes += sz;
+        }
+        if (chunk.length > 0) {
+          digest = await sha256Hex(digest + ":" + JSON.stringify(chunk));
+        }
+        tableDigests[meta.name] = digest;
       }
       const alarmMs = await this.ctx.storage.getAlarm();
       const kvAll = await this.ctx.storage.list();

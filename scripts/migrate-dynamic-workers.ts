@@ -373,14 +373,90 @@ async function uploadWfpExportShim(input: {
   );
 
   const url = `https://api.cloudflare.com/client/v4/accounts/${input.accountId}/workers/dispatch/namespaces/${input.namespace}/scripts/${encodeURIComponent(input.dispatchScriptName)}`;
-  const resp = await fetch(url, {
+  const putResp = await fetchWithRetry(url, {
     method: 'PUT',
     headers: { Authorization: `Bearer ${input.apiToken}` },
     body: form,
   });
-  if (!resp.ok) {
-    throw new Error(`Upload WfP export shim failed (${resp.status}): ${await resp.text()}`);
+  if (!putResp.ok) {
+    throw new Error(`Upload WfP export shim failed (${putResp.status}): ${await putResp.text()}`);
   }
+}
+
+async function restoreWfpScriptFromBundle(input: {
+  apiToken: string;
+  accountId: string;
+  namespace: string;
+  dispatchScriptName: string;
+  bundle: DynamicWorkerBundleRecord;
+}): Promise<void> {
+  const form = new FormData();
+  const metadata = {
+    main_module: input.bundle.mainModule,
+    compatibility_date: input.bundle.compatibilityDate || '2026-07-13',
+    compatibility_flags: input.bundle.compatibilityFlags || ['nodejs_compat'],
+    bindings: input.bundle.bindings,
+    keep_bindings: ['secret_text', 'secret_key'],
+    keep_assets: true,
+  };
+  form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+  for (const [name, mod] of Object.entries(input.bundle.modules)) {
+    let mime = 'application/javascript+module';
+    let body: string | Uint8Array = mod.content;
+    if (mod.type === 'wasm') {
+      mime = 'application/wasm';
+      body = Buffer.from(mod.content, 'base64');
+    } else if (mod.type === 'data') {
+      mime = 'application/octet-stream';
+      body = Buffer.from(mod.content, 'base64');
+    } else if (mod.type === 'json') {
+      mime = 'application/json';
+    } else if (mod.type === 'text') {
+      mime = 'text/plain';
+    }
+    form.append(name, new Blob([body], { type: mime }), name);
+  }
+  const url = `https://api.cloudflare.com/client/v4/accounts/${input.accountId}/workers/dispatch/namespaces/${input.namespace}/scripts/${encodeURIComponent(input.dispatchScriptName)}`;
+  const putResp = await fetchWithRetry(url, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${input.apiToken}` },
+    body: form,
+  });
+  if (!putResp.ok) {
+    throw new Error(`Restore WfP script failed (${putResp.status}): ${await putResp.text()}`);
+  }
+}
+
+function detectStaticSingletonIds(modules: Record<string, DynamicWorkerModule>): {
+  isStaticSingleton: boolean;
+  singletonIds: string[];
+  dynamicCalls: string[];
+} {
+  const jsSource = Object.values(modules)
+    .filter((m) => m.type === 'js')
+    .map((m) => m.content)
+    .join('\n');
+  const staticNames = new Set<string>();
+  const dynamicCalls: string[] = [];
+
+  for (const m of jsSource.matchAll(/\.idFromName\(\s*([^)]+?)\s*\)/g)) {
+    const arg = m[1]!.trim();
+    const lit = arg.match(/^["']([^"'\\]{1,64})["']$/);
+    if (lit) staticNames.add(`name:${lit[1]}`);
+    else dynamicCalls.push(`idFromName(${arg.slice(0, 40)})`);
+  }
+  if (/\.newUniqueId\s*\(/.test(jsSource)) {
+    dynamicCalls.push('newUniqueId()');
+  }
+  if (/\.idFromString\s*\(/.test(jsSource)) {
+    dynamicCalls.push('idFromString(...)');
+  }
+
+  return {
+    isStaticSingleton: dynamicCalls.length === 0 && staticNames.size > 0 && staticNames.size <= 4,
+    singletonIds: [...staticNames],
+    dynamicCalls,
+  };
 }
 
 async function migrateSingleScript(
@@ -508,6 +584,25 @@ async function migrateSingleScript(
     cfg.dispatchNamespace,
     dispatchScriptName,
   );
+  if (mainModule === 'export-shim.js' || 'export-shim.js' in modules) {
+    return { dispatchScriptName, status: 'skipped', reason: 'already_export_shim' };
+  }
+
+  let effectiveSingletonIds = opts.singletonIds;
+  if (doClasses.length > 0 && opts.cohort === 'b' && !opts.script) {
+    const detected = detectStaticSingletonIds(modules);
+    if (!detected.isStaticSingleton) {
+      return {
+        dispatchScriptName,
+        status: 'skipped',
+        reason: 'dynamic_do_ids_cohort_c',
+        dynamicCalls: detected.dynamicCalls.slice(0, 4),
+        staticNames: detected.singletonIds,
+      };
+    }
+    effectiveSingletonIds = detected.singletonIds;
+  }
+
   const bundleSha = crypto
     .createHash('sha256')
     .update(JSON.stringify({ mainModule, bindings: hydratedBindings, modules }))
@@ -565,38 +660,50 @@ async function migrateSingleScript(
     });
 
     if (opts.cohort === 'b') {
-      // Allow any already-warm WfP Durable Object isolate ~12s of quiet idle time
-      // so Cloudflare reloads the DO class onto ChiridionExportShimDO cleanly.
-      await new Promise((r) => setTimeout(r, 12_000));
-      for (const className of doClasses) {
-        for (const objectId of opts.singletonIds) {
-          const ts = Date.now();
-          const sig = await signMigrationRequest(
-            migrationHmacSecret,
-            '/__chiridion_migrate/import',
-            ts,
-          );
-          const importResp = await fetch(`${cfg.dispatcherOrigin}/__chiridion_migrate/import`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              [MIGRATION_TS_HEADER]: String(ts),
-              [MIGRATION_SIG_HEADER]: sig,
-            },
-            body: JSON.stringify({
-              dispatchScriptName,
-              className,
-              objectId,
-              orgId: String(registry.org_id ?? ''),
-            }),
-          });
-          if (!importResp.ok) {
-            throw new Error(
-              `Shard import failed for ${dispatchScriptName}:${className}:${objectId} (${importResp.status}): ${await importResp.text()}`,
+      try {
+        // Allow any already-warm WfP Durable Object isolate ~12s of quiet idle time
+        // so Cloudflare reloads the DO class onto ChiridionExportShimDO cleanly.
+        await new Promise((r) => setTimeout(r, 12_000));
+        for (const className of doClasses) {
+          for (const objectId of effectiveSingletonIds) {
+            const ts = Date.now();
+            const sig = await signMigrationRequest(
+              migrationHmacSecret,
+              '/__chiridion_migrate/import',
+              ts,
             );
+            const importResp = await fetch(`${cfg.dispatcherOrigin}/__chiridion_migrate/import`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                [MIGRATION_TS_HEADER]: String(ts),
+                [MIGRATION_SIG_HEADER]: sig,
+              },
+              body: JSON.stringify({
+                dispatchScriptName,
+                className,
+                objectId,
+                orgId: String(registry.org_id ?? ''),
+              }),
+            });
+            if (!importResp.ok) {
+              throw new Error(
+                `Shard import failed for ${dispatchScriptName}:${className}:${objectId} (${importResp.status}): ${await importResp.text()}`,
+              );
+            }
+            importedShards.push(await importResp.json());
           }
-          importedShards.push(await importResp.json());
         }
+      } catch (importErr) {
+        // Auto-restore original WfP script immediately so no app is ever left stranded on 503.
+        await restoreWfpScriptFromBundle({
+          apiToken,
+          accountId: cfg.accountId,
+          namespace: cfg.dispatchNamespace,
+          dispatchScriptName,
+          bundle: bundleRecord,
+        }).catch(() => {});
+        throw importErr;
       }
     }
   }

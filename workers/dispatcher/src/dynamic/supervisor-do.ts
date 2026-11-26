@@ -657,6 +657,12 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       'POST',
     );
 
+    if (!freeze || !Array.isArray(freeze.tables) || !Array.isArray(freeze.schema)) {
+      throw new Error(
+        `WfP DO isolate for ${identity.dispatchScriptName}:${identity.className} returned non-shim response (likely active WebSocket/alarm still running pre-shim code)`,
+      );
+    }
+
     const hasSqlData = freeze.tables.some((t) => t.rowCount > 0) || freeze.schema.length > 0;
     const hasAnyState = hasSqlData || freeze.kvCount > 0 || freeze.alarmMs !== null;
 

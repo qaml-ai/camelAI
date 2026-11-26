@@ -142,6 +142,30 @@ export function isProtectedEnterpriseScript(dispatchScriptName: string): boolean
   return PROTECTED_ENTERPRISE_ORG_SLUGS.has(orgSlug);
 }
 
+let lastApiCallAt = 0;
+const MIN_API_INTERVAL_MS = 280; // ~3.5 req/s keeps us cleanly under Cloudflare's 1,200 req/5min limit.
+
+async function fetchWithRetry(url: string, init: RequestInit = {}, maxAttempts = 6): Promise<Response> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const now = Date.now();
+    const waitMs = Math.max(0, lastApiCallAt + MIN_API_INTERVAL_MS - now);
+    lastApiCallAt = now + waitMs;
+    if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+
+    const resp = await fetch(url, init);
+    if (resp.status !== 429 && resp.status < 500) return resp;
+    if (attempt === maxAttempts) return resp;
+    const retryAfterSec = Number(resp.headers.get('retry-after') || '0');
+    const backoffMs =
+      Number.isFinite(retryAfterSec) && retryAfterSec > 0
+        ? Math.min(60_000, retryAfterSec * 1000)
+        : Math.min(30_000, 1500 * 2 ** (attempt - 1));
+    await resp.text().catch(() => {});
+    await new Promise((r) => setTimeout(r, backoffMs));
+  }
+  throw new Error(`fetchWithRetry exhausted for ${url}`);
+}
+
 async function cfFetch<T>(
   apiToken: string,
   url: string,
@@ -149,7 +173,7 @@ async function cfFetch<T>(
 ): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set('Authorization', `Bearer ${apiToken}`);
-  const resp = await fetch(url, {
+  const resp = await fetchWithRetry(url, {
     ...init,
     headers,
   });
@@ -166,7 +190,7 @@ async function cfFetch<T>(
 
 async function kvGet(apiToken: string, accountId: string, kvId: string, key: string): Promise<string | null> {
   const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${kvId}/values/${encodeURIComponent(key)}`;
-  const resp = await fetch(url, { headers: { Authorization: `Bearer ${apiToken}` } });
+  const resp = await fetchWithRetry(url, { headers: { Authorization: `Bearer ${apiToken}` } });
   if (resp.status === 404) return null;
   if (!resp.ok) throw new Error(`KV GET ${key} failed (${resp.status})`);
   return resp.text();
@@ -174,7 +198,7 @@ async function kvGet(apiToken: string, accountId: string, kvId: string, key: str
 
 async function kvPut(apiToken: string, accountId: string, kvId: string, key: string, value: string): Promise<void> {
   const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${kvId}/values/${encodeURIComponent(key)}`;
-  const resp = await fetch(url, {
+  const resp = await fetchWithRetry(url, {
     method: 'PUT',
     headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'text/plain; charset=utf-8' },
     body: value,
@@ -189,7 +213,7 @@ async function r2GetJson<T>(
   key: string,
 ): Promise<T | null> {
   const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/r2/buckets/${bucket}/objects/${encodeURIComponent(key)}`;
-  const resp = await fetch(url, { headers: { Authorization: `Bearer ${apiToken}` } });
+  const resp = await fetchWithRetry(url, { headers: { Authorization: `Bearer ${apiToken}` } });
   if (resp.status === 404) return null;
   if (!resp.ok) return null;
   return (await resp.json()) as T;
@@ -211,7 +235,7 @@ async function queryAppDbMetadata(
   scriptName: string,
 ): Promise<AppDbMetadataRow | null> {
   const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database/${dbId}/query`;
-  const resp = await fetch(url, {
+  const resp = await fetchWithRetry(url, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiToken}`,
@@ -244,7 +268,7 @@ async function r2PutJson(
   payload: unknown,
 ): Promise<void> {
   const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/r2/buckets/${bucket}/objects/${encodeURIComponent(key)}`;
-  const resp = await fetch(url, {
+  const resp = await fetchWithRetry(url, {
     method: 'PUT',
     headers: {
       Authorization: `Bearer ${apiToken}`,
@@ -262,7 +286,7 @@ async function fetchWfpScriptContent(
   scriptName: string,
 ): Promise<{ mainModule: string; modules: Record<string, DynamicWorkerModule> }> {
   const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/dispatch/namespaces/${namespace}/scripts/${encodeURIComponent(scriptName)}/content`;
-  const resp = await fetch(url, { headers: { Authorization: `Bearer ${apiToken}` } });
+  const resp = await fetchWithRetry(url, { headers: { Authorization: `Bearer ${apiToken}` } });
   if (!resp.ok) throw new Error(`GET script content failed (${resp.status})`);
   const mainModule = resp.headers.get('cf-entrypoint') || 'index.js';
   const contentType = resp.headers.get('content-type') || '';

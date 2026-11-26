@@ -292,19 +292,27 @@ async function fetchWfpScriptContent(
   const contentType = resp.headers.get('content-type') || '';
 
   const modules: Record<string, DynamicWorkerModule> = {};
+  const textExtRe = /\.(?:html?|txt|css|svg|md|markdown|sql|xml|csv|yaml|yml)$/i;
   if (contentType.includes('multipart/form-data')) {
     const form = await resp.formData();
-    for (const [name, value] of form.entries()) {
+    for (const [rawName, value] of form.entries()) {
+      const name = rawName.replace(/^\.\//, '');
       if (typeof value === 'string') {
-        modules[name] = { name, type: 'js', content: value };
+        if (textExtRe.test(name)) {
+          modules[name] = { name, type: 'text', content: value };
+        } else if (/\.json$/i.test(name)) {
+          modules[name] = { name, type: 'json', content: value };
+        } else {
+          modules[name] = { name, type: 'js', content: value };
+        }
       } else {
         const buf = new Uint8Array(await value.arrayBuffer());
         const partType = value.type.toLowerCase();
         if (partType.includes('wasm') || name.endsWith('.wasm')) {
           modules[name] = { name, type: 'wasm', content: Buffer.from(buf).toString('base64') };
-        } else if (partType.includes('json') && name.endsWith('.json')) {
+        } else if (partType.includes('json') || name.endsWith('.json')) {
           modules[name] = { name, type: 'json', content: Buffer.from(buf).toString('utf8') };
-        } else if (partType.startsWith('text/') && !name.endsWith('.js') && !name.endsWith('.mjs')) {
+        } else if (textExtRe.test(name) || (partType.startsWith('text/') && !name.endsWith('.js') && !name.endsWith('.mjs'))) {
           modules[name] = { name, type: 'text', content: Buffer.from(buf).toString('utf8') };
         } else if (partType.includes('octet-stream')) {
           modules[name] = { name, type: 'data', content: Buffer.from(buf).toString('base64') };
@@ -315,7 +323,8 @@ async function fetchWfpScriptContent(
     }
   } else {
     const text = await resp.text();
-    modules[mainModule] = { name: mainModule, type: 'js', content: text };
+    const cleanMain = mainModule.replace(/^\.\//, '');
+    modules[cleanMain] = { name: cleanMain, type: 'js', content: text };
   }
   return { mainModule, modules };
 }

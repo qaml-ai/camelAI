@@ -172,7 +172,14 @@ function base64ToArrayBuffer(value: string): ArrayBuffer {
   return bytes.buffer;
 }
 
+const TEXT_MODULE_EXTENSIONS = /\.(?:html?|txt|css|svg|md|markdown|sql|xml|csv|yaml|yml)$/i;
+
+function normalizeModuleName(name: string): string {
+  return name.replace(/^\.\//, '');
+}
+
 function toWorkerLoaderModule(module: DynamicWorkerModule): WorkerLoaderModule | string {
+  const cleanName = normalizeModuleName(module.name);
   switch (module.type) {
     case 'text':
       return { text: module.content };
@@ -184,8 +191,15 @@ function toWorkerLoaderModule(module: DynamicWorkerModule): WorkerLoaderModule |
       return { wasm: base64ToArrayBuffer(module.content) };
     case 'js':
     default:
+      // Guard against WfP multipart uploads where text/html/json parts arrived as plain strings.
+      if (TEXT_MODULE_EXTENSIONS.test(cleanName)) {
+        return { text: module.content };
+      }
+      if (/\.json$/i.test(cleanName)) {
+        return { json: JSON.parse(module.content) };
+      }
       // WorkerLoader requires explicit `{ js }` object when module name doesn't end with `.js`.
-      return module.name.endsWith('.js') ? module.content : { js: module.content };
+      return cleanName.endsWith('.js') ? module.content : { js: module.content };
   }
 }
 
@@ -374,7 +388,8 @@ export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStu
       '__chiridion_wrapper.js': generateDynamicWorkerWrapperSource(record),
     };
     for (const [moduleName, module] of Object.entries(record.modules)) {
-      modules[moduleName] = toWorkerLoaderModule(module);
+      const normalized = normalizeModuleName(moduleName);
+      modules[normalized] = toWorkerLoaderModule({ ...module, name: normalized });
     }
 
     const dynamicEnv: Record<string, unknown> = {

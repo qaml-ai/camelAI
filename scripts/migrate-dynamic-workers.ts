@@ -66,6 +66,7 @@ interface CliOptions {
   includeEnterprise: boolean;
   skipMigrated: boolean;
   limit: number;
+  concurrency: number;
   logFile: string;
 }
 
@@ -96,6 +97,7 @@ function parseArgs(argv: string[]): CliOptions {
     includeEnterprise: false,
     skipMigrated: true,
     limit: 20,
+    concurrency: 1,
     logFile: path.resolve('migration-progress.jsonl'),
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -121,6 +123,8 @@ function parseArgs(argv: string[]): CliOptions {
       opts.skipMigrated = false;
     } else if (arg === '--limit' && argv[i + 1]) {
       opts.limit = Math.max(1, Number(argv[++i]!) || 20);
+    } else if (arg === '--concurrency' && argv[i + 1]) {
+      opts.concurrency = Math.max(1, Math.min(16, Number(argv[++i]!) || 1));
     } else if (arg === '--log-file' && argv[i + 1]) {
       opts.logFile = path.resolve(argv[++i]!);
     }
@@ -655,27 +659,35 @@ async function main() {
   }
 
   let matchedCount = 0;
-  for (const script of targets) {
-    if (!opts.script && matchedCount >= opts.limit) break;
-    try {
-      const outcome = await migrateSingleScript(opts, apiToken, migrationHmacSecret, script);
-      if (outcome.status === 'migrated' || outcome.status === 'dry_run_ready') {
-        matchedCount += 1;
+  let nextIdx = 0;
+  const workerCount = opts.script ? 1 : opts.concurrency;
+  const runWorker = async () => {
+    while (true) {
+      if (!opts.script && matchedCount >= opts.limit) return;
+      const idx = nextIdx++;
+      if (idx >= targets.length) return;
+      const script = targets[idx]!;
+      try {
+        const outcome = await migrateSingleScript(opts, apiToken, migrationHmacSecret, script);
+        if (outcome.status === 'migrated' || outcome.status === 'dry_run_ready') {
+          matchedCount += 1;
+        }
+        const line = JSON.stringify({ ts: new Date().toISOString(), ...outcome });
+        console.log(line);
+        fs.appendFileSync(opts.logFile, `${line}\n`);
+      } catch (error) {
+        const line = JSON.stringify({
+          ts: new Date().toISOString(),
+          dispatchScriptName: script,
+          status: 'error',
+          error: error instanceof Error ? error.message : String(error),
+        });
+        console.error(line);
+        fs.appendFileSync(opts.logFile, `${line}\n`);
       }
-      const line = JSON.stringify({ ts: new Date().toISOString(), ...outcome });
-      console.log(line);
-      fs.appendFileSync(opts.logFile, `${line}\n`);
-    } catch (error) {
-      const line = JSON.stringify({
-        ts: new Date().toISOString(),
-        dispatchScriptName: script,
-        status: 'error',
-        error: error instanceof Error ? error.message : String(error),
-      });
-      console.error(line);
-      fs.appendFileSync(opts.logFile, `${line}\n`);
     }
-  }
+  };
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

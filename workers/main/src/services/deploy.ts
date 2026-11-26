@@ -4,7 +4,11 @@
 
 import { type Env } from '../types.js';
 import type { DeploySideEffectsInfo } from '../cf-api-proxy.js';
-import type { DynamicWorkerRegistryFields } from '../dynamic-worker-registry.js';
+import {
+  billingPlanToQuotaTier,
+  type AppQuotaTier,
+  type DynamicWorkerRegistryFields,
+} from '../dynamic-worker-registry.js';
 import type { AppScreenshotJob } from '../screenshot-queue.js';
 import {
   resolveEnvPrefix,
@@ -36,7 +40,20 @@ export async function handleDeploySideEffects(env: Env, info: DeploySideEffectsI
 
   const script = await orgStub.registerWorkerScript(scriptName, workspaceId, createdBy, configPath, projectId, commitSha, artifactCacheKey);
 
-  await refreshAppRegistryAfterDeploy(env, info, script.is_public);
+  let orgQuotaTier: AppQuotaTier | undefined;
+  try {
+    const org = await orgStub.getOrganization();
+    if (org?.billing_plan) {
+      orgQuotaTier = billingPlanToQuotaTier(org.billing_plan);
+    }
+  } catch {}
+
+  const enrichedInfo: DeploySideEffectsInfo =
+    orgQuotaTier && info.dynamicBundle && !info.dynamicBundle.quota_tier
+      ? { ...info, dynamicBundle: { ...info.dynamicBundle, quota_tier: orgQuotaTier } }
+      : info;
+
+  await refreshAppRegistryAfterDeploy(env, enrichedInfo, script.is_public);
 
   // Update preview status
   const envPrefix = resolveEnvPrefix(env.WORKER_BASE_URL, hostname);

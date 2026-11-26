@@ -42,10 +42,24 @@ export const QUOTA_LIMITS_BY_TIER: Record<Exclude<AppQuotaTier, 'exempt'>, Shard
     alarmMinIntervalMs: 10_000,
     alarmDailyBudget: 10_000,
   },
+  // Enterprise tier (e.g. SECLOCK, BrandRank.ai, Rubicon9): 100x Free limits +
+  // 8 GiB SQLite DB cap so high-volume enterprise analytics & DO workloads run
+  // with full real-time visibility and zero disruption.
+  enterprise: {
+    maxRowsWrittenPerDay: 10_000_000,
+    maxRowsReadPerDay: 2_500_000_000,
+    maxRowsWrittenPerEvent: 1_000_000,
+    maxRowsReadPerEvent: 50_000_000,
+    maxDbSizeBytes: 8 * 1024 * 1024 * 1024, // 8 GiB
+    maxSubrequestsPerRequest: 5_000,
+    maxDoHopsPerRequest: 512,
+    alarmMinIntervalMs: 5_000,
+    alarmDailyBudget: 50_000,
+  },
 };
 
 export function resolveQuotaTier(tier: string | undefined): AppQuotaTier {
-  if (tier === 'pro' || tier === 'exempt') return tier;
+  if (tier === 'pro' || tier === 'enterprise' || tier === 'exempt') return tier;
   return 'free';
 }
 

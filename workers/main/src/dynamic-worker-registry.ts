@@ -6,7 +6,14 @@
  */
 
 export type AppRuntimeMode = "wfp" | "dynamic" | "dynamic_migrating";
-export type AppQuotaTier = "free" | "pro" | "exempt";
+export type AppQuotaTier = "free" | "pro" | "enterprise" | "exempt";
+
+export function billingPlanToQuotaTier(billingPlan: string | null | undefined): AppQuotaTier {
+  const normalized = billingPlan?.trim().toLowerCase();
+  if (normalized === "enterprise") return "enterprise";
+  if (normalized === "pro" || normalized === "team" || normalized === "starter") return "pro";
+  return "free";
+}
 
 export const DYNAMIC_BUNDLE_OBJECT_PREFIX = "dynamic-bundles";
 export const DYNAMIC_DO_ALIAS_PREFIX = "do_alias:";

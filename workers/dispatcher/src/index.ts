@@ -66,6 +66,11 @@ import {
 } from '../../main/src/workspace-app-fetcher.js';
 import { dispatchDynamicWorkerEdge } from './dynamic/edge-dispatch';
 import type { DynamicRuntimeExports } from './dynamic/bundle-store';
+import {
+  MIGRATION_SIG_HEADER,
+  MIGRATION_TS_HEADER,
+  verifyMigrationSignature,
+} from './dynamic/migration-protocol';
 import type { TenantObjectSupervisorDO } from './dynamic/supervisor-do';
 export { AIVirtualBinding } from '../../main/src/ai-virtual-binding';
 export { AssetsVirtualBinding } from '../../main/src/assets-virtual-binding';
@@ -108,6 +113,7 @@ interface Env {
   R2_BUCKET?: R2Bucket;
   AI?: Ai;
   INTEGRATION_SECRET_KEY?: string;
+  MIGRATION_HMAC_SECRET?: string;
   TOKEN_SIGNING_SECRET: string;
   // Set to "true" to skip all auth checks (local development only)
   SKIP_AUTH?: string;
@@ -1129,6 +1135,76 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
     const ctx = this.ctx;
     const url = new URL(request.url);
     const hostname = getRequestHostname(request, url);
+
+    if (url.pathname === '/__chiridion_migrate/import' && request.method === 'POST') {
+      const secret = env.MIGRATION_HMAC_SECRET?.trim() || env.TOKEN_SIGNING_SECRET?.trim();
+      const valid = secret
+        ? await verifyMigrationSignature(
+            secret,
+            url.pathname,
+            request.headers.get(MIGRATION_SIG_HEADER),
+            request.headers.get(MIGRATION_TS_HEADER),
+          )
+        : false;
+      if (!valid) return new Response('Forbidden', { status: 403 });
+      if (!env.TENANT_DO_SUPERVISOR) {
+        return Response.json({ ok: false, error: 'TENANT_DO_SUPERVISOR not configured' }, { status: 500 });
+      }
+      const body = (await request.json()) as {
+        dispatchScriptName: string;
+        className: string;
+        objectId: string;
+        force?: boolean;
+        orgId?: string;
+      };
+      if (!body.dispatchScriptName || !body.className || !body.objectId) {
+        return Response.json({ ok: false, error: 'Missing migration identity fields' }, { status: 400 });
+      }
+      const supervisorKey = `${body.dispatchScriptName}:${body.className}:${body.objectId}`;
+      const stub = env.TENANT_DO_SUPERVISOR.get(env.TENANT_DO_SUPERVISOR.idFromName(supervisorKey));
+      const result = await stub.migrateFromWfpShim(
+        {
+          supervisorKey,
+          dispatchScriptName: body.dispatchScriptName,
+          className: body.className,
+          objectId: body.objectId,
+        },
+        { force: body.force, orgId: body.orgId },
+      );
+      return Response.json({ ok: true, supervisorKey, ...result });
+    }
+
+    if (url.pathname === '/__chiridion_migrate/alarm-discovered' && request.method === 'POST') {
+      const secret = env.MIGRATION_HMAC_SECRET?.trim() || env.TOKEN_SIGNING_SECRET?.trim();
+      const body = (await request.json()) as {
+        dispatchScriptName?: string;
+        className: string;
+        hexId: string;
+      };
+      const dispatchScriptName =
+        body.dispatchScriptName?.trim() || url.searchParams.get('appId')?.trim() || '';
+      const valid = secret && dispatchScriptName && body.className && body.hexId
+        ? await verifyMigrationSignature(
+            secret,
+            `alarm:${body.className}:${body.hexId}`,
+            request.headers.get(MIGRATION_SIG_HEADER),
+            request.headers.get(MIGRATION_TS_HEADER),
+          )
+        : false;
+      if (!valid) return new Response('Forbidden', { status: 403 });
+      if (!env.TENANT_DO_SUPERVISOR) {
+        return Response.json({ ok: false, error: 'TENANT_DO_SUPERVISOR not configured' }, { status: 500 });
+      }
+      const supervisorKey = `${dispatchScriptName}:${body.className}:${body.hexId}`;
+      const stub = env.TENANT_DO_SUPERVISOR.get(env.TENANT_DO_SUPERVISOR.idFromName(supervisorKey));
+      const result = await stub.migrateFromWfpShim({
+        supervisorKey,
+        dispatchScriptName,
+        className: body.className,
+        objectId: body.hexId,
+      });
+      return Response.json({ ok: true, supervisorKey, ...result });
+    }
 
     if (url.pathname === '/__selfhost_do/fetch') {
       const bridgeToken = request.headers.get('x-camelai-selfhost-do-bridge')?.trim();

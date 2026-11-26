@@ -14,6 +14,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { OrgDO } from '../../../main/src/auth';
 import {
+  dynamicDoAliasKey,
   type AppQuotaTier,
   type DynamicWorkerBundleRecord,
 } from '../../../main/src/dynamic-worker-registry';
@@ -24,6 +25,16 @@ import {
   loadManagedEnvOverlay,
   type DynamicRuntimeExports,
 } from './bundle-store';
+import { MIGRATION_IMPORTER_FACET_SOURCE } from './importer-facet';
+import {
+  MIGRATION_SIG_HEADER,
+  MIGRATION_TS_HEADER,
+  signMigrationRequest,
+  type FreezeResponsePayload,
+  type KvPagePayload,
+  type SqlPagePayload,
+  type VerifyResponsePayload,
+} from './migration-protocol';
 import {
   checkShardQuota,
   emitAppUsageMetric,
@@ -58,6 +69,8 @@ export interface SupervisorEnv {
   ORG?: DurableObjectNamespace<OrgDO>;
   USER_APP_LOADER?: WorkerLoader;
   APP_USAGE_AE?: AnalyticsEngineDataset;
+  MIGRATION_HMAC_SECRET?: string;
+  TOKEN_SIGNING_SECRET?: string;
   DISPATCHER?: {
     get(name: string): { fetch(request: Request): Promise<Response> };
   };
@@ -245,6 +258,10 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     }
     const { accessInfo, bundle, quotaTier } = resolved;
 
+    if (accessInfo.runtime_mode === 'dynamic_migrating') {
+      await this.ensureLazyMigrated(identity, accessInfo.org_id, quotaTier);
+    }
+
     const quotaState = await this.loadQuotaState();
     const preCheck = checkShardQuota({ tier: quotaTier, daily: quotaState });
     if (!preCheck.allowed) {
@@ -346,6 +363,10 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     const resolved = await this.resolveAppAndBundle(identity);
     if (!resolved) throw new Error(`Worker bundle not found: ${identity.dispatchScriptName}`);
     const { accessInfo, bundle, quotaTier } = resolved;
+
+    if (accessInfo.runtime_mode === 'dynamic_migrating') {
+      await this.ensureLazyMigrated(identity, accessInfo.org_id, quotaTier);
+    }
 
     const quotaState = await this.loadQuotaState();
     const preCheck = checkShardQuota({ tier: quotaTier, daily: quotaState });
@@ -515,6 +536,286 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
 
   async setMigrationState(state: SupervisorMigrationState): Promise<void> {
     await this.ctx.storage.put(META_MIGRATION_KEY, state);
+  }
+
+  private migrationHmacSecret(): string {
+    const secret =
+      this.env.MIGRATION_HMAC_SECRET?.trim() || this.env.TOKEN_SIGNING_SECRET?.trim();
+    if (!secret) throw new Error('Missing MIGRATION_HMAC_SECRET for WfP shard migration');
+    return secret;
+  }
+
+  private async fetchWfpShim<T>(
+    dispatchScriptName: string,
+    className: string,
+    objectId: string,
+    path: string,
+    query: Record<string, string> = {},
+    method: 'GET' | 'POST' = 'GET',
+  ): Promise<T> {
+    if (!this.env.DISPATCHER) {
+      throw new Error('DISPATCHER binding is required to pull state from WfP export shim');
+    }
+    const secret = this.migrationHmacSecret();
+    const ts = Date.now();
+    const sig = await signMigrationRequest(secret, path, ts);
+    const url = new URL(`https://migrate.internal${path}`);
+    url.searchParams.set('className', className);
+    url.searchParams.set('objectId', objectId);
+    for (const [k, v] of Object.entries(query)) {
+      url.searchParams.set(k, v);
+    }
+    const wfpWorker = this.env.DISPATCHER.get(dispatchScriptName);
+    const resp = await wfpWorker.fetch(
+      new Request(url.toString(), {
+        method,
+        headers: {
+          [MIGRATION_TS_HEADER]: String(ts),
+          [MIGRATION_SIG_HEADER]: sig,
+        },
+      }),
+    );
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      throw new Error(`WfP export shim ${path} failed (HTTP ${resp.status}): ${body.slice(0, 256)}`);
+    }
+    return (await resp.json()) as T;
+  }
+
+  /**
+   * Streams SQLite schema, rows, `sqlite_sequence`, indexes/triggers/views, DO KV,
+   * and pending alarm from the app's WfP Export Shim into this supervisor's `"main"`
+   * Facet and verifies 100% SHA-256 parity before marking the shard migrated.
+   */
+  async migrateFromWfpShim(
+    identityInput: SupervisorIdentity,
+    options?: { force?: boolean; orgId?: string; quotaTier?: AppQuotaTier },
+  ): Promise<{
+    status: 'migrated' | 'empty' | 'already_migrated';
+    hexId?: string;
+    tableCounts?: Record<string, number>;
+    kvCount?: number;
+    overallDigest?: string;
+  }> {
+    const identity = await this.ensureIdentity(identityInput);
+    if (!identity) throw new Error('Missing supervisor identity for migration');
+
+    const existing = await this.getMigrationState();
+    if (!options?.force && existing && (existing.status === 'migrated' || existing.status === 'empty')) {
+      return { status: 'already_migrated', hexId: existing.legacyHexId, overallDigest: existing.sourceDigest };
+    }
+
+    if (!this.env.USER_APP_LOADER) {
+      throw new Error('USER_APP_LOADER binding is required for migration import');
+    }
+
+    const freeze = await this.fetchWfpShim<FreezeResponsePayload>(
+      identity.dispatchScriptName,
+      identity.className,
+      identity.objectId,
+      '/__migrate/freeze',
+      {},
+      'POST',
+    );
+
+    const hasSqlData = freeze.tables.some((t) => t.rowCount > 0) || freeze.schema.length > 0;
+    const hasAnyState = hasSqlData || freeze.kvCount > 0 || freeze.alarmMs !== null;
+
+    // Record hex -> name anti-split-brain alias whenever migrating a named DO.
+    if (freeze.hexId && identity.objectId !== freeze.hexId) {
+      await this.env.APP_KV.put(
+        dynamicDoAliasKey(identity.dispatchScriptName, identity.className, freeze.hexId),
+        identity.objectId,
+      );
+    }
+
+    if (!hasAnyState) {
+      await this.setMigrationState({
+        status: 'empty',
+        legacyHexId: freeze.hexId,
+        migratedAt: new Date().toISOString(),
+      });
+      return { status: 'empty', hexId: freeze.hexId, tableCounts: {}, kvCount: 0 };
+    }
+
+    // Abort any running facet cleanly before mounting the one-shot importer facet on `"main"`.
+    try {
+      this.ctx.facets.abort('main', new Error('Mounting privileged migration importer facet'));
+    } catch {}
+    this.activeFacetBundleKey = null;
+
+    const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v1', () => ({
+      compatibilityDate: '2026-07-13',
+      compatibilityFlags: ['nodejs_compat'],
+      mainModule: '__chiridion_importer.mjs',
+      modules: {
+        '__chiridion_importer.mjs': MIGRATION_IMPORTER_FACET_SOURCE,
+      },
+      globalOutbound: null,
+    }));
+
+    const importerFacet = this.ctx.facets.get('main', () => ({
+      class: importerWorker.getDurableObjectClass('ChiridionMigrationImporterDO'),
+    })) as unknown as { fetch(req: Request): Promise<Response> };
+
+    try {
+      // 1. Replay CREATE TABLE DDL
+      const schemaResp = await importerFacet.fetch(
+        new Request('https://import.internal/__import/schema', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ schema: freeze.schema }),
+        }),
+      );
+      if (!schemaResp.ok) {
+        throw new Error(`Importer schema replay failed: ${await schemaResp.text()}`);
+      }
+
+      // 2. Stream every table in 500-row pages
+      for (const table of freeze.tables) {
+        if (table.rowCount === 0) continue;
+        let cursor = -1;
+        while (true) {
+          const page = await this.fetchWfpShim<SqlPagePayload>(
+            identity.dispatchScriptName,
+            identity.className,
+            identity.objectId,
+            '/__migrate/export-sql',
+            { table: table.name, afterRowid: String(cursor), limit: '500' },
+          );
+          if (page.rows.length > 0) {
+            const importResp = await importerFacet.fetch(
+              new Request('https://import.internal/__import/rows', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  table: page.table,
+                  columns: page.columns,
+                  hasRowid: page.hasRowid,
+                  rows: page.rows,
+                }),
+              }),
+            );
+            if (!importResp.ok) {
+              throw new Error(`Importer rows failed for ${table.name}: ${await importResp.text()}`);
+            }
+          }
+          if (page.done || page.nextCursor === null) break;
+          cursor = page.nextCursor;
+        }
+      }
+
+      // 3. Stream DO KV entries
+      const allKvEntries: Array<{ key: string; value: unknown }> = [];
+      let afterKey: string | undefined;
+      while (true) {
+        const kvPage = await this.fetchWfpShim<KvPagePayload>(
+          identity.dispatchScriptName,
+          identity.className,
+          identity.objectId,
+          '/__migrate/export-kv',
+          { ...(afterKey ? { afterKey } : {}), limit: '256' },
+        );
+        allKvEntries.push(...kvPage.entries);
+        if (kvPage.done || !kvPage.nextAfterKey) break;
+        afterKey = kvPage.nextAfterKey;
+      }
+
+      // 4. Finalize indexes/triggers/views/sqlite_sequence/KV + compute target parity digest
+      const finalizeResp = await importerFacet.fetch(
+        new Request('https://import.internal/__import/finalize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            schema: freeze.schema,
+            sqliteSequence: freeze.sqliteSequence,
+            tables: freeze.tables,
+            kvEntries: allKvEntries,
+          }),
+        }),
+      );
+      const finalized = (await finalizeResp.json()) as {
+        ok: boolean;
+        integrityOk: boolean;
+        kvCount: number;
+        tableCounts: Record<string, number>;
+        overallDigest: string;
+      };
+      if (!finalizeResp.ok || !finalized.integrityOk) {
+        throw new Error(`Importer finalize/integrity_check failed: ${JSON.stringify(finalized)}`);
+      }
+
+      // 5. Verify 100% SHA-256 parity against the frozen WfP shard!
+      const verify = await this.fetchWfpShim<VerifyResponsePayload>(
+        identity.dispatchScriptName,
+        identity.className,
+        identity.objectId,
+        '/__migrate/verify',
+      );
+      if (finalized.overallDigest !== verify.overallDigest) {
+        throw new Error(
+          `Migration parity mismatch for ${identity.supervisorKey}: ` +
+            `source=${verify.overallDigest} target=${finalized.overallDigest} ` +
+            `sourceCounts=${JSON.stringify(verify.tableCounts)} targetCounts=${JSON.stringify(finalized.tableCounts)}`,
+        );
+      }
+
+      // 6. Restore pending alarm on supervisor if scheduled in the future
+      if (verify.alarmMs !== null) {
+        await this.ctx.storage.setAlarm(Math.max(Date.now() + 1_000, verify.alarmMs));
+      }
+
+      await this.setMigrationState({
+        status: 'migrated',
+        legacyHexId: verify.hexId,
+        migratedAt: new Date().toISOString(),
+        sourceDigest: verify.overallDigest,
+      });
+
+      emitAppUsageMetric(this.env.APP_USAGE_AE, {
+        dispatchScriptName: identity.dispatchScriptName,
+        orgId: options?.orgId ?? '',
+        className: identity.className,
+        eventKind: 'lazy_migration_hit',
+        quotaTier: options?.quotaTier ?? 'free',
+      });
+
+      return {
+        status: 'migrated',
+        hexId: verify.hexId,
+        tableCounts: finalized.tableCounts,
+        kvCount: finalized.kvCount,
+        overallDigest: finalized.overallDigest,
+      };
+    } finally {
+      // Unmount the one-shot importer facet so the next call loads the real user DO class on `"main"`.
+      try {
+        this.ctx.facets.abort('main', new Error('Migration importer completed'));
+      } catch {}
+      this.activeFacetBundleKey = null;
+    }
+  }
+
+  /**
+   * Cohort C first-touch lazy hydration inside `blockConcurrencyWhile` so concurrent
+   * requests to the same unmigrated shard queue cleanly behind a single verified import.
+   */
+  private async ensureLazyMigrated(
+    identity: SupervisorIdentity,
+    orgId: string,
+    quotaTier: AppQuotaTier,
+  ): Promise<void> {
+    const state = await this.getMigrationState();
+    if (state && (state.status === 'migrated' || state.status === 'empty')) {
+      return;
+    }
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const recheck = await this.getMigrationState();
+      if (recheck && (recheck.status === 'migrated' || recheck.status === 'empty')) {
+        return;
+      }
+      await this.migrateFromWfpShim(identity, { orgId, quotaTier });
+    });
   }
 
   /** Permanent data wipe for app deletion / GDPR purge. */

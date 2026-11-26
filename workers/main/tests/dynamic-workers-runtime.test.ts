@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  billingPlanToQuotaTier,
   dynamicBundleObjectKey,
   dynamicDoAliasKey,
   extractCodemodeLoaderBindingNames,
@@ -27,6 +28,14 @@ import {
 import { classifyOutboundUrl } from "../../dispatcher/src/dynamic/outbound-gate";
 import { generateDynamicWorkerWrapperSource } from "../../dispatcher/src/dynamic/wrapper-generator";
 import { clearBundleStoreCachesForTest } from "../../dispatcher/src/dynamic/bundle-store";
+import {
+  decodeTypedValue,
+  encodeTypedValue,
+  signMigrationRequest,
+  verifyMigrationSignature,
+} from "../../dispatcher/src/dynamic/migration-protocol";
+import { buildWfpExportShimSource } from "../../dispatcher/src/dynamic/export-shim";
+import { MIGRATION_IMPORTER_FACET_SOURCE } from "../../dispatcher/src/dynamic/importer-facet";
 import { handleWorkerRequest } from "../../dispatcher/src/index";
 
 function makeAsset(path: string, body: string, contentType?: string): DirectDeployAsset {
@@ -429,5 +438,85 @@ describe("dispatcher edge routing for runtime_mode=dynamic", () => {
     expect(loaderGet).toHaveBeenCalledOnce();
     expect(dynamicFetch).toHaveBeenCalledOnce();
     expect(wfpFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("enterprise tier & zero-data-loss migration protocol", () => {
+  it("maps enterprise billing plans (e.g. SECLOCK) to 100x high-limit enterprise quota tier", () => {
+    expect(billingPlanToQuotaTier("enterprise")).toBe("enterprise");
+    expect(billingPlanToQuotaTier("pro")).toBe("pro");
+    expect(billingPlanToQuotaTier("team")).toBe("pro");
+    expect(billingPlanToQuotaTier("free")).toBe("free");
+    expect(billingPlanToQuotaTier("payg")).toBe("free");
+
+    const enterpriseLimits = quotaLimitsForTier("enterprise")!;
+    expect(enterpriseLimits.maxRowsWrittenPerDay).toBe(10_000_000);
+    expect(enterpriseLimits.maxRowsReadPerDay).toBe(2_500_000_000);
+    expect(enterpriseLimits.maxDbSizeBytes).toBe(8 * 1024 * 1024 * 1024);
+
+    // Heavy SECLOCK-scale query (5M reads / 200k writes) passes enterprise tier effortlessly
+    const state = {
+      ...createEmptyShardQuotaState(),
+      rowsWritten: 200_000,
+      rowsRead: 50_000_000,
+    };
+    expect(
+      checkShardQuota({
+        tier: "enterprise",
+        daily: state,
+        eventRowsRead: 5_000_000,
+        eventRowsWritten: 50_000,
+        dbSizeBytes: 3 * 1024 * 1024 * 1024,
+      }).allowed,
+    ).toBe(true);
+  });
+
+  it("round-trips Uint8Array, BigInt, and Date values losslessly and verifies HMAC signatures", async () => {
+    const payload = {
+      bin: new Uint8Array([0, 1, 2, 254, 255]),
+      big: 9007199254740993n,
+      when: new Date("2026-11-26T18:00:00Z"),
+      nested: [{ ok: true, empty: null }],
+    };
+    const encoded = JSON.parse(JSON.stringify(encodeTypedValue(payload)));
+    const decoded = decodeTypedValue(encoded) as typeof payload;
+    expect(decoded.bin).toBeInstanceOf(Uint8Array);
+    expect([...decoded.bin]).toEqual([0, 1, 2, 254, 255]);
+    expect(decoded.big).toBe(9007199254740993n);
+    expect(decoded.when).toBeInstanceOf(Date);
+    expect(decoded.when.toISOString()).toBe("2026-11-26T18:00:00.000Z");
+
+    const now = 1_700_000_000_000;
+    const sig = await signMigrationRequest("top-secret", "/__migrate/freeze", now);
+    await expect(
+      verifyMigrationSignature("top-secret", "/__migrate/freeze", sig, String(now), now + 5_000),
+    ).resolves.toBe(true);
+    // Reject tampered path, wrong secret, and expired timestamp (>60s)
+    await expect(
+      verifyMigrationSignature("top-secret", "/__migrate/verify", sig, String(now), now + 5_000),
+    ).resolves.toBe(false);
+    await expect(
+      verifyMigrationSignature("wrong-secret", "/__migrate/freeze", sig, String(now), now + 5_000),
+    ).resolves.toBe(false);
+    await expect(
+      verifyMigrationSignature("top-secret", "/__migrate/freeze", sig, String(now), now + 120_000),
+    ).resolves.toBe(false);
+  });
+
+  it("generates class-preserving WfP Export Shim and privileged Migration Importer Facet", () => {
+    const shim = buildWfpExportShimSource({
+      classNames: ["FreightAnalyzerDO", "ChatSessionDO"],
+      bindingMap: { FREIGHT: "FreightAnalyzerDO", CHAT: "ChatSessionDO" },
+      hmacSecret: "test-secret",
+      discoveryWebhookUrl: "https://custom-domains.camelai.app/__chiridion_migrate/alarm-discovered",
+    });
+    expect(shim).toContain("export class FreightAnalyzerDO extends ChiridionExportShimDO");
+    expect(shim).toContain("export class ChatSessionDO extends ChiridionExportShimDO");
+    expect(shim).toContain("/__migrate/freeze");
+    expect(shim).toContain("/__migrate/export-sql");
+    expect(shim).toContain("/__migrate/export-kv");
+    expect(shim).toContain("/__migrate/verify");
+    expect(MIGRATION_IMPORTER_FACET_SOURCE).toContain("export class ChiridionMigrationImporterDO extends DurableObject");
+    expect(MIGRATION_IMPORTER_FACET_SOURCE).toContain("PRAGMA integrity_check");
   });
 });

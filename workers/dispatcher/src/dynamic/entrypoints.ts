@@ -361,12 +361,10 @@ export class UserLogsTail extends WorkerEntrypoint<EntrypointsEnv, UserLogsTailP
     if (normalized.length === 0) return;
     try {
       const id = this.env.WORKER_LOGS.idFromName(scriptName);
-      const stub = this.env.WORKER_LOGS.get(id);
-      await stub.fetch('http://worker-logs/append', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ events: normalized }),
-      });
+      const stub = this.env.WORKER_LOGS.get(id) as unknown as {
+        ingestLogs(events: NormalizedLogEvent[]): Promise<void>;
+      };
+      await stub.ingestLogs(normalized);
     } catch (error) {
       console.error('[dynamic-logs-tail] failed to store logs', {
         scriptName,

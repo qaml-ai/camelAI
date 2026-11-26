@@ -107,7 +107,7 @@ function sortTablesByForeignKeys<T extends { name: string }>(
     if (entry.type !== 'table' || !entry.sql) continue;
     const child = entry.name.toLowerCase();
     if (!deps.has(child)) continue;
-    for (const match of entry.sql.matchAll(/\bREFERENCES\s+(?:["`\[])?([A-Za-z0-9_]+)(?:["`\]])?/gi)) {
+    for (const match of entry.sql.matchAll(/\bREFERENCES\s+(?:["`[])?([A-Za-z0-9_]+)(?:["`\]])?/gi)) {
       const parent = match[1]!.toLowerCase();
       if (parent !== child && byLower.has(parent)) {
         deps.get(child)!.add(parent);
@@ -120,7 +120,7 @@ function sortTablesByForeignKeys<T extends { name: string }>(
   const remaining = new Set(tables.map((t) => t.name.toLowerCase()));
   while (remaining.size > 0) {
     let progressed = false;
-    for (const key of [...remaining]) {
+    for (const key of remaining) {
       const reqs = deps.get(key)!;
       if ([...reqs].every((p) => placed.has(p))) {
         ordered.push(byLower.get(key)!);

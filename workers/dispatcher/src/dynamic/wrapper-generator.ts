@@ -465,12 +465,16 @@ class ChiridionMeteredDurableObject extends DurableObject {
     return instance.fetch(request);
   }
 
-  async alarm(alarmInfo) {
+  async __chiridionRunAlarm(alarmInfo) {
     this.__beginEvent();
     const instance = await this.__getUserInstance();
     if (typeof instance.alarm === "function") {
       return instance.alarm(alarmInfo);
     }
+  }
+
+  async alarm(alarmInfo) {
+    return this.__chiridionRunAlarm(alarmInfo);
   }
 
   async webSocketMessage(ws, message) {

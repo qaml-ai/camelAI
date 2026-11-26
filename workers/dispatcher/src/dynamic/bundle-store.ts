@@ -176,7 +176,8 @@ function toWorkerLoaderModule(module: DynamicWorkerModule): WorkerLoaderModule |
       return { wasm: base64ToArrayBuffer(module.content) };
     case 'js':
     default:
-      return module.content;
+      // WorkerLoader requires explicit `{ js }` object when module name doesn't end with `.js`.
+      return module.name.endsWith('.js') ? module.content : { js: module.content };
   }
 }
 
@@ -332,7 +333,7 @@ export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStu
 
   return loader.get(isolateId, () => {
     const modules: Record<string, WorkerLoaderModule | string> = {
-      '__chiridion_wrapper.mjs': generateDynamicWorkerWrapperSource(record),
+      '__chiridion_wrapper.js': generateDynamicWorkerWrapperSource(record),
     };
     for (const [moduleName, module] of Object.entries(record.modules)) {
       modules[moduleName] = toWorkerLoaderModule(module);
@@ -351,6 +352,7 @@ export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStu
           dispatchScriptName: record.dispatchScriptName,
           orgId: record.orgId,
           quotaTier,
+          bundleR2Key: `dynamic-bundles/${encodeURIComponent(record.dispatchScriptName)}/${record.bundleSha}.json`,
         },
       });
     }
@@ -416,7 +418,7 @@ export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStu
     return {
       compatibilityDate: record.compatibilityDate || '2026-07-13',
       compatibilityFlags: record.compatibilityFlags,
-      mainModule: '__chiridion_wrapper.mjs',
+      mainModule: '__chiridion_wrapper.js',
       modules,
       env: dynamicEnv,
       ...(globalOutbound ? { globalOutbound } : {}),

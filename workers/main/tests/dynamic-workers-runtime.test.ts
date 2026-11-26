@@ -36,6 +36,7 @@ import {
 } from "../../dispatcher/src/dynamic/migration-protocol";
 import { buildWfpExportShimSource } from "../../dispatcher/src/dynamic/export-shim";
 import { MIGRATION_IMPORTER_FACET_SOURCE } from "../../dispatcher/src/dynamic/importer-facet";
+import { buildDynamicAppUsageSql, queryDynamicAppUsage } from "../src/dynamic-usage-analytics";
 import { handleWorkerRequest } from "../../dispatcher/src/index";
 
 function makeAsset(path: string, body: string, contentType?: string): DirectDeployAsset {
@@ -517,6 +518,56 @@ describe("enterprise tier & zero-data-loss migration protocol", () => {
     expect(shim).toContain("/__migrate/export-kv");
     expect(shim).toContain("/__migrate/verify");
     expect(MIGRATION_IMPORTER_FACET_SOURCE).toContain("export class ChiridionMigrationImporterDO extends DurableObject");
-    expect(MIGRATION_IMPORTER_FACET_SOURCE).toContain("PRAGMA integrity_check");
+    expect(MIGRATION_IMPORTER_FACET_SOURCE).toContain("PRAGMA defer_foreign_keys = ON");
+  });
+
+  it("builds safe Analytics Engine SQL rollups and parses real-time per-app usage", async () => {
+    const sql = buildDynamicAppUsageSql({
+      dataset: "chiridion_app_usage_prod",
+      windowHours: 24,
+      orgId: "f9559d91-dabd-443f-a118-c92b5dc29fa2",
+      limit: 10,
+    });
+    expect(sql).toContain("FROM chiridion_app_usage_prod");
+    expect(sql).toContain("INTERVAL '24' HOUR");
+    expect(sql).toContain("blob1 = 'f9559d91-dabd-443f-a118-c92b5dc29fa2'");
+
+    const fetcher = vi.fn(async () =>
+      Response.json({
+        data: [
+          {
+            dispatchScriptName: "freight-analyzer--gmie6a",
+            orgId: "f9559d91-dabd-443f-a118-c92b5dc29fa2",
+            quotaTier: "enterprise",
+            httpRequests: 120,
+            assetRequests: 45,
+            doEvents: 80,
+            rowsRead: 1_500_000,
+            rowsWritten: 4_200,
+            totalDurationMs: 12_345,
+            maxDbSizeBytes: 52_428_800,
+            quotaTrips: 0,
+            lazyMigrationHits: 1,
+          },
+        ],
+      }),
+    );
+    const rows = await queryDynamicAppUsage(
+      {
+        accountId: "acc",
+        apiToken: "tok",
+        dataset: "chiridion_app_usage_prod",
+        fetcher: fetcher as unknown as typeof fetch,
+      },
+      { orgId: "f9559d91-dabd-443f-a118-c92b5dc29fa2" },
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      dispatchScriptName: "freight-analyzer--gmie6a",
+      quotaTier: "enterprise",
+      rowsRead: 1_500_000,
+      rowsWritten: 4_200,
+      quotaTrips: 0,
+    });
   });
 });

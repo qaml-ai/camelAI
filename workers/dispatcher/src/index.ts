@@ -1162,16 +1162,27 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
       }
       const supervisorKey = `${body.dispatchScriptName}:${body.className}:${body.objectId}`;
       const stub = env.TENANT_DO_SUPERVISOR.get(env.TENANT_DO_SUPERVISOR.idFromName(supervisorKey));
-      const result = await stub.migrateFromWfpShim(
-        {
-          supervisorKey,
-          dispatchScriptName: body.dispatchScriptName,
-          className: body.className,
-          objectId: body.objectId,
-        },
-        { force: body.force, orgId: body.orgId },
-      );
-      return Response.json({ ok: true, supervisorKey, ...result });
+      try {
+        const result = await stub.migrateFromWfpShim(
+          {
+            supervisorKey,
+            dispatchScriptName: body.dispatchScriptName,
+            className: body.className,
+            objectId: body.objectId,
+          },
+          { force: body.force, orgId: body.orgId },
+        );
+        return Response.json({ ok: true, supervisorKey, ...result });
+      } catch (error) {
+        return Response.json(
+          {
+            ok: false,
+            supervisorKey,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          { status: 500 },
+        );
+      }
     }
 
     if (url.pathname === '/__chiridion_migrate/alarm-discovered' && request.method === 'POST') {

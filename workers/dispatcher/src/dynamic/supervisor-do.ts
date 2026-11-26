@@ -54,6 +54,9 @@ export interface SupervisorIdentity {
   dispatchScriptName: string;
   className: string;
   objectId: string;
+  bundleR2Key?: string;
+  quotaTier?: AppQuotaTier;
+  envVersion?: number;
 }
 
 export interface SupervisorMigrationState {
@@ -78,7 +81,7 @@ export interface SupervisorEnv {
 
 interface MeteredFacetStub {
   fetch(request: Request): Promise<Response>;
-  alarm?(alarmInfo?: unknown): Promise<void>;
+  __chiridionRunAlarm(alarmInfo?: unknown): Promise<void>;
   __chiridionCallMethod(method: string, args: unknown[]): Promise<unknown>;
   __chiridionFlushMetrics(): Promise<{
     rowsRead: number;
@@ -98,12 +101,16 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     if (incoming) {
       if (
         !this.identityCache ||
-        this.identityCache.supervisorKey !== incoming.supervisorKey
+        this.identityCache.supervisorKey !== incoming.supervisorKey ||
+        (incoming.bundleR2Key && this.identityCache.bundleR2Key !== incoming.bundleR2Key) ||
+        (incoming.quotaTier && this.identityCache.quotaTier !== incoming.quotaTier)
       ) {
-        this.identityCache = incoming;
-        await this.ctx.storage.put(META_IDENTITY_KEY, incoming);
+        this.identityCache = this.identityCache
+          ? { ...this.identityCache, ...incoming }
+          : { ...incoming };
+        await this.ctx.storage.put(META_IDENTITY_KEY, this.identityCache);
       }
-      return incoming;
+      return this.identityCache;
     }
     if (!this.identityCache) {
       const stored = await this.ctx.storage.get<SupervisorIdentity>(META_IDENTITY_KEY);
@@ -136,13 +143,31 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     quotaTier: AppQuotaTier;
   } | null> {
     const accessInfo = await getWorkerAccessInfo(this.env.APP_KV, identity.dispatchScriptName);
-    if (!accessInfo || !accessInfo.bundle_r2_key) return null;
-    const bundle = await loadDynamicBundleRecord(this.env, accessInfo.bundle_r2_key);
+    const effectiveBundleKey = identity.bundleR2Key || accessInfo?.bundle_r2_key;
+    if (!effectiveBundleKey) return null;
+    const bundle = await loadDynamicBundleRecord(this.env, effectiveBundleKey);
     if (!bundle) return null;
+    const effectiveAccess: WorkerAccessInfo = accessInfo
+      ? {
+          ...accessInfo,
+          bundle_r2_key: effectiveBundleKey,
+          ...(identity.quotaTier ? { quota_tier: identity.quotaTier } : {}),
+          ...(identity.envVersion !== undefined ? { env_version: identity.envVersion } : {}),
+        }
+      : {
+          is_public: false,
+          org_id: bundle.orgId,
+          org_slug: bundle.orgSlug,
+          runtime_mode: 'dynamic',
+          bundle_r2_key: effectiveBundleKey,
+          bundle_sha: bundle.bundleSha,
+          quota_tier: identity.quotaTier ?? 'free',
+          env_version: identity.envVersion ?? 0,
+        };
     return {
-      accessInfo,
+      accessInfo: effectiveAccess,
       bundle,
-      quotaTier: resolveQuotaTier(accessInfo.quota_tier),
+      quotaTier: resolveQuotaTier(effectiveAccess.quota_tier),
     };
   }
 
@@ -237,6 +262,8 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     const dispatchScriptName = request.headers.get('x-chiridion-app-id')?.trim();
     const className = request.headers.get('x-chiridion-do-class')?.trim();
     const objectId = request.headers.get('x-chiridion-do-id')?.trim();
+    const bundleR2Key = request.headers.get('x-chiridion-bundle-key')?.trim() || undefined;
+    const quotaTierHeader = request.headers.get('x-chiridion-quota-tier')?.trim() as AppQuotaTier | undefined;
     const supervisorKey =
       request.headers.get('x-chiridion-supervisor-key')?.trim() ||
       (dispatchScriptName && className && objectId
@@ -245,7 +272,14 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
 
     const identity = await this.ensureIdentity(
       dispatchScriptName && className && objectId && supervisorKey
-        ? { supervisorKey, dispatchScriptName, className, objectId }
+        ? {
+            supervisorKey,
+            dispatchScriptName,
+            className,
+            objectId,
+            ...(bundleR2Key ? { bundleR2Key } : {}),
+            ...(quotaTierHeader ? { quotaTier: quotaTierHeader } : {}),
+          }
         : undefined,
     );
     if (!identity) {
@@ -300,6 +334,8 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     cleanHeaders.delete('x-chiridion-do-class');
     cleanHeaders.delete('x-chiridion-do-id');
     cleanHeaders.delete('x-chiridion-supervisor-key');
+    cleanHeaders.delete('x-chiridion-bundle-key');
+    cleanHeaders.delete('x-chiridion-quota-tier');
 
     const forwardedInit: RequestInit = {
       method: request.method,
@@ -436,9 +472,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
 
     const facet = await this.getMainFacet(identity, accessInfo, bundle, quotaTier, quotaState);
     try {
-      if (typeof facet.alarm === 'function') {
-        await facet.alarm();
-      }
+      await facet.__chiridionRunAlarm();
     } finally {
       await this.flushFacetMetrics(
         facet,
@@ -577,7 +611,9 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     );
     if (!resp.ok) {
       const body = await resp.text().catch(() => '');
-      throw new Error(`WfP export shim ${path} failed (HTTP ${resp.status}): ${body.slice(0, 256)}`);
+      throw new Error(
+        `WfP export shim ${path} failed (HTTP ${resp.status}, script=${dispatchScriptName}): ${body.slice(0, 256)}`,
+      );
     }
     return (await resp.json()) as T;
   }
@@ -647,9 +683,9 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v1', () => ({
       compatibilityDate: '2026-07-13',
       compatibilityFlags: ['nodejs_compat'],
-      mainModule: '__chiridion_importer.mjs',
+      mainModule: '__chiridion_importer.js',
       modules: {
-        '__chiridion_importer.mjs': MIGRATION_IMPORTER_FACET_SOURCE,
+        '__chiridion_importer.js': MIGRATION_IMPORTER_FACET_SOURCE,
       },
       globalOutbound: null,
     }));

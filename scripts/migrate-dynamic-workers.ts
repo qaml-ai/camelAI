@@ -30,13 +30,13 @@ import {
   type AppQuotaTier,
   type DynamicWorkerBundleRecord,
   type DynamicWorkerModule,
-} from '../workers/main/src/dynamic-worker-registry.js';
-import { buildWfpExportShimSource } from '../workers/dispatcher/src/dynamic/export-shim.js';
+} from '../workers/main/src/dynamic-worker-registry.ts';
+import { buildWfpExportShimSource } from '../workers/dispatcher/src/dynamic/export-shim.ts';
 import {
   MIGRATION_SIG_HEADER,
   MIGRATION_TS_HEADER,
   signMigrationRequest,
-} from '../workers/dispatcher/src/dynamic/migration-protocol.js';
+} from '../workers/dispatcher/src/dynamic/migration-protocol.ts';
 
 /**
  * Protected Enterprise / VIP org slugs (including SECLOCK).
@@ -254,19 +254,21 @@ async function uploadWfpExportShim(input: {
     new Blob(
       [
         JSON.stringify({
-          main_module: 'export-shim.mjs',
+          main_module: 'export-shim.js',
           compatibility_date: '2026-07-13',
           compatibility_flags: ['nodejs_compat'],
           bindings,
+          keep_bindings: ['secret_text', 'secret_key'],
+          keep_assets: true,
         }),
       ],
       { type: 'application/json' },
     ),
   );
   form.append(
-    'export-shim.mjs',
+    'export-shim.js',
     new Blob([shimSource], { type: 'application/javascript+module' }),
-    'export-shim.mjs',
+    'export-shim.js',
   );
 
   const url = `https://api.cloudflare.com/client/v4/accounts/${input.accountId}/workers/dispatch/namespaces/${input.namespace}/scripts/${encodeURIComponent(input.dispatchScriptName)}`;
@@ -415,6 +417,9 @@ async function migrateSingleScript(
     });
 
     if (opts.cohort === 'b') {
+      // Allow any already-warm WfP Durable Object isolate ~12s of quiet idle time
+      // so Cloudflare reloads the DO class onto ChiridionExportShimDO cleanly.
+      await new Promise((r) => setTimeout(r, 12_000));
       for (const className of doClasses) {
         for (const objectId of opts.singletonIds) {
           const ts = Date.now();

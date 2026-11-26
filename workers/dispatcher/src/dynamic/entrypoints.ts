@@ -27,6 +27,7 @@ export interface TenantDoRouterProps {
   dispatchScriptName: string;
   orgId: string;
   quotaTier?: AppQuotaTier;
+  bundleR2Key?: string;
 }
 
 const HEX_DO_ID_RE = /^[0-9a-f]{64}$/i;
@@ -79,6 +80,8 @@ export class TenantDoRouter extends WorkerEntrypoint<EntrypointsEnv, TenantDoRou
         dispatchScriptName: appId,
         className,
         objectId: canonicalId,
+        ...(this.ctx.props?.bundleR2Key ? { bundleR2Key: this.ctx.props.bundleR2Key } : {}),
+        ...(this.ctx.props?.quotaTier ? { quotaTier: this.ctx.props.quotaTier } : {}),
       },
     };
   }
@@ -100,6 +103,8 @@ export class TenantDoRouter extends WorkerEntrypoint<EntrypointsEnv, TenantDoRou
     headers.set('x-chiridion-do-class', identity.className);
     headers.set('x-chiridion-do-id', identity.objectId);
     headers.set('x-chiridion-supervisor-key', identity.supervisorKey);
+    if (identity.bundleR2Key) headers.set('x-chiridion-bundle-key', identity.bundleR2Key);
+    if (identity.quotaTier) headers.set('x-chiridion-quota-tier', identity.quotaTier);
 
     const init: RequestInit = {
       method: request.method,
@@ -217,11 +222,19 @@ export class CodemodeLoaderProxy extends WorkerEntrypoint<EntrypointsEnv, Codemo
     if (!this.env.USER_APP_LOADER) {
       throw new Error('USER_APP_LOADER binding is not configured for codemode proxy');
     }
+    const normalizedModules: Record<string, string | WorkerLoaderModule> = {};
+    for (const [modName, modVal] of Object.entries(spec.modules)) {
+      if (typeof modVal === 'string' && !modName.endsWith('.js') && !modName.endsWith('.py')) {
+        normalizedModules[modName] = { js: modVal };
+      } else {
+        normalizedModules[modName] = modVal;
+      }
+    }
     const code: WorkerLoaderWorkerCode = {
       compatibilityDate: spec.compatibilityDate || '2026-07-13',
       compatibilityFlags: spec.compatibilityFlags ?? ['nodejs_compat'],
       mainModule: spec.mainModule,
-      modules: spec.modules,
+      modules: normalizedModules,
       ...(spec.env ? { env: spec.env } : {}),
       // Always enforce zero raw network egress inside nested codemode sandboxes.
       globalOutbound: null,

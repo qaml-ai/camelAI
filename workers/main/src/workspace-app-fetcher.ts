@@ -38,6 +38,7 @@ export interface WorkspaceAppHostIndex {
 }
 
 const MAX_REDIRECTS = 20;
+const MAX_REDIRECT_BODY_BYTES = 1024 * 1024;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 const STRIPPED_COOKIE_NAMES = new Set([
@@ -316,31 +317,62 @@ function buildRedirectRequest(
   sourceRequest: Request,
   responseStatus: number,
   nextUrl: URL,
-  redirectMode: RequestRedirect,
-  options?: { stripSensitiveHeaders?: boolean },
+  replayBody: Uint8Array<ArrayBuffer> | null | undefined,
 ): Request {
   const method = resolveRedirectMethod(responseStatus, sourceRequest.method);
   const headers = new Headers(sourceRequest.headers);
-  if (options?.stripSensitiveHeaders) {
+  stripPlatformDispatchHeaders(headers);
+  headers.delete('Host');
+  if (nextUrl.origin !== new URL(sourceRequest.url).origin) {
     stripCrossOriginRedirectHeaders(headers);
   }
-  if (method === 'GET' || method === 'HEAD') {
+  const forwardsBody = method !== 'GET' && method !== 'HEAD';
+  if (!forwardsBody) {
     headers.delete('Content-Length');
     headers.delete('Content-Type');
   }
-  const init: RequestInit = {
+  if (forwardsBody && replayBody === undefined) {
+    throw new TypeError('Cannot follow a redirect with a request body over 1 MiB');
+  }
+  return new Request(nextUrl, {
     method,
     headers,
-    redirect: redirectMode,
-  };
-  if (
-    method !== 'GET'
-    && method !== 'HEAD'
-    && (responseStatus === 307 || responseStatus === 308)
-  ) {
-    init.body = sourceRequest.body;
+    redirect: 'manual',
+    body: forwardsBody ? replayBody : null,
+    signal: sourceRequest.signal,
+  });
+}
+
+async function retainRedirectBody(
+  request: Request,
+): Promise<Uint8Array<ArrayBuffer> | null | undefined> {
+  if (!request.body) return null;
+  const reader = request.clone().body!.getReader();
+  let buffer = new Uint8Array(0);
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return buffer.subarray(0, size);
+      const nextSize = size + value.byteLength;
+      if (nextSize > MAX_REDIRECT_BODY_BYTES) {
+        // Only the replay copy is canceled. Its tee sibling still forwards the
+        // upload. Cancellation can wait for that sibling, so don't await it.
+        void reader.cancel().catch(() => {});
+        return undefined;
+      }
+      if (nextSize > buffer.byteLength) {
+        const capacity = Math.max(nextSize, Math.min(buffer.byteLength * 2, MAX_REDIRECT_BODY_BYTES));
+        const expanded = new Uint8Array(capacity);
+        expanded.set(buffer);
+        buffer = expanded;
+      }
+      buffer.set(value, size);
+      size = nextSize;
+    }
+  } finally {
+    reader.releaseLock();
   }
-  return new Request(nextUrl, init);
 }
 
 async function fetchWorkspaceAppOnce(
@@ -351,32 +383,36 @@ async function fetchWorkspaceAppOnce(
   const sanitized = sanitizeWorkspaceAppRequest(request);
   const headers = new Headers(sanitized.headers);
   applyPlatformDispatchRoute(headers, route);
-  const forwarded = new Request(sanitized, { headers });
+  const forwarded = new Request(sanitized, { headers, redirect: 'manual' });
   if (!env.DISPATCHER || typeof env.DISPATCHER.fetchWorkspaceApp !== 'function') {
     throw new Error('DISPATCHER service binding is not configured');
   }
   return env.DISPATCHER.fetchWorkspaceApp(forwarded);
 }
 
-async function followWorkspaceAppRedirects(
+async function followRedirects(
   env: WorkspaceAppFetcherEnv,
   context: WorkspaceAppContext,
   request: Request,
   index: WorkspaceAppHostIndex,
+  initialRoute: WorkspaceAppRoute | null,
 ): Promise<Response> {
-  const redirectMode = request.redirect ?? 'follow';
+  const redirectMode = request.redirect;
+  let replayBody = redirectMode === 'follow' ? await retainRedirectBody(request) : null;
   let currentRequest = request;
+  let route = initialRoute;
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
-    const url = new URL(currentRequest.url);
-    const route = assertWorkspaceAppAccess(index, context, url.hostname);
-    const response = await fetchWorkspaceAppOnce(env, currentRequest, route);
+    const response = route
+      ? await fetchWorkspaceAppOnce(env, currentRequest, route)
+      : await fetch(currentRequest, { redirect: 'manual' });
 
     if (redirectMode === 'manual' || !REDIRECT_STATUSES.has(response.status)) {
       return response;
     }
 
     if (redirectMode === 'error') {
+      void response.body?.cancel().catch(() => {});
       throw new Error('Redirect encountered while redirect mode is "error"');
     }
 
@@ -385,29 +421,21 @@ async function followWorkspaceAppRedirects(
       return response;
     }
 
+    void response.body?.cancel().catch(() => {});
     if (hop >= MAX_REDIRECTS) {
       throw new Error('Too many redirects');
     }
 
     const nextUrl = new URL(location, currentRequest.url);
-    if (!isWorkspaceAppHostname(index, nextUrl.hostname)) {
-      const externalRequest = buildRedirectRequest(
-        currentRequest,
-        response.status,
-        nextUrl,
-        'follow',
-        { stripSensitiveHeaders: true },
-      );
-      return fetch(externalRequest);
+    if (nextUrl.protocol !== 'http:' && nextUrl.protocol !== 'https:') {
+      throw new TypeError('Redirect must use HTTP or HTTPS');
     }
-
-    assertWorkspaceAppAccess(index, context, nextUrl.hostname);
-    currentRequest = buildRedirectRequest(
-      currentRequest,
-      response.status,
-      nextUrl,
-      redirectMode,
-    );
+    // An external fetch stays on the public network for the rest of its chain.
+    route = route && isWorkspaceAppHostname(index, nextUrl.hostname)
+      ? assertWorkspaceAppAccess(index, context, nextUrl.hostname)
+      : null;
+    currentRequest = buildRedirectRequest(currentRequest, response.status, nextUrl, replayBody);
+    if (currentRequest.method === 'GET' || currentRequest.method === 'HEAD') replayBody = null;
   }
 
   throw new Error('Too many redirects');
@@ -419,7 +447,8 @@ export async function fetchWorkspaceAppViaDispatch(
   request: Request,
   index: WorkspaceAppHostIndex,
 ): Promise<Response> {
-  return followWorkspaceAppRedirects(env, context, request, index);
+  const route = assertWorkspaceAppAccess(index, context, new URL(request.url).hostname);
+  return followRedirects(env, context, request, index, route);
 }
 
 export function normalizeWorkspaceAppRequest(
@@ -447,7 +476,7 @@ export async function performWorkspaceAppFetch(
 
   const hostIndex = await deps.getHostIndex();
   if (!isWorkspaceAppHostname(hostIndex, url.hostname)) {
-    return fetch(request);
+    return followRedirects(env, context, request, hostIndex, null);
   }
 
   return fetchWorkspaceAppViaDispatch(env, context, request, hostIndex);

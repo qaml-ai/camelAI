@@ -1808,15 +1808,7 @@ export async function handleWorkerRequest(
   // Skip all auth checks in local development mode
   if (env.SKIP_AUTH === 'true') {
     console.log(`[dispatcher] SKIP_AUTH enabled, dispatching directly to: ${dispatchScriptName}`);
-    let skipAuthAccessInfo: WorkerAccessInfo | null = null;
-    if (env.USER_APP_LOADER && env.APP_KV) {
-      try {
-        skipAuthAccessInfo = await getWorkerAccessInfo(env.APP_KV, dispatchScriptName);
-      } catch {
-        skipAuthAccessInfo = null;
-      }
-    }
-    return dispatchToWorker(request, env, ctx, dispatchScriptName, scriptName, skipAuthAccessInfo);
+    return dispatchToWorker(request, env, ctx, dispatchScriptName, scriptName);
   }
 
   const cookieHeader = request.headers.get('Cookie');
@@ -1834,17 +1826,8 @@ export async function handleWorkerRequest(
     return errorResponse(error404Page(getMainAppUrl(hostname, env.MAIN_APP_URL), scriptName));
   }
 
-  if (
-    accessInfo.usage_guard_status === 'suspending' ||
-    accessInfo.usage_guard_status === 'suspended' ||
-    accessInfo.usage_guard_status === 'error'
-  ) {
-    const response = errorResponse(suspendedAppPage(getMainAppUrl(hostname, env.MAIN_APP_URL)));
-    response.headers.set('Retry-After', '300');
-    response.headers.set('Cache-Control', 'no-store');
-    response.headers.set('X-CamelAI-App-Status', 'suspended');
-    return response;
-  }
+  const quarantine = quarantinedAppResponse(accessInfo, getMainAppUrl(hostname, env.MAIN_APP_URL));
+  if (quarantine) return quarantine;
 
   // Every deployment mode honors the canonical per-app visibility flag.
   // In self-host mode the identity proxy leaves deployed-app hosts reachable,
@@ -1932,6 +1915,31 @@ export async function handleWorkerRequest(
   return redirectToAuth(env, url, hostname, scriptName, accessInfo.org_id);
 }
 
+function quarantinedAppResponse(
+  accessInfo: Pick<WorkerAccessInfo, 'usage_guard_status'> | null,
+  mainAppUrl: string,
+): Response | null {
+  const status = accessInfo?.usage_guard_status;
+  if (status !== 'suspending' && status !== 'suspended' && status !== 'error') return null;
+
+  const response = errorResponse(suspendedAppPage(mainAppUrl));
+  response.headers.set('Retry-After', '300');
+  response.headers.set('Cache-Control', 'no-store');
+  response.headers.set('X-CamelAI-App-Status', 'suspended');
+  return response;
+}
+
+async function readDynamicCutoverPointer(bucket: R2Bucket, dispatchScriptName: string) {
+  try {
+    const object = await bucket.get(`dynamic-bundles/${encodeURIComponent(dispatchScriptName)}/latest.json`);
+    const pointer = await object?.json<Partial<WorkerAccessInfo>>();
+    if (isDynamicRuntimeMode(pointer?.runtime_mode) && pointer?.bundle_r2_key) return pointer;
+  } catch {
+    // An unavailable pointer leaves the original WfP result in place.
+  }
+  return null;
+}
+
 /**
  * Dispatch request to the user worker
  * @param dispatchScriptName - The script name in the dispatch namespace ({org-slug}--{script})
@@ -1943,13 +1951,27 @@ async function dispatchToWorker(
   ctx: ExecutionContext,
   dispatchScriptName: string,
   userFacingScriptName: string,
-  accessInfo?: WorkerAccessInfo | null,
+  accessInfo?: WorkerAccessInfo,
 ): Promise<Response> {
+  const hostname = getRequestHostname(request, new URL(request.url));
+  const pageHomeUrl = getMainAppUrl(hostname, env.MAIN_APP_URL);
+  let resolvedAccess = accessInfo ?? null;
+  if (!resolvedAccess && env.APP_KV) {
+    try {
+      resolvedAccess = await getWorkerAccessInfo(env.APP_KV, dispatchScriptName);
+    } catch (error) {
+      console.error(`[dispatcher] Error getting worker access info: ${error}`);
+      return errorResponse(error503Page(pageHomeUrl));
+    }
+  }
+  const quarantine = quarantinedAppResponse(resolvedAccess, pageHomeUrl);
+  if (quarantine) return quarantine;
+
+  let retryRequest: Request | undefined;
   try {
     console.log(`[dispatcher] Routing to worker: ${dispatchScriptName}`);
     const headers = new Headers(request.headers);
-    stripPlatformAuthMaterial(headers, getRequestHostname(request, new URL(request.url)));
-    const sanitizedRequest = new Request(request, { headers });
+    stripPlatformAuthMaterial(headers, hostname);
 
     if (isSelfhostPublishingMode(env)) {
       if (!env.SELFHOST_APP_RUNNER) {
@@ -1964,61 +1986,52 @@ async function dispatchToWorker(
       );
     }
 
-    let resolvedAccess = accessInfo ?? null;
-    if (!resolvedAccess && env.USER_APP_LOADER && env.APP_KV) {
+    const sanitizedRequest = new Request(request, { headers });
+    if (!resolvedAccess || !isDynamicRuntimeMode(resolvedAccess.runtime_mode)) {
+      const cutoverBucket = env.USER_APP_LOADER ? env.R2_BUCKET : undefined;
+      let wfpResponse: Response | undefined;
+      let missingWorker: Error | undefined;
       try {
-        resolvedAccess = await getWorkerAccessInfo(env.APP_KV, dispatchScriptName);
-      } catch {
-        resolvedAccess = null;
-      }
-    }
-
-    if (resolvedAccess && isDynamicRuntimeMode(resolvedAccess.runtime_mode)) {
-      const exports = ((ctx as unknown as { exports?: DynamicRuntimeExports })?.exports ?? {}) as DynamicRuntimeExports;
-      return await dispatchDynamicWorkerEdge({
-        request: sanitizedRequest,
-        env,
-        ctx,
-        exports,
-        dispatchScriptName,
-        accessInfo: resolvedAccess,
-      });
-    }
-
-    const userWorker = getUserWorker(env, dispatchScriptName);
-    const wfpResponse = await fetchUserWorker(userWorker, sanitizedRequest);
-    // Zero-503 Cohort B/C cutover guard: if a warm PoP cached stale `runtime_mode: "wfp"` in KV
-    // for up to 60s and hit the WfP Export Shim (503 + X-Chiridion-Migrating: 1), consult the
-    // strongly-consistent R2 cutover pointer immediately and serve from Dynamic Workers.
-    if (
-      wfpResponse.status === 503 &&
-      wfpResponse.headers.get('x-chiridion-migrating') === '1' &&
-      env.USER_APP_LOADER &&
-      env.R2_BUCKET
-    ) {
-      const pointerObj = await env.R2_BUCKET.get(
-        `dynamic-bundles/${encodeURIComponent(dispatchScriptName)}/latest.json`,
-      ).catch(() => null);
-      if (pointerObj) {
-        try {
-          const pointer = (await pointerObj.json()) as Partial<WorkerAccessInfo>;
-          if (isDynamicRuntimeMode(pointer.runtime_mode)) {
-            const exports = ((ctx as unknown as { exports?: DynamicRuntimeExports })?.exports ?? {}) as DynamicRuntimeExports;
-            return await dispatchDynamicWorkerEdge({
-              request: sanitizedRequest,
-              env,
-              ctx,
-              exports,
-              dispatchScriptName,
-              accessInfo: { ...(resolvedAccess ?? { org_id: '', is_public: false }), ...pointer },
-            });
-          }
-        } catch {
-          // Fall through to WfP 503 response if pointer JSON is unreadable.
+        const userWorker = getUserWorker(env, dispatchScriptName);
+        if (cutoverBucket && sanitizedRequest.body) retryRequest = sanitizedRequest.clone() as Request;
+        wfpResponse = await fetchUserWorker(userWorker, sanitizedRequest);
+        if (!cutoverBucket || wfpResponse.status !== 503 || wfpResponse.headers.get('x-chiridion-migrating') !== '1') {
+          return wfpResponse;
         }
+      } catch (error) {
+        if (!cutoverBucket || !(error instanceof Error) || !error.message.startsWith('Worker not found')) {
+          throw error;
+        }
+        missingWorker = error;
       }
+
+      // A stale KV record can outlive the WfP export shim. R2 holds the cutover pointer.
+      const pointer = await readDynamicCutoverPointer(cutoverBucket, dispatchScriptName);
+      if (!pointer) {
+        if (wfpResponse) return wfpResponse;
+        throw missingWorker;
+      }
+
+      void wfpResponse?.body?.cancel().catch(() => {});
+      const cutoverQuarantine = quarantinedAppResponse(pointer, pageHomeUrl);
+      if (cutoverQuarantine) return cutoverQuarantine;
+      resolvedAccess = {
+        ...(resolvedAccess ?? { org_id: '', is_public: false }),
+        ...pointer,
+      };
     }
-    return wfpResponse;
+
+    const dynamicRequest = retryRequest ?? sanitizedRequest;
+    retryRequest = undefined; // Transfer ownership of the retained body to Dynamic Workers.
+    const exports = ((ctx as unknown as { exports?: DynamicRuntimeExports })?.exports ?? {}) as DynamicRuntimeExports;
+    return await dispatchDynamicWorkerEdge({
+      request: dynamicRequest,
+      env,
+      ctx,
+      exports,
+      dispatchScriptName,
+      accessInfo: resolvedAccess,
+    });
   } catch (e) {
     const error = e as Error;
     console.error('[dispatcher] failed to route user worker', {
@@ -2027,12 +2040,13 @@ async function dispatchToWorker(
       error: error.message,
       stack: error.stack,
     });
-    const requestUrl = new URL(request.url);
-    const pageHomeUrl = getMainAppUrl(getRequestHostname(request, requestUrl), env.MAIN_APP_URL);
     if (error.message?.startsWith('Worker not found')) {
       return errorResponse(error404Page(pageHomeUrl, userFacingScriptName));
     }
     return errorResponse(error500Page(pageHomeUrl));
+  } finally {
+    // Release the unused branch without waiting for the WfP consumer to finish.
+    void retryRequest?.body?.cancel().catch(() => {});
   }
 }
 

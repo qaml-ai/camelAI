@@ -7,6 +7,7 @@ import {
   isWorkspaceAppHostname,
   type WorkspaceAppHostIndex,
 } from "./workspace-app-fetcher";
+import { SECURE_FETCH_REDIRECT_HEADER } from "./secure-fetch";
 import { Buffer } from "node:buffer";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { OrgDO, WorkerScript } from "./auth";
@@ -4238,13 +4239,14 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
       );
     }
     const method = typeof args.method === "string" && args.method.trim() ? args.method.trim().toUpperCase() : "GET";
-    const headers: Record<string, string> = {};
+    const headers = new Headers();
     if (args.headers && typeof args.headers === "object" && !Array.isArray(args.headers)) {
       for (const [key, value] of Object.entries(args.headers as Record<string, unknown>)) {
-        if (typeof value === "string") headers[key] = value;
+        if (typeof value === "string") headers.append(key, value);
       }
     }
-    const init: RequestInit = { method, headers };
+    headers.set(SECURE_FETCH_REDIRECT_HEADER, "follow");
+    const init: RequestInit = { method, headers, redirect: "manual" };
     if (typeof args.body === "string") {
       if (method === "GET" || method === "HEAD") throw new Error(`${method} requests cannot have a body`);
       init.body = args.body;

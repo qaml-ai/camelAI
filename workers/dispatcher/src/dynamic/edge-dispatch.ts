@@ -16,6 +16,7 @@ import {
   loadDynamicUserWorker,
   type DynamicRuntimeExports,
 } from './bundle-store';
+import { MIGRATION_PENDING_MESSAGE, migrationPendingResponse } from './migration-protocol';
 import { emitAppUsageMetric, resolveQuotaTier } from './quota-policy';
 
 export interface EdgeDispatchEnv {
@@ -53,6 +54,8 @@ function hasStaticExtension(pathname: string): boolean {
 export function shouldTryEdgeStaticAsset(request: Request, url: URL): boolean {
   const method = request.method.toUpperCase();
   if (method !== 'GET' && method !== 'HEAD') return false;
+  // React Router single-fetch responses belong to the app, including under /assets/.
+  if (url.pathname.endsWith('.data')) return false;
   return (
     url.pathname.startsWith('/assets/') ||
     STATIC_ASSET_PATHS.has(url.pathname) ||
@@ -232,11 +235,21 @@ export async function dispatchDynamicWorkerEdge(input: {
     managedOverlay: vars,
     envHash,
     quotaTier,
+    runtimeMode: accessInfo.runtime_mode,
     preferBroker: Boolean(env.MAIN_APP_BROKER),
     enableLogsTail,
   });
 
-  const response = await worker.getEntrypoint().fetch(request);
+  let response: Response;
+  try {
+    response = await worker.getEntrypoint().fetch(request);
+  } catch (error) {
+    // Workerd preserves the message of an uncaught supervisor RPC error.
+    if (error instanceof Error && error.message === MIGRATION_PENDING_MESSAGE) {
+      return migrationPendingResponse();
+    }
+    throw error;
+  }
 
   const metricEmit = Promise.resolve().then(() => {
     emitAppUsageMetric(env.APP_USAGE_AE, {

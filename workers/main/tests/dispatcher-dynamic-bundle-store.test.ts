@@ -74,6 +74,42 @@ function captureWorkerConfig(
   return result;
 }
 
+describe("dispatcher migrated secrets overlay", () => {
+  beforeEach(clearBundleStoreCachesForTest);
+  afterEach(() => vi.restoreAllMocks());
+
+  it("keeps HTTP and facet keys stable for reordered secrets and changes both after a same-count rotation", async () => {
+    const epoch = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(epoch);
+    const masterSecret = "test-migration-key";
+    const name = "APP_SECRET";
+    const secondName = "OTHER_SECRET";
+    let envelope = await encryptSecretsPayload(masterSecret, { [name]: "original", [secondName]: "unchanged" });
+    const get = vi.fn(async () => ({ json: async () => envelope }));
+    const env = {
+      MIGRATION_HMAC_SECRET: masterSecret,
+      R2_BUCKET: { get } as unknown as R2Bucket,
+    };
+    const record = makeRecord([redacted(name), redacted(secondName)]);
+
+    const original = await loadDynamicEnvOverlay(env, record);
+    envelope = await encryptSecretsPayload(masterSecret, { [secondName]: "unchanged", [name]: "original" });
+    clock.mockReturnValue(epoch + CACHE_TTL_MS);
+    expect((await loadDynamicEnvOverlay(env, record)).envHash).toBe(original.envHash);
+
+    envelope = await encryptSecretsPayload(masterSecret, { [secondName]: "unchanged", [name]: "rotation" });
+    clock.mockReturnValue(epoch + 2 * CACHE_TTL_MS);
+    const rotated = await loadDynamicEnvOverlay(env, record);
+    expect(rotated.vars).toEqual([secret(secondName, "unchanged"), secret(name, "rotation")]);
+    for (const supervisorKey of [undefined, "facet-1"]) {
+      const before = captureWorkerConfig(record, original, supervisorKey);
+      const after = captureWorkerConfig(record, rotated, supervisorKey);
+      expect(after.isolateId).not.toBe(before.isolateId);
+      expect(after.code.env).toHaveProperty(name, "rotation");
+    }
+  });
+});
+
 describe("dispatcher legacy integration env overlay", () => {
   beforeEach(clearBundleStoreCachesForTest);
   afterEach(() => vi.restoreAllMocks());

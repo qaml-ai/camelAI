@@ -14,6 +14,7 @@ import {
 import { listConnections, type ConnectionsRuntimeEnv } from "./connections-runtime.js";
 import { annotateWarehouseConnections, withWarehouseParams, type WarehouseConnection } from "./warehouse-service.js";
 import { recordObservabilityEvent, type ObservabilityEnv } from "./observability.js";
+import { materializeRpcResult } from "./rpc-result.js";
 import { SANDBOX_EXEC_TIMEOUT_EVENT, sandboxExecTimeoutMessage } from "./sandbox-exec-deadline.js";
 import { ProjectFilesystemClient, type WorkspaceFileStoreLike } from "./workspace-filesystem-do.js";
 
@@ -1041,14 +1042,14 @@ export class AnalysisService extends WorkerEntrypoint<AnalysisEnv, AnalysisServi
  */
 export class AnalysisAppService extends WorkerEntrypoint<AnalysisEnv, AnalysisServiceProps> {
   async runCode(request: { code: string; params?: Record<string, unknown> }): Promise<AnalysisRunCodeResult> {
-    return this.full().runCodeForApps(request);
+    return materializeRpcResult(await this.full().runCodeForApps(request));
   }
 
   async listConnections(): Promise<WarehouseConnection[]> {
     // Honor CONNECTIONS_BINDING_ENABLED so deployed apps cannot read the
     // connection catalog through ANALYSIS when the CONNECTIONS broker is off.
     assertConnectionsBindingEnabled(this.env as { CONNECTIONS_BINDING_ENABLED?: string });
-    return this.full().listConnections();
+    return materializeRpcResult(await this.full().listConnections());
   }
 
   private full(): Pick<AnalysisService, "runCodeForApps" | "listConnections"> {

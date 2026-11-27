@@ -12,6 +12,7 @@ import type { WorkerLogsDO } from '../../../main/src/worker-logs-do';
 import {
   dynamicDoAliasKey,
   type AppQuotaTier,
+  type AppRuntimeMode,
 } from '../../../main/src/dynamic-worker-registry';
 import { quotaLimitsForTier, resolveQuotaTier } from './quota-policy';
 import type { SupervisorIdentity, TenantObjectSupervisorDO } from './supervisor-do';
@@ -28,6 +29,7 @@ export interface TenantDoRouterProps {
   orgId: string;
   quotaTier?: AppQuotaTier;
   bundleR2Key?: string;
+  runtimeMode?: AppRuntimeMode;
 }
 
 const HEX_DO_ID_RE = /^[0-9a-f]{64}$/i;
@@ -82,6 +84,7 @@ export class TenantDoRouter extends WorkerEntrypoint<EntrypointsEnv, TenantDoRou
         objectId: canonicalId,
         ...(this.ctx.props?.bundleR2Key ? { bundleR2Key: this.ctx.props.bundleR2Key } : {}),
         ...(this.ctx.props?.quotaTier ? { quotaTier: this.ctx.props.quotaTier } : {}),
+        ...(this.ctx.props?.runtimeMode ? { runtimeMode: this.ctx.props.runtimeMode } : {}),
       },
     };
   }
@@ -105,6 +108,11 @@ export class TenantDoRouter extends WorkerEntrypoint<EntrypointsEnv, TenantDoRou
     headers.set('x-chiridion-supervisor-key', identity.supervisorKey);
     if (identity.bundleR2Key) headers.set('x-chiridion-bundle-key', identity.bundleR2Key);
     if (identity.quotaTier) headers.set('x-chiridion-quota-tier', identity.quotaTier);
+    if (identity.runtimeMode) {
+      headers.set('x-chiridion-runtime-mode', identity.runtimeMode);
+    } else {
+      headers.delete('x-chiridion-runtime-mode');
+    }
 
     const init: RequestInit = {
       method: request.method,

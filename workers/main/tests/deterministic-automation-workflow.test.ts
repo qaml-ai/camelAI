@@ -5,6 +5,7 @@ import {
   prepareDeterministicAutomationRuntimeSource,
   recordWorkflowRunStatus,
 } from "../src/deterministic-automation-workflow";
+import { SECURE_FETCH_REDIRECT_HEADER } from "../src/secure-fetch";
 
 const WORKFLOW_COMPATIBILITY_DATE = "2026-05-18";
 
@@ -191,6 +192,57 @@ export class AutomationWorkflow extends WorkflowEntrypoint {
     };
 
     await expect(runner.run()).resolves.toEqual({ toolType: "function" });
+  });
+
+  it("passes workflow redirect intent separately from the manual HTTP transport mode", async () => {
+    const { CODE_MODE_LOADER: loader } = env as Cloudflare.Env & {
+      CODE_MODE_LOADER: WorkerLoader & { load(code: WorkerLoaderWorkerCode): WorkerStub };
+    };
+    const source = `
+import { WorkflowEntrypoint } from "cloudflare:workers";
+export class AutomationWorkflow extends WorkflowEntrypoint {
+  constructor(ctx, env) {
+    super(ctx, {
+      ...env,
+      SECURE_FETCH: {
+        async fetch(input, init) {
+          const request = new Request(input, init);
+          return Response.json({
+            redirect: request.redirect,
+            intent: request.headers.get(${JSON.stringify(SECURE_FETCH_REDIRECT_HEADER)}),
+            method: request.method,
+            body: await request.text(),
+          });
+        },
+      },
+    });
+  }
+  async run() {
+    const follow = await fetch("https://app.example.test/start", {
+      method: "POST", body: "payload",
+    });
+    const manual = await fetch(new Request("https://app.example.test/start", {
+      redirect: "manual",
+    }));
+    return [await follow.json(), await manual.json()];
+  }
+}`;
+    const worker = loader.load({
+      compatibilityDate: WORKFLOW_COMPATIBILITY_DATE,
+      mainModule: "index.js",
+      modules: {
+        "index.js": { js: prepareDeterministicAutomationRuntimeSource(source) },
+      },
+      globalOutbound: null,
+    });
+    const runner = worker.getEntrypoint("AutomationWorkflow") as unknown as {
+      run(): Promise<unknown>;
+    };
+
+    await expect(runner.run()).resolves.toEqual([
+      { redirect: "manual", intent: "follow", method: "POST", body: "payload" },
+      { redirect: "manual", intent: "manual", method: "GET", body: "" },
+    ]);
   });
 
   it("routes workflow tool facade methods through callTool", async () => {

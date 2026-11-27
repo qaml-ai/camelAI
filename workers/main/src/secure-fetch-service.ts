@@ -3,6 +3,7 @@ import type { CodeModeToolsProps } from './code-mode-tools.js';
 import {
   buildWorkspaceAppHostIndex,
   performSecureFetch,
+  SECURE_FETCH_REDIRECT_HEADER,
   type SecureFetchEnv,
   type WorkspaceAppHostIndex,
 } from './secure-fetch.js';
@@ -35,8 +36,13 @@ export class SecureFetchBinding extends WorkerEntrypoint<
     return dispatcher ? { ...this.env, DISPATCHER: dispatcher } : this.env;
   }
 
-  async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-    return performSecureFetch(this.resolveEnv(), this.context, input, init, {
+  async fetch(request: Request): Promise<Response> {
+    // The HTTP binding handler always receives a manual-mode Request. The
+    // caller's desired mode travels separately and stays inside the binding.
+    const headers = new Headers(request.headers);
+    const redirect = headers.get(SECURE_FETCH_REDIRECT_HEADER) === 'follow' ? 'follow' : 'manual';
+    headers.delete(SECURE_FETCH_REDIRECT_HEADER);
+    return performSecureFetch(this.resolveEnv(), this.context, request, { headers, redirect }, {
       getHostIndex: () => this.getHostIndex(),
     });
   }

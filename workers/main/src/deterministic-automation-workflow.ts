@@ -11,6 +11,7 @@ import {
 } from "cloudflare:workers";
 import type { AIVirtualBindingProps } from "./ai-virtual-binding";
 import type { CodeModeToolsProps } from "./code-mode-tools";
+import { SECURE_FETCH_REDIRECT_HEADER } from "./secure-fetch";
 import type { WorkspaceCronDO } from "./workspace-cron";
 
 const AUTOMATION_WORKFLOW_ENTRYPOINT = "AutomationWorkflow";
@@ -327,7 +328,12 @@ function __camelAiPatchGlobalFetch(secureFetch) {
   const nativeFetch = typeof globalThis.fetch === "function"
     ? globalThis.fetch.bind(globalThis)
     : undefined;
-  globalThis.fetch = (input, init) => secureFetch.fetch(input, init);
+  globalThis.fetch = async (input, init) => {
+    const request = input instanceof Request && init === undefined ? input : new Request(input, init);
+    const headers = new Headers(request.headers);
+    headers.set(${JSON.stringify(SECURE_FETCH_REDIRECT_HEADER)}, request.redirect);
+    return secureFetch.fetch(request, { headers, redirect: "manual" });
+  };
   return () => {
     if (nativeFetch) {
       globalThis.fetch = nativeFetch;

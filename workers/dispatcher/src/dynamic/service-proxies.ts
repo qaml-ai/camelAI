@@ -13,6 +13,7 @@ import type {
   BrokeredVirtualServiceName,
   DynamicServiceBroker,
 } from '../../../main/src/dynamic-service-broker';
+import { materializeRpcResult } from '../../../main/src/rpc-result';
 
 export interface ServiceProxyEnv {
   MAIN_APP_BROKER?: Service<DynamicServiceBroker>;
@@ -30,7 +31,7 @@ abstract class BrokeredServiceProxy extends WorkerEntrypoint<
 > {
   protected abstract readonly serviceName: BrokeredVirtualServiceName;
 
-  protected callBroker(method: string, ...args: unknown[]): Promise<unknown> {
+  protected async callBroker(method: string, ...args: unknown[]): Promise<unknown> {
     if (!this.env.MAIN_APP_BROKER) {
       throw new Error(
         `MAIN_APP_BROKER service binding is not configured on chiridion-dispatcher (required for ${this.serviceName})`,
@@ -41,7 +42,7 @@ abstract class BrokeredServiceProxy extends WorkerEntrypoint<
       workspaceId: this.ctx.props.workspaceId,
       ...(this.ctx.props.userId ? { userId: this.ctx.props.userId } : {}),
     };
-    return this.env.MAIN_APP_BROKER.invoke(this.serviceName, props, method, args);
+    return materializeRpcResult(await this.env.MAIN_APP_BROKER.invoke(this.serviceName, props, method, args));
   }
 }
 

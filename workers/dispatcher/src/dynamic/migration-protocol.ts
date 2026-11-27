@@ -10,6 +10,15 @@
 export const MIGRATION_SIG_HEADER = 'x-chiridion-migration-sig';
 export const MIGRATION_TS_HEADER = 'x-chiridion-migration-ts';
 export const MIGRATION_MAX_SKEW_MS = 60_000;
+export const MIGRATION_RETRY_AFTER_SECONDS = 2;
+export const MIGRATION_PENDING_MESSAGE = `Durable Object migration is still in progress (retry after ${MIGRATION_RETRY_AFTER_SECONDS} seconds)`;
+
+export function migrationPendingResponse(): Response {
+  return new Response(MIGRATION_PENDING_MESSAGE, {
+    status: 503,
+    headers: { 'Retry-After': String(MIGRATION_RETRY_AFTER_SECONDS) },
+  });
+}
 
 export interface SchemaObjectDdl {
   type: 'table' | 'index' | 'trigger' | 'view';

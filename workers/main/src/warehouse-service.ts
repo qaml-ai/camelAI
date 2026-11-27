@@ -3,6 +3,7 @@ import { assertConnectionsBindingEnabled } from '../../../src/lib/connections-bi
 import { isSqlDatabaseMcpIntegration } from './sql-database-mcp.js';
 import { isBigQueryMcpIntegration } from './bigquery-mcp.js';
 import { isClickHouseMcpIntegration } from './clickhouse-mcp.js';
+import { materializeRpcResult } from './rpc-result.js';
 
 /**
  * Source-compat shim for the pre-merge WAREHOUSE virtual binding.
@@ -144,14 +145,15 @@ export class WarehouseService extends WorkerEntrypoint<unknown, WarehouseService
   async runCode(request: WarehouseRunRequest): Promise<WarehouseRunResult> {
     // App-scoped by definition: this entrypoint is only reachable from deployed
     // apps' baked WAREHOUSE bindings, which were always export-mounts-only.
-    return toWarehouseCompatResult(await this.analysis().runCodeForApps(request));
+    const result = materializeRpcResult(await this.analysis().runCodeForApps(request));
+    return toWarehouseCompatResult(result);
   }
 
   async listConnections(): Promise<WarehouseConnection[]> {
     // Legacy deployed-app WAREHOUSE binding — same kill switch as CONNECTIONS /
     // AnalysisAppService so connection catalogs cannot leak when disabled.
     assertConnectionsBindingEnabled(this.env as { CONNECTIONS_BINDING_ENABLED?: string });
-    return this.analysis().listConnections();
+    return materializeRpcResult(await this.analysis().listConnections());
   }
 
   private analysis(): AnalysisDelegate {

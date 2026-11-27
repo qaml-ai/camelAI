@@ -7,9 +7,11 @@ import type { OrgDO } from '../../../main/src/auth';
 import type { DynamicServiceBroker } from '../../../main/src/dynamic-service-broker';
 import {
   type AppQuotaTier,
+  type AppRuntimeMode,
   type DynamicWorkerBundleRecord,
   type DynamicWorkerModule,
 } from '../../../main/src/dynamic-worker-registry';
+import type { TenantDoRouterProps } from './entrypoints';
 import type { ShardQuotaLimits } from './quota-policy';
 import {
   decryptSecretsPayload,
@@ -34,7 +36,7 @@ export interface DynamicRuntimeExports {
   DynamicWarehouseService?: (options: { props: Record<string, unknown> }) => unknown;
   KVVirtualNamespace?: (options: { props: Record<string, unknown> }) => unknown;
   R2VirtualBucket?: (options: { props: Record<string, unknown> }) => unknown;
-  TenantDoRouter?: (options: { props: Record<string, unknown> }) => unknown;
+  TenantDoRouter?: (options: { props: TenantDoRouterProps }) => unknown;
   AlarmMediator?: (options: { props: Record<string, unknown> }) => unknown;
   QuotaReporter?: (options: { props: Record<string, unknown> }) => unknown;
   OutboundGate?: (options: { props: Record<string, unknown> }) => Fetcher;
@@ -329,7 +331,7 @@ export async function loadDynamicEnvOverlay(
   if (migratedSecrets.length === 0 && legacy.vars.length === 0) return managed;
 
   let envHash = managed.envHash;
-  if (migratedSecrets.length > 0) envHash += `:ms${migratedSecrets.length}`;
+  if (migratedSecrets.length > 0) envHash += `:ms${await computeEnvHash(migratedSecrets)}`;
   if (legacy.vars.length > 0) envHash += `:li${legacy.envHash}`;
   return { vars: [...legacy.vars, ...migratedSecrets, ...managed.vars], envHash };
 }
@@ -528,6 +530,7 @@ export interface LoadDynamicWorkerOptions {
   managedOverlay: ManagedAppEnvVar[];
   envHash: string;
   quotaTier: AppQuotaTier;
+  runtimeMode?: AppRuntimeMode;
   quotaLimits?: ShardQuotaLimits | null;
   supervisorKey?: string;
   dailyRowsRead?: number;
@@ -544,6 +547,7 @@ export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStu
     managedOverlay,
     envHash,
     quotaTier,
+    runtimeMode,
     quotaLimits,
     supervisorKey,
     dailyRowsRead = 0,
@@ -552,9 +556,10 @@ export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStu
     enableLogsTail = false,
   } = opts;
 
-  const isolateId = supervisorKey
+  const isolateIdBase = supervisorKey
     ? `do:${supervisorKey}:${record.bundleSha}:${envHash}`
     : `http:${record.dispatchScriptName}:${record.bundleSha}:${envHash}:${enableLogsTail ? 't1' : 't0'}`;
+  const isolateId = runtimeMode ? `${isolateIdBase}:${runtimeMode}` : isolateIdBase;
 
   return loader.get(isolateId, () => {
     const modules: Record<string, WorkerLoaderModule | string> = {
@@ -579,6 +584,7 @@ export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStu
           orgId: record.orgId,
           quotaTier,
           bundleR2Key: `dynamic-bundles/${encodeURIComponent(record.dispatchScriptName)}/${record.bundleSha}.json`,
+          runtimeMode,
         },
       });
     }

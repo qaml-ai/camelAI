@@ -14,6 +14,8 @@ export type SecureFetchEnv = WorkspaceAppFetcherEnv & {
   ORG: DurableObjectNamespace<OrgDO>;
 };
 
+export const SECURE_FETCH_REDIRECT_HEADER = 'x-camelai-secure-fetch-redirect';
+
 export type { WorkspaceAppHostIndex };
 
 export {

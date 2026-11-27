@@ -20,6 +20,7 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
 import { buildIntegrationEnvVars, getIntegrationEnvVarPrefix } from './legacy-integration-env.js';
+import { materializeRpcResult } from './rpc-result.js';
 import type { Env } from './types.js';
 
 export type BrokeredVirtualServiceName =
@@ -142,6 +143,6 @@ export class DynamicServiceBroker extends WorkerEntrypoint<Env> {
     }
     // IMPORTANT: Call directly as `stub[method](...args)` — never `fn.apply(stub, args)`.
     // On Cloudflare Workers JSRPC stubs, `.apply` is intercepted as a remote RPC method name.
-    return stub[method](...args);
+    return materializeRpcResult(await stub[method](...args));
   }
 }

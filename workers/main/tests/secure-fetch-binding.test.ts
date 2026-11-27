@@ -1,5 +1,7 @@
 import { env } from 'cloudflare:test';
 import { describe, expect, it, vi } from 'vitest';
+import { SECURE_FETCH_REDIRECT_HEADER, type SecureFetchEnv } from '../src/secure-fetch';
+import { SecureFetchBinding } from '../src/secure-fetch-service';
 import { performWorkspaceAppFetch } from '../src/workspace-app-fetcher';
 
 /**
@@ -37,6 +39,47 @@ function dispatcherServiceEnv(fetchMock = vi.fn(async () => new Response('{"ok":
 }
 
 describe('secure fetch binding regression', () => {
+  it.each([
+    ['follow', 200, ['/api/water', '/final']],
+    ['manual', 302, ['/api/water']],
+  ] as const)('uses the caller\'s %s mode when Workerd sends a manual HTTP request', async (mode, status, paths) => {
+    const fetchWorkspaceApp = vi.fn(async (request: Request) => {
+      expect(request.redirect).toBe('manual');
+      expect(request.headers.has(SECURE_FETCH_REDIRECT_HEADER)).toBe(false);
+      return new URL(request.url).pathname === '/api/water'
+        ? new Response(null, { status: 302, headers: { Location: '/final' } })
+        : new Response('done');
+    });
+    const context = { orgId: 'org1', workspaceId: 'workspace1' };
+    const binding = new SecureFetchBinding(
+      { props: context } as ExecutionContext,
+      {
+        DISPATCHER: { fetchWorkspaceApp },
+        ORG: {
+          idFromName: () => context.orgId,
+          get: () => ({
+            getInfo: async () => ({ slug: 'ms-workspace-d05' }),
+            listWorkerScriptsByWorkspace: async () => [{
+              script_name: 'water-tracker',
+              is_public: false,
+              custom_domain_hostname: WORKSPACE_APP_HOST,
+              custom_domain_status: 'active',
+              custom_domain_ssl_status: 'active',
+            }],
+          }),
+        } as unknown as SecureFetchEnv['ORG'],
+        WORKER_BASE_URL: 'https://staging.camelai.dev',
+      },
+    );
+    const response = await binding.fetch(new Request(WORKSPACE_APP_URL, {
+      headers: { [SECURE_FETCH_REDIRECT_HEADER]: mode },
+      redirect: 'manual',
+    }));
+
+    expect(response.status).toBe(status);
+    expect(fetchWorkspaceApp.mock.calls.map(([request]) => new URL(request.url).pathname)).toEqual(paths);
+  });
+
   it('requires DISPATCHER to be a service binding with fetchWorkspaceApp()', () => {
     return expect(performWorkspaceAppFetch(
       {

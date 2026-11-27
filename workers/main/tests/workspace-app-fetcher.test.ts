@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   applyWorkspaceAppPath,
   buildWorkspaceAppHostIndex,
@@ -10,9 +10,32 @@ import {
   PLATFORM_DISPATCH_SCRIPT_HEADER,
   PLATFORM_DISPATCH_SCRIPT_NAME_HEADER,
   shouldUseDispatchInterceptionForScreenshot,
+  type WorkspaceAppFetcherEnv,
 } from '../src/workspace-app-fetcher';
 
+const appHost = 'private-app-alpha12.staging.camelai.app';
+const siblingHost = 'sibling-app-alpha12.staging.camelai.app';
+const context = { orgId: 'org1', workspaceId: 'workspace1' };
+
+function redirectFixture(fetchWorkspaceApp: (request: Request) => Promise<Response>) {
+  const route = { ...context, orgSlug: 'alpha12', isPublic: false };
+  const index = {
+    hostnames: new Set([appHost, siblingHost]),
+    routesByHostname: new Map([
+      [appHost, { ...route, scriptName: 'private-app', dispatchScriptName: 'private-app--alpha12' }],
+      [siblingHost, { ...route, scriptName: 'sibling-app', dispatchScriptName: 'sibling-app--alpha12' }],
+    ]),
+  };
+  const env: WorkspaceAppFetcherEnv = {
+    DISPATCHER: { fetchWorkspaceApp },
+    ORG: {} as WorkspaceAppFetcherEnv['ORG'],
+  };
+  return { env, index };
+}
+
 describe('workspace app fetcher', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
   it('indexes vanity, iframe, and custom app hostnames for a workspace', async () => {
     const orgStub = {
       getInfo: vi.fn(async () => ({ slug: 'alpha12' })),
@@ -210,6 +233,84 @@ describe('workspace app fetcher', () => {
     expect(redirected.method).toBe('GET');
   });
 
+  it.each([[307, 'POST'], [308, 'PUT']] as const)(
+    'replays an already consumed request body for %s with %s across multiple redirects',
+    async (status, method) => {
+      const upstream = vi.fn(async (request: Request) => {
+        expect(request.redirect).toBe('manual');
+        expect(request.method).toBe(method);
+        expect(request.headers.get('Content-Type')).toBe('application/octet-stream');
+        expect([...new Uint8Array(await request.arrayBuffer())]).toEqual([0, 42, 255]);
+        const path = new URL(request.url).pathname;
+        expect(request.headers.get('Authorization')).toBe(path === '/sibling' ? null : 'Bearer app-token');
+        return path === '/sibling'
+          ? new Response('done')
+          : new Response(null, {
+            status,
+            headers: { Location: path === '/start' ? '/middle' : `https://${siblingHost}/sibling` },
+          });
+      });
+      const { env, index } = redirectFixture(upstream);
+      const response = await fetchWorkspaceAppViaDispatch(
+        env,
+        context,
+        new Request(`https://${appHost}/start`, {
+          method,
+          headers: { 'Content-Type': 'application/octet-stream', Authorization: 'Bearer app-token' },
+          body: new Uint8Array([0, 42, 255]),
+        }),
+        index,
+      );
+
+      expect(await response.text()).toBe('done');
+      expect(upstream).toHaveBeenCalledTimes(3);
+    },
+  );
+
+  it('rejects replay beyond the limit without truncating an initial upload', async () => {
+    const size = 1024 * 1024 + 1;
+    const upstream = vi.fn(async (request: Request) => {
+      expect((await request.arrayBuffer()).byteLength).toBe(size);
+      return new Response(null, { status: 307, headers: { Location: '/next' } });
+    });
+    const { env, index } = redirectFixture(upstream);
+    const request = (redirect: RequestRedirect) => new Request(`https://${appHost}/start`, {
+      method: 'POST',
+      body: new Uint8Array(size),
+      redirect,
+    });
+
+    await expect(fetchWorkspaceAppViaDispatch(env, context, request('follow'), index))
+      .rejects.toThrow('request body over 1 MiB');
+    expect(upstream).toHaveBeenCalledTimes(1);
+    await expect(fetchWorkspaceAppViaDispatch(env, context, request('manual'), index))
+      .resolves.toMatchObject({ status: 307 });
+    expect(upstream).toHaveBeenCalledTimes(2);
+  });
+
+  it('follows a 303 after a large POST as a bodyless GET', async () => {
+    const upstream = vi.fn(async (request: Request) => {
+      if (new URL(request.url).pathname === '/start') {
+        await request.arrayBuffer();
+        return new Response(null, { status: 303, headers: { Location: '/next' } });
+      }
+      expect(request.method).toBe('GET');
+      expect(request.body).toBeNull();
+      expect(request.headers.has('Content-Type')).toBe(false);
+      return new Response('done');
+    });
+    const { env, index } = redirectFixture(upstream);
+
+    const response = await fetchWorkspaceAppViaDispatch(
+      env,
+      context,
+      new Request(`https://${appHost}/start`, { method: 'POST', body: 'x'.repeat(1024 * 1024 + 1) }),
+      index,
+    );
+    expect(await response.text()).toBe('done');
+    expect(upstream).toHaveBeenCalledTimes(2);
+  });
+
   it('routes self-host workspace app fetches through the dispatcher service binding', async () => {
     const fetchMock = vi.fn(async () => new Response('selfhost ok', { status: 200 }));
     const index = {
@@ -326,7 +427,10 @@ describe('workspace app fetcher', () => {
       status: 302,
       headers: { Location: 'https://example.com/landing' },
     }));
-    const externalFetchMock = vi.fn(async () => new Response('external', { status: 200 }));
+    const externalFetchMock = vi.fn(async (_request: Request, init: RequestInit) => {
+      expect(init.redirect).toBe('manual');
+      return new Response('external');
+    });
     vi.stubGlobal('fetch', externalFetchMock);
     const index = {
       hostnames: new Set(['private-app-alpha12.staging.camelai.app']),
@@ -358,6 +462,8 @@ describe('workspace app fetcher', () => {
         headers: {
           Authorization: 'Bearer secret-token',
           Cookie: 'session=abc123',
+          Host: appHost,
+          [PLATFORM_DISPATCH_SCRIPT_HEADER]: 'forged-script',
         },
       }),
       index,
@@ -369,6 +475,37 @@ describe('workspace app fetcher', () => {
     expect(externalRequest.url).toBe('https://example.com/landing');
     expect(externalRequest.headers.get('Authorization')).toBeNull();
     expect(externalRequest.headers.get('Cookie')).toBeNull();
+    expect(externalRequest.headers.has('Host')).toBe(false);
+    expect(externalRequest.headers.has(PLATFORM_DISPATCH_SCRIPT_HEADER)).toBe(false);
     vi.unstubAllGlobals();
+  });
+
+  it('strips cross-origin credentials and replays PUT through an external redirect chain', async () => {
+    const dispatched = vi.fn();
+    const { env, index } = redirectFixture(dispatched);
+    const externalFetch = vi.fn(async (request: Request, init?: RequestInit) => {
+      expect(init?.redirect).toBe('manual');
+      expect(request.method).toBe('PUT');
+      expect(await request.text()).toBe('body');
+      const { hostname } = new URL(request.url);
+      if (hostname === 'start.example.test') {
+        expect(request.headers.get('Cookie')).toBe('session=123');
+        return new Response(null, { status: 308, headers: { Location: `https://${appHost}/next` } });
+      }
+      expect(request.headers.get('Cookie')).toBeNull();
+      return new Response('done');
+    });
+    vi.stubGlobal('fetch', externalFetch);
+
+    const response = await performWorkspaceAppFetch(
+      env,
+      context,
+      'https://start.example.test/start',
+      { method: 'PUT', headers: { Cookie: 'session=123' }, body: 'body' },
+      { getHostIndex: async () => index },
+    );
+    expect(await response.text()).toBe('done');
+    expect(externalFetch).toHaveBeenCalledTimes(2);
+    expect(dispatched).not.toHaveBeenCalled();
   });
 });

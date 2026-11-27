@@ -16,7 +16,9 @@ import type { OrgDO } from '../../../main/src/auth';
 import type { DynamicServiceBroker } from '../../../main/src/dynamic-service-broker';
 import {
   dynamicDoAliasKey,
+  isDynamicRuntimeMode,
   type AppQuotaTier,
+  type AppRuntimeMode,
   type DynamicWorkerBundleRecord,
 } from '../../../main/src/dynamic-worker-registry';
 import { getWorkerAccessInfo, type WorkerAccessInfo } from '../access-control';
@@ -29,8 +31,11 @@ import {
 } from './bundle-store';
 import { MIGRATION_IMPORTER_FACET_SOURCE } from './importer-facet';
 import {
+  MIGRATION_PENDING_MESSAGE,
+  MIGRATION_RETRY_AFTER_SECONDS,
   MIGRATION_SIG_HEADER,
   MIGRATION_TS_HEADER,
+  migrationPendingResponse,
   signMigrationRequest,
   type FreezeResponsePayload,
   type KvPagePayload,
@@ -57,12 +62,13 @@ export interface SupervisorIdentity {
   className: string;
   objectId: string;
   bundleR2Key?: string;
+  runtimeMode?: AppRuntimeMode;
   quotaTier?: AppQuotaTier;
   envVersion?: number;
 }
 
 export interface SupervisorMigrationState {
-  status: 'native' | 'migrated' | 'empty';
+  status: 'native' | 'in_progress' | 'migrated' | 'empty';
   legacyHexId?: string;
   migratedAt?: string;
   sourceDigest?: string;
@@ -216,32 +222,29 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
   private unsavedQuotaRowsRead = 0;
   private unsavedQuotaRowsWritten = 0;
   private activeFacetBundleKey: string | null = null;
-  private migrationInFlight: Promise<{
-    status: 'migrated' | 'empty' | 'already_migrated';
-    hexId?: string;
-    tableCounts?: Record<string, number>;
-    kvCount?: number;
-    overallDigest?: string;
-  }> | null = null;
+  private migrationInFlight: Promise<MigrationRunResult> | null = null;
+  private migrationNeedsResume: boolean | undefined;
 
   private async ensureIdentity(incoming?: SupervisorIdentity): Promise<SupervisorIdentity | null> {
+    if (!this.identityCache) {
+      const stored = await this.ctx.storage.get<SupervisorIdentity>(META_IDENTITY_KEY);
+      if (stored) this.identityCache ??= stored;
+    }
     if (incoming) {
       if (
         !this.identityCache ||
         this.identityCache.supervisorKey !== incoming.supervisorKey ||
         (incoming.bundleR2Key && this.identityCache.bundleR2Key !== incoming.bundleR2Key) ||
+        (incoming.runtimeMode && this.identityCache.runtimeMode !== incoming.runtimeMode) ||
         (incoming.quotaTier && this.identityCache.quotaTier !== incoming.quotaTier)
       ) {
-        this.identityCache = this.identityCache
+        const updated = this.identityCache
           ? { ...this.identityCache, ...incoming }
           : { ...incoming };
-        await this.ctx.storage.put(META_IDENTITY_KEY, this.identityCache);
+        this.identityCache = updated;
+        await this.ctx.storage.put(META_IDENTITY_KEY, updated);
+        return updated;
       }
-      return this.identityCache;
-    }
-    if (!this.identityCache) {
-      const stored = await this.ctx.storage.get<SupervisorIdentity>(META_IDENTITY_KEY);
-      if (stored) this.identityCache = stored;
     }
     return this.identityCache;
   }
@@ -278,9 +281,13 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     if (!effectiveBundleKey) return null;
     const bundle = await loadDynamicBundleRecord(this.env, effectiveBundleKey);
     if (!bundle) return null;
+    const runtimeMode = identity.runtimeMode === 'dynamic_migrating' || accessInfo?.runtime_mode === 'dynamic_migrating'
+      ? 'dynamic_migrating'
+      : 'dynamic';
     const effectiveAccess: WorkerAccessInfo = accessInfo
       ? {
           ...accessInfo,
+          runtime_mode: runtimeMode,
           bundle_r2_key: effectiveBundleKey,
           ...(identity.quotaTier ? { quota_tier: identity.quotaTier } : {}),
           ...(identity.envVersion !== undefined ? { env_version: identity.envVersion } : {}),
@@ -289,7 +296,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
           is_public: false,
           org_id: bundle.orgId,
           org_slug: bundle.orgSlug,
-          runtime_mode: 'dynamic',
+          runtime_mode: runtimeMode,
           bundle_r2_key: effectiveBundleKey,
           bundle_sha: bundle.bundleSha,
           quota_tier: identity.quotaTier ?? 'free',
@@ -318,7 +325,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       isDynamicLogsTailEnabled(this.env, bundle),
     ]);
 
-    const nextFacetBundleKey = `${bundle.bundleSha}:${envHash}:${quotaTier}`;
+    const nextFacetBundleKey = `${bundle.bundleSha}:${envHash}:${quotaTier}:${accessInfo.runtime_mode}`;
     if (this.activeFacetBundleKey && this.activeFacetBundleKey !== nextFacetBundleKey) {
       // Gracefully abort the warm facet so the new bundle/env takes effect immediately
       // while preserving 100% of the facet's SQLite database.
@@ -337,6 +344,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       managedOverlay: vars,
       envHash,
       quotaTier,
+      runtimeMode: accessInfo.runtime_mode,
       quotaLimits: quotaLimitsForTier(quotaTier),
       supervisorKey: identity.supervisorKey,
       dailyRowsRead: quotaState.rowsRead,
@@ -403,6 +411,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     const className = request.headers.get('x-chiridion-do-class')?.trim();
     const objectId = request.headers.get('x-chiridion-do-id')?.trim();
     const bundleR2Key = request.headers.get('x-chiridion-bundle-key')?.trim() || undefined;
+    const runtimeModeHeader = request.headers.get('x-chiridion-runtime-mode')?.trim();
     const quotaTierHeader = request.headers.get('x-chiridion-quota-tier')?.trim() as AppQuotaTier | undefined;
     const supervisorKey =
       request.headers.get('x-chiridion-supervisor-key')?.trim() ||
@@ -418,6 +427,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
             className,
             objectId,
             ...(bundleR2Key ? { bundleR2Key } : {}),
+            ...(isDynamicRuntimeMode(runtimeModeHeader) ? { runtimeMode: runtimeModeHeader } : {}),
             ...(quotaTierHeader ? { quotaTier: quotaTierHeader } : {}),
           }
         : undefined,
@@ -432,8 +442,8 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     }
     const { accessInfo, bundle, quotaTier } = resolved;
 
-    if (accessInfo.runtime_mode === 'dynamic_migrating') {
-      await this.ensureLazyMigrated(identity, accessInfo.org_id, quotaTier);
+    if (!(await this.ensureLazyMigrated(identity, accessInfo, quotaTier))) {
+      return migrationPendingResponse();
     }
 
     const quotaState = await this.loadQuotaState();
@@ -475,6 +485,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     cleanHeaders.delete('x-chiridion-do-id');
     cleanHeaders.delete('x-chiridion-supervisor-key');
     cleanHeaders.delete('x-chiridion-bundle-key');
+    cleanHeaders.delete('x-chiridion-runtime-mode');
     cleanHeaders.delete('x-chiridion-quota-tier');
 
     const forwardedInit: RequestInit = {
@@ -545,8 +556,8 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     if (!resolved) throw new Error(`Worker bundle not found: ${identity.dispatchScriptName}`);
     const { accessInfo, bundle, quotaTier } = resolved;
 
-    if (accessInfo.runtime_mode === 'dynamic_migrating') {
-      await this.ensureLazyMigrated(identity, accessInfo.org_id, quotaTier);
+    if (!(await this.ensureLazyMigrated(identity, accessInfo, quotaTier))) {
+      throw new Error(MIGRATION_PENDING_MESSAGE);
     }
 
     const quotaState = await this.loadQuotaState();
@@ -601,6 +612,11 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     const resolved = await this.resolveAppAndBundle(identity);
     if (!resolved) return;
     const { accessInfo, bundle, quotaTier } = resolved;
+
+    if (!(await this.ensureLazyMigrated(identity, accessInfo, quotaTier))) {
+      await this.ctx.storage.setAlarm(Date.now() + MIGRATION_RETRY_AFTER_SECONDS * 1_000);
+      return;
+    }
 
     const quotaState = await this.loadQuotaState();
     const limits = quotaLimitsForTier(quotaTier);
@@ -720,6 +736,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
 
   async setMigrationState(state: SupervisorMigrationState): Promise<void> {
     await this.ctx.storage.put(META_MIGRATION_KEY, state);
+    this.migrationNeedsResume = state.status === 'in_progress';
   }
 
   private migrationHmacSecret(): string {
@@ -804,7 +821,11 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     if (!identity) throw new Error('Missing supervisor identity for migration');
 
     const existing = await this.getMigrationState();
-    if (!options?.force && !options?.resume && existing && (existing.status === 'migrated' || existing.status === 'empty')) {
+    const storedCheckpoint = await this.ctx.storage.get<MigrationCheckpoint>(MIGRATION_CHECKPOINT_KEY);
+    if (
+      !options?.force && !options?.resume && !storedCheckpoint &&
+      (existing?.status === 'migrated' || existing?.status === 'empty')
+    ) {
       return { status: 'already_migrated', hexId: existing.legacyHexId, overallDigest: existing.sourceDigest };
     }
 
@@ -812,7 +833,6 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       throw new Error('USER_APP_LOADER binding is required for migration import');
     }
 
-    const storedCheckpoint = await this.ctx.storage.get<MigrationCheckpoint>(MIGRATION_CHECKPOINT_KEY);
     let checkpoint: MigrationCheckpoint | null =
       storedCheckpoint && (options?.resume || !options?.force) ? storedCheckpoint : null;
 
@@ -889,6 +909,8 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       });
       const orderedTables = sortTablesByForeignKeys(cleanTables, cleanSchema);
 
+      await this.setMigrationState({ status: 'in_progress', legacyHexId: freeze.hexId });
+
       // Abort any running facet cleanly before mounting the one-shot importer facet on `"main"`.
       try {
         this.ctx.facets.abort('main', new Error('Mounting privileged migration importer facet'));
@@ -948,6 +970,8 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         startedAt: callStartedAt,
       };
       await this.ctx.storage.put(MIGRATION_CHECKPOINT_KEY, checkpoint);
+    } else if (existing?.status !== 'in_progress') {
+      await this.setMigrationState({ status: 'in_progress', legacyHexId: checkpoint.freeze.hexId });
     }
 
     const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v7', () => ({
@@ -1225,18 +1249,40 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
    */
   private async ensureLazyMigrated(
     identity: SupervisorIdentity,
-    orgId: string,
+    accessInfo: WorkerAccessInfo,
     quotaTier: AppQuotaTier,
-  ): Promise<void> {
-    if (this.migrationInFlight) {
-      await this.migrationInFlight;
-      return;
+  ): Promise<boolean> {
+    try {
+      // A budgeted admin import can outlive both the runtime mode and this isolate.
+      // Read legacy checkpoints once on cold start for imports started before the marker existed.
+      this.migrationNeedsResume ??=
+        this.ctx.storage.kv.get<SupervisorMigrationState>(META_MIGRATION_KEY)?.status === 'in_progress' ||
+        this.ctx.storage.kv.get(MIGRATION_CHECKPOINT_KEY) !== undefined;
+      if (accessInfo.runtime_mode !== 'dynamic_migrating' && !this.migrationInFlight && !this.migrationNeedsResume) {
+        return true;
+      }
+
+      const state = await this.getMigrationState();
+      if (
+        !this.migrationInFlight && !this.migrationNeedsResume &&
+        (state?.status === 'migrated' || state?.status === 'empty')
+      ) {
+        return true;
+      }
+
+      const result = await this.migrateFromWfpShim(identity, { orgId: accessInfo.org_id, quotaTier });
+      if (result.status !== 'migrated' && result.status !== 'empty' && result.status !== 'already_migrated') {
+        return false;
+      }
+      const settled = await this.getMigrationState();
+      return settled?.status === 'migrated' || settled?.status === 'empty';
+    } catch (error) {
+      console.error('[supervisor] migration gate failed', {
+        supervisorKey: identity.supervisorKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
     }
-    const state = await this.getMigrationState();
-    if (state && (state.status === 'migrated' || state.status === 'empty')) {
-      return;
-    }
-    await this.migrateFromWfpShim(identity, { orgId, quotaTier });
   }
 
   /** Permanent data wipe for app deletion / GDPR purge. */
@@ -1249,6 +1295,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     this.identityCache = null;
     this.quotaCache = null;
     this.activeFacetBundleKey = null;
+    this.migrationNeedsResume = undefined;
     await this.ctx.storage.deleteAll();
   }
 }

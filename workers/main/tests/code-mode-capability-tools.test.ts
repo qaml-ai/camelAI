@@ -178,20 +178,29 @@ const appHosts = async () => ({ routesByHostname: new Map(), hostnames: new Set(
 
 describe("http_request", () => {
   it("fetches through the secure fetch binding and returns a bounded body", async () => {
-    const fetch = vi.fn(async () => new Response("abcdef", { status: 201, headers: { "content-type": "text/plain" } }));
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response("abcdef", {
+      status: 201, headers: { "content-type": "text/plain" },
+    }));
     const instance = binding({ secureFetchBinding: () => ({ fetch }), workspaceAppHostIndex: appHosts });
     const result = await methods.httpRequest.call(instance, {
       url: "https://app.example.test/api",
       method: "post",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        "X-CamelAI-Secure-Fetch-Redirect": "manual",
+      },
       body: "{}",
       max_characters: 3,
     });
     expect(fetch).toHaveBeenCalledWith("https://app.example.test/api", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: expect.any(Headers),
+      redirect: "manual",
       body: "{}",
     });
+    const headers = new Headers(fetch.mock.calls[0]?.[1]?.headers);
+    expect(headers.get("content-type")).toBe("application/json");
+    expect(headers.get("x-camelai-secure-fetch-redirect")).toBe("follow");
     expect(result).toMatchObject({ status: 201, body: "abc", bodyBytes: 6, truncated: true, encoding: "text" });
   });
 

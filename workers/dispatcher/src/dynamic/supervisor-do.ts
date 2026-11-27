@@ -888,6 +888,15 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         return !shadowLower.has(lower) && !externalFtsLower.has(lower);
       });
 
+      const migStartedAt = Date.now();
+      console.log('[supervisor] migration freeze complete', {
+        supervisorKey: identity.supervisorKey,
+        databaseSize: freeze.databaseSize,
+        tables: cleanTables.length,
+        totalRows: cleanTables.reduce((acc, t) => acc + t.rowCount, 0),
+        kvCount: freeze.kvCount,
+      });
+
       // 1. Replay CREATE TABLE DDL
       const schemaResp = await importerFacet.fetch(
         new Request('https://import.internal/__import/schema', {
@@ -900,7 +909,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         throw new Error(`Importer schema replay failed: ${await schemaResp.text()}`);
       }
 
-      // 2. Stream every table in 500-row pages (parent tables before FK-referencing child tables)
+      // 2. Stream every table in up to 2000-row / 2MB pages (parent tables before FK-referencing child tables)
       // Start cursor at Number.MIN_SAFE_INTEGER so tables with negative INTEGER PRIMARY KEY
       // aliases for rowid (e.g. Telegram supergroup chat IDs like -1001234567890) are exported.
       const orderedTables = sortTablesByForeignKeys(cleanTables, cleanSchema);
@@ -913,7 +922,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
             identity.className,
             identity.objectId,
             '/__migrate/export-sql',
-            { table: table.name, afterRowid: String(cursor), limit: '500' },
+            { table: table.name, afterRowid: String(cursor), limit: '2000' },
           );
           if (page.rows.length > 0) {
             const importResp = await importerFacet.fetch(
@@ -1019,6 +1028,13 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         className: identity.className,
         eventKind: 'lazy_migration_hit',
         quotaTier: options?.quotaTier ?? 'free',
+      });
+
+      console.log('[supervisor] migration complete', {
+        supervisorKey: identity.supervisorKey,
+        elapsedMs: Date.now() - migStartedAt,
+        tables: Object.keys(finalized.tableCounts).length,
+        kvCount: finalized.kvCount,
       });
 
       return {

@@ -199,6 +199,23 @@ function inspectTables(sql) {
   return { schema, tables, sqliteSequence };
 }
 
+function inspectSingleTable(sql, table) {
+  if (!sql || !table) return null;
+  const exists = sql
+    .exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table)
+    .toArray();
+  if (exists.length === 0) return null;
+  const infoRows = sql.exec("PRAGMA table_info(" + quoteIdent(table) + ")").toArray();
+  const columns = infoRows.map((c) => String(c.name));
+  let hasRowid = true;
+  try {
+    sql.exec("SELECT rowid FROM " + quoteIdent(table) + " LIMIT 0").toArray();
+  } catch {
+    hasRowid = false;
+  }
+  return { name: table, columns, hasRowid };
+}
+
 class ChiridionExportShimDO extends DurableObject {
   async alarm() {
     if (!DISCOVERY_WEBHOOK_URL) return;
@@ -256,9 +273,8 @@ class ChiridionExportShimDO extends DurableObject {
       if (!sql) return Response.json({ ok: false, error: "No SQLite storage" }, { status: 400 });
       const table = url.searchParams.get("table") || "";
       const afterRowid = Number(url.searchParams.get("afterRowid") ?? String(Number.MIN_SAFE_INTEGER));
-      const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") ?? "500")));
-      const { tables } = inspectTables(sql);
-      const meta = tables.find((t) => t.name === table);
+      const limit = Math.max(1, Math.min(2000, Number(url.searchParams.get("limit") ?? "2000")));
+      const meta = inspectSingleTable(sql, table);
       if (!meta) return Response.json({ ok: false, error: "Table not found: " + table }, { status: 404 });
 
       const colSql = meta.columns.map(quoteIdent).join(", ");

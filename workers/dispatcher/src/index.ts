@@ -1250,6 +1250,164 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
       );
     }
 
+    if (url.pathname === '/__chiridion_migrate/backfill-assets' && request.method === 'POST') {
+      const secret = env.MIGRATION_HMAC_SECRET?.trim() || env.TOKEN_SIGNING_SECRET?.trim();
+      const body = (await request.json().catch(() => null)) as {
+        script?: string;
+        seedPaths?: string[];
+        dryRun?: boolean;
+      } | null;
+      const script = body?.script?.trim() || '';
+      const valid = secret && script
+        ? await verifyMigrationSignature(
+            secret,
+            `backfill-assets:${script}`,
+            request.headers.get(MIGRATION_SIG_HEADER),
+            request.headers.get(MIGRATION_TS_HEADER),
+          )
+        : false;
+      if (!valid) return new Response('Forbidden', { status: 403 });
+      if (!env.DISPATCHER || !env.R2_BUCKET || !env.APP_KV) {
+        return Response.json({ ok: false, error: 'DISPATCHER/R2_BUCKET/APP_KV not configured' }, { status: 500 });
+      }
+
+      const kvKey = `selfhost:assets:${script}`;
+      const existing = await env.APP_KV.get(kvKey);
+      if (existing) {
+        return Response.json({ dispatchScriptName: script, status: 'skipped', reason: 'already_has_assets_mirror' });
+      }
+
+      const normalizeRelPath = (raw: string): string | null => {
+        const cleaned = raw.split('?')[0]!.split('#')[0]!.replace(/^\/+/, '').trim();
+        if (!cleaned || cleaned.includes('..') || cleaned.startsWith('http://') || cleaned.startsWith('https://') || cleaned.startsWith('data:')) {
+          return null;
+        }
+        if (!/\.[A-Za-z0-9]{1,12}$/.test(cleaned)) return null;
+        return cleaned;
+      };
+      const extractPaths = (text: string, baseDir = ''): string[] => {
+        const found = new Set<string>();
+        for (const m of text.matchAll(/["'`(](\/(?:assets|images|img|fonts|icons|static|_assets|src)\/[A-Za-z0-9._/-]+\.[A-Za-z0-9]{1,12})["'`)]/g)) {
+          const p = normalizeRelPath(m[1]!);
+          if (p) found.add(p);
+        }
+        for (const m of text.matchAll(/(?:href|src)=["']([^"']+\.[A-Za-z0-9]{1,12}(?:\?[^"']*)?)["']/g)) {
+          const raw = m[1]!;
+          if (raw.startsWith('http://') || raw.startsWith('https://') || raw.startsWith('//') || raw.startsWith('data:')) continue;
+          const p = normalizeRelPath(raw.startsWith('./') && baseDir ? `${baseDir}/${raw.slice(2)}` : raw);
+          if (p) found.add(p);
+        }
+        if (baseDir) {
+          for (const m of text.matchAll(/["'`(](\.\/[A-Za-z0-9._/-]+\.[A-Za-z0-9]{1,12})["'`)]/g)) {
+            const p = normalizeRelPath(`${baseDir}/${m[1]!.slice(2)}`);
+            if (p) found.add(p);
+          }
+        }
+        return [...found];
+      };
+
+      const standardPaths = [
+        'favicon.svg', 'favicon.ico', 'favicon-16x16.png', 'favicon-32x32.png',
+        'apple-touch-icon.png', 'android-chrome-192x192.png', 'android-chrome-512x512.png',
+        'site.webmanifest', 'manifest.webmanifest', 'manifest.json', 'robots.txt', 'og-image.png', 'index.html',
+      ];
+      const queue = new Set<string>(standardPaths);
+      for (const s of body?.seedPaths ?? []) {
+        const p = normalizeRelPath(s);
+        if (p) queue.add(p);
+      }
+
+      const worker = env.DISPATCHER.get(script);
+      try {
+        const rootResp = await worker.fetch(new Request(`https://${script}.camelai.app/`, { method: 'GET' }));
+        if (rootResp.status === 200) {
+          const html = await rootResp.text();
+          for (const p of extractPaths(html)) queue.add(p);
+        }
+      } catch {
+        // Ignore root fetch failure; seedPaths may still succeed
+      }
+
+      const manifest: Record<string, { hash: string; size: number; contentType: string }> = {};
+      const visited = new Set<string>();
+      const pending = [...queue];
+      const dryRun = Boolean(body?.dryRun);
+
+      while (pending.length > 0 && visited.size < 250) {
+        const batch: string[] = [];
+        while (batch.length < 6 && pending.length > 0 && visited.size + batch.length < 250) {
+          const next = pending.shift()!;
+          if (!visited.has(next)) {
+            visited.add(next);
+            batch.push(next);
+          }
+        }
+        if (batch.length === 0) break;
+
+        await Promise.all(
+          batch.map(async (relPath) => {
+            try {
+              const resp = await worker.fetch(
+                new Request(`https://${script}.camelai.app/${relPath}`, { method: 'GET' }),
+              );
+              if (resp.status !== 200) return;
+              const contentType = (resp.headers.get('content-type') || 'application/octet-stream').split(';')[0]!.trim();
+              const buf = await resp.arrayBuffer();
+              if (buf.byteLength === 0) return;
+              if (!relPath.endsWith('.html') && contentType === 'text/html') return;
+
+              if (
+                (contentType.includes('javascript') || contentType === 'text/css' || relPath.endsWith('.js') || relPath.endsWith('.css')) &&
+                buf.byteLength < 5 * 1024 * 1024
+              ) {
+                const text = new TextDecoder().decode(buf);
+                const slash = relPath.lastIndexOf('/');
+                const baseDir = slash >= 0 ? relPath.slice(0, slash) : '';
+                for (const nextPath of extractPaths(text, baseDir)) {
+                  if (!visited.has(nextPath)) pending.push(nextPath);
+                }
+              }
+
+              const digestBuf = await crypto.subtle.digest('SHA-256', buf);
+              const hash = Array.from(new Uint8Array(digestBuf))
+                .map((b) => b.toString(16).padStart(2, '0'))
+                .join('');
+              if (!dryRun) {
+                await env.R2_BUCKET!.put(`selfhost-assets/${script}/${hash}`, buf, {
+                  httpMetadata: { contentType },
+                });
+              }
+              manifest[relPath] = { hash, size: buf.byteLength, contentType };
+            } catch {
+              // Skip individual asset errors
+            }
+          }),
+        );
+      }
+
+      const assetCount = Object.keys(manifest).length;
+      if (assetCount === 0) {
+        return Response.json({ dispatchScriptName: script, status: 'skipped', reason: 'no_static_assets_discovered' });
+      }
+      if (!dryRun) {
+        await env.APP_KV.put(
+          kvKey,
+          JSON.stringify({
+            schemaVersion: 1,
+            appId: script,
+            createdAt: new Date().toISOString(),
+            manifest,
+          }),
+        );
+      }
+      return Response.json({
+        dispatchScriptName: script,
+        status: dryRun ? 'dry_run_ready' : 'backfilled',
+        assetCount,
+        samplePaths: Object.keys(manifest).slice(0, 8),
+      });
+    }
+
     if (url.pathname === '/__selfhost_do/fetch') {
       const bridgeToken = request.headers.get('x-camelai-selfhost-do-bridge')?.trim();
       if (!bridgeToken || bridgeToken !== selfhostDoBridgeSecret(env)) {

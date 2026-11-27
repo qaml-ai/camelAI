@@ -132,6 +132,39 @@ async function backfillApp(
   dryRun: boolean,
   migrationHmacSecret: string,
 ): Promise<Record<string, unknown>> {
+  // Fast edge-native path: crawl WfP assets and write R2 + KV directly inside chiridion-dispatcher
+  // (avoids Cloudflare Control Plane 1,200 req/5min rate limits and round-tripping assets over the internet).
+  if (migrationHmacSecret) {
+    // Optionally extract seed asset paths from the WfP server bundle for apps whose root `/` is auth-gated or redirects.
+    let seedPaths: string[] = [];
+    const contentResp = await fetchWithRetry(
+      `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/dispatch/namespaces/${NAMESPACE}/scripts/${encodeURIComponent(dispatchScriptName)}/content`,
+      { headers: { Authorization: `Bearer ${apiToken}` } },
+    ).catch(() => null);
+    if (contentResp?.ok) {
+      seedPaths = extractAssetPaths(await contentResp.text());
+    }
+    const ts = Date.now();
+    const sig = await signMigrationRequest(
+      migrationHmacSecret,
+      `backfill-assets:${dispatchScriptName}`,
+      ts,
+    );
+    const resp = await fetchWithRetry(`${DISPATCHER_ORIGIN}/__chiridion_migrate/backfill-assets`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        [MIGRATION_TS_HEADER]: String(ts),
+        [MIGRATION_SIG_HEADER]: sig,
+      },
+      body: JSON.stringify({ script: dispatchScriptName, seedPaths, dryRun }),
+    });
+    if (!resp.ok) {
+      throw new Error(`Edge backfill-assets failed (${resp.status}): ${await resp.text()}`);
+    }
+    return (await resp.json()) as Record<string, unknown>;
+  }
+
   const kvKey = `selfhost:assets:${dispatchScriptName}`;
   const existing = await fetchWithRetry(
     `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/storage/kv/namespaces/${PROD_KV_ID}/values/${encodeURIComponent(kvKey)}`,

@@ -175,6 +175,9 @@ function sortTablesByForeignKeys<T extends { name: string }>(
 export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
   private identityCache: SupervisorIdentity | null = null;
   private quotaCache: PersistedShardQuotaState | null = null;
+  private lastQuotaPersistAt = 0;
+  private unsavedQuotaRowsRead = 0;
+  private unsavedQuotaRowsWritten = 0;
   private activeFacetBundleKey: string | null = null;
   private migrationInFlight: Promise<{
     status: 'migrated' | 'empty' | 'already_migrated';
@@ -217,8 +220,12 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
   }
 
   private async saveQuotaState(state: PersistedShardQuotaState): Promise<void> {
-    state.lastUpdatedAt = Date.now();
+    const now = Date.now();
+    state.lastUpdatedAt = now;
     this.quotaCache = state;
+    this.lastQuotaPersistAt = now;
+    this.unsavedQuotaRowsRead = 0;
+    this.unsavedQuotaRowsWritten = 0;
     await this.ctx.storage.put(META_QUOTA_KEY, state);
   }
 
@@ -336,7 +343,16 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         state.lastTripReason = metrics.lastTripReason;
       }
       if (metrics.rowsRead > 0 || metrics.rowsWritten > 0 || metrics.trips > 0) {
-        await this.saveQuotaState(state);
+        this.unsavedQuotaRowsRead += metrics.rowsRead;
+        this.unsavedQuotaRowsWritten += metrics.rowsWritten;
+        const shouldPersist =
+          metrics.trips > 0 ||
+          Date.now() - this.lastQuotaPersistAt >= 30_000 ||
+          this.unsavedQuotaRowsRead >= 5_000 ||
+          this.unsavedQuotaRowsWritten >= 500;
+        if (shouldPersist) {
+          await this.saveQuotaState(state);
+        }
       }
       emitAppUsageMetric(this.env.APP_USAGE_AE, {
         dispatchScriptName: identity.dispatchScriptName,
@@ -777,19 +793,45 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       throw new Error('USER_APP_LOADER binding is required for migration import');
     }
 
-    const freeze = await this.fetchWfpShim<FreezeResponsePayload>(
-      identity.dispatchScriptName,
-      identity.className,
-      identity.objectId,
-      '/__migrate/freeze',
-      {},
-      'POST',
-    );
-
-    if (!freeze || !Array.isArray(freeze.tables) || !Array.isArray(freeze.schema)) {
-      throw new Error(
-        `WfP DO isolate for ${identity.dispatchScriptName}:${identity.className} returned non-shim response (likely active WebSocket/alarm still running pre-shim code)`,
-      );
+    let freeze: FreezeResponsePayload | null = null;
+    let lastFreezeErr: unknown = null;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, 1_500));
+      }
+      try {
+        const candidate = await this.fetchWfpShim<FreezeResponsePayload>(
+          identity.dispatchScriptName,
+          identity.className,
+          identity.objectId,
+          '/__migrate/freeze',
+          {},
+          'POST',
+        );
+        if (candidate && Array.isArray(candidate.tables) && Array.isArray(candidate.schema)) {
+          freeze = candidate;
+          break;
+        }
+        lastFreezeErr = new Error(
+          `WfP DO isolate for ${identity.dispatchScriptName}:${identity.className} returned non-shim response (likely active WebSocket/alarm still running pre-shim code)`,
+        );
+      } catch (err) {
+        lastFreezeErr = err;
+        const msg = err instanceof Error ? err.message : String(err);
+        const isPreRecycle =
+          msg.includes('Handler does not export a fetch') ||
+          msg.includes('HTTP 405') ||
+          msg.includes('HTTP 404') ||
+          msg.includes('non-shim response') ||
+          msg.includes('Unexpected token') ||
+          msg.includes('not valid JSON');
+        if (!isPreRecycle) throw err;
+      }
+    }
+    if (!freeze) {
+      throw lastFreezeErr instanceof Error
+        ? lastFreezeErr
+        : new Error(String(lastFreezeErr ?? 'WfP export shim freeze failed'));
     }
 
     const hasSqlData = freeze.tables.some((t) => t.rowCount > 0) || freeze.schema.length > 0;

@@ -959,9 +959,9 @@ async function migrateSingleScript(
     }
 
     if (doClasses.length > 0 && opts.cohort === 'c') {
-      // Allow any already-warm WfP DO isolate to reload onto ChiridionExportShimDO
-      // before flipping KV to dynamic_migrating so the first lazy touch succeeds.
-      await new Promise((r) => setTimeout(r, 12_000));
+      // Flip KV & latest.json immediately so live traffic routes straight into
+      // TenantObjectSupervisorDO's single-flight migration queue (which retries
+      // /__migrate/freeze while WfP recycles) with zero 503s.
     }
 
     if (doClasses.length > 0 && opts.cohort === 'b') {

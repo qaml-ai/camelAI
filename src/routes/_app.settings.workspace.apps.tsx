@@ -22,8 +22,16 @@ import {
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { ExternalLink, Trash2 } from 'lucide-react';
+import { ExternalLink, KeyRound, Trash2 } from 'lucide-react';
+import { AppSecretsSection } from '@/components/pages/apps/AppSecretsSection';
 import { NoWorkspacesError } from '@/components/no-workspaces-error';
 import { getPreferredAppUrl } from '@/lib/app-url';
 import { getAppUrlContext } from '@/lib/app-url.server';
@@ -193,6 +201,7 @@ export default function WorkspaceAppsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const fetcher = useFetcher<{ success?: boolean; error?: string }>();
   const [deleteTarget, setDeleteTarget] = useState<AppRow | null>(null);
+  const [secretsTarget, setSecretsTarget] = useState<AppRow | null>(null);
 
   if (!hasWorkspace) {
     return <NoWorkspacesError />;
@@ -309,6 +318,14 @@ export default function WorkspaceAppsPage() {
                       <Button
                         variant="ghost"
                         size="icon"
+                        onClick={() => setSecretsTarget(app)}
+                        title="Runtime secrets & environment variables"
+                      >
+                        <KeyRound className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
                         onClick={() => setDeleteTarget(app)}
                       >
                         <Trash2 className="h-4 w-4 text-destructive" />
@@ -321,6 +338,29 @@ export default function WorkspaceAppsPage() {
           </TableBody>
         </Table>
       )}
+
+      <Dialog
+        open={Boolean(secretsTarget)}
+        onOpenChange={(open) => {
+          if (!open) setSecretsTarget(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-xl max-h-[85vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Runtime Secrets</DialogTitle>
+            <DialogDescription>
+              Manage encrypted runtime secrets and environment variables for {secretsTarget?.script_name}.
+            </DialogDescription>
+          </DialogHeader>
+          {secretsTarget ? (
+            <AppSecretsSection
+              workspaceId={secretsTarget.workspace_id}
+              scriptName={secretsTarget.script_name}
+              active={Boolean(secretsTarget)}
+            />
+          ) : null}
+        </DialogContent>
+      </Dialog>
 
       <ConfirmDialog
         open={Boolean(deleteTarget)}

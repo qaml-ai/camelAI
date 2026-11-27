@@ -155,6 +155,32 @@ const ORG_MODEL_PICKER_CONFIG_KEY = "model_picker_config";
 const ORG_INDEX_PREFIX = "org_index:";
 const WORKSPACE_ORG_INDEX_PREFIX = "workspace_org:";
 const CUSTOM_DOMAIN_HOST_PREFIX = "custom_domain_host:";
+const SCRIPT_REGISTRY_KV_PREFIX = "script:";
+const APP_ENV_VAR_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const APP_ENV_VAR_MAX_COUNT = 64;
+const APP_ENV_VAR_MAX_VALUE_LENGTH = 16_384;
+
+export interface AppEnvVarMetadata {
+  key: string;
+  isSecret: boolean;
+  /** Populated only when isSecret is false; secrets are write-only. */
+  value?: string;
+  createdAt: number;
+  updatedAt: number;
+  updatedBy: string;
+}
+
+export interface AppEnvVarInput {
+  key: string;
+  value: string;
+  isSecret?: boolean;
+}
+
+export interface AppEnvVarForDeploy {
+  key: string;
+  value: string;
+  isSecret: boolean;
+}
 const BIGQUERY_INTEGRATION_TYPE = "bigquery";
 const TOKEN_REFRESH_BUFFER_MS = 10 * 60 * 1000;
 const TOKEN_BATCH_WINDOW_MS = 15 * 60 * 1000;
@@ -6596,11 +6622,272 @@ export class OrgDO extends DurableObject<DOEnv> {
       "DELETE FROM worker_scripts WHERE script_name = ?",
       scriptName,
     );
+    this.ensureWorkerScriptEnvVarsTable();
+    this.sql.exec(
+      "DELETE FROM worker_script_env_vars WHERE script_name = ?",
+      scriptName,
+    );
     this.markMirrorDirty("app", scriptName);
     this.log("worker_script_deleted", actorId, scriptName, {
       workspace_id: existing.workspace_id,
     });
     return true;
+  }
+
+  // ── App Runtime Environment Variables & Secrets ──────────────────────
+
+  private ensureWorkerScriptEnvVarsTable(): void {
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS worker_script_env_vars (
+        script_name TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value_encrypted TEXT NOT NULL,
+        is_secret INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        updated_by TEXT NOT NULL,
+        PRIMARY KEY (script_name, key)
+      )
+    `);
+    this.sql.exec(
+      "CREATE INDEX IF NOT EXISTS worker_script_env_vars_script_name ON worker_script_env_vars(script_name)",
+    );
+  }
+
+  private async bumpScriptEnvVersionInKv(scriptName: string): Promise<number> {
+    const info = await this.getInfo();
+    const orgSlug = info?.slug;
+    if (!orgSlug || !this.env.APP_KV) return Date.now();
+    const kvKey = `${SCRIPT_REGISTRY_KV_PREFIX}${scriptName}--${orgSlug}`;
+    try {
+      const raw = await this.env.APP_KV.get(kvKey);
+      if (!raw) return Date.now();
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const prevVersion =
+        typeof parsed.env_version === "number" && Number.isFinite(parsed.env_version)
+          ? parsed.env_version
+          : 0;
+      const nextVersion = prevVersion + 1;
+      parsed.env_version = nextVersion;
+      await this.env.APP_KV.put(kvKey, JSON.stringify(parsed));
+      return nextVersion;
+    } catch {
+      return Date.now();
+    }
+  }
+
+  async listAppEnvVars(scriptName: string): Promise<AppEnvVarMetadata[]> {
+    this.ensureWorkerScriptEnvVarsTable();
+    const rows = this.sql
+      .exec<{
+        key: string;
+        value_encrypted: string;
+        is_secret: number;
+        created_at: number;
+        updated_at: number;
+        updated_by: string;
+      }>(
+        `SELECT key, value_encrypted, is_secret, created_at, updated_at, updated_by
+         FROM worker_script_env_vars
+         WHERE script_name = ?
+         ORDER BY key ASC`,
+        scriptName,
+      )
+      .toArray();
+
+    if (rows.length === 0) return [];
+    const hasPlainVars = rows.some((row) => row.is_secret === 0);
+    const secretKey = hasPlainVars ? this.getIntegrationSecretKey() : "";
+
+    const results: AppEnvVarMetadata[] = [];
+    for (const row of rows) {
+      const isSecret = row.is_secret !== 0;
+      let plainValue: string | undefined;
+      if (!isSecret) {
+        const decrypted = await decryptCredentials<{ value?: unknown }>(
+          row.value_encrypted,
+          secretKey,
+        );
+        plainValue = typeof decrypted.value === "string" ? decrypted.value : "";
+      }
+      results.push({
+        key: row.key,
+        isSecret,
+        ...(isSecret ? {} : { value: plainValue }),
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        updatedBy: row.updated_by,
+      });
+    }
+    return results;
+  }
+
+  async setAppEnvVars(
+    scriptName: string,
+    entries: AppEnvVarInput[],
+    actorId: string,
+  ): Promise<{ envVersion: number; vars: AppEnvVarMetadata[] }> {
+    const script = await this.getWorkerScript(scriptName);
+    if (!script) {
+      throw new Error(`App not found: ${scriptName}`);
+    }
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw new Error("At least one environment variable is required");
+    }
+
+    this.ensureWorkerScriptEnvVarsTable();
+    const existingKeys = new Set(
+      this.sql
+        .exec<{ key: string }>(
+          "SELECT key FROM worker_script_env_vars WHERE script_name = ?",
+          scriptName,
+        )
+        .toArray()
+        .map((row) => row.key),
+    );
+
+    const normalized = new Map<string, { key: string; value: string; isSecret: boolean }>();
+    for (const entry of entries) {
+      const key = typeof entry?.key === "string" ? entry.key.trim() : "";
+      if (!APP_ENV_VAR_KEY_RE.test(key)) {
+        throw new Error(
+          `Invalid variable name "${key}": must start with a letter or underscore and contain only letters, digits, and underscores (max 128 chars).`,
+        );
+      }
+      if (typeof entry?.value !== "string") {
+        throw new Error(`Variable "${key}" value must be a string`);
+      }
+      if (entry.value.length > APP_ENV_VAR_MAX_VALUE_LENGTH) {
+        throw new Error(
+          `Variable "${key}" exceeds maximum length of ${APP_ENV_VAR_MAX_VALUE_LENGTH} characters`,
+        );
+      }
+      normalized.set(key, {
+        key,
+        value: entry.value,
+        isSecret: entry.isSecret !== false,
+      });
+    }
+
+    const resultingKeys = new Set([...existingKeys, ...normalized.keys()]);
+    if (resultingKeys.size > APP_ENV_VAR_MAX_COUNT) {
+      throw new Error(`Apps can have at most ${APP_ENV_VAR_MAX_COUNT} environment variables`);
+    }
+
+    const secretKey = this.getIntegrationSecretKey();
+    const now = Date.now();
+    const encryptedRows: Array<{
+      key: string;
+      valueEncrypted: string;
+      isSecret: number;
+    }> = [];
+    for (const item of normalized.values()) {
+      const valueEncrypted = await encryptCredentials({ value: item.value }, secretKey);
+      encryptedRows.push({
+        key: item.key,
+        valueEncrypted,
+        isSecret: item.isSecret ? 1 : 0,
+      });
+    }
+
+    for (const row of encryptedRows) {
+      this.sql.exec(
+        `INSERT INTO worker_script_env_vars
+          (script_name, key, value_encrypted, is_secret, created_at, updated_at, updated_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(script_name, key) DO UPDATE SET
+           value_encrypted = excluded.value_encrypted,
+           is_secret = excluded.is_secret,
+           updated_at = excluded.updated_at,
+           updated_by = excluded.updated_by`,
+        scriptName,
+        row.key,
+        row.valueEncrypted,
+        row.isSecret,
+        now,
+        now,
+        actorId,
+      );
+    }
+
+    this.log("worker_script_env_vars_updated", actorId, scriptName, {
+      keys: [...normalized.keys()].sort(),
+    });
+    const envVersion = await this.bumpScriptEnvVersionInKv(scriptName);
+    const vars = await this.listAppEnvVars(scriptName);
+    return { envVersion, vars };
+  }
+
+  async deleteAppEnvVar(
+    scriptName: string,
+    key: string,
+    actorId: string,
+  ): Promise<{ deleted: boolean; envVersion: number; vars: AppEnvVarMetadata[] }> {
+    const trimmedKey = typeof key === "string" ? key.trim() : "";
+    if (!trimmedKey) {
+      throw new Error("Variable name is required");
+    }
+    this.ensureWorkerScriptEnvVarsTable();
+    const existing = this.sql
+      .exec<{ key: string }>(
+        "SELECT key FROM worker_script_env_vars WHERE script_name = ? AND key = ?",
+        scriptName,
+        trimmedKey,
+      )
+      .toArray();
+    if (existing.length === 0) {
+      return {
+        deleted: false,
+        envVersion: 0,
+        vars: await this.listAppEnvVars(scriptName),
+      };
+    }
+
+    this.sql.exec(
+      "DELETE FROM worker_script_env_vars WHERE script_name = ? AND key = ?",
+      scriptName,
+      trimmedKey,
+    );
+    this.log("worker_script_env_var_deleted", actorId, scriptName, {
+      key: trimmedKey,
+    });
+    const envVersion = await this.bumpScriptEnvVersionInKv(scriptName);
+    const vars = await this.listAppEnvVars(scriptName);
+    return { deleted: true, envVersion, vars };
+  }
+
+  /**
+   * Called by chiridion-dispatcher's loadManagedEnvOverlay() to inject
+   * decrypted per-app secrets and env vars into Dynamic Worker isolates and
+   * Durable Object facets on every request without resetting DO storage.
+   */
+  async getAppEnvVarsForDeploy(scriptName: string): Promise<AppEnvVarForDeploy[]> {
+    this.ensureWorkerScriptEnvVarsTable();
+    const rows = this.sql
+      .exec<{ key: string; value_encrypted: string; is_secret: number }>(
+        `SELECT key, value_encrypted, is_secret
+         FROM worker_script_env_vars
+         WHERE script_name = ?
+         ORDER BY key ASC`,
+        scriptName,
+      )
+      .toArray();
+
+    if (rows.length === 0) return [];
+    const secretKey = this.getIntegrationSecretKey();
+    const result: AppEnvVarForDeploy[] = [];
+    for (const row of rows) {
+      const decrypted = await decryptCredentials<{ value?: unknown }>(
+        row.value_encrypted,
+        secretKey,
+      );
+      result.push({
+        key: row.key,
+        value: typeof decrypted.value === "string" ? decrypted.value : "",
+        isSecret: row.is_secret !== 0,
+      });
+    }
+    return result;
   }
 
   // ── Legacy Org Custom Domains ───────────────────────────────────────

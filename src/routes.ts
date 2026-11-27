@@ -241,6 +241,10 @@ export default [
     "api/workspaces/:id/apps/:scriptName/visibility",
     "routes/api/workspaces.$id.apps.$scriptName.visibility.ts",
   ),
+  route(
+    "api/workspaces/:id/apps/:scriptName/env-vars",
+    "routes/api/workspaces.$id.apps.$scriptName.env-vars.ts",
+  ),
 
   // Workspace file upload API route (R2-based, for chat attachments)
   route("api/workspaces/:id/upload", "routes/api/workspaces.$id.upload.ts"),

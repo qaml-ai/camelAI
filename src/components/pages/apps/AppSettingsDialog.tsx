@@ -18,6 +18,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { AlertCircle, ExternalLink, Trash2 } from 'lucide-react';
+import { AppSecretsSection } from './AppSecretsSection';
 import { type AppUrlInput, getPreferredAppUrl } from '@/lib/app-url';
 import { getContrastTextColor } from '@/lib/avatar';
 import { buildSetAppPublicPayload } from '@/lib/app-visibility';
@@ -171,7 +172,7 @@ export function AppSettingsDialog({
   return (
     <>
       <Dialog open={open} onOpenChange={handleDialogOpenChange}>
-        <DialogContent className="sm:max-w-xl">
+        <DialogContent className="sm:max-w-xl max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>App Settings</DialogTitle>
             <DialogDescription>
@@ -255,6 +256,12 @@ export function AppSettingsDialog({
                   </div>
                 </div>
               </div>
+
+              <AppSecretsSection
+                workspaceId={app.workspace_id}
+                scriptName={app.script_name}
+                active={open}
+              />
 
               <div className="space-y-3">
                 <p className="text-sm font-medium text-destructive">Danger Zone</p>

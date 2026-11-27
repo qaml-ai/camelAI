@@ -1484,9 +1484,14 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
         return Response.json({ ok: false, error: 'WORKER_LOGS not configured' }, { status: 500 });
       }
       const logsStub = env.WORKER_LOGS.get(env.WORKER_LOGS.idFromName(script));
+      // Enable on-demand live tailing for 15 minutes whenever ops inspects worker logs.
+      const enableTail = env.APP_KV
+        ? env.APP_KV.put(`logs-tail-enabled:${script}`, '1', { expirationTtl: 900 }).catch(() => {})
+        : Promise.resolve();
       const [logs, stats] = await Promise.all([
         logsStub.getLogs({ limit }),
         logsStub.getStats(),
+        enableTail,
       ]);
       return Response.json({ ok: true, script, stats, logs });
     }

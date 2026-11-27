@@ -37,6 +37,7 @@ export interface DynamicRuntimeExports {
 }
 
 export interface BundleStoreEnv {
+  APP_KV?: KVNamespace;
   R2_BUCKET?: R2Bucket;
   ORG?: DurableObjectNamespace<OrgDO>;
   USER_APP_LOADER?: WorkerLoader;
@@ -54,6 +55,41 @@ const bundleLru = new Map<string, DynamicWorkerBundleRecord>();
 const ENV_CACHE_TTL_MS = 60_000;
 const envVarCache = new Map<string, { expiresAt: number; vars: ManagedAppEnvVar[]; envHash: string }>();
 
+export const DYNAMIC_LOGS_TAIL_KV_PREFIX = 'logs-tail-enabled:';
+const POST_DEPLOY_TAIL_WINDOW_MS = 60 * 60 * 1000;
+const TAIL_ENABLED_CACHE_TTL_MS = 30_000;
+const TAIL_DISABLED_CACHE_TTL_MS = 120_000;
+const tailEnabledCache = new Map<string, { expiresAt: number; enabled: boolean }>();
+
+export async function isDynamicLogsTailEnabled(
+  env: BundleStoreEnv,
+  record: Pick<DynamicWorkerBundleRecord, 'dispatchScriptName' | 'createdAt'>,
+): Promise<boolean> {
+  // Always capture logs during the first 60 minutes after a deploy so active builder
+  // iteration and `get_logs` work out of the box with zero extra KV reads.
+  const createdMs = record.createdAt ? Date.parse(record.createdAt) : NaN;
+  if (Number.isFinite(createdMs) && Date.now() - createdMs < POST_DEPLOY_TAIL_WINDOW_MS) {
+    return true;
+  }
+  if (!env.APP_KV) return false;
+  const now = Date.now();
+  const cached = tailEnabledCache.get(record.dispatchScriptName);
+  if (cached && cached.expiresAt > now) {
+    return cached.enabled;
+  }
+  try {
+    const flag = await env.APP_KV.get(`${DYNAMIC_LOGS_TAIL_KV_PREFIX}${record.dispatchScriptName}`);
+    const enabled = Boolean(flag);
+    tailEnabledCache.set(record.dispatchScriptName, {
+      enabled,
+      expiresAt: now + (enabled ? TAIL_ENABLED_CACHE_TTL_MS : TAIL_DISABLED_CACHE_TTL_MS),
+    });
+    return enabled;
+  } catch {
+    return false;
+  }
+}
+
 function setBundleLru(key: string, record: DynamicWorkerBundleRecord): void {
   if (bundleLru.has(key)) bundleLru.delete(key);
   bundleLru.set(key, record);
@@ -66,6 +102,7 @@ function setBundleLru(key: string, record: DynamicWorkerBundleRecord): void {
 export function clearBundleStoreCachesForTest(): void {
   bundleLru.clear();
   envVarCache.clear();
+  tailEnabledCache.clear();
 }
 
 export async function loadDynamicBundleRecord(
@@ -362,6 +399,7 @@ export interface LoadDynamicWorkerOptions {
   dailyRowsRead?: number;
   dailyRowsWritten?: number;
   preferBroker?: boolean;
+  enableLogsTail?: boolean;
 }
 
 export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStub {
@@ -377,11 +415,12 @@ export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStu
     dailyRowsRead = 0,
     dailyRowsWritten = 0,
     preferBroker = false,
+    enableLogsTail = false,
   } = opts;
 
   const isolateId = supervisorKey
     ? `do:${supervisorKey}:${record.bundleSha}:${envHash}`
-    : `http:${record.dispatchScriptName}:${record.bundleSha}:${envHash}`;
+    : `http:${record.dispatchScriptName}:${record.bundleSha}:${envHash}:${enableLogsTail ? 't1' : 't0'}`;
 
   return loader.get(isolateId, () => {
     const modules: Record<string, WorkerLoaderModule | string> = {
@@ -457,16 +496,17 @@ export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStu
         })
       : undefined;
 
-    const tails = exports.UserLogsTail
-      ? [
-          exports.UserLogsTail({
-            props: {
-              dispatchScriptName: record.dispatchScriptName,
-              orgId: record.orgId,
-            },
-          }),
-        ]
-      : undefined;
+    const tails =
+      enableLogsTail && exports.UserLogsTail
+        ? [
+            exports.UserLogsTail({
+              props: {
+                dispatchScriptName: record.dispatchScriptName,
+                orgId: record.orgId,
+              },
+            }),
+          ]
+        : undefined;
 
     return {
       compatibilityDate: record.compatibilityDate || '2026-07-13',

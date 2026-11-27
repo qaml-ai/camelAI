@@ -3961,9 +3961,13 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     const orgSlug = await this.getOrgSlug();
     const storageKey = orgSlug ? `${scriptName}--${orgSlug}` : scriptName;
     const logsStub = this.env.WORKER_LOGS.get(this.env.WORKER_LOGS.idFromName(storageKey));
+    const enableTail = this.env.APP_KV
+      ? this.env.APP_KV.put(`logs-tail-enabled:${storageKey}`, "1", { expirationTtl: 900 }).catch(() => {})
+      : Promise.resolve();
     const [logs, stats] = await Promise.all([
       logsStub.getLogs({ limit, since }),
       logsStub.getStats(),
+      enableTail,
     ]);
     return {
       success: true,

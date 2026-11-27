@@ -74,20 +74,8 @@ function traceItemToLogEvents(item: TraceItem): LogEvent[] {
     }
   }
 
-  // If no logs or exceptions, create an entry for the request itself
-  if (events.length === 0 && item.event) {
-    const event = item.event as { request?: { url?: string; method?: string } };
-    if (event.request) {
-      events.push({
-        timestamp,
-        level: 'info',
-        message: `${event.request.method ?? 'GET'} ${event.request.url ?? ''}`,
-        exception: null,
-        scriptVersion,
-      });
-    }
-  }
-
+  // Skip empty requests with no console logs and no exceptions to avoid waking WorkerLogsDO
+  // on every clean HTTP request.
   return events;
 }
 
@@ -99,6 +87,9 @@ export default {
     for (const item of events) {
       const scriptName = item.scriptName;
       if (!scriptName) continue;
+      // Never ingest platform main worker traffic into WorkerLogsDO (nothing reads it;
+      // chiridion-app uses native Cloudflare Workers Observability).
+      if (scriptName === 'chiridion-app' || scriptName.startsWith('chiridion-app-')) continue;
 
       const logEvents = traceItemToLogEvents(item);
       if (logEvents.length === 0) continue;

@@ -22,7 +22,6 @@
   // DO -> D1 identity mirror: advances a running backfill job and runs the
   // drift reconciler (workers/main/src/d1-mirror-cron.ts).
   "triggers": { "crons": ["*/5 * * * *"] },
-  "tail_consumers": [{ "service": "chiridion-user-logs-tail-staging" }],
   "rules": [{ "type": "ESModule", "globs": ["**/*.js", "**/*.mjs"] }],
   "routes": [{ "pattern": "staging.camelai.dev", "custom_domain": true }],
   "vpc_services": [],

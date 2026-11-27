@@ -560,9 +560,13 @@ managementRoutes.get(
     const logsStub = c.env.WORKER_LOGS.get(
       c.env.WORKER_LOGS.idFromName(storageKey),
     );
+    const enableTail = c.env.APP_KV
+      ? c.env.APP_KV.put(`logs-tail-enabled:${storageKey}`, "1", { expirationTtl: 900 }).catch(() => {})
+      : Promise.resolve();
     const [logs, stats] = await Promise.all([
       logsStub.getLogs({ limit }),
       logsStub.getStats(),
+      enableTail,
     ]);
     return c.json({ storage_key: storageKey, stats, logs });
   },

@@ -10,6 +10,7 @@ import type { OrgDO } from '../../../main/src/auth';
 import type { DynamicServiceBroker } from '../../../main/src/dynamic-service-broker';
 import type { WorkerAccessInfo } from '../access-control';
 import {
+  isDynamicLogsTailEnabled,
   loadDynamicBundleRecord,
   loadDynamicUserWorker,
   loadManagedEnvOverlay,
@@ -217,12 +218,15 @@ export async function dispatchDynamicWorkerEdge(input: {
     throw new Error(`Worker not found: bundle missing in R2 for ${dispatchScriptName}`);
   }
 
-  const { vars: managedOverlay, envHash } = await loadManagedEnvOverlay(
-    env,
-    record.orgId,
-    record.scriptName,
-    accessInfo.env_version ?? 0,
-  );
+  const [{ vars: managedOverlay, envHash }, enableLogsTail] = await Promise.all([
+    loadManagedEnvOverlay(
+      env,
+      record.orgId,
+      record.scriptName,
+      accessInfo.env_version ?? 0,
+    ),
+    isDynamicLogsTailEnabled(env, record),
+  ]);
 
   const worker = loadDynamicUserWorker({
     loader: env.USER_APP_LOADER,
@@ -232,6 +236,7 @@ export async function dispatchDynamicWorkerEdge(input: {
     envHash,
     quotaTier,
     preferBroker: Boolean(env.MAIN_APP_BROKER),
+    enableLogsTail,
   });
 
   const response = await worker.getEntrypoint().fetch(request);

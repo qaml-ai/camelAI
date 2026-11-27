@@ -21,6 +21,7 @@ import {
 } from '../../../main/src/dynamic-worker-registry';
 import { getWorkerAccessInfo, type WorkerAccessInfo } from '../access-control';
 import {
+  isDynamicLogsTailEnabled,
   loadDynamicBundleRecord,
   loadDynamicUserWorker,
   loadManagedEnvOverlay,
@@ -267,12 +268,15 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       throw new Error('USER_APP_LOADER binding is not configured on dispatcher');
     }
 
-    const { vars: managedOverlay, envHash } = await loadManagedEnvOverlay(
-      this.env,
-      bundle.orgId,
-      bundle.scriptName,
-      accessInfo.env_version ?? 0,
-    );
+    const [{ vars: managedOverlay, envHash }, enableLogsTail] = await Promise.all([
+      loadManagedEnvOverlay(
+        this.env,
+        bundle.orgId,
+        bundle.scriptName,
+        accessInfo.env_version ?? 0,
+      ),
+      isDynamicLogsTailEnabled(this.env, bundle),
+    ]);
 
     const nextFacetBundleKey = `${bundle.bundleSha}:${envHash}:${quotaTier}`;
     if (this.activeFacetBundleKey && this.activeFacetBundleKey !== nextFacetBundleKey) {
@@ -298,6 +302,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       dailyRowsRead: quotaState.rowsRead,
       dailyRowsWritten: quotaState.rowsWritten,
       preferBroker: Boolean(this.env.MAIN_APP_BROKER),
+      enableLogsTail,
     });
 
     return this.ctx.facets.get('main', () => ({

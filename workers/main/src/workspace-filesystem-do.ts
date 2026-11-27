@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { mapWithConcurrency } from "../../../src/lib/map-with-concurrency";
 import { exportCursor, readExportCursor, exportLimit, exportTableExists, pickExport, safeExportKey } from "./org-export.js";
 import { Workspace, type FileInfo } from "@cloudflare/shell";
 import { normalizeGlobalProjectId } from "./project-vm-protocol.js";
@@ -802,66 +803,123 @@ export class WorkspaceFilesystemDO extends DurableObject<WorkspaceFilesystemEnv>
   }
 
   async projectCreateSourceSnapshot(input: { message?: unknown } = {}): Promise<ProjectSourceSnapshot> {
+    const SNAPSHOT_INLINE_CONCURRENCY = 16;
+    const SNAPSHOT_SPILLED_CONCURRENCY = 4;
     const message = typeof input.message === "string" && input.message.trim()
       ? input.message.trim().slice(0, 240)
       : undefined;
     const listing = await this.projectListFiles("/", { recursive: true, includeHidden: true, limit: 50_000 });
     if (!listing.success) throw new Error(listing.error || "Failed to list project files");
 
-    const entries: ProjectSourceSnapshotEntry[] = [];
-    let totalBytes = 0;
+    // Load the latest snapshot's blob keys so unchanged files skip R2 HEAD
+    // roundtrips. Blobs are content-addressed and only deleted when the entire
+    // snapshot index is cleared (projectDeleteSourceSnapshots).
+    const existingIndex = await this.ctx.storage.kv.get<string[]>(PROJECT_SNAPSHOT_INDEX_KEY) ?? [];
+    const latestSnapshot = existingIndex[0]
+      ? await this.ctx.storage.kv.get<ProjectSourceSnapshot>(`${PROJECT_SNAPSHOT_PREFIX}${existingIndex[0]}`)
+      : undefined;
+    const knownBlobKeys = new Set<string>(
+      (latestSnapshot?.entries ?? []).map((entry) => entry.blobKey),
+    );
+
+    // One bulk SQL query for all R2-spilled paths instead of N per-file queries.
+    const spilledByPath = new Map<string, string>();
+    const spilledRows = this.ctx.storage.sql
+      .exec(`SELECT path, r2_key FROM ${WORKSPACE_STORE_TABLE} WHERE storage_backend = 'r2' AND r2_key IS NOT NULL`)
+      .toArray() as Array<{ path?: string; r2_key?: string }>;
+    for (const row of spilledRows) {
+      if (typeof row.path === "string" && typeof row.r2_key === "string" && row.r2_key) {
+        spilledByPath.set(row.path, row.r2_key);
+      }
+    }
+
+    const inlinePaths: string[] = [];
+    const spilledFiles: Array<{ path: string; r2Key: string }> = [];
     for (const entry of listing.files) {
       if (entry.type !== "file") continue;
       const path = normalizeProjectSnapshotPath(entry.absolutePath);
       if (!path || shouldIgnoreProjectSnapshotPath(path)) continue;
+      const spilledKey = spilledByPath.get(`/${path}`);
+      if (spilledKey) {
+        spilledFiles.push({ path, r2Key: spilledKey });
+      } else {
+        inlinePaths.push(path);
+      }
+    }
 
-      // R2-spilled files (including GB-scale adopted ones) must never be
-      // buffered in the isolate: whole-reading them OOM'd the DO on projects
-      // with large adopted files. Hash and copy them by streaming instead.
-      const spilled = this.ctx.storage.sql
-        .exec(
-          `SELECT storage_backend, r2_key FROM ${WORKSPACE_STORE_TABLE} WHERE path = ?`,
-          `/${path}`,
-        )
-        .toArray()[0] as { storage_backend?: string; r2_key?: string } | undefined;
-      if (spilled?.storage_backend === "r2" && spilled.r2_key) {
-        const source = await this.env.R2_BUCKET.get(spilled.r2_key);
-        if (!source) continue;
+    const durableId = this.ctx.id.toString();
+    const ensureBlobPromises = new Map<string, Promise<void>>();
+    const ensureBlobUploaded = (
+      blobKey: string,
+      upload: () => Promise<void>,
+    ): Promise<void> => {
+      if (knownBlobKeys.has(blobKey)) return Promise.resolve();
+      const existing = ensureBlobPromises.get(blobKey);
+      if (existing) return existing;
+      const task = (async () => {
+        const existingBlob = await this.env.R2_BUCKET.head(blobKey);
+        if (!existingBlob) {
+          await upload();
+        }
+        knownBlobKeys.add(blobKey);
+      })();
+      ensureBlobPromises.set(blobKey, task);
+      return task;
+    };
+
+    const inlineEntries = await mapWithConcurrency(
+      inlinePaths,
+      SNAPSHOT_INLINE_CONCURRENCY,
+      async (path): Promise<ProjectSourceSnapshotEntry | null> => {
+        const bytes = await this.projectWorkspace.readFileBytes(`/${path}`);
+        if (!bytes) return null;
+        const sha256 = await sha256Hex(bytes);
+        const blobKey = projectSnapshotBlobKey(durableId, sha256);
+        await ensureBlobUploaded(blobKey, async () => {
+          await this.env.R2_BUCKET.put(blobKey, bytes, {
+            customMetadata: { type: "project-source-snapshot", sha256 },
+          });
+        });
+        return { path, size: bytes.byteLength, sha256, blobKey };
+      },
+    );
+
+    // R2-spilled files (including GB-scale adopted ones) must never be
+    // buffered in the isolate: hash and copy them by streaming at low
+    // concurrency so peak DO memory stays bounded.
+    const spilledEntries = await mapWithConcurrency(
+      spilledFiles,
+      SNAPSHOT_SPILLED_CONCURRENCY,
+      async ({ path, r2Key }): Promise<ProjectSourceSnapshotEntry | null> => {
+        const source = await this.env.R2_BUCKET.get(r2Key);
+        if (!source) return null;
         const size = source.size;
         // workers-runtime global; the ambient Crypto type in this tsconfig
         // predates DigestStream.
         const digestStream = new (crypto as unknown as { DigestStream: new (algorithm: string) => WritableStream & { digest: Promise<ArrayBuffer> } }).DigestStream("SHA-256");
         await source.body.pipeTo(digestStream);
         const sha256 = Array.from(new Uint8Array(await digestStream.digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-        const blobKey = projectSnapshotBlobKey(this.ctx.id.toString(), sha256);
-        const existingBlob = await this.env.R2_BUCKET.head(blobKey);
-        if (!existingBlob) {
-          const copySource = await this.env.R2_BUCKET.get(spilled.r2_key);
-          if (!copySource) continue;
+        const blobKey = projectSnapshotBlobKey(durableId, sha256);
+        await ensureBlobUploaded(blobKey, async () => {
+          const copySource = await this.env.R2_BUCKET.get(r2Key);
+          if (!copySource) return;
           const fixed = new FixedLengthStream(size);
           const pump = copySource.body.pipeTo(fixed.writable);
           await this.env.R2_BUCKET.put(blobKey, fixed.readable, {
             customMetadata: { type: "project-source-snapshot", sha256 },
           });
           await pump;
-        }
-        entries.push({ path, size, sha256, blobKey });
-        totalBytes += size;
-        continue;
-      }
-
-      const bytes = await this.projectWorkspace.readFileBytes(`/${path}`);
-      if (!bytes) continue;
-      const sha256 = await sha256Hex(bytes);
-      const blobKey = projectSnapshotBlobKey(this.ctx.id.toString(), sha256);
-      const existingBlob = await this.env.R2_BUCKET.head(blobKey);
-      if (!existingBlob) {
-        await this.env.R2_BUCKET.put(blobKey, bytes, {
-          customMetadata: { type: "project-source-snapshot", sha256 },
         });
-      }
-      entries.push({ path, size: bytes.byteLength, sha256, blobKey });
-      totalBytes += bytes.byteLength;
+        return { path, size, sha256, blobKey };
+      },
+    );
+
+    const entries: ProjectSourceSnapshotEntry[] = [];
+    let totalBytes = 0;
+    for (const entry of [...inlineEntries, ...spilledEntries]) {
+      if (!entry) continue;
+      entries.push(entry);
+      totalBytes += entry.size;
     }
     entries.sort((a, b) => a.path.localeCompare(b.path));
     const digestInput = JSON.stringify(entries.map((entry) => [entry.path, entry.size, entry.sha256]));

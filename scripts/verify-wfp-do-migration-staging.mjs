@@ -299,7 +299,6 @@ async function run() {
     }
 
     // 6. Flip to Dynamic Workers on a fresh verification key (or wait for KV)
-    const cutoverScript = `${SCRIPT_NAME}-dyn`;
     const cutoverKey = `script:${DISPATCH_NAME}`;
     await kvPut(
       cutoverKey,

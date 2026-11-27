@@ -242,25 +242,6 @@ export async function deployWorkerModulesDirect(
     `Skipped static asset ${JSON.stringify(asset.path)} (${formatMiB(asset.size)} MiB, ${asset.size} bytes): ` +
     `Cloudflare Workers allows at most 25 MiB per asset. The deployed app will return 404 for this file.`
   );
-  const prepareAssetsStartedAt = Date.now();
-  // Reject known-oversized files before read() transfers their base64 payload
-  // over sandbox RPC, where the transport otherwise fails opaquely.
-  const preparedAssets = await fingerprintDirectAssets(deployableAssets);
-  const prepareAssetsMs = Date.now() - prepareAssetsStartedAt;
-  const timings: DirectDispatchDeployTimings = {
-    totalMs: 0,
-    prepareAssetsMs,
-    nativeAssetsMs: 0,
-    storeAssetsMs: 0,
-    migrationsMs: 0,
-    artifactCacheMs: 0,
-    cloudflareUploadMs: 0,
-    publishAssetsRecordMs: 0,
-    moduleCount: request.modules.length,
-    assetCount: preparedAssets.length,
-    moduleBytes: request.modules.reduce((sum, module) => sum + contentBytes(module.content).byteLength, 0),
-    assetBytes: preparedAssets.reduce((sum, asset) => sum + asset.size, 0),
-  };
   const cfApiToken = env.CF_API_TOKEN?.trim();
   const accountId = env.CF_ACCOUNT_ID?.trim();
   const dispatchNamespace = env.CF_DISPATCH_NAMESPACE?.trim();
@@ -277,14 +258,28 @@ export async function deployWorkerModulesDirect(
   }
 
   const dispatchScriptName = `${request.scriptName}--${request.identity.orgSlug}`;
+  const baseTimings: DirectDispatchDeployTimings = {
+    totalMs: 0,
+    prepareAssetsMs: 0,
+    nativeAssetsMs: 0,
+    storeAssetsMs: 0,
+    migrationsMs: 0,
+    artifactCacheMs: 0,
+    cloudflareUploadMs: 0,
+    publishAssetsRecordMs: 0,
+    moduleCount: request.modules.length,
+    assetCount: deployableAssets.length,
+    moduleBytes: request.modules.reduce((sum, module) => sum + contentBytes(module.content).byteLength, 0),
+    assetBytes: deployableAssets.reduce((sum, asset) => sum + asset.size, 0),
+  };
   if (selfhostPublishingMode) {
     return deploySelfhostWorkerModulesDirect(
       env,
       request,
       dispatchScriptName,
-      preparedAssets,
+      deployableAssets,
       warnings,
-      timings,
+      baseTimings,
       startedAt,
       options,
     );
@@ -299,14 +294,25 @@ export async function deployWorkerModulesDirect(
       env,
       request,
       dispatchScriptName,
-      preparedAssets,
+      deployableAssets,
       warnings,
-      timings,
+      baseTimings,
       startedAt,
       existingRuntime.dynamicMode ?? "dynamic",
       options,
     );
   }
+  const prepareAssetsStartedAt = Date.now();
+  // Reject known-oversized files before read() transfers their base64 payload
+  // over sandbox RPC, where the transport otherwise fails opaquely.
+  const preparedAssets = await fingerprintDirectAssets(deployableAssets);
+  const prepareAssetsMs = Date.now() - prepareAssetsStartedAt;
+  const timings: DirectDispatchDeployTimings = {
+    ...baseTimings,
+    prepareAssetsMs,
+    assetCount: preparedAssets.length,
+    assetBytes: preparedAssets.reduce((sum, asset) => sum + asset.size, 0),
+  };
   if (!cfApiToken) throw new Error("CF_API_TOKEN is required for direct deploy");
   if (!accountId) throw new Error("CF_ACCOUNT_ID is required for direct deploy");
   if (!dispatchNamespace) throw new Error("CF_DISPATCH_NAMESPACE is required for direct deploy");
@@ -549,7 +555,7 @@ async function deploySelfhostWorkerModulesDirect(
   env: DirectDispatchDeployEnv,
   request: DirectDispatchDeployRequest,
   dispatchScriptName: string,
-  preparedAssets: PreparedDirectAsset[],
+  deployableAssets: DirectDeployAsset[],
   warnings: string[],
   timings: DirectDispatchDeployTimings,
   startedAt: number,
@@ -593,15 +599,16 @@ async function deploySelfhostWorkerModulesDirect(
   };
 
   const storeAssetsStartedAt = Date.now();
-  const preparedStore = prepareDirectAssetsRecord(
+  const storedAssets = await fingerprintAndStoreSelfhostAssets(
     env,
     dispatchScriptName,
     request,
-    preparedAssets,
+    deployableAssets,
   );
-  await preparedStore.store;
-  if (preparedStore.record) {
-    await publishDirectAssetsRecord(env, dispatchScriptName, preparedStore.record);
+  timings.assetCount = storedAssets.assetCount;
+  timings.assetBytes = storedAssets.assetBytes;
+  if (storedAssets.record) {
+    await publishDirectAssetsRecord(env, dispatchScriptName, storedAssets.record);
   }
   timings.storeAssetsMs = Date.now() - storeAssetsStartedAt;
 
@@ -616,7 +623,7 @@ async function deploySelfhostWorkerModulesDirect(
       identity: request.identity,
       metadata: request.metadata,
       modules: request.modules,
-      assetsRecord: preparedStore.record,
+      assetsRecord: storedAssets.record,
     });
     if (preparedArtifactCache) {
       await storePreparedDeployArtifactCache(
@@ -689,7 +696,7 @@ async function deployDynamicWorkerModulesDirect(
   env: DirectDispatchDeployEnv,
   request: DirectDispatchDeployRequest,
   dispatchScriptName: string,
-  preparedAssets: PreparedDirectAsset[],
+  deployableAssets: DirectDeployAsset[],
   warnings: string[],
   timings: DirectDispatchDeployTimings,
   startedAt: number,
@@ -720,7 +727,7 @@ async function deployDynamicWorkerModulesDirect(
   const modules = selfhostWorkerModules(request.modules, request.metadata);
   const doBindings = extractLocalDoBindings(virtualizedBindings);
   const doClasses = [...new Set(Object.values(doBindings))];
-  const hasAssets = extractHasAssetsBinding(virtualizedBindings) || preparedAssets.length > 0;
+  const hasAssets = extractHasAssetsBinding(virtualizedBindings) || deployableAssets.length > 0;
   const hasCodemodeLoader = extractHasCodemodeLoaderBinding(virtualizedBindings);
   const costControls = userAppCostControlsForScript(
     userAppCostControlsConfig(env),
@@ -771,17 +778,16 @@ async function deployDynamicWorkerModulesDirect(
   };
 
   const storeAssetsStartedAt = Date.now();
-  const preparedStore = prepareDirectAssetsRecord(
+  const storedAssets = await fingerprintAndStoreSelfhostAssets(
     env,
     dispatchScriptName,
     request,
-    preparedAssets,
+    deployableAssets,
   );
-  if (preparedStore.store) {
-    await preparedStore.store;
-  }
-  if (preparedStore.record) {
-    await publishDirectAssetsRecord(env, dispatchScriptName, preparedStore.record);
+  timings.assetCount = storedAssets.assetCount;
+  timings.assetBytes = storedAssets.assetBytes;
+  if (storedAssets.record) {
+    await publishDirectAssetsRecord(env, dispatchScriptName, storedAssets.record);
   }
   timings.storeAssetsMs = Date.now() - storeAssetsStartedAt;
 
@@ -808,7 +814,7 @@ async function deployDynamicWorkerModulesDirect(
       identity: request.identity,
       metadata: request.metadata,
       modules: request.modules,
-      assetsRecord: preparedStore.record,
+      assetsRecord: storedAssets.record,
     });
     if (preparedArtifactCache) {
       await storePreparedDeployArtifactCache(env, preparedArtifactCache);
@@ -1401,6 +1407,100 @@ async function fingerprintDirectAssets(assets: DirectDeployAsset[]): Promise<Pre
       read: asset.read,
     };
   });
+}
+
+// Single-pass bounded streaming for Dynamic Workers and self-host deploys:
+// reads each asset from the build sandbox ONCE (instead of once for
+// fingerprinting and again for R2 upload), skips unused Cloudflare base64/cfHash
+// work, and skips R2 PUTs for content-addressed hashes already referenced by
+// the app's currently active self-host assets manifest.
+async function fingerprintAndStoreSelfhostAssets(
+  env: DirectDispatchDeployEnv,
+  appId: string,
+  request: DirectDispatchDeployRequest,
+  assets: DirectDeployAsset[],
+): Promise<{ record: SelfhostAssetsRecord | null; assetCount: number; assetBytes: number }> {
+  if (assets.length === 0) return { record: null, assetCount: 0, assetBytes: 0 };
+  const hasAssetsBinding =
+    request.metadata.bindings?.some((binding) => binding.type === "assets") ||
+    Boolean(request.metadata.assets);
+  if (!hasAssetsBinding) {
+    return {
+      record: null,
+      assetCount: assets.length,
+      assetBytes: assets.reduce((sum, asset) => sum + asset.size, 0),
+    };
+  }
+  if (!env.APP_KV) throw new Error("APP_KV is required for direct deploy assets");
+  if (!env.R2_BUCKET) throw new Error("R2_BUCKET is required for direct deploy assets");
+
+  const existingHashes = new Set<string>();
+  if (typeof env.APP_KV.get === "function") {
+    try {
+      const existingRaw = await env.APP_KV.get(selfhostAssetsKey(appId));
+      if (existingRaw) {
+        const parsed = JSON.parse(existingRaw) as Partial<SelfhostAssetsRecord>;
+        if (parsed?.manifest && typeof parsed.manifest === "object") {
+          for (const entry of Object.values(parsed.manifest)) {
+            if (entry && typeof entry.hash === "string" && entry.hash) {
+              existingHashes.add(entry.hash);
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore malformed/unavailable prior manifest and upload all assets safely.
+    }
+  }
+
+  const uploadedHashes = new Map<string, Promise<void>>();
+  const entries = await mapWithConcurrency(assets, DIRECT_DEPLOY_ASSET_BATCH_SIZE, async (asset) => {
+    const bytes = await asset.read();
+    const normalizedPath = normalizeSelfhostAssetPath(asset.path);
+    const r2Hash = await sha256Hex(bytes);
+    if (!existingHashes.has(r2Hash)) {
+      let upload = uploadedHashes.get(r2Hash);
+      if (!upload) {
+        upload = env.R2_BUCKET!.put(
+          selfhostAssetObjectKey(appId, r2Hash),
+          bytes,
+          asset.contentType ? { httpMetadata: { contentType: asset.contentType } } : undefined,
+        ).then(() => {
+          existingHashes.add(r2Hash);
+        });
+        uploadedHashes.set(r2Hash, upload);
+      }
+      await upload;
+    }
+    return {
+      normalizedPath,
+      hash: r2Hash,
+      size: bytes.byteLength,
+      ...(asset.contentType ? { contentType: asset.contentType } : {}),
+    };
+  });
+
+  const manifest: SelfhostAssetsRecord["manifest"] = {};
+  let assetBytes = 0;
+  for (const entry of entries) {
+    manifest[entry.normalizedPath] = {
+      hash: entry.hash,
+      size: entry.size,
+      ...(entry.contentType ? { contentType: entry.contentType } : {}),
+    };
+    assetBytes += entry.size;
+  }
+
+  return {
+    record: {
+      schemaVersion: 1 as const,
+      appId,
+      createdAt: new Date().toISOString(),
+      manifest,
+    },
+    assetCount: entries.length,
+    assetBytes,
+  };
 }
 
 function prepareDirectAssetsRecord(

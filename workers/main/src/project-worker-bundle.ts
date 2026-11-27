@@ -3,7 +3,7 @@ import type { WorkerBinding } from "./cf-api-proxy.js";
 import { mapWithConcurrency } from "../../../src/lib/map-with-concurrency";
 import type { ProjectBuildContainer } from "./project-build-container.js";
 
-const BUNDLE_READ_CONCURRENCY = 4;
+const BUNDLE_READ_CONCURRENCY = 8;
 
 /**
  * What build code calls on the org's build container (ProjectBuildContainer,

@@ -4939,8 +4939,10 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
         };
       }
       const projectFiles = new ProjectFilesystemClient(this.env, project.id);
-      const snapshot = await projectFiles.createSourceSnapshot({ message: `Deploy ${project.name}` });
-      const bundle = await collectWorkerBundleFromSandbox(sandbox, build.workdir);
+      const [snapshot, bundle] = await Promise.all([
+        projectFiles.createSourceSnapshot({ message: `Deploy ${project.name}` }),
+        collectWorkerBundleFromSandbox(sandbox, build.workdir),
+      ]);
       // Catch a Durable Object binding whose class the entry module doesn't
       // export before the upload, where CF would reject it with an opaque
       // migration error, and name the class so the agent can fix it directly.

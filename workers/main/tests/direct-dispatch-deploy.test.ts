@@ -1048,4 +1048,73 @@ describe("deployWorkerModulesDirect", () => {
     await deploy("demo-app--acme=0");
     expect(await uploadedMetadata()).not.toHaveProperty("limits");
   });
+
+  it("streams Dynamic Worker assets in a single read pass and skips unchanged R2 uploads on redeploy", async () => {
+    const kv = new Map<string, string>();
+    const r2Puts: string[] = [];
+    const r2 = new Map<string, { body: string | Uint8Array; options?: unknown }>();
+    const dynamicEnv = {
+      ...env,
+      DYNAMIC_WORKERS_NEW_APPS_ENABLED: "true",
+      APP_KV: {
+        get: vi.fn(async (key: string) => kv.get(key) ?? null),
+        put: vi.fn(async (key: string, value: string) => {
+          kv.set(key, value);
+        }),
+      },
+      R2_BUCKET: {
+        put: vi.fn(async (key: string, body: string | Uint8Array, options?: unknown) => {
+          r2Puts.push(key);
+          r2.set(key, { body, options });
+        }),
+      },
+    };
+
+    const firstTracker = assetTracker();
+    const firstAssets = Array.from({ length: 12 }, (_, index) =>
+      firstTracker.asset(`assets/file-${index}.txt`, `payload-${index}`, "text/plain"),
+    );
+
+    const firstResult = await deployWorkerModulesDirect(dynamicEnv as never, {
+      scriptName: "fast-app",
+      hostname: "camelai.dev",
+      identity,
+      metadata: { main_module: "index.js", assets: { directory: "../client", binding: "ASSETS" } },
+      modules: [{ name: "index.js", contentType: "application/javascript+module", content: "export default {};" }],
+      assets: firstAssets,
+    });
+
+    expect(firstResult.success).toBe(true);
+    // Single streaming pass: each asset read once (not twice), bounded concurrency.
+    expect(firstTracker.totalReads).toBe(12);
+    expect(firstTracker.maxInFlight).toBeLessThanOrEqual(8);
+    const firstAssetPuts = r2Puts.filter((key) => key.startsWith("selfhost-assets/"));
+    expect(firstAssetPuts).toHaveLength(12);
+
+    // Redeploy with 11 unchanged assets and 1 changed asset: only 1 asset R2 put!
+    r2Puts.length = 0;
+    const secondTracker = assetTracker();
+    const secondAssets = Array.from({ length: 12 }, (_, index) =>
+      secondTracker.asset(
+        `assets/file-${index}.txt`,
+        index === 0 ? "payload-0-updated" : `payload-${index}`,
+        "text/plain",
+      ),
+    );
+    const secondResult = await deployWorkerModulesDirect(dynamicEnv as never, {
+      scriptName: "fast-app",
+      hostname: "camelai.dev",
+      identity,
+      metadata: { main_module: "index.js", assets: { directory: "../client", binding: "ASSETS" } },
+      modules: [{ name: "index.js", contentType: "application/javascript+module", content: "export default {};" }],
+      assets: secondAssets,
+    });
+
+    expect(secondResult.success).toBe(true);
+    expect(secondTracker.totalReads).toBe(12);
+    const secondAssetPuts = r2Puts.filter((key) => key.startsWith("selfhost-assets/"));
+    expect(secondAssetPuts).toHaveLength(1);
+    const manifest = JSON.parse(kv.get(selfhostAssetsKey("fast-app--acme"))!).manifest;
+    expect(Object.keys(manifest)).toHaveLength(12);
+  });
 });

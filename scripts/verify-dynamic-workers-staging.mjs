@@ -17,12 +17,10 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { execFileSync } from 'node:child_process';
 
 const ACCOUNT_ID = '85bbd288051330fb51ee1c86031a299b';
 const STAGING_KV_ID = 'e894eb2caf1641ad8870da994b992fce';
 const R2_BUCKET = 'chiridion-sandbox';
-const STAGING_NAMESPACE = 'chiridion-platform-staging';
 
 const RUN_ID = crypto.randomBytes(3).toString('hex');
 const SCRIPT_NAME = `dw-e2e-${RUN_ID}`;

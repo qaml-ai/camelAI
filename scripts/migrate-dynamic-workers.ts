@@ -395,7 +395,9 @@ async function restoreWfpScriptFromBundle(input: {
     main_module: input.bundle.mainModule,
     compatibility_date: input.bundle.compatibilityDate || '2026-07-13',
     compatibility_flags: input.bundle.compatibilityFlags || ['nodejs_compat'],
-    bindings: input.bundle.bindings,
+    bindings: input.bundle.bindings.filter(
+      (b) => b.type !== 'secret_text' && b.type !== 'secret_key',
+    ),
     keep_bindings: ['secret_text', 'secret_key'],
     keep_assets: true,
   };

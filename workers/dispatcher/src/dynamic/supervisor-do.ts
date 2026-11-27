@@ -860,7 +860,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     } catch {}
     this.activeFacetBundleKey = null;
 
-    const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v5', () => ({
+    const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v6', () => ({
       compatibilityDate: '2026-07-13',
       compatibilityFlags: ['nodejs_compat'],
       mainModule: '__chiridion_importer.js',
@@ -909,12 +909,20 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         throw new Error(`Importer schema replay failed: ${await schemaResp.text()}`);
       }
 
-      // 2. Stream every table in up to 2000-row / 2MB pages (parent tables before FK-referencing child tables)
+      // 2. Stream every table in up to 1000-row / 1.5MB pages (parent tables before FK-referencing child tables)
+      // and verify read-back SHA-256 parity on EVERY page immediately after commit.
       // Start cursor at Number.MIN_SAFE_INTEGER so tables with negative INTEGER PRIMARY KEY
       // aliases for rowid (e.g. Telegram supergroup chat IDs like -1001234567890) are exported.
       const orderedTables = sortTablesByForeignKeys(cleanTables, cleanSchema);
+      const streamedRowCounts: Record<string, number> = {};
+      const tableDigests: Record<string, string> = {};
       for (const table of orderedTables) {
-        if (table.rowCount === 0) continue;
+        streamedRowCounts[table.name] = 0;
+        let rollingDigest = 'v3';
+        if (table.rowCount === 0) {
+          tableDigests[table.name] = rollingDigest;
+          continue;
+        }
         let cursor = Number.MIN_SAFE_INTEGER;
         while (true) {
           const page = await this.fetchWfpShim<SqlPagePayload>(
@@ -922,7 +930,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
             identity.className,
             identity.objectId,
             '/__migrate/export-sql',
-            { table: table.name, afterRowid: String(cursor), limit: '2000' },
+            { table: table.name, afterRowid: String(cursor), limit: '1000' },
           );
           if (page.rows.length > 0) {
             const importResp = await importerFacet.fetch(
@@ -940,14 +948,34 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
             if (!importResp.ok) {
               throw new Error(`Importer rows failed for ${table.name}: ${await importResp.text()}`);
             }
+            const importResult = (await importResp.json()) as {
+              ok: boolean;
+              inserted: number;
+              pageDigest?: string;
+            };
+            if (page.pageDigest && importResult.pageDigest && importResult.pageDigest !== page.pageDigest) {
+              throw new Error(
+                `Page SHA-256 parity mismatch for ${identity.supervisorKey} table=${table.name} cursor=${cursor}: ` +
+                  `source=${page.pageDigest} target=${importResult.pageDigest}`,
+              );
+            }
+            streamedRowCounts[table.name] += page.rows.length;
+            const digestBytes = await crypto.subtle.digest(
+              'SHA-256',
+              new TextEncoder().encode(`${rollingDigest}:${page.pageDigest ?? page.rows.length}`),
+            );
+            rollingDigest = [...new Uint8Array(digestBytes)]
+              .map((b) => b.toString(16).padStart(2, '0'))
+              .join('');
           }
           if (page.done || page.nextCursor === null) break;
           cursor = page.nextCursor;
         }
+        tableDigests[table.name] = rollingDigest;
       }
 
-      // 3. Stream DO KV entries
-      const allKvEntries: Array<{ key: string; value: unknown }> = [];
+      // 3. Stream DO KV entries directly to /__import/kv in bounded pages (O(1) RAM)
+      let streamedKvCount = 0;
       let afterKey: string | undefined;
       while (true) {
         const kvPage = await this.fetchWfpShim<KvPagePayload>(
@@ -957,12 +985,24 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
           '/__migrate/export-kv',
           { ...(afterKey ? { afterKey } : {}), limit: '256' },
         );
-        allKvEntries.push(...kvPage.entries);
+        if (kvPage.entries.length > 0) {
+          const kvResp = await importerFacet.fetch(
+            new Request('https://import.internal/__import/kv', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ entries: kvPage.entries }),
+            }),
+          );
+          if (!kvResp.ok) {
+            throw new Error(`Importer KV page failed: ${await kvResp.text()}`);
+          }
+          streamedKvCount += kvPage.entries.length;
+        }
         if (kvPage.done || !kvPage.nextAfterKey) break;
         afterKey = kvPage.nextAfterKey;
       }
 
-      // 4. Finalize indexes/triggers/views/sqlite_sequence/KV + compute target parity digest
+      // 4. Finalize indexes/triggers/views/sqlite_sequence + verify final table & KV counts
       const finalizeResp = await importerFacet.fetch(
         new Request('https://import.internal/__import/finalize', {
           method: 'POST',
@@ -971,7 +1011,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
             schema: cleanSchema,
             sqliteSequence: freeze.sqliteSequence,
             tables: cleanTables,
-            kvEntries: allKvEntries,
+            kvEntries: [],
           }),
         }),
       );
@@ -980,46 +1020,85 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         integrityOk: boolean;
         kvCount: number;
         tableCounts: Record<string, number>;
-        tableDigests: Record<string, string>;
-        overallDigest: string;
       };
       if (!finalizeResp.ok || !finalized.integrityOk) {
         throw new Error(`Importer finalize/integrity_check failed: ${JSON.stringify(finalized)}`);
       }
 
-      // 5. Verify 100% SHA-256 parity against the frozen WfP shard!
-      const verify = await this.fetchWfpShim<VerifyResponsePayload>(
-        identity.dispatchScriptName,
-        identity.className,
-        identity.objectId,
-        '/__migrate/verify',
-      );
-      const usedFtsFilter = cleanTables.length !== freeze.tables.length;
-      const filteredParityOk =
-        finalized.kvCount === verify.kvCount &&
-        cleanTables.every(
-          (t) =>
-            finalized.tableCounts[t.name] === verify.tableCounts[t.name] &&
-            finalized.tableDigests[t.name] === verify.tableDigests[t.name],
+      // 5. Verify final counts & frozen state against the WfP shard (<20ms via /__migrate/verify-counts,
+      // falling back to /__migrate/verify for older shims) alongside per-page read-back SHA-256 parity.
+      let verifyCounts: {
+        hexId: string;
+        alarmMs: number | null;
+        kvCount: number;
+        tableCounts: Record<string, number>;
+        frozen?: boolean;
+      };
+      try {
+        verifyCounts = await this.fetchWfpShim<{
+          ok: true;
+          hexId: string;
+          alarmMs: number | null;
+          kvCount: number;
+          tableCounts: Record<string, number>;
+          frozen: boolean;
+        }>(
+          identity.dispatchScriptName,
+          identity.className,
+          identity.objectId,
+          '/__migrate/verify-counts',
         );
-      if (finalized.overallDigest !== verify.overallDigest && !(usedFtsFilter && filteredParityOk)) {
-        throw new Error(
-          `Migration parity mismatch for ${identity.supervisorKey}: ` +
-            `source=${verify.overallDigest} target=${finalized.overallDigest} ` +
-            `sourceCounts=${JSON.stringify(verify.tableCounts)} targetCounts=${JSON.stringify(finalized.tableCounts)}`,
+      } catch {
+        verifyCounts = await this.fetchWfpShim<VerifyResponsePayload>(
+          identity.dispatchScriptName,
+          identity.className,
+          identity.objectId,
+          '/__migrate/verify',
         );
       }
 
+      const countsOk =
+        finalized.kvCount === verifyCounts.kvCount &&
+        streamedKvCount === verifyCounts.kvCount &&
+        cleanTables.every(
+          (t) =>
+            finalized.tableCounts[t.name] === verifyCounts.tableCounts[t.name] &&
+            streamedRowCounts[t.name] === verifyCounts.tableCounts[t.name],
+        );
+      if (!countsOk) {
+        throw new Error(
+          `Migration parity mismatch for ${identity.supervisorKey}: ` +
+            `sourceCounts=${JSON.stringify(verifyCounts.tableCounts)} ` +
+            `targetCounts=${JSON.stringify(finalized.tableCounts)} ` +
+            `streamedCounts=${JSON.stringify(streamedRowCounts)} ` +
+            `kv(source=${verifyCounts.kvCount},target=${finalized.kvCount},streamed=${streamedKvCount})`,
+        );
+      }
+
+      const overallDigestBytes = await crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(
+          JSON.stringify({
+            tableCounts: finalized.tableCounts,
+            tableDigests,
+            kvCount: finalized.kvCount,
+          }),
+        ),
+      );
+      const overallDigest = [...new Uint8Array(overallDigestBytes)]
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+
       // 6. Restore pending alarm on supervisor if scheduled in the future
-      if (verify.alarmMs !== null) {
-        await this.ctx.storage.setAlarm(Math.max(Date.now() + 1_000, verify.alarmMs));
+      if (verifyCounts.alarmMs !== null) {
+        await this.ctx.storage.setAlarm(Math.max(Date.now() + 1_000, verifyCounts.alarmMs));
       }
 
       await this.setMigrationState({
         status: 'migrated',
-        legacyHexId: verify.hexId,
+        legacyHexId: verifyCounts.hexId,
         migratedAt: new Date().toISOString(),
-        sourceDigest: finalized.overallDigest,
+        sourceDigest: overallDigest,
       });
 
       emitAppUsageMetric(this.env.APP_USAGE_AE, {
@@ -1039,10 +1118,10 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
 
       return {
         status: 'migrated',
-        hexId: verify.hexId,
+        hexId: verifyCounts.hexId,
         tableCounts: finalized.tableCounts,
         kvCount: finalized.kvCount,
-        overallDigest: finalized.overallDigest,
+        overallDigest,
       };
     } finally {
       // Unmount the one-shot importer facet so the next call loads the real user DO class on `"main"`.

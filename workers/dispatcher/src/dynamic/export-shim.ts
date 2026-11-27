@@ -216,6 +216,26 @@ function inspectSingleTable(sql, table) {
   return { name: table, columns, hasRowid };
 }
 
+async function countKvEntries(storage) {
+  let kvCount = 0;
+  let startAfter = undefined;
+  while (true) {
+    const page = await storage.list({
+      ...(startAfter ? { startAfter } : {}),
+      limit: 1000,
+    });
+    if (page.size === 0) break;
+    let lastKey = null;
+    for (const key of page.keys()) {
+      lastKey = key;
+      if (key !== FROZEN_KEY) kvCount += 1;
+    }
+    if (page.size < 1000 || lastKey === null) break;
+    startAfter = lastKey;
+  }
+  return kvCount;
+}
+
 class ChiridionExportShimDO extends DurableObject {
   async alarm() {
     if (!DISCOVERY_WEBHOOK_URL) return;
@@ -252,11 +272,7 @@ class ChiridionExportShimDO extends DurableObject {
       await this.ctx.storage.put(FROZEN_KEY, true);
       const { schema, tables, sqliteSequence } = inspectTables(sql);
       const alarmMs = await this.ctx.storage.getAlarm();
-      const kvAll = await this.ctx.storage.list();
-      let kvCount = 0;
-      for (const key of kvAll.keys()) {
-        if (key !== FROZEN_KEY) kvCount += 1;
-      }
+      const kvCount = await countKvEntries(this.ctx.storage);
       return Response.json({
         ok: true,
         hexId: this.ctx.id.toString(),
@@ -273,7 +289,7 @@ class ChiridionExportShimDO extends DurableObject {
       if (!sql) return Response.json({ ok: false, error: "No SQLite storage" }, { status: 400 });
       const table = url.searchParams.get("table") || "";
       const afterRowid = Number(url.searchParams.get("afterRowid") ?? String(Number.MIN_SAFE_INTEGER));
-      const limit = Math.max(1, Math.min(2000, Number(url.searchParams.get("limit") ?? "2000")));
+      const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get("limit") ?? "1000")));
       const meta = inspectSingleTable(sql, table);
       if (!meta) return Response.json({ ok: false, error: "Table not found: " + table }, { status: 404 });
 
@@ -282,7 +298,7 @@ class ChiridionExportShimDO extends DurableObject {
       let nextCursor = null;
       let done = true;
 
-      const maxBytes = 2 * 1024 * 1024;
+      const maxBytes = 1536 * 1024;
       let approxBytes = 0;
 
       if (meta.hasRowid) {
@@ -374,6 +390,25 @@ class ChiridionExportShimDO extends DurableObject {
         .filter(([k]) => k !== FROZEN_KEY)
         .map(([key, value]) => ({ key, value: encodeTyped(value) }));
       return Response.json({ ok: true, entries, nextAfterKey, done });
+    }
+
+    if (path === "/__migrate/verify-counts") {
+      const { tables } = inspectTables(sql);
+      const tableCounts = {};
+      for (const meta of tables) {
+        tableCounts[meta.name] = meta.rowCount;
+      }
+      const alarmMs = await this.ctx.storage.getAlarm();
+      const kvCount = await countKvEntries(this.ctx.storage);
+      const frozen = Boolean(await this.ctx.storage.get(FROZEN_KEY));
+      return Response.json({
+        ok: true,
+        hexId: this.ctx.id.toString(),
+        alarmMs: alarmMs ?? null,
+        kvCount,
+        tableCounts,
+        frozen,
+      });
     }
 
     if (path === "/__migrate/verify") {

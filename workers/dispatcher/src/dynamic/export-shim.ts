@@ -298,7 +298,7 @@ class ChiridionExportShimDO extends DurableObject {
       let nextCursor = null;
       let done = true;
 
-      const maxBytes = 1536 * 1024;
+      const maxBytes = 768 * 1024;
       let approxBytes = 0;
 
       if (meta.hasRowid) {

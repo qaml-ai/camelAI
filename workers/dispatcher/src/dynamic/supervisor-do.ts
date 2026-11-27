@@ -907,7 +907,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       } catch {}
       this.activeFacetBundleKey = null;
 
-      const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v6', () => ({
+      const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v7', () => ({
         compatibilityDate: '2026-07-13',
         compatibilityFlags: ['nodejs_compat'],
         mainModule: '__chiridion_importer.js',
@@ -962,7 +962,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       await this.ctx.storage.put(MIGRATION_CHECKPOINT_KEY, checkpoint);
     }
 
-    const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v6', () => ({
+    const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v7', () => ({
       compatibilityDate: '2026-07-13',
       compatibilityFlags: ['nodejs_compat'],
       mainModule: '__chiridion_importer.js',
@@ -976,11 +976,11 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       class: importerWorker.getDurableObjectClass('ChiridionMigrationImporterDO'),
     })) as unknown as { fetch(req: Request): Promise<Response> };
 
-    let keepFacetMounted = false;
     try {
       const { freeze, cleanSchema, cleanTables, orderedTables } = checkpoint;
+      let pagesSinceCheckpoint = 0;
 
-      // 2. Stream every table in up to 1000-row / 1.5MB pages and verify read-back SHA-256 parity
+      // 2. Stream every table in up to 1000-row / 768KB pages and verify read-back SHA-256 parity
       // on EVERY page immediately after commit. Supports resumable chunking when budgetMs is set.
       while (checkpoint.tableIndex < orderedTables.length) {
         const table = orderedTables[checkpoint.tableIndex]!;
@@ -1038,13 +1038,19 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
           if (page.done || page.nextCursor === null) {
             checkpoint.tableIndex += 1;
             checkpoint.cursor = Number.MIN_SAFE_INTEGER;
+            await this.ctx.storage.put(MIGRATION_CHECKPOINT_KEY, checkpoint);
+            pagesSinceCheckpoint = 0;
             break;
           }
           checkpoint.cursor = page.nextCursor;
+          pagesSinceCheckpoint += 1;
+          if (pagesSinceCheckpoint >= 10) {
+            await this.ctx.storage.put(MIGRATION_CHECKPOINT_KEY, checkpoint);
+            pagesSinceCheckpoint = 0;
+          }
 
           if (budgetMs > 0 && Date.now() - callStartedAt >= budgetMs) {
             await this.ctx.storage.put(MIGRATION_CHECKPOINT_KEY, checkpoint);
-            keepFacetMounted = true;
             return {
               status: 'in_progress',
               hexId: freeze.hexId,
@@ -1215,13 +1221,12 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         overallDigest,
       };
     } finally {
-      if (!keepFacetMounted) {
-        // Unmount the one-shot importer facet so the next call loads the real user DO class on `"main"`.
-        try {
-          this.ctx.facets.abort('main', new Error('Migration importer completed'));
-        } catch {}
-        this.activeFacetBundleKey = null;
-      }
+      // Always unmount the one-shot importer facet after each chunk/completion to release V8 heap
+      // (the "main" facet SQLite DB persists durably across chunks) and load user DO code on completion.
+      try {
+        this.ctx.facets.abort('main', new Error('Migration importer chunk finished'));
+      } catch {}
+      this.activeFacetBundleKey = null;
     }
   }
 

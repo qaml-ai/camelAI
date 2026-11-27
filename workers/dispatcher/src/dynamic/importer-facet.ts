@@ -120,7 +120,7 @@ export class ChiridionMigrationImporterDO extends DurableObject {
       const insertCols = hasRowid ? ["rowid", ...columns] : columns;
       const colList = insertCols.map(quoteIdent).join(", ");
       const placeholders = insertCols.map(() => "?").join(", ");
-      const stmt = "INSERT INTO " + quoteIdent(table) + " (" + colList + ") VALUES (" + placeholders + ")";
+      const stmt = "INSERT OR REPLACE INTO " + quoteIdent(table) + " (" + colList + ") VALUES (" + placeholders + ")";
 
       const readBackRows = [];
       this.ctx.storage.transactionSync(() => {

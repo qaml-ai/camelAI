@@ -19,7 +19,7 @@ import {
   MIGRATION_SIG_HEADER,
   MIGRATION_TS_HEADER,
   signMigrationRequest,
-} from '../workers/dispatcher/src/dynamic/export-shim.ts';
+} from '../workers/dispatcher/src/dynamic/migration-protocol.ts';
 
 const ACCOUNT_ID = '85bbd288051330fb51ee1c86031a299b';
 const PROD_KV_ID = '0ee80299e67c4c7fa0c1ad618b7e7a9c';

@@ -225,6 +225,7 @@ async function r2GetJson<T>(
 interface AppDbMetadataRow {
   org_id: string;
   workspace_id: string;
+  project_id: string | null;
   created_by: string | null;
   artifact_cache_key: string | null;
   billing_plan: string | null;
@@ -246,7 +247,7 @@ async function queryAppDbMetadata(
     },
     body: JSON.stringify({
       sql: `
-        SELECT a.org_id, a.workspace_id, a.created_by,
+        SELECT a.org_id, a.workspace_id, a.project_id, a.created_by,
                g.artifact_cache_key AS artifact_cache_key,
                o.billing_plan
         FROM apps a
@@ -261,6 +262,117 @@ async function queryAppDbMetadata(
   if (!resp.ok) return null;
   const data = (await resp.json()) as { result?: Array<{ results?: AppDbMetadataRow[] }> };
   return data.result?.[0]?.results?.[0] ?? null;
+}
+
+async function resolveVirtualStorageFallbackBindings(input: {
+  apiToken: string;
+  accountId: string;
+  r2Bucket: string;
+  dispatcherOrigin: string;
+  migrationHmacSecret: string;
+  orgId: string;
+  workspaceId: string;
+  projectId: string | null;
+  dispatchScriptName: string;
+  missingBindings: string[];
+}): Promise<Array<Record<string, unknown>> | null> {
+  const {
+    apiToken,
+    accountId,
+    r2Bucket,
+    dispatcherOrigin,
+    migrationHmacSecret,
+    orgId,
+    workspaceId,
+    projectId,
+    dispatchScriptName,
+    missingBindings,
+  } = input;
+
+  // 1. Check R2 deploy-artifacts/{orgId}/{workspaceId}/{projectId}/{dispatchScriptName}/*.json
+  if (orgId && workspaceId) {
+    const projSeg = projectId ? encodeURIComponent(projectId) : 'default';
+    const prefix = `deploy-artifacts/${orgId}/${workspaceId}/${projSeg}/${dispatchScriptName}/`;
+    const listResp = await fetchWithRetry(
+      `https://api.cloudflare.com/client/v4/accounts/${accountId}/r2/buckets/${r2Bucket}/objects?prefix=${encodeURIComponent(prefix)}&per_page=100`,
+      { headers: { Authorization: `Bearer ${apiToken}` } },
+    ).catch(() => null);
+    if (listResp?.ok) {
+      const listJson = (await listResp.json()) as { result?: Array<{ key: string; last_modified?: string }> };
+      const jsons = (listJson.result ?? [])
+        .filter((o) => o.key.endsWith('.json'))
+        .sort((a, b) => String(b.last_modified ?? '').localeCompare(String(a.last_modified ?? '')));
+      if (jsons.length > 0) {
+        const rec = await r2GetJson<{ metadata?: { bindings?: Array<Record<string, unknown>> } }>(
+          apiToken,
+          accountId,
+          r2Bucket,
+          jsons[0]!.key,
+        );
+        if (rec?.metadata?.bindings?.length) {
+          return rec.metadata.bindings;
+        }
+      }
+    }
+  }
+
+  // 2. Read authoritative wrangler.jsonc / wrangler.json / wrangler.toml from WorkspaceFilesystemDO
+  const synthetic: Array<Record<string, unknown>> = [];
+  if (projectId && migrationHmacSecret) {
+    const ts = Date.now();
+    const sig = await signMigrationRequest(
+      migrationHmacSecret,
+      `project-wrangler:${projectId}`,
+      ts,
+    );
+    const resp = await fetchWithRetry(
+      `${dispatcherOrigin}/__chiridion_migrate/project-wrangler-bindings?projectId=${encodeURIComponent(projectId)}`,
+      {
+        headers: {
+          [MIGRATION_TS_HEADER]: String(ts),
+          [MIGRATION_SIG_HEADER]: sig,
+        },
+      },
+    ).catch(() => null);
+    if (resp?.ok) {
+      const parsed = (await resp.json()) as {
+        r2Buckets?: Array<{ binding: string; bucket_name: string }>;
+        kvNamespaces?: Array<{ binding: string; id: string }>;
+      };
+      for (const b of parsed.r2Buckets ?? []) {
+        synthetic.push({ type: 'r2_bucket', name: b.binding, bucket_name: b.bucket_name });
+      }
+      for (const k of parsed.kvNamespaces ?? []) {
+        synthetic.push({ type: 'kv_namespace', name: k.binding, namespace_id: k.id });
+      }
+    }
+  }
+
+  // 3. If all still-missing bindings are R2VirtualBucket AND the workspace has ZERO existing R2 objects
+  // under `user-data/{workspaceId}/`, using `bucket_name = bindingName` (cf-api-proxy default) has zero data risk.
+  const resolvedNames = new Set(synthetic.map((b) => String(b.name)));
+  const remainingMissing = missingBindings.filter((m) => !resolvedNames.has(m.split(':')[0] ?? ''));
+  if (
+    workspaceId &&
+    remainingMissing.length > 0 &&
+    remainingMissing.every((m) => m.endsWith(':R2VirtualBucket'))
+  ) {
+    const udResp = await fetchWithRetry(
+      `https://api.cloudflare.com/client/v4/accounts/${accountId}/r2/buckets/${r2Bucket}/objects?prefix=${encodeURIComponent(`user-data/${workspaceId}/`)}&per_page=1`,
+      { headers: { Authorization: `Bearer ${apiToken}` } },
+    ).catch(() => null);
+    if (udResp?.ok) {
+      const udJson = (await udResp.json()) as { result?: Array<{ key: string }> };
+      if ((udJson.result ?? []).length === 0) {
+        for (const m of remainingMissing) {
+          const bindingName = m.split(':')[0]!;
+          synthetic.push({ type: 'r2_bucket', name: bindingName, bucket_name: bindingName });
+        }
+      }
+    }
+  }
+
+  return synthetic.length > 0 ? synthetic : null;
 }
 
 async function r2PutJson(
@@ -563,7 +675,7 @@ async function migrateSingleScript(
       )
     : null;
 
-  const hydratedResult = hydrateMigratedBindings({
+  let hydratedResult = hydrateMigratedBindings({
     dispatchScriptName,
     orgId,
     workspaceId,
@@ -571,6 +683,33 @@ async function migrateSingleScript(
     liveSettingsBindings: bindings,
     artifactCacheBindings: artifactRecord?.metadata?.bindings ?? null,
   });
+  if (!hydratedResult.ok && hydratedResult.reason === 'unverified_virtual_storage_props') {
+    const fallbackBindings = await resolveVirtualStorageFallbackBindings({
+      apiToken,
+      accountId: cfg.accountId,
+      r2Bucket: cfg.r2Bucket,
+      dispatcherOrigin: cfg.dispatcherOrigin,
+      migrationHmacSecret,
+      orgId,
+      workspaceId,
+      projectId: appDbRow?.project_id ?? null,
+      dispatchScriptName,
+      missingBindings: hydratedResult.missingBindings,
+    });
+    if (fallbackBindings) {
+      hydratedResult = hydrateMigratedBindings({
+        dispatchScriptName,
+        orgId,
+        workspaceId,
+        userId: appDbRow?.created_by ?? undefined,
+        liveSettingsBindings: bindings,
+        artifactCacheBindings: [
+          ...(artifactRecord?.metadata?.bindings ?? []),
+          ...fallbackBindings,
+        ],
+      });
+    }
+  }
   if (!hydratedResult.ok) {
     return {
       dispatchScriptName,

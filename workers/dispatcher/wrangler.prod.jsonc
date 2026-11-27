@@ -52,6 +52,7 @@
 		"bindings": [
 			{ "name": "ORG", "class_name": "OrgDO", "script_name": "chiridion-app" },
 			{ "name": "WORKER_LOGS", "class_name": "WorkerLogsDO", "script_name": "chiridion-app" },
+			{ "name": "WORKSPACE_FS", "class_name": "WorkspaceFilesystemDO", "script_name": "chiridion-app" },
 			{ "name": "TENANT_DO_SUPERVISOR", "class_name": "TenantObjectSupervisorDO" }
 		]
 	},

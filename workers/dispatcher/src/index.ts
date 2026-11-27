@@ -112,6 +112,7 @@ interface Env {
   SESSIONS: KVNamespace;
   ORG: DurableObjectNamespace<OrgDO>;
   WORKER_LOGS?: DurableObjectNamespace<WorkerLogsDO>;
+  WORKSPACE_FS?: DurableObjectNamespace<import('../../main/src/workspace-filesystem-do.js').WorkspaceFilesystemDO>;
   USER_APP_LOADER?: WorkerLoader;
   TENANT_DO_SUPERVISOR?: DurableObjectNamespace<TenantObjectSupervisorDO>;
   APP_USAGE_AE?: AnalyticsEngineDataset;
@@ -1256,6 +1257,8 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
         script?: string;
         seedPaths?: string[];
         dryRun?: boolean;
+        force?: boolean;
+        seedFromBundle?: boolean;
       } | null;
       const script = body?.script?.trim() || '';
       const valid = secret && script
@@ -1272,8 +1275,16 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
       }
 
       const kvKey = `selfhost:assets:${script}`;
-      const existing = await env.APP_KV.get(kvKey);
-      if (existing) {
+      const existingRaw = await env.APP_KV.get(kvKey);
+      const existingRecord = existingRaw
+        ? (JSON.parse(existingRaw) as {
+            schemaVersion?: number;
+            appId?: string;
+            createdAt?: string;
+            manifest?: Record<string, { hash: string; size: number; contentType: string }>;
+          })
+        : null;
+      if (existingRecord && !body?.force) {
         return Response.json({ dispatchScriptName: script, status: 'skipped', reason: 'already_has_assets_mirror' });
       }
 
@@ -1288,6 +1299,11 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
       const extractPaths = (text: string, baseDir = ''): string[] => {
         const found = new Set<string>();
         for (const m of text.matchAll(/["'`(](\/(?:assets|images|img|fonts|icons|static|_assets|src)\/[A-Za-z0-9._/-]+\.[A-Za-z0-9]{1,12})["'`)]/g)) {
+          const p = normalizeRelPath(m[1]!);
+          if (p) found.add(p);
+        }
+        // Also catch root-level static files referenced in bundles/HTML (e.g. "/undhari-logo.png", "/hero.jpeg")
+        for (const m of text.matchAll(/["'`](\/[A-Za-z0-9._-]+\.(?:png|jpe?g|webp|gif|svg|ico|woff2?|ttf|css|js|webmanifest|json))["'`]/gi)) {
           const p = normalizeRelPath(m[1]!);
           if (p) found.add(p);
         }
@@ -1311,31 +1327,67 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
         'apple-touch-icon.png', 'android-chrome-192x192.png', 'android-chrome-512x512.png',
         'site.webmanifest', 'manifest.webmanifest', 'manifest.json', 'robots.txt', 'og-image.png', 'index.html',
       ];
-      const queue = new Set<string>(standardPaths);
+      const queue = new Set<string>(body?.force ? [] : standardPaths);
       for (const s of body?.seedPaths ?? []) {
         const p = normalizeRelPath(s);
         if (p) queue.add(p);
       }
 
-      const worker = env.DISPATCHER.get(script);
-      try {
-        const rootResp = await worker.fetch(new Request(`https://${script}.camelai.app/`, { method: 'GET' }));
-        if (rootResp.status === 200) {
-          const html = await rootResp.text();
-          for (const p of extractPaths(html)) queue.add(p);
+      if (body?.seedFromBundle) {
+        try {
+          const regRaw = await env.APP_KV.get(`script:${script}`);
+          const reg = regRaw ? (JSON.parse(regRaw) as { bundle_r2_key?: string; has_assets?: boolean }) : null;
+          if (reg?.bundle_r2_key) {
+            const obj = await env.R2_BUCKET.get(reg.bundle_r2_key);
+            if (obj) {
+              const bundle = (await obj.json()) as { modules?: Record<string, { content?: string }> };
+              for (const mod of Object.values(bundle.modules ?? {})) {
+                if (typeof mod?.content === 'string') {
+                  for (const p of extractPaths(mod.content)) queue.add(p);
+                }
+              }
+            }
+          }
+        } catch {
+          // Best-effort bundle scan
         }
-      } catch {
-        // Ignore root fetch failure; seedPaths may still succeed
       }
 
-      const manifest: Record<string, { hash: string; size: number; contentType: string }> = {};
-      const visited = new Set<string>();
-      const pending = [...queue];
-      const dryRun = Boolean(body?.dryRun);
+      const worker = env.DISPATCHER.get(script);
+      if (!body?.seedFromBundle) {
+        try {
+          const rootResp = await worker.fetch(new Request(`https://${script}.camelai.app/`, { method: 'GET' }));
+          if (rootResp.status === 200) {
+            const html = await rootResp.text();
+            for (const p of extractPaths(html)) queue.add(p);
+          }
+        } catch {
+          // Ignore root fetch failure; seedPaths may still succeed
+        }
+      }
 
-      while (pending.length > 0 && visited.size < 250) {
+      const existingManifest = existingRecord?.manifest ?? {};
+      const manifest: Record<string, { hash: string; size: number; contentType: string }> = {
+        ...existingManifest,
+      };
+      const visited = new Set<string>();
+      // When refreshing an existing manifest, skip paths already present in manifest!
+      const pending = [...queue].filter((p) => !(body?.force && p in existingManifest));
+      const dryRun = Boolean(body?.dryRun);
+      let addedCount = 0;
+
+      if (body?.force && pending.length === 0) {
+        return Response.json({
+          dispatchScriptName: script,
+          status: 'up_to_date',
+          existingCount: Object.keys(existingManifest).length,
+          checkedPaths: queue.size,
+        });
+      }
+
+      while (pending.length > 0 && visited.size < 300) {
         const batch: string[] = [];
-        while (batch.length < 6 && pending.length > 0 && visited.size + batch.length < 250) {
+        while (batch.length < 8 && pending.length > 0 && visited.size + batch.length < 300) {
           const next = pending.shift()!;
           if (!visited.has(next)) {
             visited.add(next);
@@ -1364,7 +1416,9 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
                 const slash = relPath.lastIndexOf('/');
                 const baseDir = slash >= 0 ? relPath.slice(0, slash) : '';
                 for (const nextPath of extractPaths(text, baseDir)) {
-                  if (!visited.has(nextPath)) pending.push(nextPath);
+                  if (!visited.has(nextPath) && !(body?.force && nextPath in manifest)) {
+                    pending.push(nextPath);
+                  }
                 }
               }
 
@@ -1378,6 +1432,7 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
                 });
               }
               manifest[relPath] = { hash, size: buf.byteLength, contentType };
+              addedCount += 1;
             } catch {
               // Skip individual asset errors
             }
@@ -1386,8 +1441,11 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
       }
 
       const assetCount = Object.keys(manifest).length;
-      if (assetCount === 0) {
+      if (addedCount === 0 && !existingRecord) {
         return Response.json({ dispatchScriptName: script, status: 'skipped', reason: 'no_static_assets_discovered' });
+      }
+      if (addedCount === 0 && existingRecord) {
+        return Response.json({ dispatchScriptName: script, status: 'up_to_date', existingCount: assetCount, checkedPaths: queue.size });
       }
       if (!dryRun) {
         await env.APP_KV.put(
@@ -1402,10 +1460,110 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
       }
       return Response.json({
         dispatchScriptName: script,
-        status: dryRun ? 'dry_run_ready' : 'backfilled',
+        status: dryRun ? 'dry_run_ready' : existingRecord ? 'repaired' : 'backfilled',
+        addedCount,
         assetCount,
-        samplePaths: Object.keys(manifest).slice(0, 8),
+        samplePaths: Object.keys(manifest).slice(-8),
       });
+    }
+
+    if (url.pathname === '/__chiridion_migrate/project-wrangler-bindings' && request.method === 'GET') {
+      const secret = env.MIGRATION_HMAC_SECRET?.trim() || env.TOKEN_SIGNING_SECRET?.trim();
+      const projectId = url.searchParams.get('projectId')?.trim() || '';
+      const valid = secret && projectId
+        ? await verifyMigrationSignature(
+            secret,
+            `project-wrangler:${projectId}`,
+            request.headers.get(MIGRATION_SIG_HEADER),
+            request.headers.get(MIGRATION_TS_HEADER),
+          )
+        : false;
+      if (!valid) return new Response('Forbidden', { status: 403 });
+      if (!env.WORKSPACE_FS) {
+        return Response.json({ ok: false, error: 'WORKSPACE_FS not configured' }, { status: 500 });
+      }
+      const stub = env.WORKSPACE_FS.get(env.WORKSPACE_FS.idFromName(projectId));
+      const candidatePaths = ['/wrangler.jsonc', '/wrangler.json', '/wrangler.toml', '/build/server/wrangler.json'];
+      const stripJsonc = (raw: string): string => {
+        let out = '';
+        let inStr = false;
+        let esc = false;
+        for (let i = 0; i < raw.length; i += 1) {
+          const ch = raw[i]!;
+          const next = raw[i + 1];
+          if (inStr) {
+            out += ch;
+            if (esc) esc = false;
+            else if (ch === '\\') esc = true;
+            else if (ch === '"') inStr = false;
+            continue;
+          }
+          if (ch === '"') {
+            inStr = true;
+            out += ch;
+            continue;
+          }
+          if (ch === '/' && next === '/') {
+            while (i < raw.length && raw[i] !== '\n') i += 1;
+            out += '\n';
+            continue;
+          }
+          if (ch === '/' && next === '*') {
+            i += 2;
+            while (i < raw.length && !(raw[i] === '*' && raw[i + 1] === '/')) i += 1;
+            i += 1;
+            continue;
+          }
+          out += ch;
+        }
+        return out.replace(/,\s*([}\]])/g, '$1');
+      };
+
+      const r2Buckets: Array<{ binding: string; bucket_name: string }> = [];
+      const kvNamespaces: Array<{ binding: string; id: string }> = [];
+      let matchedPath: string | null = null;
+
+      for (const p of candidatePaths) {
+        try {
+          const res = await stub.projectReadFile(p);
+          const content = (res as { content?: string; found?: boolean })?.content;
+          if (typeof content !== 'string' || !content.trim()) continue;
+          matchedPath = p;
+          if (p.endsWith('.toml')) {
+            for (const block of content.split(/\[\[r2_buckets\]\]/i).slice(1)) {
+              const section = block.split(/^\s*\[/m)[0] || '';
+              const b = /binding\s*=\s*["']([^"']+)["']/.exec(section)?.[1];
+              const bn = /bucket_name\s*=\s*["']([^"']+)["']/.exec(section)?.[1];
+              if (b && bn) r2Buckets.push({ binding: b, bucket_name: bn });
+            }
+            for (const block of content.split(/\[\[kv_namespaces\]\]/i).slice(1)) {
+              const section = block.split(/^\s*\[/m)[0] || '';
+              const b = /binding\s*=\s*["']([^"']+)["']/.exec(section)?.[1];
+              const id = /id\s*=\s*["']([^"']+)["']/.exec(section)?.[1];
+              if (b && id) kvNamespaces.push({ binding: b, id });
+            }
+          } else {
+            const parsed = JSON.parse(stripJsonc(content)) as {
+              r2_buckets?: Array<{ binding?: string; bucket_name?: string }>;
+              kv_namespaces?: Array<{ binding?: string; id?: string }>;
+            };
+            for (const item of parsed.r2_buckets ?? []) {
+              if (item?.binding && item?.bucket_name) {
+                r2Buckets.push({ binding: item.binding, bucket_name: item.bucket_name });
+              }
+            }
+            for (const item of parsed.kv_namespaces ?? []) {
+              if (item?.binding && item?.id) {
+                kvNamespaces.push({ binding: item.binding, id: item.id });
+              }
+            }
+          }
+          if (r2Buckets.length > 0 || kvNamespaces.length > 0) break;
+        } catch {
+          // Try next wrangler config path
+        }
+      }
+      return Response.json({ ok: true, projectId, path: matchedPath, r2Buckets, kvNamespaces });
     }
 
     if (url.pathname === '/__selfhost_do/fetch') {

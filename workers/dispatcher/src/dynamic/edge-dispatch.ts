@@ -18,11 +18,15 @@ import {
 import { emitAppUsageMetric, resolveQuotaTier } from './quota-policy';
 
 export interface EdgeDispatchEnv {
+  APP_KV?: KVNamespace;
   R2_BUCKET?: R2Bucket;
   ORG?: DurableObjectNamespace<OrgDO>;
   USER_APP_LOADER?: WorkerLoader;
   APP_USAGE_AE?: AnalyticsEngineDataset;
   MAIN_APP_BROKER?: Service<DynamicServiceBroker>;
+  DISPATCHER?: {
+    get(name: string): { fetch(request: Request): Promise<Response> };
+  };
 }
 
 const STATIC_ASSET_PATHS = new Set([
@@ -59,6 +63,8 @@ async function tryServeEdgeStaticAsset(
   dispatchScriptName: string,
   bundleSha: string | undefined,
   exports: DynamicRuntimeExports,
+  env: EdgeDispatchEnv,
+  ctx: ExecutionContext,
 ): Promise<Response | null> {
   if (!shouldTryEdgeStaticAsset(request, url)) return null;
   if (!exports.AssetsVirtualBinding) return null;
@@ -86,16 +92,80 @@ async function tryServeEdgeStaticAsset(
   if (!binding || typeof binding.fetch !== 'function') return null;
 
   const response = await binding.fetch(request);
-  if (response.status === 404) return null;
-
-  if (cache && response.ok && request.method === 'GET') {
-    try {
-      await cache.put(cacheKey, response.clone());
-    } catch {
-      // Best-effort cache fill.
+  if (response.status !== 404) {
+    if (cache && response.ok && request.method === 'GET') {
+      try {
+        await cache.put(cacheKey, response.clone());
+      } catch {
+        // Best-effort cache fill.
+      }
     }
+    return response;
   }
-  return response;
+
+  // Fallback & self-heal for migrated apps whose `selfhost:assets:<app>` manifest in KV
+  // predated a newer WfP deploy: WfP `keep_assets: true` still holds the latest static files.
+  if (!env.DISPATCHER) return null;
+  try {
+    const wfpResp = await env.DISPATCHER.get(dispatchScriptName).fetch(
+      new Request(`https://${dispatchScriptName}.camelai.app${url.pathname}`, { method: 'GET' }),
+    );
+    if (wfpResp.status !== 200) return null;
+    const rawCt = wfpResp.headers.get('content-type') || 'application/octet-stream';
+    const contentType = rawCt.split(';')[0]!.trim().toLowerCase();
+    // Never treat SPA HTML fallback as a missing JS/CSS/image asset.
+    if (!url.pathname.endsWith('.html') && contentType === 'text/html') return null;
+    const bytes = await wfpResp.arrayBuffer();
+    if (bytes.byteLength === 0) return null;
+
+    const relPath = url.pathname.replace(/^\/+/, '');
+    const headers = new Headers();
+    headers.set('Content-Type', rawCt);
+    headers.set(
+      'Cache-Control',
+      url.pathname.startsWith('/assets/') ? 'public, max-age=31536000, immutable' : 'public, max-age=3600',
+    );
+    headers.set('X-Chiridion-Asset-Fallback', 'wfp-heal');
+    const out = new Response(request.method === 'HEAD' ? null : bytes, { status: 200, headers });
+
+    const healTask = (async () => {
+      if (cache && request.method === 'GET') {
+        try {
+          await cache.put(cacheKey, new Response(bytes, { status: 200, headers }));
+        } catch {}
+      }
+      if (env.R2_BUCKET && env.APP_KV && relPath) {
+        try {
+          const digestBuf = await crypto.subtle.digest('SHA-256', bytes);
+          const hash = Array.from(new Uint8Array(digestBuf))
+            .map((b) => b.toString(16).padStart(2, '0'))
+            .join('');
+          await env.R2_BUCKET.put(`selfhost-assets/${dispatchScriptName}/${hash}`, bytes, {
+            httpMetadata: { contentType },
+          });
+          const kvKey = `selfhost:assets:${dispatchScriptName}`;
+          const existingRaw = await env.APP_KV.get(kvKey);
+          const record = existingRaw
+            ? (JSON.parse(existingRaw) as {
+                schemaVersion?: number;
+                appId?: string;
+                createdAt?: string;
+                manifest?: Record<string, { hash: string; size: number; contentType: string }>;
+              })
+            : { schemaVersion: 1, appId: dispatchScriptName, createdAt: new Date().toISOString(), manifest: {} };
+          record.manifest = record.manifest ?? {};
+          record.manifest[relPath] = { hash, size: bytes.byteLength, contentType };
+          await env.APP_KV.put(kvKey, JSON.stringify(record));
+        } catch {}
+      }
+    })();
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(healTask);
+    }
+    return out;
+  } catch {
+    return null;
+  }
 }
 
 export async function dispatchDynamicWorkerEdge(input: {
@@ -120,6 +190,8 @@ export async function dispatchDynamicWorkerEdge(input: {
       dispatchScriptName,
       accessInfo.bundle_sha,
       exports,
+      env,
+      ctx,
     );
     if (assetResponse) {
       emitAppUsageMetric(env.APP_USAGE_AE, {

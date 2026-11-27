@@ -61,7 +61,17 @@ export class ChiridionMigrationImporterDO extends DurableObject {
 
     if (url.pathname === "/__import/schema") {
       const body = await request.json();
-      const tables = (body.schema || []).filter((item) => item.type === "table");
+      const rawTables = (body.schema || []).filter((item) => item.type === "table");
+      const ftsShadows = new Set();
+      for (const item of rawTables) {
+        if (/^CREATE\s+VIRTUAL\s+TABLE\b/i.test(String(item.sql || "").trim())) {
+          const base = String(item.name).toLowerCase();
+          for (const suffix of ["_data", "_idx", "_content", "_docsize", "_config"]) {
+            ftsShadows.add(base + suffix);
+          }
+        }
+      }
+      const tables = rawTables.filter((item) => !ftsShadows.has(String(item.name).toLowerCase()));
       this.ctx.storage.transactionSync(() => {
         sql.exec("PRAGMA defer_foreign_keys = ON");
         for (const item of tables) {
@@ -106,6 +116,17 @@ export class ChiridionMigrationImporterDO extends DurableObject {
         sql.exec("PRAGMA defer_foreign_keys = ON");
         for (const item of postObjects) {
           sql.exec(item.sql);
+        }
+        // Rebuild any external-content FTS5 virtual tables now that content tables and triggers exist.
+        for (const item of body.schema || []) {
+          if (item.type === "table" && /^CREATE\s+VIRTUAL\s+TABLE\b/i.test(String(item.sql || "").trim())) {
+            const m = /\bcontent\s*=\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+))/i.exec(String(item.sql || ""));
+            const target = m ? (m[1] ?? m[2] ?? m[3] ?? "").trim() : "";
+            if (target.length > 0) {
+              const q = quoteIdent(item.name);
+              sql.exec("INSERT INTO " + q + "(" + q + ") VALUES('rebuild')");
+            }
+          }
         }
         if (seqEntries.length > 0) {
           for (const entry of seqEntries) {

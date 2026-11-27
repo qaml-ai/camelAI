@@ -120,20 +120,50 @@ function getSql(storage) {
   }
 }
 
+function isVirtualTableSql(sqlText) {
+  return /^CREATE\s+VIRTUAL\s+TABLE\b/i.test(String(sqlText || "").trim());
+}
+
+function isExternalContentFtsSql(sqlText) {
+  const m = /\bcontent\s*=\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+))/i.exec(String(sqlText || ""));
+  if (!m) return false;
+  const target = (m[1] ?? m[2] ?? m[3] ?? "").trim();
+  return target.length > 0;
+}
+
+function getFtsShadowTableNames(schema) {
+  const shadows = new Set();
+  for (const item of schema) {
+    if (item.type === "table" && isVirtualTableSql(item.sql)) {
+      const base = String(item.name).toLowerCase();
+      for (const suffix of ["_data", "_idx", "_content", "_docsize", "_config"]) {
+        shadows.add(base + suffix);
+      }
+    }
+  }
+  return shadows;
+}
+
 function inspectTables(sql) {
   if (!sql) return { schema: [], tables: [], sqliteSequence: [] };
   const masterRows = sql
     .exec("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END, name")
     .toArray();
-  const schema = masterRows.map((r) => ({
+  const rawSchema = masterRows.map((r) => ({
     type: String(r.type),
     name: String(r.name),
     tblName: String(r.tbl_name),
     sql: String(r.sql),
   }));
+  const ftsShadows = getFtsShadowTableNames(rawSchema);
+  const schema = rawSchema.filter(
+    (item) => !(item.type === "table" && ftsShadows.has(item.name.toLowerCase())),
+  );
   const tables = [];
   for (const item of schema) {
     if (item.type !== "table") continue;
+    // External-content FTS5 virtual tables are rebuilt from their content table during finalize.
+    if (isVirtualTableSql(item.sql) && isExternalContentFtsSql(item.sql)) continue;
     const infoRows = sql.exec("PRAGMA table_info(" + quoteIdent(item.name) + ")").toArray();
     const columns = infoRows.map((c) => String(c.name));
     const pkCols = infoRows

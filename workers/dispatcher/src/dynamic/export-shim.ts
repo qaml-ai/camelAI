@@ -121,11 +121,11 @@ function getSql(storage) {
 }
 
 function isVirtualTableSql(sqlText) {
-  return /^CREATE\s+VIRTUAL\s+TABLE\b/i.test(String(sqlText || "").trim());
+  return /^CREATE\\s+VIRTUAL\\s+TABLE\\b/i.test(String(sqlText || "").trim());
 }
 
 function isExternalContentFtsSql(sqlText) {
-  const m = /\bcontent\s*=\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+))/i.exec(String(sqlText || ""));
+  const m = /\\bcontent\\s*=\\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+))/i.exec(String(sqlText || ""));
   if (!m) return false;
   const target = (m[1] ?? m[2] ?? m[3] ?? "").trim();
   return target.length > 0;

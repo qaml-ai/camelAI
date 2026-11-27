@@ -1,9 +1,10 @@
 /**
  * Immutable R2 bundle loader with in-isolate LRU + Cache API caching,
- * optional live OrgDO managed env overlay, and WorkerLoader option assembly.
+ * live secret and managed env overlays, and WorkerLoader option assembly.
  */
 
 import type { OrgDO } from '../../../main/src/auth';
+import type { DynamicServiceBroker } from '../../../main/src/dynamic-service-broker';
 import {
   type AppQuotaTier,
   type DynamicWorkerBundleRecord,
@@ -46,6 +47,7 @@ export interface BundleStoreEnv {
   R2_BUCKET?: R2Bucket;
   ORG?: DurableObjectNamespace<OrgDO>;
   USER_APP_LOADER?: WorkerLoader;
+  MAIN_APP_BROKER?: Pick<Service<DynamicServiceBroker>, 'resolveLegacyIntegrationEnvVars'>;
   MIGRATION_HMAC_SECRET?: string;
   TOKEN_SIGNING_SECRET?: string;
 }
@@ -61,20 +63,27 @@ const bundleLru = new Map<string, DynamicWorkerBundleRecord>();
 
 const ENV_CACHE_TTL_MS = 60_000;
 const envVarCache = new Map<string, { expiresAt: number; vars: ManagedAppEnvVar[]; envHash: string }>();
-const MIGRATED_SECRETS_CACHE_TTL_MS = 5 * 60_000;
+const SECRETS_CACHE_TTL_MS = 5 * 60_000;
 const migratedSecretsCache = new Map<string, { expiresAt: number; vars: ManagedAppEnvVar[] }>();
+const legacyIntegrationEnvCache = new Map<
+  string,
+  { expiresAt: number; vars: ManagedAppEnvVar[]; envHash: string }
+>();
+
+function isRedactedSecretBinding(binding: Record<string, unknown>): boolean {
+  return (
+    binding.type === 'secret_text' &&
+    typeof binding.text !== 'string' &&
+    typeof binding.value !== 'string'
+  );
+}
 
 export async function loadMigratedSecretsOverlay(
   env: BundleStoreEnv,
   record: Pick<DynamicWorkerBundleRecord, 'dispatchScriptName' | 'bindings'>,
 ): Promise<ManagedAppEnvVar[]> {
   // Fast zero-cost path: 99.5% of bundles have no redacted WfP secret_text bindings.
-  const hasRedactedSecret = (record.bindings ?? []).some(
-    (b) =>
-      b.type === 'secret_text' &&
-      typeof b.text !== 'string' &&
-      typeof b.value !== 'string',
-  );
+  const hasRedactedSecret = (record.bindings ?? []).some(isRedactedSecretBinding);
   if (!hasRedactedSecret) return [];
 
   const masterSecret = env.MIGRATION_HMAC_SECRET?.trim() || env.TOKEN_SIGNING_SECRET?.trim();
@@ -103,7 +112,7 @@ export async function loadMigratedSecretsOverlay(
       isSecret: true,
     }));
     migratedSecretsCache.set(record.dispatchScriptName, {
-      expiresAt: now + MIGRATED_SECRETS_CACHE_TTL_MS,
+      expiresAt: now + SECRETS_CACHE_TTL_MS,
       vars,
     });
     return vars;
@@ -161,6 +170,7 @@ export function clearBundleStoreCachesForTest(): void {
   envVarCache.clear();
   tailEnabledCache.clear();
   migratedSecretsCache.clear();
+  legacyIntegrationEnvCache.clear();
 }
 
 export async function loadDynamicBundleRecord(
@@ -256,6 +266,72 @@ export async function loadManagedEnvOverlay(
   } catch {
     return { vars: [], envHash: '0' };
   }
+}
+
+async function loadLegacyIntegrationEnvOverlay(
+  env: BundleStoreEnv,
+  record: Pick<DynamicWorkerBundleRecord, 'dispatchScriptName' | 'orgId' | 'workspaceId' | 'bindings'>,
+  managedVars: ManagedAppEnvVar[],
+  migratedSecrets: ManagedAppEnvVar[],
+): Promise<{ vars: ManagedAppEnvVar[]; envHash: string }> {
+  const missingKeys = new Set<string>();
+  for (const binding of record.bindings ?? []) {
+    if (
+      isRedactedSecretBinding(binding) &&
+      typeof binding.name === 'string' &&
+      binding.name.startsWith('INT_')
+    ) {
+      missingKeys.add(binding.name);
+    }
+  }
+  if (missingKeys.size === 0) return { vars: [], envHash: '0' };
+
+  for (const { key } of managedVars) missingKeys.delete(key);
+  for (const { key } of migratedSecrets) missingKeys.delete(key);
+  if (missingKeys.size === 0) return { vars: [], envHash: '0' };
+
+  const { dispatchScriptName, orgId, workspaceId } = record;
+  const broker = env.MAIN_APP_BROKER;
+  if (!broker) {
+    console.error('Missing MAIN_APP_BROKER for legacy integration env hydration', dispatchScriptName);
+    return { vars: [], envHash: '0' };
+  }
+
+  const sortedKeys = [...missingKeys].sort();
+  const cacheKey = JSON.stringify([dispatchScriptName, orgId, workspaceId, sortedKeys]);
+  const now = Date.now();
+  const cached = legacyIntegrationEnvCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) return cached;
+
+  try {
+    const resolved = await broker.resolveLegacyIntegrationEnvVars(orgId, workspaceId, sortedKeys);
+    const vars = resolved.filter(({ key }) => missingKeys.has(key));
+    const envHash = await computeEnvHash(vars);
+    legacyIntegrationEnvCache.set(cacheKey, { expiresAt: now + SECRETS_CACHE_TTL_MS, vars, envHash });
+    return { vars, envHash };
+  } catch {
+    console.error('Failed to hydrate legacy integration env vars via MAIN_APP_BROKER', dispatchScriptName);
+    return { vars: [], envHash: '0' };
+  }
+}
+
+export async function loadDynamicEnvOverlay(
+  env: BundleStoreEnv,
+  record: Pick<DynamicWorkerBundleRecord, 'dispatchScriptName' | 'orgId' | 'workspaceId' | 'scriptName' | 'bindings'>,
+  envVersion = 0,
+): Promise<{ vars: ManagedAppEnvVar[]; envHash: string }> {
+  const [managed, migratedSecrets] = await Promise.all([
+    loadManagedEnvOverlay(env, record.orgId, record.scriptName, envVersion),
+    loadMigratedSecretsOverlay(env, record),
+  ]);
+  const legacy = await loadLegacyIntegrationEnvOverlay(env, record, managed.vars, migratedSecrets);
+
+  if (migratedSecrets.length === 0 && legacy.vars.length === 0) return managed;
+
+  let envHash = managed.envHash;
+  if (migratedSecrets.length > 0) envHash += `:ms${migratedSecrets.length}`;
+  if (legacy.vars.length > 0) envHash += `:li${legacy.envHash}`;
+  return { vars: [...legacy.vars, ...migratedSecrets, ...managed.vars], envHash };
 }
 
 function base64ToArrayBuffer(value: string): ArrayBuffer {

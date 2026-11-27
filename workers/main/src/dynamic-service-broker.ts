@@ -18,6 +18,8 @@
  */
 
 import { WorkerEntrypoint } from 'cloudflare:workers';
+import { decryptCredentials } from '../../../src/lib/integration-crypto';
+import { buildIntegrationEnvVars, getIntegrationEnvVarPrefix } from './legacy-integration-env.js';
 import type { Env } from './types.js';
 
 export type BrokeredVirtualServiceName =
@@ -62,6 +64,60 @@ type ExportFactoryMap = Record<
 >;
 
 export class DynamicServiceBroker extends WorkerEntrypoint<Env> {
+  // Trusted dispatcher hydration, outside the virtual service invoke allowlist.
+  async resolveLegacyIntegrationEnvVars(
+    orgId: string,
+    workspaceId: string,
+    neededKeys: string[],
+  ): Promise<Array<{ key: string; value: string; isSecret: true }>> {
+    if (
+      typeof orgId !== 'string' || !orgId.trim() ||
+      typeof workspaceId !== 'string' || !workspaceId.trim() ||
+      !Array.isArray(neededKeys)
+    ) {
+      return [];
+    }
+    const keys = neededKeys.filter((key) => typeof key === 'string' && /^INT_[A-Z0-9_]+$/.test(key));
+    if (keys.length === 0) return [];
+    const requested = new Set(keys);
+
+    const org = this.env.ORG.get(this.env.ORG.idFromName(orgId));
+    // The OrgDO integration read can migrate rows from a legacy WorkspaceDO.
+    // Verify ownership before that read so it can only migrate this org's rows.
+    const workspace = await org.getWorkspaceRecord(workspaceId);
+    if (workspace?.org_id !== orgId) return [];
+    const records = await org.getWorkspaceIntegrations(workspaceId);
+    const resolved = new Map<string, string>();
+    for (const record of records) {
+      const prefix = getIntegrationEnvVarPrefix(record.name, record.integration_type);
+      if (!keys.some((key) => key.startsWith(prefix))) continue;
+      try {
+        // BigQuery access tokens are minted and refreshed by OrgDO.
+        const credentials = record.credentials_encrypted
+          ? await decryptCredentials(record.credentials_encrypted, this.env.INTEGRATION_SECRET_KEY)
+          : {};
+        const config = JSON.parse(record.config) as Record<string, unknown>;
+        const vars = buildIntegrationEnvVars([{
+          name: record.name,
+          integration_type: record.integration_type,
+          credentials,
+          config,
+        }]);
+        for (const [key, value] of Object.entries(vars)) {
+          if (requested.has(key)) resolved.set(key, value);
+        }
+      } catch {
+        console.error('[DynamicServiceBroker] Failed to resolve legacy integration env vars', {
+          orgId,
+          workspaceId,
+          integrationId: record.id,
+        });
+      }
+    }
+
+    return Array.from(resolved, ([key, value]) => ({ key, value, isSecret: true }));
+  }
+
   async invoke(
     serviceName: BrokeredVirtualServiceName,
     props: Record<string, unknown>,

@@ -23,9 +23,8 @@ import { getWorkerAccessInfo, type WorkerAccessInfo } from '../access-control';
 import {
   isDynamicLogsTailEnabled,
   loadDynamicBundleRecord,
+  loadDynamicEnvOverlay,
   loadDynamicUserWorker,
-  loadManagedEnvOverlay,
-  loadMigratedSecretsOverlay,
   type DynamicRuntimeExports,
 } from './bundle-store';
 import { MIGRATION_IMPORTER_FACET_SOURCE } from './importer-facet';
@@ -314,23 +313,12 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       throw new Error('USER_APP_LOADER binding is not configured on dispatcher');
     }
 
-    const [{ vars: managedOverlay, envHash }, migratedSecrets, enableLogsTail] = await Promise.all([
-      loadManagedEnvOverlay(
-        this.env,
-        bundle.orgId,
-        bundle.scriptName,
-        accessInfo.env_version ?? 0,
-      ),
-      loadMigratedSecretsOverlay(this.env, bundle),
+    const [{ vars, envHash }, enableLogsTail] = await Promise.all([
+      loadDynamicEnvOverlay(this.env, bundle, accessInfo.env_version),
       isDynamicLogsTailEnabled(this.env, bundle),
     ]);
 
-    const combinedOverlay =
-      migratedSecrets.length > 0 ? [...migratedSecrets, ...managedOverlay] : managedOverlay;
-    const effectiveEnvHash =
-      migratedSecrets.length > 0 ? `${envHash}:ms${migratedSecrets.length}` : envHash;
-
-    const nextFacetBundleKey = `${bundle.bundleSha}:${effectiveEnvHash}:${quotaTier}`;
+    const nextFacetBundleKey = `${bundle.bundleSha}:${envHash}:${quotaTier}`;
     if (this.activeFacetBundleKey && this.activeFacetBundleKey !== nextFacetBundleKey) {
       // Gracefully abort the warm facet so the new bundle/env takes effect immediately
       // while preserving 100% of the facet's SQLite database.
@@ -346,8 +334,8 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       loader: this.env.USER_APP_LOADER,
       record: bundle,
       exports: ((this.ctx as unknown as { exports?: DynamicRuntimeExports }).exports ?? {}) as DynamicRuntimeExports,
-      managedOverlay: combinedOverlay,
-      envHash: effectiveEnvHash,
+      managedOverlay: vars,
+      envHash,
       quotaTier,
       quotaLimits: quotaLimitsForTier(quotaTier),
       supervisorKey: identity.supervisorKey,

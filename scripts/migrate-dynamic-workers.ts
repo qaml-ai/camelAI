@@ -21,6 +21,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import * as esbuild from 'esbuild';
 import {
   billingPlanToQuotaTier,
   dynamicBundleObjectKey,
@@ -69,6 +70,7 @@ interface CliOptions {
   limit: number;
   concurrency: number;
   logFile: string;
+  r2BucketOverrides: Record<string, string>;
 }
 
 const ENV_CONFIG = {
@@ -100,6 +102,7 @@ function parseArgs(argv: string[]): CliOptions {
     limit: 20,
     concurrency: 1,
     logFile: path.resolve('migration-progress.jsonl'),
+    r2BucketOverrides: {},
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!;
@@ -130,6 +133,10 @@ function parseArgs(argv: string[]): CliOptions {
       opts.concurrency = Math.max(1, Math.min(16, Number(argv[++i]!) || 1));
     } else if (arg === '--log-file' && argv[i + 1]) {
       opts.logFile = path.resolve(argv[++i]!);
+    } else if (arg === '--r2-bucket' && argv[i + 1]) {
+      const pair = argv[++i]!;
+      const eq = pair.indexOf('=');
+      if (eq > 0) opts.r2BucketOverrides[pair.slice(0, eq)] = pair.slice(eq + 1);
     }
   }
   return opts;
@@ -450,6 +457,7 @@ async function uploadWfpExportShim(input: {
   namespace: string;
   dispatchScriptName: string;
   doBindings: Record<string, string>;
+  secretNames?: string[];
   hmacSecret: string;
   discoveryWebhookUrl?: string;
 }): Promise<void> {
@@ -465,6 +473,7 @@ async function uploadWfpExportShim(input: {
     const shimSource = buildWfpExportShimSource({
       classNames: [...Object.values(input.doBindings), ...extraClassNames],
       bindingMap: input.doBindings,
+      secretNames: input.secretNames,
       hmacSecret: input.hmacSecret,
       discoveryWebhookUrl: input.discoveryWebhookUrl,
     });
@@ -675,13 +684,21 @@ async function migrateSingleScript(
       )
     : null;
 
+  const overrideBindings = Object.entries(opts.r2BucketOverrides).map(([name, bucket_name]) => ({
+    type: 'r2_bucket',
+    name,
+    bucket_name,
+  }));
   let hydratedResult = hydrateMigratedBindings({
     dispatchScriptName,
     orgId,
     workspaceId,
     userId: appDbRow?.created_by ?? undefined,
     liveSettingsBindings: bindings,
-    artifactCacheBindings: artifactRecord?.metadata?.bindings ?? null,
+    artifactCacheBindings: [
+      ...(artifactRecord?.metadata?.bindings ?? []),
+      ...overrideBindings,
+    ],
   });
   if (!hydratedResult.ok && hydratedResult.reason === 'unverified_virtual_storage_props') {
     const fallbackBindings = await resolveVirtualStorageFallbackBindings({
@@ -750,7 +767,56 @@ async function migrateSingleScript(
     return { dispatchScriptName, status: 'skipped', reason: 'already_export_shim' };
   }
 
-  const totalBundleBytes = Object.values(modules).reduce((sum, m) => sum + m.content.length, 0);
+  const originalModules = { ...modules };
+
+  // Prune unreferenced JS modules (e.g. leftover 4MB+ index.js when mainModule is __camelai_entry.js -> worker.js)
+  if (Object.keys(modules).length > 1) {
+    const reachable = new Set<string>();
+    const queue = [mainModule.replace(/^\.\//, '')];
+    while (queue.length > 0) {
+      const cur = queue.shift()!;
+      if (reachable.has(cur) || !modules[cur]) continue;
+      reachable.add(cur);
+      const content = modules[cur]!.content;
+      const curDir = cur.includes('/') ? cur.slice(0, cur.lastIndexOf('/')) : '';
+      for (const m of content.matchAll(/(?:from|import)\s*\(?\s*["'](\.[^"']+)["']/g)) {
+        const rel = m[1]!;
+        const resolved = path.posix.normalize(curDir ? `${curDir}/${rel}` : rel).replace(/^\.\//, '');
+        if (modules[resolved]) queue.push(resolved);
+      }
+    }
+    if (reachable.size > 0 && reachable.size < Object.keys(modules).length) {
+      for (const key of Object.keys(modules)) {
+        if (!reachable.has(key) && modules[key]?.type === 'js') {
+          delete modules[key];
+        }
+      }
+    }
+  }
+
+  let totalBundleBytes = Object.values(modules).reduce((sum, m) => sum + m.content.length, 0);
+  if (totalBundleBytes > 9_500_000) {
+    // Minify large unminified JS bundles with esbuild (preserves all ESM export names & DO classes).
+    for (const [modName, mod] of Object.entries(modules)) {
+      if (mod.type === 'js' && mod.content.length > 100_000) {
+        try {
+          const minified = await esbuild.transform(mod.content, {
+            minify: true,
+            loader: 'js',
+            format: 'esm',
+            keepNames: true,
+            legalComments: 'none',
+          });
+          if (minified.code.length < mod.content.length) {
+            modules[modName] = { ...mod, content: minified.code };
+          }
+        } catch {
+          // Leave module untouched if transform fails.
+        }
+      }
+    }
+    totalBundleBytes = Object.values(modules).reduce((sum, m) => sum + m.content.length, 0);
+  }
   if (totalBundleBytes > 9_500_000) {
     return {
       dispatchScriptName,
@@ -809,16 +875,21 @@ async function migrateSingleScript(
     backedUpAt: new Date().toISOString(),
     settings,
     mainModule,
-    modules,
+    modules: originalModules,
   });
   await r2PutJson(apiToken, cfg.accountId, cfg.r2Bucket, bundleR2Key, bundleRecord);
 
-  // 2. For DO cohorts (B & C), swap WfP to zero-migration Export Shim & run verified import
+  // 2. For DO cohorts (B & C) or secret-bearing WfP apps, swap WfP to zero-migration
+  //    Export Shim, extract AES-GCM encrypted secrets edge-to-edge, & run DO import.
+  const secretNames = bindings
+    .filter((b) => b.type === 'secret_text' && typeof b.name === 'string')
+    .map((b) => String(b.name));
   let importedShards: unknown[] = [];
-  const targetMode = opts.cohort === 'c' ? 'dynamic_migrating' : 'dynamic';
-  if (doClasses.length > 0) {
+  let exportedSecrets: { secretCount: number; secretNames: string[] } | null = null;
+  const targetMode = doClasses.length > 0 && opts.cohort === 'c' ? 'dynamic_migrating' : 'dynamic';
+  if (doClasses.length > 0 || secretNames.length > 0) {
     if (!migrationHmacSecret) {
-      throw new Error('MIGRATION_HMAC_SECRET (or TOKEN_SIGNING_SECRET) is required for DO migrations');
+      throw new Error('MIGRATION_HMAC_SECRET (or TOKEN_SIGNING_SECRET) is required for DO/secret migrations');
     }
     await uploadWfpExportShim({
       apiToken,
@@ -826,52 +897,119 @@ async function migrateSingleScript(
       namespace: cfg.dispatchNamespace,
       dispatchScriptName,
       doBindings,
+      secretNames,
       hmacSecret: migrationHmacSecret,
       discoveryWebhookUrl:
-        opts.cohort === 'c'
+        doClasses.length > 0 && opts.cohort === 'c'
           ? `${cfg.dispatcherOrigin}/__chiridion_migrate/alarm-discovered?appId=${encodeURIComponent(dispatchScriptName)}`
           : undefined,
     });
 
-    if (opts.cohort === 'c') {
+    if (secretNames.length > 0) {
+      try {
+        let lastErr = '';
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          if (attempt > 0) await new Promise((r) => setTimeout(r, 2_000 * attempt));
+          const ts = Date.now();
+          const sig = await signMigrationRequest(
+            migrationHmacSecret,
+            `export-secrets:${dispatchScriptName}`,
+            ts,
+          );
+          const secResp = await fetch(`${cfg.dispatcherOrigin}/__chiridion_migrate/export-secrets`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              [MIGRATION_TS_HEADER]: String(ts),
+              [MIGRATION_SIG_HEADER]: sig,
+            },
+            body: JSON.stringify({ dispatchScriptName }),
+          });
+          if (secResp.ok) {
+            const secJson = (await secResp.json()) as {
+              ok: boolean;
+              secretCount: number;
+              secretNames: string[];
+            };
+            if (secJson.ok && secJson.secretCount > 0) {
+              exportedSecrets = {
+                secretCount: secJson.secretCount,
+                secretNames: secJson.secretNames,
+              };
+              break;
+            }
+            lastErr = `export-secrets returned 0 secrets for ${dispatchScriptName}`;
+          } else {
+            lastErr = `export-secrets HTTP ${secResp.status}: ${(await secResp.text()).slice(0, 200)}`;
+          }
+        }
+        if (!exportedSecrets) {
+          throw new Error(lastErr || `Failed to export secrets for ${dispatchScriptName}`);
+        }
+      } catch (secErr) {
+        await restoreWfpScriptFromBundle({
+          apiToken,
+          accountId: cfg.accountId,
+          namespace: cfg.dispatchNamespace,
+          dispatchScriptName,
+          bundle: bundleRecord,
+        }).catch(() => {});
+        throw secErr;
+      }
+    }
+
+    if (doClasses.length > 0 && opts.cohort === 'c') {
       // Allow any already-warm WfP DO isolate to reload onto ChiridionExportShimDO
       // before flipping KV to dynamic_migrating so the first lazy touch succeeds.
       await new Promise((r) => setTimeout(r, 12_000));
     }
 
-    if (opts.cohort === 'b') {
+    if (doClasses.length > 0 && opts.cohort === 'b') {
       try {
-        // Allow any already-warm WfP Durable Object isolate ~12s of quiet idle time
-        // so Cloudflare reloads the DO class onto ChiridionExportShimDO cleanly.
-        await new Promise((r) => setTimeout(r, 12_000));
+        // Allow any already-warm WfP Durable Object isolate quiet time to reload onto
+        // ChiridionExportShimDO cleanly, retrying up to 4 times if an active DO isolate
+        // hasn't recycled yet (HTTP 405 / non-shim response).
+        await new Promise((r) => setTimeout(r, 15_000));
         for (const className of doClasses) {
           for (const objectId of effectiveSingletonIds) {
-            const ts = Date.now();
-            const sig = await signMigrationRequest(
-              migrationHmacSecret,
-              '/__chiridion_migrate/import',
-              ts,
-            );
-            const importResp = await fetch(`${cfg.dispatcherOrigin}/__chiridion_migrate/import`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                [MIGRATION_TS_HEADER]: String(ts),
-                [MIGRATION_SIG_HEADER]: sig,
-              },
-              body: JSON.stringify({
-                dispatchScriptName,
-                className,
-                objectId,
-                orgId: String(registry.org_id ?? ''),
-              }),
-            });
-            if (!importResp.ok) {
-              throw new Error(
-                `Shard import failed for ${dispatchScriptName}:${className}:${objectId} (${importResp.status}): ${await importResp.text()}`,
+            let importedPayload: unknown = null;
+            let lastImportErr = '';
+            for (let attempt = 0; attempt < 4; attempt += 1) {
+              if (attempt > 0) await new Promise((r) => setTimeout(r, 5_000));
+              const ts = Date.now();
+              const sig = await signMigrationRequest(
+                migrationHmacSecret,
+                '/__chiridion_migrate/import',
+                ts,
               );
+              const importResp = await fetch(`${cfg.dispatcherOrigin}/__chiridion_migrate/import`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  [MIGRATION_TS_HEADER]: String(ts),
+                  [MIGRATION_SIG_HEADER]: sig,
+                },
+                body: JSON.stringify({
+                  dispatchScriptName,
+                  className,
+                  objectId,
+                  orgId: String(registry.org_id ?? ''),
+                }),
+              });
+              if (importResp.ok) {
+                importedPayload = await importResp.json();
+                break;
+              }
+              const errBody = await importResp.text();
+              lastImportErr = `Shard import failed for ${dispatchScriptName}:${className}:${objectId} (${importResp.status}): ${errBody}`;
+              if (!errBody.includes('HTTP 405') && !errBody.includes('non-shim response')) {
+                break;
+              }
             }
-            importedShards.push(await importResp.json());
+            if (!importedPayload) {
+              throw new Error(lastImportErr);
+            }
+            importedShards.push(importedPayload);
           }
         }
       } catch (importErr) {
@@ -915,6 +1053,7 @@ async function migrateSingleScript(
     bundle_r2_key: bundleR2Key,
     quota_tier: quotaTier,
     importedShards,
+    ...(exportedSecrets ? { exportedSecrets } : {}),
   };
 }
 

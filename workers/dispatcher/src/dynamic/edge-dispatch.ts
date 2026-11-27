@@ -14,6 +14,7 @@ import {
   loadDynamicBundleRecord,
   loadDynamicUserWorker,
   loadManagedEnvOverlay,
+  loadMigratedSecretsOverlay,
   type DynamicRuntimeExports,
 } from './bundle-store';
 import { emitAppUsageMetric, resolveQuotaTier } from './quota-policy';
@@ -25,6 +26,8 @@ export interface EdgeDispatchEnv {
   USER_APP_LOADER?: WorkerLoader;
   APP_USAGE_AE?: AnalyticsEngineDataset;
   MAIN_APP_BROKER?: Service<DynamicServiceBroker>;
+  MIGRATION_HMAC_SECRET?: string;
+  TOKEN_SIGNING_SECRET?: string;
   DISPATCHER?: {
     get(name: string): { fetch(request: Request): Promise<Response> };
   };
@@ -218,22 +221,28 @@ export async function dispatchDynamicWorkerEdge(input: {
     throw new Error(`Worker not found: bundle missing in R2 for ${dispatchScriptName}`);
   }
 
-  const [{ vars: managedOverlay, envHash }, enableLogsTail] = await Promise.all([
+  const [{ vars: managedOverlay, envHash }, migratedSecrets, enableLogsTail] = await Promise.all([
     loadManagedEnvOverlay(
       env,
       record.orgId,
       record.scriptName,
       accessInfo.env_version ?? 0,
     ),
+    loadMigratedSecretsOverlay(env, record),
     isDynamicLogsTailEnabled(env, record),
   ]);
+
+  const combinedOverlay =
+    migratedSecrets.length > 0 ? [...migratedSecrets, ...managedOverlay] : managedOverlay;
+  const effectiveEnvHash =
+    migratedSecrets.length > 0 ? `${envHash}:ms${migratedSecrets.length}` : envHash;
 
   const worker = loadDynamicUserWorker({
     loader: env.USER_APP_LOADER,
     record,
     exports,
-    managedOverlay,
-    envHash,
+    managedOverlay: combinedOverlay,
+    envHash: effectiveEnvHash,
     quotaTier,
     preferBroker: Boolean(env.MAIN_APP_BROKER),
     enableLogsTail,

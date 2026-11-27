@@ -10,6 +10,11 @@ import {
   type DynamicWorkerModule,
 } from '../../../main/src/dynamic-worker-registry';
 import type { ShardQuotaLimits } from './quota-policy';
+import {
+  decryptSecretsPayload,
+  dynamicSecretsR2Key,
+  type EncryptedSecretsEnvelope,
+} from './secret-crypto';
 import { generateDynamicWorkerWrapperSource } from './wrapper-generator';
 
 export interface DynamicRuntimeExports {
@@ -41,6 +46,8 @@ export interface BundleStoreEnv {
   R2_BUCKET?: R2Bucket;
   ORG?: DurableObjectNamespace<OrgDO>;
   USER_APP_LOADER?: WorkerLoader;
+  MIGRATION_HMAC_SECRET?: string;
+  TOKEN_SIGNING_SECRET?: string;
 }
 
 export interface ManagedAppEnvVar {
@@ -54,6 +61,56 @@ const bundleLru = new Map<string, DynamicWorkerBundleRecord>();
 
 const ENV_CACHE_TTL_MS = 60_000;
 const envVarCache = new Map<string, { expiresAt: number; vars: ManagedAppEnvVar[]; envHash: string }>();
+const MIGRATED_SECRETS_CACHE_TTL_MS = 5 * 60_000;
+const migratedSecretsCache = new Map<string, { expiresAt: number; vars: ManagedAppEnvVar[] }>();
+
+export async function loadMigratedSecretsOverlay(
+  env: BundleStoreEnv,
+  record: Pick<DynamicWorkerBundleRecord, 'dispatchScriptName' | 'bindings'>,
+): Promise<ManagedAppEnvVar[]> {
+  // Fast zero-cost path: 99.5% of bundles have no redacted WfP secret_text bindings.
+  const hasRedactedSecret = (record.bindings ?? []).some(
+    (b) =>
+      b.type === 'secret_text' &&
+      typeof b.text !== 'string' &&
+      typeof b.value !== 'string',
+  );
+  if (!hasRedactedSecret) return [];
+
+  const masterSecret = env.MIGRATION_HMAC_SECRET?.trim() || env.TOKEN_SIGNING_SECRET?.trim();
+  if (!masterSecret || !env.R2_BUCKET) return [];
+
+  const now = Date.now();
+  const cached = migratedSecretsCache.get(record.dispatchScriptName);
+  if (cached && cached.expiresAt > now) {
+    return cached.vars;
+  }
+
+  try {
+    const obj = await env.R2_BUCKET.get(dynamicSecretsR2Key(record.dispatchScriptName));
+    if (!obj) {
+      migratedSecretsCache.set(record.dispatchScriptName, {
+        expiresAt: now + 30_000,
+        vars: [],
+      });
+      return [];
+    }
+    const envelope = (await obj.json()) as EncryptedSecretsEnvelope;
+    const decrypted = await decryptSecretsPayload(masterSecret, envelope);
+    const vars: ManagedAppEnvVar[] = Object.entries(decrypted).map(([key, value]) => ({
+      key,
+      value,
+      isSecret: true,
+    }));
+    migratedSecretsCache.set(record.dispatchScriptName, {
+      expiresAt: now + MIGRATED_SECRETS_CACHE_TTL_MS,
+      vars,
+    });
+    return vars;
+  } catch {
+    return [];
+  }
+}
 
 export const DYNAMIC_LOGS_TAIL_KV_PREFIX = 'logs-tail-enabled:';
 const POST_DEPLOY_TAIL_WINDOW_MS = 60 * 60 * 1000;
@@ -103,6 +160,7 @@ export function clearBundleStoreCachesForTest(): void {
   bundleLru.clear();
   envVarCache.clear();
   tailEnabledCache.clear();
+  migratedSecretsCache.clear();
 }
 
 export async function loadDynamicBundleRecord(

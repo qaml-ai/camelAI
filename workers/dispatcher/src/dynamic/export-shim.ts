@@ -27,6 +27,7 @@ export interface BuildExportShimOptions {
   bindingMap: Record<string, string>; // bindingName -> className
   hmacSecret: string;
   discoveryWebhookUrl?: string;
+  secretNames?: string[];
 }
 
 export function buildWfpExportShimSource(options: BuildExportShimOptions): string {
@@ -49,6 +50,7 @@ import { DurableObject } from "cloudflare:workers";
 
 const HMAC_SECRET = ${JSON.stringify(options.hmacSecret)};
 const BINDING_MAP = ${JSON.stringify(options.bindingMap)};
+const SECRET_NAMES = ${JSON.stringify(options.secretNames ?? [])};
 const DISCOVERY_WEBHOOK_URL = ${JSON.stringify(options.discoveryWebhookUrl ?? '')};
 const FROZEN_KEY = "__chiridion_migration_frozen";
 const MAX_SKEW_MS = 60_000;
@@ -417,6 +419,18 @@ ${classExports}
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === "/__migrate/export-secrets") {
+      if (!(await verifyRequest(request, "/__migrate/export-secrets"))) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      const secrets = {};
+      for (const name of SECRET_NAMES) {
+        if (typeof env[name] === "string") {
+          secrets[name] = env[name];
+        }
+      }
+      return Response.json({ ok: true, secrets });
+    }
     if (!url.pathname.startsWith("/__migrate/")) {
       return new Response("Service temporarily migrating", {
         status: 503,

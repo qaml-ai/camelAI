@@ -70,8 +70,10 @@ import type { DynamicRuntimeExports } from './dynamic/bundle-store';
 import {
   MIGRATION_SIG_HEADER,
   MIGRATION_TS_HEADER,
+  signMigrationRequest,
   verifyMigrationSignature,
 } from './dynamic/migration-protocol';
+import { dynamicSecretsR2Key, encryptSecretsPayload } from './dynamic/secret-crypto';
 import type { TenantObjectSupervisorDO } from './dynamic/supervisor-do';
 export { AIVirtualBinding } from '../../main/src/ai-virtual-binding';
 export { AssetsVirtualBinding } from '../../main/src/assets-virtual-binding';
@@ -1464,6 +1466,58 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
         addedCount,
         assetCount,
         samplePaths: Object.keys(manifest).slice(-8),
+      });
+    }
+
+    if (url.pathname === '/__chiridion_migrate/export-secrets' && request.method === 'POST') {
+      const secret = env.MIGRATION_HMAC_SECRET?.trim() || env.TOKEN_SIGNING_SECRET?.trim();
+      const body = (await request.json()) as { dispatchScriptName?: string };
+      const dispatchScriptName = body.dispatchScriptName?.trim() || '';
+      const valid = secret && dispatchScriptName
+        ? await verifyMigrationSignature(
+            secret,
+            `export-secrets:${dispatchScriptName}`,
+            request.headers.get(MIGRATION_SIG_HEADER),
+            request.headers.get(MIGRATION_TS_HEADER),
+          )
+        : false;
+      if (!valid) return new Response('Forbidden', { status: 403 });
+      if (!env.DISPATCHER || !env.R2_BUCKET) {
+        return Response.json({ ok: false, error: 'DISPATCHER or R2_BUCKET not configured' }, { status: 500 });
+      }
+      const ts = Date.now();
+      const shimSig = await signMigrationRequest(secret, '/__migrate/export-secrets', ts);
+      const shimResp = await env.DISPATCHER.get(dispatchScriptName).fetch(
+        new Request('https://migrate.internal/__migrate/export-secrets', {
+          method: 'POST',
+          headers: {
+            [MIGRATION_TS_HEADER]: String(ts),
+            [MIGRATION_SIG_HEADER]: shimSig,
+          },
+        }),
+      );
+      if (!shimResp.ok) {
+        return Response.json(
+          {
+            ok: false,
+            error: `WfP shim export-secrets failed (${shimResp.status}): ${(await shimResp.text()).slice(0, 256)}`,
+          },
+          { status: 502 },
+        );
+      }
+      const payload = (await shimResp.json()) as { ok?: boolean; secrets?: Record<string, string> };
+      const secrets = payload.secrets ?? {};
+      const secretNames = Object.keys(secrets).sort();
+      const envelope = await encryptSecretsPayload(secret, secrets);
+      await env.R2_BUCKET.put(dynamicSecretsR2Key(dispatchScriptName), JSON.stringify(envelope), {
+        httpMetadata: { contentType: 'application/json' },
+      });
+      // Never return plaintext secret values — only names & count.
+      return Response.json({
+        ok: true,
+        dispatchScriptName,
+        secretCount: secretNames.length,
+        secretNames,
       });
     }
 

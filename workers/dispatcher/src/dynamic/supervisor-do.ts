@@ -107,6 +107,44 @@ function isExternalContentFtsSql(sqlText: string | undefined): boolean {
   return target.length > 0;
 }
 
+const MIGRATION_CHECKPOINT_KEY = '__chiridion_migration_checkpoint';
+
+interface MigrationCheckpoint {
+  freeze: FreezeResponsePayload;
+  cleanSchema: FreezeResponsePayload['schema'];
+  cleanTables: FreezeResponsePayload['tables'];
+  orderedTables: FreezeResponsePayload['tables'];
+  tableIndex: number;
+  cursor: number;
+  streamedRowCounts: Record<string, number>;
+  tableDigests: Record<string, string>;
+  kvAfterKey?: string;
+  kvDone: boolean;
+  streamedKvCount: number;
+  startedAt: number;
+}
+
+interface MigrationProgress {
+  databaseSize: number;
+  tableIndex: number;
+  totalTables: number;
+  currentTable: string;
+  rowsCopied: number;
+  totalRows: number;
+  tableCounts: Record<string, number>;
+  streamedRowCounts: Record<string, number>;
+  elapsedMs: number;
+}
+
+interface MigrationRunResult {
+  status: 'migrated' | 'empty' | 'already_migrated' | 'in_progress';
+  hexId?: string;
+  tableCounts?: Record<string, number>;
+  kvCount?: number;
+  overallDigest?: string;
+  progress?: MigrationProgress;
+}
+
 function getFtsShadowAndExternalTables(
   schema: Array<{ type: string; name: string; sql: string }>,
 ): { shadowLower: Set<string>; externalFtsLower: Set<string> } {
@@ -749,14 +787,8 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
    */
   async migrateFromWfpShim(
     identityInput: SupervisorIdentity,
-    options?: { force?: boolean; orgId?: string; quotaTier?: AppQuotaTier },
-  ): Promise<{
-    status: 'migrated' | 'empty' | 'already_migrated';
-    hexId?: string;
-    tableCounts?: Record<string, number>;
-    kvCount?: number;
-    overallDigest?: string;
-  }> {
+    options?: { force?: boolean; resume?: boolean; budgetMs?: number; orgId?: string; quotaTier?: AppQuotaTier },
+  ): Promise<MigrationRunResult> {
     if (this.migrationInFlight) {
       return this.migrationInFlight;
     }
@@ -773,19 +805,18 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
 
   private async runMigrationFromWfpShim(
     identityInput: SupervisorIdentity,
-    options?: { force?: boolean; orgId?: string; quotaTier?: AppQuotaTier },
-  ): Promise<{
-    status: 'migrated' | 'empty' | 'already_migrated';
-    hexId?: string;
-    tableCounts?: Record<string, number>;
-    kvCount?: number;
-    overallDigest?: string;
-  }> {
+    options?: { force?: boolean; resume?: boolean; budgetMs?: number; orgId?: string; quotaTier?: AppQuotaTier },
+  ): Promise<MigrationRunResult> {
+    const callStartedAt = Date.now();
+    const budgetMs =
+      typeof options?.budgetMs === 'number' && options.budgetMs >= 5_000
+        ? options.budgetMs
+        : 0;
     const identity = await this.ensureIdentity(identityInput);
     if (!identity) throw new Error('Missing supervisor identity for migration');
 
     const existing = await this.getMigrationState();
-    if (!options?.force && existing && (existing.status === 'migrated' || existing.status === 'empty')) {
+    if (!options?.force && !options?.resume && existing && (existing.status === 'migrated' || existing.status === 'empty')) {
       return { status: 'already_migrated', hexId: existing.legacyHexId, overallDigest: existing.sourceDigest };
     }
 
@@ -793,92 +824,73 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       throw new Error('USER_APP_LOADER binding is required for migration import');
     }
 
-    let freeze: FreezeResponsePayload | null = null;
-    let lastFreezeErr: unknown = null;
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      if (attempt > 0) {
-        await new Promise((r) => setTimeout(r, 1_500));
-      }
-      try {
-        const candidate = await this.fetchWfpShim<FreezeResponsePayload>(
-          identity.dispatchScriptName,
-          identity.className,
-          identity.objectId,
-          '/__migrate/freeze',
-          {},
-          'POST',
-        );
-        if (candidate && Array.isArray(candidate.tables) && Array.isArray(candidate.schema)) {
-          freeze = candidate;
-          break;
+    const storedCheckpoint = await this.ctx.storage.get<MigrationCheckpoint>(MIGRATION_CHECKPOINT_KEY);
+    let checkpoint: MigrationCheckpoint | null =
+      storedCheckpoint && (options?.resume || !options?.force) ? storedCheckpoint : null;
+
+    if (!checkpoint) {
+      await this.ctx.storage.delete(MIGRATION_CHECKPOINT_KEY);
+      let freeze: FreezeResponsePayload | null = null;
+      let lastFreezeErr: unknown = null;
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        if (attempt > 0) {
+          await new Promise((r) => setTimeout(r, 1_500));
         }
-        lastFreezeErr = new Error(
-          `WfP DO isolate for ${identity.dispatchScriptName}:${identity.className} returned non-shim response (likely active WebSocket/alarm still running pre-shim code)`,
-        );
-      } catch (err) {
-        lastFreezeErr = err;
-        const msg = err instanceof Error ? err.message : String(err);
-        const isPreRecycle =
-          msg.includes('Handler does not export a fetch') ||
-          msg.includes('HTTP 405') ||
-          msg.includes('HTTP 404') ||
-          msg.includes('non-shim response') ||
-          msg.includes('Unexpected token') ||
-          msg.includes('not valid JSON');
-        if (!isPreRecycle) throw err;
+        try {
+          const candidate = await this.fetchWfpShim<FreezeResponsePayload>(
+            identity.dispatchScriptName,
+            identity.className,
+            identity.objectId,
+            '/__migrate/freeze',
+            {},
+            'POST',
+          );
+          if (candidate && Array.isArray(candidate.tables) && Array.isArray(candidate.schema)) {
+            freeze = candidate;
+            break;
+          }
+          lastFreezeErr = new Error(
+            `WfP DO isolate for ${identity.dispatchScriptName}:${identity.className} returned non-shim response (likely active WebSocket/alarm still running pre-shim code)`,
+          );
+        } catch (err) {
+          lastFreezeErr = err;
+          const msg = err instanceof Error ? err.message : String(err);
+          const isPreRecycle =
+            msg.includes('Handler does not export a fetch') ||
+            msg.includes('HTTP 405') ||
+            msg.includes('HTTP 404') ||
+            msg.includes('non-shim response') ||
+            msg.includes('Unexpected token') ||
+            msg.includes('not valid JSON');
+          if (!isPreRecycle) throw err;
+        }
       }
-    }
-    if (!freeze) {
-      throw lastFreezeErr instanceof Error
-        ? lastFreezeErr
-        : new Error(String(lastFreezeErr ?? 'WfP export shim freeze failed'));
-    }
+      if (!freeze) {
+        throw lastFreezeErr instanceof Error
+          ? lastFreezeErr
+          : new Error(String(lastFreezeErr ?? 'WfP export shim freeze failed'));
+      }
 
-    const hasSqlData = freeze.tables.some((t) => t.rowCount > 0) || freeze.schema.length > 0;
-    const hasAnyState = hasSqlData || freeze.kvCount > 0 || freeze.alarmMs !== null;
+      const hasSqlData = freeze.tables.some((t) => t.rowCount > 0) || freeze.schema.length > 0;
+      const hasAnyState = hasSqlData || freeze.kvCount > 0 || freeze.alarmMs !== null;
 
-    // Record hex -> name anti-split-brain alias whenever migrating a named DO.
-    if (freeze.hexId && identity.objectId !== freeze.hexId) {
-      await this.env.APP_KV.put(
-        dynamicDoAliasKey(identity.dispatchScriptName, identity.className, freeze.hexId),
-        identity.objectId,
-      );
-    }
+      // Record hex -> name anti-split-brain alias whenever migrating a named DO.
+      if (freeze.hexId && identity.objectId !== freeze.hexId) {
+        await this.env.APP_KV.put(
+          dynamicDoAliasKey(identity.dispatchScriptName, identity.className, freeze.hexId),
+          identity.objectId,
+        );
+      }
 
-    if (!hasAnyState) {
-      await this.setMigrationState({
-        status: 'empty',
-        legacyHexId: freeze.hexId,
-        migratedAt: new Date().toISOString(),
-      });
-      return { status: 'empty', hexId: freeze.hexId, tableCounts: {}, kvCount: 0 };
-    }
+      if (!hasAnyState) {
+        await this.setMigrationState({
+          status: 'empty',
+          legacyHexId: freeze.hexId,
+          migratedAt: new Date().toISOString(),
+        });
+        return { status: 'empty', hexId: freeze.hexId, tableCounts: {}, kvCount: 0 };
+      }
 
-    // Abort any running facet cleanly before mounting the one-shot importer facet on `"main"`.
-    try {
-      this.ctx.facets.abort('main', new Error('Mounting privileged migration importer facet'));
-    } catch {}
-    this.activeFacetBundleKey = null;
-
-    const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v6', () => ({
-      compatibilityDate: '2026-07-13',
-      compatibilityFlags: ['nodejs_compat'],
-      mainModule: '__chiridion_importer.js',
-      modules: {
-        '__chiridion_importer.js': MIGRATION_IMPORTER_FACET_SOURCE,
-      },
-      globalOutbound: null,
-    }));
-
-    const importerFacet = this.ctx.facets.get('main', () => ({
-      class: importerWorker.getDurableObjectClass('ChiridionMigrationImporterDO'),
-    })) as unknown as { fetch(req: Request): Promise<Response> };
-
-    try {
-      // Filter out SQLite FTS5 shadow tables (*_data, *_idx, *_content, *_docsize, *_config)
-      // and external-content FTS5 virtual tables on the supervisor side as well, so Cohort C
-      // apps still running an older WfP export shim migrate cleanly without attempting direct
-      // INSERTs into FTS5 shadow tables (SQLITE_ERROR: table *_fts_config may not be modified).
       const { shadowLower, externalFtsLower } = getFtsShadowAndExternalTables(freeze.schema);
       const cleanSchema = freeze.schema.filter(
         (item) => !(item.type === 'table' && shadowLower.has(item.name.toLowerCase())),
@@ -887,8 +899,27 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         const lower = t.name.toLowerCase();
         return !shadowLower.has(lower) && !externalFtsLower.has(lower);
       });
+      const orderedTables = sortTablesByForeignKeys(cleanTables, cleanSchema);
 
-      const migStartedAt = Date.now();
+      // Abort any running facet cleanly before mounting the one-shot importer facet on `"main"`.
+      try {
+        this.ctx.facets.abort('main', new Error('Mounting privileged migration importer facet'));
+      } catch {}
+      this.activeFacetBundleKey = null;
+
+      const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v6', () => ({
+        compatibilityDate: '2026-07-13',
+        compatibilityFlags: ['nodejs_compat'],
+        mainModule: '__chiridion_importer.js',
+        modules: {
+          '__chiridion_importer.js': MIGRATION_IMPORTER_FACET_SOURCE,
+        },
+        globalOutbound: null,
+      }));
+      const importerFacet = this.ctx.facets.get('main', () => ({
+        class: importerWorker.getDurableObjectClass('ChiridionMigrationImporterDO'),
+      })) as unknown as { fetch(req: Request): Promise<Response> };
+
       console.log('[supervisor] migration freeze complete', {
         supervisorKey: identity.supervisorKey,
         databaseSize: freeze.databaseSize,
@@ -909,28 +940,62 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         throw new Error(`Importer schema replay failed: ${await schemaResp.text()}`);
       }
 
-      // 2. Stream every table in up to 1000-row / 1.5MB pages (parent tables before FK-referencing child tables)
-      // and verify read-back SHA-256 parity on EVERY page immediately after commit.
-      // Start cursor at Number.MIN_SAFE_INTEGER so tables with negative INTEGER PRIMARY KEY
-      // aliases for rowid (e.g. Telegram supergroup chat IDs like -1001234567890) are exported.
-      const orderedTables = sortTablesByForeignKeys(cleanTables, cleanSchema);
-      const streamedRowCounts: Record<string, number> = {};
-      const tableDigests: Record<string, string> = {};
-      for (const table of orderedTables) {
-        streamedRowCounts[table.name] = 0;
-        let rollingDigest = 'v3';
+      const initialCounts: Record<string, number> = {};
+      const initialDigests: Record<string, string> = {};
+      for (const t of orderedTables) {
+        initialCounts[t.name] = 0;
+        initialDigests[t.name] = 'v3';
+      }
+      checkpoint = {
+        freeze,
+        cleanSchema,
+        cleanTables,
+        orderedTables,
+        tableIndex: 0,
+        cursor: Number.MIN_SAFE_INTEGER,
+        streamedRowCounts: initialCounts,
+        tableDigests: initialDigests,
+        kvDone: false,
+        streamedKvCount: 0,
+        startedAt: callStartedAt,
+      };
+      await this.ctx.storage.put(MIGRATION_CHECKPOINT_KEY, checkpoint);
+    }
+
+    const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v6', () => ({
+      compatibilityDate: '2026-07-13',
+      compatibilityFlags: ['nodejs_compat'],
+      mainModule: '__chiridion_importer.js',
+      modules: {
+        '__chiridion_importer.js': MIGRATION_IMPORTER_FACET_SOURCE,
+      },
+      globalOutbound: null,
+    }));
+
+    const importerFacet = this.ctx.facets.get('main', () => ({
+      class: importerWorker.getDurableObjectClass('ChiridionMigrationImporterDO'),
+    })) as unknown as { fetch(req: Request): Promise<Response> };
+
+    let keepFacetMounted = false;
+    try {
+      const { freeze, cleanSchema, cleanTables, orderedTables } = checkpoint;
+
+      // 2. Stream every table in up to 1000-row / 1.5MB pages and verify read-back SHA-256 parity
+      // on EVERY page immediately after commit. Supports resumable chunking when budgetMs is set.
+      while (checkpoint.tableIndex < orderedTables.length) {
+        const table = orderedTables[checkpoint.tableIndex]!;
         if (table.rowCount === 0) {
-          tableDigests[table.name] = rollingDigest;
+          checkpoint.tableIndex += 1;
+          checkpoint.cursor = Number.MIN_SAFE_INTEGER;
           continue;
         }
-        let cursor = Number.MIN_SAFE_INTEGER;
         while (true) {
           const page = await this.fetchWfpShim<SqlPagePayload>(
             identity.dispatchScriptName,
             identity.className,
             identity.objectId,
             '/__migrate/export-sql',
-            { table: table.name, afterRowid: String(cursor), limit: '1000' },
+            { table: table.name, afterRowid: String(checkpoint.cursor), limit: '1000' },
           );
           if (page.rows.length > 0) {
             const importResp = await importerFacet.fetch(
@@ -955,35 +1020,58 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
             };
             if (page.pageDigest && importResult.pageDigest && importResult.pageDigest !== page.pageDigest) {
               throw new Error(
-                `Page SHA-256 parity mismatch for ${identity.supervisorKey} table=${table.name} cursor=${cursor}: ` +
+                `Page SHA-256 parity mismatch for ${identity.supervisorKey} table=${table.name} cursor=${checkpoint.cursor}: ` +
                   `source=${page.pageDigest} target=${importResult.pageDigest}`,
               );
             }
-            streamedRowCounts[table.name] += page.rows.length;
+            checkpoint.streamedRowCounts[table.name] =
+              (checkpoint.streamedRowCounts[table.name] ?? 0) + page.rows.length;
+            const prevDigest = checkpoint.tableDigests[table.name] ?? 'v3';
             const digestBytes = await crypto.subtle.digest(
               'SHA-256',
-              new TextEncoder().encode(`${rollingDigest}:${page.pageDigest ?? page.rows.length}`),
+              new TextEncoder().encode(`${prevDigest}:${page.pageDigest ?? page.rows.length}`),
             );
-            rollingDigest = [...new Uint8Array(digestBytes)]
+            checkpoint.tableDigests[table.name] = [...new Uint8Array(digestBytes)]
               .map((b) => b.toString(16).padStart(2, '0'))
               .join('');
           }
-          if (page.done || page.nextCursor === null) break;
-          cursor = page.nextCursor;
+          if (page.done || page.nextCursor === null) {
+            checkpoint.tableIndex += 1;
+            checkpoint.cursor = Number.MIN_SAFE_INTEGER;
+            break;
+          }
+          checkpoint.cursor = page.nextCursor;
+
+          if (budgetMs > 0 && Date.now() - callStartedAt >= budgetMs) {
+            await this.ctx.storage.put(MIGRATION_CHECKPOINT_KEY, checkpoint);
+            keepFacetMounted = true;
+            return {
+              status: 'in_progress',
+              hexId: freeze.hexId,
+              progress: {
+                databaseSize: freeze.databaseSize,
+                tableIndex: checkpoint.tableIndex,
+                totalTables: orderedTables.length,
+                currentTable: table.name,
+                rowsCopied: Object.values(checkpoint.streamedRowCounts).reduce((a, b) => a + b, 0),
+                totalRows: orderedTables.reduce((a, t) => a + t.rowCount, 0),
+                tableCounts: Object.fromEntries(orderedTables.map((t) => [t.name, t.rowCount])),
+                streamedRowCounts: { ...checkpoint.streamedRowCounts },
+                elapsedMs: Date.now() - checkpoint.startedAt,
+              },
+            };
+          }
         }
-        tableDigests[table.name] = rollingDigest;
       }
 
       // 3. Stream DO KV entries directly to /__import/kv in bounded pages (O(1) RAM)
-      let streamedKvCount = 0;
-      let afterKey: string | undefined;
-      while (true) {
+      while (!checkpoint.kvDone) {
         const kvPage = await this.fetchWfpShim<KvPagePayload>(
           identity.dispatchScriptName,
           identity.className,
           identity.objectId,
           '/__migrate/export-kv',
-          { ...(afterKey ? { afterKey } : {}), limit: '256' },
+          { ...(checkpoint.kvAfterKey ? { afterKey: checkpoint.kvAfterKey } : {}), limit: '256' },
         );
         if (kvPage.entries.length > 0) {
           const kvResp = await importerFacet.fetch(
@@ -996,10 +1084,13 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
           if (!kvResp.ok) {
             throw new Error(`Importer KV page failed: ${await kvResp.text()}`);
           }
-          streamedKvCount += kvPage.entries.length;
+          checkpoint.streamedKvCount += kvPage.entries.length;
         }
-        if (kvPage.done || !kvPage.nextAfterKey) break;
-        afterKey = kvPage.nextAfterKey;
+        if (kvPage.done || !kvPage.nextAfterKey) {
+          checkpoint.kvDone = true;
+          break;
+        }
+        checkpoint.kvAfterKey = kvPage.nextAfterKey;
       }
 
       // 4. Finalize indexes/triggers/views/sqlite_sequence + verify final table & KV counts
@@ -1025,8 +1116,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         throw new Error(`Importer finalize/integrity_check failed: ${JSON.stringify(finalized)}`);
       }
 
-      // 5. Verify final counts & frozen state against the WfP shard (<20ms via /__migrate/verify-counts,
-      // falling back to /__migrate/verify for older shims) alongside per-page read-back SHA-256 parity.
+      // 5. Verify final counts & frozen state against the WfP shard (<20ms via /__migrate/verify-counts)
       let verifyCounts: {
         hexId: string;
         alarmMs: number | null;
@@ -1059,19 +1149,19 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
 
       const countsOk =
         finalized.kvCount === verifyCounts.kvCount &&
-        streamedKvCount === verifyCounts.kvCount &&
+        checkpoint.streamedKvCount === verifyCounts.kvCount &&
         cleanTables.every(
           (t) =>
             finalized.tableCounts[t.name] === verifyCounts.tableCounts[t.name] &&
-            streamedRowCounts[t.name] === verifyCounts.tableCounts[t.name],
+            checkpoint.streamedRowCounts[t.name] === verifyCounts.tableCounts[t.name],
         );
       if (!countsOk) {
         throw new Error(
           `Migration parity mismatch for ${identity.supervisorKey}: ` +
             `sourceCounts=${JSON.stringify(verifyCounts.tableCounts)} ` +
             `targetCounts=${JSON.stringify(finalized.tableCounts)} ` +
-            `streamedCounts=${JSON.stringify(streamedRowCounts)} ` +
-            `kv(source=${verifyCounts.kvCount},target=${finalized.kvCount},streamed=${streamedKvCount})`,
+            `streamedCounts=${JSON.stringify(checkpoint.streamedRowCounts)} ` +
+            `kv(source=${verifyCounts.kvCount},target=${finalized.kvCount},streamed=${checkpoint.streamedKvCount})`,
         );
       }
 
@@ -1080,7 +1170,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         new TextEncoder().encode(
           JSON.stringify({
             tableCounts: finalized.tableCounts,
-            tableDigests,
+            tableDigests: checkpoint.tableDigests,
             kvCount: finalized.kvCount,
           }),
         ),
@@ -1094,6 +1184,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         await this.ctx.storage.setAlarm(Math.max(Date.now() + 1_000, verifyCounts.alarmMs));
       }
 
+      await this.ctx.storage.delete(MIGRATION_CHECKPOINT_KEY);
       await this.setMigrationState({
         status: 'migrated',
         legacyHexId: verifyCounts.hexId,
@@ -1111,7 +1202,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
 
       console.log('[supervisor] migration complete', {
         supervisorKey: identity.supervisorKey,
-        elapsedMs: Date.now() - migStartedAt,
+        elapsedMs: Date.now() - checkpoint.startedAt,
         tables: Object.keys(finalized.tableCounts).length,
         kvCount: finalized.kvCount,
       });
@@ -1124,11 +1215,13 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         overallDigest,
       };
     } finally {
-      // Unmount the one-shot importer facet so the next call loads the real user DO class on `"main"`.
-      try {
-        this.ctx.facets.abort('main', new Error('Migration importer completed'));
-      } catch {}
-      this.activeFacetBundleKey = null;
+      if (!keepFacetMounted) {
+        // Unmount the one-shot importer facet so the next call loads the real user DO class on `"main"`.
+        try {
+          this.ctx.facets.abort('main', new Error('Migration importer completed'));
+        } catch {}
+        this.activeFacetBundleKey = null;
+      }
     }
   }
 

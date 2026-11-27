@@ -1168,6 +1168,8 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
         className: string;
         objectId: string;
         force?: boolean;
+        resume?: boolean;
+        budgetMs?: number;
         orgId?: string;
       };
       if (!body.dispatchScriptName || !body.className || !body.objectId) {
@@ -1183,7 +1185,12 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
             className: body.className,
             objectId: body.objectId,
           },
-          { force: body.force, orgId: body.orgId },
+          {
+            force: body.force,
+            resume: body.resume,
+            budgetMs: body.budgetMs,
+            orgId: body.orgId,
+          },
         );
         return Response.json({ ok: true, supervisorKey, ...result });
       } catch (error) {

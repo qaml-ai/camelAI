@@ -140,7 +140,9 @@ function buildAgentMcpTools() {
       // loop gives the model directly (long builds and notebooks among them,
       // which outlast js_exec's 120 s) stay direct too; the rest are for code.
       _meta: {
-        "agent-runtime/exposure": AGENT_MCP_CONFIRMED_TOOL_NAMES.has(definition.name) || definition.name === "prompt_connection_setup"
+        "agent-runtime/exposure": AGENT_MCP_CONFIRMED_TOOL_NAMES.has(definition.name) ||
+          definition.name === "prompt_connection_setup" ||
+          definition.name === "prompt_app_secrets"
           ? "direct"
           : DIRECT_FIRST.has(definition.name) ? "both" : "codemode",
       },
@@ -241,6 +243,9 @@ export function agentToolServer(env: Env, tools: ToolsFactory, version?: "v2"): 
           }
           return toMcpResult(await tools({ ...scoped, preconfirmed: true }).callToolEnvelope(name, args));
         }
+        if (name === "prompt_app_secrets") {
+          return await handlePromptAppSecrets(env, props, args, context);
+        }
         const result = toMcpResult(await tools(scoped).callToolEnvelope(name, args));
         if (name === "prompt_connection_setup") return await connectionSetupFallback(env, result, args, context);
         return result;
@@ -258,6 +263,120 @@ export function agentToolServer(env: Env, tools: ToolsFactory, version?: "v2"): 
       }
     },
   };
+}
+
+const APP_SECRET_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+
+/**
+ * Blind runtime secrets prompt: suspends the turn with an app_secrets form
+ * elicitation so the chat UI opens a secure popup that submits secret values
+ * directly to OrgDO (never through the agent runtime or LLM context). When the
+ * user finishes, only configured key names are returned to the model.
+ */
+async function handlePromptAppSecrets(
+  env: Env,
+  props: CodeModeToolsProps,
+  args: Record<string, unknown>,
+  context: ToolContext,
+): Promise<CallToolResult> {
+  const appName = text(args.app_name);
+  if (!appName) return toolError("app_name is required");
+
+  const rawKeys = Array.isArray(args.keys) ? args.keys : [];
+  if (rawKeys.length === 0) return toolError("keys must be a non-empty array");
+  if (rawKeys.length > 20) return toolError("At most 20 keys can be requested at once");
+
+  const normalizedKeys: Array<{
+    key: string;
+    description?: string;
+    required: boolean;
+    isSecret: boolean;
+  }> = [];
+  const seenKeys = new Set<string>();
+  for (const raw of rawKeys) {
+    if (!isRecord(raw)) return toolError("Each entry in keys must be an object with a key string");
+    const key = text(raw.key);
+    if (!APP_SECRET_KEY_RE.test(key)) {
+      return toolError(
+        `Invalid variable name "${key}": must start with a letter or underscore and contain only letters, digits, and underscores.`,
+      );
+    }
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    const description = text(raw.description);
+    normalizedKeys.push({
+      key,
+      ...(description ? { description: description.slice(0, 240) } : {}),
+      required: raw.required !== false,
+      isSecret: raw.is_secret !== false,
+    });
+  }
+
+  const orgStub = getOrgStub(env, props.orgId);
+  const script = await orgStub.getWorkerScript(appName);
+  if (!script || script.workspace_id !== props.workspaceId) {
+    return toolError(
+      `Deployed app '${appName}' was not found in this workspace. Deploy the app first with deploy_project before prompting for runtime secrets.`,
+    );
+  }
+
+  const existingBefore = await orgStub.listAppEnvVars(script.script_name);
+  const existingKeys = existingBefore.map((entry) => entry.key);
+  const customMessage = text(args.message);
+  const promptMessage =
+    customMessage ||
+    `Configure runtime secrets for ${script.script_name} (${normalizedKeys.map((k) => k.key).join(", ")})`;
+
+  const answer = await context.ask(promptMessage, {
+    type: "object",
+    "x-camelai-kind": "app_secrets",
+    "x-camelai-app-secrets": {
+      workspaceId: props.workspaceId,
+      scriptName: script.script_name,
+      message: promptMessage,
+      existingKeys,
+      keys: normalizedKeys,
+    },
+    properties: {
+      saved: { type: "boolean", title: "Saved" },
+    },
+  });
+
+  const existingAfter = await orgStub.listAppEnvVars(script.script_name);
+  const configuredSet = new Set(existingAfter.map((entry) => entry.key));
+  const configuredKeys = normalizedKeys
+    .map((entry) => entry.key)
+    .filter((key) => configuredSet.has(key));
+  const missingKeys = normalizedKeys
+    .filter((entry) => entry.required && !configuredSet.has(entry.key))
+    .map((entry) => entry.key);
+
+  if (!answer) {
+    return toMcpResult({
+      ok: true,
+      data: {
+        ok: true,
+        app_name: script.script_name,
+        cancelled: true,
+        configured_keys: configuredKeys,
+        missing_keys: missingKeys,
+        note: "The user dismissed the secrets prompt. Only key names are reported; secret values are never visible to the agent.",
+      },
+    });
+  }
+
+  return toMcpResult({
+    ok: true,
+    data: {
+      ok: true,
+      app_name: script.script_name,
+      cancelled: false,
+      configured_keys: configuredKeys,
+      all_configured_keys: existingAfter.map((entry) => entry.key),
+      missing_keys: missingKeys,
+      note: "Secret values are stored encrypted at rest and injected as env.<KEY> on every request (including Durable Objects) across all future redeployments. The agent cannot read secret values.",
+    },
+  });
 }
 
 /**

@@ -65,6 +65,8 @@ import {
   ConnectionSetupPrompt,
   type ConnectionSetupPromptData,
 } from "@/components/connection-setup-prompt";
+import { AppSecretsPromptDialog } from "@/components/app-secrets-prompt-dialog";
+import type { RuntimeAppSecretsPrompt } from "@/lib/agent-runtime-shared";
 import type { Attachment } from "@/components/attachment-list";
 import { Button } from "@/components/ui/button";
 import {
@@ -246,7 +248,8 @@ type ChatAgentState = Partial<
     PreviewTarget,
     AskUserQuestionData,
     ConnectionSetupPromptData,
-    LlmModel
+    LlmModel,
+    RuntimeAppSecretsPrompt
   >
 >;
 
@@ -876,6 +879,9 @@ export default function Chat({
   const [pendingQuestion, setPendingQuestion] =
     useState<AskUserQuestionData | null>(null);
   const optimisticallyAnsweredQuestionIdRef = useRef<string | null>(null);
+  const [pendingAppSecretsPrompt, setPendingAppSecretsPrompt] =
+    useState<RuntimeAppSecretsPrompt | null>(null);
+  const optimisticallyResolvedAppSecretsInputIdRef = useRef<string | null>(null);
   const currentChatPath = useMemo(
     () => `${locationPathname}${locationSearch}${locationHash}`,
     [locationHash, locationPathname, locationSearch],
@@ -3008,6 +3014,17 @@ export default function Chat({
         if (suppressedId) optimisticallyAnsweredQuestionIdRef.current = null;
         return sameJson(previous, next) ? previous : next;
       });
+      setPendingAppSecretsPrompt((previous) => {
+        const next = state.pendingAppSecretsPrompt ?? null;
+        const suppressedId = optimisticallyResolvedAppSecretsInputIdRef.current;
+        if (!next) {
+          if (suppressedId) optimisticallyResolvedAppSecretsInputIdRef.current = null;
+          return previous === null ? previous : null;
+        }
+        if (suppressedId === next.inputId) return previous;
+        if (suppressedId) optimisticallyResolvedAppSecretsInputIdRef.current = null;
+        return sameJson(previous, next) ? previous : next;
+      });
       setConnectionSetupPrompt((previous) => {
         const next = state.connectionSetupPrompt ?? null;
         const suppressedId =
@@ -4144,6 +4161,28 @@ export default function Chat({
     [pendingQuestion],
   );
 
+  const handleAppSecretsPromptResolve = useCallback(
+    (accepted: boolean) => {
+      const agent = chatAgentRef.current;
+      if (
+        !pendingAppSecretsPrompt ||
+        !agent ||
+        agent.readyState !== CLIENT_OPEN
+      ) {
+        return;
+      }
+      optimisticallyResolvedAppSecretsInputIdRef.current =
+        pendingAppSecretsPrompt.inputId;
+      void agent.call("resolveAppSecretsPrompt", [
+        pendingAppSecretsPrompt.inputId,
+        accepted,
+      ]);
+      setPendingAppSecretsPrompt(null);
+      window.setTimeout(() => composerTextareaRef.current?.focus(), 0);
+    },
+    [pendingAppSecretsPrompt],
+  );
+
   const resetPreviewTabsState = useCallback(() => {
     setLocalPreviewSessionState([], null);
     setTabIframeKeys({});
@@ -4942,6 +4981,14 @@ export default function Chat({
           data={connectionSetupPrompt}
           onSubmit={handleConnectionSetupResponse}
           onCancel={handleConnectionSetupCancel}
+        />
+      )}
+
+      {/* Blind App Runtime Secrets Prompt Modal */}
+      {pendingAppSecretsPrompt && (
+        <AppSecretsPromptDialog
+          prompt={pendingAppSecretsPrompt}
+          onResolve={handleAppSecretsPromptResolve}
         />
       )}
     </TooltipProvider>

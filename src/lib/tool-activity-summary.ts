@@ -125,6 +125,10 @@ function canonicalizeToolSummaryName(name: string): string {
       return 'CreateConnection';
     case 'prompt_connection_setup':
       return 'PromptConnectionSetup';
+    case 'prompt_app_secrets':
+      return 'PromptAppSecrets';
+    case 'list_app_secrets':
+      return 'ListAppSecrets';
     case 'get_custom_domain':
       return 'GetCustomDomain';
     case 'set_custom_domain':

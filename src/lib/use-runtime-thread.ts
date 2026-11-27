@@ -14,7 +14,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { AgentMessage } from "@/lib/agent-messages";
 import type { Message, PreviewTarget } from "@/types";
-import { localToolName, runtimeInputQuestions, runtimeSpendLimitError, V2_BROWSER_SESSION, type RuntimeInput } from "@/lib/agent-runtime-shared";
+import { localToolName, runtimeInputAppSecrets, runtimeInputQuestions, runtimeSpendLimitError, V2_BROWSER_SESSION, type RuntimeAppSecretsPrompt, type RuntimeInput } from "@/lib/agent-runtime-shared";
 import { latestRuntimeTodos, piRender, type PiRenderMemo } from "@/lib/pi-render";
 import { getPreviewTabId } from "@/components/preview-panel/preview-utils";
 import { watchAgent, type AgentView, type Watcher } from "@camelai/run/watch";
@@ -60,6 +60,7 @@ export interface RuntimeThreadState {
   currentTodos: unknown[];
   contextUsedPercent: number | null;
   pendingQuestion: { questionId: string; questions: unknown[] } | null;
+  pendingAppSecretsPrompt: RuntimeAppSecretsPrompt | null;
   connectionSetupPrompt: null;
   lastError: { id: string; error: string; billingSource: null; provider: null; status: null; errorType: null } | null;
   modelFallbackNotice?: { id: string; fromModel: string; toModel: string; reason: "hosted_credits_exhausted" | "hosted_subscription_unavailable"; createdAt: number } | null;
@@ -544,11 +545,17 @@ export function useRuntimeThread(options: {
     // `sends` changes when sentRef does.
   }, [threadId, view, clientMessageIds, sends]);
 
-  // Inputs the chat cannot ask (forms with fields) are cancelled, as the DO did, so the turn goes on.
+  // Inputs the chat cannot ask (arbitrary forms with fields) are cancelled, as the DO did, so the turn goes on.
   useEffect(() => {
     if (!enabled) return;
     for (const input of view.pendingInputs as RuntimeInput[]) {
-      if (runtimeInputQuestions(input) || cancelledInputsRef.current.has(input.id)) continue;
+      if (
+        runtimeInputQuestions(input) ||
+        runtimeInputAppSecrets(input) ||
+        cancelledInputsRef.current.has(input.id)
+      ) {
+        continue;
+      }
       cancelledInputsRef.current.add(input.id);
       void postJson(`${base}/inputs/${encodeURIComponent(input.id)}${query}`, { action: "cancel" });
     }
@@ -559,6 +566,9 @@ export function useRuntimeThread(options: {
     const question = (view.pendingInputs as RuntimeInput[])
       .map((input) => ({ input, card: runtimeInputQuestions(input) }))
       .find((entry) => entry.card);
+    const appSecretsPrompt = (view.pendingInputs as RuntimeInput[])
+      .map((input) => runtimeInputAppSecrets(input))
+      .find((entry): entry is RuntimeAppSecretsPrompt => Boolean(entry)) ?? null;
     const known = knownIndexesRef.current;
     let lastError: RuntimeThreadState["lastError"] = null;
     for (let position = view.messages.length - 1; position >= 0; position--) {
@@ -587,6 +597,7 @@ export function useRuntimeThread(options: {
       currentTodos: latestRuntimeTodos(view.messages) ?? [],
       contextUsedPercent: null,
       pendingQuestion: question ? { questionId: question.input.id, questions: question.card!.questions } : null,
+      pendingAppSecretsPrompt: appSecretsPrompt,
       connectionSetupPrompt: null,
       lastError,
       modelFallbackNotice: fallbackNotice ?? null,
@@ -663,6 +674,19 @@ export function useRuntimeThread(options: {
           toast.error(answered.status === 403
             ? "Only the person who started this turn can answer this question."
             : typeof answered.data?.error === "string" ? answered.data.error : "Could not send your answer.");
+        }
+        return undefined;
+      }
+      case "resolveAppSecretsPrompt": {
+        const [inputId, accepted] = args as [string, boolean];
+        const answered = await postJson(
+          `${base}/inputs/${encodeURIComponent(inputId)}${query}`,
+          accepted ? { action: "accept", content: { saved: true } } : { action: "decline" },
+        );
+        if (!answered.ok) {
+          toast.error(answered.status === 403
+            ? "Only the person who started this turn can respond to this prompt."
+            : typeof answered.data?.error === "string" ? answered.data.error : "Could not resume the agent.");
         }
         return undefined;
       }

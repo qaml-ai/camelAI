@@ -174,6 +174,67 @@ export interface RuntimeInputAnswer {
   content?: unknown;
 }
 
+export interface RuntimeAppSecretsKeySpec {
+  key: string;
+  description?: string;
+  required: boolean;
+  isSecret: boolean;
+}
+
+export interface RuntimeAppSecretsPrompt {
+  inputId: string;
+  workspaceId: string;
+  scriptName: string;
+  message: string;
+  existingKeys: string[];
+  keys: RuntimeAppSecretsKeySpec[];
+}
+
+/**
+ * Recognizes a blind app-secrets elicitation (`x-camelai-kind: "app_secrets"`)
+ * emitted by the `prompt_app_secrets` MCP tool. Secret values are submitted
+ * directly from the browser to OrgDO, never through the runtime input answer.
+ */
+export function runtimeInputAppSecrets(input: RuntimeInput): RuntimeAppSecretsPrompt | null {
+  if (input.kind !== "form") return null;
+  const detail = isRecord(input.detail) ? input.detail : {};
+  const schema = isRecord(detail.requestedSchema) ? detail.requestedSchema : null;
+  if (!schema || schema["x-camelai-kind"] !== "app_secrets") return null;
+  const spec = isRecord(schema["x-camelai-app-secrets"]) ? schema["x-camelai-app-secrets"] : null;
+  if (!spec) return null;
+  const workspaceId = typeof spec.workspaceId === "string" ? spec.workspaceId.trim() : "";
+  const scriptName = typeof spec.scriptName === "string" ? spec.scriptName.trim() : "";
+  if (!workspaceId || !scriptName || !Array.isArray(spec.keys)) return null;
+  const keys: RuntimeAppSecretsKeySpec[] = [];
+  for (const raw of spec.keys) {
+    if (!isRecord(raw) || typeof raw.key !== "string" || !raw.key.trim()) continue;
+    keys.push({
+      key: raw.key.trim(),
+      ...(typeof raw.description === "string" && raw.description.trim()
+        ? { description: raw.description.trim() }
+        : {}),
+      required: raw.required !== false,
+      isSecret: raw.isSecret !== false,
+    });
+  }
+  if (keys.length === 0) return null;
+  const existingKeys = Array.isArray(spec.existingKeys)
+    ? spec.existingKeys.filter((k): k is string => typeof k === "string" && k.trim().length > 0)
+    : [];
+  const message =
+    typeof spec.message === "string" && spec.message.trim()
+      ? spec.message.trim()
+      : input.message || `Configure runtime secrets for ${scriptName}`;
+  return {
+    inputId: input.id,
+    workspaceId,
+    scriptName,
+    message,
+    existingKeys,
+    keys,
+  };
+}
+
 /** A question card for the chat UI (AskUserQuestion's shape), and how its answers become the input's. */
 export interface RuntimeInputCard {
   questions: Array<{

@@ -52,6 +52,7 @@ export interface ChatAgentStatePayload<
   Question = unknown,
   ConnectionPrompt = unknown,
   Model = unknown,
+  AppSecretsPrompt = unknown,
 > {
   previewTabs: Preview[];
   previewActiveTabId: string | null;
@@ -60,6 +61,7 @@ export interface ChatAgentStatePayload<
   currentTodos: unknown[];
   contextUsedPercent: number | null;
   pendingQuestion: Question | null;
+  pendingAppSecretsPrompt?: AppSecretsPrompt | null;
   connectionSetupPrompt: ConnectionPrompt | null;
   title: string | null;
   titleUpdatedAt: number | null;

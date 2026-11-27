@@ -354,6 +354,7 @@ const JS_EXEC_EXCLUDED_TOOL_NAMES = new Set([
   // This tool waits for human input and can outlive js_exec's short sandbox
   // timeout. Keep it as a top-level Pi tool so the agent sees the submission.
   "prompt_connection_setup",
+  "prompt_app_secrets",
   "delete_connection",
   "delete_app",
   "delete_project",
@@ -901,6 +902,35 @@ const CODE_MODE_TOOL_REGISTRY: CodeModeToolRegistration[] = [
       offset: Type.Optional(Type.Integer({ minimum: 0, description: "Versions to skip: a previous page's next_offset." })),
     }, { additionalProperties: false }),
     { category: "apps" },
+  ),
+  codeModePassthroughTool(
+    "list_app_secrets",
+    "List configured runtime secret and environment variable key names for a deployed app (metadata only — secret values are never returned to the agent). Arguments: { app_name }.",
+    Type.Object({
+      app_name: Type.String({ description: "Deployed app script name (e.g. 'inventreetracker')." }),
+    }, { additionalProperties: false }),
+    { category: "apps" },
+  ),
+  codeModePassthroughTool(
+    "prompt_app_secrets",
+    "Prompt the user with a secure blind-entry popup in the chat UI to enter or rotate runtime secrets and environment variables for a deployed app, and wait until they save or cancel. Use this as a top-level tool, not from js_exec. Secret values are submitted directly from the user's browser to encrypted OrgDO storage and are NEVER visible to the agent — only configured key names are returned. Always use this instead of putting secrets in wrangler.jsonc or asking the user to paste secrets in chat. Arguments: { app_name, keys: [{ key, description?, required?, is_secret? }], message? }.",
+    Type.Object({
+      app_name: Type.String({ description: "Deployed app script name (e.g. 'inventreetracker')." }),
+      keys: Type.Array(
+        Type.Object({
+          key: Type.String({ description: "Environment variable name (e.g. 'SESSION_SECRET')." }),
+          description: Type.Optional(Type.String({ description: "Short explanation of what this secret is used for." })),
+          required: Type.Optional(Type.Boolean({ description: "Whether this key is required (default true)." })),
+          is_secret: Type.Optional(Type.Boolean({ description: "Whether to store as a write-only secret (default true)." })),
+        }, { additionalProperties: false }),
+        { minItems: 1, maxItems: 20 },
+      ),
+      message: Type.Optional(Type.String({ description: "Optional short message explaining why these secrets are needed." })),
+    }, { additionalProperties: false }),
+    {
+      category: "apps",
+      sideEffect: true,
+    },
   ),
   codeModePassthroughTool(
     "delete_app",
@@ -2215,6 +2245,8 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     create_integration: (binding, args) => binding.integrations.create(args),
     prompt_connection_setup: (binding, args) => binding.integrations.promptConnectionSetup(args),
     delete_connection: (binding, args) => binding.deleteConnection(args),
+    list_app_secrets: (binding, args) => binding.listAppSecrets(args),
+    prompt_app_secrets: (binding, args) => binding.promptAppSecrets(args),
     delete_app: (binding, args) => binding.deleteApp(args),
     delete_project: (binding, args) => binding.deleteProject(args),
     send_email: (binding, args) => binding.sendEmail(args),
@@ -5298,6 +5330,37 @@ export class CodeModeToolsBinding extends WorkerEntrypoint<ChatEnv, CodeModeTool
     await this.env.APP_KV.delete(
       `script:${getDispatchScriptName(script.script_name, orgSlug)}`,
     );
+  }
+
+  private async listAppSecrets(args: Record<string, unknown>): Promise<unknown> {
+    const appName = typeof args.app_name === "string" ? args.app_name.trim() : "";
+    if (!appName) throw new Error("app_name is required");
+    const script = await this.orgStub.getWorkerScript(appName);
+    if (!script) throw new Error(`App '${appName}' not found`);
+    if (script.workspace_id !== this.ctx.props.workspaceId) {
+      throw new Error(`App '${appName}' belongs to a different workspace`);
+    }
+    const vars = await this.orgStub.listAppEnvVars(script.script_name);
+    return {
+      app_name: script.script_name,
+      configured_keys: vars.map((entry) => ({
+        key: entry.key,
+        is_secret: entry.isSecret,
+        updated_at: entry.updatedAt,
+      })),
+      note: "Values are hidden from the agent. Secrets are injected as env.<KEY> at runtime.",
+    };
+  }
+
+  private async promptAppSecrets(args: Record<string, unknown>): Promise<unknown> {
+    const appName = typeof args.app_name === "string" ? args.app_name.trim() : "";
+    if (!appName) throw new Error("app_name is required");
+    return {
+      ok: false,
+      app_name: appName,
+      cancelled: true,
+      error: "Interactive app secret prompts are only available in interactive chat sessions. Users can configure runtime secrets in Apps -> Settings -> Runtime Secrets & Environment Variables.",
+    };
   }
 
   private async deleteApp(args: Record<string, unknown>): Promise<unknown> {

@@ -94,6 +94,36 @@ interface MeteredFacetStub {
   }>;
 }
 
+function isVirtualTableSql(sqlText: string | undefined): boolean {
+  return /^CREATE\s+VIRTUAL\s+TABLE\b/i.test(String(sqlText || '').trim());
+}
+
+function isExternalContentFtsSql(sqlText: string | undefined): boolean {
+  const m = /\bcontent\s*=\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+))/i.exec(String(sqlText || ''));
+  if (!m) return false;
+  const target = (m[1] ?? m[2] ?? m[3] ?? '').trim();
+  return target.length > 0;
+}
+
+function getFtsShadowAndExternalTables(
+  schema: Array<{ type: string; name: string; sql: string }>,
+): { shadowLower: Set<string>; externalFtsLower: Set<string> } {
+  const shadowLower = new Set<string>();
+  const externalFtsLower = new Set<string>();
+  for (const item of schema) {
+    if (item.type === 'table' && isVirtualTableSql(item.sql)) {
+      const base = item.name.toLowerCase();
+      for (const suffix of ['_data', '_idx', '_content', '_docsize', '_config']) {
+        shadowLower.add(base + suffix);
+      }
+      if (isExternalContentFtsSql(item.sql)) {
+        externalFtsLower.add(base);
+      }
+    }
+  }
+  return { shadowLower, externalFtsLower };
+}
+
 function sortTablesByForeignKeys<T extends { name: string }>(
   tables: T[],
   schema: Array<{ type: string; name: string; sql: string }>,
@@ -144,6 +174,13 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
   private identityCache: SupervisorIdentity | null = null;
   private quotaCache: PersistedShardQuotaState | null = null;
   private activeFacetBundleKey: string | null = null;
+  private migrationInFlight: Promise<{
+    status: 'migrated' | 'empty' | 'already_migrated';
+    hexId?: string;
+    tableCounts?: Record<string, number>;
+    kvCount?: number;
+    overallDigest?: string;
+  }> | null = null;
 
   private async ensureIdentity(incoming?: SupervisorIdentity): Promise<SupervisorIdentity | null> {
     if (incoming) {
@@ -412,6 +449,11 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       }
       return response;
     } catch (error) {
+      console.error('[supervisor] fetch failed', {
+        supervisorKey: identity.supervisorKey,
+        url: request.url,
+        error: error instanceof Error ? error.message : String(error),
+      });
       await this.flushFacetMetrics(
         facet,
         identity,
@@ -480,6 +522,11 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       );
       return result;
     } catch (error) {
+      console.error('[supervisor] rpcCall failed', {
+        supervisorKey: identity.supervisorKey,
+        method,
+        error: error instanceof Error ? error.message : String(error),
+      });
       await this.flushFacetMetrics(
         facet,
         identity,
@@ -682,6 +729,30 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     kvCount?: number;
     overallDigest?: string;
   }> {
+    if (this.migrationInFlight) {
+      return this.migrationInFlight;
+    }
+    const run = this.runMigrationFromWfpShim(identityInput, options);
+    this.migrationInFlight = run;
+    try {
+      return await run;
+    } finally {
+      if (this.migrationInFlight === run) {
+        this.migrationInFlight = null;
+      }
+    }
+  }
+
+  private async runMigrationFromWfpShim(
+    identityInput: SupervisorIdentity,
+    options?: { force?: boolean; orgId?: string; quotaTier?: AppQuotaTier },
+  ): Promise<{
+    status: 'migrated' | 'empty' | 'already_migrated';
+    hexId?: string;
+    tableCounts?: Record<string, number>;
+    kvCount?: number;
+    overallDigest?: string;
+  }> {
     const identity = await this.ensureIdentity(identityInput);
     if (!identity) throw new Error('Missing supervisor identity for migration');
 
@@ -735,7 +806,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     } catch {}
     this.activeFacetBundleKey = null;
 
-    const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v4', () => ({
+    const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v5', () => ({
       compatibilityDate: '2026-07-13',
       compatibilityFlags: ['nodejs_compat'],
       mainModule: '__chiridion_importer.js',
@@ -750,12 +821,25 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     })) as unknown as { fetch(req: Request): Promise<Response> };
 
     try {
+      // Filter out SQLite FTS5 shadow tables (*_data, *_idx, *_content, *_docsize, *_config)
+      // and external-content FTS5 virtual tables on the supervisor side as well, so Cohort C
+      // apps still running an older WfP export shim migrate cleanly without attempting direct
+      // INSERTs into FTS5 shadow tables (SQLITE_ERROR: table *_fts_config may not be modified).
+      const { shadowLower, externalFtsLower } = getFtsShadowAndExternalTables(freeze.schema);
+      const cleanSchema = freeze.schema.filter(
+        (item) => !(item.type === 'table' && shadowLower.has(item.name.toLowerCase())),
+      );
+      const cleanTables = freeze.tables.filter((t) => {
+        const lower = t.name.toLowerCase();
+        return !shadowLower.has(lower) && !externalFtsLower.has(lower);
+      });
+
       // 1. Replay CREATE TABLE DDL
       const schemaResp = await importerFacet.fetch(
         new Request('https://import.internal/__import/schema', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ schema: freeze.schema }),
+          body: JSON.stringify({ schema: cleanSchema }),
         }),
       );
       if (!schemaResp.ok) {
@@ -763,10 +847,12 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       }
 
       // 2. Stream every table in 500-row pages (parent tables before FK-referencing child tables)
-      const orderedTables = sortTablesByForeignKeys(freeze.tables, freeze.schema);
+      // Start cursor at Number.MIN_SAFE_INTEGER so tables with negative INTEGER PRIMARY KEY
+      // aliases for rowid (e.g. Telegram supergroup chat IDs like -1001234567890) are exported.
+      const orderedTables = sortTablesByForeignKeys(cleanTables, cleanSchema);
       for (const table of orderedTables) {
         if (table.rowCount === 0) continue;
-        let cursor = -1;
+        let cursor = Number.MIN_SAFE_INTEGER;
         while (true) {
           const page = await this.fetchWfpShim<SqlPagePayload>(
             identity.dispatchScriptName,
@@ -819,9 +905,9 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            schema: freeze.schema,
+            schema: cleanSchema,
             sqliteSequence: freeze.sqliteSequence,
-            tables: freeze.tables,
+            tables: cleanTables,
             kvEntries: allKvEntries,
           }),
         }),
@@ -831,6 +917,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         integrityOk: boolean;
         kvCount: number;
         tableCounts: Record<string, number>;
+        tableDigests: Record<string, string>;
         overallDigest: string;
       };
       if (!finalizeResp.ok || !finalized.integrityOk) {
@@ -844,7 +931,15 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         identity.objectId,
         '/__migrate/verify',
       );
-      if (finalized.overallDigest !== verify.overallDigest) {
+      const usedFtsFilter = cleanTables.length !== freeze.tables.length;
+      const filteredParityOk =
+        finalized.kvCount === verify.kvCount &&
+        cleanTables.every(
+          (t) =>
+            finalized.tableCounts[t.name] === verify.tableCounts[t.name] &&
+            finalized.tableDigests[t.name] === verify.tableDigests[t.name],
+        );
+      if (finalized.overallDigest !== verify.overallDigest && !(usedFtsFilter && filteredParityOk)) {
         throw new Error(
           `Migration parity mismatch for ${identity.supervisorKey}: ` +
             `source=${verify.overallDigest} target=${finalized.overallDigest} ` +
@@ -861,7 +956,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
         status: 'migrated',
         legacyHexId: verify.hexId,
         migratedAt: new Date().toISOString(),
-        sourceDigest: verify.overallDigest,
+        sourceDigest: finalized.overallDigest,
       });
 
       emitAppUsageMetric(this.env.APP_USAGE_AE, {
@@ -889,25 +984,24 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
   }
 
   /**
-   * Cohort C first-touch lazy hydration inside `blockConcurrencyWhile` so concurrent
-   * requests to the same unmigrated shard queue cleanly behind a single verified import.
+   * Cohort C first-touch lazy hydration using an in-memory single-flight promise so
+   * concurrent requests queue cleanly behind a single verified import without hitting
+   * Cloudflare DO's 30-second `blockConcurrencyWhile()` reset timeout on larger shards.
    */
   private async ensureLazyMigrated(
     identity: SupervisorIdentity,
     orgId: string,
     quotaTier: AppQuotaTier,
   ): Promise<void> {
+    if (this.migrationInFlight) {
+      await this.migrationInFlight;
+      return;
+    }
     const state = await this.getMigrationState();
     if (state && (state.status === 'migrated' || state.status === 'empty')) {
       return;
     }
-    await this.ctx.blockConcurrencyWhile(async () => {
-      const recheck = await this.getMigrationState();
-      if (recheck && (recheck.status === 'migrated' || recheck.status === 'empty')) {
-        return;
-      }
-      await this.migrateFromWfpShim(identity, { orgId, quotaTier });
-    });
+    await this.migrateFromWfpShim(identity, { orgId, quotaTier });
   }
 
   /** Permanent data wipe for app deletion / GDPR purge. */

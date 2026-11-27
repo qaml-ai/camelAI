@@ -1467,6 +1467,30 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
       });
     }
 
+    if (url.pathname === '/__chiridion_migrate/worker-logs' && request.method === 'GET') {
+      const secret = env.MIGRATION_HMAC_SECRET?.trim() || env.TOKEN_SIGNING_SECRET?.trim();
+      const script = url.searchParams.get('script')?.trim() || '';
+      const limit = Math.max(1, Math.min(200, Number(url.searchParams.get('limit') || '30')));
+      const valid = secret && script
+        ? await verifyMigrationSignature(
+            secret,
+            `worker-logs:${script}`,
+            request.headers.get(MIGRATION_SIG_HEADER),
+            request.headers.get(MIGRATION_TS_HEADER),
+          )
+        : false;
+      if (!valid) return new Response('Forbidden', { status: 403 });
+      if (!env.WORKER_LOGS) {
+        return Response.json({ ok: false, error: 'WORKER_LOGS not configured' }, { status: 500 });
+      }
+      const logsStub = env.WORKER_LOGS.get(env.WORKER_LOGS.idFromName(script));
+      const [logs, stats] = await Promise.all([
+        logsStub.getLogs({ limit }),
+        logsStub.getStats(),
+      ]);
+      return Response.json({ ok: true, script, stats, logs });
+    }
+
     if (url.pathname === '/__chiridion_migrate/project-wrangler-bindings' && request.method === 'GET') {
       const secret = env.MIGRATION_HMAC_SECRET?.trim() || env.TOKEN_SIGNING_SECRET?.trim();
       const projectId = url.searchParams.get('projectId')?.trim() || '';

@@ -72,8 +72,12 @@ export class ChiridionMigrationImporterDO extends DurableObject {
         }
       }
       const tables = rawTables.filter((item) => !ftsShadows.has(String(item.name).toLowerCase()));
+      const views = (body.schema || []).filter((item) => item.type === "view");
       this.ctx.storage.transactionSync(() => {
         sql.exec("PRAGMA defer_foreign_keys = ON");
+        for (const view of views) {
+          sql.exec("DROP VIEW IF EXISTS " + quoteIdent(view.name));
+        }
         for (const item of tables) {
           // Drop if retrying an interrupted import so schema replay is idempotent.
           sql.exec("DROP TABLE IF EXISTS " + quoteIdent(item.name));

@@ -253,7 +253,7 @@ class ChiridionExportShimDO extends DurableObject {
     if (path === "/__migrate/export-sql") {
       if (!sql) return Response.json({ ok: false, error: "No SQLite storage" }, { status: 400 });
       const table = url.searchParams.get("table") || "";
-      const afterRowid = Number(url.searchParams.get("afterRowid") ?? "-1");
+      const afterRowid = Number(url.searchParams.get("afterRowid") ?? String(Number.MIN_SAFE_INTEGER));
       const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") ?? "500")));
       const { tables } = inspectTables(sql);
       const meta = tables.find((t) => t.name === table);

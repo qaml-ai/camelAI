@@ -261,10 +261,14 @@ async function main() {
   let script = '';
   let appsFile = '';
   let dryRun = false;
+  let concurrency = 1;
+  let logFile = '';
   for (let i = 0; i < args.length; i += 1) {
     if (args[i] === '--script' && args[i + 1]) script = args[++i]!;
     else if (args[i] === '--apps-file' && args[i + 1]) appsFile = args[++i]!;
     else if (args[i] === '--dry-run') dryRun = true;
+    else if (args[i] === '--concurrency' && args[i + 1]) concurrency = Math.max(1, Math.min(8, Number(args[++i]!) || 1));
+    else if (args[i] === '--log-file' && args[i + 1]) logFile = args[++i]!;
   }
   const apiToken = process.env.CLOUDFLARE_API_TOKEN || process.env.CF_API_TOKEN || '';
   const migrationHmacSecret = process.env.MIGRATION_HMAC_SECRET || process.env.TOKEN_SIGNING_SECRET || '';
@@ -276,18 +280,29 @@ async function main() {
       ? fs.readFileSync(appsFile, 'utf8').split('\n').map((s) => s.trim()).filter(Boolean)
       : [];
   if (targets.length === 0) {
-    console.error('Usage: --script <name> | --apps-file <path> [--dry-run]');
+    console.error('Usage: --script <name> | --apps-file <path> [--dry-run] [--concurrency N] [--log-file <path>]');
     process.exit(1);
   }
 
-  for (const app of targets) {
-    try {
-      const res = await backfillApp(apiToken, app, dryRun, migrationHmacSecret);
-      console.log(JSON.stringify(res));
-    } catch (err) {
-      console.error(JSON.stringify({ dispatchScriptName: app, status: 'error', error: String(err) }));
+  let nextIdx = 0;
+  const runWorker = async () => {
+    while (true) {
+      const idx = nextIdx++;
+      if (idx >= targets.length) return;
+      const app = targets[idx]!;
+      try {
+        const res = await backfillApp(apiToken, app, dryRun, migrationHmacSecret);
+        const line = JSON.stringify(res);
+        console.log(line);
+        if (logFile) fs.appendFileSync(logFile, `${line}\n`);
+      } catch (err) {
+        const line = JSON.stringify({ dispatchScriptName: app, status: 'error', error: String(err) });
+        console.error(line);
+        if (logFile) fs.appendFileSync(logFile, `${line}\n`);
+      }
     }
-  }
+  };
+  await Promise.all(Array.from({ length: script ? 1 : concurrency }, () => runWorker()));
 }
 
 main().catch((err) => {

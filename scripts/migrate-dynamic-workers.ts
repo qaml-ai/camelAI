@@ -59,6 +59,7 @@ interface CliOptions {
   env: 'staging' | 'prod';
   cohort?: 'a' | 'b' | 'c';
   script?: string;
+  scriptsFile?: string;
   orgSlug?: string;
   rollback?: string;
   singletonIds: string[];
@@ -109,6 +110,8 @@ function parseArgs(argv: string[]): CliOptions {
       if (c === 'a' || c === 'b' || c === 'c') opts.cohort = c;
     } else if (arg === '--script' && argv[i + 1]) {
       opts.script = argv[++i]!;
+    } else if (arg === '--scripts-file' && argv[i + 1]) {
+      opts.scriptsFile = path.resolve(argv[++i]!);
     } else if (arg === '--org-slug' && argv[i + 1]) {
       opts.orgSlug = argv[++i]!;
     } else if (arg === '--rollback' && argv[i + 1]) {
@@ -338,48 +341,64 @@ async function uploadWfpExportShim(input: {
   hmacSecret: string;
   discoveryWebhookUrl?: string;
 }): Promise<void> {
-  const shimSource = buildWfpExportShimSource({
-    classNames: Object.values(input.doBindings),
-    bindingMap: input.doBindings,
-    hmacSecret: input.hmacSecret,
-    discoveryWebhookUrl: input.discoveryWebhookUrl,
-  });
   const bindings = Object.entries(input.doBindings).map(([name, class_name]) => ({
     type: 'durable_object_namespace',
     name,
     class_name,
   }));
-  const form = new FormData();
-  form.append(
-    'metadata',
-    new Blob(
-      [
-        JSON.stringify({
-          main_module: 'export-shim.js',
-          compatibility_date: '2026-07-13',
-          compatibility_flags: ['nodejs_compat'],
-          bindings,
-          keep_bindings: ['secret_text', 'secret_key'],
-          keep_assets: true,
-        }),
-      ],
-      { type: 'application/json' },
-    ),
-  );
-  form.append(
-    'export-shim.js',
-    new Blob([shimSource], { type: 'application/javascript+module' }),
-    'export-shim.js',
-  );
-
+  const extraClassNames = new Set<string>();
   const url = `https://api.cloudflare.com/client/v4/accounts/${input.accountId}/workers/dispatch/namespaces/${input.namespace}/scripts/${encodeURIComponent(input.dispatchScriptName)}`;
-  const putResp = await fetchWithRetry(url, {
-    method: 'PUT',
-    headers: { Authorization: `Bearer ${input.apiToken}` },
-    body: form,
-  });
-  if (!putResp.ok) {
-    throw new Error(`Upload WfP export shim failed (${putResp.status}): ${await putResp.text()}`);
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const shimSource = buildWfpExportShimSource({
+      classNames: [...Object.values(input.doBindings), ...extraClassNames],
+      bindingMap: input.doBindings,
+      hmacSecret: input.hmacSecret,
+      discoveryWebhookUrl: input.discoveryWebhookUrl,
+    });
+    const form = new FormData();
+    form.append(
+      'metadata',
+      new Blob(
+        [
+          JSON.stringify({
+            main_module: 'export-shim.js',
+            compatibility_date: '2026-07-13',
+            compatibility_flags: ['nodejs_compat'],
+            bindings,
+            keep_bindings: ['secret_text', 'secret_key'],
+            keep_assets: true,
+          }),
+        ],
+        { type: 'application/json' },
+      ),
+    );
+    form.append(
+      'export-shim.js',
+      new Blob([shimSource], { type: 'application/javascript+module' }),
+      'export-shim.js',
+    );
+
+    const putResp = await fetchWithRetry(url, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${input.apiToken}` },
+      body: form,
+    });
+    if (putResp.ok) return;
+    const errText = await putResp.text();
+    // Auto-export legacy unreferenced DO classes still tracked by Cloudflare DO metadata (error 10064).
+    const missingClasses = [...errText.matchAll(/does not export class '([^']+)'/g)].map((m) => m[1]!);
+    if (errText.includes('10064') && missingClasses.length > 0 && attempt < 4) {
+      let added = false;
+      for (const cls of missingClasses) {
+        if (!extraClassNames.has(cls)) {
+          extraClassNames.add(cls);
+          added = true;
+        }
+      }
+      if (added) continue;
+    }
+    throw new Error(`Upload WfP export shim failed (${putResp.status}): ${errText}`);
   }
 }
 
@@ -813,6 +832,14 @@ async function main() {
   let targets: string[];
   if (opts.script) {
     targets = [opts.script];
+  } else if (opts.scriptsFile) {
+    targets = fs
+      .readFileSync(opts.scriptsFile, 'utf8')
+      .split('\n')
+      .map((s) => s.trim())
+      .filter((s) => s && s.includes('--'))
+      .filter((s) => !opts.orgSlug || extractOrgSlugFromDispatchName(s) === opts.orgSlug)
+      .filter((s) => opts.includeEnterprise || !isProtectedEnterpriseScript(s));
   } else {
     const allScripts: Array<{ id: string; migration_tag?: string | null; modified_on?: string }> = [];
     let cursor = '';

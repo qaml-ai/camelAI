@@ -439,7 +439,7 @@ function detectStaticSingletonIds(modules: Record<string, DynamicWorkerModule>):
   const staticNames = new Set<string>();
   const dynamicCalls: string[] = [];
 
-  for (const m of jsSource.matchAll(/\.idFromName\(\s*([^)]+?)\s*\)/g)) {
+  for (const m of jsSource.matchAll(/\.(?:idFromName|getByName)\(\s*([^)]+?)\s*\)/g)) {
     const arg = m[1]!.trim();
     const lit = arg.match(/^["']([^"'\\]{1,64})["']$/);
     if (lit) staticNames.add(`name:${lit[1]}`);
@@ -480,7 +480,9 @@ async function migrateSingleScript(
   if (
     opts.skipMigrated &&
     !opts.script &&
-    (registry.runtime_mode === 'dynamic' || registry.runtime_mode === 'hybrid_migrating')
+    (registry.runtime_mode === 'dynamic' ||
+      registry.runtime_mode === 'dynamic_migrating' ||
+      registry.runtime_mode === 'hybrid_migrating')
   ) {
     return { dispatchScriptName, status: 'skipped', reason: 'already_migrated', runtime_mode: registry.runtime_mode };
   }
@@ -588,10 +590,20 @@ async function migrateSingleScript(
     return { dispatchScriptName, status: 'skipped', reason: 'already_export_shim' };
   }
 
+  const totalBundleBytes = Object.values(modules).reduce((sum, m) => sum + m.content.length, 0);
+  if (totalBundleBytes > 9_500_000) {
+    return {
+      dispatchScriptName,
+      status: 'skipped',
+      reason: 'bundle_exceeds_dynamic_limit',
+      totalBundleBytes,
+    };
+  }
+
   let effectiveSingletonIds = opts.singletonIds;
-  if (doClasses.length > 0 && opts.cohort === 'b' && !opts.script) {
+  if (doClasses.length > 0 && opts.cohort === 'b') {
     const detected = detectStaticSingletonIds(modules);
-    if (!detected.isStaticSingleton) {
+    if (!opts.script && !detected.isStaticSingleton) {
       return {
         dispatchScriptName,
         status: 'skipped',
@@ -600,7 +612,9 @@ async function migrateSingleScript(
         staticNames: detected.singletonIds,
       };
     }
-    effectiveSingletonIds = detected.singletonIds;
+    if (detected.isStaticSingleton && detected.singletonIds.length > 0) {
+      effectiveSingletonIds = detected.singletonIds;
+    }
   }
 
   const bundleSha = crypto
@@ -658,6 +672,12 @@ async function migrateSingleScript(
           ? `${cfg.dispatcherOrigin}/__chiridion_migrate/alarm-discovered?appId=${encodeURIComponent(dispatchScriptName)}`
           : undefined,
     });
+
+    if (opts.cohort === 'c') {
+      // Allow any already-warm WfP DO isolate to reload onto ChiridionExportShimDO
+      // before flipping KV to dynamic_migrating so the first lazy touch succeeds.
+      await new Promise((r) => setTimeout(r, 12_000));
+    }
 
     if (opts.cohort === 'b') {
       try {
@@ -753,13 +773,33 @@ async function main() {
     const raw = await kvGet(apiToken, cfg.accountId, cfg.appKvId, key);
     if (!raw) throw new Error(`Registry key not found: ${key}`);
     const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const bundleKey = typeof parsed.bundle_r2_key === 'string' ? parsed.bundle_r2_key : '';
+    const doClasses = Array.isArray(parsed.do_classes) ? parsed.do_classes : [];
+    let restoredWfp = false;
+    if (bundleKey && doClasses.length > 0) {
+      const r2Resp = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${cfg.accountId}/r2/buckets/${cfg.r2Bucket}/objects/${bundleKey.split('/').map(encodeURIComponent).join('/')}`,
+        { headers: { Authorization: `Bearer ${apiToken}` } },
+      );
+      if (r2Resp.ok) {
+        const bundle = (await r2Resp.json()) as DynamicWorkerBundleRecord;
+        await restoreWfpScriptFromBundle({
+          apiToken,
+          accountId: cfg.accountId,
+          namespace: cfg.dispatchNamespace,
+          dispatchScriptName: opts.rollback,
+          bundle,
+        });
+        restoredWfp = true;
+      }
+    }
     parsed.runtime_mode = 'wfp';
     await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${cfg.accountId}/r2/buckets/${cfg.r2Bucket}/objects/${encodeURIComponent(`dynamic-bundles/${encodeURIComponent(opts.rollback)}/latest.json`)}`,
+      `https://api.cloudflare.com/client/v4/accounts/${cfg.accountId}/r2/buckets/${cfg.r2Bucket}/objects/dynamic-bundles/${encodeURIComponent(opts.rollback)}/latest.json`,
       { method: 'DELETE', headers: { Authorization: `Bearer ${apiToken}` } },
     ).catch(() => {});
     await kvPut(apiToken, cfg.accountId, cfg.appKvId, key, JSON.stringify(parsed));
-    console.log(JSON.stringify({ ok: true, action: 'rollback', dispatchScriptName: opts.rollback, runtime_mode: 'wfp' }));
+    console.log(JSON.stringify({ ok: true, action: 'rollback', dispatchScriptName: opts.rollback, runtime_mode: 'wfp', restoredWfp }));
     return;
   }
 

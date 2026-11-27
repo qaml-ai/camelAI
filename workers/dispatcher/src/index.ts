@@ -1227,6 +1227,29 @@ export default class DispatcherEntrypoint extends WorkerEntrypoint<Env> {
       return Response.json({ ok: true, supervisorKey, ...result });
     }
 
+    if (url.pathname === '/__chiridion_migrate/fetch-wfp-asset' && request.method === 'GET') {
+      const secret = env.MIGRATION_HMAC_SECRET?.trim() || env.TOKEN_SIGNING_SECRET?.trim();
+      const script = url.searchParams.get('script')?.trim() || '';
+      const assetPath = url.searchParams.get('path')?.trim() || '/';
+      const valid = secret && script
+        ? await verifyMigrationSignature(
+            secret,
+            `wfp-asset:${script}:${assetPath}`,
+            request.headers.get(MIGRATION_SIG_HEADER),
+            request.headers.get(MIGRATION_TS_HEADER),
+          )
+        : false;
+      if (!valid) return new Response('Forbidden', { status: 403 });
+      if (!env.DISPATCHER) {
+        return new Response('DISPATCHER not configured', { status: 500 });
+      }
+      const normalizedPath = assetPath.startsWith('/') ? assetPath : `/${assetPath}`;
+      const worker = env.DISPATCHER.get(script);
+      return worker.fetch(
+        new Request(`https://${script}.camelai.app${normalizedPath}`, { method: 'GET' }),
+      );
+    }
+
     if (url.pathname === '/__selfhost_do/fetch') {
       const bridgeToken = request.headers.get('x-camelai-selfhost-do-bridge')?.trim();
       if (!bridgeToken || bridgeToken !== selfhostDoBridgeSecret(env)) {

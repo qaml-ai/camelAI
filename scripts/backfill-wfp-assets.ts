@@ -15,11 +15,17 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import {
+  MIGRATION_SIG_HEADER,
+  MIGRATION_TS_HEADER,
+  signMigrationRequest,
+} from '../workers/dispatcher/src/dynamic/export-shim.ts';
 
 const ACCOUNT_ID = '85bbd288051330fb51ee1c86031a299b';
 const PROD_KV_ID = '0ee80299e67c4c7fa0c1ad618b7e7a9c';
 const R2_BUCKET = 'chiridion-sandbox';
 const NAMESPACE = 'chiridion-platform';
+const DISPATCHER_ORIGIN = 'https://custom-domains.camelai.app';
 
 const STANDARD_STATIC_PATHS = [
   'favicon.svg',
@@ -93,7 +99,39 @@ function extractAssetPaths(text: string, baseDir = ''): string[] {
   return [...found];
 }
 
-async function backfillApp(apiToken: string, dispatchScriptName: string, dryRun: boolean): Promise<Record<string, unknown>> {
+async function fetchFromWfpAsset(
+  dispatchScriptName: string,
+  assetPath: string,
+  isPublic: boolean,
+  migrationHmacSecret: string,
+): Promise<Response | null> {
+  const normalized = assetPath.startsWith('/') ? assetPath : `/${assetPath}`;
+  if (!isPublic && migrationHmacSecret) {
+    const ts = Date.now();
+    const sig = await signMigrationRequest(
+      migrationHmacSecret,
+      `wfp-asset:${dispatchScriptName}:${normalized}`,
+      ts,
+    );
+    const url = `${DISPATCHER_ORIGIN}/__chiridion_migrate/fetch-wfp-asset?script=${encodeURIComponent(dispatchScriptName)}&path=${encodeURIComponent(normalized)}`;
+    return fetchWithRetry(url, {
+      redirect: 'manual',
+      headers: {
+        [MIGRATION_TS_HEADER]: String(ts),
+        [MIGRATION_SIG_HEADER]: sig,
+      },
+    }).catch(() => null);
+  }
+  const origin = `https://${dispatchScriptName}.camelai.app`;
+  return fetchWithRetry(`${origin}${normalized}`, { redirect: 'manual' }).catch(() => null);
+}
+
+async function backfillApp(
+  apiToken: string,
+  dispatchScriptName: string,
+  dryRun: boolean,
+  migrationHmacSecret: string,
+): Promise<Record<string, unknown>> {
   const kvKey = `selfhost:assets:${dispatchScriptName}`;
   const existing = await fetchWithRetry(
     `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/storage/kv/namespaces/${PROD_KV_ID}/values/${encodeURIComponent(kvKey)}`,
@@ -103,7 +141,7 @@ async function backfillApp(apiToken: string, dispatchScriptName: string, dryRun:
     return { dispatchScriptName, status: 'skipped', reason: 'already_has_assets_mirror' };
   }
 
-  // Check if app is public (private apps redirect static fetches to login)
+  // Check if app is public (private apps use HMAC-authenticated dispatcher direct WfP asset fetch)
   const regResp = await fetchWithRetry(
     `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/storage/kv/namespaces/${PROD_KV_ID}/values/${encodeURIComponent(`script:${dispatchScriptName}`)}`,
     { headers: { Authorization: `Bearer ${apiToken}` } },
@@ -112,7 +150,8 @@ async function backfillApp(apiToken: string, dispatchScriptName: string, dryRun:
     return { dispatchScriptName, status: 'skipped', reason: 'missing_kv_registry' };
   }
   const reg = (await regResp.json()) as { is_public?: boolean };
-  if (!reg.is_public) {
+  const isPublic = Boolean(reg.is_public);
+  if (!isPublic && !migrationHmacSecret) {
     return { dispatchScriptName, status: 'skipped', reason: 'private_app_cannot_crawl_assets' };
   }
 
@@ -127,10 +166,9 @@ async function backfillApp(apiToken: string, dispatchScriptName: string, dryRun:
   const contentText = await contentResp.text();
 
   const queue = new Set<string>([...STANDARD_STATIC_PATHS, ...extractAssetPaths(contentText)]);
-  const origin = `https://${dispatchScriptName}.camelai.app`;
 
   // Also inspect live HTML root for any additional asset tags
-  const rootResp = await fetchWithRetry(`${origin}/`, { redirect: 'manual' }).catch(() => null);
+  const rootResp = await fetchFromWfpAsset(dispatchScriptName, '/', isPublic, migrationHmacSecret);
   if (rootResp && rootResp.status === 200) {
     const html = await rootResp.text();
     for (const p of extractAssetPaths(html)) queue.add(p);
@@ -145,7 +183,7 @@ async function backfillApp(apiToken: string, dispatchScriptName: string, dryRun:
     if (visited.has(relPath)) continue;
     visited.add(relPath);
 
-    const resp = await fetchWithRetry(`${origin}/${relPath}`, { redirect: 'manual' }).catch(() => null);
+    const resp = await fetchFromWfpAsset(dispatchScriptName, relPath, isPublic, migrationHmacSecret);
     if (!resp || resp.status !== 200) continue;
     const contentType = (resp.headers.get('content-type') || 'application/octet-stream').split(';')[0]!.trim();
     const bytes = new Uint8Array(await resp.arrayBuffer());
@@ -229,6 +267,7 @@ async function main() {
     else if (args[i] === '--dry-run') dryRun = true;
   }
   const apiToken = process.env.CLOUDFLARE_API_TOKEN || process.env.CF_API_TOKEN || '';
+  const migrationHmacSecret = process.env.MIGRATION_HMAC_SECRET || process.env.TOKEN_SIGNING_SECRET || '';
   if (!apiToken) throw new Error('CLOUDFLARE_API_TOKEN is required');
 
   const targets = script
@@ -243,7 +282,7 @@ async function main() {
 
   for (const app of targets) {
     try {
-      const res = await backfillApp(apiToken, app, dryRun);
+      const res = await backfillApp(apiToken, app, dryRun, migrationHmacSecret);
       console.log(JSON.stringify(res));
     } catch (err) {
       console.error(JSON.stringify({ dispatchScriptName: app, status: 'error', error: String(err) }));

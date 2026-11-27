@@ -42,7 +42,7 @@ export async function handleDeploySideEffects(env: Env, info: DeploySideEffectsI
 
   let orgQuotaTier: AppQuotaTier | undefined;
   try {
-    const org = await orgStub.getOrganization();
+    const org = await orgStub.getInfo();
     if (org?.billing_plan) {
       orgQuotaTier = billingPlanToQuotaTier(org.billing_plan);
     }

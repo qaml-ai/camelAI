@@ -796,6 +796,36 @@ async function migrateSingleScript(
 
   let totalBundleBytes = Object.values(modules).reduce((sum, m) => sum + m.content.length, 0);
   if (totalBundleBytes > 9_500_000) {
+    // Replace huge browser-only Plotly chunks (e.g. react-plotly-*.js, plotly.min-*.js)
+    // that are only referenced via dynamic `import(...)` inside React client handlers
+    // and can never execute during Cloudflare Workers SSR. Real browser client assets
+    // in R2 remain completely untouched.
+    const allOtherSource = (excludeName: string) =>
+      Object.entries(modules)
+        .filter(([k, m]) => k !== excludeName && m.type === 'js')
+        .map(([, m]) => m.content)
+        .join('\n');
+    for (const [modName, mod] of Object.entries(modules)) {
+      if (
+        mod.type === 'js' &&
+        mod.content.length > 2_000_000 &&
+        /(?:^|\/)(?:react-plotly|plotly(?:\.min)?)-[^/]+\.js$/i.test(modName)
+      ) {
+        const base = path.posix.basename(modName);
+        const otherSrc = allOtherSource(modName);
+        const escapedBase = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const hasStaticImport = new RegExp(`\\bfrom\\s+["'][^"']*${escapedBase}["']`).test(otherSrc);
+        if (!hasStaticImport) {
+          const stub = /react-plotly/i.test(base)
+            ? 'export default function PlotlySsrStub() { return null; }\n'
+            : 'export default {};\n';
+          modules[modName] = { ...mod, content: stub };
+        }
+      }
+    }
+    totalBundleBytes = Object.values(modules).reduce((sum, m) => sum + m.content.length, 0);
+  }
+  if (totalBundleBytes > 9_500_000) {
     // Minify large unminified JS bundles with esbuild (preserves all ESM export names & DO classes).
     for (const [modName, mod] of Object.entries(modules)) {
       if (mod.type === 'js' && mod.content.length > 100_000) {

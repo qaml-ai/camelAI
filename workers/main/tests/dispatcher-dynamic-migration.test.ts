@@ -111,7 +111,10 @@ function setup(
     env: { value: env },
   });
   const supervisor = createSupervisor();
-  const makeRouter = (props: TenantDoRouterProps, target = supervisor): TenantDoRouter =>
+  const makeRouter = (
+    props: TenantDoRouterProps,
+    target: Pick<TenantObjectSupervisorDO, 'fetch' | 'rpcCall'> = supervisor,
+  ): TenantDoRouter =>
     Object.create(TenantDoRouter.prototype, {
       ctx: { value: { props } },
       env: { value: { APP_KV: appKv, TENANT_DO_SUPERVISOR: { idFromName: (name: string) => name, get: () => target } } },
@@ -130,6 +133,185 @@ function setup(
   });
   return { edgeFetch, supervisor, createSupervisor, makeRouter, facet, setAlarm, sourceFetch, tenantDoRouter, values, workerCodes, abortFacet };
 }
+
+describe('TenantDoRouter result lifetime', () => {
+  const url = 'https://migration-test.example/borrows';
+  const bufferLimit = 4 * 1024 * 1024;
+
+  function setupRouter() {
+    const { makeRouter } = setup();
+    const fetch = vi.fn<TenantObjectSupervisorDO['fetch']>();
+    const rpcCall = vi.fn<TenantObjectSupervisorDO['rpcCall']>();
+    const router = makeRouter({ dispatchScriptName: appId, orgId: bundle.orgId }, { fetch, rpcCall });
+    return { router, fetch, rpcCall };
+  }
+
+  it.each([
+    { contentType: 'application/json', knownLength: true, payload: '{"account":"é"}' },
+    { contentType: 'text/plain; charset=utf-8', knownLength: false, payload: 'borrowed items\n' },
+  ])('drains a small $contentType response before returning a copy', async ({ contentType, knownLength, payload }) => {
+    const { router, fetch } = setupRouter();
+    const bytes = new TextEncoder().encode(payload);
+    const headers = new Headers({ 'Content-Type': contentType, 'X-Test': 'forwarded' });
+    if (knownLength) headers.set('Content-Length', String(bytes.byteLength));
+    const upstream = new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes.subarray(0, 5));
+        controller.enqueue(bytes.subarray(5));
+        controller.close();
+      },
+    }), { status: 202, statusText: 'Borrowed', headers });
+    fetch.mockResolvedValue(upstream);
+
+    const response = await router.fetchObject(appId, className, objectId, new Request(url));
+
+    expect(upstream.bodyUsed).toBe(true);
+    expect(response).not.toBe(upstream);
+    expect(response.status).toBe(202);
+    expect(response.statusText).toBe('Borrowed');
+    expect([...response.headers]).toEqual([...headers]);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
+  });
+
+  it('passes a WebSocket upgrade through by identity', async () => {
+    const { router, fetch } = setupRouter();
+    const pair = new WebSocketPair();
+    const upstream = new Response(null, { status: 101, webSocket: pair[0] });
+    fetch.mockResolvedValue(upstream);
+
+    const request = new Request(url, { headers: { Upgrade: 'websocket' } });
+    const response = await router.fetchObject(appId, className, objectId, request);
+
+    expect(response).toBe(upstream);
+    expect(response.webSocket).toBe(pair[0]);
+  });
+
+  it.each([
+    { method: 'GET', contentType: 'text/event-stream; charset=utf-8', contentLength: undefined },
+    { method: 'GET', contentType: 'application/x-ndjson', contentLength: undefined },
+    { method: 'GET', contentType: 'application/octet-stream', contentLength: bufferLimit + 1 },
+    { method: 'HEAD', contentType: 'text/plain', contentLength: 5 },
+  ])('passes through $method $contentType without reading its body', async ({ method, contentType, contentLength }) => {
+    const { router, fetch } = setupRouter();
+    const headers = new Headers({ 'Content-Type': contentType });
+    if (contentLength !== undefined) headers.set('Content-Length', String(contentLength));
+    const upstream = new Response('hello', { headers });
+    fetch.mockResolvedValue(upstream);
+
+    const response = await router.fetchObject(appId, className, objectId, new Request(url, { method }));
+
+    expect(response).toBe(upstream);
+    expect(upstream.bodyUsed).toBe(false);
+    expect(new TextDecoder().decode(await response.arrayBuffer())).toBe('hello');
+  });
+
+  it('replays the buffered prefix and streams the rest when a response without a length exceeds 4 MiB', async () => {
+    const { router, fetch } = setupRouter();
+    const prefix = new Uint8Array(bufferLimit);
+    prefix[0] = 0x10;
+    prefix[bufferLimit - 1] = 0x20;
+    const upstream = new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(prefix);
+        controller.enqueue(new Uint8Array([0x30, 0x40]));
+        controller.enqueue(new Uint8Array([0x50, 0x60]));
+        controller.close();
+      },
+    }), { status: 206, headers: { 'Content-Type': 'application/octet-stream' } });
+    fetch.mockResolvedValue(upstream);
+
+    const response = await router.fetchObject(appId, className, objectId, new Request(url));
+
+    expect(upstream.bodyUsed).toBe(true);
+    expect(response.status).toBe(206);
+    expect(response.headers.get('Content-Type')).toBe('application/octet-stream');
+    expect(response.headers.get('Content-Length')).toBeNull();
+    const body = new Uint8Array(await response.arrayBuffer());
+    expect(body.byteLength).toBe(bufferLimit + 4);
+    expect(body[0]).toBe(0x10);
+    expect([...body.slice(bufferLimit - 1)]).toEqual([0x20, 0x30, 0x40, 0x50, 0x60]);
+    expect(upstream.body!.locked).toBe(false);
+  });
+
+  it('cancels an overflowing upstream response when its downstream body is canceled', async () => {
+    const { router, fetch } = setupRouter();
+    const cancel = vi.fn();
+    const upstream = new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(bufferLimit + 1));
+      },
+      cancel,
+    }));
+    fetch.mockResolvedValue(upstream);
+
+    const response = await router.fetchObject(appId, className, objectId, new Request(url));
+    expect(response).not.toBe(upstream);
+    await response.body!.cancel();
+
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(upstream.body!.locked).toBe(false);
+  });
+
+  it('passes a null-body response through by identity', async () => {
+    const { router, fetch } = setupRouter();
+    const upstream = new Response(null, { status: 204 });
+    fetch.mockResolvedValue(upstream);
+
+    await expect(router.fetchObject(appId, className, objectId, new Request(url))).resolves.toBe(upstream);
+  });
+
+  it('cancels an unread request body when the supervisor rejects the fetch', async () => {
+    const { router, fetch } = setupRouter();
+    const error = new Error('supervisor fetch failed');
+    const cancel = vi.fn();
+    const request = new Request(url, { method: 'POST', body: new ReadableStream({ cancel }) });
+    fetch.mockRejectedValue(error);
+
+    await expect(router.fetchObject(appId, className, objectId, request)).rejects.toBe(error);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels an unread request body when cross-app access is denied', async () => {
+    const { router, fetch } = setupRouter();
+    const cancel = vi.fn();
+    const request = new Request(url, { method: 'POST', body: new ReadableStream({ cancel }) });
+
+    const response = await router.fetchObject('different-app', className, objectId, request);
+
+    expect(response.status).toBe(403);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('clones the RPC result before disposing the upstream result', async () => {
+    const { router, rpcCall } = setupRouter();
+    const data = { rows: [{ id: 1 }], bytes: new Uint8Array([2, 3]) };
+    const dispose = vi.fn(() => { data.rows[0].id = 9; });
+    Object.defineProperty(data, Symbol.dispose, { value: dispose });
+    rpcCall.mockResolvedValue(data);
+
+    const result = await router.rpcObject(appId, className, objectId, 'read', []);
+
+    expect(result).not.toBe(data);
+    expect(result).toEqual({ rows: [{ id: 1 }], bytes: new Uint8Array([2, 3]) });
+    expect(Object.getOwnPropertySymbols(result as object)).not.toContain(Symbol.dispose);
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a live RPC stream with the reply', async () => {
+    const { router, rpcCall } = setupRouter();
+    const body = new Response('rpc stream').body!;
+    const dispose = vi.fn();
+    const data = Object.defineProperty({ body }, Symbol.dispose, { value: dispose });
+    rpcCall.mockResolvedValue(data);
+
+    const result = await router.rpcObject(appId, className, objectId, 'read', []);
+
+    expect(result).toBe(data);
+    expect(dispose).not.toHaveBeenCalled();
+    await expect(new Response(body).text()).resolves.toBe('rpc stream');
+  });
+});
 
 describe('Dynamic Workers DO migration gate', () => {
   beforeEach(clearBundleStoreCachesForTest);

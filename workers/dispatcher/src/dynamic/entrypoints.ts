@@ -14,6 +14,7 @@ import {
   type AppQuotaTier,
   type AppRuntimeMode,
 } from '../../../main/src/dynamic-worker-registry';
+import { materializeRpcResult } from '../../../main/src/rpc-result';
 import { quotaLimitsForTier, resolveQuotaTier } from './quota-policy';
 import type { SupervisorIdentity, TenantObjectSupervisorDO } from './supervisor-do';
 
@@ -33,6 +34,102 @@ export interface TenantDoRouterProps {
 }
 
 const HEX_DO_ID_RE = /^[0-9a-f]{64}$/i;
+const MAX_BUFFERED_DO_RESPONSE_BYTES = 4 * 1024 * 1024;
+
+function replayBody(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  prefix: Uint8Array[],
+): ReadableStream<Uint8Array> {
+  let canceled = false;
+  return new ReadableStream({
+    type: 'bytes',
+    start(controller) {
+      for (const chunk of prefix) controller.enqueue(chunk);
+    },
+    async pull(controller) {
+      try {
+        let next = await reader.read();
+        while (!next.done && next.value.byteLength === 0) next = await reader.read();
+        if (canceled) return;
+        if (next.done) {
+          reader.releaseLock();
+          controller.close();
+        } else {
+          controller.enqueue(next.value);
+        }
+      } catch (error) {
+        if (!canceled) {
+          void reader.cancel(error).catch(() => {});
+          reader.releaseLock();
+          throw error;
+        }
+      }
+    },
+    async cancel(reason) {
+      canceled = true;
+      try {
+        await reader.cancel(reason);
+      } finally {
+        reader.releaseLock();
+      }
+    },
+  });
+}
+
+async function materializeDoResponse(response: Response, method: string): Promise<Response> {
+  const body = response.body;
+  if (!body || method === 'HEAD' || response.status === 101 || response.webSocket) return response;
+  const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
+  if (
+    contentType.includes('text/event-stream') || contentType.includes('application/x-ndjson') ||
+    Number(response.headers.get('content-length')) > MAX_BUFFERED_DO_RESPONSE_BYTES
+  ) {
+    return response;
+  }
+
+  // Drain small replies before returning them through RPC so the caller can drop
+  // the reply without leaving a pipe back to the supervisor open.
+  const reader = body.getReader();
+  let buffer = new Uint8Array(0);
+  let size = 0;
+  let streaming = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return new Response(buffer.subarray(0, size), response);
+
+      const nextSize = size + value.byteLength;
+      if (nextSize > MAX_BUFFERED_DO_RESPONSE_BYTES) {
+        // Replay the bytes already read, then stream the rest from the same reader.
+        const prefix = size ? [buffer.subarray(0, size), value] : [value];
+        const forwarded = new Response(replayBody(reader, prefix), response);
+        streaming = true;
+        return forwarded;
+      }
+      if (nextSize > buffer.byteLength) {
+        const capacity = Math.max(nextSize, Math.min(buffer.byteLength * 2, MAX_BUFFERED_DO_RESPONSE_BYTES));
+        const expanded = new Uint8Array(capacity);
+        expanded.set(buffer);
+        buffer = expanded;
+      }
+      buffer.set(value, size);
+      size = nextSize;
+    }
+  } finally {
+    if (!streaming) {
+      void reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+  }
+}
+
+function cancelRequestBody(request: Request): void {
+  const body = request.body;
+  if (body && !body.locked) {
+    // Cancellation can wait for another tee branch. Start it without delaying the error.
+    void body.cancel().catch(() => {});
+  }
+}
 
 export class TenantDoRouter extends WorkerEntrypoint<EntrypointsEnv, TenantDoRouterProps> {
   private hopCount = 0;
@@ -95,34 +192,42 @@ export class TenantDoRouter extends WorkerEntrypoint<EntrypointsEnv, TenantDoRou
     objectId: string,
     request: Request,
   ): Promise<Response> {
-    this.enforceHopBudget();
-    const expectedApp = this.ctx.props?.dispatchScriptName;
-    if (expectedApp && appId !== expectedApp) {
-      return new Response('Cross-app Durable Object access denied', { status: 403 });
-    }
-    const { stub, identity } = await this.getSupervisor(appId, className, objectId);
-    const headers = new Headers(request.headers);
-    headers.set('x-chiridion-app-id', identity.dispatchScriptName);
-    headers.set('x-chiridion-do-class', identity.className);
-    headers.set('x-chiridion-do-id', identity.objectId);
-    headers.set('x-chiridion-supervisor-key', identity.supervisorKey);
-    if (identity.bundleR2Key) headers.set('x-chiridion-bundle-key', identity.bundleR2Key);
-    if (identity.quotaTier) headers.set('x-chiridion-quota-tier', identity.quotaTier);
-    if (identity.runtimeMode) {
-      headers.set('x-chiridion-runtime-mode', identity.runtimeMode);
-    } else {
-      headers.delete('x-chiridion-runtime-mode');
-    }
+    let uploadAbort: AbortController | undefined;
+    try {
+      this.enforceHopBudget();
+      const expectedApp = this.ctx.props?.dispatchScriptName;
+      if (expectedApp && appId !== expectedApp) {
+        cancelRequestBody(request);
+        return new Response('Cross-app Durable Object access denied', { status: 403 });
+      }
+      const { stub, identity } = await this.getSupervisor(appId, className, objectId);
+      const headers = new Headers(request.headers);
+      headers.set('x-chiridion-app-id', identity.dispatchScriptName);
+      headers.set('x-chiridion-do-class', identity.className);
+      headers.set('x-chiridion-do-id', identity.objectId);
+      headers.set('x-chiridion-supervisor-key', identity.supervisorKey);
+      if (identity.bundleR2Key) headers.set('x-chiridion-bundle-key', identity.bundleR2Key);
+      if (identity.quotaTier) headers.set('x-chiridion-quota-tier', identity.quotaTier);
+      if (identity.runtimeMode) {
+        headers.set('x-chiridion-runtime-mode', identity.runtimeMode);
+      } else {
+        headers.delete('x-chiridion-runtime-mode');
+      }
 
-    const init: RequestInit = {
-      method: request.method,
-      headers,
-    };
-    if (request.method !== 'GET' && request.method !== 'HEAD') {
-      init.body = request.body;
+      const init: RequestInit = { method: request.method, headers };
+      if (request.body && request.method !== 'GET' && request.method !== 'HEAD') {
+        uploadAbort = new AbortController();
+        init.body = request.body;
+        init.signal = uploadAbort.signal;
+      }
+      const response = await stub.fetch(new Request(request.url, init));
+      return await materializeDoResponse(response, request.method);
+    } catch (error) {
+      // The outgoing fetch may still hold the request body lock when reading the reply fails.
+      uploadAbort?.abort();
+      cancelRequestBody(request);
+      throw error;
     }
-    // Direct fetch forwarding preserves WebSocket upgrades & hibernation end-to-end.
-    return stub.fetch(new Request(request.url, init));
   }
 
   async rpcObject(
@@ -141,7 +246,7 @@ export class TenantDoRouter extends WorkerEntrypoint<EntrypointsEnv, TenantDoRou
       throw new Error(`Disallowed Durable Object RPC method: ${method}`);
     }
     const { stub, identity } = await this.getSupervisor(appId, className, objectId);
-    return stub.rpcCall(identity, method, args);
+    return materializeRpcResult(await stub.rpcCall(identity, method, args));
   }
 }
 

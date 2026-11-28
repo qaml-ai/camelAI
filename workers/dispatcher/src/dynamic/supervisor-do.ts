@@ -101,6 +101,24 @@ interface MeteredFacetStub {
   }>;
 }
 
+type BundleMeta = Pick<DynamicWorkerBundleRecord,
+  'dispatchScriptName' | 'scriptName' | 'orgId' | 'orgSlug' | 'workspaceId' | 'bundleSha' | 'createdAt' | 'bindings'
+> & { bundleR2Key: string };
+
+interface ResolvedApp {
+  accessInfo: WorkerAccessInfo;
+  bundleMeta: BundleMeta;
+  quotaTier: AppQuotaTier;
+}
+
+interface BundleRead {
+  ready: Promise<BundleMeta | null>;
+  record: DynamicWorkerBundleRecord | null;
+  callers: number;
+}
+
+class WorkerBundleNotFoundError extends Error {}
+
 function isVirtualTableSql(sqlText: string | undefined): boolean {
   return /^CREATE\s+VIRTUAL\s+TABLE\b/i.test(String(sqlText || '').trim());
 }
@@ -221,7 +239,10 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
   private lastQuotaPersistAt = 0;
   private unsavedQuotaRowsRead = 0;
   private unsavedQuotaRowsWritten = 0;
-  private activeFacetBundleKey: string | null = null;
+  private activeBundleMeta: BundleMeta | null = null;
+  private bundleReads?: Map<string, BundleRead>;
+  private bundleLoads?: Map<string, Promise<DynamicWorkerBundleRecord | null>>;
+  private activeFacetConfig: { key: string; missingBundle?: WorkerBundleNotFoundError } | null = null;
   private migrationInFlight: Promise<MigrationRunResult> | null = null;
   private migrationNeedsResume: boolean | undefined;
 
@@ -269,18 +290,62 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     await this.ctx.storage.put(META_QUOTA_KEY, state);
   }
 
-  private async resolveAppAndBundle(
+  private async resolveAppAndBundle<T>(
     identity: SupervisorIdentity,
-  ): Promise<{
-    accessInfo: WorkerAccessInfo;
-    bundle: DynamicWorkerBundleRecord;
-    quotaTier: AppQuotaTier;
-  } | null> {
+    run: (app: ResolvedApp) => Promise<T>,
+    onMissing: () => T,
+  ): Promise<T> {
     const accessInfo = await getWorkerAccessInfo(this.env.APP_KV, identity.dispatchScriptName);
     const effectiveBundleKey = identity.bundleR2Key || accessInfo?.bundle_r2_key;
-    if (!effectiveBundleKey) return null;
-    const bundle = await loadDynamicBundleRecord(this.env, effectiveBundleKey);
-    if (!bundle) return null;
+    if (!effectiveBundleKey) return onMissing();
+    const runWithMeta = async (bundleMeta: BundleMeta) => {
+      try {
+        return await run(this.resolveAccess(identity, accessInfo, bundleMeta));
+      } catch (error) {
+        if (error instanceof WorkerBundleNotFoundError) return onMissing();
+        throw error;
+      }
+    };
+    if (this.activeBundleMeta?.bundleR2Key === effectiveBundleKey) {
+      return runWithMeta(this.activeBundleMeta);
+    }
+
+    // Share the first read across metadata resolution and the loader's startup callback.
+    // The flight is only held by requests that encountered a metadata miss.
+    const reads = this.bundleReads ??= new Map<string, BundleRead>();
+    let read = reads.get(effectiveBundleKey);
+    if (!read) {
+      const pending: BundleRead = { record: null, callers: 0, ready: Promise.resolve(null) };
+      pending.ready = this.readBundleRecord(effectiveBundleKey).then((record) => {
+        pending.record = record;
+        if (!record) return null;
+        const { dispatchScriptName, scriptName, orgId, orgSlug, workspaceId, bundleSha, createdAt, bindings } = record;
+        const meta = {
+          bundleR2Key: effectiveBundleKey,
+          dispatchScriptName, scriptName, orgId, orgSlug, workspaceId, bundleSha, createdAt, bindings,
+        };
+        if (this.bundleReads === reads) this.activeBundleMeta = meta;
+        return meta;
+      });
+      reads.set(effectiveBundleKey, pending);
+      read = pending;
+    }
+    read.callers += 1;
+    try {
+      const meta = await read.ready;
+      return meta ? await runWithMeta(meta) : onMissing();
+    } finally {
+      read.callers -= 1;
+      if (read.callers === 0) reads.delete(effectiveBundleKey);
+    }
+  }
+
+  private resolveAccess(
+    identity: SupervisorIdentity,
+    accessInfo: WorkerAccessInfo | null,
+    bundleMeta: BundleMeta,
+  ): ResolvedApp {
+    const { bundleR2Key, orgId, orgSlug, bundleSha } = bundleMeta;
     const runtimeMode = identity.runtimeMode === 'dynamic_migrating' || accessInfo?.runtime_mode === 'dynamic_migrating'
       ? 'dynamic_migrating'
       : 'dynamic';
@@ -288,74 +353,130 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       ? {
           ...accessInfo,
           runtime_mode: runtimeMode,
-          bundle_r2_key: effectiveBundleKey,
+          bundle_r2_key: bundleR2Key,
           ...(identity.quotaTier ? { quota_tier: identity.quotaTier } : {}),
           ...(identity.envVersion !== undefined ? { env_version: identity.envVersion } : {}),
         }
       : {
           is_public: false,
-          org_id: bundle.orgId,
-          org_slug: bundle.orgSlug,
+          org_id: orgId,
+          org_slug: orgSlug,
           runtime_mode: runtimeMode,
-          bundle_r2_key: effectiveBundleKey,
-          bundle_sha: bundle.bundleSha,
+          bundle_r2_key: bundleR2Key,
+          bundle_sha: bundleSha,
           quota_tier: identity.quotaTier ?? 'free',
           env_version: identity.envVersion ?? 0,
         };
     return {
       accessInfo: effectiveAccess,
-      bundle,
+      bundleMeta,
       quotaTier: resolveQuotaTier(effectiveAccess.quota_tier),
     };
   }
 
-  private async getMainFacet(
+  private readBundleRecord(bundleR2Key: string): Promise<DynamicWorkerBundleRecord | null> {
+    // A rotation can replace a facet while its startup callback is still reading R2.
+    const loads = this.bundleLoads ??= new Map<string, Promise<DynamicWorkerBundleRecord | null>>();
+    const pending = loads.get(bundleR2Key);
+    if (pending) return pending;
+    const load = loadDynamicBundleRecord(this.env, bundleR2Key).finally(() => loads.delete(bundleR2Key));
+    loads.set(bundleR2Key, load);
+    return load;
+  }
+
+  private async loadBundleForFacet(bundleR2Key: string): Promise<DynamicWorkerBundleRecord> {
+    const read = this.bundleReads?.get(bundleR2Key);
+    const preloaded = read?.record;
+    if (read) read.record = null;
+    const record = preloaded ?? await this.readBundleRecord(bundleR2Key);
+    if (!record) throw new WorkerBundleNotFoundError(`Worker bundle not found: ${bundleR2Key}`);
+    return record;
+  }
+
+  private abortMainFacet(reason: string | Error): void {
+    this.activeFacetConfig = null;
+    try {
+      this.ctx.facets.abort('main', typeof reason === 'string' ? new Error(reason) : reason);
+    } catch {
+      // Facet may not be active.
+    }
+  }
+
+  private async withMainFacet<T>(
     identity: SupervisorIdentity,
     accessInfo: WorkerAccessInfo,
-    bundle: DynamicWorkerBundleRecord,
+    bundleMeta: BundleMeta,
     quotaTier: AppQuotaTier,
     quotaState: PersistedShardQuotaState,
-  ): Promise<MeteredFacetStub> {
-    if (!this.env.USER_APP_LOADER) {
+    run: (facet: MeteredFacetStub) => Promise<T>,
+  ): Promise<T> {
+    const loader = this.env.USER_APP_LOADER;
+    if (!loader) {
       throw new Error('USER_APP_LOADER binding is not configured on dispatcher');
     }
 
     const [{ vars, envHash }, enableLogsTail] = await Promise.all([
-      loadDynamicEnvOverlay(this.env, bundle, accessInfo.env_version),
-      isDynamicLogsTailEnabled(this.env, bundle),
+      loadDynamicEnvOverlay(this.env, bundleMeta, accessInfo.env_version),
+      isDynamicLogsTailEnabled(this.env, bundleMeta),
     ]);
 
-    const nextFacetBundleKey = `${bundle.bundleSha}:${envHash}:${quotaTier}:${accessInfo.runtime_mode}`;
-    if (this.activeFacetBundleKey && this.activeFacetBundleKey !== nextFacetBundleKey) {
-      // Gracefully abort the warm facet so the new bundle/env takes effect immediately
-      // while preserving 100% of the facet's SQLite database.
-      try {
-        this.ctx.facets.abort('main', new Error('Bundle or env version updated'));
-      } catch {
-        // Facet may not have been started yet.
-      }
+    const nextFacetBundleKey = `${bundleMeta.bundleR2Key}:${bundleMeta.bundleSha}:${envHash}:${quotaTier}:${accessInfo.runtime_mode}:${enableLogsTail ? '1' : '0'}`;
+    if (this.activeFacetConfig && this.activeFacetConfig.key !== nextFacetBundleKey) {
+      this.abortMainFacet('Bundle or env version updated');
     }
-    this.activeFacetBundleKey = nextFacetBundleKey;
+    const facetConfig = this.activeFacetConfig ??= { key: nextFacetBundleKey };
 
-    const worker = loadDynamicUserWorker({
-      loader: this.env.USER_APP_LOADER,
-      record: bundle,
-      exports: ((this.ctx as unknown as { exports?: DynamicRuntimeExports }).exports ?? {}) as DynamicRuntimeExports,
-      managedOverlay: vars,
-      envHash,
-      quotaTier,
-      runtimeMode: accessInfo.runtime_mode,
-      quotaLimits: quotaLimitsForTier(quotaTier),
-      supervisorKey: identity.supervisorKey,
-      dailyRowsRead: quotaState.rowsRead,
-      dailyRowsWritten: quotaState.rowsWritten,
-      preferBroker: Boolean(this.env.MAIN_APP_BROKER),
-      enableLogsTail,
-    });
+    // The runtime invokes the callback once per mount and a fresh stub can reattach
+    // after the child disconnects. Warm requests never enter the callback.
+    const { bundleR2Key } = bundleMeta;
+    const handoff: { record: DynamicWorkerBundleRecord | null } = { record: null };
+    const facet = this.ctx.facets.get('main', async () => {
+      try {
+        // Read before asking Worker Loader so a transient storage failure cannot
+        // poison the loader's cache for this version.
+        const record = await this.loadBundleForFacet(bundleR2Key);
+        if (this.activeFacetConfig !== facetConfig) throw new Error('Facet configuration changed during startup');
+        handoff.record = record;
+        const worker = loadDynamicUserWorker({
+          loader,
+          bundleIdentity: bundleMeta,
+          loadRecord: async () => {
+            const preloaded = handoff.record;
+            handoff.record = null;
+            return preloaded ?? this.loadBundleForFacet(bundleR2Key);
+          },
+          exports: ((this.ctx as unknown as { exports?: DynamicRuntimeExports }).exports ?? {}) as DynamicRuntimeExports,
+          managedOverlay: vars,
+          envHash,
+          quotaTier,
+          runtimeMode: accessInfo.runtime_mode,
+          quotaLimits: quotaLimitsForTier(quotaTier),
+          supervisorKey: identity.supervisorKey,
+          dailyRowsRead: quotaState.rowsRead,
+          dailyRowsWritten: quotaState.rowsWritten,
+          preferBroker: Boolean(this.env.MAIN_APP_BROKER),
+          enableLogsTail,
+        });
+        return { class: worker.getDurableObjectClass(identity.className) };
+      } catch (error) {
+        if (error instanceof WorkerBundleNotFoundError) {
+          facetConfig.missingBundle = error;
+          if (this.activeBundleMeta === bundleMeta) this.activeBundleMeta = null;
+        }
+        if (this.activeFacetConfig === facetConfig) this.abortMainFacet(error instanceof Error ? error : String(error));
+        throw error;
+      }
+    }) as unknown as MeteredFacetStub;
 
-    return this.ctx.facets.get('main', () => ({
-      class: worker.getDurableObjectClass(identity.className),
-    })) as unknown as MeteredFacetStub;
+    try {
+      return await run(facet);
+    } catch (error) {
+      // Facet RPC can serialize the error as a plain Error.
+      throw facetConfig.missingBundle ?? error;
+    } finally {
+      // Worker Loader can reuse an existing isolate without calling loadRecord.
+      handoff.record = null;
+    }
   }
 
   private async flushFacetMetrics(
@@ -436,111 +557,108 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       return new Response('Missing Durable Object supervisor identity', { status: 400 });
     }
 
-    const resolved = await this.resolveAppAndBundle(identity);
-    if (!resolved) {
-      return new Response('Worker bundle not found', { status: 404 });
-    }
-    const { accessInfo, bundle, quotaTier } = resolved;
-
-    if (!(await this.ensureLazyMigrated(identity, accessInfo, quotaTier))) {
-      return migrationPendingResponse();
-    }
-
-    const quotaState = await this.loadQuotaState();
-    const preCheck = checkShardQuota({ tier: quotaTier, daily: quotaState });
-    if (!preCheck.allowed) {
-      emitAppUsageMetric(this.env.APP_USAGE_AE, {
-        dispatchScriptName: identity.dispatchScriptName,
-        orgId: accessInfo.org_id,
-        className: identity.className,
-        eventKind: 'quota_trip',
-        quotaTier,
-        quotaTripped: true,
-      });
-      return new Response(
-        JSON.stringify({
-          error: 'Durable Object quota exceeded',
-          reason: preCheck.reason,
-          limit: preCheck.limit,
-          observed: preCheck.observed,
-        }),
-        {
-          status: 429,
-          headers: {
-            'Content-Type': 'application/json',
-            'X-CamelAI-Quota-Exceeded': preCheck.reason ?? 'quota_exceeded',
-            'Retry-After': '60',
-          },
-        },
-      );
-    }
-
-    const facet = await this.getMainFacet(identity, accessInfo, bundle, quotaTier, quotaState);
-    const isWebSocket = request.headers.get('upgrade')?.toLowerCase() === 'websocket';
-
-    // Strip internal routing headers before handing request to user code.
-    const cleanHeaders = new Headers(request.headers);
-    cleanHeaders.delete('x-chiridion-app-id');
-    cleanHeaders.delete('x-chiridion-do-class');
-    cleanHeaders.delete('x-chiridion-do-id');
-    cleanHeaders.delete('x-chiridion-supervisor-key');
-    cleanHeaders.delete('x-chiridion-bundle-key');
-    cleanHeaders.delete('x-chiridion-runtime-mode');
-    cleanHeaders.delete('x-chiridion-quota-tier');
-
-    const forwardedInit: RequestInit = {
-      method: request.method,
-      headers: cleanHeaders,
-    };
-    if (request.method !== 'GET' && request.method !== 'HEAD') {
-      forwardedInit.body = request.body;
-    }
-
-    try {
-      const response = await facet.fetch(new Request(request.url, forwardedInit));
-      // Do NOT await flush if WebSocket upgrade (101) — use waitUntil so upgrade returns immediately.
-      const flushPromise = this.flushFacetMetrics(
-        facet,
-        identity,
-        accessInfo.org_id,
-        quotaTier,
-        isWebSocket ? 'do_ws' : 'do_fetch',
-        startedAt,
-      );
-      if (isWebSocket) {
-        this.ctx.waitUntil(flushPromise);
-      } else {
-        await flushPromise;
+    return this.resolveAppAndBundle(identity, async ({ accessInfo, bundleMeta, quotaTier }) => {
+      if (!(await this.ensureLazyMigrated(identity, accessInfo, quotaTier))) {
+        return migrationPendingResponse();
       }
-      return response;
-    } catch (error) {
-      console.error('[supervisor] fetch failed', {
-        supervisorKey: identity.supervisorKey,
-        url: request.url,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      await this.flushFacetMetrics(
-        facet,
-        identity,
-        accessInfo.org_id,
-        quotaTier,
-        isWebSocket ? 'do_ws' : 'do_fetch',
-        startedAt,
-      );
-      if (error instanceof Error && error.message.includes('Quota exceeded')) {
+
+      const quotaState = await this.loadQuotaState();
+      const preCheck = checkShardQuota({ tier: quotaTier, daily: quotaState });
+      if (!preCheck.allowed) {
+        emitAppUsageMetric(this.env.APP_USAGE_AE, {
+          dispatchScriptName: identity.dispatchScriptName,
+          orgId: accessInfo.org_id,
+          className: identity.className,
+          eventKind: 'quota_trip',
+          quotaTier,
+          quotaTripped: true,
+        });
         return new Response(
-          JSON.stringify({ error: error.message }),
+          JSON.stringify({
+            error: 'Durable Object quota exceeded',
+            reason: preCheck.reason,
+            limit: preCheck.limit,
+            observed: preCheck.observed,
+          }),
           {
             status: 429,
             headers: {
               'Content-Type': 'application/json',
-              'X-CamelAI-Quota-Exceeded': 'runtime_trip',
+              'X-CamelAI-Quota-Exceeded': preCheck.reason ?? 'quota_exceeded',
+              'Retry-After': '60',
             },
           },
         );
       }
-      throw error;
-    }
+
+      const isWebSocket = request.headers.get('upgrade')?.toLowerCase() === 'websocket';
+
+      // Strip internal routing headers before handing request to user code.
+      const cleanHeaders = new Headers(request.headers);
+      cleanHeaders.delete('x-chiridion-app-id');
+      cleanHeaders.delete('x-chiridion-do-class');
+      cleanHeaders.delete('x-chiridion-do-id');
+      cleanHeaders.delete('x-chiridion-supervisor-key');
+      cleanHeaders.delete('x-chiridion-bundle-key');
+      cleanHeaders.delete('x-chiridion-runtime-mode');
+      cleanHeaders.delete('x-chiridion-quota-tier');
+
+      const forwardedInit: RequestInit = {
+        method: request.method,
+        headers: cleanHeaders,
+      };
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        forwardedInit.body = request.body;
+      }
+
+      return this.withMainFacet(identity, accessInfo, bundleMeta, quotaTier, quotaState, async (facet) => {
+        try {
+          const response = await facet.fetch(new Request(request.url, forwardedInit));
+          // Do NOT await flush if WebSocket upgrade (101) — use waitUntil so upgrade returns immediately.
+          const flushPromise = this.flushFacetMetrics(
+            facet,
+            identity,
+            accessInfo.org_id,
+            quotaTier,
+            isWebSocket ? 'do_ws' : 'do_fetch',
+            startedAt,
+          );
+          if (isWebSocket) {
+            this.ctx.waitUntil(flushPromise);
+          } else {
+            await flushPromise;
+          }
+          return response;
+        } catch (error) {
+          console.error('[supervisor] fetch failed', {
+            supervisorKey: identity.supervisorKey,
+            url: request.url,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          await this.flushFacetMetrics(
+            facet,
+            identity,
+            accessInfo.org_id,
+            quotaTier,
+            isWebSocket ? 'do_ws' : 'do_fetch',
+            startedAt,
+          );
+          if (error instanceof Error && error.message.includes('Quota exceeded')) {
+            return new Response(
+              JSON.stringify({ error: error.message }),
+              {
+                status: 429,
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-CamelAI-Quota-Exceeded': 'runtime_trip',
+                },
+              },
+            );
+          }
+          throw error;
+        }
+      });
+    }, () => new Response('Worker bundle not found', { status: 404 }));
   }
 
   async rpcCall(
@@ -552,56 +670,57 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     const identity = await this.ensureIdentity(identityInput);
     if (!identity) throw new Error('Missing Durable Object supervisor identity');
 
-    const resolved = await this.resolveAppAndBundle(identity);
-    if (!resolved) throw new Error(`Worker bundle not found: ${identity.dispatchScriptName}`);
-    const { accessInfo, bundle, quotaTier } = resolved;
+    return this.resolveAppAndBundle(identity, async ({ accessInfo, bundleMeta, quotaTier }) => {
+      if (!(await this.ensureLazyMigrated(identity, accessInfo, quotaTier))) {
+        throw new Error(MIGRATION_PENDING_MESSAGE);
+      }
 
-    if (!(await this.ensureLazyMigrated(identity, accessInfo, quotaTier))) {
-      throw new Error(MIGRATION_PENDING_MESSAGE);
-    }
+      const quotaState = await this.loadQuotaState();
+      const preCheck = checkShardQuota({ tier: quotaTier, daily: quotaState });
+      if (!preCheck.allowed) {
+        emitAppUsageMetric(this.env.APP_USAGE_AE, {
+          dispatchScriptName: identity.dispatchScriptName,
+          orgId: accessInfo.org_id,
+          className: identity.className,
+          eventKind: 'quota_trip',
+          quotaTier,
+          quotaTripped: true,
+        });
+        throw new Error(`Durable Object quota exceeded (${preCheck.reason})`);
+      }
 
-    const quotaState = await this.loadQuotaState();
-    const preCheck = checkShardQuota({ tier: quotaTier, daily: quotaState });
-    if (!preCheck.allowed) {
-      emitAppUsageMetric(this.env.APP_USAGE_AE, {
-        dispatchScriptName: identity.dispatchScriptName,
-        orgId: accessInfo.org_id,
-        className: identity.className,
-        eventKind: 'quota_trip',
-        quotaTier,
-        quotaTripped: true,
+      return this.withMainFacet(identity, accessInfo, bundleMeta, quotaTier, quotaState, async (facet) => {
+        try {
+          const result = await facet.__chiridionCallMethod(method, args);
+          await this.flushFacetMetrics(
+            facet,
+            identity,
+            accessInfo.org_id,
+            quotaTier,
+            'do_rpc',
+            startedAt,
+          );
+          return result;
+        } catch (error) {
+          console.error('[supervisor] rpcCall failed', {
+            supervisorKey: identity.supervisorKey,
+            method,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          await this.flushFacetMetrics(
+            facet,
+            identity,
+            accessInfo.org_id,
+            quotaTier,
+            'do_rpc',
+            startedAt,
+          );
+          throw error;
+        }
       });
-      throw new Error(`Durable Object quota exceeded (${preCheck.reason})`);
-    }
-
-    const facet = await this.getMainFacet(identity, accessInfo, bundle, quotaTier, quotaState);
-    try {
-      const result = await facet.__chiridionCallMethod(method, args);
-      await this.flushFacetMetrics(
-        facet,
-        identity,
-        accessInfo.org_id,
-        quotaTier,
-        'do_rpc',
-        startedAt,
-      );
-      return result;
-    } catch (error) {
-      console.error('[supervisor] rpcCall failed', {
-        supervisorKey: identity.supervisorKey,
-        method,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      await this.flushFacetMetrics(
-        facet,
-        identity,
-        accessInfo.org_id,
-        quotaTier,
-        'do_rpc',
-        startedAt,
-      );
-      throw error;
-    }
+    }, () => {
+      throw new Error(`Worker bundle not found: ${identity.dispatchScriptName}`);
+    });
   }
 
   async alarm(): Promise<void> {
@@ -609,46 +728,45 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     const identity = await this.ensureIdentity();
     if (!identity) return;
 
-    const resolved = await this.resolveAppAndBundle(identity);
-    if (!resolved) return;
-    const { accessInfo, bundle, quotaTier } = resolved;
+    return this.resolveAppAndBundle(identity, async ({ accessInfo, bundleMeta, quotaTier }) => {
+      if (!(await this.ensureLazyMigrated(identity, accessInfo, quotaTier))) {
+        await this.ctx.storage.setAlarm(Date.now() + MIGRATION_RETRY_AFTER_SECONDS * 1_000);
+        return;
+      }
 
-    if (!(await this.ensureLazyMigrated(identity, accessInfo, quotaTier))) {
-      await this.ctx.storage.setAlarm(Date.now() + MIGRATION_RETRY_AFTER_SECONDS * 1_000);
-      return;
-    }
+      const quotaState = await this.loadQuotaState();
+      const limits = quotaLimitsForTier(quotaTier);
+      quotaState.alarmsFired += 1;
+      await this.saveQuotaState(quotaState);
 
-    const quotaState = await this.loadQuotaState();
-    const limits = quotaLimitsForTier(quotaTier);
-    quotaState.alarmsFired += 1;
-    await this.saveQuotaState(quotaState);
+      const preCheck = checkShardQuota({ tier: quotaTier, daily: quotaState });
+      if (!preCheck.allowed || (limits && quotaState.alarmsFired > limits.alarmDailyBudget)) {
+        emitAppUsageMetric(this.env.APP_USAGE_AE, {
+          dispatchScriptName: identity.dispatchScriptName,
+          orgId: accessInfo.org_id,
+          className: identity.className,
+          eventKind: 'quota_trip',
+          quotaTier,
+          quotaTripped: true,
+        });
+        return;
+      }
 
-    const preCheck = checkShardQuota({ tier: quotaTier, daily: quotaState });
-    if (!preCheck.allowed || (limits && quotaState.alarmsFired > limits.alarmDailyBudget)) {
-      emitAppUsageMetric(this.env.APP_USAGE_AE, {
-        dispatchScriptName: identity.dispatchScriptName,
-        orgId: accessInfo.org_id,
-        className: identity.className,
-        eventKind: 'quota_trip',
-        quotaTier,
-        quotaTripped: true,
+      return this.withMainFacet(identity, accessInfo, bundleMeta, quotaTier, quotaState, async (facet) => {
+        try {
+          await facet.__chiridionRunAlarm();
+        } finally {
+          await this.flushFacetMetrics(
+            facet,
+            identity,
+            accessInfo.org_id,
+            quotaTier,
+            'do_alarm',
+            startedAt,
+          );
+        }
       });
-      return;
-    }
-
-    const facet = await this.getMainFacet(identity, accessInfo, bundle, quotaTier, quotaState);
-    try {
-      await facet.__chiridionRunAlarm();
-    } finally {
-      await this.flushFacetMetrics(
-        facet,
-        identity,
-        accessInfo.org_id,
-        quotaTier,
-        'do_alarm',
-        startedAt,
-      );
-    }
+    }, () => undefined);
   }
 
   /**
@@ -704,11 +822,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
 
     const identity = await this.ensureIdentity();
     if (tripCountInEvent >= 2) {
-      try {
-        this.ctx.facets.abort('main', new Error(`Aborted due to repeated quota breach: ${reason}`));
-      } catch {
-        // Already aborted.
-      }
+      this.abortMainFacet(`Aborted due to repeated quota breach: ${reason}`);
       if (identity) {
         emitAppUsageMetric(this.env.APP_USAGE_AE, {
           dispatchScriptName: identity.dispatchScriptName,
@@ -723,11 +837,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
   }
 
   async abortFacet(reason: string): Promise<void> {
-    try {
-      this.ctx.facets.abort('main', new Error(reason));
-    } catch {
-      // Facet not active.
-    }
+    this.abortMainFacet(reason);
   }
 
   async getMigrationState(): Promise<SupervisorMigrationState | null> {
@@ -912,10 +1022,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
       await this.setMigrationState({ status: 'in_progress', legacyHexId: freeze.hexId });
 
       // Abort any running facet cleanly before mounting the one-shot importer facet on `"main"`.
-      try {
-        this.ctx.facets.abort('main', new Error('Mounting privileged migration importer facet'));
-      } catch {}
-      this.activeFacetBundleKey = null;
+      this.abortMainFacet('Mounting privileged migration importer facet');
 
       const importerWorker = this.env.USER_APP_LOADER.get('__chiridion_migration_importer_v7', () => ({
         compatibilityDate: '2026-07-13',
@@ -1235,10 +1342,7 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     } finally {
       // Always unmount the one-shot importer facet after each chunk/completion to release V8 heap
       // (the "main" facet SQLite DB persists durably across chunks) and load user DO code on completion.
-      try {
-        this.ctx.facets.abort('main', new Error('Migration importer chunk finished'));
-      } catch {}
-      this.activeFacetBundleKey = null;
+      this.abortMainFacet('Migration importer chunk finished');
     }
   }
 
@@ -1294,7 +1398,10 @@ export class TenantObjectSupervisorDO extends DurableObject<SupervisorEnv> {
     }
     this.identityCache = null;
     this.quotaCache = null;
-    this.activeFacetBundleKey = null;
+    this.activeBundleMeta = null;
+    this.bundleReads = undefined;
+    this.bundleLoads = undefined;
+    this.activeFacetConfig = null;
     this.migrationNeedsResume = undefined;
     await this.ctx.storage.deleteAll();
   }

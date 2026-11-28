@@ -556,9 +556,8 @@ function buildVirtualBindingsEnv(
   return result;
 }
 
-export interface LoadDynamicWorkerOptions {
+interface DynamicWorkerOptions {
   loader: WorkerLoader;
-  record: DynamicWorkerBundleRecord;
   exports: DynamicRuntimeExports;
   managedOverlay: ManagedAppEnvVar[];
   envHash: string;
@@ -572,10 +571,17 @@ export interface LoadDynamicWorkerOptions {
   enableLogsTail?: boolean;
 }
 
+export type LoadDynamicWorkerOptions = DynamicWorkerOptions & (
+  | { record: DynamicWorkerBundleRecord }
+  | {
+      bundleIdentity: Pick<DynamicWorkerBundleRecord, 'bundleSha' | 'dispatchScriptName'>;
+      loadRecord: () => Promise<DynamicWorkerBundleRecord>;
+    }
+);
+
 export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStub {
   const {
     loader,
-    record,
     exports,
     managedOverlay,
     envHash,
@@ -589,12 +595,13 @@ export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStu
     enableLogsTail = false,
   } = opts;
 
+  const { bundleSha, dispatchScriptName } = 'record' in opts ? opts.record : opts.bundleIdentity;
   const isolateIdBase = supervisorKey
-    ? `do:${supervisorKey}:${record.bundleSha}:${envHash}`
-    : `http:${record.dispatchScriptName}:${record.bundleSha}:${envHash}:${enableLogsTail ? 't1' : 't0'}`;
+    ? `do:${supervisorKey}:${bundleSha}:${envHash}:${quotaTier}:${enableLogsTail ? 't1' : 't0'}`
+    : `http:${dispatchScriptName}:${bundleSha}:${envHash}:${enableLogsTail ? 't1' : 't0'}`;
   const isolateId = runtimeMode ? `${isolateIdBase}:${runtimeMode}` : isolateIdBase;
 
-  return loader.get(isolateId, () => {
+  const buildCode = (record: DynamicWorkerBundleRecord): WorkerLoaderWorkerCode => {
     const modules: Record<string, WorkerLoaderModule | string> = {
       '__chiridion_wrapper.js': generateDynamicWorkerWrapperSource(record),
     };
@@ -690,5 +697,8 @@ export function loadDynamicUserWorker(opts: LoadDynamicWorkerOptions): WorkerStu
       ...(globalOutbound ? { globalOutbound } : {}),
       ...(tails ? { tails } : {}),
     } as WorkerLoaderWorkerCode;
-  });
+  };
+  return loader.get(isolateId, 'record' in opts
+    ? () => buildCode(opts.record)
+    : () => opts.loadRecord().then(buildCode));
 }

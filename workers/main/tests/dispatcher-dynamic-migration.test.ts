@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { clearBundleStoreCachesForTest } from '../../dispatcher/src/dynamic/bundle-store';
+import type { WorkerAccessInfo } from '../../dispatcher/src/access-control';
+import { clearBundleStoreCachesForTest, type ManagedAppEnvVar } from '../../dispatcher/src/dynamic/bundle-store';
 import { dispatchDynamicWorkerEdge } from '../../dispatcher/src/dynamic/edge-dispatch';
 import { TenantDoRouter, type TenantDoRouterProps } from '../../dispatcher/src/dynamic/entrypoints';
 import { TenantObjectSupervisorDO, type SupervisorEnv } from '../../dispatcher/src/dynamic/supervisor-do';
@@ -36,16 +37,27 @@ const bundle: DynamicWorkerBundleRecord = {
 
 function setup(
   kvMode?: AppRuntimeMode,
-  { record = bundle, broker }: {
+  { record = bundle, broker, getAppEnvVarsForDeploy }: {
     record?: DynamicWorkerBundleRecord;
     broker?: Pick<DynamicServiceBroker, 'resolveLegacyIntegrationEnvVars'>;
+    getAppEnvVarsForDeploy?: (name: string) => Promise<ManagedAppEnvVar[]>;
   } = {},
 ) {
   const recordKey = dynamicBundleObjectKey(appId, record.bundleSha);
+  const bundleBodies = new Map([[recordKey, JSON.stringify(record)]]);
+  const r2Get = vi.fn(async (key: string) => {
+    const body = bundleBodies.get(key);
+    return body === undefined ? null : { text: async () => body };
+  });
   const values = new Map<string, unknown>();
-  const appKv = { get: async (key: string) => key === `script:${appId}` && kvMode
-    ? JSON.stringify({ org_id: bundle.orgId, is_public: true, runtime_mode: kvMode })
-    : null, put: vi.fn() };
+  let accessInfo: WorkerAccessInfo | null = kvMode
+    ? { org_id: bundle.orgId, is_public: true, runtime_mode: kvMode }
+    : null;
+  const setAppAccessInfo = (next: WorkerAccessInfo) => { accessInfo = next; };
+  const appKv = {
+    get: async (key: string) => key === `script:${appId}` && accessInfo ? JSON.stringify(accessInfo) : null,
+    put: vi.fn(),
+  };
   const facet = {
     fetch: vi.fn(async (request: Request) => Response.json({
       reached: 'fetch',
@@ -68,7 +80,14 @@ function setup(
   });
   const sourceFetch = vi.fn<(request: Request) => Promise<Response>>();
   const setAlarm = vi.fn();
-  const abortFacet = vi.fn();
+  const startFacet = vi.fn((name: string) => name === 'ChiridionMigrationImporterDO' ? { fetch: importerFetch } : facet);
+  type FacetClass = { name: string; code: Promise<WorkerLoaderWorkerCode> };
+  type Facet = ReturnType<typeof startFacet>;
+  let mountedFacet: { ready: Promise<Facet>; abortReason?: Error } | undefined;
+  const abortFacet = vi.fn((_name: string, reason: Error) => {
+    if (mountedFacet) mountedFacet.abortReason = reason;
+    mountedFacet = undefined;
+  });
   const ctx = {
     storage: {
       get: async (key: string) => values.get(key),
@@ -79,29 +98,59 @@ function setup(
     },
     facets: {
       abort: abortFacet,
-      get: (_name: string, factory: () => { class: string }) =>
-        factory().class === 'ChiridionMigrationImporterDO' ? { fetch: importerFetch } : facet,
+      get: (_name: string, factory: () => { class: FacetClass } | Promise<{ class: FacetClass }>) => {
+        const mount = mountedFacet ??= {
+          ready: Promise.resolve(factory()).then(async ({ class: facetClass }) => {
+            await facetClass.code;
+            return startFacet(facetClass.name);
+          }),
+        };
+        const getFacet = async () => {
+          const target = await mount.ready;
+          if (mount.abortReason) throw mount.abortReason;
+          return target;
+        };
+        const getTenantFacet = async () => {
+          const target = await getFacet();
+          if (!('__chiridionCallMethod' in target)) throw new Error('Expected tenant facet');
+          return target;
+        };
+        return {
+          fetch: async (request: Request) => (await getFacet()).fetch(request),
+          __chiridionCallMethod: async () => (await getTenantFacet()).__chiridionCallMethod(),
+          __chiridionRunAlarm: async () => (await getTenantFacet()).__chiridionRunAlarm(),
+          __chiridionFlushMetrics: async () => (await getTenantFacet()).__chiridionFlushMetrics(),
+        };
+      },
     },
   };
   const workerCodes = new Map<string, WorkerLoaderWorkerCode>();
-  const loader = { get: (key: string, create: () => WorkerLoaderWorkerCode) => {
-    if (!workerCodes.has(key)) workerCodes.set(key, create());
-    const code = workerCodes.get(key)!;
+  const loadingWorkerCodes = new Map<string, Promise<WorkerLoaderWorkerCode>>();
+  const loaderGet = vi.fn<(key: string) => void>();
+  const loadWorker = (key: string, create: () => WorkerLoaderWorkerCode | Promise<WorkerLoaderWorkerCode>) => {
+    loaderGet(key);
+    const code = loadingWorkerCodes.get(key) ?? Promise.resolve(create()).then((value) => {
+      workerCodes.set(key, value);
+      return value;
+    });
+    loadingWorkerCodes.set(key, code);
     return {
-      getDurableObjectClass: (name: string) => name,
+      getDurableObjectClass: (name: string): FacetClass => ({ name, code }),
       getEntrypoint: () => ({ fetch: async (request: Request) => {
-        const router = (code.env as { __CHIRIDION_DO_ROUTER: TenantDoRouter }).__CHIRIDION_DO_ROUTER;
+        const { env } = await code;
+        const router = (env as { __CHIRIDION_DO_ROUTER: TenantDoRouter }).__CHIRIDION_DO_ROUTER;
         if (new URL(request.url).pathname === '/rpc') {
           return Response.json(await router.rpcObject(appId, className, objectId, 'read', []));
         }
         return router.fetchObject(appId, className, objectId, request);
       } }),
     };
-  } };
+  };
   const env = {
     APP_KV: appKv,
-    R2_BUCKET: { get: async (key: string) => key === recordKey ? { text: async () => JSON.stringify(record) } : null },
-    USER_APP_LOADER: loader,
+    R2_BUCKET: { get: r2Get },
+    USER_APP_LOADER: { get: loadWorker },
+    ORG: getAppEnvVarsForDeploy && { idFromName: (name: string) => name, get: () => ({ getAppEnvVarsForDeploy }) },
     MAIN_APP_BROKER: broker,
     MIGRATION_HMAC_SECRET: 'test-migration-secret',
     DISPATCHER: { get: () => ({ fetch: sourceFetch }) },
@@ -131,7 +180,10 @@ function setup(
     dispatchScriptName: appId,
     accessInfo: { runtime_mode: mode, is_public: true, org_id: bundle.orgId, bundle_r2_key: recordKey },
   });
-  return { edgeFetch, supervisor, createSupervisor, makeRouter, facet, setAlarm, sourceFetch, tenantDoRouter, values, workerCodes, abortFacet };
+  return {
+    edgeFetch, supervisor, createSupervisor, makeRouter, facet, setAlarm, sourceFetch, tenantDoRouter, values,
+    workerCodes, abortFacet, startFacet, bundleBodies, r2Get, loaderGet, setAppAccessInfo,
+  };
 }
 
 describe('TenantDoRouter result lifetime', () => {
@@ -313,6 +365,215 @@ describe('TenantDoRouter result lifetime', () => {
   });
 });
 
+describe('TenantObjectSupervisorDO warm facets', () => {
+  const batchSize = 20;
+  const dynamicAccess = { org_id: bundle.orgId, is_public: true, runtime_mode: 'dynamic' } as const;
+
+  function largeBundle(sha = bundleSha): DynamicWorkerBundleRecord {
+    return {
+      ...bundle,
+      bundleSha: sha,
+      modules: {
+        'index.js': { name: 'index.js', type: 'js', content: `export default {}; /*${' '.repeat(3 * 1024 * 1024)}*/` },
+      },
+    };
+  }
+
+  function request(key?: string): Request {
+    const headers = new Headers({
+      'x-chiridion-app-id': appId,
+      'x-chiridion-do-class': className,
+      'x-chiridion-do-id': objectId,
+    });
+    if (key) headers.set('x-chiridion-bundle-key', key);
+    return new Request('https://migration-test.example', { headers });
+  }
+
+  beforeEach(() => {
+    clearBundleStoreCachesForTest();
+    // Force every bundle load that bypasses the heap LRU to read from R2.
+    vi.stubGlobal('caches', { default: { match: async () => undefined, put: async () => {} } });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it.each(['KV', 'no KV'])('loads a large bundle once across cold and warm concurrent requests with %s', async (source) => {
+    const { supervisor, facet, r2Get, loaderGet, startFacet, setAppAccessInfo } = setup(undefined, { record: largeBundle() });
+    const key = source === 'no KV' ? bundleR2Key : undefined;
+    if (source === 'KV') {
+      setAppAccessInfo({ ...dynamicAccess, bundle_r2_key: bundleR2Key, bundle_sha: bundleSha });
+    }
+
+    const batch = () => Promise.all(Array.from({ length: batchSize }, () => supervisor.fetch(request(key))));
+    for (const response of await batch()) expect(response.status).toBe(200);
+    expect(r2Get).toHaveBeenCalledExactlyOnceWith(bundleR2Key);
+    expect(loaderGet).toHaveBeenCalledTimes(1);
+
+    const [warmResponses, result] = await Promise.all([batch(), supervisor.rpcCall(identity, 'read', []), supervisor.alarm()]);
+
+    for (const response of warmResponses) expect(response.status).toBe(200);
+    expect(result).toBe('rpc');
+    expect(facet.fetch).toHaveBeenCalledTimes(batchSize * 2);
+    expect(facet.__chiridionRunAlarm).toHaveBeenCalledTimes(1);
+    expect(r2Get).toHaveBeenCalledExactlyOnceWith(bundleR2Key);
+    expect(loaderGet).toHaveBeenCalledTimes(1);
+    expect(startFacet).toHaveBeenCalledExactlyOnceWith(className);
+  });
+
+  it('rotates a warm facet once for a new bundle key and once for a new env version', async () => {
+    const getAppEnvVarsForDeploy = vi.fn(async () => [{ key: 'APP_SETTING', value: 'initial', isSecret: false }]);
+    const { supervisor, workerCodes, abortFacet, startFacet, bundleBodies, r2Get, loaderGet, setAppAccessInfo } = setup(undefined, {
+      record: largeBundle(),
+      getAppEnvVarsForDeploy,
+    });
+    const nextBundle = largeBundle('0123456789abcdef');
+    const nextKey = dynamicBundleObjectKey(appId, nextBundle.bundleSha);
+    bundleBodies.set(nextKey, JSON.stringify(nextBundle));
+    setAppAccessInfo({ ...dynamicAccess, bundle_r2_key: bundleR2Key, bundle_sha: bundleSha, env_version: 1 });
+
+    expect((await supervisor.fetch(request())).status).toBe(200);
+    setAppAccessInfo({ ...dynamicAccess, bundle_r2_key: nextKey, bundle_sha: nextBundle.bundleSha, env_version: 1 });
+    const rotated = await Promise.all(Array.from({ length: batchSize }, () => supervisor.fetch(request())));
+    for (const response of rotated) expect(response.status).toBe(200);
+    expect(abortFacet).toHaveBeenCalledExactlyOnceWith('main', expect.any(Error));
+    expect(r2Get.mock.calls).toEqual([[bundleR2Key], [nextKey]]);
+    expect(loaderGet).toHaveBeenCalledTimes(2);
+
+    getAppEnvVarsForDeploy.mockResolvedValue([{ key: 'APP_SETTING', value: 'updated', isSecret: false }]);
+    setAppAccessInfo({ ...dynamicAccess, bundle_r2_key: nextKey, bundle_sha: nextBundle.bundleSha, env_version: 2 });
+    expect((await supervisor.fetch(request())).status).toBe(200);
+    expect((await supervisor.fetch(request())).status).toBe(200);
+
+    expect(r2Get.mock.calls).toEqual([[bundleR2Key], [nextKey], [nextKey]]);
+    expect(loaderGet).toHaveBeenCalledTimes(3);
+    expect(abortFacet).toHaveBeenCalledTimes(2);
+    expect(startFacet).toHaveBeenCalledTimes(3);
+    expect([...workerCodes.values()].map(({ env }) => (env as { APP_SETTING: string }).APP_SETTING))
+      .toEqual(['initial', 'initial', 'updated']);
+  });
+
+  it('reinitializes a warm facet after repeated quota trips and after an explicit abort', async () => {
+    const { supervisor, abortFacet, startFacet, r2Get, loaderGet, setAppAccessInfo } = setup(undefined, { record: largeBundle() });
+    setAppAccessInfo({ ...dynamicAccess, bundle_r2_key: bundleR2Key, bundle_sha: bundleSha });
+
+    expect((await supervisor.fetch(request())).status).toBe(200);
+    await supervisor.reportQuotaTrip('event_rows_written', 10_000, 10_001, 1);
+    expect((await supervisor.fetch(request())).status).toBe(200);
+    expect(abortFacet).not.toHaveBeenCalled();
+    expect(loaderGet).toHaveBeenCalledTimes(1);
+
+    await supervisor.reportQuotaTrip('event_rows_written', 10_000, 10_002, 2);
+    expect(abortFacet).toHaveBeenCalledExactlyOnceWith('main', new Error('Aborted due to repeated quota breach: event_rows_written'));
+    expect((await supervisor.fetch(request())).status).toBe(200);
+    expect(startFacet).toHaveBeenCalledTimes(2);
+    expect(r2Get).toHaveBeenCalledTimes(2);
+    expect(loaderGet).toHaveBeenCalledTimes(2);
+
+    await supervisor.abortFacet('operator restart');
+    expect(abortFacet).toHaveBeenLastCalledWith('main', new Error('operator restart'));
+    expect((await supervisor.fetch(request())).status).toBe(200);
+    expect(startFacet).toHaveBeenCalledTimes(3);
+    expect(r2Get).toHaveBeenCalledTimes(3);
+    expect(loaderGet).toHaveBeenCalledTimes(3);
+  });
+
+  it('starts a fresh facet when the platform drops the prior mount', async () => {
+    const { supervisor, abortFacet, startFacet, r2Get, loaderGet, setAppAccessInfo } = setup(undefined, { record: largeBundle() });
+    setAppAccessInfo({ ...dynamicAccess, bundle_r2_key: bundleR2Key, bundle_sha: bundleSha });
+    expect((await supervisor.fetch(request())).status).toBe(200);
+
+    abortFacet('main', new Error('Facet disconnected'));
+
+    await expect(supervisor.rpcCall(identity, 'read', [])).resolves.toBe('rpc');
+    expect(startFacet).toHaveBeenCalledTimes(2);
+    expect(r2Get).toHaveBeenCalledTimes(2);
+    expect(loaderGet).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns the missing-bundle response if a restart cannot find the artifact', async () => {
+    const { supervisor, bundleBodies, loaderGet, setAppAccessInfo } = setup(undefined, { record: largeBundle() });
+    setAppAccessInfo({ ...dynamicAccess, bundle_r2_key: bundleR2Key, bundle_sha: bundleSha });
+    expect((await supervisor.fetch(request())).status).toBe(200);
+    await supervisor.abortFacet('operator restart');
+    bundleBodies.delete(bundleR2Key);
+
+    const response = await supervisor.fetch(request());
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe('Worker bundle not found');
+    await expect(supervisor.rpcCall(identity, 'read', [])).rejects.toThrow(`Worker bundle not found: ${appId}`);
+    await expect(supervisor.alarm()).resolves.toBeUndefined();
+    expect(loaderGet).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a failed bundle read during env rotation on the next request', async () => {
+    const getAppEnvVarsForDeploy = vi.fn(async () => [{ key: 'APP_SETTING', value: 'initial', isSecret: false }]);
+    const { supervisor, startFacet, r2Get, loaderGet, setAppAccessInfo } = setup(undefined, {
+      record: largeBundle(),
+      getAppEnvVarsForDeploy,
+    });
+    const accessInfo = { ...dynamicAccess, bundle_r2_key: bundleR2Key, bundle_sha: bundleSha };
+    setAppAccessInfo({ ...accessInfo, env_version: 1 });
+    expect((await supervisor.fetch(request())).status).toBe(200);
+
+    getAppEnvVarsForDeploy.mockResolvedValue([{ key: 'APP_SETTING', value: 'updated', isSecret: false }]);
+    setAppAccessInfo({ ...accessInfo, env_version: 2 });
+    r2Get.mockRejectedValueOnce(new Error('R2 temporarily unavailable'));
+
+    await expect(supervisor.fetch(request())).rejects.toThrow('R2 temporarily unavailable');
+    expect(loaderGet).toHaveBeenCalledTimes(1);
+
+    const recovered = await Promise.all(Array.from({ length: batchSize }, () => supervisor.fetch(request())));
+    for (const response of recovered) expect(response.status).toBe(200);
+    expect(r2Get.mock.calls).toEqual([[bundleR2Key], [bundleR2Key], [bundleR2Key]]);
+    expect(loaderGet).toHaveBeenCalledTimes(2);
+    expect(startFacet).toHaveBeenCalledTimes(2);
+  });
+
+  it('shares a bundle read when a newer env supersedes a facet that is still starting', async () => {
+    const getAppEnvVarsForDeploy = vi.fn(async () => [{ key: 'APP_SETTING', value: 'initial', isSecret: false }]);
+    const { supervisor, abortFacet, workerCodes, r2Get, loaderGet, setAppAccessInfo } = setup(undefined, {
+      record: largeBundle(),
+      getAppEnvVarsForDeploy,
+    });
+    const accessInfo = { ...dynamicAccess, bundle_r2_key: bundleR2Key, bundle_sha: bundleSha };
+    setAppAccessInfo({ ...accessInfo, env_version: 1 });
+    expect((await supervisor.fetch(request())).status).toBe(200);
+
+    const readBundle = r2Get.getMockImplementation()!;
+    const readStarted = Promise.withResolvers<void>();
+    const releaseRead = Promise.withResolvers<void>();
+    r2Get.mockImplementationOnce(async (key) => {
+      readStarted.resolve();
+      await releaseRead.promise;
+      return readBundle(key);
+    });
+
+    getAppEnvVarsForDeploy.mockResolvedValue([{ key: 'APP_SETTING', value: 'intermediate', isSecret: false }]);
+    setAppAccessInfo({ ...accessInfo, env_version: 2 });
+    const superseded = Promise.allSettled([supervisor.fetch(request())]);
+    await readStarted.promise;
+
+    getAppEnvVarsForDeploy.mockResolvedValue([{ key: 'APP_SETTING', value: 'latest', isSecret: false }]);
+    setAppAccessInfo({ ...accessInfo, env_version: 3 });
+    const latest = supervisor.fetch(request());
+    try {
+      await vi.waitFor(() => expect(abortFacet).toHaveBeenCalledTimes(2));
+    } finally {
+      releaseRead.resolve();
+    }
+
+    expect((await superseded)[0]?.status).toBe('rejected');
+    expect((await latest).status).toBe(200);
+    expect(r2Get.mock.calls).toEqual([[bundleR2Key], [bundleR2Key]]);
+    expect(loaderGet).toHaveBeenCalledTimes(2);
+    expect([...workerCodes.values()].map(({ env }) => (env as { APP_SETTING: string }).APP_SETTING))
+      .toEqual(['initial', 'latest']);
+  });
+});
+
 describe('Dynamic Workers DO migration gate', () => {
   beforeEach(clearBundleStoreCachesForTest);
   afterEach(() => vi.restoreAllMocks());
@@ -428,7 +689,7 @@ describe('Dynamic Workers DO migration gate', () => {
   it('rebuilds the edge isolate and warm supervisor facet when the live BigQuery token rotates', async () => {
     const key = 'INT_BIGQUERY_ERP_ACCESS_TOKEN';
     const resolveLegacyIntegrationEnvVars = vi.fn(async () => [{ key, value: 'initial-token', isSecret: true as const }]);
-    const { edgeFetch, workerCodes, abortFacet } = setup(undefined, {
+    const { edgeFetch, workerCodes, abortFacet, loaderGet } = setup(undefined, {
       record: { ...bundle, bundleSha: '0123456789abcdef', bindings: [{ name: key, type: 'secret_text' }] },
       broker: { resolveLegacyIntegrationEnvVars },
     });
@@ -439,12 +700,14 @@ describe('Dynamic Workers DO migration gate', () => {
     resolveLegacyIntegrationEnvVars.mockResolvedValue([{ key, value: 'fresh-token', isSecret: true }]);
     expect((await edgeFetch('/fetch', 'dynamic')).status).toBe(200);
     expect(workerCodes.size).toBe(2);
+    expect(loaderGet.mock.calls.filter(([key]) => key.startsWith('do:'))).toHaveLength(1);
     expect(abortFacet).not.toHaveBeenCalled();
 
     clock.mockReturnValue(epoch + 5 * 60_000);
     expect((await edgeFetch('/fetch', 'dynamic')).status).toBe(200);
     expect(resolveLegacyIntegrationEnvVars).toHaveBeenCalledTimes(2);
     expect(abortFacet).toHaveBeenCalledExactlyOnceWith('main', expect.any(Error));
+    expect(loaderGet.mock.calls.filter(([key]) => key.startsWith('do:'))).toHaveLength(2);
     for (const kind of ['http:', 'do:']) {
       const codes = [...workerCodes].filter(([id]) => id.startsWith(kind)).map(([, code]) => code.env);
       expect(codes).toEqual([expect.objectContaining({ [key]: 'initial-token' }), expect.objectContaining({ [key]: 'fresh-token' })]);

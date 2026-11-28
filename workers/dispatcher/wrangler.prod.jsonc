@@ -10,6 +10,17 @@
 	],
 	"compatibility_date": "2026-07-13",
 	"compatibility_flags": ["nodejs_compat"],
+	"observability": {
+		"enabled": true,
+		"logs": {
+			"enabled": true,
+			"invocation_logs": true
+		},
+		"traces": {
+			"enabled": true,
+			"head_sampling_rate": 0.1
+		}
+	},
 	"vars": {
 		"AI_VIRTUAL_MODEL": "dynamic/auto",
 		"MAIN_APP_URL": "https://camelai.dev",

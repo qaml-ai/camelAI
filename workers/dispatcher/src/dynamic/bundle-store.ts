@@ -3,6 +3,7 @@
  * live secret and managed env overlays, and WorkerLoader option assembly.
  */
 
+import { Buffer } from 'node:buffer';
 import type { OrgDO } from '../../../main/src/auth';
 import type { DynamicServiceBroker } from '../../../main/src/dynamic-service-broker';
 import {
@@ -60,9 +61,13 @@ export interface ManagedAppEnvVar {
   isSecret: boolean;
 }
 
-const BUNDLE_LRU_MAX = 64;
-const bundleLru = new Map<string, DynamicWorkerBundleRecord>();
+const BUNDLE_LRU_MAX_ENTRIES = 16;
+const BUNDLE_LRU_MAX_BYTES = 12 * 1024 * 1024;
+const BUNDLE_LRU_MAX_ENTRY_BYTES = 3 * 1024 * 1024;
+const bundleLru = new Map<string, { record: DynamicWorkerBundleRecord; bytes: number }>();
+let bundleLruBytes = 0;
 
+const MAX_METADATA_CACHE_ENTRIES = 512;
 const ENV_CACHE_TTL_MS = 60_000;
 const envVarCache = new Map<string, { expiresAt: number; vars: ManagedAppEnvVar[]; envHash: string }>();
 const SECRETS_CACHE_TTL_MS = 5 * 60_000;
@@ -71,6 +76,15 @@ const legacyIntegrationEnvCache = new Map<
   string,
   { expiresAt: number; vars: ManagedAppEnvVar[]; envHash: string }
 >();
+
+function setMetadataCacheEntry<T>(cache: Map<string, T>, key: string, entry: T): void {
+  cache.delete(key);
+  cache.set(key, entry);
+  if (cache.size > MAX_METADATA_CACHE_ENTRIES) {
+    const oldest = cache.keys().next();
+    if (!oldest.done) cache.delete(oldest.value);
+  }
+}
 
 function isRedactedSecretBinding(binding: Record<string, unknown>): boolean {
   return (
@@ -100,7 +114,7 @@ export async function loadMigratedSecretsOverlay(
   try {
     const obj = await env.R2_BUCKET.get(dynamicSecretsR2Key(record.dispatchScriptName));
     if (!obj) {
-      migratedSecretsCache.set(record.dispatchScriptName, {
+      setMetadataCacheEntry(migratedSecretsCache, record.dispatchScriptName, {
         expiresAt: now + 30_000,
         vars: [],
       });
@@ -113,7 +127,7 @@ export async function loadMigratedSecretsOverlay(
       value,
       isSecret: true,
     }));
-    migratedSecretsCache.set(record.dispatchScriptName, {
+    setMetadataCacheEntry(migratedSecretsCache, record.dispatchScriptName, {
       expiresAt: now + SECRETS_CACHE_TTL_MS,
       vars,
     });
@@ -148,7 +162,7 @@ export async function isDynamicLogsTailEnabled(
   try {
     const flag = await env.APP_KV.get(`${DYNAMIC_LOGS_TAIL_KV_PREFIX}${record.dispatchScriptName}`);
     const enabled = Boolean(flag);
-    tailEnabledCache.set(record.dispatchScriptName, {
+    setMetadataCacheEntry(tailEnabledCache, record.dispatchScriptName, {
       enabled,
       expiresAt: now + (enabled ? TAIL_ENABLED_CACHE_TTL_MS : TAIL_DISABLED_CACHE_TTL_MS),
     });
@@ -158,17 +172,31 @@ export async function isDynamicLogsTailEnabled(
   }
 }
 
-function setBundleLru(key: string, record: DynamicWorkerBundleRecord): void {
-  if (bundleLru.has(key)) bundleLru.delete(key);
-  bundleLru.set(key, record);
-  if (bundleLru.size > BUNDLE_LRU_MAX) {
-    const oldest = bundleLru.keys().next().value;
-    if (oldest) bundleLru.delete(oldest);
+function setBundleLru(key: string, record: DynamicWorkerBundleRecord, text: string): void {
+  // Use the serialized UTF-8 size as a heap estimate without allocating another byte buffer.
+  const bytes = Buffer.byteLength(text, 'utf8');
+  if (bytes > BUNDLE_LRU_MAX_ENTRY_BYTES) return;
+
+  // Concurrent misses can fill the same immutable key more than once.
+  const previous = bundleLru.get(key);
+  if (previous) {
+    bundleLru.delete(key);
+    bundleLruBytes -= previous.bytes;
+  }
+  bundleLru.set(key, { record, bytes });
+  bundleLruBytes += bytes;
+  while (bundleLru.size > BUNDLE_LRU_MAX_ENTRIES || bundleLruBytes > BUNDLE_LRU_MAX_BYTES) {
+    const oldest = bundleLru.entries().next();
+    if (oldest.done) break;
+    const [oldestKey, entry] = oldest.value;
+    bundleLru.delete(oldestKey);
+    bundleLruBytes -= entry.bytes;
   }
 }
 
 export function clearBundleStoreCachesForTest(): void {
   bundleLru.clear();
+  bundleLruBytes = 0;
   envVarCache.clear();
   tailEnabledCache.clear();
   migratedSecretsCache.clear();
@@ -181,8 +209,9 @@ export async function loadDynamicBundleRecord(
 ): Promise<DynamicWorkerBundleRecord | null> {
   const cached = bundleLru.get(bundleR2Key);
   if (cached) {
-    setBundleLru(bundleR2Key, cached);
-    return cached;
+    bundleLru.delete(bundleR2Key);
+    bundleLru.set(bundleR2Key, cached);
+    return cached.record;
   }
 
   // Try Cloudflare edge Cache API (immutable bundle key).
@@ -192,9 +221,10 @@ export async function loadDynamicBundleRecord(
     cache = caches.default;
     const hit = await cache.match(cacheUrl);
     if (hit) {
-      const parsed = (await hit.json()) as DynamicWorkerBundleRecord;
+      const text = await hit.text();
+      const parsed = JSON.parse(text) as DynamicWorkerBundleRecord;
       if (parsed && parsed.schemaVersion === 2) {
-        setBundleLru(bundleR2Key, parsed);
+        setBundleLru(bundleR2Key, parsed, text);
         return parsed;
       }
     }
@@ -210,7 +240,7 @@ export async function loadDynamicBundleRecord(
   const parsed = JSON.parse(text) as DynamicWorkerBundleRecord;
   if (!parsed || parsed.schemaVersion !== 2) return null;
 
-  setBundleLru(bundleR2Key, parsed);
+  setBundleLru(bundleR2Key, parsed, text);
   if (cache) {
     try {
       await cache.put(
@@ -263,7 +293,7 @@ export async function loadManagedEnvOverlay(
     }
     const vars = await stub.getAppEnvVarsForDeploy(scriptName);
     const envHash = await computeEnvHash(vars);
-    envVarCache.set(cacheKey, { expiresAt: now + ENV_CACHE_TTL_MS, vars, envHash });
+    setMetadataCacheEntry(envVarCache, cacheKey, { expiresAt: now + ENV_CACHE_TTL_MS, vars, envHash });
     return { vars, envHash };
   } catch {
     return { vars: [], envHash: '0' };
@@ -308,7 +338,11 @@ async function loadLegacyIntegrationEnvOverlay(
     const resolved = await broker.resolveLegacyIntegrationEnvVars(orgId, workspaceId, sortedKeys);
     const vars = resolved.filter(({ key }) => missingKeys.has(key));
     const envHash = await computeEnvHash(vars);
-    legacyIntegrationEnvCache.set(cacheKey, { expiresAt: now + SECRETS_CACHE_TTL_MS, vars, envHash });
+    setMetadataCacheEntry(legacyIntegrationEnvCache, cacheKey, {
+      expiresAt: now + SECRETS_CACHE_TTL_MS,
+      vars,
+      envHash,
+    });
     return { vars, envHash };
   } catch {
     console.error('Failed to hydrate legacy integration env vars via MAIN_APP_BROKER', dispatchScriptName);

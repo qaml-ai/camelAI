@@ -2,6 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   clearBundleStoreCachesForTest,
+  DYNAMIC_LOGS_TAIL_KV_PREFIX,
+  isDynamicLogsTailEnabled,
+  loadDynamicBundleRecord,
   loadDynamicEnvOverlay,
   loadDynamicUserWorker,
   type BundleStoreEnv,
@@ -19,6 +22,7 @@ const ORG = "org-1";
 const KEY = "INT_STRIPE_BILLING_SECRET_KEY";
 const SECOND_KEY = "INT_SLACK_MESSAGES_BOT_TOKEN";
 const CACHE_TTL_MS = 5 * 60_000;
+const MIB = 1024 * 1024;
 
 function secret(key: string, value: string) {
   return { key, value, isSecret: true as const };
@@ -50,6 +54,134 @@ function makeRecord(bindings: DynamicWorkerBundleRecord["bindings"]): DynamicWor
     hasCodemodeLoader: false,
   };
 }
+
+function makeBundleObject(padding: string) {
+  const record = makeRecord([]);
+  const content = `export default {}; /* ${padding} */`;
+  record.modules["index.js"].content = content;
+  const body = JSON.stringify(record);
+  return { content, text: async () => body };
+}
+
+describe("dispatcher bundle cache bounds", () => {
+  beforeEach(clearBundleStoreCachesForTest);
+  afterEach(() => {
+    clearBundleStoreCachesForTest();
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    { limit: "12 MiB byte budget", entries: 4, moduleBytes: 2.5 * MIB },
+    { limit: "16-entry cap", entries: 16, moduleBytes: 0 },
+  ])("evicts the least recently used bundle at the $limit", async ({ entries, moduleBytes }) => {
+    const object = makeBundleObject("x".repeat(moduleBytes));
+    const get = vi.fn(async () => object);
+    const env = { R2_BUCKET: { get } as unknown as R2Bucket };
+    vi.stubGlobal("caches", {
+      default: { match: async () => undefined, put: async () => {} },
+    });
+
+    for (let index = 0; index < entries; index++) {
+      await loadDynamicBundleRecord(env, `bundle-${index}`);
+    }
+    get.mockClear();
+
+    // Touch the first bundle so the second becomes the least recently used.
+    await loadDynamicBundleRecord(env, "bundle-0");
+    expect(get).not.toHaveBeenCalled();
+    await loadDynamicBundleRecord(env, `bundle-${entries}`);
+    expect(get).toHaveBeenCalledExactlyOnceWith(`bundle-${entries}`);
+    get.mockClear();
+
+    await loadDynamicBundleRecord(env, "bundle-0");
+    await loadDynamicBundleRecord(env, "bundle-2");
+    expect(get).not.toHaveBeenCalled();
+    await loadDynamicBundleRecord(env, "bundle-1");
+    expect(get).toHaveBeenCalledExactlyOnceWith("bundle-1");
+  });
+
+  it("serves bundles over 3 MiB from R2 and the edge cache without pinning them in heap", async () => {
+    // This is over 3 MiB in UTF-8 even though the JS string has fewer than 3 Mi characters.
+    const object = makeBundleObject("é".repeat(2 * MIB));
+    const smallObject = makeBundleObject("");
+    const get = vi.fn(async (key: string) => key === "oversized" ? object : smallObject);
+    const env = { R2_BUCKET: { get } as unknown as R2Bucket };
+    let edgeBody: string | undefined;
+    const match = vi.fn(async (url: string) =>
+      url.endsWith("/oversized") && edgeBody ? new Response(edgeBody) : undefined,
+    );
+    const put = vi.fn(async (url: string, response: Response) => {
+      if (url.endsWith("/oversized")) edgeBody = await response.text();
+    });
+    vi.stubGlobal("caches", { default: { match, put } });
+    await loadDynamicBundleRecord(env, "small");
+    get.mockClear();
+    match.mockClear();
+    put.mockClear();
+
+    for (let request = 0; request < 3; request++) {
+      const loaded = await loadDynamicBundleRecord(env, "oversized");
+      expect(loaded?.modules["index.js"].content.length).toBe(object.content.length);
+    }
+    await loadDynamicBundleRecord(env, "small");
+
+    expect(get).toHaveBeenCalledExactlyOnceWith("oversized");
+    expect(match).toHaveBeenCalledTimes(3);
+    expect(put).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("dispatcher metadata cache bounds", () => {
+  beforeEach(clearBundleStoreCachesForTest);
+  afterEach(() => {
+    clearBundleStoreCachesForTest();
+    vi.restoreAllMocks();
+  });
+
+  it("evicts the oldest entries from all four metadata caches past 512 entries", async () => {
+    const record = makeRecord([redacted(KEY)]);
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse(record.createdAt) + 24 * 60 * 60_000);
+    const masterSecret = "test-migration-key";
+    const encrypted = await encryptSecretsPayload(masterSecret, { APP_SECRET: "migrated" });
+    const getAppEnvVarsForDeploy = vi.fn(async () => []);
+    const missingSecretsKey = dynamicSecretsR2Key(`${SCRIPT}-0`);
+    const getMigratedSecrets = vi.fn(async (key: string) =>
+      key === missingSecretsKey ? null : { json: async () => encrypted },
+    );
+    const resolveLegacyIntegrationEnvVars = vi.fn(async () => []);
+    const getTailFlag = vi.fn(async () => null);
+    const env: BundleStoreEnv = {
+      MIGRATION_HMAC_SECRET: masterSecret,
+      R2_BUCKET: { get: getMigratedSecrets } as unknown as R2Bucket,
+      ORG: {
+        idFromName: (id: string) => id,
+        get: () => ({ getAppEnvVarsForDeploy }),
+      } as unknown as BundleStoreEnv["ORG"],
+      MAIN_APP_BROKER: { resolveLegacyIntegrationEnvVars },
+      APP_KV: { get: getTailFlag } as unknown as KVNamespace,
+    };
+    const loadMetadata = async (index: number) => {
+      const name = `${SCRIPT}-${index}`;
+      const app = { ...record, scriptName: name, dispatchScriptName: name };
+      await loadDynamicEnvOverlay(env, app);
+      await isDynamicLogsTailEnabled(env, app);
+    };
+    const lookups = [getAppEnvVarsForDeploy, getMigratedSecrets, resolveLegacyIntegrationEnvVars, getTailFlag];
+
+    for (let index = 0; index <= 512; index++) {
+      await loadMetadata(index);
+    }
+    for (const lookup of lookups) lookup.mockClear();
+
+    await loadMetadata(1);
+    for (const lookup of lookups) expect(lookup).not.toHaveBeenCalled();
+    await loadMetadata(0);
+    expect(getAppEnvVarsForDeploy).toHaveBeenCalledExactlyOnceWith(`${SCRIPT}-0`);
+    expect(getMigratedSecrets).toHaveBeenCalledExactlyOnceWith(missingSecretsKey);
+    expect(resolveLegacyIntegrationEnvVars).toHaveBeenCalledExactlyOnceWith(ORG, WORKSPACE, [KEY]);
+    expect(getTailFlag).toHaveBeenCalledExactlyOnceWith(`${DYNAMIC_LOGS_TAIL_KV_PREFIX}${SCRIPT}-0`);
+  });
+});
 
 function captureWorkerConfig(
   record: DynamicWorkerBundleRecord,

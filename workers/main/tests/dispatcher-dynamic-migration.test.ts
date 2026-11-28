@@ -3,6 +3,7 @@ import { clearBundleStoreCachesForTest } from '../../dispatcher/src/dynamic/bund
 import { dispatchDynamicWorkerEdge } from '../../dispatcher/src/dynamic/edge-dispatch';
 import { TenantDoRouter, type TenantDoRouterProps } from '../../dispatcher/src/dynamic/entrypoints';
 import { TenantObjectSupervisorDO, type SupervisorEnv } from '../../dispatcher/src/dynamic/supervisor-do';
+import type { DynamicServiceBroker } from '../src/dynamic-service-broker';
 import { dynamicBundleObjectKey, type AppRuntimeMode, type DynamicWorkerBundleRecord } from '../src/dynamic-worker-registry';
 
 const appId = 'migration-test--acme';
@@ -33,7 +34,14 @@ const bundle: DynamicWorkerBundleRecord = {
   hasCodemodeLoader: false,
 };
 
-function setup(kvMode?: AppRuntimeMode) {
+function setup(
+  kvMode?: AppRuntimeMode,
+  { record = bundle, broker }: {
+    record?: DynamicWorkerBundleRecord;
+    broker?: Pick<DynamicServiceBroker, 'resolveLegacyIntegrationEnvVars'>;
+  } = {},
+) {
+  const recordKey = dynamicBundleObjectKey(appId, record.bundleSha);
   const values = new Map<string, unknown>();
   const appKv = { get: async (key: string) => key === `script:${appId}` && kvMode
     ? JSON.stringify({ org_id: bundle.orgId, is_public: true, runtime_mode: kvMode })
@@ -60,6 +68,7 @@ function setup(kvMode?: AppRuntimeMode) {
   });
   const sourceFetch = vi.fn<(request: Request) => Promise<Response>>();
   const setAlarm = vi.fn();
+  const abortFacet = vi.fn();
   const ctx = {
     storage: {
       get: async (key: string) => values.get(key),
@@ -69,7 +78,7 @@ function setup(kvMode?: AppRuntimeMode) {
       setAlarm,
     },
     facets: {
-      abort: vi.fn(),
+      abort: abortFacet,
       get: (_name: string, factory: () => { class: string }) =>
         factory().class === 'ChiridionMigrationImporterDO' ? { fetch: importerFetch } : facet,
     },
@@ -91,8 +100,9 @@ function setup(kvMode?: AppRuntimeMode) {
   } };
   const env = {
     APP_KV: appKv,
-    R2_BUCKET: { get: async (key: string) => key === bundleR2Key ? { text: async () => JSON.stringify(bundle) } : null },
+    R2_BUCKET: { get: async (key: string) => key === recordKey ? { text: async () => JSON.stringify(record) } : null },
     USER_APP_LOADER: loader,
+    MAIN_APP_BROKER: broker,
     MIGRATION_HMAC_SECRET: 'test-migration-secret',
     DISPATCHER: { get: () => ({ fetch: sourceFetch }) },
   } as unknown as SupervisorEnv;
@@ -116,9 +126,9 @@ function setup(kvMode?: AppRuntimeMode) {
     ctx: {} as ExecutionContext,
     exports: { TenantDoRouter: tenantDoRouter },
     dispatchScriptName: appId,
-    accessInfo: { runtime_mode: mode, is_public: true, org_id: bundle.orgId, bundle_r2_key: bundleR2Key },
+    accessInfo: { runtime_mode: mode, is_public: true, org_id: bundle.orgId, bundle_r2_key: recordKey },
   });
-  return { edgeFetch, supervisor, createSupervisor, makeRouter, facet, setAlarm, sourceFetch, tenantDoRouter, values };
+  return { edgeFetch, supervisor, createSupervisor, makeRouter, facet, setAlarm, sourceFetch, tenantDoRouter, values, workerCodes, abortFacet };
 }
 
 describe('Dynamic Workers DO migration gate', () => {
@@ -231,5 +241,31 @@ describe('Dynamic Workers DO migration gate', () => {
     expect((await edgeFetch('/fetch')).status).toBe(200);
     expect(tenantDoRouter.mock.calls.map(([{ props }]) => props.runtimeMode)).toEqual(['dynamic', 'dynamic_migrating']);
     expect(sourceFetch).not.toHaveBeenCalled();
+  });
+
+  it('rebuilds the edge isolate and warm supervisor facet when the live BigQuery token rotates', async () => {
+    const key = 'INT_BIGQUERY_ERP_ACCESS_TOKEN';
+    const resolveLegacyIntegrationEnvVars = vi.fn(async () => [{ key, value: 'initial-token', isSecret: true as const }]);
+    const { edgeFetch, workerCodes, abortFacet } = setup(undefined, {
+      record: { ...bundle, bundleSha: '0123456789abcdef', bindings: [{ name: key, type: 'secret_text' }] },
+      broker: { resolveLegacyIntegrationEnvVars },
+    });
+    const epoch = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(epoch);
+
+    expect((await edgeFetch('/fetch', 'dynamic')).status).toBe(200);
+    resolveLegacyIntegrationEnvVars.mockResolvedValue([{ key, value: 'fresh-token', isSecret: true }]);
+    expect((await edgeFetch('/fetch', 'dynamic')).status).toBe(200);
+    expect(workerCodes.size).toBe(2);
+    expect(abortFacet).not.toHaveBeenCalled();
+
+    clock.mockReturnValue(epoch + 5 * 60_000);
+    expect((await edgeFetch('/fetch', 'dynamic')).status).toBe(200);
+    expect(resolveLegacyIntegrationEnvVars).toHaveBeenCalledTimes(2);
+    expect(abortFacet).toHaveBeenCalledExactlyOnceWith('main', expect.any(Error));
+    for (const kind of ['http:', 'do:']) {
+      const codes = [...workerCodes].filter(([id]) => id.startsWith(kind)).map(([, code]) => code.env);
+      expect(codes).toEqual([expect.objectContaining({ [key]: 'initial-token' }), expect.objectContaining({ [key]: 'fresh-token' })]);
+    }
   });
 });

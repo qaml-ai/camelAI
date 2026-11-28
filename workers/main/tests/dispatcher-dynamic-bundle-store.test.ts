@@ -162,13 +162,17 @@ describe("dispatcher legacy integration env overlay", () => {
     expect(code.env).not.toHaveProperty("INT_UNREQUESTED");
   });
 
-  it("uses managed env over migrated secrets and hydrates only the remaining redacted keys", async () => {
-    const migratedKey = "INT_NOTION_DOCS_TOKEN";
+  it("prefers managed env and live integration tokens while preserving migrated fallbacks", async () => {
+    const bigQueryKey = "INT_BIGQUERY_ERP_ACCESS_TOKEN";
+    const deletedKey = "INT_DELETED_API_KEY";
+    const customKey = "FIRECRAWLER_API_KEY";
     const unresolvedKey = "INT_OTHER_MISSING_API_KEY";
     const masterSecret = "test-migration-key";
     const encrypted = await encryptSecretsPayload(masterSecret, {
       [KEY]: "migrated-value-overridden-by-managed",
-      [migratedKey]: "migrated-value",
+      [bigQueryKey]: "expired-token",
+      [deletedKey]: "deleted-integration-snapshot",
+      [customKey]: "custom-secret",
     });
     const getAppEnvVarsForDeploy = vi.fn(async () => [secret(KEY, "")]);
     const get = vi.fn(async (key: string) =>
@@ -176,7 +180,7 @@ describe("dispatcher legacy integration env overlay", () => {
     );
     const resolveLegacyIntegrationEnvVars = vi.fn(async () => [
       secret(SECOND_KEY, "legacy-value"),
-      secret(migratedKey, "legacy-value-overridden-by-migrated"),
+      secret(bigQueryKey, "fresh-token"),
       secret(KEY, "legacy-value-overridden-by-managed"),
     ]);
     const env: BundleStoreEnv = {
@@ -190,9 +194,12 @@ describe("dispatcher legacy integration env overlay", () => {
     };
     const record = makeRecord([
       redacted(KEY),
-      redacted(migratedKey),
+      redacted(bigQueryKey),
+      redacted(deletedKey),
+      redacted(customKey),
       redacted(SECOND_KEY),
       redacted(unresolvedKey),
+      { name: "PLAIN_VALUE", type: "plain_text", text: "bundle-value" },
     ]);
 
     const overlay = await loadDynamicEnvOverlay(env, record);
@@ -200,18 +207,23 @@ describe("dispatcher legacy integration env overlay", () => {
     expect(getAppEnvVarsForDeploy).toHaveBeenCalledExactlyOnceWith(record.scriptName);
     expect(get).toHaveBeenCalledExactlyOnceWith(dynamicSecretsR2Key(SCRIPT));
     expect(resolveLegacyIntegrationEnvVars).toHaveBeenCalledExactlyOnceWith(ORG, WORKSPACE, [
+      bigQueryKey,
+      deletedKey,
       unresolvedKey,
       SECOND_KEY,
     ]);
     expect(code.env).toMatchObject({
       [KEY]: "",
-      [migratedKey]: "migrated-value",
+      [bigQueryKey]: "fresh-token",
+      [deletedKey]: "deleted-integration-snapshot",
+      [customKey]: "custom-secret",
       [SECOND_KEY]: "legacy-value",
       [unresolvedKey]: "",
+      PLAIN_VALUE: "bundle-value",
     });
 
     resolveLegacyIntegrationEnvVars.mockClear();
-    const coveredRecord = { ...record, bindings: [redacted(KEY), redacted(migratedKey)] };
+    const coveredRecord = { ...record, bindings: [redacted(KEY), redacted(customKey)] };
     await loadDynamicEnvOverlay(env, coveredRecord);
     expect(resolveLegacyIntegrationEnvVars).not.toHaveBeenCalled();
   });

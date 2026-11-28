@@ -274,7 +274,6 @@ async function loadLegacyIntegrationEnvOverlay(
   env: BundleStoreEnv,
   record: Pick<DynamicWorkerBundleRecord, 'dispatchScriptName' | 'orgId' | 'workspaceId' | 'bindings'>,
   managedVars: ManagedAppEnvVar[],
-  migratedSecrets: ManagedAppEnvVar[],
 ): Promise<{ vars: ManagedAppEnvVar[]; envHash: string }> {
   const missingKeys = new Set<string>();
   for (const binding of record.bindings ?? []) {
@@ -288,8 +287,8 @@ async function loadLegacyIntegrationEnvOverlay(
   }
   if (missingKeys.size === 0) return { vars: [], envHash: '0' };
 
+  // Exported integration secrets are fallbacks. Only explicit app overrides skip hydration.
   for (const { key } of managedVars) missingKeys.delete(key);
-  for (const { key } of migratedSecrets) missingKeys.delete(key);
   if (missingKeys.size === 0) return { vars: [], envHash: '0' };
 
   const { dispatchScriptName, orgId, workspaceId } = record;
@@ -326,14 +325,14 @@ export async function loadDynamicEnvOverlay(
     loadManagedEnvOverlay(env, record.orgId, record.scriptName, envVersion),
     loadMigratedSecretsOverlay(env, record),
   ]);
-  const legacy = await loadLegacyIntegrationEnvOverlay(env, record, managed.vars, migratedSecrets);
+  const legacy = await loadLegacyIntegrationEnvOverlay(env, record, managed.vars);
 
   if (migratedSecrets.length === 0 && legacy.vars.length === 0) return managed;
 
   let envHash = managed.envHash;
   if (migratedSecrets.length > 0) envHash += `:ms${await computeEnvHash(migratedSecrets)}`;
   if (legacy.vars.length > 0) envHash += `:li${legacy.envHash}`;
-  return { vars: [...legacy.vars, ...migratedSecrets, ...managed.vars], envHash };
+  return { vars: [...migratedSecrets, ...legacy.vars, ...managed.vars], envHash };
 }
 
 function base64ToArrayBuffer(value: string): ArrayBuffer {

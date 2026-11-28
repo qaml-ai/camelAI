@@ -19,6 +19,7 @@
 
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { decryptCredentials } from '../../../src/lib/integration-crypto';
+import { needsIntegrationTokenRefresh } from './integration-token-refresh.js';
 import { buildIntegrationEnvVars, getIntegrationEnvVarPrefix } from './legacy-integration-env.js';
 import { materializeRpcResult } from './rpc-result.js';
 import type { Env } from './types.js';
@@ -89,14 +90,31 @@ export class DynamicServiceBroker extends WorkerEntrypoint<Env> {
     if (workspace?.org_id !== orgId) return [];
     const records = await org.getWorkspaceIntegrations(workspaceId);
     const resolved = new Map<string, string>();
-    for (const record of records) {
+    for (let record of records) {
       const prefix = getIntegrationEnvVarPrefix(record.name, record.integration_type);
       if (!keys.some((key) => key.startsWith(prefix))) continue;
       try {
-        // BigQuery access tokens are minted and refreshed by OrgDO.
-        const credentials = record.credentials_encrypted
+        let credentials = record.credentials_encrypted
           ? await decryptCredentials(record.credentials_encrypted, this.env.INTEGRATION_SECRET_KEY)
           : {};
+        if (needsIntegrationTokenRefresh(record, credentials)) {
+          try {
+            const refreshed = await org.ensureFreshWorkspaceIntegration(workspaceId, record.id);
+            if (!refreshed) continue;
+            if (refreshed.credentials_encrypted !== record.credentials_encrypted) {
+              credentials = refreshed.credentials_encrypted
+                ? await decryptCredentials(refreshed.credentials_encrypted, this.env.INTEGRATION_SECRET_KEY)
+                : {};
+            }
+            record = refreshed;
+          } catch {
+            console.error('[DynamicServiceBroker] Failed to request integration token refresh', {
+              orgId,
+              workspaceId,
+              integrationId: record.id,
+            });
+          }
+        }
         const config = JSON.parse(record.config) as Record<string, unknown>;
         const vars = buildIntegrationEnvVars([{
           name: record.name,

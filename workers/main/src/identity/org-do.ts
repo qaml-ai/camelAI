@@ -16,6 +16,11 @@ import {
   refreshOpenAiSubscriptionCredentials,
 } from "../../../../src/lib/openai-subscription.server";
 import { mintBigQueryAccessTokenFromServiceAccount, ServiceAccountTokenError } from "../google-service-account";
+import {
+  BIGQUERY_INTEGRATION_TYPE,
+  needsIntegrationTokenRefresh,
+  TOKEN_REFRESH_BUFFER_MS,
+} from "../integration-token-refresh";
 import { refreshRemoteMcpOAuthToken, RemoteMcpOAuthError } from "../remote-mcp-oauth";
 import {
   generateDefaultAvatar,
@@ -181,8 +186,6 @@ export interface AppEnvVarForDeploy {
   value: string;
   isSecret: boolean;
 }
-const BIGQUERY_INTEGRATION_TYPE = "bigquery";
-const TOKEN_REFRESH_BUFFER_MS = 10 * 60 * 1000;
 const TOKEN_BATCH_WINDOW_MS = 15 * 60 * 1000;
 const TOKEN_REFRESH_FALLBACK_MS = 60 * 60 * 1000;
 const TOKEN_REFRESH_RETRY_MS = 15 * 60 * 1000;
@@ -987,6 +990,7 @@ export class OrgDO extends DurableObject<DOEnv> {
   private sql: SqlStorage;
   private usageControlsInstance?: OrgUsageControls;
   private workerScriptsHasPreviewColumns = true;
+  private readonly integrationRefreshes = new Map<string, Promise<void>>();
   private static readonly ACCESS_MAPPED_ORG_ID_KEY = "accessMappedOrgId";
   private static readonly WORKSPACE_ACCESS_MIGRATION_PREFIX =
     "workspaceTenantDataMigrated:access:";
@@ -5080,6 +5084,36 @@ export class OrgDO extends DurableObject<DOEnv> {
     );
   }
 
+  async ensureFreshWorkspaceIntegration(
+    workspaceId: string,
+    integrationId: string,
+  ): Promise<WorkspaceIntegrationRecord | null> {
+    const integration = await this.getWorkspaceIntegration(workspaceId, integrationId);
+    if (!integration) return null;
+
+    try {
+      let needsRefresh = needsIntegrationTokenRefresh(integration);
+      if (!needsRefresh && integration.integration_type === BIGQUERY_INTEGRATION_TYPE) {
+        const credentials = integration.credentials_encrypted
+          ? await decryptCredentials(integration.credentials_encrypted, this.getIntegrationSecretKey())
+          : {};
+        needsRefresh = needsIntegrationTokenRefresh(integration, credentials);
+      }
+      if (!needsRefresh) return integration;
+
+      await this.refreshIntegrationToken(workspaceId, integration);
+      await this.scheduleNextTokenRefresh();
+    } catch (error) {
+      console.error("[OrgDO] On-demand integration token refresh failed", {
+        workspaceId,
+        integrationId,
+        integrationType: integration.integration_type,
+        errorName: error instanceof Error ? error.name : typeof error,
+      });
+    }
+    return this.getWorkspaceIntegration(workspaceId, integrationId);
+  }
+
   async workspaceIntegrationNameExists(
     workspaceId: string,
     integrationType: string,
@@ -5588,7 +5622,7 @@ export class OrgDO extends DurableObject<DOEnv> {
     try {
       const batchCutoff = now + TOKEN_BATCH_WINDOW_MS;
       const expiringIntegrations = this.sql
-        .exec<WorkspaceIntegrationRecord & Record<string, SqlStorageValue>>(
+        .exec<WorkspaceIntegrationRecord & { workspace_id: string } & Record<string, SqlStorageValue>>(
           `SELECT id, integration_type, name, category, auth_method, config,
                   credentials_encrypted, created_by, created_at, updated_at,
                   deleted_at, token_expires_at, auth_status, auth_error_code,
@@ -5606,14 +5640,16 @@ export class OrgDO extends DurableObject<DOEnv> {
         .toArray();
 
       for (const integration of expiringIntegrations) {
+        const workspaceId = integration.workspace_id;
         try {
-          await this.refreshIntegrationToken(integration);
+          await this.refreshIntegrationToken(workspaceId, integration);
         } catch (error) {
           console.error("[OrgDO] Failed to refresh integration token", {
             integrationId: integration.id,
             integrationType: integration.integration_type,
             error,
           });
+          if (!this.isIntegrationRefreshCurrent(workspaceId, integration)) continue;
           if (error instanceof PermanentRefreshError) {
             const failureAt = Date.now();
             this.sql.exec(
@@ -5630,7 +5666,7 @@ export class OrgDO extends DurableObject<DOEnv> {
               failureAt,
               failureAt,
               failureAt,
-              integration.workspace_id ?? "",
+              workspaceId,
               integration.id,
             );
           } else {
@@ -5644,7 +5680,7 @@ export class OrgDO extends DurableObject<DOEnv> {
                 WHERE workspace_id = ? AND id = ?`,
               retryAtMs,
               Date.now(),
-              integration.workspace_id ?? "",
+              workspaceId,
               integration.id,
             );
           }
@@ -5658,12 +5694,45 @@ export class OrgDO extends DurableObject<DOEnv> {
   }
 
   private async refreshIntegrationToken(
-    integration: WorkspaceIntegrationRecord & { workspace_id?: string },
+    workspaceId: string,
+    integration: WorkspaceIntegrationRecord,
+  ): Promise<void> {
+    const inFlight = this.integrationRefreshes.get(integration.id);
+    if (inFlight) return inFlight;
+
+    // Alarm and app requests can interleave while the provider request is pending.
+    const refresh = this.performIntegrationTokenRefresh(workspaceId, integration);
+    this.integrationRefreshes.set(integration.id, refresh);
+    try {
+      await refresh;
+    } finally {
+      this.integrationRefreshes.delete(integration.id);
+    }
+  }
+
+  private isIntegrationRefreshCurrent(
+    workspaceId: string,
+    integration: WorkspaceIntegrationRecord,
+  ): boolean {
+    return this.sql.exec(
+      `SELECT 1 FROM integrations WHERE workspace_id = ? AND id = ? AND deleted_at IS NULL
+         AND credentials_encrypted = ? AND token_expires_at IS ?`,
+      workspaceId,
+      integration.id,
+      integration.credentials_encrypted,
+      integration.token_expires_at,
+    ).toArray().length > 0;
+  }
+
+  private async performIntegrationTokenRefresh(
+    workspaceId: string,
+    integration: WorkspaceIntegrationRecord,
   ): Promise<void> {
     const credentials = await decryptCredentials(
       integration.credentials_encrypted,
       this.getIntegrationSecretKey(),
     );
+    if (!this.isIntegrationRefreshCurrent(workspaceId, integration)) return;
 
     let newCredentials: Record<string, unknown>;
     let newExpiresAt: number;
@@ -5723,7 +5792,7 @@ export class OrgDO extends DurableObject<DOEnv> {
           this.sql.exec(
             `UPDATE integrations SET token_expires_at = NULL, updated_at = ? WHERE workspace_id = ? AND id = ?`,
             Date.now(),
-            integration.workspace_id ?? "",
+            workspaceId,
             integration.id,
           );
           return;
@@ -5757,13 +5826,14 @@ export class OrgDO extends DurableObject<DOEnv> {
         this.sql.exec(
           `UPDATE integrations SET token_expires_at = NULL, updated_at = ? WHERE workspace_id = ? AND id = ?`,
           Date.now(),
-          integration.workspace_id ?? "",
+          workspaceId,
           integration.id,
         );
         return;
     }
 
     const encrypted = await encryptCredentials(newCredentials, this.getIntegrationSecretKey());
+    if (!this.isIntegrationRefreshCurrent(workspaceId, integration)) return;
     const now = Date.now();
     this.sql.exec(
       `UPDATE integrations
@@ -5780,11 +5850,11 @@ export class OrgDO extends DurableObject<DOEnv> {
       newExpiresAt,
       now,
       now,
-      integration.workspace_id ?? "",
+      workspaceId,
       integration.id,
     );
     this.log("token_refreshed", "system", integration.id, {
-      workspace_id: integration.workspace_id ?? "",
+      workspace_id: workspaceId,
       integration_type: integration.integration_type,
     });
   }

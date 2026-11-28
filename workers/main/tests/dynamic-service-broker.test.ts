@@ -15,19 +15,25 @@ interface IntegrationRow {
   integration_type: string;
   credentials_encrypted: string;
   config: string;
+  auth_method?: string;
+  token_expires_at?: number | null;
 }
 
 function createBroker(records: IntegrationRow[] = [], ownerOrgId: string | null = orgId) {
   const getWorkspaceIntegrations = vi.fn(async (_workspaceId: string) => records);
   const getWorkspaceRecord = vi.fn(async (_workspaceId: string) =>
     ownerOrgId === null ? null : { org_id: ownerOrgId });
-  const get = vi.fn((_orgId: string) => ({ getWorkspaceRecord, getWorkspaceIntegrations }));
+  const ensureFreshWorkspaceIntegration = vi.fn(async (_workspaceId: string, integrationId: string) =>
+    records.find((record) => record.id === integrationId) ?? null);
+  const get = vi.fn((_orgId: string) => ({
+    getWorkspaceRecord, getWorkspaceIntegrations, ensureFreshWorkspaceIntegration,
+  }));
   const idFromName = vi.fn((name: string) => name);
   const broker = Object.create(DynamicServiceBroker.prototype) as DynamicServiceBroker;
   Object.defineProperty(broker, 'env', {
     value: { ORG: { get, idFromName }, INTEGRATION_SECRET_KEY: secretKey },
   });
-  return { broker, idFromName, getWorkspaceRecord, getWorkspaceIntegrations };
+  return { broker, idFromName, getWorkspaceRecord, getWorkspaceIntegrations, ensureFreshWorkspaceIntegration };
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -197,11 +203,12 @@ describe('DynamicServiceBroker.resolveLegacyIntegrationEnvVars', () => {
     expect(getWorkspaceIntegrations).not.toHaveBeenCalled();
   });
 
-  it('uses the stored BigQuery token and never returns its private service account JSON', async () => {
-    const { broker } = createBroker([{
+  it('uses the fresh stored BigQuery token and never returns its private service account JSON', async () => {
+    const { broker, ensureFreshWorkspaceIntegration } = createBroker([{
       id: 'bigquery-1',
       name: 'Warehouse',
       integration_type: 'bigquery',
+      token_expires_at: Date.now() + 60 * 60_000,
       credentials_encrypted: await encryptCredentials({
         access_token: 'bigquery-fixture',
         service_account_json: 'private-key-fixture',
@@ -217,6 +224,95 @@ describe('DynamicServiceBroker.resolveLegacyIntegrationEnvVars', () => {
       { key: 'INT_BIGQUERY_WAREHOUSE_ACCESS_TOKEN', value: 'bigquery-fixture', isSecret: true },
       { key: 'INT_BIGQUERY_WAREHOUSE_PROJECT_ID', value: 'example-project', isSecret: true },
     ]);
+    expect(ensureFreshWorkspaceIntegration).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { state: 'expired', expiresInMs: -60_000, accessToken: 'stale-token' },
+    { state: 'expiring', expiresInMs: 5 * 60_000, accessToken: 'stale-token' },
+    { state: 'missing an expiry', expiresInMs: null, accessToken: 'stale-token' },
+    { state: 'missing an access token', expiresInMs: 60 * 60_000, accessToken: undefined },
+  ])('hydrates the refreshed token when matching BigQuery is $state', async ({ expiresInMs, accessToken }) => {
+    const record = {
+      id: 'bigquery-erp',
+      name: 'ERP',
+      integration_type: 'bigquery',
+      token_expires_at: expiresInMs === null ? null : Date.now() + expiresInMs,
+      credentials_encrypted: await encryptCredentials({
+        access_token: accessToken,
+        service_account_json: 'private-key-fixture',
+      }, secretKey),
+      config: '{"project_id":"example-project"}',
+    };
+    const { broker, ensureFreshWorkspaceIntegration } = createBroker([
+      { ...record, id: 'bigquery-unrelated', name: 'Other warehouse', token_expires_at: Date.now() - 60_000 },
+      record,
+    ]);
+    ensureFreshWorkspaceIntegration.mockResolvedValueOnce({
+      ...record,
+      token_expires_at: Date.now() + 60 * 60_000,
+      credentials_encrypted: await encryptCredentials({ access_token: 'fresh-token' }, secretKey),
+    });
+
+    const key = 'INT_BIGQUERY_ERP_ACCESS_TOKEN';
+    await expect(broker.resolveLegacyIntegrationEnvVars(orgId, workspaceId, [key]))
+      .resolves.toEqual([{ key, value: 'fresh-token', isSecret: true }]);
+    expect(ensureFreshWorkspaceIntegration).toHaveBeenCalledExactlyOnceWith(workspaceId, 'bigquery-erp');
+  });
+
+  it('refreshes matching OAuth integrations with an expiring token', async () => {
+    const credentials_encrypted = await encryptCredentials({ access_token: 'stored-token' }, secretKey);
+    const expiring = { token_expires_at: Date.now() + 60_000, credentials_encrypted, config: '{}' };
+    const { broker, ensureFreshWorkspaceIntegration } = createBroker([
+      { ...expiring, id: 'notion-oauth', name: 'Docs', integration_type: 'notion' },
+      { ...expiring, id: 'notion-no-expiry', name: 'Notes', integration_type: 'notion', token_expires_at: null },
+      { ...expiring, id: 'salesforce-oauth', name: 'Sales', integration_type: 'salesforce', auth_method: 'oauth2' },
+      { ...expiring, id: 'salesforce-api-key', name: 'Test', integration_type: 'salesforce', auth_method: 'api_key' },
+    ]);
+
+    const keys = [
+      'INT_NOTION_DOCS_API_KEY', 'INT_NOTION_NOTES_API_KEY',
+      'INT_SALESFORCE_SALES_ACCESS_TOKEN', 'INT_SALESFORCE_TEST_ACCESS_TOKEN',
+    ];
+    await expect(broker.resolveLegacyIntegrationEnvVars(orgId, workspaceId, keys))
+      .resolves.toEqual(keys.map((key) => ({ key, value: 'stored-token', isSecret: true })));
+    expect(ensureFreshWorkspaceIntegration.mock.calls).toEqual([
+      [workspaceId, 'notion-oauth'],
+      [workspaceId, 'salesforce-oauth'],
+    ]);
+  });
+
+  it('uses stored values and resolves other integrations if the refresh RPC fails', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { broker, ensureFreshWorkspaceIntegration } = createBroker([
+      {
+        id: 'bigquery-erp',
+        name: 'ERP',
+        integration_type: 'bigquery',
+        token_expires_at: null,
+        credentials_encrypted: await encryptCredentials({ access_token: 'stored-token' }, secretKey),
+        config: '{}',
+      },
+      {
+        id: 'stripe-1',
+        name: 'Billing',
+        integration_type: 'stripe',
+        credentials_encrypted: await encryptCredentials({ api_key: 'stripe-fixture' }, secretKey),
+        config: '{}',
+      },
+    ]);
+    ensureFreshWorkspaceIntegration.mockRejectedValueOnce(new Error('RPC temporarily unavailable'));
+
+    await expect(broker.resolveLegacyIntegrationEnvVars(orgId, workspaceId, [
+      'INT_BIGQUERY_ERP_ACCESS_TOKEN', 'INT_STRIPE_BILLING_API_KEY',
+    ])).resolves.toEqual([
+      { key: 'INT_BIGQUERY_ERP_ACCESS_TOKEN', value: 'stored-token', isSecret: true },
+      { key: 'INT_STRIPE_BILLING_API_KEY', value: 'stripe-fixture', isSecret: true },
+    ]);
+    expect(log).toHaveBeenCalledExactlyOnceWith(
+      '[DynamicServiceBroker] Failed to request integration token refresh',
+      { orgId, workspaceId, integrationId: 'bigquery-erp' },
+    );
   });
 
   it('skips unrelated records and lets valid records hydrate when another credential cannot be decrypted', async () => {

@@ -7,6 +7,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { env, runInDurableObject } from 'cloudflare:test';
+import type { OrgDO } from '../src/identity/org-do';
 import type { WorkspaceDO, WorkspaceIntegrationRecord } from '../src/workspace';
 import { encryptCredentials, decryptCredentials } from '../../../src/lib/integration-crypto';
 import {
@@ -86,6 +87,102 @@ describe('OAuth Token Refresh', () => {
     }>;
     return workspaceStub.getIntegration(integrationId);
   }
+
+  describe('OrgDO on-demand refresh', () => {
+    const tokenUrl = 'https://bigquery-token.test/token';
+
+    async function seedLegacyBigQuery(tokenExpiresAt: number | null, accessToken?: string) {
+      // Use an empty OrgDO to keep the shared mirror alarm from refreshing the
+      // seeded integration before the on-demand call.
+      const orgStub = testEnv.ORG.get(testEnv.ORG.newUniqueId());
+      const workspaceId = crypto.randomUUID();
+      const integrationId = crypto.randomUUID();
+      const key = await crypto.subtle.generateKey(
+        { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+        true,
+        ['sign', 'verify'],
+      );
+      const pkcs8 = new Uint8Array(await crypto.subtle.exportKey('pkcs8', key.privateKey));
+      const serviceAccountJson = JSON.stringify({
+        client_email: 'testing@example.com',
+        private_key: `-----BEGIN PRIVATE KEY-----\n${btoa(String.fromCharCode(...pkcs8))}\n-----END PRIVATE KEY-----`,
+        token_uri: tokenUrl,
+      });
+      const credentials = await encryptCredentials({
+        service_account_json: serviceAccountJson,
+        access_token: accessToken,
+      }, getSecretKey());
+      // Represent an existing row without minting a token through the create RPC.
+      await runInDurableObject(orgStub, (_instance, state) => {
+        const now = Date.now();
+        state.storage.sql.exec(
+          `INSERT INTO integrations
+           (id, workspace_id, integration_type, name, category, auth_method, config,
+            credentials_encrypted, created_by, created_at, updated_at, token_expires_at)
+           VALUES (?, ?, 'bigquery', 'ERP', 'databases', 'service_account', '{}', ?, 'test', ?, ?, ?)`,
+          integrationId, workspaceId, credentials, now, now, tokenExpiresAt,
+        );
+      });
+      return { orgStub, workspaceId, integrationId, credentials, serviceAccountJson };
+    }
+
+    it.each([
+      { label: 'expired token', expiryOffset: -60_000, accessToken: 'old-token' },
+      { label: 'expiring token', expiryOffset: 5 * 60_000, accessToken: 'old-token' },
+      { label: 'unknown expiry', expiryOffset: null, accessToken: 'old-token' },
+      { label: 'missing token', expiryOffset: 60 * 60_000, accessToken: undefined },
+    ])('mints and stores a fresh BigQuery token for $label', async ({ expiryOffset, accessToken }) => {
+      const expiry = expiryOffset === null ? null : Date.now() + expiryOffset;
+      const { orgStub, workspaceId, integrationId, serviceAccountJson } = await seedLegacyBigQuery(expiry, accessToken);
+      await runInDurableObject(orgStub, async (instance, state) => {
+        const org = instance as unknown as OrgDO;
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+          Response.json({ access_token: 'fresh-token', token_type: 'Bearer', expires_in: 3600 }),
+        );
+        try {
+          const [first, second] = await Promise.all([
+            org.ensureFreshWorkspaceIntegration(workspaceId, integrationId),
+            org.ensureFreshWorkspaceIntegration(workspaceId, integrationId),
+          ]);
+          expect(first).toEqual(second);
+          expect(first!.token_expires_at).toBeGreaterThan(Date.now() + TOKEN_REFRESH_BUFFER_MS);
+          await expect(decryptCredentials(first!.credentials_encrypted, getSecretKey())).resolves.toMatchObject({
+            access_token: 'fresh-token',
+            service_account_json: serviceAccountJson,
+          });
+          await expect(state.storage.getAlarm()).resolves.toBe(first!.token_expires_at! - TOKEN_REFRESH_BUFFER_MS);
+          await expect(org.ensureFreshWorkspaceIntegration(workspaceId, integrationId)).resolves.toEqual(first);
+          expect(fetchSpy).toHaveBeenCalledExactlyOnceWith(tokenUrl, expect.objectContaining({ method: 'POST' }));
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    });
+
+    it('returns the existing record when the provider refresh fails', async () => {
+      const expiry = Date.now() - 60_000;
+      const { orgStub, workspaceId, integrationId, credentials } = await seedLegacyBigQuery(expiry, 'old-token');
+      await runInDurableObject(orgStub, async (instance) => {
+        const org = instance as unknown as OrgDO;
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 503 }));
+        const logSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+          await expect(org.ensureFreshWorkspaceIntegration(workspaceId, integrationId)).resolves.toMatchObject({
+            credentials_encrypted: credentials,
+            token_expires_at: expiry,
+          });
+          expect(fetchSpy).toHaveBeenCalledOnce();
+          expect(logSpy).toHaveBeenCalledWith(
+            '[OrgDO] On-demand integration token refresh failed',
+            expect.objectContaining({ integrationId, errorName: 'ServiceAccountTokenError' }),
+          );
+        } finally {
+          logSpy.mockRestore();
+          fetchSpy.mockRestore();
+        }
+      });
+    });
+  });
 
   describe('Alarm scheduling', () => {
     it('schedules an alarm when creating an OAuth integration with token expiry', async () => {
